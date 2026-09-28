@@ -498,6 +498,9 @@ pub(crate) fn run_brain(
                     {
                         println!("  {line}");
                     }
+                    for line in vault_derivation_status_lines(&value) {
+                        println!("  {line}");
+                    }
                     if let Some(near) = value.get("notes_near_size_limit") {
                         let near_count = near.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
                         if near_count > 0 {
@@ -1477,6 +1480,8 @@ pub(crate) fn run_brain(
             config,
             since,
             ignore,
+            json,
+            fail_on_skip,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             if !path.exists() || !path.is_dir() {
@@ -1601,6 +1606,9 @@ pub(crate) fn run_brain(
             let v_uid = nestweaver_schema::vault_uid(&instance_id, &canonical.to_string_lossy());
 
             if use_daemon {
+                // nw-196: the terminal `Done` event carries the skip rows the
+                // `--json` payload and `--fail-on-skip` are built from.
+                let mut terminal: Option<nestweaver_proto::IndexProgress> = None;
                 let rt = tokio::runtime::Runtime::new()?;
                 let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
                     &db_path,
@@ -1643,6 +1651,9 @@ pub(crate) fn run_brain(
                                 _ => "Progress",
                             };
                             eprintln!("[{phase_name}] {}", progress.message);
+                            if progress.phase == nestweaver_proto::Phase::Done as i32 {
+                                terminal = Some(progress.clone());
+                            }
                         })
                         .await
                     })?;
@@ -1666,16 +1677,44 @@ pub(crate) fn run_brain(
                                 _ => "Progress",
                             };
                             eprintln!("[{phase_name}] {}", progress.message);
+                            if progress.phase == nestweaver_proto::Phase::Done as i32 {
+                                terminal = Some(progress.clone());
+                            }
                         })
                         .await
                     })?;
                 }
-                return Ok((EXIT_SUCCESS, None));
+                let terminal = terminal.ok_or_else(|| {
+                    anyhow::anyhow!("vault refresh completed without a terminal progress payload")
+                })?;
+                let skipped: Vec<RefreshSkipRow> = terminal
+                    .skipped_files
+                    .iter()
+                    .map(RefreshSkipRow::from_wire)
+                    .collect();
+                let unparsed: Vec<RefreshSkipRow> = terminal
+                    .frontmatter_unparsed
+                    .iter()
+                    .map(RefreshSkipRow::from_wire)
+                    .collect();
+                return finish_vault_refresh(
+                    json,
+                    fail_on_skip,
+                    &vault_name,
+                    since.is_some(),
+                    &terminal.message,
+                    &skipped,
+                    &unparsed,
+                );
             }
 
             // Both refresh arms below write the graph and rebuild Tantivy on
             // the direct path.
             let write_lease = require_exclusive_store_access(&db_path, "refresh a vault")?;
+            // (summary text, skip rows, frontmatter-unparsed rows), rendered by
+            // `finish_vault_refresh` once the link and search rebuilds ran.
+            let refresh_outcome: (String, Vec<RefreshSkipRow>, Vec<RefreshSkipRow>);
+            let incremental = since.is_some();
 
             if let Some(since_str) = since {
                 // Incremental refresh: only re-index files modified since the
@@ -1703,7 +1742,7 @@ pub(crate) fn run_brain(
                     tracing::warn!("failed to record last_indexed_at: {e}");
                 }
 
-                println!(
+                let mut message = format!(
                     "Incremental refresh of vault '{}' (since {}): \
                      checked {} file(s), updated {} note(s), dropped {} prior note(s), \
                      {} heading(s), {} section(s), {} tag(s), \
@@ -1718,12 +1757,34 @@ pub(crate) fn run_brain(
                     result.tags_count,
                     result.changed_note_link_edges,
                 );
+                // nw-694: the skip rows themselves, as the daemon route and
+                // the full-refresh summary list them, so a gap names its path.
+                for row in &result.skipped {
+                    message.push_str(&format!("\n  {} - {}", row.path, row.reason));
+                }
                 // nw-585: the same lines the daemon route appends.
                 if let Some(unparsed) = nestweaver_engine::index_md::frontmatter_unparsed_summary(
                     &result.frontmatter_unparsed,
                 ) {
-                    println!("{unparsed}");
+                    message.push('\n');
+                    message.push_str(&unparsed);
                 }
+                if !json {
+                    println!("{message}");
+                }
+                refresh_outcome = (
+                    message,
+                    result
+                        .skipped
+                        .iter()
+                        .map(RefreshSkipRow::from_engine)
+                        .collect(),
+                    result
+                        .frontmatter_unparsed
+                        .iter()
+                        .map(RefreshSkipRow::from_engine)
+                        .collect(),
+                );
             } else {
                 // Full refresh: the markdown indexer's writable store performs
                 // the old-vault cascade and replacement in one transaction.
@@ -1748,9 +1809,24 @@ pub(crate) fn run_brain(
                     tracing::warn!("failed to record last_indexed_at: {e}");
                 }
 
-                println!(
-                    "{}",
-                    nestweaver_engine::index_md::format_markdown_refresh_summary(&result)
+                let message = nestweaver_engine::index_md::format_markdown_refresh_summary(&result);
+                if !json {
+                    println!("{message}");
+                }
+                refresh_outcome = (
+                    message,
+                    result
+                        .index
+                        .skipped
+                        .iter()
+                        .map(RefreshSkipRow::from_engine)
+                        .collect(),
+                    result
+                        .index
+                        .frontmatter_unparsed
+                        .iter()
+                        .map(RefreshSkipRow::from_engine)
+                        .collect(),
                 );
             }
 
@@ -1771,16 +1847,25 @@ pub(crate) fn run_brain(
                     let store_for_tantivy =
                         GraphStore::open_read_only_with_authority(&db_path, &write_lease)?;
                     match tantivy.reindex_from_store(&store_for_tantivy) {
-                        Ok(count) => {
-                            println!("Tantivy: indexed {count} document(s)");
-                        }
+                        // Stdout carries only the JSON payload under --json.
+                        Ok(count) if json => eprintln!("Tantivy: indexed {count} document(s)"),
+                        Ok(count) => println!("Tantivy: indexed {count} document(s)"),
                         Err(e) => tracing::warn!("Tantivy reindex failed: {e}"),
                     }
                 }
                 Err(e) => tracing::warn!("Tantivy open failed: {e}"),
             }
 
-            Ok((EXIT_SUCCESS, None))
+            let (message, skipped, unparsed) = refresh_outcome;
+            finish_vault_refresh(
+                json,
+                fail_on_skip,
+                &vault_name,
+                incremental,
+                &message,
+                &skipped,
+                &unparsed,
+            )
         }
 
         BrainCommands::Remove {
@@ -3430,5 +3515,172 @@ pub(crate) fn run_brain(
             }
             Ok((EXIT_SUCCESS, None))
         }
+    }
+}
+
+/// One `brain refresh` skip row, from either route (nw-196).
+pub(crate) struct RefreshSkipRow {
+    path: String,
+    reason_code: String,
+    detail: String,
+    observed_bytes: Option<u64>,
+    limit_bytes: Option<u64>,
+    excluded_by_request: bool,
+}
+
+impl RefreshSkipRow {
+    fn from_wire(row: &nestweaver_proto::IndexSkipDetail) -> Self {
+        Self {
+            path: row.path.clone(),
+            reason_code: row.reason_code.clone(),
+            detail: row.detail.clone(),
+            observed_bytes: row.observed_bytes,
+            limit_bytes: row.limit_bytes,
+            excluded_by_request: nestweaver_engine::index_md::skip_wire_excluded_by_request(
+                &row.reason_code,
+                &row.detail,
+            ),
+        }
+    }
+
+    fn from_engine(row: &nestweaver_engine::index_md::SkippedFile) -> Self {
+        Self {
+            path: row.path.clone(),
+            reason_code: serde_json::to_value(row.reason_code)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "other".to_string()),
+            detail: row.reason.clone(),
+            observed_bytes: row.observed_bytes,
+            limit_bytes: row.limit_bytes,
+            excluded_by_request: nestweaver_engine::index_md::skip_excluded_by_request(
+                row.reason_code,
+                &row.reason,
+            ),
+        }
+    }
+
+    fn to_json(&self, with_request_flag: bool) -> serde_json::Value {
+        let mut row = serde_json::json!({
+            "path": self.path,
+            "reason_code": self.reason_code,
+            "detail": self.detail,
+            "observed_bytes": self.observed_bytes,
+            "limit_bytes": self.limit_bytes,
+        });
+        if with_request_flag {
+            row["excluded_by_request"] = self.excluded_by_request.into();
+        }
+        row
+    }
+}
+
+/// Render a finished `brain refresh`'s `--json` payload and pick its exit
+/// code (nw-196). The text summary is printed by each route as before.
+///
+/// `--fail-on-skip` mirrors `index --fail-on-skip` (exit 1), except that a row
+/// excluded by request (`.brainignore`) never fails the run: the same shared
+/// predicate that fills `excluded_by_request` decides it.
+pub(crate) fn finish_vault_refresh(
+    json: bool,
+    fail_on_skip: bool,
+    vault_name: &str,
+    incremental: bool,
+    message: &str,
+    skipped: &[RefreshSkipRow],
+    frontmatter_unparsed: &[RefreshSkipRow],
+) -> anyhow::Result<(i32, Option<String>)> {
+    let unrequested = skipped
+        .iter()
+        .filter(|row| !row.excluded_by_request)
+        .count();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "vault": vault_name,
+                "mode": if incremental { "since" } else { "full" },
+                "coverage_status": if unrequested > 0 { "degraded" } else { "complete" },
+                "skipped_count": skipped.len(),
+                "excluded_by_request_count": skipped.len() - unrequested,
+                "skipped_files": skipped.iter().map(|row| row.to_json(true)).collect::<Vec<_>>(),
+                "frontmatter_unparsed": frontmatter_unparsed
+                    .iter()
+                    .map(|row| row.to_json(false))
+                    .collect::<Vec<_>>(),
+                "message": message,
+            }))?
+        );
+    }
+    Ok((
+        if fail_on_skip && unrequested > 0 {
+            EXIT_ERROR
+        } else {
+            EXIT_SUCCESS
+        },
+        None,
+    ))
+}
+
+/// nw-694: `brain status` text says a vault is BLOCKED. The count lived only
+/// in `--json` (`vault_derivation`), so a human saw a healthy status while
+/// every link-graph tool refused that vault.
+pub(crate) fn vault_derivation_status_lines(status: &serde_json::Value) -> Vec<String> {
+    let Some(blocked) = status
+        .get("vault_derivation")
+        .and_then(|derivation| derivation.get("blocked_vaults"))
+        .and_then(|blocked| blocked.as_array())
+    else {
+        return Vec::new();
+    };
+    blocked
+        .iter()
+        .map(|vault| {
+            let root = vault
+                .get("root_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unknown vault>");
+            let reason = vault
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            format!(
+                "Vault BLOCKED: {root} ({reason}) -- Markdown link derivation is not current, so \
+                 link-graph tools refuse it. Fix the unreadable path and run a full \
+                 `nestweaver brain refresh {root}`."
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod vault_derivation_status_tests {
+    use super::vault_derivation_status_lines;
+
+    /// nw-694: a Blocked vault is said in the text render.
+    #[test]
+    fn a_blocked_vault_gets_a_status_line_naming_it() {
+        let status = serde_json::json!({
+            "vault_derivation": {
+                "pending_or_blocked_vaults": 1,
+                "blocked_vaults": [
+                    { "root_path": "/v/brain", "reason": "publication_incomplete" }
+                ]
+            }
+        });
+        let lines = vault_derivation_status_lines(&status);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("Vault BLOCKED: /v/brain"), "{}", lines[0]);
+        assert!(lines[0].contains("brain refresh /v/brain"), "{}", lines[0]);
+    }
+
+    /// Counterweight: no Blocked vault, no line.
+    #[test]
+    fn no_blocked_vault_means_no_line() {
+        let status = serde_json::json!({
+            "vault_derivation": { "pending_or_blocked_vaults": 0, "blocked_vaults": [] }
+        });
+        assert!(vault_derivation_status_lines(&status).is_empty());
+        assert!(vault_derivation_status_lines(&serde_json::json!({})).is_empty());
     }
 }

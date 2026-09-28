@@ -2449,11 +2449,47 @@ fn index_done_message(
 }
 
 /// Appended to a vault RPC's Done message when a coverage gap kept (or
-/// demoted) Markdown derivation from Current (nw-651). One constant so
+/// demoted) Markdown derivation from Current (nw-651). One function so
 /// IndexVault and RefreshVaultSince say the same thing.
-const DERIVATION_WITHHELD_NOTE: &str = "\nMarkdown link derivation NOT marked current: a \
-     skipped path above could not be read or parsed. Fix it and re-run; until then \
-     link-graph tools report this vault as blocked.";
+///
+/// nw-694: it NAMES the gap paths. It used to say "a skipped path above"
+/// while the `--since` message printed no skip rows at all, so the reader had
+/// no path to fix.
+fn derivation_withheld_note(skipped: &[nestweaver_parser::SkippedFile]) -> String {
+    let gaps: Vec<&str> = skipped
+        .iter()
+        .filter(|file| nestweaver_engine::markdown_derivation::is_coverage_gap(file))
+        .map(|file| file.path.as_str())
+        .collect();
+    // Review N1: a vault with thousands of unreadable notes must not print
+    // them all here; the skip rows above carry the full list.
+    let named = match gaps.len() {
+        0 => "a skipped path".to_string(),
+        n if n <= DERIVATION_WITHHELD_PATH_LIMIT => gaps.join(", "),
+        n => format!(
+            "{} (+{} more)",
+            gaps[..DERIVATION_WITHHELD_PATH_LIMIT].join(", "),
+            n - DERIVATION_WITHHELD_PATH_LIMIT
+        ),
+    };
+    format!(
+        "\nMarkdown link derivation NOT marked current: {named} could not be read or parsed. \
+         Fix it and re-run a full `nestweaver brain refresh` (without --since); until then \
+         link-graph tools report this vault as blocked."
+    )
+}
+
+/// How many gap paths [`derivation_withheld_note`] names before summarising.
+const DERIVATION_WITHHELD_PATH_LIMIT: usize = 10;
+
+/// nw-694: the skip rows of a vault refresh, in the `  {path} - {reason}`
+/// shape the full-refresh summary already prints, for the `--since` message.
+fn skip_rows_text(skipped: &[nestweaver_parser::SkippedFile]) -> String {
+    skipped
+        .iter()
+        .map(|file| format!("\n  {} - {}", file.path, file.reason))
+        .collect()
+}
 
 fn index_skip_details(skipped: &[nestweaver_parser::SkippedFile]) -> Vec<IndexSkipDetail> {
     skipped
@@ -2502,6 +2538,26 @@ mod index_done_message_tests {
         assert!(message.contains("12 files"), "{message}");
         assert!(message.contains("340 symbols"), "{message}");
         assert!(message.contains("1500 edges"), "{message}");
+    }
+
+    /// Review N1: the withheld note names at most ten gap paths.
+    #[test]
+    fn derivation_withheld_note_caps_its_path_list() {
+        let rows: Vec<nestweaver_parser::SkippedFile> = (0..13)
+            .map(|i| {
+                nestweaver_parser::SkippedFile::new(
+                    format!("dir{i:02}"),
+                    nestweaver_parser::SkipReasonCode::ReadError,
+                    "unreadable",
+                )
+            })
+            .collect();
+        let note = derivation_withheld_note(&rows);
+        assert!(note.contains("dir09 (+3 more)"), "{note}");
+        assert!(!note.contains("dir10"), "{note}");
+        let few = derivation_withheld_note(&rows[..2]);
+        assert!(few.contains("dir00, dir01 could not"), "{few}");
+        assert!(!few.contains("more)"), "{few}");
     }
 
     #[test]
@@ -7092,7 +7148,8 @@ impl NestWeaverDaemon for DaemonService {
         let _ = app_state
             .vault_derivation
             .set(nestweaver_web::state::VaultDerivationHttp {
-                data_instance_id: state.data_instance_id.clone(),
+                // nw-693: the live identity, as the RPC admission uses.
+                data_instance_id: state.effective_data_instance_id(),
                 read_only: state.read_only,
                 max_note_bytes: vault_derivation::http_max_note_bytes(&state),
             });
@@ -7947,10 +8004,14 @@ impl NestWeaverDaemon for DaemonService {
                     let frontmatter_unparsed =
                         index_skip_details(&result.index.frontmatter_unparsed);
                     let skipped_count = skipped_files.len();
-                    let coverage_status = if skipped_count == 0 {
-                        CoverageStatus::Complete as i32
-                    } else {
+                    // nw-196 review (N2): `.brainignore`-only skips are
+                    // complete coverage, the rule `brain refresh --json` uses.
+                    let coverage_status = if nestweaver_engine::index_md::vault_coverage_degraded(
+                        &result.index.skipped,
+                    ) {
                         CoverageStatus::Degraded as i32
+                    } else {
+                        CoverageStatus::Complete as i32
                     };
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         frontmatter_unparsed: frontmatter_unparsed.clone(),
@@ -8049,7 +8110,7 @@ impl NestWeaverDaemon for DaemonService {
                     let mut message =
                         nestweaver_engine::index_md::format_markdown_refresh_summary(&result);
                     if stamp == vault_derivation::IndexStamp::WithheldForCoverageGap {
-                        message.push_str(DERIVATION_WITHHELD_NOTE);
+                        message.push_str(&derivation_withheld_note(&result.index.skipped));
                     }
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         frontmatter_unparsed: frontmatter_unparsed.clone(),
@@ -8253,11 +8314,14 @@ impl NestWeaverDaemon for DaemonService {
                     // nw-585: see IndexVault.
                     let frontmatter_unparsed = index_skip_details(&result.frontmatter_unparsed);
                     let skipped_count = skipped_files.len();
-                    let coverage_status = if skipped_count == 0 {
-                        CoverageStatus::Complete as i32
-                    } else {
-                        CoverageStatus::Degraded as i32
-                    };
+                    // nw-196 review (N2): `.brainignore`-only skips are
+                    // complete coverage, the rule `brain refresh --json` uses.
+                    let coverage_status =
+                        if nestweaver_engine::index_md::vault_coverage_degraded(&result.skipped) {
+                            CoverageStatus::Degraded as i32
+                        } else {
+                            CoverageStatus::Complete as i32
+                        };
                     let withheld = match vault_derivation::withhold_if_coverage_gap(
                         &state,
                         &vault_path,
@@ -8296,6 +8360,7 @@ impl NestWeaverDaemon for DaemonService {
                         result.tags_count,
                         result.changed_note_link_edges,
                     );
+                    message.push_str(&skip_rows_text(&result.skipped));
                     if let Some(unparsed) =
                         nestweaver_engine::index_md::frontmatter_unparsed_summary(
                             &result.frontmatter_unparsed,
@@ -8305,7 +8370,7 @@ impl NestWeaverDaemon for DaemonService {
                         message.push_str(&unparsed);
                     }
                     if withheld {
-                        message.push_str(DERIVATION_WITHHELD_NOTE);
+                        message.push_str(&derivation_withheld_note(&result.skipped));
                     }
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         frontmatter_unparsed: frontmatter_unparsed.clone(),
@@ -17413,6 +17478,145 @@ repos = ["alpha"]
         assert!(kept.iter().any(|path| path == "locked/C.md"), "{kept:?}");
     }
 
+    /// nw-694: run 1 names the unreadable directory (its skip row and the
+    /// "NOT marked current" note); the refusal that follows names the vault,
+    /// the directory, the retry time and the full-refresh remedy; and the
+    /// status overlay names the Blocked vault for the text render.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_since_over_an_unreadable_directory_names_it_and_the_remedy() {
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\n").unwrap();
+        std::fs::create_dir(root.join("locked")).unwrap();
+        std::fs::write(root.join("locked/C.md"), "# C\n").unwrap();
+        let first = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(first.last().unwrap().phase, Phase::Done as i32);
+
+        let _restore = lock_dir(&root.join("locked"));
+        let run1 = refresh_vault_since_via_rpc(&state, &root).await;
+        let last = run1.last().unwrap();
+        assert_eq!(last.phase, Phase::Done as i32, "{}", last.message);
+        assert!(last.message.contains("\n  locked - "), "{}", last.message);
+        assert!(
+            last.message
+                .contains("NOT marked current: locked could not be read"),
+            "{}",
+            last.message
+        );
+
+        let run2 = refresh_vault_since_via_rpc(&state, &root).await;
+        let last = run2.last().unwrap();
+        assert_eq!(last.phase, Phase::Error as i32, "{}", last.message);
+        for needle in [
+            root.display().to_string().as_str(),
+            "unreadable now: locked",
+            "automatic retry is due in",
+            "run a full `nestweaver brain refresh",
+            "(without --since)",
+        ] {
+            assert!(
+                last.message.contains(needle),
+                "refusal must name {needle:?}: {}",
+                last.message
+            );
+        }
+
+        let mut status = serde_json::json!({});
+        vault_derivation::status_overlay(&state, &mut status);
+        let blocked = status["vault_derivation"]["blocked_vaults"]
+            .as_array()
+            .unwrap();
+        assert_eq!(blocked.len(), 1, "{status}");
+        assert_eq!(blocked[0]["root_path"], root.display().to_string());
+    }
+
+    /// nw-196 review (N2): a vault whose only skip rows are `.brainignore`
+    /// exclusions reports COMPLETE coverage on both vault RPCs, as
+    /// `brain refresh --json` does; an unrequested skip still degrades it.
+    #[tokio::test]
+    async fn brainignore_only_skips_are_complete_coverage_on_vault_rpcs() {
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\n").unwrap();
+        std::fs::write(root.join(".brainignore"), "secret.md\n").unwrap();
+        std::fs::write(root.join("secret.md"), "# Secret\n").unwrap();
+        let index = index_vault_via_rpc(&state, &root).await;
+        let last = index.last().unwrap();
+        assert_eq!(last.phase, Phase::Done as i32, "{}", last.message);
+        assert!(last.skipped_count >= 1, "{last:?}");
+        assert_eq!(
+            last.coverage_status,
+            CoverageStatus::Complete as i32,
+            "{last:?}"
+        );
+        let refresh = refresh_vault_since_via_rpc(&state, &root).await;
+        let last = refresh.last().unwrap();
+        assert_eq!(last.phase, Phase::Done as i32, "{}", last.message);
+        assert_eq!(
+            last.coverage_status,
+            CoverageStatus::Complete as i32,
+            "{last:?}"
+        );
+
+        // Counterweight: an oversized note is an unrequested skip.
+        std::fs::write(
+            root.join("big.md"),
+            format!("# Big\n{}\n", "x".repeat(1024 * 1024 + 16)),
+        )
+        .unwrap();
+        let index = index_vault_via_rpc(&state, &root).await;
+        let last = index.last().unwrap();
+        assert_eq!(
+            last.coverage_status,
+            CoverageStatus::Degraded as i32,
+            "{last:?}"
+        );
+    }
+
+    /// nw-693 review (M1): a sidecar an older daemon stamped with the ambient
+    /// "default" is healed by the background migrator alone -- no refresh --
+    /// and until then the refusal names the remedy.
+    #[tokio::test]
+    async fn migrator_heals_a_default_stamped_derivation_sidecar_without_a_refresh() {
+        let state = test_state_with_writer();
+        state.store.ensure_data_instance_id("alpha").unwrap();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\nsee [[B]]\n").unwrap();
+        std::fs::write(root.join("B.md"), "# B\n").unwrap();
+        let progress = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(progress.last().unwrap().phase, Phase::Done as i32);
+        vault_derivation::admit_tool(&state, "backlinks").unwrap();
+
+        let path = nestweaver_engine::markdown_derivation::record_path(&state.db_path);
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(envelope["data_instance_id"], "alpha", "{envelope}");
+        envelope["data_instance_id"] = "default".into();
+        std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+
+        let refused = vault_derivation::admit_tool(&state, "backlinks").unwrap_err();
+        assert!(refused.message().contains("ForeignRecord"), "{refused:?}");
+        assert!(refused.message().contains("brain refresh"), "{refused:?}");
+
+        let due = vault_derivation::inspect_next(&state)
+            .unwrap()
+            .expect("a default-stamped sidecar is due for the migrator");
+        vault_derivation::migrate_named(&state, &due).unwrap();
+        vault_derivation::admit_tool(&state, "backlinks").unwrap();
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(envelope["data_instance_id"], "alpha", "{envelope}");
+        assert_eq!(vault_derivation::inspect_next(&state).unwrap(), None);
+    }
+
     /// Counterweight: a clean RefreshVaultSince leaves a Current vault Current
     /// and reports complete coverage.
     #[tokio::test]
@@ -23647,6 +23851,73 @@ repos = ["alpha"]
         assert_eq!(state.active_writes.load(Ordering::SeqCst), 0);
         assert!(state.write_gate.holder_snapshot().is_none());
         assert_eq!(state.manifest_recovery.status().state, "stopped");
+    }
+
+    /// nw-680: outstanding manifest debt is paid even when a repo's recorded
+    /// eligibility is from the SUPERSEDED fingerprint version (a repo indexed
+    /// before nw-652's v2 bump and not re-indexed since). Demanding the
+    /// current version failed the capture for every repo, so the sidecar
+    /// stayed at its old generation and the debt stayed outstanding.
+    #[tokio::test]
+    async fn manifest_debt_is_paid_over_a_repo_with_a_superseded_eligibility_policy() {
+        use nestweaver_engine::content_reader::ContentReader;
+        let state = test_state_with_writer();
+        manifest_recovery_fixture(&state);
+        let beta = state.db_path.parent().unwrap().join("beta");
+        let superseded = nestweaver_engine::content_reader::FilesystemReader::new(&beta)
+            .superseded_eligibility_fingerprints();
+        state
+            .store
+            .set_repo_index_policy("repo:beta", &superseded[0])
+            .unwrap();
+        nestweaver_engine::manifest::mark_manifest_reconciliation_pending(
+            &state.db_path,
+            "repository index",
+        )
+        .unwrap();
+
+        let task = tokio::spawn(super::manifest_recovery::run(Arc::clone(&state)));
+        state.manifest_recovery.wake.notify_one();
+        let paid = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if nestweaver_engine::manifest::current_manifest_snapshot(
+                    &state.store,
+                    &state.db_path,
+                )
+                .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let status = state.manifest_recovery.status();
+        state.shutdown_started.store(true, Ordering::SeqCst);
+        state.shutdown_tx.send_replace(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        assert!(paid.is_ok(), "manifest debt was never paid: {status:?}");
+        assert!(
+            nestweaver_engine::manifest::manifest_debt_revision(&state.db_path)
+                .unwrap()
+                .is_none(),
+            "the debt must be cleared"
+        );
+
+        // Counterweight: a policy that differs in its configured parameters
+        // still refuses the capture.
+        state
+            .store
+            .set_repo_index_policy("repo:beta", "a-different-policy")
+            .unwrap();
+        let error = match super::manifest_recovery::capture(
+            &state,
+            Instant::now() + Duration::from_secs(60),
+        ) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a differing policy was accepted"),
+        };
+        assert!(error.contains("repo:beta"), "{error}");
     }
 
     #[tokio::test]

@@ -13,10 +13,10 @@ use crate::content_reader::ContentReader;
 use anyhow::Context;
 use globset::GlobSet;
 use indicatif::{ProgressBar, ProgressStyle};
-use nestweaver_parser::{
-    ParsedNote, RawTag, RawWikilink, SkipReasonCode, SkippedFile, TagSource, is_markdown,
-    parse_markdown,
-};
+use nestweaver_parser::{ParsedNote, RawTag, RawWikilink, TagSource, is_markdown, parse_markdown};
+/// Re-exported for callers of [`skip_excluded_by_request`] and the refresh
+/// results' `skipped` rows.
+pub use nestweaver_parser::{SkipReasonCode, SkippedFile};
 use nestweaver_schema::{
     EdgeType, Heading, Note, Repo, ResolvedEdge, Section, Tag, Vault, heading_uid, note_uid,
     repo_uid, section_uid, tag_uid, vault_uid,
@@ -84,6 +84,37 @@ pub struct MarkdownRefreshResult {
     pub notes_near_size_limit: Vec<NearLimitNote>,
 }
 
+/// The reason a `.brainignore` exclusion carries on a skip row.
+pub const BRAINIGNORE_SKIP_REASON: &str = "matched .brainignore pattern";
+
+/// nw-196: THE predicate for "this note was skipped because the operator asked
+/// for it" (a `.brainignore` pattern). One rule drives the refresh summary's
+/// "Excluded by request" count, `brain refresh --json`'s per-row
+/// `excluded_by_request`, and `--fail-on-skip`, which never fails on such a
+/// row. Config-requested (`--ignore`) exclusions never become skip rows at
+/// all, so they need no arm here.
+pub fn skip_excluded_by_request(reason_code: SkipReasonCode, reason: &str) -> bool {
+    matches!(reason_code, SkipReasonCode::Ignored) && reason == BRAINIGNORE_SKIP_REASON
+}
+
+/// Whether a vault run's coverage is degraded: some note was skipped for a
+/// reason OTHER than an exclusion the operator requested. `.brainignore`-only
+/// skips are complete coverage on every route (nw-196 review N2).
+pub fn vault_coverage_degraded(skipped: &[SkippedFile]) -> bool {
+    skipped
+        .iter()
+        .any(|row| !skip_excluded_by_request(row.reason_code, &row.reason))
+}
+
+/// [`skip_excluded_by_request`] for a skip row as it crosses the daemon wire
+/// (`IndexSkipDetail`: the snake_case `reason_code` string and its `detail`).
+/// The same rule, not a second one: the wire code is parsed back into the
+/// enum, and an unknown code is never "requested".
+pub fn skip_wire_excluded_by_request(reason_code: &str, reason: &str) -> bool {
+    serde_json::from_value::<SkipReasonCode>(serde_json::Value::String(reason_code.to_string()))
+        .is_ok_and(|code| skip_excluded_by_request(code, reason))
+}
+
 /// Canonical full-refresh summary shared by direct CLI and daemon progress.
 ///
 /// nw-196: this is the ONLY call site `format_markdown_refresh_summary` has in
@@ -119,10 +150,7 @@ pub fn format_markdown_refresh_summary(result: &MarkdownRefreshResult) -> String
             .index
             .skipped
             .iter()
-            .filter(|file| {
-                matches!(file.reason_code, SkipReasonCode::Ignored)
-                    && file.reason == "matched .brainignore pattern"
-            })
+            .filter(|file| skip_excluded_by_request(file.reason_code, &file.reason))
             .count();
         let degraded = result.index.skipped.len() - excluded;
         if degraded > 0 {
@@ -3521,7 +3549,7 @@ where
                 skipped.push(SkippedFile::new(
                     rel_str.into_owned(),
                     SkipReasonCode::Ignored,
-                    "matched .brainignore pattern",
+                    BRAINIGNORE_SKIP_REASON,
                 ));
                 continue;
             }
@@ -5152,6 +5180,34 @@ fn skip_frontmatter(source: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    /// nw-196: one predicate, on either side of the daemon wire. Only a
+    /// `.brainignore` match is "requested"; an unreadable or oversized note
+    /// is not, even when its code is `ignored` with another reason.
+    #[test]
+    fn excluded_by_request_is_only_a_brainignore_match_on_both_sides_of_the_wire() {
+        assert!(skip_excluded_by_request(
+            SkipReasonCode::Ignored,
+            BRAINIGNORE_SKIP_REASON
+        ));
+        assert!(skip_wire_excluded_by_request(
+            "ignored",
+            BRAINIGNORE_SKIP_REASON
+        ));
+        assert!(!skip_excluded_by_request(
+            SkipReasonCode::Ignored,
+            "some other ignore"
+        ));
+        assert!(!skip_wire_excluded_by_request(
+            "read_error",
+            BRAINIGNORE_SKIP_REASON
+        ));
+        assert!(!skip_wire_excluded_by_request("oversized", "too big"));
+        assert!(!skip_wire_excluded_by_request(
+            "not-a-code",
+            BRAINIGNORE_SKIP_REASON
+        ));
+    }
+
     use super::*;
     use std::fs;
 

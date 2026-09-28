@@ -517,6 +517,71 @@ fn write_stdio_boot_error_to(
     write_stdout_frame(out, &serialized)
 }
 
+/// How long a boot failure waits for the client's first request before
+/// exiting without a reply (nw-656 review M2).
+pub const STDIO_BOOT_FAILURE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Answer the client's first request with a JSON-RPC error carrying its `id`,
+/// then return so the caller can exit.
+///
+/// nw-656: a boot failure that happens before the session exists (an invalid
+/// `--config`) used to exit 1 with EMPTY stdout, so an MCP client saw the
+/// process die with no reason it could show. Replying to the request the
+/// client actually sent (normally `initialize`) with its own `id` is what a
+/// client can match and surface. Notifications are skipped, an unparsable
+/// line is answered with a `null` id, and a client that sends nothing before
+/// closing stdin gets nothing: stdout stays clean. The wait is bounded by
+/// [`STDIO_BOOT_FAILURE_WAIT`], so a client that never writes cannot hold the
+/// failed process open; the caller prints the cause to stderr first.
+pub fn answer_stdio_boot_failure(message: impl Into<String>) -> Result<(), StdoutWriteError> {
+    answer_stdio_boot_failure_io(
+        std::io::BufReader::new(std::io::stdin()),
+        &mut std::io::stdout(),
+        message,
+        STDIO_BOOT_FAILURE_WAIT,
+    )
+}
+
+fn answer_stdio_boot_failure_io(
+    input: impl std::io::BufRead + Send + 'static,
+    out: &mut impl Write,
+    message: impl Into<String>,
+    wait: std::time::Duration,
+) -> Result<(), StdoutWriteError> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut first = None;
+        for line in input.lines() {
+            let Ok(line) = line else { break };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Value>(line) {
+                Ok(value) => match value.get("id") {
+                    Some(id) if !id.is_null() => {
+                        first = Some(id.clone());
+                        break;
+                    }
+                    // A notification expects no reply.
+                    _ => continue,
+                },
+                Err(_) => {
+                    first = Some(Value::Null);
+                    break;
+                }
+            }
+        }
+        let _ = tx.send(first);
+    });
+    let Ok(Some(id)) = rx.recv_timeout(wait) else {
+        return Ok(());
+    };
+    let frame = error(id, error_code::INTERNAL_ERROR, message);
+    let serialized = serde_json::to_string(&frame).expect("JSON-RPC error is valid JSON");
+    write_stdout_frame(out, &serialized)
+}
+
 fn abort_stdio_before_session(error: anyhow::Error) -> anyhow::Error {
     let _ = write_stdio_boot_error(format!("{error:#}"));
     error
@@ -1425,6 +1490,74 @@ mod tests {
                 .unwrap()
                 .contains("write-ahead")
         );
+    }
+
+    /// nw-656: the first REQUEST is answered with its own id; a preceding
+    /// notification is not answered, and nothing follows the one reply.
+    #[test]
+    fn boot_failure_answers_the_first_request_by_id() {
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"initialize\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/list\"}\n",
+        );
+        let mut buf = Vec::new();
+        answer_stdio_boot_failure_io(
+            std::io::Cursor::new(input.as_bytes().to_vec()),
+            &mut buf,
+            "loading --config bad.toml",
+            STDIO_BOOT_FAILURE_WAIT,
+        )
+        .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        let frame: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(frame["id"], 7);
+        assert_eq!(frame["error"]["code"], -32603);
+        assert!(
+            frame["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("bad.toml")
+        );
+    }
+
+    /// Counterweight: a client that sends nothing gets nothing on stdout.
+    #[test]
+    fn boot_failure_with_no_request_writes_nothing() {
+        let mut buf = Vec::new();
+        answer_stdio_boot_failure_io(
+            std::io::Cursor::new(Vec::new()),
+            &mut buf,
+            "boom",
+            STDIO_BOOT_FAILURE_WAIT,
+        )
+        .unwrap();
+        assert!(buf.is_empty());
+    }
+
+    /// nw-656 review (M2): a client that never writes cannot hold the failed
+    /// process open; the wait ends at its bound with nothing on stdout.
+    #[test]
+    fn boot_failure_wait_is_bounded_when_the_client_never_writes() {
+        struct Silent;
+        impl std::io::Read for Silent {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+                Ok(0)
+            }
+        }
+        let mut buf = Vec::new();
+        let started = std::time::Instant::now();
+        answer_stdio_boot_failure_io(
+            std::io::BufReader::new(Silent),
+            &mut buf,
+            "boom",
+            std::time::Duration::from_millis(200),
+        )
+        .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(buf.is_empty());
     }
 }
 #[test]

@@ -23,7 +23,7 @@ use nestweaver_engine::{
     investigate, investigate_expand, investigate_hydrate, load_alias_sidecar, load_clusters,
     load_extensions, memory_consolidate, memory_lint, memory_related, orphan_documents,
     parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text, tag_graph,
-    tag_graph_all, topic_clusters, truncate_to_budget,
+    tag_graph_all, topic_clusters, truncate_to_budget_keeping_first,
 };
 use nestweaver_schema::SymbolKind;
 use nestweaver_store::tantivy_index::{SearchTotal, SearchTotalRelation};
@@ -2304,6 +2304,38 @@ mod tool_schema_validation_tests {
         // Blank config strings are treated as absent.
         tool_brain_guide(&store, json!({ "config": "  " }))
             .expect("blank config must be treated as absent");
+    }
+
+    /// nw-690 review (B1): both wire inputs are capped at 1 MiB.
+    #[test]
+    fn brain_guide_refuses_oversized_guide_inputs() {
+        let store = GraphStore::in_memory().unwrap();
+        let big = "x".repeat(nestweaver_engine::GUIDE_INPUT_MAX_BYTES + 1);
+        let error = tool_brain_guide(&store, json!({ "rules": big }))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("'rules' is"), "{error}");
+        let error = tool_brain_guide(
+            &store,
+            json!({ "guide_config": { "links": [{ "from": big, "to": "b", "link_type": "t" }] } }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("'guide_config' is"), "{error}");
+        // Counterweight: small inputs render.
+        let ok = tool_brain_guide(
+            &store,
+            json!({
+                "guide_config": { "links": [{ "from": "a", "to": "b", "link_type": "t", "description": "tiny link" }] },
+                "rules": "**HARD RULE:** Small — tiny rule",
+            }),
+        )
+        .unwrap();
+        let guide = ok["guide"].as_str().unwrap();
+        assert!(
+            guide.contains("tiny link") && guide.contains("tiny rule"),
+            "{guide}"
+        );
     }
 
     #[test]
@@ -9262,7 +9294,7 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
                 "unresolved_link_occurrences": result.unresolved_link_occurrences,
                 "unresolved_link_section_targets": result.unresolved_link_section_targets,
                 "unresolved_link_targets": result.unresolved_link_targets,
-                "coverage_status": if result.skipped.is_empty() { "complete" } else { "degraded" },
+                "coverage_status": if nestweaver_engine::index_md::vault_coverage_degraded(&result.skipped) { "degraded" } else { "complete" },
                 "skipped_count": result.skipped.len(),
                 "skipped_files": result.skipped,
             }));
@@ -10264,7 +10296,16 @@ fn tool_schema_brain_guide() -> Value {
                 },
                 "config": {
                     "type": "string",
-                    "description": "Path to an instance config TOML. NOT supported by this handler (it generates from the graph only and cannot honor per-instance settings); passing it returns an explicit error. Use the CLI 'nestweaver generate-guide --config <path>' local path instead."
+                    "description": "Path to an instance config TOML. NOT supported: the server never reads a caller-named file, so passing it returns an explicit error. Pass `guide_config` instead (the CLI 'nestweaver generate-guide --config <path>' does this for you)."
+                },
+                "guide_config": {
+                    "type": "object",
+                    "description": "The config-declared sections the guide renders, and nothing else: {links: [{from, to, link_type, description}], features: [{name, description, repos, entry_points}], projects: [{name, description, aliases, vault_folder, repos, external_refs: [[label, type]]}]}. At most 1 MiB serialized. Never used for authorization or any other server setting. The CLI's `generate-guide --config` builds it from the config file."
+                },
+                "rules": {
+                    "type": "string",
+                    "maxLength": 1048576,
+                    "description": "Contents of a hard-rules override file (TOML with [[rules]] or markdown), replacing the default Hard Rules section. At most 1 MiB. The CLI's --rules-from sends this."
                 }
             }
         }
@@ -10272,10 +10313,9 @@ fn tool_schema_brain_guide() -> Value {
 }
 
 fn tool_brain_guide(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    // This handler generates from the graph only and has no
-    // InstanceConfig to honor. Silently ignoring a caller-supplied `config`
-    // would return a guide shaped by the wrong instance — fail loudly instead
-    // (the CLI already falls back to the local path when --config is given).
+    // A caller-named config PATH is refused: the server must not read an
+    // arbitrary file on a client's say-so, and silently ignoring it would
+    // return a guide shaped by the wrong instance.
     if args
         .get("config")
         .and_then(|v| v.as_str())
@@ -10283,9 +10323,47 @@ fn tool_brain_guide(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     {
         return Err(anyhow!(
             "brain_guide cannot honor the 'config' argument in this context; \
-             use the CLI local path instead: nestweaver generate-guide --config <path>"
+             pass its rendered sections as 'guide_config' instead \
+             (nestweaver generate-guide --config <path> does this)"
         ));
     }
+    // nw-690: the config and rules travel as CONTENT, read by the client, so
+    // `generate-guide --config/--rules-from` renders through the daemon
+    // instead of opening the store directly (which fails while the daemon
+    // holds the write lock). The config arrives as a `GuideConfigProjection`
+    // (review B1): only the sections the guide prints, so no credential,
+    // endpoint or `[authz]` can be in it. It is a RENDERING input only.
+    let cap = nestweaver_engine::GUIDE_INPUT_MAX_BYTES;
+    let instance_config = match args.get("guide_config") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let size = serde_json::to_string(value).map_or(usize::MAX, |s| s.len());
+            if size > cap {
+                return Err(anyhow!(
+                    "brain_guide: 'guide_config' is {size} bytes; the maximum is {cap}"
+                ));
+            }
+            let projection: nestweaver_engine::GuideConfigProjection =
+                serde_json::from_value(value.clone())
+                    .context("brain_guide: invalid 'guide_config'")?;
+            Some(projection.to_render_config()?)
+        }
+    };
+    let override_rules = match args.get("rules").and_then(|v| v.as_str()) {
+        Some(contents) if contents.len() > cap => {
+            return Err(anyhow!(
+                "brain_guide: 'rules' is {} bytes; the maximum is {cap}",
+                contents.len()
+            ));
+        }
+        Some(contents) => Some(
+            nestweaver_engine::parse_rules_override(contents)
+                .context("brain_guide: invalid 'rules'")?,
+        ),
+        None => None,
+    };
+    let cfg_ref = instance_config.as_ref();
+    let rules_ref = override_rules.as_deref();
     let format = args
         .get("format")
         .and_then(|v| v.as_str())
@@ -10303,14 +10381,16 @@ fn tool_brain_guide(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         })
         .collect();
 
-    // The MCP server does not hold an InstanceConfig at runtime; cross-repo
-    // edges from the graph are still included via the store query.
+    // The same five generators, with the same arguments, as the CLI's direct
+    // route, so the two routes cannot render different guides.
     let guide = match format {
-        "skill" => generate_skill_with_tools(store, None, None, &tool_docs)?,
-        "cursor-rule" => generate_cursor_rule_with_rules(store, None, None)?,
-        "agents-md" => generate_agents_md_with_rules(store, None, None, Some(tool_docs.len()))?,
-        "claude-md" => generate_claude_md_with_rules(store, None, None)?,
-        _ => generate_guide_with_tools(store, None, None, &tool_docs)?,
+        "skill" => generate_skill_with_tools(store, cfg_ref, rules_ref, &tool_docs)?,
+        "cursor-rule" => generate_cursor_rule_with_rules(store, cfg_ref, rules_ref)?,
+        "agents-md" => {
+            generate_agents_md_with_rules(store, cfg_ref, rules_ref, Some(tool_docs.len()))?
+        }
+        "claude-md" => generate_claude_md_with_rules(store, cfg_ref, rules_ref)?,
+        _ => generate_guide_with_tools(store, cfg_ref, rules_ref, &tool_docs)?,
     };
     Ok(json!({ "guide": guide }))
 }
@@ -14205,11 +14285,13 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         )?;
         let matched_total = out.matched_total;
         let capped = out.capped;
+        // nw-644: the first summary is always returned, and an overrun is
+        // disclosed as `budget_exceeded_by_first_item`.
+        let mut first_item_overrun = None;
         let display: Vec<nestweaver_engine::Summary> = if let Some(budget) = token_budget {
-            truncate_to_budget(&out.summaries, budget)
-                .into_iter()
-                .cloned()
-                .collect()
+            let budgeted = truncate_to_budget_keeping_first(&out.summaries, budget);
+            first_item_overrun = budgeted.budget_exceeded_by_first_item;
+            budgeted.kept.into_iter().cloned().collect()
         } else {
             out.summaries
         };
@@ -14249,7 +14331,7 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
         } else {
             None
         };
-        return Ok(json!({
+        let mut resp = json!({
             "level": level_str,
             "target": target,
             // nw-321: `returned`/`total` is the one pair of count names, and
@@ -14280,7 +14362,9 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
             "note": note,
             "summaries": display,
             "summaries_text": render_text(&display),
-        }));
+        });
+        attach_first_item_overrun(&mut resp, first_item_overrun);
+        return Ok(resp);
     }
 
     // Try loading cached summaries from the sidecar first; only use the
@@ -14365,11 +14449,12 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     // caller can see. `cap_dropped` is still added because those rows matched
     // and were dropped by the generator's cap, not by the caller's filter.
     let total_available = after_filter_len + cap_dropped;
+    // nw-644: see the symbol-level branch.
+    let mut first_item_overrun = None;
     let display: Vec<nestweaver_engine::Summary> = if let Some(budget) = token_budget {
-        truncate_to_budget(&after_filter, budget)
-            .into_iter()
-            .cloned()
-            .collect()
+        let budgeted = truncate_to_budget_keeping_first(&after_filter, budget);
+        first_item_overrun = budgeted.budget_exceeded_by_first_item;
+        budgeted.kept.into_iter().cloned().collect()
     } else {
         after_filter
     };
@@ -14504,7 +14589,23 @@ fn tool_get_summary(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
     if level == SummaryLevel::Hub {
         attach_ranking_staleness(&mut resp, store);
     }
+    attach_first_item_overrun(&mut resp, first_item_overrun);
     Ok(resp)
+}
+
+/// nw-644: `budget_exceeded_by_first_item`, present only when the first
+/// summary alone overran `token_budget` and was returned anyway. The CLI's
+/// `summary --json` publishes the same key.
+fn attach_first_item_overrun(
+    resp: &mut Value,
+    overrun: Option<nestweaver_engine::read_symbols::BudgetOverrun>,
+) {
+    if let (Some(overrun), Some(obj)) = (overrun, resp.as_object_mut()) {
+        obj.insert(
+            "budget_exceeded_by_first_item".into(),
+            serde_json::to_value(overrun).unwrap_or(Value::Null),
+        );
+    }
 }
 
 /// Shallow check: does the directory contain any `.md` file in its tree?

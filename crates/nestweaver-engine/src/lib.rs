@@ -508,9 +508,10 @@ pub use affected_tests::{
     AffectedTestFile, AffectedTestSymbol, AffectedTestsResult, ChangedSymbolRef, affected_tests,
 };
 pub use agent_guide::{
-    ToolDocEntry, generate_agents_md, generate_agents_md_with_rules, generate_claude_md,
-    generate_claude_md_with_rules, generate_cursor_rule, generate_cursor_rule_with_rules,
-    generate_guide, generate_guide_with_rules, generate_guide_with_tools, generate_skill,
+    GUIDE_INPUT_MAX_BYTES, GuideConfigProjection, ToolDocEntry, generate_agents_md,
+    generate_agents_md_with_rules, generate_claude_md, generate_claude_md_with_rules,
+    generate_cursor_rule, generate_cursor_rule_with_rules, generate_guide,
+    generate_guide_with_rules, generate_guide_with_tools, generate_skill,
     generate_skill_with_rules, generate_skill_with_tools,
 };
 pub use authz::{
@@ -685,6 +686,7 @@ pub use summaries::{
     DEFAULT_SYMBOL_SUMMARY_CAP, SUMMARY_DEFAULT_TOKEN_BUDGET, Summary, SummaryLevel, SummaryStore,
     SymbolSummaries, filter_by_target, generate_summaries, generate_symbol_summaries_bounded,
     load_summaries, merge_and_save_summaries, render_text, save_summaries, truncate_to_budget,
+    truncate_to_budget_keeping_first,
 };
 pub use watch_code::CodeWatcher;
 pub use watcher::{

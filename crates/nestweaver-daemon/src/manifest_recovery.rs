@@ -92,9 +92,26 @@ pub(super) fn capture(state: &DaemonState, deadline: Instant) -> anyhow::Result<
             )
         };
         let policy = state.store.get_repo_index_policy(&repo.uid)?;
+        // nw-680: a policy recorded under a SUPERSEDED fingerprint version,
+        // with the same configured parameters, is accepted. Demanding the
+        // current version meant that after nw-652's v2 bump any one repo not
+        // yet re-indexed failed this capture for EVERY repo, so the sidecar
+        // stayed at its old generation and the debt was never paid. The
+        // trade-off: such a repo's graph may still lack a non-build `target/`
+        // (what v2 restores on its next index), and a manifest inside one is
+        // captured here anyway, which can add an entry root, never remove one.
+        // A policy that differs in its configured parameters still refuses.
+        let accepted = policy.as_deref().is_some_and(|recorded| {
+            recorded == reader.eligibility_fingerprint()
+                || reader
+                    .superseded_eligibility_fingerprints()
+                    .iter()
+                    .any(|old| old == recorded)
+        });
         anyhow::ensure!(
-            policy.as_deref() == Some(reader.eligibility_fingerprint().as_str()),
-            "{}: recorded source eligibility is absent or differs from current configuration",
+            accepted,
+            "{}: recorded source eligibility is absent or differs from current configuration; \
+             re-index it with `nestweaver index --repo <path>`",
             repo.uid
         );
         inventory.push(serde_json::json!({ "repo": repo, "policy": policy }));

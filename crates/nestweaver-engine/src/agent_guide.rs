@@ -3,6 +3,195 @@ use nestweaver_store::GraphStore;
 use crate::config::{DEFAULT_RESULT_LIMIT, InstanceConfig};
 use crate::guide_rules::{self, OwnedRule};
 
+/// Upper bound, in bytes, on a guide input sent over the wire: the serialized
+/// [`GuideConfigProjection`] and the hard-rules override text (nw-690 review).
+pub const GUIDE_INPUT_MAX_BYTES: usize = 1024 * 1024;
+
+/// The ONLY parts of an instance config the guide generators render.
+///
+/// nw-690 review (B1): `generate-guide --config` used to send the whole TOML
+/// over the RPC, and `brain_guide` is a federated (Merge) tool, so
+/// `[[upstream]] token`, `[authz]` and `[git]` reached remote servers. A
+/// client now sends this projection instead: declared links, feature bundles
+/// and projects, each cut to the fields the renderer prints. Anything not
+/// named here (credentials, endpoints, authorization, a project's
+/// `wiki_sources` or its external-ref URLs) cannot travel, by construction.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuideConfigProjection {
+    #[serde(default)]
+    pub links: Vec<GuideLink>,
+    #[serde(default)]
+    pub features: Vec<GuideFeature>,
+    #[serde(default)]
+    pub projects: Vec<GuideProject>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuideLink {
+    pub from: String,
+    pub to: String,
+    pub link_type: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuideFeature {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub repos: Vec<String>,
+    #[serde(default)]
+    pub entry_points: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuideProject {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub vault_folder: Option<String>,
+    #[serde(default)]
+    pub repos: Vec<String>,
+    /// `(label, type)` only: the URL is not rendered, so it is not sent.
+    #[serde(default)]
+    pub external_refs: Vec<(String, Option<String>)>,
+}
+
+/// A fixed, credential-free skeleton the projection is rendered through, so
+/// the generators keep taking an `InstanceConfig`.
+const GUIDE_RENDER_SKELETON: &str = r#"
+instance_id = "guide-render"
+
+[snapshot_storage]
+backend = "local"
+path = "/nonexistent/guide-render/snapshots"
+
+[workspace]
+backend = "local"
+path = "/nonexistent/guide-render/workspace"
+
+[inference]
+endpoint = "http://127.0.0.1:9"
+embedding_model = "none"
+summary_model = "none"
+
+[git]
+credential_method = "none"
+"#;
+
+impl GuideConfigProjection {
+    pub fn from_config(config: &InstanceConfig) -> Self {
+        Self {
+            links: config
+                .links
+                .iter()
+                .flatten()
+                .map(|link| GuideLink {
+                    from: link.from.clone(),
+                    to: link.to.clone(),
+                    link_type: link.link_type.clone(),
+                    description: link.description.clone(),
+                })
+                .collect(),
+            features: config
+                .features
+                .iter()
+                .flatten()
+                .map(|feature| GuideFeature {
+                    name: feature.name.clone(),
+                    description: feature.description.clone(),
+                    repos: feature.repos.clone(),
+                    entry_points: feature.entry_points.clone(),
+                })
+                .collect(),
+            projects: config
+                .projects
+                .iter()
+                .map(|project| GuideProject {
+                    name: project.name.clone(),
+                    description: project.description.clone(),
+                    aliases: project.aliases.clone(),
+                    vault_folder: project.vault_folder.clone(),
+                    repos: project.repos.clone(),
+                    external_refs: project
+                        .external_refs
+                        .iter()
+                        .map(|r| (r.label.clone(), r.ref_type.clone()))
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
+    /// An `InstanceConfig` carrying exactly this projection, for the
+    /// generators. Rendering it produces the same guide as the full config.
+    pub fn to_render_config(&self) -> Result<InstanceConfig, anyhow::Error> {
+        use crate::config::{ExternalRefConfig, FeatureConfig, LinkConfig, ProjectConfig};
+        let mut config = InstanceConfig::from_toml_str(GUIDE_RENDER_SKELETON)?;
+        config.links = (!self.links.is_empty()).then(|| {
+            self.links
+                .iter()
+                .map(|link| LinkConfig {
+                    from: link.from.clone(),
+                    to: link.to.clone(),
+                    link_type: link.link_type.clone(),
+                    description: link.description.clone(),
+                    endpoints: None,
+                    identifiers: None,
+                    contract: None,
+                    materialize: false,
+                })
+                .collect()
+        });
+        config.features = (!self.features.is_empty()).then(|| {
+            self.features
+                .iter()
+                .map(|feature| FeatureConfig {
+                    name: feature.name.clone(),
+                    description: feature.description.clone(),
+                    repos: feature.repos.clone(),
+                    entry_points: feature.entry_points.clone(),
+                })
+                .collect()
+        });
+        config.projects = self
+            .projects
+            .iter()
+            .map(|project| ProjectConfig {
+                name: project.name.clone(),
+                description: project.description.clone(),
+                aliases: project.aliases.clone(),
+                vault_folder: project.vault_folder.clone(),
+                repos: project.repos.clone(),
+                features: Vec::new(),
+                components: Vec::new(),
+                parent: None,
+                tags: Vec::new(),
+                wiki_sources: Vec::new(),
+                external_refs: project
+                    .external_refs
+                    .iter()
+                    .map(|(label, ref_type)| ExternalRefConfig {
+                        label: label.clone(),
+                        url: String::new(),
+                        ref_type: ref_type.clone(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        Ok(config)
+    }
+}
+
 /// Structured metadata for a single MCP tool, used to dynamically generate
 /// tool documentation tables in skills and guides. Created in the MCP crate
 /// (which owns the tool registry) and bridged into engine via the binary crate.
@@ -1097,6 +1286,76 @@ pub fn generate_agents_md_with_rules(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SECRET_CONFIG: &str = r#"
+instance_id = "proj-test"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/s"
+
+[workspace]
+backend = "local"
+path = "/tmp/w"
+
+[inference]
+endpoint = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+summary_model = "none"
+
+[git]
+credential_method = "gh"
+
+[[upstream]]
+url = "https://upstream.example"
+token = "SECRET-UPSTREAM-TOKEN"
+
+[[links]]
+from = "app"
+to = "svc"
+type = "http-api"
+description = "app calls svc"
+endpoints = ["/secret-endpoint"]
+
+[[features]]
+name = "billing"
+description = "billing bundle"
+repos = ["app"]
+entry_points = ["charge"]
+
+[[projects]]
+name = "Proj"
+description = "a project"
+aliases = ["P"]
+vault_folder = "Workspaces/Proj"
+repos = ["app"]
+external_refs = [{ label = "Board", url = "https://secret.example/board", ref_type = "tracker" }]
+"#;
+
+    /// nw-690 review (B1): the projection renders the same guide as the full
+    /// config, and carries none of the fields the renderer does not print.
+    #[test]
+    fn guide_projection_renders_like_the_full_config_and_carries_no_secrets() {
+        let config = InstanceConfig::from_toml_str(SECRET_CONFIG).unwrap();
+        let projection = GuideConfigProjection::from_config(&config);
+        let wire = serde_json::to_string(&projection).unwrap();
+        for secret in [
+            "SECRET-UPSTREAM-TOKEN",
+            "upstream.example",
+            "secret-endpoint",
+            "secret.example",
+        ] {
+            assert!(!wire.contains(secret), "{secret} leaked: {wire}");
+        }
+        let store = GraphStore::in_memory().unwrap();
+        let rendered = projection.to_render_config().unwrap();
+        let full = generate_guide_with_tools(&store, Some(&config), None, &[]).unwrap();
+        let via = generate_guide_with_tools(&store, Some(&rendered), None, &[]).unwrap();
+        assert_eq!(full, via);
+        assert!(full.contains("app calls svc") && full.contains("Board (tracker)"));
+        let round: GuideConfigProjection = serde_json::from_str(&wire).unwrap();
+        assert_eq!(round, projection);
+    }
 
     /// A dirty index publication fails `generate_repo_map` closed (the
     /// ranking.rs module contract): the guide must say the map is temporarily

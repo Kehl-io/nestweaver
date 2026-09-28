@@ -115,7 +115,7 @@ use nestweaver_engine::{
     index_markdown_directory_with_ignore_and_write_lease_and_note_limits, list_repos,
     list_services, load_alias_sidecar, load_clusters, load_clusters_with_generation, lookup_symbol,
     record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
-    search_symbols, suggest_links, truncate_to_budget,
+    search_symbols, suggest_links,
 };
 use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol, parse_drain_ceiling};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
@@ -1174,7 +1174,13 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
 /// nothing here can improve it — but a `--json` caller now also gets a parsable
 /// object on stdout instead of an empty stream to scrape stderr for.
 fn report_context_lookup_failure(error: &anyhow::Error, json: bool, seeds: &[String]) -> i32 {
-    let message = format!("{error:#}");
+    // nw-550: the ROOT cause only. On the daemon route the error is the
+    // tool's answer wrapped as "<answer>: code_context RPC failed: code:
+    // 'Internal error', message: \"tool code_context failed: <answer>\"", so
+    // the full chain told scripts the tool crashed and repeated the answer.
+    // `daemon_application_error` is the unwrap every answered-RPC failure
+    // uses; the direct route has no gRPC status and keeps its chain.
+    let message = daemon_application_error(error).unwrap_or_else(|| format!("{error:#}"));
     if message.contains("No matching symbols") || message.contains("No symbols found") {
         if json {
             print_json_not_found_detail("seeds", &serde_json::json!(seeds), Some(&message));
@@ -8306,6 +8312,17 @@ enum BrainCommands {
         since: Option<String>,
         #[arg(long, help = "Additional glob patterns to ignore (comma-separated)")]
         ignore: Option<String>,
+        /// Emit one machine-readable result on stdout: `skipped_files[]`, each
+        /// row with `excluded_by_request` (true for a `.brainignore` match).
+        /// Progress stays on stderr.
+        #[arg(long)]
+        json: bool,
+        /// Exit 1 when a note was skipped for any reason OTHER than an
+        /// exclusion you requested (unreadable, unparsable, oversized, ...),
+        /// as `index --fail-on-skip` does. `.brainignore` exclusions never
+        /// fail the run. The refresh still completes and commits either way.
+        #[arg(long)]
+        fail_on_skip: bool,
     },
     /// Remove a vault from the brain. Drops the Vault node and
     /// cascade-deletes every Note/Heading/Section/edge belonging to it.
@@ -16930,26 +16947,64 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
 
             // ── daemon guard (JSON pass-through) ─────────────────
-            // Try the daemon first regardless of --output / --rules-from
-            // flags — it can generate the guide without the CLI opening
-            // the DB directly. When --output is set we write the result
-            // to the file locally; --rules-from is applied CLI-side only
-            // so we skip the daemon when that flag is present.
-            // The daemon's brain_guide handler ignores the `config`
-            // arg, so when --config is given fall back to the local read
-            // path, which actually honors it.
-            if rules_from.is_none() && config.is_none() && use_daemon {
+            // Try the daemon first regardless of --output / --config /
+            // --rules-from — it can generate the guide without the CLI
+            // opening the DB directly. When --output is set we write the
+            // result to the file locally.
+            //
+            // nw-690: `--config` and `--rules-from` used to skip the daemon
+            // outright, so the documented guide-with-config command always
+            // took the direct open and failed while a daemon served the DB.
+            // Both files are now read HERE; the daemon never reads a path a
+            // client names.
+            //
+            // Review B1: the config is sent as a `GuideConfigProjection` --
+            // only the links, features and projects the guide prints -- never
+            // the TOML, which holds `[[upstream]] token`, `[authz]` and
+            // `[git]`. And a request carrying either input goes to the LOCAL
+            // daemon only: `brain_guide` is a federated tool, and a caller's
+            // config and rules must never reach an upstream.
+            if use_daemon {
                 let mut args = serde_json::json!({ "format": format });
-                if let Some(ref c) = config {
-                    args["config"] = serde_json::json!(c.to_string_lossy());
+                let cap = nestweaver_engine::GUIDE_INPUT_MAX_BYTES;
+                if let Some(ref path) = config {
+                    let parsed = nestweaver_engine::InstanceConfig::from_file(path)
+                        .with_context(|| format!("failed to load --config {}", path.display()))?;
+                    let projection = serde_json::to_value(
+                        nestweaver_engine::GuideConfigProjection::from_config(&parsed),
+                    )?;
+                    let size = serde_json::to_string(&projection)?.len();
+                    if size > cap {
+                        eprintln!(
+                            "Error: the guide sections of --config {} are {size} bytes; the \
+                             maximum is {cap}",
+                            path.display()
+                        );
+                        return Ok((EXIT_ERROR, None));
+                    }
+                    args["guide_config"] = projection;
                 }
-                if let Some(value) = try_hybrid_json_rpc_checked(
-                    true,
-                    &db_path,
-                    config.as_deref(),
-                    "brain_guide",
-                    args,
-                )? {
+                if let Some(ref path) = rules_from {
+                    let contents = std::fs::read_to_string(path).with_context(|| {
+                        format!("failed to read --rules-from {}", path.display())
+                    })?;
+                    if contents.len() > cap {
+                        eprintln!(
+                            "Error: --rules-from {} is {} bytes; the maximum is {cap}",
+                            path.display(),
+                            contents.len()
+                        );
+                        return Ok((EXIT_ERROR, None));
+                    }
+                    args["rules"] = serde_json::json!(contents);
+                }
+                let private_inputs = config.is_some() || rules_from.is_some();
+                let answer = if private_inputs {
+                    try_local_daemon_json_rpc(&db_path, config.as_deref(), "brain_guide", args)?
+                } else {
+                    try_hybrid_json_rpc_checked(true, &db_path, None, "brain_guide", args)?
+                };
+                if let Some(value) = answer {
                     // brain_guide returns { "guide": "<markdown>" }. Extract the
                     // raw markdown body — printing the JSON object would emit an
                     // envelope with escaped newlines instead of a usable guide.
@@ -16967,7 +17022,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                         None => print!("{text}"),
                     }
-                    return Ok((EXIT_SUCCESS, None));
+                    // `--stats` names the route, as `summary` does, so which
+                    // transport answered is observable rather than inferred.
+                    return Ok((
+                        EXIT_SUCCESS,
+                        Some("guide generated (via daemon)".to_string()),
+                    ));
                 }
             }
 
@@ -17595,9 +17655,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // hardcoded `None`, so even a caller who had one could not use
                 // it — the daemon route silently ignored the instance and any
                 // upstream it declares.
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, config.as_deref(), "get_summary", args)?
-                    && let Some(text) = value.get("summaries").and_then(|v| v.as_str())
+                //
+                // nw-690: the rendered text is read from `summaries_text`.
+                // nw-321 made `summaries` the structured LIST, so reading it
+                // as a string found nothing and every daemon answer fell
+                // through to the direct open below, which fails while the
+                // daemon holds the write lock. The plain-string `summaries`
+                // is still accepted, for a daemon older than nw-321. `_checked`
+                // because `--config` reaches here (nw-414) and the configless
+                // wrapper asserts it never does.
+                if let Some(value) = try_hybrid_json_rpc_checked(
+                    true,
+                    &db_path,
+                    config.as_deref(),
+                    "get_summary",
+                    args,
+                )? && let Some(text) = value
+                    .get("summaries_text")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| value.get("summaries").and_then(|v| v.as_str()))
                 {
                     // nw-370: `get_summary` attaches the verdict on hub level,
                     // so this route reads the daemon's own answer rather than
@@ -17618,6 +17694,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         if !text.ends_with('\n') {
                             println!();
                         }
+                    }
+                    if let Some(note) = value
+                        .get("budget_exceeded_by_first_item")
+                        .and_then(|overrun| overrun.get("note"))
+                        .and_then(|note| note.as_str())
+                    {
+                        eprintln!("note: {note}");
                     }
                     // `returned` first, `count` as the fallback: nw-321 made
                     // `returned` the canonical name and kept `count` as an
@@ -17767,14 +17850,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // exposed as an MCP tool where that is a context-window bomb. A
             // default budget bounds it; `--token-budget 0` still returns
             // everything.
+            //
+            // nw-644: the first summary is always returned, so a `--target`
+            // whose one hit overruns a small budget is no longer an empty
+            // success; the overrun is disclosed as
+            // `budget_exceeded_by_first_item`, as `read-symbols` does.
             let total = after_filter.len();
+            let mut first_item_overrun = None;
             let display: Vec<Summary> = if token_budget == 0 {
                 after_filter
             } else {
-                truncate_to_budget(&after_filter, token_budget)
-                    .into_iter()
-                    .cloned()
-                    .collect()
+                let budgeted = nestweaver_engine::truncate_to_budget_keeping_first(
+                    &after_filter,
+                    token_budget,
+                );
+                first_item_overrun = budgeted.budget_exceeded_by_first_item;
+                budgeted.kept.into_iter().cloned().collect()
             };
             // Truncation is either cause: the symbol cap upstream, or the
             // token budget here. Reporting only the second made the first
@@ -17822,6 +17913,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "truncated_by_budget": truncated_by_budget,
                     "truncated_by_cap": truncated_by_cap,
                 });
+                if let (Some(overrun), Some(obj)) = (&first_item_overrun, payload.as_object_mut()) {
+                    obj.insert(
+                        "budget_exceeded_by_first_item".into(),
+                        serde_json::to_value(overrun)?,
+                    );
+                }
                 // Both keys, always — but only on the level they describe.
                 if let (Some(staleness), Some(obj)) = (&hub_staleness, payload.as_object_mut()) {
                     obj.insert("rankings_stale".into(), staleness.rankings_stale.into());
@@ -17841,6 +17938,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // and nothing telling them the other 39,500 exist — the same
                 // silence nw-270 removed from the JSON, left in place on the
                 // route most people actually use.
+                if let Some(overrun) = &first_item_overrun {
+                    eprintln!("note: {}", overrun.note);
+                }
                 if truncated {
                     let shown = display.len();
                     let matched = total + cap_dropped;
@@ -19801,7 +19901,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                      remove it from your MCP config"
                 );
             }
-            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // nw-656: an invalid `--config` failed HERE, before any JSON-RPC
+            // existed, so the process exited 1 with empty stdout and an MCP
+            // client had nothing to show. Answer the client's first request
+            // with the cause (it names the file and the parse error), then
+            // exit.
+            let db_path = match resolve_db_with_config(db, config.as_deref()) {
+                Ok(db_path) => db_path,
+                Err(error) => {
+                    // Review M2: the cause reaches stderr BEFORE the bounded
+                    // wait for a request, so a human at a terminal (or a
+                    // client that logs stderr) sees it at once.
+                    eprintln!("Error: {error:#}");
+                    let _ = nestweaver_mcp::answer_stdio_boot_failure(format!("{error:#}"));
+                    return Ok((EXIT_ERROR, None));
+                }
+            };
             // nw-199: absent flags inherit `[ranking] track_interactions`, so
             // the policy is a durable per-brain setting rather than something
             // every generated `.mcp.json` has to remember. An explicit flag
@@ -20547,7 +20662,42 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     None
                 };
 
+            // nw-539: a nonexistent or unreadable `--root` is STATE, not a
+            // missing target. It used to exit 2 with `not_found: []` because
+            // every found symbol's body was unavailable. Owner policy
+            // (2026-09-27): exit 1, with a named `unreadable_root` diagnostic;
+            // exit 2 stays for targets that did not resolve.
+            let root_problem = root
+                .as_deref()
+                .and_then(|root| unreadable_root_reason(root).map(|reason| (root, reason)));
+            // nw-706: a READABLE `--root` that holds none of the resolved
+            // symbols' files (the wrong tree) is the same state, with its own
+            // reason. A stale span is a different cause and keeps its own
+            // diagnostic.
+            let wrong_tree = |res: &nestweaver_engine::read_symbols::ReadSymbolsResult| {
+                root.as_deref().filter(|_| {
+                    !res.symbols.is_empty()
+                        && res
+                            .symbols
+                            .iter()
+                            .all(|w| !w.body_available && !w.stale_span)
+                })
+            };
+
             if let Some(res) = daemon_result {
+                if let Some((root, reason)) = &root_problem
+                    && !res.symbols.is_empty()
+                {
+                    return render_read_symbols_unreadable_root(&res, json, root, reason);
+                }
+                if let Some(root) = wrong_tree(&res) {
+                    return render_read_symbols_unreadable_root(
+                        &res,
+                        json,
+                        root,
+                        NO_INDEXED_FILE_READABLE,
+                    );
+                }
                 return render_read_symbols(&res, json);
             }
 
@@ -20584,6 +20734,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     )
                 }
             };
+            if let Some((root, reason)) = &root_problem
+                && !res.symbols.is_empty()
+            {
+                return render_read_symbols_unreadable_root(&res, json, root, reason);
+            }
+            if let Some(root) = wrong_tree(&res) {
+                return render_read_symbols_unreadable_root(
+                    &res,
+                    json,
+                    root,
+                    NO_INDEXED_FILE_READABLE,
+                );
+            }
             render_read_symbols(&res, json)
         }
         Commands::Symbol {
@@ -25278,6 +25441,60 @@ fn read_symbols_window_text(w: &nestweaver_engine::read_symbols::SymbolWindow) -
     }
 }
 
+/// nw-706: the `unreadable_root` reason for a readable `--root` that holds
+/// none of the resolved symbols' files.
+const NO_INDEXED_FILE_READABLE: &str = "no indexed file readable under it";
+
+/// Why an explicit `read-symbols --root` cannot serve source, or `None` when
+/// it is a readable directory (nw-539).
+fn unreadable_root_reason(root: &Path) -> Option<String> {
+    match std::fs::metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Some("does not exist".to_string())
+        }
+        Err(error) => Some(format!("cannot be accessed ({error})")),
+        Ok(meta) if !meta.is_dir() => Some("is not a directory".to_string()),
+        Ok(_) => std::fs::read_dir(root)
+            .err()
+            .map(|error| format!("cannot be read ({error})")),
+    }
+}
+
+/// nw-539: the symbols resolved, but the `--root` they were to be read from
+/// cannot be. Exit 1 (valid invocation, state cannot satisfy it) with a named
+/// `unreadable_root` diagnostic, never exit 2, which means a target did not
+/// resolve.
+fn render_read_symbols_unreadable_root(
+    res: &nestweaver_engine::read_symbols::ReadSymbolsResult,
+    json: bool,
+    root: &Path,
+    reason: &str,
+) -> anyhow::Result<(i32, Option<String>)> {
+    let remedy = "pass a readable --root, or omit --root to read from each repo's recorded root";
+    if json {
+        let mut payload = serde_json::to_value(res)?;
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("error".into(), "unreadable_root".into());
+            obj.insert(
+                "unreadable_root".into(),
+                serde_json::json!({
+                    "path": root.display().to_string(),
+                    "reason": reason,
+                    "remedy": remedy,
+                }),
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    }
+    eprintln!(
+        "unreadable root: --root {}: {reason}; {} symbol(s) resolved but no source could be \
+         read from it — {remedy}",
+        root.display(),
+        res.symbols.len()
+    );
+    Ok((EXIT_ERROR, None))
+}
+
 /// Render a `read_symbols` result and compute its exit code.
 ///
 /// Shared by the daemon and direct paths so `--json` and the exit-code
@@ -25334,8 +25551,12 @@ fn render_read_symbols(
     // answered no part of the question asked, and exiting 0 made that
     // indistinguishable from success. A partial answer still succeeds — the
     // bodies that were read are real.
+    //
+    // nw-539/nw-706: exit 1, not 2. Owner policy (2026-09-27): exit 2 means a
+    // target did not RESOLVE; these all resolved, and it is the state of the
+    // source (unreadable, moved, stale) that cannot satisfy the read.
     if !res.symbols.is_empty() && res.symbols.iter().all(|w| !w.body_available) {
-        return Ok((EXIT_NOT_FOUND, None));
+        return Ok((EXIT_ERROR, None));
     }
     Ok((EXIT_SUCCESS, None))
 }
@@ -32175,8 +32396,8 @@ credential_method = "gh"
 
     /// nw-340. A read where NO requested symbol had a readable body is a
     /// failure the exit code must carry: the caller asked for source and
-    /// received none. Exit 2 ("not found") is the existing code for "the
-    /// question was not answered".
+    /// received none. Since nw-539/nw-706 that is exit 1: the targets
+    /// resolved, so exit 2 ("not found") would misstate the cause.
     #[test]
     fn a_read_where_no_body_was_readable_does_not_exit_success() {
         let unreadable = |name: &str| nestweaver_engine::read_symbols::SymbolWindow {
@@ -32197,8 +32418,10 @@ credential_method = "gh"
             ..Default::default()
         };
         let (code, _) = render_read_symbols(&res, false).unwrap();
+        // nw-539/nw-706: exit 1 (state), deliberately no longer exit 2, which
+        // is reserved for a target that did not resolve.
         assert_eq!(
-            code, EXIT_NOT_FOUND,
+            code, EXIT_ERROR,
             "every requested body was unreadable; exiting 0 reports success for \
              work that did not happen"
         );

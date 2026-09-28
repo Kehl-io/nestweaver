@@ -34,11 +34,47 @@ fn cancelled(state: &DaemonState) -> bool {
     state.shutdown_started.load(Ordering::SeqCst)
 }
 
+/// The data instance derivation records are stamped and validated with.
+///
+/// nw-693: the LIVE identity, never the boot snapshot. A config-less daemon
+/// that booted before the database recorded its instance snapshotted
+/// `"default"` and stamped records with it; after a restart it adopted the
+/// recorded instance and every record read as `ForeignRecord`.
+fn record_instance(state: &DaemonState) -> String {
+    state.effective_data_instance_id()
+}
+
+/// nw-693: heal records a config-less daemon stamped with the ambient
+/// `"default"` before the database recorded its instance. Called only on the
+/// WRITER paths (every stamp, demotion and migration, which a refresh runs
+/// through), never from a read, because it rewrites the sidecar. Only toward
+/// the instance the DATABASE carries; a `--config`-stated instance is intent
+/// and is never rebound.
+fn heal_ambient_default(
+    state: &DaemonState,
+    identity: &nestweaver_store::PublicationIdentity,
+) -> Result<(), RecordError> {
+    if state.instance_stated_by_config {
+        return Ok(());
+    }
+    // The database's own instance: its record, else the single instance its
+    // repos and vaults carry (`effective_data_instance_id`'s precedence).
+    let recorded = record_instance(state);
+    if markdown_derivation::rebind_ambient_default_records(&state.db_path, identity, &recorded)? {
+        tracing::info!(
+            instance = %recorded,
+            "re-bound Markdown derivation records stamped with the ambient default instance"
+        );
+    }
+    Ok(())
+}
+
 fn load_or_empty(
     state: &DaemonState,
     identity: &nestweaver_store::PublicationIdentity,
 ) -> Result<DerivationRecords, RecordError> {
-    let expected = expectation(identity, &state.data_instance_id);
+    let instance = record_instance(state);
+    let expected = expectation(identity, &instance);
     Ok(load_records(&state.db_path, &expected)?.unwrap_or_default())
 }
 
@@ -47,11 +83,8 @@ fn persist(
     identity: &nestweaver_store::PublicationIdentity,
     records: &DerivationRecords,
 ) -> Result<(), RecordError> {
-    save_records(
-        &state.db_path,
-        records,
-        &expectation(identity, &state.data_instance_id),
-    )
+    let instance = record_instance(state);
+    save_records(&state.db_path, records, &expectation(identity, &instance))
 }
 
 /// Reuse the recorded coverage scope so IndexVault's FullRegisteredPolicy is
@@ -163,6 +196,7 @@ fn stamp_from_refresh(
         scope,
     )?;
     let notes = state.store.list_notes(Some(&vault.uid))?;
+    heal_ambient_default(state, &identity)?;
     let mut records = load_or_empty(state, &identity)?;
     let mut record = records
         .vaults
@@ -289,6 +323,7 @@ fn withhold_for_coverage_gap(
         max_note_bytes,
         CoverageScope::FullRegisteredPolicy,
     )?;
+    heal_ambient_default(state, &identity)?;
     let mut records = load_or_empty(state, &identity)?;
     let mut record = records
         .vaults
@@ -324,6 +359,7 @@ fn migrate_vault(
     if nestweaver_schema::vault_uid(&vault.instance_id, &source.canonical_root) != vault.uid {
         anyhow::bail!("vault source identity does not match its UID");
     }
+    heal_ambient_default(state, &identity)?;
     let mut records = load_or_empty(state, &identity)?;
     let coverage = coverage_for_vault(
         vault,
@@ -417,10 +453,9 @@ pub(super) fn ensure_current(
         .publication_identity()?
         .ok_or_else(|| anyhow::anyhow!("graph publication identity is absent"))?;
     let source = filesystem_source(Path::new(&vault.root_path))?;
-    let records = load_records(
-        &state.db_path,
-        &expectation(&identity, &state.data_instance_id),
-    )?;
+    heal_ambient_default(state, &identity)?;
+    let instance = record_instance(state);
+    let records = load_records(&state.db_path, &expectation(&identity, &instance))?;
     let coverage = coverage_for_vault(
         &vault,
         &source,
@@ -431,7 +466,7 @@ pub(super) fn ensure_current(
     )?;
     match markdown_derivation::admit_vault(
         records.as_ref(),
-        &expectation(&identity, &state.data_instance_id),
+        &expectation(&identity, &instance),
         &vault,
         &source,
         &coverage,
@@ -447,8 +482,74 @@ pub(super) fn ensure_current(
                 CoverageScope::FullRegisteredPolicy,
             )
         }
-        Err(error) => Err(error.into()),
+        Err(error) => {
+            let blocked = records
+                .as_ref()
+                .and_then(|records| records.vaults.get(&vault.uid))
+                .filter(|record| record.phase == DerivationPhase::Blocked);
+            match blocked {
+                // The vault-specific remedy replaces the generic path-free
+                // one in `DerivationUnavailable`'s Display, so it is said once.
+                Some(record) => Err(anyhow::anyhow!(
+                    "Markdown link derivation is not current ({:?}): {}",
+                    error.reason,
+                    blocked_vault_remedy(state, &vault, record, now_unix_seconds())
+                )),
+                None => Err(error.into()),
+            }
+        }
     }
+}
+
+/// nw-694: what a refusal over a Blocked vault must say. The bare
+/// "Markdown link derivation is not current (SourceBlocked)" named neither the
+/// directory nor the way out, and the refusal repeats until the backoff
+/// expires even after the directory is fixed. It now names the vault, the
+/// directories that cannot be read NOW (one non-strict walk, only on this
+/// refusal path), when the automatic retry is due, and the remedy: a FULL
+/// refresh re-derives the vault at once, because IndexVault does not wait on
+/// the Blocked backoff.
+fn blocked_vault_remedy(
+    state: &DaemonState,
+    vault: &Vault,
+    record: &VaultDerivationRecord,
+    now_unix_seconds: u64,
+) -> String {
+    use nestweaver_engine::content_reader::{ContentReader, UNREADABLE_DIR_REASON};
+    let reader = nestweaver_engine::index_md::filesystem_vault_reader(
+        Path::new(&vault.root_path),
+        note_limits(state),
+    );
+    let unreadable: Vec<String> = match reader.list_files() {
+        Ok(_) => reader
+            .skipped_dirs()
+            .into_iter()
+            .filter(|dir| dir.reason == UNREADABLE_DIR_REASON)
+            .map(|dir| dir.path)
+            .collect(),
+        Err(error) => vec![format!("the vault root itself ({error})")],
+    };
+    let blocked_on = if unreadable.is_empty() {
+        "no directory is unreadable now".to_string()
+    } else {
+        format!("unreadable now: {}", unreadable.join(", "))
+    };
+    let retry = match record.retry_after_unix_seconds {
+        Some(at) if at > now_unix_seconds => format!(
+            "the automatic retry is due in {}s (unix time {at})",
+            at - now_unix_seconds
+        ),
+        _ => "the automatic retry is due now".to_string(),
+    };
+    format!(
+        "vault {} is blocked ({:?}; {blocked_on}); {retry}. To re-derive it now, fix the \
+         directory and run a full `nestweaver brain refresh {}` (without --since)",
+        vault.root_path,
+        record
+            .last_error
+            .unwrap_or(markdown_derivation::BlockedReason::SourceUnavailable),
+        vault.root_path,
+    )
 }
 
 pub(super) fn admit_tool(state: &DaemonState, tool: &str) -> Result<(), Status> {
@@ -464,7 +565,7 @@ pub(super) fn admit_tool(state: &DaemonState, tool: &str) -> Result<(), Status> 
     admit_all_vaults(
         &state.store,
         &state.db_path,
-        &state.data_instance_id,
+        &record_instance(state),
         &extra_ignore(state),
         note_limits(state).max_note_bytes(),
         state.read_only,
@@ -477,12 +578,10 @@ pub(super) fn status_overlay(state: &DaemonState, value: &mut serde_json::Value)
         Ok(Some(identity)) => identity,
         _ => return,
     };
-    let records = load_records(
-        &state.db_path,
-        &expectation(&identity, &state.data_instance_id),
-    )
-    .ok()
-    .flatten();
+    let instance = record_instance(state);
+    let records = load_records(&state.db_path, &expectation(&identity, &instance))
+        .ok()
+        .flatten();
     let Some(records) = records else {
         return;
     };
@@ -491,12 +590,28 @@ pub(super) fn status_overlay(state: &DaemonState, value: &mut serde_json::Value)
         .values()
         .filter(|record| record.phase != DerivationPhase::Current)
         .count();
+    // nw-694: name the Blocked vaults, so the text render can say a vault is
+    // blocked rather than leaving it to a JSON-only count.
+    let blocked: Vec<serde_json::Value> = records
+        .vaults
+        .values()
+        .filter(|record| record.phase == DerivationPhase::Blocked)
+        .map(|record| {
+            serde_json::json!({
+                "vault_uid": record.vault_uid,
+                "root_path": record.source.canonical_root,
+                "reason": record.last_error,
+                "retry_after_unix_seconds": record.retry_after_unix_seconds,
+            })
+        })
+        .collect();
     if let serde_json::Value::Object(object) = value {
         object.insert(
             "vault_derivation".to_string(),
             serde_json::json!({
                 "expected_version": markdown_derivation::DERIVATION_VERSION,
                 "pending_or_blocked_vaults": pending,
+                "blocked_vaults": blocked,
                 "read_only": state.read_only,
             }),
         );
@@ -552,6 +667,24 @@ pub(super) fn inspect_next(state: &DaemonState) -> anyhow::Result<Option<String>
         Some(identity) => identity,
         None => return Ok(None),
     };
+    // nw-693 review (M1): a sidecar an older daemon stamped with the ambient
+    // "default" failed this load with ForeignIdentity, which the loop dropped
+    // and retried every 2s forever. It is due: `migrate_named` heals it under
+    // the write lease, so an upgrade heals without a manual refresh.
+    if !state.instance_stated_by_config
+        && markdown_derivation::records_await_ambient_rebind(
+            &state.db_path,
+            &identity,
+            &record_instance(state),
+        )
+    {
+        return Ok(state
+            .store
+            .list_vaults(None)?
+            .into_iter()
+            .next()
+            .map(|vault| vault.uid));
+    }
     let records = load_or_empty(state, &identity)?;
     let extra = extra_ignore(state);
     let max_note_bytes = note_limits(state).max_note_bytes();
@@ -571,7 +704,7 @@ pub(super) fn inspect_next(state: &DaemonState) -> anyhow::Result<Option<String>
         };
         if markdown_derivation::admit_vault(
             Some(&records),
-            &expectation(&identity, &state.data_instance_id),
+            &expectation(&identity, &record_instance(state)),
             &vault,
             &source,
             &coverage,
@@ -599,6 +732,7 @@ pub(super) fn migrate_named(state: &DaemonState, vault_uid: &str) -> anyhow::Res
     let source = filesystem_source(Path::new(&vault.root_path))?;
     let extra = extra_ignore(state);
     let max_note_bytes = note_limits(state).max_note_bytes();
+    heal_ambient_default(state, &identity)?;
     let records = load_or_empty(state, &identity)?;
     let coverage = coverage_for_vault(
         &vault,
@@ -610,7 +744,7 @@ pub(super) fn migrate_named(state: &DaemonState, vault_uid: &str) -> anyhow::Res
     )?;
     match markdown_derivation::admit_vault(
         Some(&records),
-        &expectation(&identity, &state.data_instance_id),
+        &expectation(&identity, &record_instance(state)),
         &vault,
         &source,
         &coverage,
