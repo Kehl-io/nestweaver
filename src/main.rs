@@ -20610,7 +20610,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     None
                 };
 
+            // nw-539: a nonexistent or unreadable `--root` is STATE, not a
+            // missing target. It used to exit 2 with `not_found: []` because
+            // every found symbol's body was unavailable. Owner policy
+            // (2026-09-27): exit 1, with a named `unreadable_root` diagnostic;
+            // exit 2 stays for targets that did not resolve.
+            let root_problem = root
+                .as_deref()
+                .and_then(|root| unreadable_root_reason(root).map(|reason| (root, reason)));
+
             if let Some(res) = daemon_result {
+                if let Some((root, reason)) = &root_problem
+                    && !res.symbols.is_empty()
+                {
+                    return render_read_symbols_unreadable_root(&res, json, root, reason);
+                }
                 return render_read_symbols(&res, json);
             }
 
@@ -20647,6 +20661,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     )
                 }
             };
+            if let Some((root, reason)) = &root_problem
+                && !res.symbols.is_empty()
+            {
+                return render_read_symbols_unreadable_root(&res, json, root, reason);
+            }
             render_read_symbols(&res, json)
         }
         Commands::Symbol {
@@ -25339,6 +25358,56 @@ fn read_symbols_window_text(w: &nestweaver_engine::read_symbols::SymbolWindow) -
             w.path, w.start_line, w.end_line
         )
     }
+}
+
+/// Why an explicit `read-symbols --root` cannot serve source, or `None` when
+/// it is a readable directory (nw-539).
+fn unreadable_root_reason(root: &Path) -> Option<String> {
+    match std::fs::metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Some("does not exist".to_string())
+        }
+        Err(error) => Some(format!("cannot be accessed ({error})")),
+        Ok(meta) if !meta.is_dir() => Some("is not a directory".to_string()),
+        Ok(_) => std::fs::read_dir(root)
+            .err()
+            .map(|error| format!("cannot be read ({error})")),
+    }
+}
+
+/// nw-539: the symbols resolved, but the `--root` they were to be read from
+/// cannot be. Exit 1 (valid invocation, state cannot satisfy it) with a named
+/// `unreadable_root` diagnostic, never exit 2, which means a target did not
+/// resolve.
+fn render_read_symbols_unreadable_root(
+    res: &nestweaver_engine::read_symbols::ReadSymbolsResult,
+    json: bool,
+    root: &Path,
+    reason: &str,
+) -> anyhow::Result<(i32, Option<String>)> {
+    let remedy = "pass a readable --root, or omit --root to read from each repo's recorded root";
+    if json {
+        let mut payload = serde_json::to_value(res)?;
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("error".into(), "unreadable_root".into());
+            obj.insert(
+                "unreadable_root".into(),
+                serde_json::json!({
+                    "path": root.display().to_string(),
+                    "reason": reason,
+                    "remedy": remedy,
+                }),
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    }
+    eprintln!(
+        "unreadable root: --root {} {reason}; {} symbol(s) resolved but no source could be \
+         read from it — {remedy}",
+        root.display(),
+        res.symbols.len()
+    );
+    Ok((EXIT_ERROR, None))
 }
 
 /// Render a `read_symbols` result and compute its exit code.

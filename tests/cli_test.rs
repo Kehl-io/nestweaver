@@ -12708,3 +12708,82 @@ fn summary_target_over_a_tight_budget_returns_the_hit_and_flags_the_overrun() {
     assert_eq!(untargeted["returned"], 1, "{untargeted}");
     assert_eq!(untargeted["truncated_by_budget"], true, "{untargeted}");
 }
+
+/// nw-539: a found symbol with a nonexistent or unreadable `--root` exited 2
+/// (TARGET NOT FOUND) with `not_found: []`. It is state, not a missing target:
+/// exit 1 with a named `unreadable_root` diagnostic.
+#[test]
+fn read_symbols_unreadable_root_is_exit_1_not_a_missing_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "function nw539ReadTarget(name) { return name; }\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    let read = |target: &str, root: Option<&std::path::Path>| {
+        let mut cmd = nestweaver_cmd();
+        cmd.args(["read-symbols", target, "--json", "--db"])
+            .arg(&db_path)
+            .current_dir(dir.path());
+        if let Some(root) = root {
+            cmd.arg("--root").arg(root);
+        }
+        let output = cmd.output().unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or(serde_json::Value::Null);
+        (output.status.code(), payload, output)
+    };
+
+    let missing = dir.path().join("does-not-exist");
+    let (code, payload, output) = read("nw539ReadTarget", Some(&missing));
+    assert_eq!(
+        code,
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(payload["error"], "unreadable_root", "{payload}");
+    assert_eq!(
+        payload["unreadable_root"]["path"],
+        missing.display().to_string()
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(&missing.display().to_string()),
+        "stderr must name the root"
+    );
+
+    // Counterweight: an unresolved target is still exit 2, not_found populated.
+    let (code, payload, _) = read("nw539NoSuchSymbolXYZ", Some(&missing));
+    assert_eq!(code, Some(2), "{payload}");
+    assert_eq!(payload["not_found"][0], "nw539NoSuchSymbolXYZ", "{payload}");
+
+    // Counterweight: an omitted --root still reads from the recorded root.
+    let (code, payload, _) = read("nw539ReadTarget", None);
+    assert_eq!(code, Some(0), "{payload}");
+    assert_eq!(payload["symbols"][0]["body_available"], true, "{payload}");
+
+    // An existing but unreadable directory is the same state.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_err() {
+            let (code, payload, _) = read("nw539ReadTarget", Some(&locked));
+            assert_eq!(code, Some(1), "{payload}");
+            assert_eq!(payload["error"], "unreadable_root", "{payload}");
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
