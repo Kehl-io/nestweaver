@@ -1310,7 +1310,7 @@ async fn handle_mcp(
                 Ok(Ok(Err(e))) => json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "result": tools::wrap_tool_error(&e.to_string()),
+                    "result": tools::wrap_tool_failure(&e),
                 }),
                 Ok(Err(e)) => json!({
                     "jsonrpc": "2.0",

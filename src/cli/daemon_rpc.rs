@@ -840,7 +840,7 @@ pub(crate) fn dispatch_hybrid_mcp_request(
                     }),
                     Ok(Err(error)) => serde_json::json!({
                         "jsonrpc": "2.0", "id": id,
-                        "result": nestweaver_mcp::tools::wrap_tool_error(&error.to_string()),
+                        "result": nestweaver_mcp::tools::wrap_tool_failure(&error),
                     }),
                     Err(_) => serde_json::json!({
                         "jsonrpc": "2.0", "id": id,

@@ -4238,6 +4238,28 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     };
     let mut value = value;
 
+    // nw-557: a batch where NO target resolved in the graph is a failed
+    // lookup, reported with the shared not-found envelope keys so MCP flags
+    // it `isError: true`. A partial miss is a successful read that lists what
+    // it could not find in `not_found`. Resolution is checked against the
+    // graph, not read off `not_found`: the server-mode bare-clone reader also
+    // files targets there whose symbol exists but whose clone it cannot open,
+    // and that is unreadable source, not a missing target.
+    let is_empty = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+    };
+    if is_empty("symbols")
+        && is_empty("ambiguous")
+        && group_targets_by_repo(store, &targets).0.is_empty()
+    {
+        value["status"] = json!("not_found");
+        value["error"] = json!("not found");
+        value["targets"] = json!(targets);
+    }
+
     // If we're in server mode and the result has no symbols with bodies,
     // add a diagnostic note for AI agents.
     if is_server_mode() {
@@ -5229,12 +5251,215 @@ fn parse_string_array(args: &Value, key: &str) -> Option<Vec<String>> {
 /// both a human-readable text block (rendering the JSON) and the
 /// structured value via `structuredContent`, so clients can use either.
 pub fn wrap_tool_result(value: Value) -> Value {
+    // nw-557: a tool that reports its miss as data (`brain_impact`,
+    // `brain_memory_related`, `read_symbols` with every target missing) is
+    // the same failed lookup as one that raises `ToolTargetNotFound`.
+    let not_found = value.get("status").and_then(Value::as_str) == Some("not_found");
     let pretty = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
     json!({
         "content": [{ "type": "text", "text": pretty }],
         "structuredContent": value,
-        "isError": false,
+        "isError": not_found,
     })
+}
+
+/// A lookup-by-identifier tool could not find its target (nw-557).
+///
+/// Every lookup tool reports a miss through this one type, so MCP has ONE
+/// not-found contract: a tool result with `isError: true` whose text AND
+/// `structuredContent` are the CLI's JSON envelope
+/// `{status: "not_found", error: "not found", <target key>: <target>,
+/// message, did_you_mean?}`. That follows MCP 2025-11-25 (server/tools,
+/// "Error Handling"): a business-logic failure is an in-band tool error the
+/// model can correct, and `did_you_mean` gives it the retry.
+///
+/// `Display` is the tool's existing prose (`no symbol found: 'x'`, ...), so
+/// every CLI route that already classifies a miss by that text keeps working.
+/// Across gRPC the daemon carries the envelope in the status details and
+/// [`not_found_envelope`] recovers it on the far side.
+#[derive(Debug, Clone)]
+pub struct ToolTargetNotFound {
+    message: String,
+    envelope: Value,
+}
+
+impl ToolTargetNotFound {
+    /// The JSON envelope a client receives.
+    pub fn envelope(&self) -> &Value {
+        &self.envelope
+    }
+}
+
+impl std::fmt::Display for ToolTargetNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ToolTargetNotFound {}
+
+/// The metadata code (under `NW_ERROR_CODE_METADATA_KEY`) the daemon stamps
+/// on a status raised by [`ToolTargetNotFound`]; the envelope itself rides in
+/// the status details.
+pub const TOOL_TARGET_NOT_FOUND_CODE: &str = "tool-target-not-found";
+
+/// Build a [`ToolTargetNotFound`]. `did_you_mean` is omitted when empty, the
+/// nw-481 convention the CLI's envelope already follows.
+pub fn target_not_found(
+    message: impl Into<String>,
+    target_key: &str,
+    target: Value,
+    did_you_mean: &[String],
+) -> anyhow::Error {
+    let message = message.into();
+    let envelope = nestweaver_schema::responses::with_did_you_mean(
+        json!({
+            "status": "not_found",
+            "error": "not found",
+            target_key: target,
+            "message": message,
+        }),
+        did_you_mean,
+    );
+    ToolTargetNotFound { message, envelope }.into()
+}
+
+/// `did_you_mean` for a symbol-name miss: the shared nw-481 builder, scoped to
+/// what the caller may see. Best-effort: a lookup failure is logged and
+/// yields no suggestions, never a failed call.
+fn symbol_did_you_mean(
+    store: &GraphStore,
+    name: &str,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+    repo_uid: Option<&str>,
+) -> Vec<String> {
+    nestweaver_engine::did_you_mean::did_you_mean_candidates(store, name, |s| {
+        repo_is_visible(&s.repo_uid, visible) && repo_uid.is_none_or(|uid| s.repo_uid == uid)
+    })
+    .unwrap_or_else(|error| {
+        tracing::warn!("did_you_mean_candidates lookup failed for '{name}': {error:#}");
+        Vec::new()
+    })
+}
+
+/// `did_you_mean` for a note-title miss: up to
+/// [`nestweaver_engine::did_you_mean::DID_YOU_MEAN_LIMIT`] distinct titles
+/// containing the query, case-insensitively. Empty for a UID-shaped or blank
+/// query, like the symbol builder.
+fn note_did_you_mean(store: &GraphStore, title: &str) -> Vec<String> {
+    let needle = title.trim().to_lowercase();
+    if needle.is_empty() || needle.starts_with("note:") {
+        return Vec::new();
+    }
+    let notes = match store.list_notes(None) {
+        Ok(notes) => notes,
+        Err(error) => {
+            tracing::warn!("note did_you_mean lookup failed for '{title}': {error}");
+            return Vec::new();
+        }
+    };
+    let mut titles: Vec<String> = notes
+        .into_iter()
+        .map(|note| note.title)
+        .filter(|candidate| candidate.to_lowercase().contains(&needle))
+        .collect();
+    titles.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+    titles.dedup();
+    titles.truncate(nestweaver_engine::did_you_mean::DID_YOU_MEAN_LIMIT);
+    titles
+}
+
+/// nw-557: the engine reports "none of these seeds resolved" as prose (it has
+/// no dependency on this crate's type). Re-raise exactly that failure, and
+/// nothing else, as a [`ToolTargetNotFound`] keyed on `seeds`. The message,
+/// which carries the `nestweaver investigate` hint (nw-511), is kept whole.
+fn seeds_not_found(error: anyhow::Error, seeds: &[String], prefixes: &[&str]) -> anyhow::Error {
+    let matched = error
+        .chain()
+        .map(ToString::to_string)
+        .find(|message| prefixes.iter().any(|prefix| message.starts_with(prefix)));
+    match matched {
+        Some(message) => target_not_found(message, "seeds", json!(seeds), &[]),
+        None => error,
+    }
+}
+
+/// The engine's investigate-bundle miss, re-raised as a
+/// [`ToolTargetNotFound`] keyed on `bundle_id` (nw-557).
+fn bundle_not_found(error: anyhow::Error, bundle_id: &str) -> anyhow::Error {
+    let expected = format!("bundle '{bundle_id}' not found or expired");
+    if error.chain().any(|cause| cause.to_string() == expected) {
+        target_not_found(expected, "bundle_id", json!(bundle_id), &[])
+    } else {
+        error
+    }
+}
+
+/// `did_you_mean` for a project miss: names containing the query,
+/// case-insensitively, capped like the symbol builder (nw-557).
+fn project_did_you_mean(projects: &[nestweaver_schema::Project], query: &str) -> Vec<String> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = projects
+        .iter()
+        .map(|project| project.name.clone())
+        .filter(|name| name.to_lowercase().contains(&needle))
+        .collect();
+    names.sort();
+    names.dedup();
+    names.truncate(nestweaver_engine::did_you_mean::DID_YOU_MEAN_LIMIT);
+    names
+}
+
+/// Recover a [`ToolTargetNotFound`] envelope from `error`, in-process or from
+/// a daemon status's details (nw-557).
+pub fn not_found_envelope(error: &anyhow::Error) -> Option<Value> {
+    if let Some(found) = error.downcast_ref::<ToolTargetNotFound>() {
+        return Some(found.envelope.clone());
+    }
+    for cause in error.chain() {
+        if let Some(found) = cause.downcast_ref::<ToolTargetNotFound>() {
+            return Some(found.envelope.clone());
+        }
+        #[cfg(feature = "daemon")]
+        if let Some(status) = cause.downcast_ref::<tonic::Status>()
+            && let Some(envelope) = envelope_from_status_details(status.details())
+        {
+            return Some(envelope);
+        }
+    }
+    None
+}
+
+/// Parse a not-found envelope out of gRPC status details, if that is what
+/// they hold.
+pub fn envelope_from_status_details(details: &[u8]) -> Option<Value> {
+    if details.is_empty() {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(details).ok()?;
+    (value.get("status").and_then(Value::as_str) == Some("not_found")).then_some(value)
+}
+
+/// Wrap a not-found envelope as the one MCP miss contract.
+pub fn wrap_tool_not_found(envelope: Value) -> Value {
+    let pretty = serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| envelope.to_string());
+    json!({
+        "content": [{ "type": "text", "text": pretty }],
+        "structuredContent": envelope,
+        "isError": true,
+    })
+}
+
+/// Wrap a failed dispatch: a lookup miss becomes the not-found envelope,
+/// anything else the plain error text.
+pub fn wrap_tool_failure(error: &anyhow::Error) -> Value {
+    match not_found_envelope(error) {
+        Some(envelope) => wrap_tool_not_found(envelope),
+        None => wrap_tool_error(&error.to_string()),
+    }
 }
 
 /// Wrap an error as a tool-call result so the client receives a proper MCP
@@ -5527,7 +5752,14 @@ fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         &seeds,
         intent,
         Some(limit.saturating_add(1)),
-    )?;
+    )
+    .map_err(|error| {
+        seeds_not_found(
+            error,
+            &seeds,
+            &["No matching symbols found.", "No symbols found in file(s):"],
+        )
+    })?;
     let truncated = truncate_reporting(&mut result.connected, limit);
 
     let render = |node: &nestweaver_engine::ContextNode| {
@@ -5750,7 +5982,8 @@ fn tool_brain_context(
         intent,
         embed_model,
         cancel,
-    )?;
+    )
+    .map_err(|error| seeds_not_found(error, &seeds, &["No seeds resolved."]))?;
 
     // Feature F6 (per-path ranking priors) is a deliberate no-op here: the MCP
     // server holds no InstanceConfig at the call site (same as F8, which uses
@@ -7959,14 +8192,31 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         });
 
     let note = if let Some(uid) = args.get("uid").and_then(|v| v.as_str()) {
-        store
-            .lookup_note(uid)
-            .with_context(|| format!("failed to look up note with uid '{uid}'"))?
+        match store.lookup_note(uid) {
+            Ok(note) => note,
+            Err(nestweaver_store::StoreError::NotFound) => {
+                return Err(target_not_found(
+                    format!("failed to look up note with uid '{uid}': not found"),
+                    "uid",
+                    json!(uid),
+                    &[],
+                ));
+            }
+            Err(error) => {
+                return Err(anyhow!(error))
+                    .with_context(|| format!("failed to look up note with uid '{uid}'"));
+            }
+        }
     } else if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
         match resolve_note_by_title(store, title)? {
             StrictNoteResolve::Found(n) => *n,
             StrictNoteResolve::NotFound => {
-                return Err(anyhow!("no note found with title '{title}'"));
+                return Err(target_not_found(
+                    format!("no note found with title '{title}'"),
+                    "title",
+                    json!(title),
+                    &note_did_you_mean(store, title),
+                ));
             }
             StrictNoteResolve::Ambiguous(notes) => {
                 return Ok(notes_ambiguous_payload(title, &notes));
@@ -8261,12 +8511,30 @@ fn resolve_note_by_title_with(
 
 fn tool_backlinks(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
     let target_uid = if let Some(uid) = args.get("uid").and_then(|v| v.as_str()) {
-        uid.to_string()
+        // nw-557: a uid naming no note used to answer `backlinks: []`, the
+        // same as a real note nobody links to. It is a failed lookup.
+        match store.lookup_note(uid) {
+            Ok(_) => uid.to_string(),
+            Err(nestweaver_store::StoreError::NotFound) => {
+                return Err(target_not_found(
+                    format!("no note found with uid '{uid}'"),
+                    "uid",
+                    json!(uid),
+                    &[],
+                ));
+            }
+            Err(error) => return Err(anyhow!("lookup_note: {error}")),
+        }
     } else if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
         match resolve_note_by_title(store, title)? {
             StrictNoteResolve::Found(n) => n.uid,
             StrictNoteResolve::NotFound => {
-                return Err(anyhow!("no note found with title '{title}'"));
+                return Err(target_not_found(
+                    format!("no note found with title '{title}'"),
+                    "title",
+                    json!(title),
+                    &note_did_you_mean(store, title),
+                ));
             }
             StrictNoteResolve::Ambiguous(notes) => {
                 return Ok(notes_ambiguous_payload(title, &notes));
@@ -9539,7 +9807,12 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
             "'{target}' matches multiple sources. Use a UID to disambiguate."
         ));
     }
-    Err(anyhow!("no repo or vault matching '{target}' found"))
+    Err(target_not_found(
+        format!("no repo or vault matching '{target}' found"),
+        "target",
+        json!(target),
+        &[],
+    ))
 }
 
 // ── 6c. prune_stale ─────────────────────────────────────────────────────────
@@ -9839,12 +10112,22 @@ fn tool_cross_repo_contracts(
         match store.lookup_symbol(uid) {
             Ok(symbol) => {
                 if !repo_is_visible(&symbol.repo_uid, visible) {
-                    return Err(anyhow!("no symbol found: '{uid}'"));
+                    return Err(target_not_found(
+                        format!("no symbol found: '{uid}'"),
+                        "uid",
+                        json!(uid),
+                        &[],
+                    ));
                 }
                 symbol.uid
             }
             Err(nestweaver_store::StoreError::NotFound) => {
-                return Err(anyhow!("no symbol found: '{uid}'"));
+                return Err(target_not_found(
+                    format!("no symbol found: '{uid}'"),
+                    "uid",
+                    json!(uid),
+                    &[],
+                ));
             }
             Err(e) => return Err(anyhow!("lookup_symbol: {e}")),
         }
@@ -9867,7 +10150,12 @@ fn tool_cross_repo_contracts(
         match resolved {
             StrictNameResolve::Found(resolved) => resolved,
             StrictNameResolve::NotFound => {
-                return Err(anyhow!("no symbol found: '{name}'"));
+                return Err(target_not_found(
+                    format!("no symbol found: '{name}'"),
+                    "name",
+                    json!(name),
+                    &symbol_did_you_mean(store, name, visible, None),
+                ));
             }
             StrictNameResolve::Ambiguous(candidates) => {
                 return Ok(name_lookup_ambiguous_payload(name, name_repo, &candidates));
@@ -10073,7 +10361,7 @@ fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_brain_impact() -> Value {
     json!({
         "name": "brain_impact",
-        "description": "Trace reverse dependencies of a symbol to understand what might break if it changes. Returns confidence-weighted impact scores (0.0-1.0) decaying through the call graph.\n\nGuidelines:\n- Use BEFORE modifying a function, class, or interface\n- Results sorted by impact_score (highest risk first); type-aware resolution follows class hierarchies\n- Use response_format 'concise' for names only, 'detailed' for full metadata\n\nLimitations:\n- A bare `symbol` name resolves by EXACT match only, never substring/fuzzy -- a name `brain_search` finds hits for can still be not_found here; the not_found response carries a bounded `did_you_mean` list of the closest substring matches when any exist\n- For forward call chains use flow_trace; for file-level impact use detect_changes or blast_radius\n- For cross-repo impact use cross_repo_contracts\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
+        "description": "Trace reverse dependencies of a symbol to understand what might break if it changes. Returns confidence-weighted impact scores (0.0-1.0) decaying through the call graph.\n\nGuidelines:\n- Use BEFORE modifying a function, class, or interface\n- Results sorted by impact_score (highest risk first); type-aware resolution follows class hierarchies\n- Use response_format 'concise' for names only, 'detailed' for full metadata\n\nLimitations:\n- A bare `symbol` name resolves by EXACT match only, never substring/fuzzy -- a name `brain_search` finds hits for can still be not_found here; the not_found response (`isError: true`, like every lookup tool's miss) carries a bounded `did_you_mean` list of the closest substring matches when any exist\n- For forward call chains use flow_trace; for file-level impact use detect_changes or blast_radius\n- For cross-repo impact use cross_repo_contracts\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -10473,7 +10761,19 @@ fn tool_flow_trace(
     let resolved_uid = match resolve_symbol_strict(store, symbol, visible, repo_filter)? {
         StrictNameResolve::Found(uid) => uid,
         StrictNameResolve::NotFound => {
-            return Err(anyhow!("no symbol found: '{symbol}'"));
+            let repo_uid = repo_filter.filter(|s| !s.is_empty()).and_then(|selector| {
+                let mut repos = store.list_repos(None).unwrap_or_default();
+                repos.retain(|r| repo_is_visible(&r.uid, visible));
+                nestweaver_engine::resolve_repo_selector(&repos, selector)
+                    .ok()
+                    .map(|r| r.uid.clone())
+            });
+            return Err(target_not_found(
+                format!("no symbol found: '{symbol}'"),
+                "symbol",
+                json!(symbol),
+                &symbol_did_you_mean(store, symbol, visible, repo_uid.as_deref()),
+            ));
         }
         StrictNameResolve::Ambiguous(candidates) => {
             return Ok(name_lookup_ambiguous_payload(
@@ -10484,9 +10784,14 @@ fn tool_flow_trace(
         }
     };
 
-    let root = store
-        .lookup_symbol(&resolved_uid)
-        .map_err(|_| anyhow!("symbol '{symbol}' not found"))?;
+    let root = store.lookup_symbol(&resolved_uid).map_err(|_| {
+        target_not_found(
+            format!("symbol '{symbol}' not found"),
+            "symbol",
+            json!(symbol),
+            &[],
+        )
+    })?;
 
     // nw-403. A root in a repository this caller cannot see answers exactly as
     // an absent symbol does. Deliberately the SAME error string as the lookup
@@ -10494,7 +10799,12 @@ fn tool_flow_trace(
     // this tool into an existence oracle for the hidden repo, which is the
     // property `brain_impact`'s ambiguity handling already protects.
     if !repo_is_visible(&root.repo_uid, visible) {
-        return Err(anyhow!("symbol '{symbol}' not found"));
+        return Err(target_not_found(
+            format!("symbol '{symbol}' not found"),
+            "symbol",
+            json!(symbol),
+            &[],
+        ));
     }
 
     // nw-390: uids that must never be EXPANDED even when an edge reaches
@@ -12709,7 +13019,14 @@ fn tool_project_context(
             .map_err(|e| anyhow!("list_projects: {e}"))?;
         all.into_iter()
             .find(|p| p.uid == project_str || p.uid.contains(project_str))
-            .ok_or_else(|| anyhow!("project UID '{}' not found", project_str))?
+            .ok_or_else(|| {
+                target_not_found(
+                    format!("project UID '{project_str}' not found"),
+                    "project",
+                    json!(project_str),
+                    &[],
+                )
+            })?
     } else {
         // Try name match first.
         match store
@@ -12741,9 +13058,17 @@ fn tool_project_context(
                     p.clone()
                 } else {
                     // Fall back to UID substring match.
+                    let suggestions = project_did_you_mean(&all, project_str);
                     all.into_iter()
                         .find(|p| p.uid.contains(project_str))
-                        .ok_or_else(|| anyhow!("project '{}' not found", project_str))?
+                        .ok_or_else(|| {
+                            target_not_found(
+                                format!("project '{project_str}' not found"),
+                                "project",
+                                json!(project_str),
+                                &suggestions,
+                            )
+                        })?
                 }
             }
         }
@@ -15355,6 +15680,14 @@ fn daemon_brain_search_response_to_json(
 #[cfg(feature = "daemon")]
 fn grpc_status_err(status: tonic::Status) -> anyhow::Error {
     let message = status.message();
+    // nw-557: a daemon-side lookup miss carries its envelope in the details.
+    if let Some(envelope) = envelope_from_status_details(status.details()) {
+        return ToolTargetNotFound {
+            message: message.to_string(),
+            envelope,
+        }
+        .into();
+    }
     if message.starts_with("tool ") || message.contains(" query cancelled:") {
         anyhow::anyhow!("{message}")
     } else {
@@ -15515,8 +15848,11 @@ fn dispatch_via_daemon_inner(
             })));
         }
 
-        return Err(anyhow::anyhow!(
-            "no repo or vault matching '{target}' found"
+        return Err(target_not_found(
+            format!("no repo or vault matching '{target}' found"),
+            "target",
+            json!(target),
+            &[],
         ));
     }
 
@@ -16445,7 +16781,8 @@ fn tool_investigate_expand(store: &GraphStore, args: Value) -> Result<Value, any
     }
     let root = arg_root_opt(&args);
     let db_path = current_db_path(store)?;
-    let result = investigate_expand(store, &db_path, root.as_deref(), bundle_id, &targets)?;
+    let result = investigate_expand(store, &db_path, root.as_deref(), bundle_id, &targets)
+        .map_err(|error| bundle_not_found(error, bundle_id))?;
     Ok(serde_json::to_value(result)?)
 }
 
@@ -16484,7 +16821,8 @@ fn tool_investigate_hydrate(store: &GraphStore, args: Value) -> Result<Value, an
         .map(|n| n as usize);
     let root = arg_root_opt(&args);
     let db_path = current_db_path(store)?;
-    let result = investigate_hydrate(store, &db_path, root.as_deref(), bundle_id, token_budget)?;
+    let result = investigate_hydrate(store, &db_path, root.as_deref(), bundle_id, token_budget)
+        .map_err(|error| bundle_not_found(error, bundle_id))?;
     Ok(serde_json::to_value(result)?)
 }
 
@@ -27868,5 +28206,248 @@ mod nw674_project_context_tests {
         );
         let complete = context_for(&store, "complete");
         assert!(complete.get("repo_issues").is_none(), "{complete}");
+    }
+}
+
+#[cfg(test)]
+mod lookup_not_found_contract_tests {
+    use super::*;
+    use nestweaver_schema::{Note, NoteKind, Project, Repo, Symbol, SymbolKind, Vault, Visibility};
+
+    fn fixture() -> (GraphStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        set_current_db_path(dir.path().join("test.lbug"));
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&Repo {
+                uid: "repo:r".into(),
+                url: "https://example.test/r".into(),
+                indexed_sha: String::new(),
+                staleness_commits_behind: 0,
+                instance_id: "default".into(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        store
+            .insert_symbol(&Symbol {
+                uid: "sym:r:alpha_fn".into(),
+                name: "alpha_fn".into(),
+                kind: SymbolKind::Function,
+                repo_uid: "repo:r".into(),
+                file_path: "src/lib.rs".into(),
+                start_line: 1,
+                end_line: 2,
+                signature: "fn alpha_fn()".into(),
+                summary: None,
+                content_hash: "h".into(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: Visibility::Inferred,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:v".into(),
+                name: "v".into(),
+                root_path: "/v".into(),
+                instance_id: "default".into(),
+            })
+            .unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:alpha".into(),
+                vault_uid: "vlt:v".into(),
+                file_path: "Alpha Doc.md".into(),
+                title: "Alpha Doc".into(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: "n".into(),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_project(&Project {
+                uid: "proj:alpha".into(),
+                name: "Alpha".into(),
+                summary: None,
+                instance_id: "default".into(),
+            })
+            .unwrap();
+        (store, dir)
+    }
+
+    /// What an MCP client receives for this call, on every transport.
+    fn mcp_result(store: &GraphStore, tool: &str, args: Value) -> Value {
+        match dispatch(store, None, tool, args, None) {
+            Ok(value) => wrap_tool_result(value),
+            Err(error) => wrap_tool_failure(&error),
+        }
+    }
+
+    /// nw-557. ONE not-found contract for every lookup-by-identifier tool:
+    /// `isError: true`, and the CLI's JSON envelope (`status: "not_found"`,
+    /// `error: "not found"`) in BOTH the text content and
+    /// `structuredContent`. It used to be three: `brain_impact` answered
+    /// `isError: false` with JSON, `flow_trace`/`note_get`/`backlinks`/
+    /// `project_context` `isError: true` with prose, and a `backlinks` uid
+    /// miss answered success with an empty list.
+    #[test]
+    fn every_lookup_tool_reports_a_miss_with_one_envelope() {
+        let (store, _dir) = fixture();
+        let misses: &[(&str, Value, &str)] = &[
+            ("note_get", json!({ "title": "Nope Nothing" }), "title"),
+            ("note_get", json!({ "uid": "note:nope" }), "uid"),
+            ("backlinks", json!({ "title": "Nope Nothing" }), "title"),
+            ("backlinks", json!({ "uid": "note:nope" }), "uid"),
+            ("flow_trace", json!({ "symbol": "alpha" }), "symbol"),
+            ("brain_impact", json!({ "symbol": "alpha" }), "symbol"),
+            ("cross_repo_contracts", json!({ "name": "alpha" }), "name"),
+            (
+                "cross_repo_contracts",
+                json!({ "uid": "sym:r:nope" }),
+                "uid",
+            ),
+            ("project_context", json!({ "project": "Zeta" }), "project"),
+            (
+                "read_symbols",
+                json!({ "targets": ["nope_xyz_q"] }),
+                "targets",
+            ),
+            (
+                "brain_context",
+                json!({ "seeds": ["zzzNoSuchSeedQQ"] }),
+                "seeds",
+            ),
+            (
+                "code_context",
+                json!({ "seeds": ["zzzNoSuchSeedQQ"] }),
+                "seeds",
+            ),
+            ("brain_memory_related", json!({ "uid": "note:nope" }), "uid"),
+            (
+                "investigate_expand",
+                json!({ "bundle_id": "missing-bundle", "targets": ["x"] }),
+                "bundle_id",
+            ),
+            (
+                "investigate_hydrate",
+                json!({ "bundle_id": "missing-bundle" }),
+                "bundle_id",
+            ),
+        ];
+        for (tool, args, key) in misses {
+            let result = mcp_result(&store, tool, args.clone());
+            assert_eq!(result["isError"], json!(true), "{tool} {args}: {result}");
+            let structured = &result["structuredContent"];
+            assert_eq!(
+                structured["status"],
+                json!("not_found"),
+                "{tool} {args}: {result}"
+            );
+            assert_eq!(structured["error"], json!("not found"), "{tool}: {result}");
+            assert!(
+                structured.get(*key).is_some(),
+                "{tool} must echo '{key}': {result}"
+            );
+            let text: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap())
+                .unwrap_or_else(|e| {
+                    panic!("{tool}: text must be the JSON envelope ({e}): {result}")
+                });
+            assert_eq!(
+                &text, structured,
+                "{tool}: text and structuredContent must agree"
+            );
+        }
+    }
+
+    /// The retry hint rides along where a close name exists.
+    #[test]
+    fn symbol_note_and_project_misses_carry_did_you_mean() {
+        let (store, _dir) = fixture();
+        for (tool, args, expected) in [
+            ("flow_trace", json!({ "symbol": "alpha" }), "alpha_fn"),
+            (
+                "cross_repo_contracts",
+                json!({ "name": "alpha" }),
+                "alpha_fn",
+            ),
+            ("note_get", json!({ "title": "Alpha" }), "Alpha Doc"),
+            ("backlinks", json!({ "title": "Alpha" }), "Alpha Doc"),
+            ("project_context", json!({ "project": "Alph" }), "Alpha"),
+        ] {
+            let result = mcp_result(&store, tool, args.clone());
+            let suggestions = &result["structuredContent"]["did_you_mean"];
+            assert!(
+                suggestions
+                    .as_array()
+                    .is_some_and(|names| names.iter().any(|n| n == expected)),
+                "{tool} {args}: {result}"
+            );
+        }
+    }
+
+    /// COUNTERWEIGHT: a found target stays `isError: false`, and a search or
+    /// query tool that runs and matches nothing is not a miss.
+    #[test]
+    fn a_found_target_or_an_empty_search_stays_a_success() {
+        let (store, _dir) = fixture();
+        for (tool, args) in [
+            ("note_get", json!({ "title": "Alpha Doc" })),
+            ("note_get", json!({ "uid": "note:alpha" })),
+            ("backlinks", json!({ "uid": "note:alpha" })),
+            ("backlinks", json!({ "title": "Alpha Doc" })),
+            ("flow_trace", json!({ "symbol": "alpha_fn" })),
+            ("brain_impact", json!({ "symbol": "alpha_fn" })),
+            ("cross_repo_contracts", json!({ "name": "alpha_fn" })),
+            ("project_context", json!({ "project": "Alpha" })),
+            ("read_symbols", json!({ "targets": ["alpha_fn"] })),
+            (
+                "read_symbols",
+                json!({ "targets": ["alpha_fn", "nope_xyz_q"] }),
+            ),
+            ("code_context", json!({ "seeds": ["alpha_fn"] })),
+            ("brain_memory_related", json!({ "uid": "note:alpha" })),
+            ("brain_search", json!({ "query": "zzzNoSuchTermQQ" })),
+            ("regex_search", json!({ "pattern": "zzzNoSuchTermQQ" })),
+        ] {
+            let result = mcp_result(&store, tool, args.clone());
+            assert_eq!(result["isError"], json!(false), "{tool} {args}: {result}");
+        }
+    }
+
+    /// The daemon carries the envelope across gRPC in the status details, so
+    /// an MCP client behind the daemon proxy (`grpc_status_err`) or the hybrid
+    /// client (a `tonic::Status` in the chain) gets the same result.
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn the_envelope_survives_a_grpc_status() {
+        let error = target_not_found("no symbol found: 'x'", "symbol", json!("x"), &[]);
+        let envelope = not_found_envelope(&error).unwrap();
+        let status = tonic::Status::with_details(
+            tonic::Code::Internal,
+            "tool flow_trace failed: no symbol found: 'x'",
+            serde_json::to_vec(&envelope).unwrap().into(),
+        );
+        let proxied = grpc_status_err(status.clone());
+        assert_eq!(
+            proxied.to_string(),
+            "tool flow_trace failed: no symbol found: 'x'",
+            "the prose the CLI classifies must be unchanged"
+        );
+        assert_eq!(wrap_tool_failure(&proxied)["structuredContent"], envelope);
+        let hybrid = anyhow::Error::new(status).context("daemon call");
+        assert_eq!(wrap_tool_failure(&hybrid)["isError"], json!(true));
+        assert_eq!(wrap_tool_failure(&hybrid)["structuredContent"], envelope);
     }
 }
