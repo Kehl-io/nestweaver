@@ -3230,10 +3230,6 @@ timeout = "15s"
     std::fs::write(path, toml).expect("write instance.toml");
 }
 
-/// The daemon IS the federated coordinator at its `/mcp` boundary (ADR
-/// Decision 2): a raw MCP client POSTing a two-tier-routed tool to a daemon
-/// configured with an `[[upstream]]` gets a `{ local_impact, org_wide_impact }`
-/// envelope plus federated provenance — no client-side `HybridClient` involved.
 /// nw-557 F1: `brain_impact` is TwoTier-routed, so behind a daemon with a
 /// healthy upstream a miss is nested as `local_impact.status`. A symbol NEITHER
 /// tier knows must still be `isError: true` with the not-found envelope at the
@@ -3313,6 +3309,10 @@ async fn daemon_mcp_boundary_two_tier_impact_miss_is_an_error() {
     assert!(structured["message"].is_string(), "{miss}");
 }
 
+/// The daemon IS the federated coordinator at its `/mcp` boundary (ADR
+/// Decision 2): a raw MCP client POSTing a two-tier-routed tool to a daemon
+/// configured with an `[[upstream]]` gets a `{ local_impact, org_wide_impact }`
+/// envelope plus federated provenance — no client-side `HybridClient` involved.
 #[tokio::test]
 async fn daemon_mcp_boundary_federates_two_tier() {
     let dir = tempfile::tempdir().unwrap();
