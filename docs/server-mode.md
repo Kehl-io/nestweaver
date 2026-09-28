@@ -321,7 +321,25 @@ Core method parameters are validated separately from tool arguments.
 `clientInfo` with string `name` and `version`. `ping` and `tools/list` accept
 omitted or null parameters; when present, parameters must be an object.
 `tools/list.cursor` must be a string. Client `_meta` objects are accepted.
-Malformed method parameters return `-32602`.
+Malformed method parameters return `-32602`, and so does a `tools/call` whose
+`name` is missing or is not a registered tool (`Unknown tool: <name>`).
+Arguments that fail a tool's schema are not a protocol error: they return a
+tool result with `isError: true` and the schema message, as the MCP
+specification (2025-11-25) requires for input-validation errors, so a client
+model can read the message and correct the call.
+
+A lookup tool whose target does not exist (`note_get`, `backlinks`,
+`flow_trace`, `brain_impact`, `cross_repo_contracts`, `project_context`,
+`brain_context`/`code_context` seeds, `read_symbols` when no target resolves,
+`brain_memory_related`, `investigate_expand`/`investigate_hydrate` bundles,
+`brain_diff` repo, `clusters` `cluster_id`, `brain_remove_source`) returns a tool result with `isError: true`. Its text
+and `structuredContent` are the same JSON envelope the CLI prints with exit 2:
+`{"status": "not_found", "error": "not found", <target key>, "message",
+"did_you_mean"?}`. `did_you_mean` appears when close names exist. A search or
+query tool that runs and matches nothing is not an error: it returns
+`isError: false` with empty results. Behind a daemon with an upstream, a
+two-tier `brain_impact` result carries the envelope at its top level when
+neither tier found the symbol (or the upstream was unavailable).
 
 Send `notifications/cancelled` with `params.requestId` to cancel an in-flight
 request. Stdio continues reading cancellation and ping frames while tool work

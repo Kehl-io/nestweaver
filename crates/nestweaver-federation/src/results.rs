@@ -429,6 +429,19 @@ pub fn merge_json_results(local: &Value, server: &Value) -> Value {
         response["engine_warnings"] = serde_json::json!(warnings);
     }
 
+    // nw-557 F2: `wrap_merged_response` rebuilds the envelope, which dropped
+    // a lookup miss's `status`/`error`. When BOTH tiers missed (a clean local
+    // miss sent to the upstream as "sparse"), the merged answer is still a
+    // miss and must say so; when either tier found something it is not.
+    let is_miss = |value: &Value| value.get("status").and_then(Value::as_str) == Some("not_found");
+    if is_miss(local) && is_miss(server) {
+        for key in ["status", "error", "message", "did_you_mean", "targets"] {
+            if let Some(value) = local.get(key).or_else(|| server.get(key)) {
+                response[key] = value.clone();
+            }
+        }
+    }
+
     response
 }
 
@@ -1312,6 +1325,26 @@ mod tests {
     }
 
     // ── Merge helpers test ────────────────────────────────────────
+
+    /// nw-557 F2: an all-miss `read_symbols` sent upstream because local was
+    /// "sparse" keeps its not-found envelope when the upstream missed too.
+    /// Counterweight: an upstream hit is a found answer, with no status.
+    #[test]
+    fn merge_json_results_carries_a_miss_on_both_tiers() {
+        let miss = json!({
+            "status": "not_found", "error": "not found",
+            "message": "no symbol found for any of 1 target(s): nope",
+            "targets": ["nope"], "symbols": [], "not_found": ["nope"]
+        });
+        let merged = merge_json_results(&miss, &miss);
+        assert_eq!(merged["status"], "not_found", "{merged}");
+        assert_eq!(merged["error"], "not found");
+        assert_eq!(merged["message"], miss["message"]);
+
+        let hit = json!({"symbols": [{"uid": "sym:x", "name": "nope"}], "not_found": []});
+        let merged = merge_json_results(&miss, &hit);
+        assert!(merged.get("status").is_none(), "{merged}");
+    }
 
     #[test]
     fn merge_json_results_deduplicates() {

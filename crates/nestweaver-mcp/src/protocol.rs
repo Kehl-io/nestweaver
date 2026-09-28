@@ -170,6 +170,17 @@ pub fn validate_method_params(req: &Request) -> Result<(), String> {
             if !nonempty_string(get("name")) {
                 return Err("tools/call: 'name' must be a nonempty string".into());
             }
+            // nw-576: an unknown tool name is a protocol error (MCP
+            // 2025-11-25, server/tools "Error Handling"), reported as -32602
+            // exactly like a missing name. It used to be a tool result with
+            // `isError: true`, a second contract for the same malformed call.
+            // Only names absent from the registry land here; a registered tool
+            // hidden by `--tools`/`--lite` keeps its descriptive tool error.
+            if let Some(name) = get("name").and_then(Value::as_str)
+                && !crate::tools::is_registered_tool(name)
+            {
+                return Err(crate::tools::unknown_tool_message(name));
+            }
             if get("arguments").is_some_and(|value| !value.is_object()) {
                 return Err("tools/call: 'arguments' must be an object".into());
             }

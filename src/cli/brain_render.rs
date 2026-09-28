@@ -198,8 +198,8 @@ pub(crate) fn render_cost_tokens(n: &nestweaver_engine::BrainNode, concise: bool
 /// an MCP tool, where that is a context-window bomb rather than an answer. The
 /// MCP tool already truncated member lists at 20; the CLI did not.
 ///
-/// Truncation is reported rather than silent: `total_communities` vs
-/// `returned_communities`, and a per-community `returned_members`, so a caller
+/// Truncation is reported rather than silent: `total` vs `returned`
+/// (`clusters` array, nw-559 names), and a per-cluster `returned_members`, so a caller
 /// can tell a small graph from a truncated view. `0` means unlimited for both
 /// bounds, so the previous full output is still reachable.
 /// `graph_generation`/`cached` are nw-646's cache-identity disclosure: before
@@ -216,39 +216,9 @@ pub(crate) fn bounded_clusters_payload(
     graph_generation: Option<u64>,
     cached: bool,
 ) -> serde_json::Value {
-    let total = output.communities.len();
-    let take = if limit == 0 { total } else { limit.min(total) };
-    let communities: Vec<serde_json::Value> = output.communities[..take]
-        .iter()
-        .map(|community| {
-            let member_total = community.members.len();
-            let member_take = if members == 0 {
-                member_total
-            } else {
-                members.min(member_total)
-            };
-            serde_json::json!({
-                "id": community.id,
-                "name": community.name,
-                "cohesion": community.cohesion,
-                "member_count": community.member_count,
-                "members": &community.members[..member_take],
-                "returned_members": member_take,
-                "members_truncated": member_take < member_total,
-                "key_files": community.key_files,
-            })
-        })
-        .collect();
-    serde_json::json!({
-        "resolution": output.resolution,
-        "modularity": output.modularity,
-        "communities": communities,
-        "total_communities": total,
-        "returned_communities": take,
-        "truncated": take < total,
-        "graph_generation": graph_generation,
-        "cached": cached,
-    })
+    // nw-559: the MCP `clusters` envelope, built by the same function, so
+    // `clusters --json` and the tool cannot drift on key names again.
+    nestweaver_mcp::tools::clusters_payload(output, limit, members, graph_generation, cached, None)
 }
 
 /// Render the text form of a clustering result, bounded to `limit`.
@@ -1373,4 +1343,201 @@ pub(crate) fn publication_from_wire(
                 .unwrap_or(false),
         },
     )
+}
+
+/// `brain doc-stats`'s text rendering, shared by the daemon and direct routes.
+///
+/// nw-554. The two unresolved-link counts are ONE population of broken links
+/// deduplicated two ways (nw-345): distinct (note, target) and distinct
+/// (section, target). Printed as two "unresolved links" lines, one missing
+/// `[[Note]]` read as a note-level miss AND a section-level miss. They are now
+/// one line: the vault-health number, then the finer per-section count in
+/// parentheses. The JSON keys and their meanings are unchanged.
+pub(crate) fn doc_stats_text_lines(stats: &nestweaver_engine::DocStats) -> Vec<String> {
+    let mut lines = vec![
+        "Document graph stats:".to_string(),
+        format!("  total notes:      {}", stats.total_notes),
+        format!(
+            "  wikilink edges:                        {}",
+            stats.wikilink_edges
+        ),
+        format!(
+            "  unresolved links:                      {} (distinct note + target; {} counted per source section)",
+            stats.unresolved_link_targets, stats.unresolved_link_section_targets
+        ),
+        format!(
+            "  low-confidence (resolved, not broken): {}",
+            stats.low_confidence_link_targets
+        ),
+        format!("  orphans:          {}", stats.orphans),
+        format!("  avg out-degree:   {:.2}", stats.avg_outdegree),
+    ];
+    if !stats.top_tags.is_empty() {
+        lines.push("  top tags:".to_string());
+        for t in &stats.top_tags {
+            lines.push(format!("    #{} ({})", t.tag, t.count));
+        }
+    }
+    if !stats.notes_by_year.is_empty() {
+        let mut years: Vec<(&String, &usize)> = stats.notes_by_year.iter().collect();
+        years.sort_by(|a, b| a.0.cmp(b.0));
+        lines.push("  notes by year:".to_string());
+        for (year, count) in years {
+            lines.push(format!("    {year}: {count}"));
+        }
+    }
+    lines
+}
+
+#[cfg(test)]
+mod doc_stats_text_tests {
+    use super::doc_stats_text_lines;
+
+    fn stats(targets: usize, section_targets: usize) -> nestweaver_engine::DocStats {
+        serde_json::from_value(serde_json::json!({
+            "total_notes": 1,
+            "wikilink_edges": 0,
+            "unresolved_link_targets": targets,
+            "unresolved_link_section_targets": section_targets,
+            "low_confidence_link_targets": 0,
+            "orphans": 0,
+            "avg_outdegree": 0.0,
+            "top_tags": [],
+            "notes_by_year": {},
+        }))
+        .unwrap()
+    }
+
+    /// nw-554. One missing `[[Note]]` is one broken link. The text must not
+    /// list it under two "unresolved" headings as if a note-level miss and a
+    /// section-level miss both happened.
+    #[test]
+    fn one_missing_note_link_is_reported_once() {
+        let lines = doc_stats_text_lines(&stats(1, 1));
+        let unresolved: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("unresolved"))
+            .collect();
+        assert_eq!(unresolved.len(), 1, "{lines:#?}");
+        assert!(
+            unresolved[0].contains("unresolved links:                      1 "),
+            "{lines:#?}"
+        );
+    }
+
+    /// Counterweight: when the per-section count genuinely differs (the same
+    /// target linked from two sections of one note), both numbers still show.
+    #[test]
+    fn a_differing_per_section_count_is_still_shown() {
+        let lines = doc_stats_text_lines(&stats(2, 3));
+        let line = lines
+            .iter()
+            .find(|line| line.contains("unresolved links"))
+            .unwrap();
+        assert!(
+            line.contains(" 2 (") && line.contains("3 counted per source section"),
+            "{line}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod clusters_envelope_parity_tests {
+    use super::bounded_clusters_payload;
+    use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+    use nestweaver_store::GraphStore;
+    use std::collections::BTreeSet;
+
+    fn store() -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["a0", "a1", "b0", "b1"] {
+            store
+                .insert_symbol(&Symbol {
+                    uid: uid.to_string(),
+                    name: uid.to_string(),
+                    kind: SymbolKind::Function,
+                    repo_uid: "repo:x".to_string(),
+                    file_path: format!("src/{uid}.rs"),
+                    start_line: 1,
+                    end_line: 1,
+                    signature: format!("fn {uid}()"),
+                    summary: None,
+                    content_hash: format!("h_{uid}"),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Inferred,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+        }
+        for (src, dst) in [("a0", "a1"), ("a1", "a0"), ("b0", "b1"), ("b1", "b0")] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: src.to_string(),
+                    target_uid: dst.to_string(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 1.0,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+        store
+    }
+
+    fn keys(value: &serde_json::Value) -> BTreeSet<String> {
+        value
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| !key.starts_with('_'))
+            .cloned()
+            .collect()
+    }
+
+    /// nw-559. `clusters --json` and MCP `clusters` named the same data
+    /// differently (`communities`/`total_communities`/`returned_communities`/
+    /// `member_count` against `clusters`/`total`/`returned`/`size`). One
+    /// envelope now: the same top-level and per-cluster keys on both surfaces.
+    /// Counterweight: the member populations are still the same.
+    #[test]
+    fn cli_clusters_json_uses_the_mcp_clusters_envelope() {
+        let store = store();
+        let output = nestweaver_engine::compute_clusters(&store, 1.0).unwrap();
+        let cli = bounded_clusters_payload(&output, 0, 0, Some(store.graph_generation()), false);
+        let mcp = nestweaver_mcp::tools::dispatch(
+            &store,
+            None,
+            "clusters",
+            serde_json::json!({ "limit": 0, "members": 0, "resolution": 1.0 }),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(keys(&cli), keys(&mcp), "cli: {cli}\nmcp: {mcp}");
+        let cli_clusters = cli["clusters"].as_array().expect("cli clusters array");
+        let mcp_clusters = mcp["clusters"].as_array().expect("mcp clusters array");
+        assert!(!cli_clusters.is_empty());
+        assert_eq!(cli_clusters.len(), mcp_clusters.len());
+        for (c, m) in cli_clusters.iter().zip(mcp_clusters) {
+            assert_eq!(keys(c), keys(m));
+            assert_eq!(c["size"], m["size"]);
+        }
+        let members = |clusters: &[serde_json::Value]| -> BTreeSet<String> {
+            clusters
+                .iter()
+                .flat_map(|c| c["members"].as_array().unwrap().clone())
+                .map(|m| m["uid"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(members(cli_clusters), members(mcp_clusters));
+        assert_eq!(members(cli_clusters).len(), 4);
+        for key in ["cluster_count", "total", "returned", "truncated"] {
+            assert_eq!(cli[key], mcp[key], "{key}");
+        }
+    }
 }

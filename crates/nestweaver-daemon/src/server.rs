@@ -128,6 +128,33 @@ fn dispatch_err_to_status(tool_name: &str, e: anyhow::Error) -> Status {
         );
     }
 
+    // nw-557: a lookup miss keeps its gRPC code and message (the CLI
+    // classifies both) and carries the MCP not-found envelope in the status
+    // details, so an MCP client behind the daemon proxy or the hybrid client
+    // gets the same `isError: true` envelope as one served in-process.
+    if let Some(envelope) = nestweaver_mcp::tools::lookup_miss_envelope(tool_name, &e) {
+        let mut with_details = Status::with_details(
+            status.code(),
+            status.message().to_string(),
+            serde_json::to_vec(&envelope).unwrap_or_default().into(),
+        );
+        *with_details.metadata_mut() = status.metadata().clone();
+        // A typed code already stamped (e.g. `repo-filter-unresolved`, which
+        // the CLI keys its exit 2 on) wins; the envelope rides in the details.
+        if !with_details
+            .metadata()
+            .contains_key(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
+            && let Ok(value) =
+                nestweaver_mcp::tools::TOOL_TARGET_NOT_FOUND_CODE.parse::<MetadataValue<_>>()
+        {
+            with_details.metadata_mut().insert(
+                nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY,
+                value,
+            );
+        }
+        return with_details;
+    }
+
     status
 }
 
@@ -294,6 +321,74 @@ mod dispatch_err_to_status_tests {
     fn a_genuine_failure_stays_internal() {
         let status = dispatch_err_to_status("read_symbols", anyhow::anyhow!("disk I/O error"));
         assert_eq!(status.code(), tonic::Code::Internal);
+        assert!(
+            status.details().is_empty(),
+            "a plain failure carries no envelope"
+        );
+    }
+
+    /// nw-557 F3: `brain_diff`'s unknown `repo` is its lookup miss. The
+    /// status keeps `repo-filter-unresolved` (the code the CLI's exit 2 keys
+    /// on) and carries the MCP envelope in its details. Counterweight: the
+    /// same error from a tool whose `repo` is only a filter gets no envelope.
+    #[test]
+    fn brain_diff_unknown_repo_carries_the_envelope_and_keeps_its_code() {
+        let unresolved = || {
+            anyhow::Error::new(nestweaver_engine::node_scope::RepoFilterUnresolved::new(
+                "no-such-repo",
+                &anyhow::anyhow!("no repo matches 'no-such-repo'"),
+            ))
+        };
+        let status = dispatch_err_to_status("brain_diff", unresolved());
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            status
+                .metadata()
+                .get(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
+                .and_then(|v| v.to_str().ok()),
+            Some(nestweaver_engine::node_scope::REPO_FILTER_UNRESOLVED_CODE)
+        );
+        let envelope =
+            nestweaver_mcp::tools::envelope_from_status_details(status.details()).unwrap();
+        assert_eq!(envelope["repo"], "no-such-repo");
+        assert!(envelope["message"].as_str().is_some());
+
+        let filter = dispatch_err_to_status("hub_nodes", unresolved());
+        assert!(
+            filter.details().is_empty(),
+            "a filter miss is not a lookup miss"
+        );
+    }
+
+    /// nw-557: a lookup miss keeps its code and prose (the CLI classifies
+    /// both) and carries the MCP not-found envelope in the status details,
+    /// so a client behind the daemon gets the in-process result.
+    #[test]
+    fn a_lookup_miss_carries_its_envelope_in_the_details() {
+        let error = nestweaver_mcp::tools::target_not_found(
+            "no symbol found: 'x'",
+            "symbol",
+            serde_json::json!("x"),
+            &["x_fn".to_string()],
+        );
+        let envelope = nestweaver_mcp::tools::not_found_envelope(&error).unwrap();
+        let status = dispatch_err_to_status("flow_trace", error);
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert_eq!(
+            status.message(),
+            "tool flow_trace failed: no symbol found: 'x'"
+        );
+        assert_eq!(
+            nestweaver_mcp::tools::envelope_from_status_details(status.details()),
+            Some(envelope)
+        );
+        assert_eq!(
+            status
+                .metadata()
+                .get(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
+                .and_then(|v| v.to_str().ok()),
+            Some(nestweaver_mcp::tools::TOOL_TARGET_NOT_FOUND_CODE)
+        );
     }
 }
 

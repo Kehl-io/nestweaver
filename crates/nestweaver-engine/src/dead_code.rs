@@ -222,9 +222,13 @@ pub fn dead_code_page_refusal(reason: &str) -> serde_json::Value {
 /// exit 2 rather than ever sending a malformed token to the daemon's `dead_code`
 /// RPC — that RPC dispatches through the MCP tool's JSON schema
 /// (`page_token` is `minLength`/`maxLength: 64` + a hex `pattern`), which is
-/// deliberately kept strict so external MCP clients get a visible,
-/// standards-shaped `-32602 invalid params`. This function stays the single
-/// source of truth for "well-formed" on both sides of that boundary.
+/// deliberately kept strict so external MCP clients get a visible schema
+/// error: a tool result with `isError: true` naming the failed keyword, which
+/// is where MCP (2025-11-25, server/tools "Error Handling") puts
+/// input-validation errors so the model can correct the call. It is NOT a
+/// JSON-RPC `-32602`; that code is reserved for malformed method params and
+/// unknown tool names (nw-576, nw-700). This function stays the single source
+/// of truth for "well-formed" on both sides of that boundary.
 pub fn is_well_formed_page_token(token: &str) -> bool {
     token.len() == 64
         && token

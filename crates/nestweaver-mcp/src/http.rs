@@ -1029,6 +1029,8 @@ async fn handle_mcp(
                 );
             };
 
+            // nw-558: one spelling per argument from here on.
+            let arguments = tools::canonicalize_tool_arguments(&name, arguments);
             if let Err(error) = tools::validate_tool_arguments(&name, &arguments) {
                 return jsonrpc_http_response(
                     notification,
@@ -1310,7 +1312,7 @@ async fn handle_mcp(
                 Ok(Ok(Err(e))) => json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "result": tools::wrap_tool_error(&e.to_string()),
+                    "result": tools::wrap_tool_failure(&name, &e),
                 }),
                 Ok(Err(e)) => json!({
                     "jsonrpc": "2.0",
