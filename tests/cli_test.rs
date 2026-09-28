@@ -12822,6 +12822,36 @@ fn mcp_invalid_config_answers_initialize_with_a_jsonrpc_error() {
         "must name the cause: {message}"
     );
 
+    // Review M2: the cause is on stderr BEFORE the process waits for a
+    // request -- read while stdin is still open and silent.
+    {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("nestweaver"))
+            .env("NESTWEAVER_NO_DAEMON", "1")
+            .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+            .args(["mcp", "--db"])
+            .arg(&db)
+            .arg("--config")
+            .arg(&bad)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+        let mut first = String::new();
+        stderr.read_line(&mut first).unwrap();
+        assert!(first.contains("bad.toml"), "first stderr line: {first}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the cause must be printed before the bounded wait"
+        );
+        drop(child.stdin.take());
+        let status = child.wait().unwrap();
+        assert_eq!(status.code(), Some(1));
+    }
+
     // Counterweight: a valid config boots and serves tools/list unchanged.
     let good =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/minimal-instance.toml");

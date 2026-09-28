@@ -19909,8 +19909,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let db_path = match resolve_db_with_config(db, config.as_deref()) {
                 Ok(db_path) => db_path,
                 Err(error) => {
+                    // Review M2: the cause reaches stderr BEFORE the bounded
+                    // wait for a request, so a human at a terminal (or a
+                    // client that logs stderr) sees it at once.
+                    eprintln!("Error: {error:#}");
                     let _ = nestweaver_mcp::answer_stdio_boot_failure(format!("{error:#}"));
-                    return Err(error);
+                    return Ok((EXIT_ERROR, None));
                 }
             };
             // nw-199: absent flags inherit `[ranking] track_interactions`, so
