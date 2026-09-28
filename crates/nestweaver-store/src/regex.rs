@@ -524,7 +524,12 @@ const MAX_EXACT_STRINGS: usize = 16;
 const MAX_CLASS_CHARS: u32 = 8;
 /// Largest DNF kept; beyond it an AND drops a conjunct and an OR widens to the
 /// trigrams its branches share — both only ever admit MORE candidates.
-const MAX_DNF_BRANCHES: usize = 32;
+///
+/// Review M1: at 32, a 40-way identifier alternation widened to the trigrams
+/// ALL its literals share — usually none — and fell back to a full scan. One
+/// OR branch per literal is kept up to this many; each branch is one posting
+/// intersection, so the cost stays linear in the pattern.
+const MAX_DNF_BRANCHES: usize = 256;
 
 /// Trigram requirement: `None` admits every text, `Some(dnf)` is an OR of
 /// ANDed trigram sets (never empty, no empty branch).
@@ -2680,6 +2685,68 @@ mod tests {
         assert!(required_trigram_clauses(r"fn\s+\w+").is_none());
     }
 
+    /// Review M1: a 40-way exact alternation keeps one branch per literal
+    /// instead of widening to (usually empty) shared trigrams.
+    #[test]
+    fn a_wide_exact_alternation_keeps_one_branch_per_literal() {
+        let pattern = format!(
+            "({}|authenticateUser)",
+            (0..40)
+                .map(|i| format!("identifier_{i:02}"))
+                .collect::<Vec<_>>()
+                .join("|")
+        );
+        let branches = required_trigram_clauses(&pattern).expect("planned");
+        assert_eq!(branches.len(), 41, "{branches:?}");
+        assert!(branches.contains(&trigrams("authenticateuser")));
+    }
+
+    /// The size caps only ever loosen: an AND whose product is too large
+    /// keeps the side with fewer alternatives, and an OR with too many
+    /// branches widens to the trigrams all of them share (or to no filter).
+    #[test]
+    fn dnf_size_caps_only_loosen() {
+        let branch = |s: &str| trigrams(s);
+        let many = |prefix: &str, n: usize| -> Vec<HashSet<String>> {
+            (0..n).map(|i| branch(&format!("{prefix}{i:03}"))).collect()
+        };
+        // AND over the cap keeps the smaller side, unmodified.
+        let small = many("xyz", 2);
+        let anded = dnf_and(Some(small.clone()), Some(many("abc", MAX_DNF_BRANCHES)));
+        assert_eq!(anded, Some(small));
+        // AND under the cap is the cross product.
+        let product = dnf_and(Some(many("xyz", 2)), Some(many("abc", 3))).unwrap();
+        assert_eq!(product.len(), 6);
+        assert!(
+            product
+                .iter()
+                .all(|b| b.contains("xyz") && b.contains("abc"))
+        );
+        // OR over the cap widens to the shared trigrams...
+        let widened = dnf_or(
+            Some(many("shared", MAX_DNF_BRANCHES)),
+            Some(many("shared", 1)),
+        );
+        assert_eq!(widened, Some(vec![trigrams("shared")]));
+        // ...or to no filter when nothing is shared.
+        let mut disjoint = many("aaa", MAX_DNF_BRANCHES);
+        disjoint.push(branch("zzzz"));
+        assert_eq!(dnf_or(Some(disjoint), Some(Vec::new())), None);
+        // An OR with an unconstrained side is unconstrained.
+        assert_eq!(dnf_or(Some(many("abc", 1)), None), None);
+    }
+
+    /// `(abc|)` can match the empty string, so it constrains nothing, and a
+    /// literal after it still does.
+    #[test]
+    fn an_empty_alternative_admits_all_text() {
+        assert!(required_trigram_clauses("(abc|)").is_none());
+        // `abcdefg` or `defg`: one branch per exact string.
+        let mut got = required_trigram_clauses("(abc|)defg").expect("planned");
+        got.sort_by_key(HashSet::len);
+        assert_eq!(got, vec![trigrams("defg"), trigrams("abcdefg")]);
+    }
+
     fn symbol_with_signature(uid: &str, signature: &str) -> Symbol {
         Symbol {
             uid: uid.to_string(),
@@ -2742,6 +2809,14 @@ mod tests {
         }
         planned_store.rebuild_trigram_index().unwrap();
 
+        // Review M1: a 40-way identifier alternation.
+        let wide = format!(
+            "\\b({}|run_code_link_reconciler|colour_grey)\\b",
+            (0..40)
+                .map(|i| format!("identifier_{i:02}"))
+                .collect::<Vec<_>>()
+                .join("|")
+        );
         // (pattern, must be trigram-planned)
         let patterns: &[(&str, bool)] = &[
             (r"fn\s+run_\w+_reconciler", true),
@@ -2763,6 +2838,9 @@ mod tests {
             (r"run_[a-c]{2}_x", true),
             (r"(?i)run_[A-C]{2}_X", true),
             (r"fn\s+\w+", false),
+            (r"(abc|)", false),
+            (r"(authenticate|)User", true),
+            (&wide, true),
         ];
         for (pattern, must_plan) in patterns {
             let planned = planned_store
