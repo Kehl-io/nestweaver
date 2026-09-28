@@ -12236,6 +12236,7 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         let scoped = nestweaver_engine::compute_clusters_scoped(store, &selectors, resolution_arg)
             .context("compute_clusters_scoped")?;
 
+        require_cluster(requested_id, &scoped.communities)?;
         let matching: Vec<&nestweaver_engine::CommunityInfo> = scoped
             .communities
             .iter()
@@ -12283,6 +12284,7 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         tracing::warn!("failed to persist clusters sidecar: {e}");
     }
 
+    require_cluster(requested_id, &output.communities)?;
     // nw-646 parity: this tool ALWAYS computes fresh (never reads the sidecar
     // back), so `cached` is always `false` here — only the CLI's own
     // cache-reuse gate can ever set it `true`.
@@ -12294,6 +12296,24 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         false,
         requested_id,
     ))
+}
+
+/// `cluster_id` is a lookup by identifier: an id no community has is a miss
+/// (nw-557), the same outcome as the CLI's `cluster <id>` exit 2, not an
+/// empty `clusters` list.
+fn require_cluster(
+    requested_id: Option<i64>,
+    communities: &[nestweaver_engine::CommunityInfo],
+) -> Result<(), anyhow::Error> {
+    match requested_id {
+        Some(id) if !communities.iter().any(|c| c.id as i64 == id) => Err(target_not_found(
+            format!("cluster {id} not found"),
+            "cluster_id",
+            json!(id),
+            &[],
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// The ONE unscoped `clusters` envelope (nw-559), built here and by the CLI's
@@ -28713,6 +28733,12 @@ mod lookup_not_found_contract_tests {
                 "bundle_id",
             ),
             ("brain_diff", json!({ "repo": "no-such-repo" }), "repo"),
+            ("clusters", json!({ "cluster_id": 999_999 }), "cluster_id"),
+            (
+                "clusters",
+                json!({ "cluster_id": 999_999, "repos": ["repo:r"] }),
+                "cluster_id",
+            ),
         ];
         for (tool, args, key) in misses {
             let result = mcp_result(&store, tool, args.clone());
@@ -28793,6 +28819,7 @@ mod lookup_not_found_contract_tests {
             ("code_context", json!({ "seeds": ["alpha_fn"] })),
             ("brain_memory_related", json!({ "uid": "note:alpha" })),
             ("brain_search", json!({ "query": "zzzNoSuchTermQQ" })),
+            ("clusters", json!({})),
             ("regex_search", json!({ "pattern": "zzzNoSuchTermQQ" })),
         ] {
             let result = mcp_result(&store, tool, args.clone());
