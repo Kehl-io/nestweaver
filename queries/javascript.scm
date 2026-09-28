@@ -85,7 +85,8 @@
 
 ; Test-runner blocks (Jest/Vitest/Mocha): test('name', fn), it('name', fn),
 ; describe('name', fn). Captured as a definition so the calls inside the
-; callback attach to this symbol (named after the test title).
+; callback attach to this symbol. nw-688: the parser names it `<runner>
+; <title>` (`describe getTier`), so a title can never shadow a real definition.
 (call_expression
   function: (identifier) @_runner
   arguments: (arguments
@@ -128,10 +129,13 @@
 (new_expression
   constructor: (identifier) @name) @reference.call
 
-; require() calls
+; require() calls. nw-688: only `require` itself -- without the #eq? this
+; matched ANY identifier call whose first argument is a string, so
+; `describe('getTier', ..)` and `loadFixture('./x')` were imports.
 (call_expression
-  function: (identifier)
-  arguments: (arguments (string) @name)) @reference.import
+  function: (identifier) @_require
+  arguments: (arguments (string) @name)
+  (#eq? @_require "require")) @reference.import
 
 ; JSX opening element — component reference
 (jsx_opening_element

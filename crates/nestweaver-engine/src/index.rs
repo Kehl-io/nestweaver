@@ -3104,12 +3104,22 @@ fn infer_cross_repo_call_edges(
             .filter(|r| r.kind == ReferenceKind::Import)
             .map(|r| r.name.as_str())
             .collect();
+        // nw-688: names bound from an npm package (`const { isEmpty } =
+        // require('lodash')`). The call is that package's function, not
+        // another indexed repo's same-named symbol, so it gets no hint.
+        let package_bound: std::collections::HashSet<&str> = references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::PackageBinding)
+            .map(|r| r.name.as_str())
+            .collect();
 
         for reference in references {
             if reference.kind != ReferenceKind::Call || reference.receiver.is_some() {
                 continue;
             }
-            if local_symbol_names.contains(&reference.name) {
+            if local_symbol_names.contains(&reference.name)
+                || package_bound.contains(reference.name.as_str())
+            {
                 continue;
             }
 
@@ -12847,6 +12857,115 @@ function hello(name) { return "Hello " + name; }
                 src == &importer && dst == &exported && kind == "IMPORTS"
             }),
             "a JavaScript import must resolve using JavaScript rules even when another language has more files: {edges:?}"
+        );
+    }
+
+    /// nw-688: `describe('getTier', fn)` used to be a Function named
+    /// `getTier`, so the test's own `getTier()` call bound to the block and
+    /// affected-tests for the real definition's file missed the test.
+    /// Counterweight: a test file that never calls `getTier` stays out.
+    #[test]
+    fn jest_describe_title_does_not_hide_the_test_from_affected_tests() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(src.join("src/helpers")).unwrap();
+        fs::create_dir_all(src.join("test")).unwrap();
+        fs::write(
+            src.join("src/helpers/instructor.js"),
+            "function getTier(n) { return n > 1 ? 'gold' : 'basic'; }\nmodule.exports = { getTier };\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("test/instructor.test.js"),
+            "const { getTier } = require('../src/helpers/instructor');\n\
+describe('getTier', () => {\n  it('returns gold', () => {\n    getTier(2);\n  });\n});\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("test/other.test.js"),
+            "function helper() {}\ndescribe('other', () => {\n  it('works', () => {\n    helper();\n  });\n});\n",
+        )
+        .unwrap();
+
+        let (_, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/jest", "abc123").unwrap();
+        let named = store.lookup_symbols_by_name("getTier").unwrap();
+        assert_eq!(
+            named.len(),
+            1,
+            "only the real function may be named getTier: {named:#?}"
+        );
+        let result = crate::affected_tests::affected_tests(
+            &store,
+            &["src/helpers/instructor.js".to_string()],
+        )
+        .unwrap();
+        let selected: Vec<&str> = result
+            .tier_1
+            .iter()
+            .chain(&result.tier_2)
+            .chain(&result.tier_3)
+            .map(|file| file.test_file.as_str())
+            .collect();
+        assert!(
+            selected.contains(&"test/instructor.test.js"),
+            "the test calling getTier must be selected: {result:#?}"
+        );
+        assert!(
+            !selected.contains(&"test/other.test.js"),
+            "a test that never calls getTier must not be selected: {result:#?}"
+        );
+    }
+
+    /// nw-688: a call to a name bound from an npm package (`lodash`'s
+    /// `isEmpty`) must not become a CROSS_REPO_LINK to another indexed repo's
+    /// same-named symbol. Counterweight: a free call with no package binding
+    /// still gets the name-matched hint.
+    #[test]
+    fn npm_package_calls_do_not_link_to_another_repos_same_named_symbol() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        fs::create_dir_all(&lib).unwrap();
+        fs::write(
+            lib.join("index.js"),
+            "export function isEmpty(x) { return !x; }\nexport function sharedHelper(x) { return x; }\n",
+        )
+        .unwrap();
+        let app_source = "const { isEmpty } = require('lodash');\n\
+function check(x) { return isEmpty(x); }\n\
+function plain(x) { return sharedHelper(x); }\n\
+module.exports = { check, plain };\n";
+
+        let (_, store) =
+            index_directory_in_memory(&lib, "test", "https://example.com/lib", "abc123").unwrap();
+        let lib_uid = repo_uid("test", "https://example.com/lib");
+        let app_uid = repo_uid("test", "https://example.com/app");
+        let parsed = nestweaver_parser::parse_source(Path::new("main.js"), app_source).unwrap();
+        let links: Vec<(String, String)> = infer_cross_repo_call_edges(
+            &store,
+            &app_uid,
+            &[(
+                "main.js".to_string(),
+                parsed.symbols,
+                parsed.references,
+                Some(app_source.to_string()),
+            )],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|edge| (edge.source_uid, edge.target_uid))
+        .collect();
+        let check = symbol_uid(&app_uid, "main.js", "check", 2);
+        let plain = symbol_uid(&app_uid, "main.js", "plain", 3);
+        let is_empty = symbol_uid(&lib_uid, "index.js", "isEmpty", 1);
+        let shared = symbol_uid(&lib_uid, "index.js", "sharedHelper", 2);
+        assert!(
+            !links.contains(&(check, is_empty)),
+            "lodash's isEmpty must not link to another repo's isEmpty: {links:?}"
+        );
+        assert!(
+            links.contains(&(plain, shared)),
+            "an unbound free call keeps its name-matched hint: {links:?}"
         );
     }
 

@@ -1,8 +1,13 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 6253
+assertion_line: 8442
 expression: "parsed_references(\"simple.ts\", &source)"
 ---
+- name: EventEmitter
+  kind: PackageBinding
+  start_line: 1
+  context: events
+  receiver: ~
 - name: events
   kind: Import
   start_line: 1

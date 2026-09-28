@@ -123,7 +123,7 @@ Run `nestweaver --help` for the full command list. Most commands support `--json
 
 ## Upgrading — re-index before you trust a ranking
 
-**`RESOLVER_GENERATION` is 7. Every graph indexed by an earlier release must be
+**`RESOLVER_GENERATION` is 8. Every graph indexed by an earlier release must be
 re-indexed.** Compatibility is an EXACT MATCH, not a floor, so a graph written
 by any other generation — older or newer — is treated as untrustworthy.
 
@@ -131,7 +131,9 @@ by any other generation — older or newer — is treated as untrustworthy.
 changed edge SHAPE; 5 and 6 changed which symbols are persisted as ENTRY
 POINTS, which is what `dead-code` walks from. Generation 7 (nw-687) adds
 missing CALLS/definition edges for CommonJS `module.exports.X`/`exports.X`
-function definitions, which a stale graph is missing entirely. Both kinds of
+function definitions, which a stale graph is missing entirely. Generation 8
+(nw-688) renames JS/TS test-runner blocks so `describe('getTier')` no longer
+shadows the real `getTier`. Both kinds of
 staleness have the same remedy and the same symptom list. Until you re-index:
 
 - **Rankings are stale.** `hubs`, `bridges`, `repo-map`, `clusters`, and every
@@ -267,6 +269,7 @@ Also changing behaviour in this release, in ways a script may notice:
 | A UID seed with no text label no longer opens a semantic seed search (nw-686) | Expect structural results for the UID without unrelated semantic matches |
 | `read-symbols` verifies indexed spans and reports stale or relocated source instead of returning another symbol's body (nw-689) | Handle the additive stale-span/relocation fields in `read-symbols` responses |
 | CommonJS `module.exports.X` and `exports.X` functions are now definitions with call edges. Resolver generation 7 requires a full repo re-index before `dead-code` answers (nw-687) | Run `nestweaver index --repo <path> --force` for each repo after upgrading |
+| A JS/TS test block is now named `<runner> <title>` (`describe getTier`, `it returns gold`) instead of its bare title, so it no longer shadows a real definition of the same name, and `affected-tests` selects the test that calls it. Only `require('x')` is an import (any `f('x')` call was one), and a call bound from an npm package (`const { isEmpty } = require('lodash')`) no longer gets a `CROSS_REPO_LINK` to another repo's same-named symbol. Resolver generation 8 (nw-688) | Run `nestweaver index --repo <path> --force` for each repo after upgrading; search test blocks by the prefixed name |
 | In unscoped `investigate`, an exact symbol name remains a seed while longer substring matches are connected results; partial matches remain seeds when there is no exact match (nw-529) | Treat `is_seed` as the query match indicator; results still include relevant connected symbols |
 | Invalid `export --format` / `--scope` now exits **64**, not 1 | Gate on 64 for usage errors; 1 still means the export itself failed |
 | A value a tool's schema rejects (e.g. an over-long `read-symbols` target) now exits **64**, not 1, on the daemon route, and on the `--no-daemon` route for commands that run through the shared tool layer (`brain search`, `project-context`, `clusters`, `blast-radius`, …). Direct-route commands that call the engine without the tool layer (e.g. `read-symbols --no-daemon`) never see the schema and keep their own exit codes | Gate on 64 for usage errors; 1 still means the command itself failed |

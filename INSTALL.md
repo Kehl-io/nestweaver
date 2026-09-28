@@ -170,12 +170,14 @@ open target/release/NestWeaver.app
 
 ## Upgrading to this release — re-index every graph
 
-**This release bumps `RESOLVER_GENERATION` to 7.** Installing the new binary
+**This release bumps `RESOLVER_GENERATION` to 8.** Installing the new binary
 does not repair a graph already on disk. Until each repo is re-indexed, its
 rankings, edges and `dead-code` results are computed from data the old resolver
 wrote, and `dead-code` refuses outright rather than reporting from it.
 
-Generation 7 (nw-687) adds definitions and call edges for CommonJS
+Generation 8 (nw-688) renames JavaScript/TypeScript test-runner blocks to
+`<runner> <title>` (`describe getTier`), so a test title no longer shadows the
+real definition it tests. Generation 7 (nw-687) adds definitions and call edges for CommonJS
 `module.exports.X` and `exports.X` functions in JavaScript and TypeScript.
 An older graph is missing those edges, so `dead-code` may call their live
 callees unreachable until the repo is re-indexed. Generation 6 changed which

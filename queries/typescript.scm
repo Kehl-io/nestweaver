@@ -92,7 +92,8 @@
 
 ; Test-runner blocks (Jest/Vitest/Mocha): test('name', fn), it('name', fn),
 ; describe('name', fn). Captured as a definition so the calls inside the
-; callback attach to this symbol (named after the test title).
+; callback attach to this symbol. nw-688: the parser names it `<runner>
+; <title>` (`describe getTier`), so a title can never shadow a real definition.
 (call_expression
   function: (identifier) @_runner
   arguments: (arguments
