@@ -110,6 +110,9 @@ pub struct WorkerPool {
     /// nw-673: the instance's `[cross_domain]` settings for the discovery
     /// pass after each vault fetch.
     cross_domain: Arc<crate::config::CrossDomainConfig>,
+    /// nw-677: relinks notes to code after each code index. One per pool so
+    /// its mention cache outlives a job.
+    code_link_reconciler: Arc<std::sync::Mutex<crate::code_links::CodeLinkReconciler>>,
     /// Tracks successful incremental code updates so server mode can
     /// periodically force a full refresh and bound graph drift.
     reindex_tracker: Arc<Mutex<crate::scheduler::ReindexTracker>>,
@@ -124,6 +127,11 @@ impl WorkerPool {
             index_limits: crate::index_limits::IndexLimits::default(),
             note_limits: crate::index_limits::NoteLimits::default(),
             cross_domain: Arc::new(crate::config::CrossDomainConfig::default()),
+            code_link_reconciler: Arc::new(std::sync::Mutex::new(
+                crate::code_links::CodeLinkReconciler::new(
+                    crate::config::CrossDomainConfig::default(),
+                ),
+            )),
             reindex_tracker: Arc::new(Mutex::new(crate::scheduler::ReindexTracker::new())),
         }
     }
@@ -153,6 +161,9 @@ impl WorkerPool {
     /// Apply the instance's `[cross_domain]` settings to link discovery
     /// (nw-673).
     pub fn with_cross_domain_config(mut self, config: crate::config::CrossDomainConfig) -> Self {
+        self.code_link_reconciler = Arc::new(std::sync::Mutex::new(
+            crate::code_links::CodeLinkReconciler::new(config.clone()),
+        ));
         self.cross_domain = Arc::new(config);
         self
     }
@@ -218,6 +229,7 @@ impl WorkerPool {
         let index_limits = self.index_limits;
         let note_limits = self.note_limits;
         let cross_domain = Arc::clone(&self.cross_domain);
+        let code_link_reconciler = Arc::clone(&self.code_link_reconciler);
 
         // Rehydrate the reindex tracker from the persisted store so the
         // periodic-full update counter and 7-day backstop survive a daemon
@@ -329,6 +341,7 @@ impl WorkerPool {
             let circuit_breakers = circuit_breakers.clone();
             let repo_types = repo_types.clone();
             let cross_domain = Arc::clone(&cross_domain);
+            let code_link_reconciler = Arc::clone(&code_link_reconciler);
             let reindex_tracker = self.reindex_tracker.clone();
 
             tasks.spawn(async move {
@@ -393,6 +406,16 @@ impl WorkerPool {
                                 false
                             };
 
+                            // nw-677: the relink after a code index takes the
+                            // same write gate, once per chunk it rewrites.
+                            let code_link_lease: Option<crate::watcher::WatchMutationLeaseFactory> =
+                                write_gate.clone().map(|gate| {
+                                    Arc::new(move |what: &'static str| {
+                                        Ok(Box::new(gate.blocking_lock(what))
+                                            as Box<dyn crate::watcher::WatchMutationLease>)
+                                    })
+                                        as crate::watcher::WatchMutationLeaseFactory
+                                });
                             let outcome = commit_prepared_job_with_reindex_decision_and_limits(
                                 &prepared,
                                 &store,
@@ -401,6 +424,10 @@ impl WorkerPool {
                                 index_limits,
                                 note_limits,
                                 &cross_domain,
+                                CodeLinkRelink {
+                                    reconciler: Some(&code_link_reconciler),
+                                    lease: code_link_lease.as_ref(),
+                                },
                                 move || {
                                     // Acquire the write lock. A backup in progress holds this lock
                                     // while it copies files, so this simply waits until the backup
@@ -800,8 +827,76 @@ where
         crate::index_limits::IndexLimits::default(),
         crate::index_limits::NoteLimits::default(),
         &crate::config::CrossDomainConfig::default(),
+        CodeLinkRelink::default(),
         acquire_write_guard,
     )
+}
+
+/// nw-677: how the worker relinks notes to code after a code index. The
+/// default (tests) is a fresh reconciler with no write gate.
+#[derive(Default, Clone, Copy)]
+struct CodeLinkRelink<'a> {
+    reconciler: Option<&'a std::sync::Mutex<crate::code_links::CodeLinkReconciler>>,
+    lease: crate::code_links::CodeLinkLease<'a>,
+}
+
+/// nw-677: a code re-index drops every note link INTO the re-indexed files
+/// (the cascade takes them with the symbols). Server mode runs no
+/// code-link reconciler loop — its vault notes live in bare clones the loop
+/// cannot read — so the worker relinks here, reading notes from the bare
+/// clones. The debt is recorded first, so `brain status` discloses it while
+/// the pass runs and keeps it, with the error, if the pass fails.
+fn relink_notes_after_code_index(
+    store: &nestweaver_store::GraphStore,
+    repo_url: &str,
+    note_limits: crate::index_limits::NoteLimits,
+    cross_domain: &crate::config::CrossDomainConfig,
+    relink: CodeLinkRelink<'_>,
+) {
+    match store.list_vaults(None) {
+        Ok(vaults) if vaults.is_empty() => return,
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, "note relink after code index: cannot list vaults");
+            return;
+        }
+    }
+    if let Some(db_path) = store.db_path() {
+        crate::code_links::mark_code_links_pending(
+            db_path,
+            &format!("code re-index of {repo_url}"),
+        );
+    }
+    let readers =
+        match crate::code_links::bare_clone_vault_readers(store, note_limits.as_index_limits()) {
+            Ok(readers) => readers,
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "note relink after code index");
+                return;
+            }
+        };
+    let run = |reconciler: &mut crate::code_links::CodeLinkReconciler| {
+        reconciler.set_vault_readers(readers);
+        reconciler.reconcile(store, relink.lease, &|| false)
+    };
+    let outcome = match relink.reconciler {
+        Some(shared) => run(&mut shared.lock().unwrap_or_else(|e| e.into_inner())),
+        None => run(&mut crate::code_links::CodeLinkReconciler::new(
+            cross_domain.clone(),
+        )),
+    };
+    match outcome {
+        Ok(report) => tracing::info!(
+            repo = %repo_url,
+            notes_rewritten = report.rewritten.len(),
+            "relinked notes after code index"
+        ),
+        Err(error) => tracing::warn!(
+            repo = %repo_url,
+            error = %format!("{error:#}"),
+            "note relink after code index failed; the debt stays disclosed"
+        ),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -813,6 +908,7 @@ fn commit_prepared_job_with_reindex_decision_and_limits<G, F>(
     limits: crate::index_limits::IndexLimits,
     note_limits: crate::index_limits::NoteLimits,
     cross_domain: &crate::config::CrossDomainConfig,
+    relink: CodeLinkRelink<'_>,
     acquire_write_guard: F,
 ) -> Result<ReindexOutcome, anyhow::Error>
 where
@@ -916,7 +1012,7 @@ where
                     &prepared.remote_sha,
                 );
 
-            if can_incremental {
+            let outcome = if can_incremental {
                 let result = crate::index::incremental_index_with_reader_and_write_gate(
                     &reader,
                     &prepared.bare_path,
@@ -928,9 +1024,9 @@ where
                 )?;
                 report_degraded_worker_coverage(&prepared.repo_url, &result.skipped_files);
                 if result.fell_back_to_full {
-                    Ok(ReindexOutcome::Full)
+                    ReindexOutcome::Full
                 } else {
-                    Ok(ReindexOutcome::Incremental)
+                    ReindexOutcome::Incremental
                 }
             } else {
                 // Server full path: the bare reader passes no filemeta cache,
@@ -954,8 +1050,16 @@ where
                     acquire_write_guard,
                 )?;
                 report_degraded_worker_coverage(&prepared.repo_url, &result.skipped_files);
-                Ok(ReindexOutcome::Full)
-            }
+                ReindexOutcome::Full
+            };
+            relink_notes_after_code_index(
+                store,
+                &prepared.repo_url,
+                note_limits,
+                cross_domain,
+                relink,
+            );
+            Ok(outcome)
         }
     }
 }
@@ -1816,6 +1920,7 @@ mod tests {
                 crate::index_limits::IndexLimits::default(),
                 crate::index_limits::NoteLimits::default(),
                 &config,
+                CodeLinkRelink::default(),
                 || Ok::<_, anyhow::Error>(()),
             )
             .unwrap();
@@ -1825,6 +1930,87 @@ mod tests {
                 "{config:?}"
             );
         }
+    }
+
+    /// nw-677: in server mode no code-link reconciler loop runs, and a code
+    /// re-index drops every note link into the re-indexed files. The worker
+    /// now relinks after the code index, reading the notes from the vault's
+    /// bare clone, and settles the debt it disclosed. The full re-index of
+    /// the code repo is what drops the links (the counterweight: without the
+    /// relink the count falls to 0).
+    #[test]
+    fn server_code_reindex_keeps_note_links_from_bare_clone_vaults() {
+        let tmp = TempDir::new().unwrap();
+        let code_src = tmp.path().join("code-src");
+        create_source_repo(&code_src, &[("src/w.rs", "pub struct AlphaWidget;\n")]);
+        let vault_src = tmp.path().join("vault-src");
+        create_source_repo(&vault_src, &[("a.md", "# A\n\nuses AlphaWidget\n")]);
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let db = tmp.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::open(&db).unwrap();
+        let instance = "test-instance";
+        let job = |id: i64, repo_id: &str, src: &std::path::Path| IndexJob {
+            id,
+            repo_id: repo_id.to_string(),
+            repo_url: format!("file://{}", src.display()),
+            trigger: JobTrigger::Unindexed,
+            priority: 0,
+            status: crate::jobs::JobStatus::Running,
+            attempt: 1,
+            max_attempts: 4,
+            error_msg: None,
+            branch: None,
+            claimed_by: None,
+            created_at: 0,
+            updated_at: 0,
+            started_at: Some(0),
+            completed_at: None,
+        };
+        let run = |job: &IndexJob, repo_type: RepoType, force_full: bool| {
+            let prepared = prepare_job(job, &ws, &store, instance, None, repo_type)
+                .unwrap()
+                .expect("job must be prepared");
+            commit_prepared_job_with_reindex_decision_and_limits(
+                &prepared,
+                &store,
+                instance,
+                force_full,
+                crate::index_limits::IndexLimits::default(),
+                crate::index_limits::NoteLimits::default(),
+                &crate::config::CrossDomainConfig::default(),
+                CodeLinkRelink::default(),
+                || Ok::<_, anyhow::Error>(()),
+            )
+            .unwrap()
+        };
+
+        run(&job(1, "code", &code_src), RepoType::Code, false);
+        run(&job(2, "vault", &vault_src), RepoType::Vault, false);
+        assert_eq!(
+            store.count_references_code_edges().unwrap(),
+            2,
+            "the vault fetch links the note and its section"
+        );
+
+        // A new code commit, fully re-indexed: the symbol is deleted and
+        // re-inserted, and the cascade takes the note links with it.
+        commit_file(
+            &code_src,
+            "src/w.rs",
+            "// moved\npub struct AlphaWidget;\n",
+            "move AlphaWidget",
+        );
+        assert_eq!(
+            run(&job(3, "code", &code_src), RepoType::Code, true),
+            ReindexOutcome::Full
+        );
+        assert_eq!(
+            store.count_references_code_edges().unwrap(),
+            2,
+            "a code re-index must keep the note->code links"
+        );
+        let status = crate::code_links::code_links_status_json(Some(&db));
+        assert_eq!(status["pending"], false, "the debt is settled: {status}");
     }
 
     /// Crash-between-SHA-and-content self-heal: a Repo row whose indexed_sha
