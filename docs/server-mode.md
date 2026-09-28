@@ -321,7 +321,12 @@ Core method parameters are validated separately from tool arguments.
 `clientInfo` with string `name` and `version`. `ping` and `tools/list` accept
 omitted or null parameters; when present, parameters must be an object.
 `tools/list.cursor` must be a string. Client `_meta` objects are accepted.
-Malformed method parameters return `-32602`.
+Malformed method parameters return `-32602`, and so does a `tools/call` whose
+`name` is missing or is not a registered tool (`Unknown tool: <name>`).
+Arguments that fail a tool's schema are not a protocol error: they return a
+tool result with `isError: true` and the schema message, as the MCP
+specification (2025-11-25) requires for input-validation errors, so a client
+model can read the message and correct the call.
 
 Send `notifications/cancelled` with `params.requestId` to cancel an in-flight
 request. Stdio continues reading cancellation and ping frames while tool work
