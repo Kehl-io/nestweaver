@@ -85,6 +85,11 @@ test.describe("Deep links (batch 11)", () => {
       "fixture overview has non-repo landmarks to filter out",
     ).toBeGreaterThan(repoCount);
 
+    const overviewKinds: (string | null)[] = [];
+    page.on("request", (req) => {
+      const url = new URL(req.url());
+      if (url.pathname === "/api/v1/overview") overviewKinds.push(url.searchParams.get("kind"));
+    });
     await page.setViewportSize({ width: 1440, height: 900 });
     await persistRepresentation(page, "graph");
     await page.goto("/?kind=repo&representation=table");
@@ -96,6 +101,8 @@ test.describe("Deep links (batch 11)", () => {
     // header row + one row per repo landmark
     await expect(rows).toHaveCount(repoCount + 1);
     await expect.poll(() => urlParam(page, "kind")).toBe("repo");
+    // The server filters before its per-kind caps, so the client asks for it.
+    expect(overviewKinds).toContain("repo");
     expect(new URL(page.url()).pathname + new URL(page.url()).search).not.toBe("/");
 
     // Clearing the filter restores the full overview and drops the param.

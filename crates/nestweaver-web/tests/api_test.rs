@@ -717,6 +717,79 @@ async fn overview_keeps_symbol_when_repos_exceed_limit() {
 }
 
 #[tokio::test]
+async fn overview_kind_filters_before_the_per_kind_cap() {
+    // nw-595 review: `?kind=note` must show the notes, not the first 12 of a
+    // mixed list that a client-side filter would see.
+    let store = setup_test_store();
+    store
+        .insert_vault(&Vault {
+            uid: "vault:test".to_string(),
+            name: "test-vault".to_string(),
+            root_path: "/tmp/test-vault".to_string(),
+            instance_id: String::new(),
+        })
+        .unwrap();
+    for index in 0..20 {
+        store
+            .insert_note(&Note {
+                uid: format!("note:test:n{index:02}"),
+                vault_uid: "vault:test".to_string(),
+                file_path: format!("N{index:02}.md"),
+                title: format!("Note {index:02}"),
+                note_kind: NoteKind::General,
+                word_count: 12,
+                content_hash: format!("hash-{index}"),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: Some(0.01 * f64::from(index)),
+                embedding: None,
+            })
+            .unwrap();
+    }
+    let state = AppState::new(
+        store,
+        None,
+        std::path::PathBuf::from("/tmp/overview-kind.lbug"),
+    );
+    let app = create_router(state);
+
+    let (status, mixed) = get_json(&app, "/api/v1/overview?limit=40").await;
+    assert_eq!(status, StatusCode::OK);
+    let mixed_notes = mixed["landmarks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["kind"] == "note")
+        .count();
+    assert_eq!(mixed_notes, 12, "the mixed overview keeps its note cap");
+
+    let (status, notes) = get_json(&app, "/api/v1/overview?limit=40&kind=note").await;
+    assert_eq!(status, StatusCode::OK);
+    let landmarks = notes["landmarks"].as_array().unwrap();
+    assert_eq!(
+        landmarks.len(),
+        20,
+        "kind=note returns every note up to the limit"
+    );
+    assert!(landmarks.iter().all(|item| item["kind"] == "note"));
+
+    let (status, repos) = get_json(&app, "/api/v1/overview?kind=repo").await;
+    assert_eq!(status, StatusCode::OK);
+    let repo_landmarks = repos["landmarks"].as_array().unwrap();
+    assert!(!repo_landmarks.is_empty());
+    assert!(repo_landmarks.iter().all(|item| item["kind"] == "repo"));
+
+    let (status, body) = get_json(&app, "/api/v1/overview?kind=Function").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unknown kind is rejected: {body}"
+    );
+}
+
+#[tokio::test]
 async fn brain_status_returns_counts() {
     let app = make_app();
     let (status, json) = get_json(&app, "/api/v1/brain/status").await;
