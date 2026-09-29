@@ -312,6 +312,31 @@ function ZeroNodeImpactOverlay() {
   );
 }
 
+function OverviewKindFilter() {
+  const overviewKind = useStore((s) => s.overviewKind);
+  const graphMode = useStore((s) => s.graphMode);
+  const setOverviewKind = useStore((s) => s.setOverviewKind);
+  if (graphMode !== "overview" || !overviewKind) return null;
+  return (
+    <div
+      role="status"
+      aria-label="Overview filter"
+      className="flex shrink-0 items-center gap-2 border-b border-[var(--color-border)] bg-[var(--color-surface-alt)] px-3 py-1 text-[11px] text-[var(--color-text-muted)]"
+    >
+      <span>
+        Showing <span className="font-medium text-[var(--color-text)]">{overviewKind}s</span> only
+      </span>
+      <button
+        type="button"
+        onClick={() => setOverviewKind(null)}
+        className="rounded border border-[var(--color-border)] px-1.5 py-0.5 text-[11px] text-[var(--color-text-muted)] hover:bg-[var(--color-surface)] hover:text-[var(--color-text)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-graph-selection)]"
+      >
+        Show all kinds
+      </button>
+    </div>
+  );
+}
+
 export function GraphPanel() {
   const pathfindingActive = useStore((s) => s.pathfindingActive);
   const pathfindingTo = useStore((s) => s.pathfindingTo);
@@ -358,6 +383,7 @@ export function GraphPanel() {
     <div data-testid="graph-panel" className="flex h-full flex-col relative">
       <WorkspaceToolbar />
       <ModeTabs />
+      <OverviewKindFilter />
       <div className="flex-1 relative bg-[var(--color-surface)]">
         <div
           ref={graphPanelRef}

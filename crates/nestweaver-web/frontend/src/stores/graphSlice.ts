@@ -4,6 +4,14 @@ import type { StoreState } from "./index";
 
 export type DetailFocus = "summary" | "source" | "related" | "analysis";
 export type ViewMode = "graph" | "list" | "matrix";
+/** Landmark kinds an Overview `?kind=` filter can narrow to (nw-595). */
+export const OVERVIEW_KINDS = ["repo", "note", "service", "symbol"] as const;
+export type OverviewKind = (typeof OVERVIEW_KINDS)[number];
+
+export function parseOverviewKind(value: string | null): OverviewKind | null {
+  const lower = value?.toLowerCase();
+  return OVERVIEW_KINDS.find((kind) => kind === lower) ?? null;
+}
 
 export interface GraphSlice {
   selectedNodeId: string | null;
@@ -20,6 +28,8 @@ export interface GraphSlice {
   graphMode: GraphMode;
   seeds: string[];
   scopeFilter: ScopeFilter;
+  overviewKind: OverviewKind | null;
+  setOverviewKind: (kind: OverviewKind | null) => void;
   communityOverlay: boolean;
   tagsVisible: boolean;
   minimapVisible: boolean;
@@ -80,6 +90,7 @@ export const createGraphSlice: StateCreator<
   graphMode: "overview",
   seeds: [],
   scopeFilter: "all",
+  overviewKind: null,
   communityOverlay: false,
   tagsVisible: true,
   minimapVisible: true,
@@ -247,6 +258,11 @@ export const createGraphSlice: StateCreator<
   setScopeFilter: (filter) =>
     set((s) => {
       s.scopeFilter = filter;
+    }),
+
+  setOverviewKind: (kind) =>
+    set((s) => {
+      s.overviewKind = kind;
     }),
 
   toggleCommunityOverlay: () =>

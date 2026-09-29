@@ -37,6 +37,7 @@ export function useOverviewMode() {
   const setGraphData = useStore((s) => s.setGraphData);
   const clearGraphData = useStore((s) => s.clearGraphData);
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
+  const overviewKind = useStore((s) => s.overviewKind);
   const setActiveLens = useStore((s) => s.setActiveLens);
   const setSceneMetadata = useStore((s) => s.setSceneMetadata);
   const notify = useStore((s) => s.notify);
@@ -86,7 +87,15 @@ export function useOverviewMode() {
       const result = await loadScopedOverview(96, requestWorkspaceId);
       if (!isCurrentRequest()) return;
 
-      const graph = buildGraphFromOverview(result);
+      // A `?kind=` deep link narrows the landmarks client-side (nw-595).
+      const graph = buildGraphFromOverview(
+        overviewKind
+          ? {
+              ...result,
+              landmarks: result.landmarks.filter((item) => item.kind === overviewKind),
+            }
+          : result,
+      );
       const previous = previousOverviewGraphRef.current;
       const hasPreviousLayout = previous?.workspaceId === requestWorkspaceId;
       preserveGraphLayout(
@@ -143,6 +152,7 @@ export function useOverviewMode() {
     clearGraphData,
     graphMode,
     notify,
+    overviewKind,
     setActiveLens,
     setGraphData,
     setSceneMetadata,

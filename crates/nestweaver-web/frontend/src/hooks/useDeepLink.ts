@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { useStore } from "../stores";
 import type { GraphMode } from "../api/types";
 import type { ActiveLens, RepresentationMode } from "../api/p1Types";
+import { parseOverviewKind } from "../stores/graphSlice";
 import {
   DEFAULT_IMPACT_CONFIDENCE,
   DEFAULT_IMPACT_DEPTH,
@@ -74,6 +75,7 @@ export function useDeepLink() {
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
+  const overviewKind = useStore((s) => s.overviewKind);
   const activeLens = useStore((s) => s.activeLens);
   const representationMode = useStore((s) => s.representationMode);
   const impactDepth = useStore((s) => s.impactDepth);
@@ -112,6 +114,18 @@ export function useDeepLink() {
     }
     if (nodeParam) {
       selectNode(nodeParam, kindParam);
+    } else if (kindParam) {
+      // Without a node, `kind` narrows the Overview landmarks (nw-595).
+      const overviewKindParam = parseOverviewKind(kindParam);
+      if (overviewKindParam) {
+        useStore.getState().setOverviewKind(overviewKindParam);
+      } else {
+        useStore.getState().notify({
+          kind: "warning",
+          title: "Unsupported kind filter",
+          message: `kind=${kindParam} needs a node; Overview filters by repo, note, service, or symbol.`,
+        });
+      }
     }
     if (representationParam) {
       setRepresentationMode(representationParam);
@@ -166,7 +180,11 @@ export function useDeepLink() {
     if (graphMode !== "overview") params.set("mode", graphMode);
     if (activeWorkspaceId !== "all") params.set("workspace", activeWorkspaceId);
     if (selectedNodeId) params.set("node", selectedNodeId);
-    if (selectedNodeKind) params.set("kind", selectedNodeKind);
+    if (selectedNodeId && selectedNodeKind) {
+      params.set("kind", selectedNodeKind);
+    } else if (!selectedNodeId && overviewKind) {
+      params.set("kind", overviewKind);
+    }
     if (activeLens.lens !== "overview") params.set("lens", activeLens.lens);
     if (representationMode !== "graph") {
       params.set("representation", representationMode);
@@ -189,6 +207,7 @@ export function useDeepLink() {
     graphMode,
     impactConfidence,
     impactDepth,
+    overviewKind,
     representationMode,
     seeds,
     selectedNodeId,
