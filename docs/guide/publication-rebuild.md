@@ -46,13 +46,48 @@ nestweaver publication status --db /path/to/brain.lbug --operation <uuid> --json
 nestweaver publication rebuild --config /path/to/instance.toml --operation <uuid>
 ```
 
-Resume is refused if source content, configuration, binary version, publication
-format, or database identity changed. Stabilize the named input and start a new
-operation instead of overriding that refusal.
+### Resuming after the sources changed
+
+A rebuild of a large brain takes long enough (about an hour for tens of
+repositories) that a source often changes before it finishes, and final
+validation then refuses the cutover. Resume the same operation: it compares the
+current inputs with the ones the operation recorded, re-indexes only the
+repositories and vaults whose content or commit changed into the staged slot,
+re-embeds only their changed nodes, rebuilds the state derived from the graph
+(projects, note→code links, BM25, regex shards, ranking), and validates again:
+
+```text
+Resume: 1 input(s) changed since the build recorded them (repository file:///src/app); re-indexing only those, then rebuilding derived state and validating.
+[Graph] re-indexing changed repository file:///src/app
+[Embeddings] embedding changed nodes
+```
+
+Some changes cannot be scoped to a source: the instance configuration changed,
+a repository or vault was added, removed, moved, or renamed, or the staged slot
+was already sealed. Resume then says why, discards the operation, and starts a
+full rebuild under a new operation:
+
+```text
+Resume cannot re-index only what changed: the instance configuration changed. Discarding operation <uuid> and starting a full rebuild.
+```
+
+A changed binary version, publication format, or database identity is still
+refused; discard the operation and start a new one.
+
+### Pause writers to the sources during a rebuild
+
+Every change to a source between the start of a rebuild and its validation
+costs a scoped re-index on resume, and a change to which sources exist costs a
+full restart. Before a long rebuild, pause what writes to the indexed sources:
+stop the daemon and any external watchers (as above), and hold off on commits,
+checkouts, `git pull`, branch switches, and editor or sync tools (Obsidian
+Sync, iCloud, Dropbox) writing into indexed repositories and vaults until the
+rebuild reports `Publication <uuid> is Activated`. Do not add or remove repositories or
+vaults, or edit the instance configuration, while it runs.
 
 Graph progress is checkpointed after each repository and vault. A retry resumes
-from the first unfinished source, but only when the checkpoint's captured
-content digest still matches. Final source revalidation enumerates every input
+from the first unfinished source; a source whose captured content digest no
+longer matches is re-indexed as described above. Final source revalidation enumerates every input
 again and uses strong filesystem change tokens to avoid rereading unchanged
 files on supported systems; ambiguous or changed metadata always falls back to
 content hashing. Bundle size and BLAKE3 validation stream through a fixed-size

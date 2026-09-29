@@ -13054,6 +13054,8 @@ struct LinkedRebuildFixture {
     _dir: tempfile::TempDir,
     db: std::path::PathBuf,
     config: std::path::PathBuf,
+    alpha: std::path::PathBuf,
+    vault: std::path::PathBuf,
 }
 
 impl LinkedRebuildFixture {
@@ -13120,6 +13122,8 @@ impl LinkedRebuildFixture {
             _dir: dir,
             db,
             config,
+            alpha,
+            vault,
         }
     }
 
@@ -13333,6 +13337,290 @@ fn a_daemon_started_on_a_rebuilt_brain_serves_without_a_code_link_pass() {
         generation_before,
         "the daemon's first pass rewrote links (the graph generation moved)"
     );
+}
+
+impl LinkedRebuildFixture {
+    /// Start a rebuild and stop it right before validation, as an
+    /// interruption would; returns the operation uuid.
+    fn build_until_validation(&self) -> String {
+        let stopped = nestweaver_cmd()
+            .timeout(std::time::Duration::from_secs(300))
+            .env("NESTWEAVER_TEST_STOP_BEFORE_PHASE", "validating")
+            .args(["publication", "rebuild", "--config"])
+            .arg(&self.config)
+            .output()
+            .unwrap();
+        assert_exit(&stopped, 88, "rebuild stopped before validation");
+        operation_uuid_of(&stopped)
+    }
+}
+
+fn symbol_content(
+    db: &std::path::Path,
+) -> std::collections::BTreeMap<String, (String, String, String)> {
+    nestweaver_store::GraphStore::open_read_only(db)
+        .unwrap()
+        .list_all_symbols()
+        .unwrap()
+        .into_iter()
+        .map(|symbol| {
+            (
+                symbol.uid,
+                (symbol.name, symbol.repo_uid, symbol.content_hash),
+            )
+        })
+        .collect()
+}
+
+fn embedding_count_line(stderr: &str, kind: &str) -> Option<usize> {
+    stderr.lines().find_map(|line| {
+        line.strip_prefix("Embedding ")?
+            .strip_suffix(&format!(" {kind}(s) via API (batch size 32)…"))?
+            .parse()
+            .ok()
+    })
+}
+
+/// Sources changed while a rebuild ran (its validation refuses the cutover).
+/// A resume re-indexes only the changed repository into the staged slot,
+/// re-embeds only its changed nodes, rebuilds what derives from the graph,
+/// validates, and publishes a graph equal to a fresh full rebuild.
+#[test]
+fn a_resume_after_source_drift_reindexes_only_the_changed_repository() {
+    let fx = LinkedRebuildFixture::new();
+    let operation = fx.build_until_validation();
+    let root = nestweaver_engine::publication::default_publication_root(&fx.db);
+    let staged = staged_graph_of(&fx.db, &operation);
+    let before = symbol_content(&staged);
+    // The validation refusal a drifted source produces, recorded as the
+    // rebuild records it.
+    let latest =
+        nestweaver_engine::publication_operation::load_operation(&root, &operation).unwrap();
+    nestweaver_engine::publication_operation::record_failure(
+        &root,
+        &operation,
+        latest.revision,
+        "publication_rebuild_failed",
+        "publication sources, configuration, or preserved user state changed during rebuild",
+        true,
+    )
+    .unwrap();
+    let kept_checkpoints = latest.completed_artifacts.len();
+
+    // Edit one symbol in place (same uid, new content), rename one, delete a
+    // file and add one — all in alpha.
+    std::fs::write(
+        fx.alpha.join("src/widget.rs"),
+        "pub struct SharedWidget(u8);\npub struct AlphaGizmo;\n",
+    )
+    .unwrap();
+    std::fs::remove_file(fx.alpha.join("src/extra.rs")).unwrap();
+    std::fs::write(fx.alpha.join("src/added.rs"), "pub fn alpha_added() {}\n").unwrap();
+
+    let resumed = fx.rebuild(&["--operation", &operation]);
+    assert_exit(&resumed, 0, "scoped resume");
+    let stderr = String::from_utf8_lossy(&resumed.stderr).into_owned();
+    let alpha_url = format!("file://{}", fx.alpha.canonicalize().unwrap().display());
+    assert!(
+        stderr.contains("Resume: 1 input(s) changed")
+            && stderr.contains(&format!("re-indexing changed repository {alpha_url}")),
+        "{stderr}"
+    );
+    let indexed: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("[Graph]") && line.contains("indexing"))
+        .collect();
+    assert_eq!(indexed.len(), 1, "only alpha is re-indexed: {indexed:?}");
+    assert!(
+        stderr.contains("[Embeddings] embedding changed nodes"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Publication operation:"),
+        "no new operation: {stderr}"
+    );
+
+    let selected = fx.selected();
+    assert_eq!(selected, staged, "the resumed slot is published");
+    let after = symbol_content(&selected);
+    let changed = after
+        .iter()
+        .filter(|(uid, (_, _, hash))| before.get(*uid).is_none_or(|(_, _, old)| old != hash))
+        .count();
+    assert!(changed >= 3, "the edit changed alpha's symbols: {after:?}");
+    assert!(changed < after.len());
+    assert_eq!(
+        embedding_count_line(&stderr, "symbol"),
+        Some(changed),
+        "exactly the changed symbols are re-embedded: {stderr}"
+    );
+    assert_eq!(embedding_count_line(&stderr, "note"), None, "{stderr}");
+    let state =
+        nestweaver_engine::publication_operation::load_operation(&root, &operation).unwrap();
+    assert!(state.completed_artifacts.len() >= kept_checkpoints);
+
+    // Equal to a fresh full rebuild of the changed sources.
+    let fresh_output = fx.rebuild(&[]);
+    assert_exit(&fresh_output, 0, "fresh rebuild");
+    let fresh = fx.selected();
+    assert_ne!(fresh, selected);
+    let names = |content: &std::collections::BTreeMap<String, (String, String, String)>| {
+        content
+            .iter()
+            .map(|(uid, (name, repo, hash))| {
+                (uid.clone(), name.clone(), repo.clone(), hash.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(&after), names(&symbol_content(&fresh)));
+    let resumed_store = nestweaver_store::GraphStore::open_read_only(&selected).unwrap();
+    let fresh_store = nestweaver_store::GraphStore::open_read_only(&fresh).unwrap();
+    assert!(after.values().any(|(name, _, _)| name == "AlphaGizmo"));
+    assert!(
+        !after
+            .values()
+            .any(|(name, _, _)| name == "alpha_extra" || name == "AlphaGadget")
+    );
+    assert_eq!(
+        resumed_store.count_notes().unwrap(),
+        fresh_store.count_notes().unwrap()
+    );
+    assert_eq!(
+        resumed_store.list_references_code_edges().unwrap(),
+        fresh_store.list_references_code_edges().unwrap()
+    );
+    for uid in after.keys() {
+        assert!(resumed_store.has_embedding(uid), "{uid} has no vector");
+    }
+    assert_eq!(
+        resumed_store.embedding_index_dimension(),
+        fresh_store.embedding_index_dimension()
+    );
+}
+
+/// The vault twin: an edited note re-indexes only its vault, re-embeds only
+/// the changed note, re-stamps the vault's derivation record, and relinks.
+#[test]
+fn a_resume_after_a_vault_edit_reindexes_only_that_vault() {
+    let fx = LinkedRebuildFixture::new();
+    let operation = fx.build_until_validation();
+    std::fs::write(
+        fx.vault.join("Notes/beta.md"),
+        "# Beta\n\nThe BetaGadget ships next, beside the SharedWidget.\n",
+    )
+    .unwrap();
+    let resumed = fx.rebuild(&["--operation", &operation]);
+    assert_exit(&resumed, 0, "scoped resume");
+    let stderr = String::from_utf8_lossy(&resumed.stderr).into_owned();
+    let indexed: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("[Graph]") && line.contains("indexing"))
+        .collect();
+    assert_eq!(
+        indexed,
+        ["[Graph] re-indexing changed vault vault"],
+        "{stderr}"
+    );
+    assert_eq!(embedding_count_line(&stderr, "symbol"), None, "{stderr}");
+    assert_eq!(embedding_count_line(&stderr, "note"), Some(1), "{stderr}");
+
+    let selected = fx.selected();
+    let fresh_output = fx.rebuild(&[]);
+    assert_exit(&fresh_output, 0, "fresh rebuild");
+    let fresh = fx.selected();
+    let resumed_store = nestweaver_store::GraphStore::open_read_only(&selected).unwrap();
+    let fresh_store = nestweaver_store::GraphStore::open_read_only(&fresh).unwrap();
+    assert_eq!(
+        resumed_store.list_references_code_edges().unwrap(),
+        fresh_store.list_references_code_edges().unwrap()
+    );
+    let hashes = |store: &nestweaver_store::GraphStore| {
+        store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .map(|note| (note.uid, note.content_hash))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    assert_eq!(hashes(&resumed_store), hashes(&fresh_store));
+    for note in resumed_store.list_notes(None).unwrap() {
+        assert!(
+            resumed_store.has_embedding(&note.uid),
+            "{} has no vector",
+            note.uid
+        );
+    }
+    let identity = resumed_store.publication_identity().unwrap().unwrap();
+    let records = nestweaver_engine::markdown_derivation::load_records(
+        &selected,
+        &nestweaver_engine::markdown_derivation::expectation(&identity, "linked"),
+    )
+    .unwrap()
+    .unwrap();
+    let record = records.vaults.values().next().unwrap();
+    assert_eq!(
+        record.phase,
+        nestweaver_engine::markdown_derivation::DerivationPhase::Current
+    );
+    assert_eq!(
+        record.witness.as_ref().unwrap().source_inventory_digest,
+        nestweaver_engine::markdown_derivation::inventory_digest(
+            &resumed_store.list_notes(None).unwrap()
+        )
+    );
+}
+
+/// A change resume cannot scope — the configuration, or which sources exist —
+/// falls back to a full rebuild under a new operation, and says why.
+#[test]
+fn a_resume_restarts_in_full_when_the_change_cannot_be_scoped() {
+    let fx = LinkedRebuildFixture::new();
+    let root = nestweaver_engine::publication::default_publication_root(&fx.db);
+
+    let operation = fx.build_until_validation();
+    let mut config = std::fs::read_to_string(&fx.config).unwrap();
+    config.push_str("# edited while the rebuild ran\n");
+    std::fs::write(&fx.config, config).unwrap();
+    let resumed = fx.rebuild(&["--operation", &operation]);
+    assert_exit(&resumed, 0, "resume after a configuration change");
+    let stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert!(
+        stderr.contains(
+            "Resume cannot re-index only what changed: the instance configuration changed"
+        ) && stderr.contains(&format!("Discarding operation {operation}")),
+        "{stderr}"
+    );
+    let restarted = operation_uuid_of(&resumed);
+    assert_ne!(restarted, operation);
+    assert!(nestweaver_engine::publication_operation::load_operation(&root, &operation).is_err());
+    assert!(!stderr.contains("re-indexing changed"), "{stderr}");
+    assert_eq!(fx.selected(), staged_graph_of(&fx.db, &restarted));
+
+    // A repository added to the incumbent while the next rebuild ran.
+    let operation = fx.build_until_validation();
+    let gamma = fx.alpha.parent().unwrap().join("gamma");
+    std::fs::create_dir_all(gamma.join("src")).unwrap();
+    std::fs::write(gamma.join("src/lib.rs"), "pub fn gamma_signal() {}\n").unwrap();
+    nestweaver_cmd()
+        .args(["index", "--config"])
+        .arg(&fx.config)
+        .arg("--repo")
+        .arg(&gamma)
+        .assert()
+        .success();
+    let resumed = fx.rebuild(&["--operation", &operation]);
+    assert_exit(&resumed, 0, "resume after a repository was added");
+    let stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert!(
+        stderr.contains("Resume cannot re-index only what changed: repository")
+            && stderr.contains("gamma was added"),
+        "{stderr}"
+    );
+    let names: Vec<String> = symbol_content(&fx.selected())
+        .into_values()
+        .map(|(name, _, _)| name)
+        .collect();
+    assert!(names.contains(&"gamma_signal".to_string()), "{names:?}");
 }
 
 /// A minimal OpenAI-compatible `/v1/embeddings` endpoint on loopback, so a

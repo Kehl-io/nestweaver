@@ -29641,12 +29641,36 @@ fn run_publication_rebuild(
     let incumbent_identity = incumbent_store
         .publication_identity()?
         .ok_or_else(|| anyhow::anyhow!("incumbent database has no publication identity"))?;
-    let sources = nestweaver_engine::PublicationSourceManifest::capture(&incumbent_store)?;
+    // A resume reuses the recorded per-file digests wherever a strong change
+    // token proves the file is unchanged, so only changed files are reread.
+    let recorded_inputs = operation_uuid.and_then(|operation_uuid| {
+        nestweaver_engine::publication_operation::load_operation_inputs(
+            &publication_root,
+            operation_uuid,
+        )
+    });
+    let sources = match recorded_inputs.as_ref() {
+        Some(recorded) => recorded
+            .sources
+            .recapture_for_validation(&incumbent_store)?,
+        None => nestweaver_engine::PublicationSourceManifest::capture(&incumbent_store)?,
+    };
     let preserved_state =
         nestweaver_engine::publication_state::PreservedStateSnapshot::capture(&incumbent_db)?;
     let preserved_state_fingerprint = preserved_state.fingerprint()?;
     let input_fingerprint =
         publication_input_fingerprint(&sources, config_path, &preserved_state_fingerprint)?;
+    let config_blake3 = nestweaver_engine::hash::blake3_hex_bytes(
+        &std::fs::read(config_path)
+            .with_context(|| format!("read publication config {}", config_path.display()))?,
+    );
+    let current_inputs = nestweaver_engine::publication_operation::PublicationOperationInputs {
+        version: nestweaver_engine::publication_operation::OPERATION_INPUTS_VERSION,
+        input_fingerprint: input_fingerprint.clone(),
+        config_blake3,
+        preserved_state_fingerprint: preserved_state_fingerprint.clone(),
+        sources: sources.clone(),
+    };
     drop(incumbent_store);
     let current = nestweaver_engine::publication::read_current(&publication_root)?;
     if let Some(current) = current.as_ref()
@@ -29660,6 +29684,35 @@ fn run_publication_rebuild(
         );
     }
 
+    let create_operation = || -> anyhow::Result<
+        nestweaver_engine::publication_operation::PublicationOperationState,
+    > {
+        let target = incumbent_identity.next_publication()?;
+        let plan = nestweaver_engine::publication_operation::PublicationOperationPlan {
+            operation_uuid: uuid::Uuid::new_v4().to_string(),
+            brain_uuid: incumbent_identity.brain_uuid.clone(),
+            target_publication_uuid: target.publication_uuid,
+            expected_current_publication_uuid: current
+                .as_ref()
+                .map(|pointer| pointer.publication_uuid.clone()),
+            input_fingerprint: input_fingerprint.clone(),
+            producer_version: env!("CARGO_PKG_VERSION").to_string(),
+            publication_format_version: nestweaver_engine::snapshot::SNAPSHOT_FORMAT_VERSION,
+            created_unix_millis: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis()
+                .try_into()?,
+        };
+        let created =
+            nestweaver_engine::publication_operation::create_operation(&publication_root, plan)?;
+        eprintln!("Publication operation: {}", created.plan.operation_uuid);
+        nestweaver_engine::publication_operation::write_operation_inputs(
+            &publication_root,
+            &created.plan.operation_uuid,
+            &current_inputs,
+        )?;
+        Ok(created)
+    };
     let mut state = if let Some(operation_uuid) = operation_uuid {
         let loaded = nestweaver_engine::publication_operation::load_operation(
             &publication_root,
@@ -29669,6 +29722,11 @@ fn run_publication_rebuild(
         requested.input_fingerprint = input_fingerprint.clone();
         requested.producer_version = env!("CARGO_PKG_VERSION").to_string();
         requested.publication_format_version = nestweaver_engine::snapshot::SNAPSHOT_FORMAT_VERSION;
+        let inputs_drifted = loaded.plan.input_fingerprint != input_fingerprint
+            && loaded.plan.producer_version == requested.producer_version
+            && loaded.plan.publication_format_version == requested.publication_format_version
+            && !loaded.cancel_requested
+            && nestweaver_engine::publication_operation::phase_accepts_rescope(loaded.phase);
         if loaded.cancel_requested {
             let cancelled = nestweaver_engine::publication_operation::acknowledge_cancel(
                 &publication_root,
@@ -29684,6 +29742,111 @@ fn run_publication_rebuild(
                 );
             }
             return Ok(EXIT_ERROR);
+        } else if inputs_drifted {
+            let slot = nestweaver_engine::publication::slot_path(
+                &publication_root,
+                &loaded.plan.target_publication_uuid,
+            )?;
+            let scope = match recorded_inputs.as_ref() {
+                _ if slot
+                    .join(nestweaver_engine::publication::PUBLICATION_MANIFEST_FILE)
+                    .exists() =>
+                {
+                    nestweaver_engine::publication_operation::ResumeScope::Restart(
+                        "its staged publication is already sealed".to_string(),
+                    )
+                }
+                Some(recorded) if recorded.input_fingerprint == loaded.plan.input_fingerprint => {
+                    nestweaver_engine::publication_operation::plan_resume_scope(
+                        recorded,
+                        &sources,
+                        &current_inputs.config_blake3,
+                        &preserved_state_fingerprint,
+                    )
+                }
+                _ => nestweaver_engine::publication_operation::ResumeScope::Restart(
+                    "it has no record of the inputs it was built from".to_string(),
+                ),
+            };
+            match scope {
+                nestweaver_engine::publication_operation::ResumeScope::Restart(reason) => {
+                    eprintln!(
+                        "Resume cannot re-index only what changed: {reason}. Discarding operation {} and starting a full rebuild.",
+                        loaded.plan.operation_uuid
+                    );
+                    let latest = if loaded.failure.is_none() {
+                        nestweaver_engine::publication_operation::record_failure(
+                            &publication_root,
+                            &loaded.plan.operation_uuid,
+                            loaded.revision,
+                            "publication_inputs_changed",
+                            format!("resume could not be scoped: {reason}"),
+                            false,
+                        )?
+                    } else {
+                        loaded
+                    };
+                    nestweaver_engine::publication_operation::discard_operation(
+                        &publication_root,
+                        &latest.plan.operation_uuid,
+                        latest.revision,
+                        &root_lock,
+                    )?;
+                    create_operation()?
+                }
+                nestweaver_engine::publication_operation::ResumeScope::Unchanged => {
+                    anyhow::bail!(
+                        "publication inputs changed in a way resume cannot attribute to a source; discard operation {} and rebuild",
+                        loaded.plan.operation_uuid
+                    );
+                }
+                nestweaver_engine::publication_operation::ResumeScope::Rescope {
+                    repos,
+                    vaults,
+                    preserved_state_changed,
+                } => {
+                    let mut invalidated = Vec::new();
+                    let mut names = Vec::new();
+                    for repo in sources
+                        .repos
+                        .iter()
+                        .filter(|repo| repos.contains(&repo.uid))
+                    {
+                        invalidated.push(publication_graph_checkpoint("repo", &repo.uid));
+                        names.push(format!("repository {}", repo.url));
+                    }
+                    for vault in sources
+                        .vaults
+                        .iter()
+                        .filter(|vault| vaults.contains(&vault.uid))
+                    {
+                        invalidated.push(publication_graph_checkpoint("vault", &vault.uid));
+                        names.push(format!("vault {}", vault.name));
+                    }
+                    if preserved_state_changed {
+                        names.push("preserved interaction history".to_string());
+                    }
+                    eprintln!(
+                        "Resume: {} input(s) changed since the build recorded them ({}); re-indexing only those, then rebuilding derived state and validating.",
+                        names.len(),
+                        names.join(", ")
+                    );
+                    // Record the new inputs first: a crash before the journal
+                    // update leaves a record the journal does not match, which
+                    // a later resume treats as unscoped (full rebuild).
+                    nestweaver_engine::publication_operation::write_operation_inputs(
+                        &publication_root,
+                        &loaded.plan.operation_uuid,
+                        &current_inputs,
+                    )?;
+                    nestweaver_engine::publication_operation::rescope_operation(
+                        &publication_root,
+                        &requested,
+                        loaded.revision,
+                        &invalidated,
+                    )?
+                }
+            }
         } else if loaded.failure.is_some() {
             nestweaver_engine::publication_operation::resume_operation(
                 &publication_root,
@@ -29695,26 +29858,7 @@ fn run_publication_rebuild(
             loaded
         }
     } else {
-        let target = incumbent_identity.next_publication()?;
-        let plan = nestweaver_engine::publication_operation::PublicationOperationPlan {
-            operation_uuid: uuid::Uuid::new_v4().to_string(),
-            brain_uuid: incumbent_identity.brain_uuid.clone(),
-            target_publication_uuid: target.publication_uuid,
-            expected_current_publication_uuid: current
-                .as_ref()
-                .map(|pointer| pointer.publication_uuid.clone()),
-            input_fingerprint,
-            producer_version: env!("CARGO_PKG_VERSION").to_string(),
-            publication_format_version: nestweaver_engine::snapshot::SNAPSHOT_FORMAT_VERSION,
-            created_unix_millis: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_millis()
-                .try_into()?,
-        };
-        let created =
-            nestweaver_engine::publication_operation::create_operation(&publication_root, plan)?;
-        eprintln!("Publication operation: {}", created.plan.operation_uuid);
-        created
+        create_operation()?
     };
     let operation_uuid = state.plan.operation_uuid.clone();
     let slot = nestweaver_engine::publication::slot_path(
@@ -29798,12 +29942,21 @@ fn run_publication_rebuild(
                             }
                             continue;
                         }
+                        // A source the slot already holds is being
+                        // re-indexed (a scoped resume, or a retry after an
+                        // interruption): remember its nodes' content so the
+                        // ones whose content changed are re-embedded.
+                        let staged_before = staged_source_content(&target_db, "repo", &repo.uid)?;
                         state = publication_progress(
                             &publication_root,
                             &state,
                             completed,
                             total,
-                            format!("indexing repository {}", repo.url),
+                            if staged_before.is_some() {
+                                format!("re-indexing changed repository {}", repo.url)
+                            } else {
+                                format!("indexing repository {}", repo.url)
+                            },
                         )?;
                         let indexed_sha = repo.observed_head.as_deref().unwrap_or("local");
                         // The same per-repository directory policy an
@@ -29830,6 +29983,9 @@ fn run_publication_rebuild(
                             &target_db,
                             &opts,
                         )?;
+                        if let Some(before) = staged_before {
+                            invalidate_changed_embeddings(&target_db, "repo", &repo.uid, &before)?;
+                        }
                         state = nestweaver_engine::publication_operation::record_artifact(
                             &publication_root,
                             &operation_uuid,
@@ -29866,12 +30022,18 @@ fn run_publication_rebuild(
                             }
                             continue;
                         }
+                        let staged_before =
+                            staged_source_content(&target_db, "vault", &vault.uid)?;
                         state = publication_progress(
                             &publication_root,
                             &state,
                             completed,
                             total,
-                            format!("indexing vault {}", vault.name),
+                            if staged_before.is_some() {
+                                format!("re-indexing changed vault {}", vault.name)
+                            } else {
+                                format!("indexing vault {}", vault.name)
+                            },
                         )?;
                         let indexed = index_markdown_directory_with_ignore_and_note_limits(
                             Path::new(&vault.root_path),
@@ -29891,6 +30053,9 @@ fn run_publication_rebuild(
                             &[],
                             config.indexing.note_limits().max_note_bytes(),
                         )?;
+                        if let Some(before) = staged_before {
+                            invalidate_changed_embeddings(&target_db, "vault", &vault.uid, &before)?;
+                        }
                         state = nestweaver_engine::publication_operation::record_artifact(
                             &publication_root,
                             &operation_uuid,
@@ -30005,8 +30170,22 @@ fn run_publication_rebuild(
                         "build the staged regex index",
                     )?;
                     let store = GraphStore::open_with_authority(&target_db, &authority)?;
-                    store.rebuild_trigram_index()?;
+                    // After one complete build, a resume over changed sources
+                    // refreshes only the scopes whose candidate digest moved.
+                    let complete_regex = !state
+                        .completed_artifacts
+                        .contains_key(PUBLICATION_REGEX_CHECKPOINT);
+                    store.refresh_trigram_index(complete_regex)?;
                     drop(store);
+                    if complete_regex {
+                        state = nestweaver_engine::publication_operation::record_artifact(
+                            &publication_root,
+                            &operation_uuid,
+                            state.revision,
+                            PUBLICATION_REGEX_CHECKPOINT.to_string(),
+                            nestweaver_engine::hash::blake3_hex(&state.plan.target_publication_uuid),
+                        )?;
+                    }
                     state = nestweaver_engine::publication_operation::advance_phase(
                         &publication_root,
                         &operation_uuid,
@@ -30015,12 +30194,22 @@ fn run_publication_rebuild(
                     )?;
                 }
                 PublicationPhase::Embeddings => {
+                    // After one complete re-embed, a resume over changed
+                    // sources embeds only nodes without a vector: the changed
+                    // ones, whose vectors the graph phase invalidated.
+                    let complete_embed = !state
+                        .completed_artifacts
+                        .contains_key(PUBLICATION_EMBEDDINGS_CHECKPOINT);
                     state = publication_progress(
                         &publication_root,
                         &state,
                         0,
                         0,
-                        "re-embedding the complete staged corpus".to_string(),
+                        if complete_embed {
+                            "re-embedding the complete staged corpus".to_string()
+                        } else {
+                            "embedding changed nodes".to_string()
+                        },
                     )?;
                     let accelerator = Some(match config.embedding.accelerator {
                         nestweaver_engine::config::EmbeddingAccelerator::Auto => CliEmbeddingAccelerator::Auto,
@@ -30046,7 +30235,7 @@ fn run_publication_rebuild(
                         if external.is_none() { accelerator } else { None },
                         batch_size,
                         "all",
-                        true,
+                        complete_embed,
                         false,
                         true,
                         false,
@@ -30055,6 +30244,27 @@ fn run_publication_rebuild(
                     )?;
                     if exit != EXIT_SUCCESS {
                         anyhow::bail!("complete publication re-embed reported failures");
+                    }
+                    // A pass over an existing base (an incremental resume,
+                    // or a retry after an interrupted embed) journals its
+                    // vectors over that base; the slot seals one
+                    // self-contained base bound to the current generation.
+                    {
+                        let authority = acquire_publication_write_authority(
+                            &target_db,
+                            "compact the staged embeddings",
+                        )?;
+                        GraphStore::open_with_authority(&target_db, &authority)?
+                            .compact_embedding_index()?;
+                    }
+                    if complete_embed {
+                        state = nestweaver_engine::publication_operation::record_artifact(
+                            &publication_root,
+                            &operation_uuid,
+                            state.revision,
+                            PUBLICATION_EMBEDDINGS_CHECKPOINT.to_string(),
+                            nestweaver_engine::hash::blake3_hex(&state.plan.target_publication_uuid),
+                        )?;
                     }
                     state = nestweaver_engine::publication_operation::advance_phase(
                         &publication_root,
@@ -30275,6 +30485,76 @@ fn run_publication_rebuild(
     )
 }
 
+/// Content hash of every embeddable node of one source in the staged graph —
+/// a repository's symbols, or a vault's notes and headings — or `None` when
+/// the slot does not hold that source yet.
+fn staged_source_content(
+    target_db: &Path,
+    kind: &str,
+    source_uid: &str,
+) -> anyhow::Result<Option<std::collections::HashMap<String, String>>> {
+    if !target_db.exists() {
+        return Ok(None);
+    }
+    let store = GraphStore::open_read_only(target_db)
+        .map_err(|error| anyhow::anyhow!("open staged graph: {error}"))?;
+    let mut content = std::collections::HashMap::new();
+    if kind == "repo" {
+        if store.lookup_repo(source_uid)?.is_none() {
+            return Ok(None);
+        }
+        for symbol in store.list_all_symbols()? {
+            if symbol.repo_uid == source_uid {
+                content.insert(symbol.uid, symbol.content_hash);
+            }
+        }
+    } else {
+        if !store
+            .list_vaults(None)?
+            .iter()
+            .any(|vault| vault.uid == source_uid)
+        {
+            return Ok(None);
+        }
+        for note in store.list_notes(Some(source_uid))? {
+            content.insert(note.uid, note.content_hash);
+        }
+        for heading in store.list_headings_by_vault(source_uid)? {
+            content.insert(heading.uid, heading.content_hash);
+        }
+    }
+    Ok(Some(content))
+}
+
+/// After re-indexing a source into the staged slot, tombstone the embeddings
+/// of its nodes whose content changed (or that disappeared), so the resumed
+/// embedding phase — which only fills missing vectors — re-embeds exactly the
+/// changed nodes. Unchanged nodes keep their vectors.
+fn invalidate_changed_embeddings(
+    target_db: &Path,
+    kind: &str,
+    source_uid: &str,
+    before: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<()> {
+    let after = staged_source_content(target_db, kind, source_uid)?.unwrap_or_default();
+    let changed: Vec<String> = before
+        .iter()
+        .filter(|(uid, hash)| after.get(*uid) != Some(*hash))
+        .map(|(uid, _)| uid.clone())
+        .collect();
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let authority =
+        acquire_publication_write_authority(target_db, "invalidate changed embeddings")?;
+    let store = GraphStore::open_with_authority(target_db, &authority)?;
+    let removed = store.tombstone_embeddings(&changed)?;
+    if removed > 0 {
+        eprintln!("Invalidated {removed} embedding(s) of changed or removed nodes.");
+    }
+    Ok(())
+}
+
 /// Build every note's code links in the staged graph with the machinery the
 /// daemon settles code-link debt with: the same project repo membership
 /// rebuild, then the same reconciler with the same project folders. The
@@ -30413,6 +30693,11 @@ fn publication_progress(
         },
     )
 }
+
+/// Journal checkpoint: the staged slot completed one full re-embed.
+const PUBLICATION_EMBEDDINGS_CHECKPOINT: &str = "embeddings/complete.done";
+/// Journal checkpoint: the staged slot completed one full regex build.
+const PUBLICATION_REGEX_CHECKPOINT: &str = "regex/complete.done";
 
 fn publication_graph_checkpoint(kind: &str, source_uid: &str) -> String {
     format!(
