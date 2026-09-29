@@ -51,20 +51,38 @@ refuses any older snapshot with a message naming the rebuild. `backup restore`
 of an archive written before the upgrade still restores it unchanged, and
 warns that the restored database must be rebuilt before use.
 
-The same release changes three crash-recovery behaviours:
+`publication rollback` cannot select a predecessor built by an older storage
+engine: this version refuses to open it. To roll back across the upgrade,
+reinstall the previous NestWeaver version and restore the backup you took
+before rebuilding. If a database built by an older engine was left mid-way
+through a checkpoint (a `<db>.wal.checkpoint` or `<db>.shadow` beside it),
+open it once with the previous NestWeaver version to finish that checkpoint,
+then back it up and rebuild.
+
+The same release changes these crash-recovery behaviours:
 
 * A stale `<db>.wal.checkpoint` from another database is now renamed to
   `<db>.wal.checkpoint.stale-<epoch>`, never deleted.
 * A frozen `<db>.wal.checkpoint` whose pages were already applied before a
-  crash (its `<db>.shadow` is gone) is reported with the single safe move,
+  crash (its `<db>.shadow` is gone or empty) is reported, by the daemon's
+  preflight as well as by any open, with the single safe move,
   `mv <db>.wal.checkpoint <db>.wal.checkpoint.applied`. Leave `<db>.wal` in
-  place: it holds later commits. Nothing is moved automatically.
-* A recovery that runs out of disk space or buffer pool while finishing an
-  interrupted checkpoint is reported as a resource problem, not corruption.
-  Free space (or raise `NESTWEAVER_LBUG_BUFFER_POOL_BYTES`) and open again; do
-  not move log files aside. A write whose post-commit checkpoint is deferred is
-  reported as committed and is never retried; restart the daemon so recovery
-  finishes the checkpoint.
+  place: it holds later commits. Keep the `.applied` file: after a power loss
+  (not just a crash) it may still hold committed records. Nothing is moved
+  automatically.
+* A recovery that cannot finish an interrupted checkpoint keeps the frozen
+  log and retries on the next open. It is reported as a resource problem only
+  when the engine's cause is a full buffer pool or disk (free space, or raise
+  `NESTWEAVER_LBUG_BUFFER_POOL_BYTES`); any other cause is shown as the engine
+  wrote it. Either way, do not move log files aside.
+* A write whose post-commit checkpoint the engine defers is reported as
+  committed and is never retried. The daemon reopens the store by itself to
+  finish the checkpoint (`brain_status` shows `store_reopen_pending` until it
+  does). If reads keep the store busy for about a minute, it briefly holds off
+  new reads so the reopen can happen.
+* A daemon whose selected publication was left mid-checkpoint now boots and
+  finishes the checkpoint itself; resolving `CURRENT` no longer needs a
+  read-only open that such a slot refuses.
 
 ## Upgrade
 
