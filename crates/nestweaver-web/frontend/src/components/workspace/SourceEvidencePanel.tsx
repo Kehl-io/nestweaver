@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { FileText, Link2, SearchCode } from "lucide-react";
 import { api } from "../../api/client";
 import { isFileSelection, isNoteSelection, isSymbolKind } from "../../api/kinds";
@@ -9,6 +9,9 @@ import { NodeActionBar } from "../actions/NodeActionBar";
 import { CodePreview } from "../detail/CodePreview";
 import { RepoPicker } from "../detail/RepoPicker";
 import { KindBadge } from "../shared/KindBadge";
+import { NodeNotFound } from "../shared/NodeNotFound";
+import { fetchSymbol, isNotFoundError } from "../../api/symbolQuery";
+import { useSymbolQueryGeneration } from "../../hooks/useSymbolQuery";
 
 interface SourceEvidencePanelProps {
   compact?: boolean;
@@ -48,12 +51,15 @@ export function SourceEvidencePanel({
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
   const graphInstance = useStore((s) => s.graphInstance);
   const detailFocus = useStore((s) => s.detailFocus);
+  // Re-read the selection after a graph update drops the shared cache.
+  const symbolGeneration = useSymbolQueryGeneration();
   const [symbolDetail, setSymbolDetail] = useState<SymbolDetail | null>(null);
   const [noteDetail, setNoteDetail] = useState<NoteDetail | null>(null);
   const [fileSymbols, setFileSymbols] = useState<SymbolCandidate[]>([]);
   const [fileSource, setFileSource] = useState<SourceResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [missing, setMissing] = useState(false);
   // Kept across the refetch a pick triggers; applies only to its own path.
   const [repoChoice, setRepoChoice] = useState<FileRepoChoice | null>(null);
   const fileChoice = repoChoice && repoChoice.path === selectedNodeId ? repoChoice : null;
@@ -94,13 +100,27 @@ export function SourceEvidencePanel({
     setRepoChoice(null);
   }, [selectedNodeId]);
 
+  // The selection the shown evidence belongs to. A re-run for the same key
+  // (a graph update bumped symbolGeneration) revalidates in the background:
+  // the current evidence stays up until the fresh result replaces it.
+  const loadedKeyRef = useRef<string | null>(null);
+
   useEffect(() => {
     const controller = new AbortController();
-    setSymbolDetail(null);
-    setNoteDetail(null);
-    setFileSymbols([]);
-    setFileSource(null);
-    setError(null);
+    const key = `${selectedNodeId ?? ""}|${selectedNodeKind ?? ""}|${pickedRepo ?? ""}`;
+    const revalidating = loadedKeyRef.current === key;
+    loadedKeyRef.current = key;
+    const startLoading = () => {
+      if (!revalidating) setLoading(true);
+    };
+    if (!revalidating) {
+      setSymbolDetail(null);
+      setNoteDetail(null);
+      setFileSymbols([]);
+      setFileSource(null);
+      setError(null);
+      setMissing(false);
+    }
 
     if (!selectedNodeId) {
       setLoading(false);
@@ -113,14 +133,20 @@ export function SourceEvidencePanel({
       useStore.getState().selectedNodeId === requestedUid;
 
     if (isSymbolLike(selectedNodeId, selectedNodeKind)) {
-      setLoading(true);
-      api
-        .symbol(selectedNodeId, { signal: controller.signal })
+      startLoading();
+      fetchSymbol(selectedNodeId)
         .then((detail) => {
-          if (isCurrent()) setSymbolDetail(detail);
+          if (!isCurrent()) return;
+          setSymbolDetail(detail);
+          setMissing(false);
+          setError(null);
         })
         .catch((e) => {
-          if (isCurrent()) {
+          if (!isCurrent()) return;
+          if (isNotFoundError(e)) {
+            setSymbolDetail(null);
+            setMissing(true);
+          } else {
             setError(e instanceof Error ? e.message : "Symbol evidence is unavailable.");
           }
         })
@@ -131,11 +157,13 @@ export function SourceEvidencePanel({
     }
 
     if (isNoteLike(selectedNodeId, selectedNodeKind)) {
-      setLoading(true);
+      startLoading();
       api
         .brainNote(selectedNodeId, { signal: controller.signal })
         .then((detail) => {
-          if (isCurrent()) setNoteDetail(detail);
+          if (!isCurrent()) return;
+          setNoteDetail(detail);
+          setError(null);
         })
         .catch((e) => {
           if (isCurrent()) {
@@ -149,7 +177,7 @@ export function SourceEvidencePanel({
     }
 
     if (isFileLike(selectedNodeId, selectedNodeKind)) {
-      setLoading(true);
+      startLoading();
       // Symbols populate the list; /source resolves path ownership, including
       // repos that index the file without finding any symbols in it.
       const path = selectedNodeId;
@@ -173,6 +201,7 @@ export function SourceEvidencePanel({
           if (controller.signal.aborted) return;
           setFileSymbols(symbols);
           setFileSource(source);
+          setError(null);
           const ambiguous = ambiguousCandidates(sourceError);
           if (ambiguous) setRepoChoice({ path, candidates: ambiguous });
           if (symbols.length === 0 && (!source || !source.lines?.length)) {
@@ -192,7 +221,7 @@ export function SourceEvidencePanel({
 
     setLoading(false);
     return () => controller.abort();
-  }, [selectedNodeId, selectedNodeKind, pickedRepo]);
+  }, [selectedNodeId, selectedNodeKind, pickedRepo, symbolGeneration]);
 
   const pickRepo = (uid: string, candidates: string[]) => {
     if (selectedNodeId) setRepoChoice({ path: selectedNodeId, candidates, repo: uid });
@@ -221,8 +250,9 @@ export function SourceEvidencePanel({
     graphEvidence?.startLine ??
     null;
   const fileLabel = selectedNodeId?.split("/").pop() ?? selectedNodeId;
-  const label =
-    symbol?.name ??
+  const label = missing
+    ? selectedNodeId?.split(":").pop() || selectedNodeId || "Node not found"
+    : symbol?.name ??
     note?.title ??
     (hasFileEvidence ? fileLabel : null) ??
     graphEvidence?.label ??
@@ -250,7 +280,7 @@ export function SourceEvidencePanel({
         </div>
         {selectedNodeId && (
           <NodeActionBar
-            node={{ uid: selectedNodeId, kind, label }}
+            node={{ uid: selectedNodeId, kind, label, missing }}
             ids={["open", "related", "trace", "copyLink"]}
             compact
             className="mt-3"
@@ -264,6 +294,8 @@ export function SourceEvidencePanel({
             Select a node to inspect source spans, note excerpts, or an explicit
             no-evidence state.
           </div>
+        ) : missing ? (
+          <NodeNotFound uid={selectedNodeId} compact />
         ) : loading && fileChoice ? (
           // nw-683: keep the picker mounted during the refetch a pick
           // triggers so the pressed button doesn't lose focus.

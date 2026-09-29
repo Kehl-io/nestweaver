@@ -1,6 +1,7 @@
 import type { StateCreator } from "zustand";
 import type { ActiveLensState } from "../api/p1Types";
 import type { StoreState } from "./index";
+import { setLiveMessage } from "./notificationSlice";
 import type {
   BacklinkRow,
   BrainContextResult,
@@ -122,6 +123,19 @@ function flattenFlowTree(node: FlowNode): string[] {
   return uids;
 }
 
+function contextUids(snapshot: BrainContextResult): Set<string> {
+  return new Set([...snapshot.seeds, ...snapshot.connected].map((node) => node.uid));
+}
+
+/** Screen-reader summary of a finished Compare (nw-593). */
+function compareAnnouncement(a: BrainContextResult | null, b: BrainContextResult): string {
+  const uidsB = contextUids(b);
+  if (!a) return `Compare ready: ${uidsB.size} nodes in the second context.`;
+  const uidsA = contextUids(a);
+  const shared = [...uidsA].filter((uid) => uidsB.has(uid)).length;
+  return `Compare ready: ${shared} shared, ${uidsA.size - shared} only in A, ${uidsB.size - shared} only in B.`;
+}
+
 function pathRequestMatches(state: StoreState, request?: PathRequest): boolean {
   if (!request) return true;
   return (
@@ -218,6 +232,12 @@ export const createAnalysisSlice: StateCreator<
       s.pathStatus = results.length > 0 ? "success" : "empty";
       s.pathError = null;
       s.selectedPathIndex = 0;
+      setLiveMessage(
+        s,
+        results.length > 0
+          ? `Found ${results.length} path${results.length === 1 ? "" : "s"}.`
+          : "No path was found between these nodes.",
+      );
     }),
 
   setPathError: (error, request) =>
@@ -227,6 +247,7 @@ export const createAnalysisSlice: StateCreator<
       s.pathStatus = "error";
       s.pathError = error;
       s.selectedPathIndex = 0;
+      setLiveMessage(s, `Path query failed. ${error}`);
     }),
 
   isCurrentPathRequest: (request) => pathRequestMatches(get(), request),
@@ -269,6 +290,10 @@ export const createAnalysisSlice: StateCreator<
     set((s) => {
       s.diffState.snapshotB = snapshotB;
       s.diffState.seedsB = seedsB;
+      setLiveMessage(
+        s,
+        compareAnnouncement(s.diffState.snapshotA as BrainContextResult | null, snapshotB),
+      );
     }),
 
   clearDiff: () =>

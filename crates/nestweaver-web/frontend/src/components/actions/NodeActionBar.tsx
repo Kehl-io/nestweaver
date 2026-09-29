@@ -31,6 +31,7 @@ export function NodeActionBar({
   return (
     <div
       className={`${layoutClass} gap-1.5 ${compact ? "text-[11px]" : "text-xs"} ${className}`}
+      role="group"
       aria-label="Node actions"
     >
       {actions.map((action) => {

@@ -266,6 +266,7 @@ function CameraFitController({
 }) {
   const camera = useThree((s) => s.camera);
   const controls = useThree((s) => s.controls);
+  const gl = useThree((s) => s.gl);
   const graphKey = useMemo(
     () => buffers.indexToUid.join("\u0000"),
     [buffers.indexToUid],
@@ -280,13 +281,36 @@ function CameraFitController({
     if (canvasSize.width <= 0 || canvasSize.height <= 0) return;
     const fitKey = `${graphKey}:${canvasSize.width}x${canvasSize.height}:${cameraFitRequestId}`;
     if (fittedKeyRef.current === fitKey) return;
+    // Read, not subscribed: only a fit request (or a new graph/size) refits.
+    const cameraFitUids = useStore.getState().cameraFitUids;
+
+    // nw-572: a fit target frames those nodes plus their neighbours (a repo
+    // hub and its members); with no target, or none of it in this graph,
+    // frame everything.
+    let fitIndices: number[] | null = null;
+    if (cameraFitUids) {
+      const graph = useStore.getState().graphInstance;
+      const wanted = new Set<string>();
+      for (const uid of cameraFitUids) {
+        if (!graph?.hasNode(uid)) continue;
+        wanted.add(uid);
+        graph.forEachNeighbor(uid, (neighbor) => wanted.add(neighbor));
+      }
+      const indices: number[] = [];
+      buffers.indexToUid.forEach((uid, index) => {
+        if (index < buffers.nodeCount && wanted.has(uid)) indices.push(index);
+      });
+      if (indices.length > 0) fitIndices = indices;
+    }
 
     let minX = Infinity;
     let maxX = -Infinity;
     let minY = Infinity;
     let maxY = -Infinity;
 
-    for (let i = 0; i < buffers.nodeCount; i++) {
+    const fitCount = fitIndices ? fitIndices.length : buffers.nodeCount;
+    for (let n = 0; n < fitCount; n++) {
+      const i = fitIndices ? fitIndices[n] : n;
       const x = buffers.positions[i * 3];
       const y = buffers.positions[i * 3 + 1];
       const radius = (buffers.sizes[i] || 6) * 1.6 + 28;
@@ -300,8 +324,13 @@ function CameraFitController({
 
     // The Start Here shelf overlays the canvas's left ~340px in the panels
     // overview — widen the left bound so the constellation centers in the
-    // *unobscured* area instead of hiding behind the card
-    if (graphMode === "overview" && layoutMode !== "zen") {
+    // *unobscured* area instead of hiding behind the card. The shelf is
+    // dismissed while a node is selected (nw-572), so no offset then.
+    if (
+      graphMode === "overview" &&
+      layoutMode !== "zen" &&
+      !useStore.getState().selectedNodeId
+    ) {
       const overlayPx = Math.min(340, canvasSize.width * 0.4);
       const visiblePx = Math.max(canvasSize.width - overlayPx, 1);
       minX -= (maxX - minX) * (overlayPx / visiblePx);
@@ -322,7 +351,9 @@ function CameraFitController({
     (controls as any).target.set(centerX, centerY, 0);
     (controls as any).update?.();
     fittedKeyRef.current = fitKey;
-  }, [buffers, cameraFitRequestId, canvasSize.height, canvasSize.width, camera, controls, graphKey, graphMode, layoutMode]);
+    // Observable fit target, for tests and debugging.
+    gl.domElement.dataset.cameraFit = fitIndices && cameraFitUids ? cameraFitUids.join(",") : "all";
+  }, [buffers, cameraFitRequestId, canvasSize.height, canvasSize.width, camera, controls, gl, graphKey, graphMode, layoutMode]);
 
   return null;
 }

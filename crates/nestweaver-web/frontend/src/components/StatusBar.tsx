@@ -60,22 +60,35 @@ export function StatusBar() {
       >
         {sseConnected ? "● Live" : "○ Static"}
       </span>
-      {wasm.enabled && (
-        <span
-          className={
-            wasm.ready
-              ? "text-[var(--color-graph-selection)]"
+      <span
+        role="status"
+        aria-label="Graph engine"
+        data-syncs={wasm.syncs}
+        className={
+          wasm.mode === "wasm" && wasm.status === "ready"
+            ? "text-[var(--color-graph-selection)]"
+            : wasm.status === "error"
+              ? "text-amber-400"
               : "text-[var(--color-text-muted)]"
-          }
-          title={
-            wasm.ready
+        }
+        title={
+          wasm.mode === "server"
+            ? "Graph algorithms run on the server. Add ?engine=wasm to run them in the browser."
+            : wasm.status === "ready"
               ? `WASM: ${wasm.nodeCount} nodes, ${wasm.edgeCount} edges`
-              : "WASM: initializing"
-          }
-        >
-          {wasm.ready ? `WASM: ready (${wasm.nodeCount}n)` : "WASM: loading…"}
-        </span>
-      )}
+              : wasm.status === "error"
+                ? `WASM failed: ${wasm.error ?? "unknown error"}`
+                : "WASM: downloading the graph snapshot"
+        }
+      >
+        {wasm.mode === "server"
+          ? "Engine: server"
+          : wasm.status === "ready"
+            ? `Engine: WASM · ready (${wasm.nodeCount}n)`
+            : wasm.status === "error"
+              ? "Engine: WASM · failed"
+              : "Engine: WASM · loading…"}
+      </span>
       <span className="ml-auto capitalize">{mode}</span>
     </footer>
   );

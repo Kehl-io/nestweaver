@@ -87,7 +87,7 @@ test("notes explorer lists every vault with its true count and pages the rest", 
 
   await page.goto("/");
   const explorer = page.getByTestId("explorer-panel");
-  await explorer.getByRole("button", { name: "Notes", exact: true }).click();
+  await explorer.getByRole("tab", { name: "Notes", exact: true }).click();
 
   const brainHeader = explorer.getByRole("button", { name: /^▾\s*brain[\s\d]/ });
   const docsHeader = explorer.getByRole("button", { name: /^▾\s*kehl-craft-docs[\s\d]/ });
@@ -141,7 +141,7 @@ test("one vault failing to load is shown on that vault, not the whole tab", asyn
 
   await page.goto("/");
   const explorer = page.getByTestId("explorer-panel");
-  await explorer.getByRole("button", { name: "Notes", exact: true }).click();
+  await explorer.getByRole("tab", { name: "Notes", exact: true }).click();
   await expect(
     explorer.getByTestId("notes-vault-kehl-craft-docs").getByText("kehl-craft-docs note 0003"),
   ).toBeVisible();
@@ -190,7 +190,7 @@ test("a failed page can be retried, including a failed first page", async ({ pag
 
   await page.goto("/");
   const explorer = page.getByTestId("explorer-panel");
-  await explorer.getByRole("button", { name: "Notes", exact: true }).click();
+  await explorer.getByRole("tab", { name: "Notes", exact: true }).click();
 
   const flaky = explorer.getByTestId("notes-vault-flaky");
   await expect(flaky.getByRole("alert")).toContainText("fixture transient failure (flaky-first)");
@@ -227,7 +227,7 @@ test("a page shortened by a dropped corrupt row is not the end of the vault", as
 
   await page.goto("/");
   const explorer = page.getByTestId("explorer-panel");
-  await explorer.getByRole("button", { name: "Notes", exact: true }).click();
+  await explorer.getByRole("tab", { name: "Notes", exact: true }).click();
   const brain = explorer.getByTestId("notes-vault-brain");
   await expect(brain.getByTestId("notes-vault-status")).toContainText(
     `Showing ${PAGE - 1} of ${BRAIN.total} notes.`,
@@ -258,7 +258,7 @@ test("a single small vault lists all its notes with no truncation disclosure", a
 
   await page.goto("/");
   const explorer = page.getByTestId("explorer-panel");
-  await explorer.getByRole("button", { name: "Notes", exact: true }).click();
+  await explorer.getByRole("tab", { name: "Notes", exact: true }).click();
   await expect(explorer.getByRole("button", { name: /^▾\s*small\s*\d+$/ })).toContainText("5");
   const small = explorer.getByTestId("notes-vault-small");
   await expect(small.getByRole("listitem")).toHaveCount(SMALL.total);

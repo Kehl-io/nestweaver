@@ -31,6 +31,8 @@ export interface NodeActionContext {
   uid: string;
   kind?: string | null;
   label?: string | null;
+  /** The node is not in the index (e.g. a stale deep link): every action is off. */
+  missing?: boolean;
 }
 
 export interface NodeAction {
@@ -135,7 +137,7 @@ export function useNodeActions(node: NodeActionContext | null): NodeAction[] {
     setActiveLens(lens);
   };
 
-  return [
+  const actions: NodeAction[] = [
     {
       id: "open",
       label: note ? "Open note" : symbol ? "Open source" : "Open detail",
@@ -366,6 +368,12 @@ export function useNodeActions(node: NodeActionContext | null): NodeAction[] {
       },
     },
   ];
+
+  if (node.missing) {
+    const reason = "This node is not in the index.";
+    return actions.map((action) => ({ ...action, disabled: true, disabledReason: reason }));
+  }
+  return actions;
 }
 
 export const addToSceneIcon = Binary;

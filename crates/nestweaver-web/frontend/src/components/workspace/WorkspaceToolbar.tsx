@@ -1,4 +1,5 @@
 import {
+  PanelRight,
   CornerDownLeft,
   LocateFixed,
   Map,
@@ -7,6 +8,8 @@ import {
   Undo2,
 } from "lucide-react";
 import { useNavigationHistory } from "../../hooks/useNavigationHistory";
+import { useMediaQuery } from "../../hooks/useMediaQuery";
+import { INSPECTOR_DRAWER_QUERY } from "../InspectorDrawer";
 import { useStore } from "../../stores";
 import { RepresentationTabs } from "./RepresentationTabs";
 import { SceneBreadcrumbs } from "./SceneBreadcrumbs";
@@ -22,6 +25,10 @@ export function WorkspaceToolbar() {
   const setGraphData = useStore((s) => s.setGraphData);
   const requestSemanticLayout = useStore((s) => s.requestSemanticLayout);
   const notify = useStore((s) => s.notify);
+  const layoutMode = useStore((s) => s.layoutMode);
+  const inspectorOpen = useStore((s) => s.inspectorOpen);
+  const setInspectorOpen = useStore((s) => s.setInspectorOpen);
+  const drawerWidth = useMediaQuery(INSPECTOR_DRAWER_QUERY);
 
   function centerSelection() {
     if (!selectedNodeId) {
@@ -100,6 +107,24 @@ export function WorkspaceToolbar() {
           Enter opens
         </span>
         <RepresentationTabs />
+        {drawerWidth && layoutMode !== "zen" && (
+          <button
+            id="inspector-toggle"
+            type="button"
+            onClick={() => setInspectorOpen(!inspectorOpen)}
+            aria-expanded={inspectorOpen}
+            aria-controls="inspector-drawer"
+            aria-label="Inspector"
+            title={inspectorOpen ? "Hide Details and Evidence" : "Show Details and Evidence"}
+            className={`inline-flex h-8 w-8 items-center justify-center rounded border outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-graph-selection)] ${
+              inspectorOpen
+                ? "border-[var(--color-graph-selection)] bg-[var(--color-surface-alt)] text-[var(--color-graph-selection)]"
+                : "border-[var(--color-border)] text-[var(--color-text-muted)] hover:bg-[var(--color-surface-alt)] hover:text-[var(--color-text)]"
+            }`}
+          >
+            <PanelRight className="h-4 w-4" />
+          </button>
+        )}
       </div>
     </header>
   );

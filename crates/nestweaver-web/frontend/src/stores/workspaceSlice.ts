@@ -63,6 +63,8 @@ export const createWorkspaceSlice: StateCreator<
 
   setActiveWorkspaceId: (id) =>
     set((s) => {
+      // Another workspace is another scene: drop a targeted camera fit.
+      if (s.activeWorkspaceId !== id) s.cameraFitUids = null;
       s.activeWorkspaceId = id;
     }),
 
