@@ -21,6 +21,8 @@ export interface WasmEngineState {
   edgeCount: number;
   generation: number | null;
   error: string | null;
+  /** Completed sync passes (initial load plus each refresh check). */
+  syncs: number;
 }
 
 const SNAPSHOT_URL = "/api/v1/snapshot.msgpack";
@@ -42,6 +44,7 @@ let state: WasmEngineState = {
   edgeCount: 0,
   generation: null,
   error: null,
+  syncs: 0,
 };
 const listeners = new Set<() => void>();
 let bridge: WasmBridge | null = null;
@@ -111,7 +114,9 @@ async function sync(): Promise<void> {
     bridge = created;
   }
   const generation = await serverGeneration();
-  if (state.status === "ready" && generation !== null && generation === state.generation) {
+  // Loaded and the generation is unchanged, or unknowable (a non-OK
+  // /version): keep the snapshot rather than re-download ~37 MB per event.
+  if (state.status === "ready" && (generation === null || generation === state.generation)) {
     return;
   }
   const snapshot = await snapshotFor(generation);
@@ -141,6 +146,7 @@ function run(): Promise<void> {
     })
     .finally(() => {
       pending = null;
+      update({ syncs: state.syncs + 1 });
       if (rerun) {
         rerun = false;
         void run();

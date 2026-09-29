@@ -63,6 +63,7 @@ export function StatusBar() {
       <span
         role="status"
         aria-label="Graph engine"
+        data-syncs={wasm.syncs}
         className={
           wasm.mode === "wasm" && wasm.status === "ready"
             ? "text-[var(--color-graph-selection)]"
