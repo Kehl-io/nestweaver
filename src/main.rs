@@ -29794,15 +29794,29 @@ fn run_publication_rebuild(
                             format!("indexing repository {}", repo.url),
                         )?;
                         let indexed_sha = repo.observed_head.as_deref().unwrap_or("local");
-                        nestweaver_engine::index::index_directory_with_options_and_limits(
+                        // The same per-repository directory policy an
+                        // ordinary `index --config` applies; without it a
+                        // rebuild re-admits excluded code and drops
+                        // re-admitted directories.
+                        let (repo_excludes, repo_unskip) = resolve_repo_directory_policy(
+                            Some(&config),
+                            &repo.url,
                             Path::new(&repo.root_path),
-                            &target_db,
+                        );
+                        let opts = nestweaver_engine::index::IndexOptions::new(
                             &repo.instance_id,
                             &repo.url,
                             indexed_sha,
-                            true,
-                            repo.name.as_deref(),
-                            config.indexing.limits(),
+                        )
+                        .force(true)
+                        .name(repo.name.as_deref())
+                        .limits(config.indexing.limits())
+                        .excludes(&repo_excludes)
+                        .unskip(&repo_unskip);
+                        nestweaver_engine::index::index_directory_with_opts(
+                            Path::new(&repo.root_path),
+                            &target_db,
+                            &opts,
                         )?;
                         state = nestweaver_engine::publication_operation::record_artifact(
                             &publication_root,
