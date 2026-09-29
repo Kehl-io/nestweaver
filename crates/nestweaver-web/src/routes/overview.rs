@@ -487,6 +487,7 @@ mod tests {
                 limit: None,
                 workspace: None,
                 scope: None,
+                kind: None,
             }),
         )
         .await
