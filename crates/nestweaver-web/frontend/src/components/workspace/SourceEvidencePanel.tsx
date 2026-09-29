@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { FileText, Link2, SearchCode } from "lucide-react";
 import { api } from "../../api/client";
 import { isFileSelection, isNoteSelection, isSymbolKind } from "../../api/kinds";
@@ -100,14 +100,27 @@ export function SourceEvidencePanel({
     setRepoChoice(null);
   }, [selectedNodeId]);
 
+  // The selection the shown evidence belongs to. A re-run for the same key
+  // (a graph update bumped symbolGeneration) revalidates in the background:
+  // the current evidence stays up until the fresh result replaces it.
+  const loadedKeyRef = useRef<string | null>(null);
+
   useEffect(() => {
     const controller = new AbortController();
-    setSymbolDetail(null);
-    setNoteDetail(null);
-    setFileSymbols([]);
-    setFileSource(null);
-    setError(null);
-    setMissing(false);
+    const key = `${selectedNodeId ?? ""}|${selectedNodeKind ?? ""}|${pickedRepo ?? ""}`;
+    const revalidating = loadedKeyRef.current === key;
+    loadedKeyRef.current = key;
+    const startLoading = () => {
+      if (!revalidating) setLoading(true);
+    };
+    if (!revalidating) {
+      setSymbolDetail(null);
+      setNoteDetail(null);
+      setFileSymbols([]);
+      setFileSource(null);
+      setError(null);
+      setMissing(false);
+    }
 
     if (!selectedNodeId) {
       setLoading(false);
@@ -120,14 +133,18 @@ export function SourceEvidencePanel({
       useStore.getState().selectedNodeId === requestedUid;
 
     if (isSymbolLike(selectedNodeId, selectedNodeKind)) {
-      setLoading(true);
+      startLoading();
       fetchSymbol(selectedNodeId)
         .then((detail) => {
-          if (isCurrent()) setSymbolDetail(detail);
+          if (!isCurrent()) return;
+          setSymbolDetail(detail);
+          setMissing(false);
+          setError(null);
         })
         .catch((e) => {
           if (!isCurrent()) return;
           if (isNotFoundError(e)) {
+            setSymbolDetail(null);
             setMissing(true);
           } else {
             setError(e instanceof Error ? e.message : "Symbol evidence is unavailable.");
@@ -140,11 +157,13 @@ export function SourceEvidencePanel({
     }
 
     if (isNoteLike(selectedNodeId, selectedNodeKind)) {
-      setLoading(true);
+      startLoading();
       api
         .brainNote(selectedNodeId, { signal: controller.signal })
         .then((detail) => {
-          if (isCurrent()) setNoteDetail(detail);
+          if (!isCurrent()) return;
+          setNoteDetail(detail);
+          setError(null);
         })
         .catch((e) => {
           if (isCurrent()) {
@@ -158,7 +177,7 @@ export function SourceEvidencePanel({
     }
 
     if (isFileLike(selectedNodeId, selectedNodeKind)) {
-      setLoading(true);
+      startLoading();
       // Symbols populate the list; /source resolves path ownership, including
       // repos that index the file without finding any symbols in it.
       const path = selectedNodeId;
@@ -182,6 +201,7 @@ export function SourceEvidencePanel({
           if (controller.signal.aborted) return;
           setFileSymbols(symbols);
           setFileSource(source);
+          setError(null);
           const ambiguous = ambiguousCandidates(sourceError);
           if (ambiguous) setRepoChoice({ path, candidates: ambiguous });
           if (symbols.length === 0 && (!source || !source.lines?.length)) {

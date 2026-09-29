@@ -220,6 +220,52 @@ test.describe("Deep links (batch 11)", () => {
     expect(urlParam(page, "node")).toBe(symbol.uid);
   });
 
+  test("evidence keeps showing the current node while a graph update revalidates it", async ({
+    page,
+    request,
+  }) => {
+    const symbol = await findSymbol(request, "releaseTarget");
+    let version = 1;
+    let pendingUpdate = false;
+    await page.route("**/api/v1/symbol/**", async (route) => {
+      const response = await route.fetch();
+      const body = await response.json();
+      body.symbol.signature = `function releaseTarget(name) /* v${version} */`;
+      await route.fulfill({ response, json: body });
+    });
+    await page.route("**/api/v1/events", (route) => {
+      const body = pendingUpdate ? "retry: 200\nevent: graph:updated\ndata: {}\n\n" : "retry: 200\n\n";
+      pendingUpdate = false;
+      return route.fulfill({ status: 200, contentType: "text/event-stream", body });
+    });
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await persistRepresentation(page, "graph");
+    await page.goto(`/?node=${encodeURIComponent(symbol.uid)}&kind=${symbol.kind}`);
+
+    const evidence = page.getByRole("complementary", { name: "Source and note evidence" });
+    await expect(evidence).toContainText("/* v1 */", { timeout: 15_000 });
+    // Record every state the panel passes through from here on.
+    await evidence.evaluate((el) => {
+      const seen: string[] = [];
+      (window as unknown as { __evidence: string[] }).__evidence = seen;
+      new MutationObserver(() => seen.push(el.textContent ?? "")).observe(el, {
+        childList: true,
+        characterData: true,
+        subtree: true,
+      });
+    });
+
+    version = 2;
+    pendingUpdate = true;
+    await expect(evidence).toContainText("/* v2 */", { timeout: 10_000 });
+    const states = await page.evaluate(() => (window as unknown as { __evidence: string[] }).__evidence);
+    expect(states.length).toBeGreaterThan(0);
+    for (const state of states) {
+      expect(state, "evidence never blanks or shows a loading state").not.toMatch(/Loading evidence|No selection/);
+      expect(state, "the node stays named throughout").toContain(symbol.name);
+    }
+  });
+
   test("counterweight: a real Function deep link still enables the actions (nw-567)", async ({
     page,
     request,
