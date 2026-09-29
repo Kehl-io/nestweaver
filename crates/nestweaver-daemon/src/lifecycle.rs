@@ -925,6 +925,45 @@ pub fn db_rebuild_required(db_path: &Path) -> Option<nestweaver_store::StoreErro
     }
 }
 
+/// Is the database this daemon would serve stuck on a frozen checkpoint log
+/// whose pages were already applied (see
+/// `nestweaver_store::StoreError::FrozenCheckpointAlreadyApplied`)?
+///
+/// Every writable open of that state fails, so a daemon spawned against it
+/// exits before it is healthy and the operator sees a spawn failure instead of
+/// the one `mv` that fixes it. Only the exact file shape is probed: a frozen
+/// `<db>.wal.checkpoint` with `<db>.shadow` absent or zero bytes. Telling the
+/// stuck state from an ordinary interrupted checkpoint needs the engine
+/// (whether the frozen log ends in a CHECKPOINT record), so this makes the
+/// same writable open the daemon would, under the database's writer lease.
+/// If that open succeeds, the engine has recovered an ordinary interrupted
+/// checkpoint exactly as the daemon would have. If the lease is held, someone
+/// else owns the database and this declines. Every other outcome is `None`.
+pub fn db_frozen_checkpoint_applied(db_path: &Path) -> Option<nestweaver_store::StoreError> {
+    if !db_path.exists() {
+        return None;
+    }
+    let selected = nestweaver_engine::publication::resolve_selected_database(db_path).ok()?;
+    let sidecar = |suffix: &str| {
+        let mut name = selected.as_os_str().to_owned();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    if !matches!(sidecar(".wal.checkpoint").try_exists(), Ok(true)) {
+        return None;
+    }
+    match std::fs::symlink_metadata(sidecar(".shadow")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {}
+        _ => return None,
+    }
+    let lease = nestweaver_store::acquire_db_write_lease(&selected).ok()?;
+    match nestweaver_store::GraphStore::open_with_authority(&selected, &lease) {
+        Err(error @ nestweaver_store::StoreError::FrozenCheckpointAlreadyApplied(_)) => Some(error),
+        _ => None,
+    }
+}
+
 /// nw-367. Distinguish a LIVE checkpoint from the debris a crashed one leaves.
 ///
 /// The engine raises one message —

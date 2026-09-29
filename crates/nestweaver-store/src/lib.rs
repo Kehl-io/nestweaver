@@ -24,7 +24,7 @@ pub mod zstd;
 pub use db::{
     EmbeddingIndexOccupancy, EmbeddingIndexReconciliation, EmbeddingSnapshotLease,
     EmbeddingSnapshotState, GraphStore, GraphStoreAccessMode, IndexPublicationLease,
-    PublicationIdentity,
+    PublicationIdentity, ReopenOutcome, StoreConnection,
 };
 pub use error::{
     CancelReason, CheckpointFailure, CorruptionKind, DB_REBUILD_REQUIRED_CODE, EngineCorruption,

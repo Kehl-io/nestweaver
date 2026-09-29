@@ -672,6 +672,14 @@ fn ensure_daemon_with_spawn_lock_impl(
             db_path.display()
         )));
     }
+    // A frozen checkpoint log whose pages were already applied: every open
+    // fails until one file is moved. Print that move, not a spawn failure.
+    if let Some(error) = nestweaver_daemon::lifecycle::db_frozen_checkpoint_applied(db_path) {
+        return Err(anyhow::Error::new(error).context(format!(
+            "refusing to start a daemon against the database at {}",
+            db_path.display()
+        )));
+    }
 
     // Spawn the daemon as a detached child.
     let mut launcher = spawn_daemon(db_path, restart_config.as_path(), spawn_lock, usage)?;

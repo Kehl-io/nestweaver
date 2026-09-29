@@ -274,12 +274,71 @@ impl Drop for IndexPublicationLease<'_> {
     }
 }
 
+/// The engine handle behind a [`GraphStore`], replaceable in place.
+///
+/// LadybugDB 0.21 can finish a write and then refuse every later checkpoint
+/// until the database is reopened (see
+/// [`crate::error::CheckpointFailure::CommittedCheckpointDeferred`]). The
+/// daemon shares one `Arc<GraphStore>` everywhere, so the reopen happens
+/// here, behind the one door every connection goes through
+/// ([`GraphStore::conn`]): each [`StoreConnection`] holds a read guard for its
+/// whole life, and [`GraphStore::reopen_after_deferred_checkpoint`] swaps the
+/// handle only when it can take the write guard WITHOUT waiting. It never
+/// blocks, so a thread that already holds a connection and opens a second one
+/// can never deadlock behind a pending reopen.
+pub(crate) struct ReopenableDatabase {
+    gate: std::sync::RwLock<()>,
+    cell: std::cell::UnsafeCell<Option<lbug::Database>>,
+}
+
+// SAFETY: `cell` is only written under the exclusive `gate` guard (in
+// `GraphStore::reopen_after_deferred_checkpoint`), and only read through a
+// shared `gate` guard that outlives every reference handed out
+// (`StoreConnection` owns the guard). `lbug::Database` itself is Send + Sync.
+unsafe impl Sync for ReopenableDatabase {}
+unsafe impl Send for ReopenableDatabase {}
+
+impl ReopenableDatabase {
+    fn new(db: lbug::Database) -> Self {
+        Self {
+            gate: std::sync::RwLock::new(()),
+            cell: std::cell::UnsafeCell::new(Some(db)),
+        }
+    }
+}
+
+/// A connection to a [`GraphStore`], holding the handle open for its lifetime.
+/// Dereferences to [`lbug::Connection`], so it is used exactly like one.
+pub struct StoreConnection<'a> {
+    // Declared first so it drops BEFORE the guard below.
+    conn: lbug::Connection<'a>,
+    _open: std::sync::RwLockReadGuard<'a, ()>,
+}
+
+impl<'a> std::ops::Deref for StoreConnection<'a> {
+    type Target = lbug::Connection<'a>;
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+
+/// What [`GraphStore::reopen_after_deferred_checkpoint`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReopenOutcome {
+    /// No deferred checkpoint is pending on this handle.
+    NotNeeded,
+    /// A connection is still open; try again at the next safe point.
+    Busy,
+    /// The handle was closed and reopened; recovery finished the checkpoint.
+    Reopened,
+}
+
 /// GraphStore wraps a LadybugDB database for storing and querying the code knowledge graph.
 ///
 /// Each method creates a fresh Connection internally, which is the simplest safe pattern
 /// given that Connection<'a> borrows &'a Database.
 pub struct GraphStore {
-    pub(crate) db: lbug::Database,
+    pub(crate) db: ReopenableDatabase,
     access_mode: GraphStoreAccessMode,
     pub(crate) pagerank_cache: Mutex<Option<HashMap<String, f64>>>,
     /// Algorithm and scope fingerprint for the scores currently held in
@@ -821,17 +880,41 @@ fn quarantine_orphaned_wal(path: &Path, authority: Option<&DbWriteLease>) -> Opt
 /// committed after the checkpoint began and must stay. Shipped as a targeted
 /// diagnostic naming that one move, not as an automatic arm. Returns the
 /// frozen log's path when the state matches exactly; declines on any doubt.
+///
+/// THE ZERO-LENGTH `.shadow` VARIANT is the same state, and the upstream code
+/// proves it. `ShadowFile::clear` truncates the shadow to zero bytes
+/// (`resetToZeroPagesAndPageCapacity`, `src/storage/file_handle.cpp`) and only
+/// then unlinks it, so a crash between the two leaves a zero-byte `.shadow`.
+/// `clear` runs only after `ShadowFile::applyShadowPages` has written every
+/// page AND `syncFile`d the data file (`src/storage/shadow_file.cpp`), and the
+/// CHECKPOINT record is logged only after `shadowFile.flushAll`, so a frozen log
+/// that ends in CHECKPOINT never sits beside a shadow that was merely created
+/// and not yet written. The only other truncation, `ShadowFile::reset`, runs
+/// after `clearFrozenWAL` (`src/storage/checkpointer.cpp`), when no frozen log
+/// remains. On open, the replay reads the header page of the empty file: POSIX
+/// `readFromFile` accepts a short read that ends at end-of-file
+/// (`src/common/file_system/local_file_system.cpp`), the zero-initialised
+/// header carries a zero database id, and `FileDBIDUtils::verifyDatabaseID`
+/// fails with "Database ID for temporary file '<db>.shadow' does not match the
+/// current database". With a frozen log present and that exact message, moving
+/// the frozen log aside is again the one safe remedy; the engine then removes
+/// the empty shadow itself (`WALReplayer::replay`).
 fn frozen_checkpoint_already_applied(path: &Path, msg: &str) -> Option<PathBuf> {
-    if !is_orphaned_wal_error(msg) {
-        return None;
-    }
     let frozen = PathBuf::from(format!("{}.wal.checkpoint", path.display()));
     let shadow = PathBuf::from(format!("{}.shadow", path.display()));
-    matches!(
-        (frozen.try_exists(), shadow.try_exists()),
-        (Ok(true), Ok(false))
-    )
-    .then_some(frozen)
+    if !matches!(frozen.try_exists(), Ok(true)) {
+        return None;
+    }
+    let shadow_state = std::fs::symlink_metadata(&shadow);
+    let matches_state = match shadow_state {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => is_orphaned_wal_error(msg),
+        Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {
+            let shadow_name = format!("{}.shadow", path.display());
+            msg.contains(&shadow_name) && msg.contains("does not match the current database")
+        }
+        _ => false,
+    };
+    matches_state.then_some(frozen)
 }
 
 /// Turn a failed open into a `StoreError`, consulting the write lease when — and
@@ -1290,7 +1373,7 @@ impl GraphStore {
     fn create_inner(path: &Path, authority: Option<&DbWriteLease>) -> Result<Self, StoreError> {
         let db = open_lbug_with_recovery(path, true, authority, hardened_system_config)?;
         let store = GraphStore {
-            db,
+            db: ReopenableDatabase::new(db),
             access_mode: GraphStoreAccessMode::ReadWrite,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
@@ -1386,7 +1469,7 @@ impl GraphStore {
     ) -> Result<Self, StoreError> {
         let db = open_lbug_with_recovery(path, true, authority, hardened_system_config)?;
         let store = GraphStore {
-            db,
+            db: ReopenableDatabase::new(db),
             access_mode: GraphStoreAccessMode::ReadWrite,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
@@ -1437,7 +1520,7 @@ impl GraphStore {
     fn open_inner(path: &Path, authority: Option<&DbWriteLease>) -> Result<Self, StoreError> {
         let db = open_lbug_with_recovery(path, true, authority, hardened_system_config)?;
         let store = GraphStore {
-            db,
+            db: ReopenableDatabase::new(db),
             access_mode: GraphStoreAccessMode::ReadWrite,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
@@ -1639,7 +1722,7 @@ impl GraphStore {
 
     fn finish_read_only_open(path: &Path, db: lbug::Database) -> Result<Self, StoreError> {
         let store = GraphStore {
-            db,
+            db: ReopenableDatabase::new(db),
             access_mode: GraphStoreAccessMode::ReadOnly,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
@@ -1720,7 +1803,7 @@ impl GraphStore {
             .tempdir()
             .map_err(|error| StoreError::Query(format!("create in-memory regex root: {error}")))?;
         let store = GraphStore {
-            db,
+            db: ReopenableDatabase::new(db),
             access_mode: GraphStoreAccessMode::ReadWrite,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
@@ -3509,8 +3592,27 @@ impl GraphStore {
         Ok(())
     }
 
-    pub(crate) fn conn(&self) -> Result<lbug::Connection<'_>, StoreError> {
-        let conn = lbug::Connection::new(&self.db)?;
+    pub(crate) fn conn(&self) -> Result<StoreConnection<'_>, StoreError> {
+        let open = self
+            .db
+            .gate
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        // SAFETY: the shared guard `open` is held (inside the returned
+        // `StoreConnection`) for as long as this reference is used; the cell is
+        // only replaced under the exclusive guard. See `ReopenableDatabase`.
+        let db = unsafe { &*self.db.cell.get() }.as_ref().ok_or_else(|| {
+            StoreError::Database(format!(
+                "{} is closed: reopening it after an interrupted checkpoint failed; \
+                 restart the daemon",
+                self.db_path
+                    .as_deref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "the graph".to_string())
+            ))
+        })?;
+        let conn = lbug::Connection::new(db)?;
+        let conn = StoreConnection { conn, _open: open };
         if let Some(deadline) = READ_DEADLINE.get() {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
@@ -3944,7 +4046,7 @@ impl GraphStore {
     /// Begin an explicit write transaction. All subsequent writes on the
     /// returned connection are grouped into a single transaction until
     /// `commit_transaction` is called, avoiding per-statement WAL flushes.
-    pub fn begin_transaction(&self) -> Result<lbug::Connection<'_>, StoreError> {
+    pub fn begin_transaction(&self) -> Result<StoreConnection<'_>, StoreError> {
         let conn = self.conn()?;
         conn.query("BEGIN TRANSACTION")
             .map_err(|e| StoreError::Query(format!("begin transaction: {e}")))?;
@@ -4004,6 +4106,59 @@ impl GraphStore {
     pub fn reopen_required(&self) -> bool {
         self.checkpoint_deferred
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Close and reopen the engine handle so recovery finishes the checkpoint
+    /// the engine deferred behind a committed write.
+    ///
+    /// Call at a safe point: with no write in flight (the daemon holds its
+    /// write gate). Never blocks: if any connection is still open it returns
+    /// [`ReopenOutcome::Busy`] and changes nothing. The reopen goes through the
+    /// ordinary open funnel, so recovery replays the pending frozen log and the
+    /// engine-format check still applies. `authority`, when given, is the
+    /// caller's writer lease: closing the old descriptor releases its POSIX
+    /// compatibility lock, so it is re-armed before and after the open.
+    pub fn reopen_after_deferred_checkpoint(
+        &self,
+        authority: Option<&DbWriteLease>,
+    ) -> Result<ReopenOutcome, StoreError> {
+        if !self.reopen_required() {
+            return Ok(ReopenOutcome::NotNeeded);
+        }
+        let Some(path) = self.db_path.clone() else {
+            // In-memory stores never checkpoint to a file.
+            self.checkpoint_deferred
+                .store(false, std::sync::atomic::Ordering::Release);
+            return Ok(ReopenOutcome::NotNeeded);
+        };
+        if self.access_mode != GraphStoreAccessMode::ReadWrite {
+            return Ok(ReopenOutcome::NotNeeded);
+        }
+        let _exclusive = match self.db.gate.try_write() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(ReopenOutcome::Busy),
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        // SAFETY: exclusive guard held; no StoreConnection exists.
+        let cell = unsafe { &mut *self.db.cell.get() };
+        drop(cell.take());
+        let authority = authority.filter(|authority| authority.authorizes(&path));
+        if let Some(authority) = authority {
+            let _ = authority.rearm_legacy_writer_exclusion();
+        }
+        let reopened = open_lbug_with_recovery(&path, true, authority, hardened_system_config);
+        if let Some(authority) = authority {
+            let _ = authority.rearm_legacy_writer_exclusion();
+        }
+        let db = reopened?;
+        *cell = Some(db);
+        self.checkpoint_deferred
+            .store(false, std::sync::atomic::Ordering::Release);
+        tracing::info!(
+            "store reopened after an interrupted checkpoint: {}",
+            path.display()
+        );
+        Ok(ReopenOutcome::Reopened)
     }
 
     /// Roll back the explicit transaction opened by [`Self::begin_transaction`].
@@ -7439,6 +7594,30 @@ mod wal_recovery_arm_tests {
             "not corruption: {text}"
         );
 
+        // The zero-length shadow a crash between truncate and unlink leaves.
+        let shadow = dir.path().join("brain.lbug.shadow");
+        std::fs::write(&shadow, b"").unwrap();
+        let id_mismatch = format!(
+            "Runtime exception: Database ID for temporary file '{}' does not match the \
+             current database. This file may have been left behind from a previous database \
+             with the same name.",
+            shadow.display()
+        );
+        assert_eq!(
+            frozen_checkpoint_already_applied(&db, &id_mismatch),
+            Some(frozen.clone())
+        );
+        assert!(
+            frozen_checkpoint_already_applied(&db, SHADOW_MISSING).is_none(),
+            "a present shadow is not the missing-shadow message"
+        );
+        std::fs::write(&shadow, b"not-empty").unwrap();
+        assert!(
+            frozen_checkpoint_already_applied(&db, &id_mismatch).is_none(),
+            "a non-empty shadow may hold unapplied pages"
+        );
+        std::fs::remove_file(&shadow).unwrap();
+
         // Counterweights: any other shape is not this state.
         std::fs::write(dir.path().join("brain.lbug.shadow"), b"s").unwrap();
         assert!(frozen_checkpoint_already_applied(&db, SHADOW_MISSING).is_none());
@@ -7516,6 +7695,60 @@ mod wal_recovery_arm_tests {
             "{error}"
         );
         assert!(fresh.reopen_required());
+    }
+
+    /// The recovery the flag asks for: close and reopen the handle in place.
+    /// The pending frozen log is recovered by the engine's own open, a later
+    /// checkpoint succeeds, committed data survives, and the reopen never
+    /// happens while a connection is open.
+    #[test]
+    fn a_flagged_store_reopens_in_place_and_checkpoints_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = GraphStore::create(&db).unwrap();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:kept".to_string(),
+                url: "file:///kept".to_string(),
+                indexed_sha: "x".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        assert_eq!(
+            store.reopen_after_deferred_checkpoint(None).unwrap(),
+            ReopenOutcome::NotNeeded
+        );
+        std::fs::write(dir.path().join("brain.lbug.wal.checkpoint"), b"").unwrap();
+        assert!(store.checkpoint().is_err());
+        assert!(store.reopen_required());
+
+        {
+            let _open = store.conn().unwrap();
+            assert_eq!(
+                store.reopen_after_deferred_checkpoint(None).unwrap(),
+                ReopenOutcome::Busy,
+                "never swap the handle under an open connection"
+            );
+            assert!(store.reopen_required());
+        }
+
+        assert_eq!(
+            store.reopen_after_deferred_checkpoint(None).unwrap(),
+            ReopenOutcome::Reopened
+        );
+        assert!(!store.reopen_required());
+        store
+            .checkpoint()
+            .expect("a checkpoint after the reopen must succeed");
+        assert!(!dir.path().join("brain.lbug.wal.checkpoint").exists());
+        let repos = store.list_repos(None).unwrap();
+        assert!(
+            repos.iter().any(|repo| repo.uid == "repo:kept"),
+            "{repos:?}"
+        );
     }
 
     /// An interrupted checkpoint that recovery could not finish for lack of

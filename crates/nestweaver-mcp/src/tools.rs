@@ -9629,6 +9629,14 @@ fn brain_status_warnings_for(
         }));
     }
 
+    if store.reopen_required() {
+        warnings.push(json!({
+            "kind": "store_reopen_pending",
+            "warning": "a write committed, but the storage engine deferred its checkpoint until the database is reopened (an earlier checkpoint was interrupted); nothing was lost, and the write was not retried",
+            "action": "the daemon reopens the store automatically at the next point with no write or read in flight; restart the daemon if this persists",
+        }));
+    }
+
     if let Some(error) = store.embedding_identity_error() {
         warnings.push(json!({
             "kind": "embedding_identity_unreadable",

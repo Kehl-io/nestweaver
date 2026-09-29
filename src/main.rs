@@ -23635,6 +23635,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 db_path.display()
                             )));
                         }
+                        if let Some(error) =
+                            nestweaver_daemon::lifecycle::db_frozen_checkpoint_applied(&db_path)
+                        {
+                            return Err(anyhow::Error::new(error).context(format!(
+                                "refusing to start a daemon against the database at {}",
+                                db_path.display()
+                            )));
+                        }
                         Ok(())
                     };
 

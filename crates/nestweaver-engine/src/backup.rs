@@ -446,14 +446,14 @@ pub fn backup_save(config: &BackupConfig) -> anyhow::Result<BackupResult> {
     // "Back up before upgrading" must work after the upgrade too: a database
     // an older storage engine built is read through the store's legacy
     // read-only exemption (scans only, no writes), under the same authority.
-    let store = match nestweaver_store::GraphStore::open_with_authority(&config.db_path, &authority)
-    {
-        Err(nestweaver_store::StoreError::RebuildRequired { .. }) => {
-            nestweaver_store::GraphStore::open_legacy_engine_read_only(&config.db_path)
+    let store =
+        match nestweaver_store::GraphStore::open_with_authority(&config.db_path, &authority) {
+            Err(nestweaver_store::StoreError::RebuildRequired { .. }) => {
+                nestweaver_store::GraphStore::open_legacy_engine_read_only(&config.db_path)
+            }
+            other => other,
         }
-        other => other,
-    }
-    .map_err(|e| anyhow::anyhow!("failed to open database: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to open database: {e}"))?;
     let staged = stage_backup_from_store(&store, config)?;
     drop(store);
     drop(authority);

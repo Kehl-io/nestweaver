@@ -13509,7 +13509,11 @@ fn backup_save_works_on_a_pre_cutover_database_and_the_restore_warns() {
     let saved_text = String::from_utf8_lossy(&saved.stderr).to_string();
     assert_eq!(saved.status.code(), Some(0), "{saved_text}");
     assert!(saved_text.contains("LadybugDB 0.21"), "{saved_text}");
-    assert_eq!(std::fs::read(&db).unwrap(), before, "backup changed the database");
+    assert_eq!(
+        std::fs::read(&db).unwrap(),
+        before,
+        "backup changed the database"
+    );
     assert!(
         !nestweaver_store::engine_format::sidecar_path(&db).exists(),
         "backup must not stamp the pre-cutover database as current"
@@ -13537,5 +13541,37 @@ fn backup_save_works_on_a_pre_cutover_database_and_the_restore_warns() {
             .err()
             .expect("the restored pre-cutover database must be refused")
             .is_rebuild_required()
+    );
+}
+
+/// The frozen-applied preflight probes ONLY the exact file shape, and an
+/// ordinary interrupted checkpoint in that shape is recovered by the same
+/// writable open the daemon would make, so the preflight lets it start.
+/// (The positive verdict is covered where the state is recognised, in the
+/// store; a frozen log ending in a CHECKPOINT record cannot be produced
+/// deterministically from outside the engine.)
+#[test]
+fn the_frozen_checkpoint_preflight_declines_everything_but_its_exact_state() {
+    use nestweaver_daemon::lifecycle::db_frozen_checkpoint_applied;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("brain.lbug");
+    assert!(db_frozen_checkpoint_applied(&db).is_none());
+    drop(nestweaver_store::GraphStore::open_or_create(&db).unwrap());
+    assert!(db_frozen_checkpoint_applied(&db).is_none(), "healthy");
+
+    // A non-empty shadow may hold unapplied pages: not this state, untouched.
+    let frozen = dir.path().join("brain.lbug.wal.checkpoint");
+    let shadow = dir.path().join("brain.lbug.shadow");
+    std::fs::write(&frozen, b"").unwrap();
+    std::fs::write(&shadow, b"pages").unwrap();
+    assert!(db_frozen_checkpoint_applied(&db).is_none());
+    assert!(frozen.exists() && shadow.exists());
+
+    // An empty frozen log and no shadow: the engine's own recovery clears it.
+    std::fs::remove_file(&shadow).unwrap();
+    assert!(db_frozen_checkpoint_applied(&db).is_none());
+    assert!(
+        !frozen.exists(),
+        "the probe's open recovered the empty frozen log"
     );
 }
