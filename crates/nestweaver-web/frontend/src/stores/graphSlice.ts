@@ -64,7 +64,11 @@ export interface GraphSlice {
   requestSemanticLayout: () => void;
   clearSemanticLayoutRequest: () => void;
   cameraFitRequestId: number;
-  /** Nodes the next camera fit frames (with their neighbours); null = all. */
+  /**
+   * Nodes a camera fit frames (with their neighbours); null = all. Read only
+   * when a fit runs (a new request, graph or canvas size), so later
+   * selections never move the camera.
+   */
   cameraFitUids: string[] | null;
   /**
    * Refit the camera. `uids` frames those nodes and their neighbours, `null`
@@ -190,7 +194,6 @@ export const createGraphSlice: StateCreator<
       s.selectedNodeId = id;
       s.selectedNodeKind = kind ?? null;
       s.detailFocus = "summary";
-      s.cameraFitUids = null;
       if (id === null) {
         s.previewNodeId = null;
         s.previewExpanded = false;
@@ -249,6 +252,8 @@ export const createGraphSlice: StateCreator<
 
   setGraphMode: (mode) =>
     set((s) => {
+      // A new scene frames everything; a targeted fit belongs to its scene.
+      if (s.graphMode !== mode) s.cameraFitUids = null;
       s.graphMode = mode;
     }),
 

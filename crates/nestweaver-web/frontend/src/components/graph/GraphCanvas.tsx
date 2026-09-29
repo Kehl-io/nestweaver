@@ -272,7 +272,6 @@ function CameraFitController({
     [buffers.indexToUid],
   );
   const cameraFitRequestId = useStore((s) => s.cameraFitRequestId);
-  const cameraFitUids = useStore((s) => s.cameraFitUids);
   const graphMode = useStore((s) => s.graphMode);
   const layoutMode = useStore((s) => s.layoutMode);
   const fittedKeyRef = useRef("");
@@ -280,8 +279,10 @@ function CameraFitController({
   useEffect(() => {
     if (buffers.nodeCount === 0 || !controls) return;
     if (canvasSize.width <= 0 || canvasSize.height <= 0) return;
-    const fitKey = `${graphKey}:${canvasSize.width}x${canvasSize.height}:${cameraFitRequestId}:${cameraFitUids?.join(",") ?? ""}`;
+    const fitKey = `${graphKey}:${canvasSize.width}x${canvasSize.height}:${cameraFitRequestId}`;
     if (fittedKeyRef.current === fitKey) return;
+    // Read, not subscribed: only a fit request (or a new graph/size) refits.
+    const cameraFitUids = useStore.getState().cameraFitUids;
 
     // nw-572: a fit target frames those nodes plus their neighbours (a repo
     // hub and its members); with no target, or none of it in this graph,
@@ -352,7 +353,7 @@ function CameraFitController({
     fittedKeyRef.current = fitKey;
     // Observable fit target, for tests and debugging.
     gl.domElement.dataset.cameraFit = fitIndices && cameraFitUids ? cameraFitUids.join(",") : "all";
-  }, [buffers, cameraFitRequestId, cameraFitUids, canvasSize.height, canvasSize.width, camera, controls, gl, graphKey, graphMode, layoutMode]);
+  }, [buffers, cameraFitRequestId, canvasSize.height, canvasSize.width, camera, controls, gl, graphKey, graphMode, layoutMode]);
 
   return null;
 }

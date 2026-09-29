@@ -83,6 +83,25 @@ test.describe("Start Here (nw-572)", () => {
     await expect.poll(() => cameraFit(page)).toBe(repo!.uid);
   });
 
+  test("selecting another node after a targeted fit keeps the camera where it is", async ({
+    page,
+    request,
+  }) => {
+    const data = await overview(request);
+    const repo = data.landmarks.find((landmark) => landmark.kind === "repo")!;
+    await openPanels(page, `/?node=${encodeURIComponent(repo.uid)}&kind=repo`);
+    await expect.poll(() => cameraFit(page)).toBe(repo.uid);
+
+    // Ctrl+Tab cycles the selection through the graph without a new fit.
+    await page.getByRole("application", { name: "Code knowledge graph" }).focus();
+    await page.keyboard.press("Control+Tab");
+    await expect.poll(() => new URL(page.url()).searchParams.get("node")).not.toBe(repo.uid);
+    await page.keyboard.press("Control+Tab");
+    // Two selection changes and two frames later, still the repo's fit.
+    await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+    expect(await cameraFit(page)).toBe(repo.uid);
+  });
+
   test("counterweight: Start Here still shows on a fresh / with no node", async ({ page }) => {
     await openPanels(page, "/");
     await expect(page.getByRole("region", { name: "Start Here" })).toBeVisible();
