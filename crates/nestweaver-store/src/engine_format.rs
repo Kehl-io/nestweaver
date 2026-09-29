@@ -35,11 +35,85 @@ pub fn sidecar_path(db_path: &Path) -> PathBuf {
 }
 
 /// Write the sidecar durably (temp file, fsync, rename, fsync the directory).
+///
+/// The first line is the format. When the database file exists, a second line
+/// records WHICH file the claim is about (`file=<device>:<inode>`), so a
+/// sidecar left behind by a deleted or replaced database cannot vouch for
+/// whatever file appears at the path later (see [`check`]).
 pub fn write_sidecar(db_path: &Path) -> std::io::Result<()> {
+    let identity = file_identity(db_path);
     crate::durable_sidecar::atomic_replace_file(&sidecar_path(db_path), |file| {
         file.write_all(ENGINE_FORMAT_VALUE.as_bytes())?;
-        file.write_all(b"\n")
+        file.write_all(b"\n")?;
+        if let Some((device, inode)) = identity {
+            writeln!(file, "file={device}:{inode}")?;
+        }
+        Ok(())
     })
+}
+
+/// Re-bind an existing, valid sidecar to the database file now at the path.
+///
+/// For every path that COPIES a database together with its sidecar (a backup
+/// restore, a manual copy): the copy is a new file, so the recorded identity
+/// no longer matches, and a copy that later crashed with a log beside it would
+/// be refused as unverifiable. A missing or foreign sidecar is left alone:
+/// this never creates a claim, it only moves one to the copy it came with.
+pub fn restamp_after_copy(db_path: &Path) -> std::io::Result<()> {
+    match read_sidecar(db_path)? {
+        Some(sidecar) if sidecar.format == ENGINE_FORMAT_VALUE => write_sidecar(db_path),
+        _ => Ok(()),
+    }
+}
+
+/// The (device, inode) of the database file, where the platform has them.
+fn file_identity(db_path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(db_path)
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = db_path;
+        None
+    }
+}
+
+/// A parsed sidecar.
+struct Sidecar {
+    format: String,
+    /// The file the claim was made for; `None` for a sidecar written without
+    /// one (no file yet, a platform without inodes, or an earlier build).
+    file: Option<(u64, u64)>,
+}
+
+fn read_sidecar(db_path: &Path) -> std::io::Result<Option<Sidecar>> {
+    let content = match std::fs::read_to_string(sidecar_path(db_path)) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut lines = content.lines();
+    let format = lines.next().unwrap_or_default().trim().to_string();
+    let file = lines.find_map(|line| {
+        let (device, inode) = line.trim().strip_prefix("file=")?.split_once(':')?;
+        Some((device.parse().ok()?, inode.parse().ok()?))
+    });
+    Ok(Some(Sidecar { format, file }))
+}
+
+/// True when the sidecar's recorded file is the one at the path (or it
+/// records none). A copy fails this until it is re-stamped.
+pub(crate) fn sidecar_names_this_file(db_path: &Path) -> bool {
+    match read_sidecar(db_path) {
+        Ok(Some(Sidecar {
+            file: Some(file), ..
+        })) => file_identity(db_path) == Some(file),
+        _ => true,
+    }
 }
 
 /// What the pre-open check concluded.
@@ -92,19 +166,32 @@ pub(crate) fn check(db_path: &Path) -> Result<Precheck, crate::StoreError> {
         return Ok(Precheck::Fresh);
     }
     let sidecar = sidecar_path(db_path);
-    match std::fs::read_to_string(&sidecar) {
-        Ok(content) if content.trim() == ENGINE_FORMAT_VALUE => return Ok(Precheck::Current),
-        Ok(content) => {
+    match read_sidecar(db_path) {
+        Ok(Some(claim)) if claim.format == ENGINE_FORMAT_VALUE => {
+            // A sidecar made for a DIFFERENT file (the database was deleted or
+            // replaced, or copied without a re-stamp) proves nothing about this
+            // one. With crash debris beside it, even opening it would replay a
+            // log of unknown format, so it counts as no sidecar at all and is
+            // refused below, before any open. Without debris the read-only
+            // marker check in the open funnel still decides.
+            let foreign = claim
+                .file
+                .is_some_and(|file| file_identity(db_path) != Some(file));
+            if !(foreign && debris_present(db_path).is_some()) {
+                return Ok(Precheck::Current);
+            }
+        }
+        Ok(Some(claim)) => {
             return Err(rebuild_required(
                 db_path,
                 format!(
                     "carries an engine-format marker this build does not recognise ({:?} in {})",
-                    content.trim(),
+                    claim.format,
                     sidecar.display()
                 ),
             ));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(None) => {}
         Err(error) => {
             return Err(crate::StoreError::Database(format!(
                 "cannot read the engine-format marker {}: {error}",

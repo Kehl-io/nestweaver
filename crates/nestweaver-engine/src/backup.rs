@@ -1656,6 +1656,33 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
     }
     clear_restore_journal(&config.data_dir);
 
+    // The restored databases are new files, so their engine-format sidecars
+    // (which name the file they were written for) are re-bound to them. Done
+    // after the cutover validated the archive's bytes, so it cannot disturb
+    // that check; without it a restored database that later crashed with a
+    // log beside it would be refused as unverifiable.
+    for entry in walkdir::WalkDir::new(&config.data_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+    {
+        let name = entry.file_name().to_string_lossy();
+        let Some(db_name) =
+            name.strip_suffix(nestweaver_store::engine_format::ENGINE_FORMAT_SIDECAR_SUFFIX)
+        else {
+            continue;
+        };
+        let db = entry.path().with_file_name(db_name);
+        if let Err(error) = nestweaver_store::engine_format::restamp_after_copy(&db) {
+            manifest.warnings.push(format!(
+                "could not re-bind the engine-format marker of the restored database {} \
+                 ({error}); it still opens, but if it crashes before its first clean open it \
+                 will be refused until the marker file is rewritten",
+                db.display()
+            ));
+        }
+    }
+
     Ok(RestoreResult {
         manifest,
         data_dir: config.data_dir.clone(),
@@ -3961,6 +3988,37 @@ mod tests {
                 .err()
                 .expect("the restored pre-cutover graph must be refused")
                 .is_rebuild_required()
+        );
+    }
+
+    /// A restored database is a NEW file; the restore re-binds its
+    /// engine-format sidecar to it, so if it later crashes with a log beside
+    /// it, it still recovers instead of being refused as unverifiable.
+    #[test]
+    fn a_restored_database_that_crashes_still_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        drop(nestweaver_store::GraphStore::create(&db_path).unwrap());
+        let archive = dir.path().join("a.nwsnap.zst");
+        backup_save(&BackupConfig {
+            db_path: db_path.clone(),
+            output_path: archive.clone(),
+            include_clones: false,
+            instance_id: "test".to_string(),
+            workspace_path: None,
+        })
+        .unwrap();
+        let restore_dir = dir.path().join("restored");
+        backup_restore(&RestoreConfig {
+            snapshot_path: archive,
+            data_dir: restore_dir.clone(),
+        })
+        .unwrap();
+        let restored = restore_dir.join("test.lbug");
+        std::fs::write(restore_dir.join("test.lbug.wal.checkpoint"), b"").unwrap();
+        drop(
+            nestweaver_store::GraphStore::open(&restored)
+                .expect("a restored database with crash debris must recover"),
         );
     }
 

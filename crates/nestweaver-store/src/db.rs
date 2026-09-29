@@ -1342,6 +1342,15 @@ fn open_lbug_with_recovery(
             withdraw_claim();
             return Err(error);
         }
+        // Now that the file exists, bind the claim to it (device, inode).
+        if let Err(error) = crate::engine_format::write_sidecar(path) {
+            drop(db);
+            withdraw_claim();
+            return Err(StoreError::Database(format!(
+                "could not record the storage-engine format for the new database {}: {error}",
+                path.display()
+            )));
+        }
     } else if precheck == crate::engine_format::Precheck::Current {
         // The sidecar says current; the database must agree. A sidecar left
         // behind by a failed create or a deleted file must never make this
@@ -1357,6 +1366,12 @@ fn open_lbug_with_recovery(
                 path,
                 disagreeing_marker_reason(path),
             ));
+        }
+        // Verified by the marker inside it: a copy's sidecar is re-bound to
+        // this file on its first writable open (best effort; the marker is
+        // the source of truth).
+        if read_write && !crate::engine_format::sidecar_names_this_file(path) {
+            stamp_engine_format_sidecar(path);
         }
     }
     Ok(db)
@@ -8004,6 +8019,52 @@ pub(crate) mod engine_format_open_tests {
             .expect("the selected graph opens");
     }
 
+    /// A sidecar written for a DIFFERENT file, beside an old-engine database
+    /// that has a log: counted as no sidecar, so the file is refused before
+    /// any open, and neither it nor its log changes by a byte.
+    #[test]
+    fn a_stray_sidecar_with_crash_debris_is_refused_before_any_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = old_engine_fixture(dir.path(), "pre-cutover-wal.lbug");
+        let elsewhere = dir.path().join("elsewhere.lbug");
+        std::fs::write(&elsewhere, b"another file").unwrap();
+        crate::engine_format::write_sidecar(&elsewhere).unwrap();
+        std::fs::rename(sidecar_path(&elsewhere), sidecar_path(&db)).unwrap();
+        std::fs::remove_file(&elsewhere).unwrap();
+        let before = tree_bytes(dir.path());
+        for open in [GraphStore::open(&db), GraphStore::open_or_create(&db)] {
+            match open {
+                Err(StoreError::RebuildRequired { reason, .. }) => {
+                    assert!(reason.contains("crash debris"), "{reason}")
+                }
+                Err(other) => panic!("expected the pre-open refusal, got {other}"),
+                Ok(_) => panic!("a stray sidecar let an old-engine log be replayed"),
+            }
+        }
+        assert_eq!(
+            tree_bytes(dir.path()),
+            before,
+            "nothing opened, nothing written"
+        );
+    }
+
+    /// Counterweight: this engine's own database, crashed IN PLACE with a
+    /// log beside it, still recovers: the sidecar names this very file.
+    #[test]
+    fn a_new_database_with_crash_debris_in_place_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        drop(GraphStore::create(&db).unwrap());
+        assert!(
+            std::fs::read_to_string(sidecar_path(&db))
+                .unwrap()
+                .contains("file="),
+            "a create binds its claim to the file"
+        );
+        std::fs::write(dir.path().join("graph.lbug.wal.checkpoint"), b"").unwrap();
+        drop(GraphStore::open(&db).expect("its own crash debris must not block recovery"));
+    }
+
     /// THE HAZARD, shown on a file the OLD engine wrote: this engine's
     /// primary-key lookup misses a non-ASCII key, while a scan finds the row.
     /// An ASCII key is unaffected. This is why a pre-cutover database is
@@ -8108,7 +8169,12 @@ pub(crate) mod engine_format_open_tests {
         let db = dir.path().join("graph.lbug");
         drop(GraphStore::create(&db).unwrap());
         assert_eq!(
-            std::fs::read_to_string(sidecar_path(&db)).unwrap().trim(),
+            std::fs::read_to_string(sidecar_path(&db))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap()
+                .trim(),
             ENGINE_FORMAT_VALUE
         );
         assert_eq!(marker_in(&db).as_deref(), Some(ENGINE_FORMAT_VALUE));
@@ -8161,7 +8227,12 @@ pub(crate) mod engine_format_open_tests {
         );
         drop(GraphStore::open(&db).unwrap());
         assert_eq!(
-            std::fs::read_to_string(sidecar_path(&db)).unwrap().trim(),
+            std::fs::read_to_string(sidecar_path(&db))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap()
+                .trim(),
             ENGINE_FORMAT_VALUE,
             "a writable open rewrites the sidecar it verified"
         );
@@ -8182,6 +8253,8 @@ pub(crate) mod engine_format_open_tests {
         std::fs::copy(&wal, format!("{}.wal", crashed_db.display())).unwrap();
         if sidecar {
             std::fs::copy(sidecar_path(&live_db), sidecar_path(&crashed_db)).unwrap();
+            // A copy path re-binds the claim to the copy, as a restore does.
+            crate::engine_format::restamp_after_copy(&crashed_db).unwrap();
         }
         drop(store);
         (crashed, crashed_db)

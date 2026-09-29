@@ -13642,6 +13642,9 @@ fn a_pre_cutover_database_rebuilds_into_a_current_publication() {
         nestweaver_store::engine_format::sidecar_path(&selected),
     )
     .unwrap();
+    // Copied as a copy path would (the claim re-bound to the copy), so what
+    // decides here is the identity check, not the file-identity rule.
+    nestweaver_store::engine_format::restamp_after_copy(&selected).unwrap();
     for stale in [".wal", ".shadow"] {
         let _ = std::fs::remove_file(format!("{}{stale}", selected.display()));
     }
