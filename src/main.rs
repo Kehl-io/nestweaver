@@ -1731,6 +1731,12 @@ const ENV_REGISTRY: &[EnvVar] = &[
         name: "NESTWEAVER_TEST_CRASH_AFTER_STAGED_IDENTITY",
         role: EnvRole::Internal,
     },
+    // Test-only: `testdata/lbug-0.20.4/regenerate.sh` points the old-engine
+    // fixture tests at freshly generated files before replacing the fixtures.
+    EnvVar {
+        name: "NESTWEAVER_OLD_ENGINE_FIXTURE_DIR",
+        role: EnvRole::Internal,
+    },
     EnvVar {
         name: "NESTWEAVER_TEST_SERVER_TIMEOUT_SECS",
         role: EnvRole::Internal,
