@@ -4,6 +4,14 @@ import { useStore } from "../stores";
 import type { GraphMode } from "../api/types";
 import { useNavigationHistory } from "./useNavigationHistory";
 
+/**
+ * Unmodified single keys bound app-wide below. Widgets with their own
+ * letter navigation (the Files tree's type-ahead) must leave these alone.
+ */
+export const GLOBAL_SINGLE_KEYS = new Set([
+  "1", "2", "3", "4", "5", "6", "[", "]", "c", "m", "t", "i", "p", "/", "?",
+]);
+
 const MODES: GraphMode[] = ["overview", "context", "impact", "repos", "features", "local"];
 
 function isEditableTarget(target: EventTarget | null) {

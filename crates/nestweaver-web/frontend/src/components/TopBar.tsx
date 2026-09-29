@@ -85,6 +85,17 @@ export function TopBar() {
     );
   }
 
+  // nw-593: the live region reports each finished search.
+  function announceSearch(q: string, count: number) {
+    useStore
+      .getState()
+      .announce(
+        count === 0
+          ? `No results for "${q}".`
+          : `${count} result${count === 1 ? "" : "s"} for "${q}".`,
+      );
+  }
+
   function beginSearch(q: string, workspaceId: string | null) {
     const generation = searchGenerationRef.current + 1;
     searchGenerationRef.current = generation;
@@ -120,6 +131,7 @@ export function TopBar() {
         const [symbols, brain] = await Promise.all([symbolsPromise, brainPromise]);
         if (!isCurrentSearch(generation, q, workspaceId, scope)) return;
         setSearchResults(symbols, brain);
+        announceSearch(q, symbols.length + brain.length);
       } else {
         const scoped = await brainSearchInWorkspace(q, {
           workspaceId,
@@ -130,6 +142,7 @@ export function TopBar() {
         const symbols = scope === "notes_only" ? [] : split.symbols.slice(0, 10);
         const brain = scope === "code_only" ? [] : split.brain.slice(0, 5);
         setSearchResults(symbols, brain);
+        announceSearch(q, symbols.length + brain.length);
       }
     } catch (error) {
       if (!isCurrentSearch(generation, q, workspaceId, scope)) return;

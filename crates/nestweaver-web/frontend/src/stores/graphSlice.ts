@@ -4,6 +4,14 @@ import type { StoreState } from "./index";
 
 export type DetailFocus = "summary" | "source" | "related" | "analysis";
 export type ViewMode = "graph" | "list" | "matrix";
+/** Landmark kinds an Overview `?kind=` filter can narrow to (nw-595). */
+export const OVERVIEW_KINDS = ["repo", "note", "service", "symbol"] as const;
+export type OverviewKind = (typeof OVERVIEW_KINDS)[number];
+
+export function parseOverviewKind(value: string | null): OverviewKind | null {
+  const lower = value?.toLowerCase();
+  return OVERVIEW_KINDS.find((kind) => kind === lower) ?? null;
+}
 
 export interface GraphSlice {
   selectedNodeId: string | null;
@@ -20,6 +28,8 @@ export interface GraphSlice {
   graphMode: GraphMode;
   seeds: string[];
   scopeFilter: ScopeFilter;
+  overviewKind: OverviewKind | null;
+  setOverviewKind: (kind: OverviewKind | null) => void;
   communityOverlay: boolean;
   tagsVisible: boolean;
   minimapVisible: boolean;
@@ -54,7 +64,18 @@ export interface GraphSlice {
   requestSemanticLayout: () => void;
   clearSemanticLayoutRequest: () => void;
   cameraFitRequestId: number;
-  requestCameraFit: () => void;
+  /**
+   * Nodes a camera fit frames (with their neighbours); null = all. Read only
+   * when a fit runs (a new request, graph or canvas size), so later
+   * selections never move the camera.
+   */
+  cameraFitUids: string[] | null;
+  /**
+   * Refit the camera. `uids` frames those nodes and their neighbours, `null`
+   * frames everything, and omitting it keeps the current target (so a
+   * layout-settle refit does not undo a fit-to-selection).
+   */
+  requestCameraFit: (uids?: string[] | null) => void;
   setNodeTypeFilter: (kind: string, visible: boolean) => void;
   setAllNodeTypes: (visible: boolean) => void;
   setEdgeTypeFilter: (type: string, visible: boolean) => void;
@@ -80,6 +101,7 @@ export const createGraphSlice: StateCreator<
   graphMode: "overview",
   seeds: [],
   scopeFilter: "all",
+  overviewKind: null,
   communityOverlay: false,
   tagsVisible: true,
   minimapVisible: true,
@@ -175,6 +197,8 @@ export const createGraphSlice: StateCreator<
       if (id === null) {
         s.previewNodeId = null;
         s.previewExpanded = false;
+        // Nothing selected: the next refit frames the whole scene.
+        s.cameraFitUids = null;
       }
     }),
 
@@ -230,6 +254,8 @@ export const createGraphSlice: StateCreator<
 
   setGraphMode: (mode) =>
     set((s) => {
+      // A new scene frames everything; a targeted fit belongs to its scene.
+      if (s.graphMode !== mode) s.cameraFitUids = null;
       s.graphMode = mode;
     }),
 
@@ -247,6 +273,11 @@ export const createGraphSlice: StateCreator<
   setScopeFilter: (filter) =>
     set((s) => {
       s.scopeFilter = filter;
+    }),
+
+  setOverviewKind: (kind) =>
+    set((s) => {
+      s.overviewKind = kind;
     }),
 
   toggleCommunityOverlay: () =>
@@ -271,8 +302,10 @@ export const createGraphSlice: StateCreator<
     }),
 
   cameraFitRequestId: 0,
-  requestCameraFit: () =>
+  cameraFitUids: null,
+  requestCameraFit: (uids) =>
     set((s) => {
+      if (uids !== undefined) s.cameraFitUids = uids && uids.length > 0 ? uids : null;
       s.cameraFitRequestId += 1;
     }),
 

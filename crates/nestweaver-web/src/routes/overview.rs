@@ -16,6 +16,31 @@ pub struct OverviewParams {
     pub limit: Option<usize>,
     pub workspace: Option<String>,
     pub scope: Option<String>,
+    /// Narrow the landmarks to one kind (`repo`, `service`, `symbol`,
+    /// `note`), applied before the per-kind caps so `kind=note` lists the
+    /// top notes up to `limit` rather than the few a mixed scene keeps.
+    pub kind: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LandmarkKind {
+    Repo,
+    Service,
+    Symbol,
+    Note,
+}
+
+fn parse_landmark_kind(kind: Option<&str>) -> Result<Option<LandmarkKind>, ApiError> {
+    match kind {
+        None | Some("") => Ok(None),
+        Some("repo") => Ok(Some(LandmarkKind::Repo)),
+        Some("service") => Ok(Some(LandmarkKind::Service)),
+        Some("symbol") => Ok(Some(LandmarkKind::Symbol)),
+        Some("note") => Ok(Some(LandmarkKind::Note)),
+        Some(other) => Err(ApiError::bad_request(format!(
+            "unsupported overview kind '{other}'; expected repo, service, symbol or note"
+        ))),
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -81,6 +106,8 @@ pub async fn overview(
 
 fn overview_response(state: &Arc<AppState>, params: &OverviewParams) -> Result<Response, ApiError> {
     let limit = params.limit.unwrap_or(24).clamp(6, 100);
+    let only = parse_landmark_kind(params.kind.as_deref())?;
+    let wants = |kind: LandmarkKind| only.is_none_or(|only| only == kind);
     let workspace = workspaces::resolve_workspace(
         &state.store,
         workspaces::workspace_param(params.workspace.as_deref(), params.scope.as_deref()),
@@ -94,7 +121,13 @@ fn overview_response(state: &Arc<AppState>, params: &OverviewParams) -> Result<R
             .partial_cmp(&a.pagerank_score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    notes.truncate(limit.min(12));
+    // Notes share a mixed scene, so they are capped at 12 there; a
+    // note-only scene may use the whole limit.
+    notes.truncate(if only == Some(LandmarkKind::Note) {
+        limit
+    } else {
+        limit.min(12)
+    });
 
     let mut gaps = Vec::new();
     if workspace.kind == WorkspaceKind::All
@@ -156,11 +189,14 @@ fn overview_response(state: &Arc<AppState>, params: &OverviewParams) -> Result<R
             bridge_score: None,
         })
         .collect();
+    let keep = |kind: LandmarkKind, landmarks: Vec<OverviewLandmark>| {
+        if wants(kind) { landmarks } else { Vec::new() }
+    };
     let mut landmarks = select_landmarks(
-        repo_landmarks,
-        service_landmarks,
-        symbol_landmarks,
-        note_landmarks,
+        keep(LandmarkKind::Repo, repo_landmarks),
+        keep(LandmarkKind::Service, service_landmarks),
+        keep(LandmarkKind::Symbol, symbol_landmarks),
+        keep(LandmarkKind::Note, note_landmarks),
         limit,
     );
 
@@ -176,6 +212,15 @@ fn overview_response(state: &Arc<AppState>, params: &OverviewParams) -> Result<R
         landmark.bridge_score = bridge_scores.get(&landmark.uid).copied();
     }
 
+    // With a kind filter the scene can only hold that kind, so its total
+    // (and any omitted count) is that kind's count, not the whole scope's.
+    let total_landmark_count = match only {
+        None => meta_state.total_landmark_count,
+        Some(LandmarkKind::Repo) => counts.repo_count,
+        Some(LandmarkKind::Service) => counts.service_count,
+        Some(LandmarkKind::Symbol) => counts.symbol_count,
+        Some(LandmarkKind::Note) => counts.note_count,
+    };
     let meta = workspaces::p1_meta_for_result_set(
         &workspace,
         meta_state.result,
@@ -183,7 +228,7 @@ fn overview_response(state: &Arc<AppState>, params: &OverviewParams) -> Result<R
         vec![meta_state.provenance],
         Some(limit),
         landmarks.len(),
-        Some(meta_state.total_landmark_count),
+        Some(total_landmark_count),
     );
 
     let start_here = landmarks.iter().take(8).cloned().collect();
@@ -451,6 +496,7 @@ mod tests {
                 limit: None,
                 workspace: None,
                 scope: None,
+                kind: None,
             }),
         )
         .await

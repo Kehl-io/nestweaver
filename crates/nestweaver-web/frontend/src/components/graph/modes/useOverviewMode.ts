@@ -22,8 +22,11 @@ function loadErrorMessage(err: unknown, fallback: string): string {
 async function loadScopedOverview(
   limit: number,
   workspaceId: string,
+  kind: string | null,
 ): Promise<ScopedOverviewResponse> {
-  const url = appendWorkspaceParam(`/api/v1/overview?limit=${limit}`, workspaceId);
+  // `kind` is applied server-side, before the per-kind caps (nw-595).
+  const kindParam = kind ? `&kind=${encodeURIComponent(kind)}` : "";
+  const url = appendWorkspaceParam(`/api/v1/overview?limit=${limit}${kindParam}`, workspaceId);
   const response = await fetch(url);
   if (!response.ok) {
     const body = await response.json().catch(() => ({ error: response.statusText }));
@@ -37,6 +40,7 @@ export function useOverviewMode() {
   const setGraphData = useStore((s) => s.setGraphData);
   const clearGraphData = useStore((s) => s.clearGraphData);
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
+  const overviewKind = useStore((s) => s.overviewKind);
   const setActiveLens = useStore((s) => s.setActiveLens);
   const setSceneMetadata = useStore((s) => s.setSceneMetadata);
   const notify = useStore((s) => s.notify);
@@ -83,7 +87,7 @@ export function useOverviewMode() {
     try {
       // Starfield density: the constellation should feel populated. Server
       // clamps at 100; per-galaxy caps in the builder keep it readable.
-      const result = await loadScopedOverview(96, requestWorkspaceId);
+      const result = await loadScopedOverview(96, requestWorkspaceId, overviewKind);
       if (!isCurrentRequest()) return;
 
       const graph = buildGraphFromOverview(result);
@@ -143,6 +147,7 @@ export function useOverviewMode() {
     clearGraphData,
     graphMode,
     notify,
+    overviewKind,
     setActiveLens,
     setGraphData,
     setSceneMetadata,

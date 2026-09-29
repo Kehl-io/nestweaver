@@ -2,6 +2,8 @@ import { useEffect, useRef } from "react";
 import { useStore } from "../stores";
 import type { GraphMode } from "../api/types";
 import type { ActiveLens, RepresentationMode } from "../api/p1Types";
+import { parseOverviewKind } from "../stores/graphSlice";
+import { ENGINE_MODE } from "../engine/wasmEngine";
 import {
   DEFAULT_IMPACT_CONFIDENCE,
   DEFAULT_IMPACT_DEPTH,
@@ -33,6 +35,9 @@ const representationModes: RepresentationMode[] = [
   "matrix",
   "json",
 ];
+
+// Params that make a URL a scene deep link (as opposed to a bare `/`).
+const NAVIGATION_PARAMS = ["seeds", "mode", "workspace", "node", "kind", "lens"];
 
 function validGraphMode(value: string | null): GraphMode | null {
   return value && graphModes.includes(value as GraphMode)
@@ -71,6 +76,7 @@ export function useDeepLink() {
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
+  const overviewKind = useStore((s) => s.overviewKind);
   const activeLens = useStore((s) => s.activeLens);
   const representationMode = useStore((s) => s.representationMode);
   const impactDepth = useStore((s) => s.impactDepth);
@@ -109,9 +115,25 @@ export function useDeepLink() {
     }
     if (nodeParam) {
       selectNode(nodeParam, kindParam);
+    } else if (kindParam) {
+      // Without a node, `kind` narrows the Overview landmarks (nw-595).
+      const overviewKindParam = parseOverviewKind(kindParam);
+      if (overviewKindParam) {
+        useStore.getState().setOverviewKind(overviewKindParam);
+      } else {
+        useStore.getState().notify({
+          kind: "warning",
+          title: "Unsupported kind filter",
+          message: `kind=${kindParam} needs a node; Overview filters by repo, note, service, or symbol.`,
+        });
+      }
     }
     if (representationParam) {
       setRepresentationMode(representationParam);
+    } else if (NAVIGATION_PARAMS.some((name) => params.has(name))) {
+      // A deep link describes a whole scene: with no representation it means
+      // the graph, not whatever mode the last session left in storage (nw-571).
+      setRepresentationMode("graph");
     }
     const depthParam = parseNumberParam(params.get("depth"));
     const confidenceParam = parseNumberParam(params.get("confidence"));
@@ -137,6 +159,11 @@ export function useDeepLink() {
     if (validMode) {
       setGraphMode(validMode);
     }
+    if (nodeParam) {
+      // Frame the linked node once its scene is loaded (nw-572); after the
+      // mode is set, since a mode change resets the fit target.
+      useStore.getState().requestCameraFit([nodeParam]);
+    }
   }, [
     selectNode,
     setActiveLens,
@@ -155,11 +182,18 @@ export function useDeepLink() {
     }
 
     const params = new URLSearchParams();
+    // The engine is fixed for the page's lifetime; keep it in the address
+    // bar so a reload or shared link stays on the same engine (nw-570).
+    if (ENGINE_MODE === "wasm") params.set("engine", "wasm");
     if (seeds.length > 0) params.set("seeds", seeds.join(","));
     if (graphMode !== "overview") params.set("mode", graphMode);
     if (activeWorkspaceId !== "all") params.set("workspace", activeWorkspaceId);
     if (selectedNodeId) params.set("node", selectedNodeId);
-    if (selectedNodeKind) params.set("kind", selectedNodeKind);
+    if (selectedNodeId && selectedNodeKind) {
+      params.set("kind", selectedNodeKind);
+    } else if (!selectedNodeId && overviewKind) {
+      params.set("kind", overviewKind);
+    }
     if (activeLens.lens !== "overview") params.set("lens", activeLens.lens);
     if (representationMode !== "graph") {
       params.set("representation", representationMode);
@@ -182,6 +216,7 @@ export function useDeepLink() {
     graphMode,
     impactConfidence,
     impactDepth,
+    overviewKind,
     representationMode,
     seeds,
     selectedNodeId,

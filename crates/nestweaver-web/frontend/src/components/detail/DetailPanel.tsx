@@ -11,6 +11,44 @@ import { PathDetail } from "./PathDetail";
 import { SymbolDetail } from "./SymbolDetail";
 import { NodeActionBar } from "../actions/NodeActionBar";
 import { LensSummaryPanel } from "../workspace/LensSummaryPanel";
+import { useSymbolQuery } from "../../hooks/useSymbolQuery";
+
+function uidDisplayName(uid: string): string {
+  // repo:<instance>:<name> / svc:repo:<instance>:<name>:<hash>
+  const repo = /repo:[^:]+:([^:]+)/.exec(uid);
+  if (repo) return repo[1];
+  return uid.split(":").pop() || uid;
+}
+
+/** Repos, services and other non-symbol nodes: name first, uid as metadata (nw-572). */
+function ContainerDetail({ uid, kind }: { uid: string; kind: string | null }) {
+  const graphInstance = useStore((s) => s.graphInstance);
+  const attr = (name: string) =>
+    graphInstance?.hasNode(uid)
+      ? (graphInstance.getNodeAttribute(uid, name) as string | undefined)
+      : undefined;
+  const name = attr("label") || uidDisplayName(uid);
+  const nodeKind = attr("kind") ?? kind;
+  const kindLabel =
+    nodeKind === "repo" ? "Repository" : nodeKind === "service" ? "Service" : nodeKind ?? "Node";
+  const reason = attr("reason");
+  const location = attr("location");
+  return (
+    <div className="space-y-2 p-4">
+      <p className="text-[10px] font-medium uppercase tracking-wide text-[var(--color-text-muted)]">
+        {kindLabel}
+      </p>
+      <h2 className="break-words text-sm font-semibold text-[var(--color-text)]">{name}</h2>
+      {reason && <p className="text-xs leading-5 text-[var(--color-text-muted)]">{reason}</p>}
+      {location && (
+        <p className="break-all text-[11px] text-[var(--color-text-muted)]">{location}</p>
+      )}
+      <p className="break-all font-mono text-[10px] text-[var(--color-text-muted)]" title="Node UID">
+        {uid}
+      </p>
+    </div>
+  );
+}
 
 export function DetailPanel() {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
@@ -20,6 +58,11 @@ export function DetailPanel() {
   const diffActive = useStore((s) => s.diffActive);
   const gapActive = useStore((s) => s.gapActive);
   const llmResult = useStore((s) => s.llmResult);
+  const isSymbolSelection = Boolean(
+    selectedNodeId && (selectedNodeId.startsWith("sym:") || isSymbolKind(selectedNodeKind)),
+  );
+  // Shared with SymbolDetail/Evidence/breadcrumb: one request per selection.
+  const symbolQuery = useSymbolQuery(isSymbolSelection ? selectedNodeId : null);
 
   if (!selectedNodeId) {
     return (
@@ -60,9 +103,7 @@ export function DetailPanel() {
     );
   }
 
-  const isSymbol =
-    selectedNodeId.startsWith("sym:") ||
-    isSymbolKind(selectedNodeKind);
+  const isSymbol = isSymbolSelection;
   const isNote = isNoteSelection(selectedNodeId, selectedNodeKind);
   const isFile = isFileSelection(selectedNodeId, selectedNodeKind);
 
@@ -70,7 +111,11 @@ export function DetailPanel() {
     <GlassPanel data-testid="detail-panel" className="flex h-full flex-col border-l border-[var(--color-border)] bg-[var(--color-surface)]">
       <div className="border-b border-[var(--color-border)] p-2">
         <NodeActionBar
-          node={{ uid: selectedNodeId, kind: selectedNodeKind }}
+          node={{
+            uid: selectedNodeId,
+            kind: selectedNodeKind,
+            missing: symbolQuery.status === "missing",
+          }}
           compact
         />
       </div>
@@ -90,12 +135,7 @@ export function DetailPanel() {
         ) : isFile ? (
           <FileDetail key={selectedNodeId} path={selectedNodeId} />
         ) : (
-          <div className="p-4">
-            <h2 className="mb-2 text-sm font-semibold">Selected</h2>
-            <p className="break-all text-sm text-[var(--color-text-muted)]">
-              {selectedNodeId}
-            </p>
-          </div>
+          <ContainerDetail uid={selectedNodeId} kind={selectedNodeKind} />
         )}
       </div>
     </GlassPanel>

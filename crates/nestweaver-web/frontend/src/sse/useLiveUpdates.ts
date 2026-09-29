@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useStore } from "../stores";
+import { clearSymbolQueries } from "../api/symbolQuery";
 
 export function useLiveUpdates() {
   const setSseConnected = useStore((s) => s.setSseConnected);
@@ -26,6 +27,8 @@ export function useLiveUpdates() {
     };
 
     const handleUpdate = () => {
+      // A re-index can add or remove symbols; drop remembered lookups.
+      clearSymbolQueries();
       setLastEventTimestamp(Date.now());
       refreshSeeds();
     };

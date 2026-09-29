@@ -206,3 +206,85 @@ test.describe("Scene breadcrumbs (nw-658)", () => {
     await expect(lensCrumb).toHaveText("Overview");
   });
 });
+
+// nw-663: at 1280px the breadcrumb nav only gets ~190px. The lens crumb was
+// `shrink-0`, so the nav's `overflow-hidden` cut it mid-word ("Overv") with
+// no ellipsis, and the selection crumb (plus a trailing representation crumb
+// that repeats RepresentationTabs) was pushed off entirely.
+test.describe("Scene breadcrumbs at 1280px (nw-663)", () => {
+  async function crumbFits(nav: Locator) {
+    // For each crumb: is any of it clipped by the nav (or another clipping
+    // ancestor) rather than truncated with its own ellipsis?
+    return nav.evaluate((navEl) => {
+      const crumbs = Array.from(navEl.querySelectorAll<HTMLElement>(":scope > button, :scope > span"));
+      return crumbs.map((el) => {
+        const own = el.getBoundingClientRect();
+        const clip = navEl.getBoundingClientRect();
+        const visibleWidth = Math.max(0, Math.min(own.right, clip.right) - Math.max(own.left, clip.left));
+        const truncated = el.scrollWidth > el.clientWidth + 1;
+        const ellipsis = getComputedStyle(el).textOverflow === "ellipsis";
+        return {
+          text: el.textContent ?? "",
+          title: el.getAttribute("title") ?? "",
+          clipped: visibleWidth + 0.5 < own.width,
+          truncated,
+          ellipsis,
+          width: own.width,
+        };
+      });
+    });
+  }
+
+  test("every crumb is whole or ellipsis-truncated and the selection name stays visible", async ({
+    page,
+    request,
+  }) => {
+    const response = await request.get("/api/v1/search?q=releaseTarget&limit=5");
+    const symbols = (await response.json()) as { uid: string; name: string; kind: string }[];
+    const symbol = symbols.find((s) => s.name === "releaseTarget") ?? symbols[0];
+    expect(symbol).toBeTruthy();
+
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto(`/?node=${encodeURIComponent(symbol.uid)}&kind=${symbol.kind}&lens=context&mode=context`);
+    await expect(page.getByTestId("graph-panel")).toBeVisible({ timeout: 15_000 });
+    await page.evaluate(() => document.fonts.ready);
+
+    const nav = crumbNav(page);
+    await expect(nav.getByTitle(symbol.uid)).toHaveText(symbol.name);
+    await expect(nav.getByTitle("Current representation")).toHaveCount(0);
+
+    const crumbs = await crumbFits(nav);
+    for (const crumb of crumbs) {
+      expect(crumb.clipped, `crumb "${crumb.text}" is clipped by the nav`).toBe(false);
+      if (crumb.truncated) {
+        expect(crumb.ellipsis, `crumb "${crumb.text}" is cut without an ellipsis`).toBe(true);
+      }
+    }
+    const selection = crumbs.find((crumb) => crumb.title === symbol.uid);
+    expect(selection?.truncated, "the selected node's name is shown whole").toBe(false);
+  });
+
+  test("with no selection every crumb is whole or ellipsis-truncated", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+    await expect(page.getByTestId("graph-panel")).toBeVisible({ timeout: 15_000 });
+    await page.evaluate(() => document.fonts.ready);
+    const nav = crumbNav(page);
+    await expect(nav.getByTitle(/^Lens:/)).toBeVisible();
+    for (const crumb of await crumbFits(nav)) {
+      expect(crumb.clipped, `crumb "${crumb.text}" is clipped by the nav`).toBe(false);
+      if (crumb.truncated) {
+        expect(crumb.ellipsis, `crumb "${crumb.text}" is cut without an ellipsis`).toBe(true);
+      }
+    }
+  });
+
+  test("counterweight: the representation stays visible in RepresentationTabs", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/?representation=table");
+    await expect(page.getByTestId("graph-panel")).toBeVisible({ timeout: 15_000 });
+    await expect(
+      page.getByRole("tablist", { name: "Result representation" }).getByRole("tab", { name: "Table representation" }),
+    ).toHaveAttribute("aria-selected", "true");
+  });
+});

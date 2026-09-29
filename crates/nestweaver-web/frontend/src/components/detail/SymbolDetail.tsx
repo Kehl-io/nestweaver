@@ -1,10 +1,9 @@
-import { useEffect, useState } from "react";
-import { api } from "../../api/client";
-import type { SymbolDetail as SymbolDetailType } from "../../api/types";
+import { useSymbolQuery } from "../../hooks/useSymbolQuery";
 import { useStore } from "../../stores";
 import { NodeActionBar } from "../actions/NodeActionBar";
 import { Collapsible } from "../shared/Collapsible";
 import { KindBadge } from "../shared/KindBadge";
+import { NodeNotFound } from "../shared/NodeNotFound";
 import { CodePreview } from "./CodePreview";
 
 interface SymbolDetailProps {
@@ -15,31 +14,10 @@ export function SymbolDetail({ uid }: SymbolDetailProps) {
   const exploreNode = useStore((s) => s.exploreNode);
   const detailFocus = useStore((s) => s.detailFocus);
 
-  const [detail, setDetail] = useState<SymbolDetailType | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const query = useSymbolQuery(uid);
+  const detail = query.detail;
 
-  useEffect(() => {
-    const controller = new AbortController();
-    setDetail(null);
-    setLoading(true);
-    setError(null);
-    api
-      .symbol(uid, { signal: controller.signal })
-      .then((data) => {
-        if (!controller.signal.aborted) setDetail(data);
-      })
-      .catch((e) => {
-        if (controller.signal.aborted) return;
-        setError(e.message ?? "Failed to load symbol");
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setLoading(false);
-      });
-    return () => controller.abort();
-  }, [uid]);
-
-  if (loading) {
+  if (query.status === "loading" || query.status === "idle") {
     return (
       <div className="flex h-full items-center justify-center text-sm text-[var(--color-text-muted)]">
         Loading symbol...
@@ -47,18 +25,14 @@ export function SymbolDetail({ uid }: SymbolDetailProps) {
     );
   }
 
-  if (error) {
-    return (
-      <div className="flex h-full items-center justify-center p-4 text-sm text-red-500">
-        {error}
-      </div>
-    );
+  if (query.status === "missing") {
+    return <NodeNotFound uid={uid} />;
   }
 
-  if (!detail) {
+  if (query.status === "error" || !detail) {
     return (
-      <div className="flex h-full items-center justify-center text-sm text-[var(--color-text-muted)]">
-        Symbol not found.
+      <div role="alert" className="flex h-full items-center justify-center p-4 text-sm text-red-500">
+        {query.error ?? "Symbol detail is unavailable."}
       </div>
     );
   }
