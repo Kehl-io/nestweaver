@@ -122,4 +122,59 @@ test.describe("Deep links (batch 11)", () => {
     await expect.poll(() => urlParam(page, "kind")).toBe(symbol.kind);
     await expect(page.getByRole("status", { name: "Overview filter" })).toHaveCount(0);
   });
+
+  test("an invalid ?node= deep link fetches once, shows one not-found state, and disables actions (nw-567)", async ({
+    page,
+  }) => {
+    const missing = "sym:does-not-exist";
+    let symbolFetches = 0;
+    page.on("request", (req) => {
+      if (new URL(req.url()).pathname.startsWith("/api/v1/symbol/")) symbolFetches += 1;
+    });
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await persistRepresentation(page, "graph");
+    await page.goto(`/?node=${encodeURIComponent(missing)}&kind=Function`);
+    await expect(page.getByTestId("graph-panel")).toBeVisible({ timeout: 15_000 });
+
+    const details = page.getByTestId("detail-panel");
+    const evidence = page.getByRole("complementary", { name: "Source and note evidence" });
+    await expect(details.getByRole("heading", { name: "Node not found" })).toBeVisible();
+    await expect(evidence.getByRole("heading", { name: "Node not found" })).toBeVisible();
+    await expect(details).not.toContainText("symbol '");
+    await expect(
+      page.getByRole("navigation", { name: "Scene breadcrumbs" }).getByTitle(/not found/i),
+    ).toBeVisible();
+
+    const actions = details.getByRole("group", { name: "Node actions" }).getByRole("button");
+    await expect(actions.first()).toBeVisible();
+    for (const action of await actions.all()) {
+      await expect(action).toHaveAttribute("aria-disabled", "true");
+    }
+
+    await page.waitForTimeout(1_500);
+    expect(symbolFetches).toBe(1);
+
+    // The not-found state offers a way out.
+    await details.getByRole("button", { name: "Clear selection" }).click();
+    await expect(details.getByRole("heading", { name: "Ready when you select a node" })).toBeVisible();
+    await expect.poll(() => urlParam(page, "node")).toBeNull();
+  });
+
+  test("counterweight: a real Function deep link still enables the actions (nw-567)", async ({
+    page,
+    request,
+  }) => {
+    const symbol = await findSymbol(request, "greet");
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await persistRepresentation(page, "graph");
+    await page.goto(`/?node=${encodeURIComponent(symbol.uid)}&kind=${symbol.kind}`);
+    const details = page.getByTestId("detail-panel");
+    await expect(details.getByText(symbol.name).first()).toBeVisible({ timeout: 15_000 });
+    const open = details
+      .getByRole("group", { name: "Node actions" })
+      .first()
+      .getByRole("button", { name: /^Open source/ });
+    await expect(open).toHaveAttribute("aria-disabled", "false");
+    await expect(details.getByRole("heading", { name: "Node not found" })).toHaveCount(0);
+  });
 });

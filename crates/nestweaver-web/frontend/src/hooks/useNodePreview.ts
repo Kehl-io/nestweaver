@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError, apiErrorFromBody } from "../api/errors";
 import { isFileSelection, isNoteSelection } from "../api/kinds";
+import { fetchSymbol, isNotFoundError } from "../api/symbolQuery";
 import type {
   NoteDetail,
   SourceResponse,
@@ -34,10 +35,6 @@ async function fetchJson<T>(url: string, signal: AbortSignal): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-function symbolUrl(uid: string): string {
-  return `/api/v1/symbol/${encodeURIComponent(uid)}`;
-}
-
 function noteUrl(uid: string): string {
   return `/api/v1/brain/note/${encodeURIComponent(uid)}`;
 }
@@ -58,16 +55,18 @@ function sourceUrl(file: string, line?: number, context?: number, repo?: string)
 export function useNodePreview(
   nodeId: string | null,
   nodeKind: string | null,
-): { data: PreviewData; loading: boolean; error: string | null } {
+): { data: PreviewData; loading: boolean; error: string | null; notFound: boolean } {
   const [data, setData] = useState<PreviewData>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notFound, setNotFound] = useState(false);
   const requestSeqRef = useRef(0);
 
   useEffect(() => {
     const requestSeq = requestSeqRef.current + 1;
     requestSeqRef.current = requestSeq;
 
+    setNotFound(false);
     if (!nodeId) {
       setData(null);
       setLoading(false);
@@ -147,7 +146,9 @@ export function useNodePreview(
           cacheSet(nodeId, result);
           if (isCurrent()) setData(result);
         } else {
-          const detail = await fetchJson<SymbolDetail>(symbolUrl(nodeId), controller.signal);
+          // Shared with Details/Evidence so one selection costs one request.
+          const detail = await fetchSymbol(nodeId);
+          if (controller.signal.aborted) return;
           let sourceLines: string[] = [];
           try {
             const source = await fetchJson<SourceResponse>(
@@ -171,6 +172,7 @@ export function useNodePreview(
       } catch (fetchError) {
         if (isCurrent()) {
           setData(null);
+          setNotFound(isNotFoundError(fetchError));
           setError(
             fetchError instanceof Error && fetchError.message
               ? fetchError.message
@@ -186,5 +188,5 @@ export function useNodePreview(
     return () => controller.abort();
   }, [nodeId, nodeKind]);
 
-  return { data, loading, error };
+  return { data, loading, error, notFound };
 }

@@ -11,6 +11,7 @@ import { PathDetail } from "./PathDetail";
 import { SymbolDetail } from "./SymbolDetail";
 import { NodeActionBar } from "../actions/NodeActionBar";
 import { LensSummaryPanel } from "../workspace/LensSummaryPanel";
+import { useSymbolQuery } from "../../hooks/useSymbolQuery";
 
 export function DetailPanel() {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
@@ -20,6 +21,11 @@ export function DetailPanel() {
   const diffActive = useStore((s) => s.diffActive);
   const gapActive = useStore((s) => s.gapActive);
   const llmResult = useStore((s) => s.llmResult);
+  const isSymbolSelection = Boolean(
+    selectedNodeId && (selectedNodeId.startsWith("sym:") || isSymbolKind(selectedNodeKind)),
+  );
+  // Shared with SymbolDetail/Evidence/breadcrumb: one request per selection.
+  const symbolQuery = useSymbolQuery(isSymbolSelection ? selectedNodeId : null);
 
   if (!selectedNodeId) {
     return (
@@ -60,9 +66,7 @@ export function DetailPanel() {
     );
   }
 
-  const isSymbol =
-    selectedNodeId.startsWith("sym:") ||
-    isSymbolKind(selectedNodeKind);
+  const isSymbol = isSymbolSelection;
   const isNote = isNoteSelection(selectedNodeId, selectedNodeKind);
   const isFile = isFileSelection(selectedNodeId, selectedNodeKind);
 
@@ -70,7 +74,11 @@ export function DetailPanel() {
     <GlassPanel data-testid="detail-panel" className="flex h-full flex-col border-l border-[var(--color-border)] bg-[var(--color-surface)]">
       <div className="border-b border-[var(--color-border)] p-2">
         <NodeActionBar
-          node={{ uid: selectedNodeId, kind: selectedNodeKind }}
+          node={{
+            uid: selectedNodeId,
+            kind: selectedNodeKind,
+            missing: symbolQuery.status === "missing",
+          }}
           compact
         />
       </div>

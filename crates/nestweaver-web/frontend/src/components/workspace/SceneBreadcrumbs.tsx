@@ -36,7 +36,7 @@ export function SceneBreadcrumbs() {
   // crumb shows the symbol/note name rather than the uid's numeric line-tail.
   // useNodePreview shares a module-level cache with the detail panel, so this
   // does not add a fetch when the panel is already showing the same node.
-  const { data: preview } = useNodePreview(selectedNodeId, selectedNodeKind);
+  const { data: preview, notFound } = useNodePreview(selectedNodeId, selectedNodeKind);
   const previewName =
     preview?.type === "symbol"
       ? preview.detail.symbol.name
@@ -92,9 +92,13 @@ export function SceneBreadcrumbs() {
       <ChevronRight className="h-3.5 w-3.5 shrink-0" />
       <span
         className="min-w-[4rem] max-w-[10rem] truncate rounded px-1.5 py-1 font-medium text-[var(--color-text)]"
-        title={selectedNodeId ?? "No selected node"}
+        title={
+          notFound && selectedNodeId
+            ? `Not found: ${selectedNodeId}`
+            : selectedNodeId ?? "No selected node"
+        }
       >
-        {compactNodeLabel(selectedNodeId, graphLabel)}
+        {notFound ? "Not found" : compactNodeLabel(selectedNodeId, graphLabel)}
       </span>
       <ChevronRight className="hidden h-3.5 w-3.5 shrink-0 xl:block" />
       <button

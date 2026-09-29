@@ -9,6 +9,8 @@ import { NodeActionBar } from "../actions/NodeActionBar";
 import { CodePreview } from "../detail/CodePreview";
 import { RepoPicker } from "../detail/RepoPicker";
 import { KindBadge } from "../shared/KindBadge";
+import { NodeNotFound } from "../shared/NodeNotFound";
+import { fetchSymbol, isNotFoundError } from "../../api/symbolQuery";
 
 interface SourceEvidencePanelProps {
   compact?: boolean;
@@ -54,6 +56,7 @@ export function SourceEvidencePanel({
   const [fileSource, setFileSource] = useState<SourceResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [missing, setMissing] = useState(false);
   // Kept across the refetch a pick triggers; applies only to its own path.
   const [repoChoice, setRepoChoice] = useState<FileRepoChoice | null>(null);
   const fileChoice = repoChoice && repoChoice.path === selectedNodeId ? repoChoice : null;
@@ -101,6 +104,7 @@ export function SourceEvidencePanel({
     setFileSymbols([]);
     setFileSource(null);
     setError(null);
+    setMissing(false);
 
     if (!selectedNodeId) {
       setLoading(false);
@@ -114,13 +118,15 @@ export function SourceEvidencePanel({
 
     if (isSymbolLike(selectedNodeId, selectedNodeKind)) {
       setLoading(true);
-      api
-        .symbol(selectedNodeId, { signal: controller.signal })
+      fetchSymbol(selectedNodeId)
         .then((detail) => {
           if (isCurrent()) setSymbolDetail(detail);
         })
         .catch((e) => {
-          if (isCurrent()) {
+          if (!isCurrent()) return;
+          if (isNotFoundError(e)) {
+            setMissing(true);
+          } else {
             setError(e instanceof Error ? e.message : "Symbol evidence is unavailable.");
           }
         })
@@ -221,8 +227,9 @@ export function SourceEvidencePanel({
     graphEvidence?.startLine ??
     null;
   const fileLabel = selectedNodeId?.split("/").pop() ?? selectedNodeId;
-  const label =
-    symbol?.name ??
+  const label = missing
+    ? selectedNodeId?.split(":").pop() || selectedNodeId || "Node not found"
+    : symbol?.name ??
     note?.title ??
     (hasFileEvidence ? fileLabel : null) ??
     graphEvidence?.label ??
@@ -250,7 +257,7 @@ export function SourceEvidencePanel({
         </div>
         {selectedNodeId && (
           <NodeActionBar
-            node={{ uid: selectedNodeId, kind, label }}
+            node={{ uid: selectedNodeId, kind, label, missing }}
             ids={["open", "related", "trace", "copyLink"]}
             compact
             className="mt-3"
@@ -264,6 +271,8 @@ export function SourceEvidencePanel({
             Select a node to inspect source spans, note excerpts, or an explicit
             no-evidence state.
           </div>
+        ) : missing ? (
+          <NodeNotFound uid={selectedNodeId} compact />
         ) : loading && fileChoice ? (
           // nw-683: keep the picker mounted during the refetch a pick
           // triggers so the pressed button doesn't lose focus.
