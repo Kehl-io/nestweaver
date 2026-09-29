@@ -2740,6 +2740,11 @@ async fn run_shutdown_drain(state: Arc<DaemonState>, ceiling: u64) {
 /// How often the daemon checks whether the store needs a reopen after a
 /// deferred checkpoint.
 const DEFERRED_CHECKPOINT_REOPEN_INTERVAL: Duration = Duration::from_secs(5);
+/// Consecutive busy non-blocking attempts (about a minute) before the daemon
+/// escalates to a bounded hold-off of new connections.
+const DEFERRED_CHECKPOINT_ESCALATE_AFTER: u32 = 12;
+/// How long an escalated reopen may hold off new connections.
+const DEFERRED_CHECKPOINT_ESCALATION_WAIT: Duration = Duration::from_secs(10);
 
 /// Reopen the store after a deferred checkpoint, holding the write gate so no
 /// write is in flight. Returns the store's verdict; `Busy` (a read still has a
@@ -2748,9 +2753,13 @@ fn reopen_store_at_safe_point(
     store: &GraphStore,
     write_gate: &WriteGate,
     authority: Option<&nestweaver_store::DbWriteLease>,
+    escalation: Option<Duration>,
 ) -> Result<nestweaver_store::ReopenOutcome, nestweaver_store::StoreError> {
     let _no_writes = write_gate.blocking_lock("reopen after interrupted checkpoint");
-    store.reopen_after_deferred_checkpoint(authority)
+    match escalation {
+        None => store.reopen_after_deferred_checkpoint(authority),
+        Some(max_wait) => store.reopen_after_deferred_checkpoint_waiting(authority, max_wait),
+    }
 }
 
 fn begin_shutdown_drain(state: Arc<DaemonState>, trigger: &'static str) {
@@ -14436,26 +14445,53 @@ pub async fn run_server(
         let authority = write_authority.clone();
         let mut reopen_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
+            let mut busy_attempts = 0_u32;
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(DEFERRED_CHECKPOINT_REOPEN_INTERVAL) => {}
                     _ = reopen_shutdown.changed() => break,
                 }
                 if !store.reopen_required() {
+                    busy_attempts = 0;
                     continue;
+                }
+                // Readers that always hold a connection starve the
+                // non-blocking attempt; after a run of those, escalate to a
+                // bounded hold-off of new connections.
+                let escalate = busy_attempts >= DEFERRED_CHECKPOINT_ESCALATE_AFTER;
+                if escalate {
+                    tracing::warn!(
+                        attempts = busy_attempts,
+                        "the store still needs a reopen after an interrupted checkpoint and \
+                         open reads keep it busy; holding off new reads for up to {}s so it \
+                         can reopen",
+                        DEFERRED_CHECKPOINT_ESCALATION_WAIT.as_secs()
+                    );
                 }
                 let store = store.clone();
                 let write_gate = write_gate.clone();
                 let authority = authority.clone();
                 let outcome = tokio::task::spawn_blocking(move || {
-                    reopen_store_at_safe_point(&store, &write_gate, authority.as_deref())
+                    reopen_store_at_safe_point(
+                        &store,
+                        &write_gate,
+                        authority.as_deref(),
+                        escalate.then_some(DEFERRED_CHECKPOINT_ESCALATION_WAIT),
+                    )
                 })
                 .await;
-                if let Ok(Err(error)) = outcome {
-                    tracing::warn!(
+                match outcome {
+                    Ok(Ok(nestweaver_store::ReopenOutcome::Busy)) => {
+                        // An escalation that timed out backs off and starts
+                        // the non-blocking run again.
+                        busy_attempts = if escalate { 0 } else { busy_attempts + 1 };
+                    }
+                    Ok(Ok(_)) => busy_attempts = 0,
+                    Ok(Err(error)) => tracing::warn!(
                         "reopening the store after an interrupted checkpoint failed; \
                          will retry: {error}"
-                    );
+                    ),
+                    Err(_) => {}
                 }
             }
         });
@@ -31371,7 +31407,7 @@ mod deferred_checkpoint_reopen_tests {
             let store = Arc::clone(&store);
             let gate = gate.clone();
             std::thread::spawn(move || {
-                let outcome = reopen_store_at_safe_point(&store, &gate, None);
+                let outcome = reopen_store_at_safe_point(&store, &gate, None, None);
                 tx.send(()).unwrap();
                 outcome
             })

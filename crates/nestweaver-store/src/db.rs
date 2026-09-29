@@ -289,6 +289,9 @@ impl Drop for IndexPublicationLease<'_> {
 pub(crate) struct ReopenableDatabase {
     gate: std::sync::RwLock<()>,
     cell: std::cell::UnsafeCell<Option<lbug::Database>>,
+    /// Set while an escalated reopen waits for open connections to finish:
+    /// new connections wait for it to clear (see `wait_out_hold_off`).
+    holding_off: std::sync::atomic::AtomicBool,
 }
 
 // SAFETY: `cell` is only written under the exclusive `gate` guard (in
@@ -303,7 +306,32 @@ impl ReopenableDatabase {
         Self {
             gate: std::sync::RwLock::new(()),
             cell: std::cell::UnsafeCell::new(Some(db)),
+            holding_off: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Hold off new connections until the returned guard drops. Always
+    /// released, including on an early return or a panic.
+    fn hold_off_new_connections(&self) -> HoldOff<'_> {
+        self.holding_off
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        HoldOff(&self.holding_off)
+    }
+
+    /// Wait while an escalated reopen holds off new connections. The hold-off
+    /// is bounded by the reopen's own deadline, so this wait is too.
+    fn wait_out_hold_off(&self) {
+        while self.holding_off.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+struct HoldOff<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for HoldOff<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -3593,6 +3621,7 @@ impl GraphStore {
     }
 
     pub(crate) fn conn(&self) -> Result<StoreConnection<'_>, StoreError> {
+        self.db.wait_out_hold_off();
         let open = self
             .db
             .gate
@@ -4122,6 +4151,33 @@ impl GraphStore {
         &self,
         authority: Option<&DbWriteLease>,
     ) -> Result<ReopenOutcome, StoreError> {
+        self.reopen_after_deferred_checkpoint_within(authority, None)
+    }
+
+    /// The escalated form of [`Self::reopen_after_deferred_checkpoint`], for
+    /// when readers keep a connection open at every non-blocking attempt.
+    ///
+    /// For at most `max_wait` it holds off NEW connections (they wait in
+    /// [`Self::conn`] for the hold-off to end; writer-preferring), so the
+    /// connections already open finish and the reopen gets in. It never
+    /// blocks longer than that: on timeout the hold-off ends and the answer is
+    /// [`ReopenOutcome::Busy`], for the caller to back off and retry. A
+    /// connection held for longer than `max_wait` (or a thread that holds one
+    /// and asks for a second during the hold-off) delays the reopen by one
+    /// bounded window; it cannot deadlock it.
+    pub fn reopen_after_deferred_checkpoint_waiting(
+        &self,
+        authority: Option<&DbWriteLease>,
+        max_wait: std::time::Duration,
+    ) -> Result<ReopenOutcome, StoreError> {
+        self.reopen_after_deferred_checkpoint_within(authority, Some(max_wait))
+    }
+
+    fn reopen_after_deferred_checkpoint_within(
+        &self,
+        authority: Option<&DbWriteLease>,
+        max_wait: Option<std::time::Duration>,
+    ) -> Result<ReopenOutcome, StoreError> {
         if !self.reopen_required() {
             return Ok(ReopenOutcome::NotNeeded);
         }
@@ -4134,10 +4190,28 @@ impl GraphStore {
         if self.access_mode != GraphStoreAccessMode::ReadWrite {
             return Ok(ReopenOutcome::NotNeeded);
         }
-        let _exclusive = match self.db.gate.try_write() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(ReopenOutcome::Busy),
-            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        let _exclusive = match max_wait {
+            None => match self.db.gate.try_write() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(ReopenOutcome::Busy),
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            },
+            Some(max_wait) => {
+                let _hold_off = self.db.hold_off_new_connections();
+                let deadline = std::time::Instant::now() + max_wait;
+                loop {
+                    match self.db.gate.try_write() {
+                        Ok(guard) => break guard,
+                        Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            if std::time::Instant::now() >= deadline {
+                                return Ok(ReopenOutcome::Busy);
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                    }
+                }
+            }
         };
         // SAFETY: exclusive guard held; no StoreConnection exists.
         let cell = unsafe { &mut *self.db.cell.get() };
@@ -7749,6 +7823,68 @@ mod wal_recovery_arm_tests {
             repos.iter().any(|repo| repo.uid == "repo:kept"),
             "{repos:?}"
         );
+    }
+
+    /// Readers that keep a connection open at every moment starve the
+    /// non-blocking reopen. The escalated reopen holds off NEW connections for
+    /// a bounded window, the open ones finish, and the reopen gets in, while
+    /// the readers carry on afterwards.
+    #[test]
+    fn continuously_overlapping_readers_cannot_starve_the_escalated_reopen() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = Arc::new(GraphStore::create(&db).unwrap());
+        std::fs::write(dir.path().join("brain.lbug.wal.checkpoint"), b"").unwrap();
+        assert!(store.checkpoint().is_err());
+        assert!(store.reopen_required());
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let readers: Vec<_> = (0..4)
+            .map(|index| {
+                let store = Arc::clone(&store);
+                let stop = Arc::clone(&stop);
+                let reads = Arc::clone(&reads);
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(7 * index));
+                    while !stop.load(Ordering::SeqCst) {
+                        let conn = store.conn().unwrap();
+                        conn.query("MATCH (m:Meta) RETURN count(*)").unwrap();
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        drop(conn);
+                    }
+                })
+            })
+            .collect();
+        // Let the readers overlap first.
+        while reads.load(Ordering::SeqCst) < 8 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            store.reopen_after_deferred_checkpoint(None).unwrap(),
+            ReopenOutcome::Busy,
+            "the non-blocking attempt is starved by the overlapping readers"
+        );
+        let started = std::time::Instant::now();
+        let outcome = store
+            .reopen_after_deferred_checkpoint_waiting(None, std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(outcome, ReopenOutcome::Reopened);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let before = reads.load(Ordering::SeqCst);
+        while reads.load(Ordering::SeqCst) < before + 4 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        stop.store(true, Ordering::SeqCst);
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        store
+            .checkpoint()
+            .expect("checkpoint after the escalated reopen");
     }
 
     /// An interrupted checkpoint that recovery could not finish for lack of
