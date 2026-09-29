@@ -19,6 +19,7 @@ import { ShortcutsOverlay } from "./components/ShortcutsOverlay";
 import { LiveAnnouncer } from "./components/shared/LiveAnnouncer";
 import { ToastViewport } from "./components/shared/ToastViewport";
 import { LlmQueryBar } from "./components/llm/LlmQueryBar";
+import { InspectorDrawer } from "./components/InspectorDrawer";
 
 function ResizeHandle() {
   return (
@@ -115,6 +116,7 @@ function AppContent() {
         </div>
       ) : (
         // Normal / responsive layout
+        <div className="relative flex min-h-0 flex-1">
         <Group
           orientation="horizontal"
           className="flex-1 min-h-0"
@@ -171,6 +173,8 @@ function AppContent() {
             </>
           )}
         </Group>
+        {hideDetail && <InspectorDrawer />}
+        </div>
       )}
       <StatusBar />
       <LlmQueryBar />

@@ -39,6 +39,7 @@ export function RepresentationTabs() {
             type="button"
             role="tab"
             aria-selected={active}
+            aria-label={label}
             title={label}
             onClick={() => setRepresentationMode(mode)}
             className={`inline-flex h-7 min-w-0 items-center gap-1.5 rounded px-2 text-[11px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-[var(--color-graph-selection)] ${

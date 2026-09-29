@@ -7,6 +7,9 @@ export interface PanelSlice {
   explorerTab: ExplorerTab;
   leftPanelCollapsed: boolean;
   rightPanelCollapsed: boolean;
+  /** Tablet drawer holding Details/Evidence below the inline-pane breakpoint (nw-593). */
+  inspectorOpen: boolean;
+  setInspectorOpen: (open: boolean) => void;
   setExplorerTab: (tab: ExplorerTab) => void;
   toggleLeftPanel: () => void;
   toggleRightPanel: () => void;
@@ -21,6 +24,12 @@ export const createPanelSlice: StateCreator<
   explorerTab: "files",
   leftPanelCollapsed: false,
   rightPanelCollapsed: false,
+  inspectorOpen: false,
+
+  setInspectorOpen: (open) =>
+    set((s) => {
+      s.inspectorOpen = open;
+    }),
 
   setExplorerTab: (tab) =>
     set((s) => {
