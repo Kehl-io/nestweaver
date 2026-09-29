@@ -72,16 +72,32 @@ function AppContent() {
         ? "78%"
         : "62%";
 
-  const graphView = activeView === "canvas" ? (
+  const graphContent = activeView === "canvas" ? (
     <CanvasView />
   ) : activeView === "presentation" ? (
     <PresentationView />
   ) : (
     <GraphPanel />
   );
+  // nw-565: the skip link's target; Tab from here reaches the graph chrome.
+  const graphView = (
+    <main id="main-content" tabIndex={-1} aria-label="Graph and results" className="h-full outline-none">
+      {graphContent}
+    </main>
+  );
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
+      <a
+        href="#main-content"
+        onClick={(event) => {
+          event.preventDefault();
+          document.getElementById("main-content")?.focus();
+        }}
+        className="sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:z-[100] focus:rounded focus:border focus:border-[var(--color-graph-selection)] focus:bg-[var(--color-surface)] focus:px-3 focus:py-2 focus:text-sm focus:font-medium focus:text-[var(--color-text)] focus:shadow-lg"
+      >
+        Skip to graph
+      </a>
       <TopBar />
       {isZen ? (
         // Zen mode: graph takes full area, with a compact evidence path for the selected node.
