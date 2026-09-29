@@ -240,7 +240,7 @@ impl WorkerPool {
             write_gate.clone(),
             shutdown.clone(),
             Arc::clone(&relink_wake),
-            CODE_LINK_RELINK_DEBOUNCE,
+            CODE_LINK_RELINK_TIMING,
         ));
 
         // Rehydrate the reindex tracker from the persisted store so the
@@ -915,10 +915,38 @@ fn relink_pass(
     }
 }
 
+/// nw-677: how the relink task waits. `retry_min` doubles up to
+/// `retry_max` while passes end with the debt still owed.
+#[derive(Clone, Copy)]
+struct RelinkTiming {
+    debounce: std::time::Duration,
+    retry_min: std::time::Duration,
+    retry_max: std::time::Duration,
+}
+
+const CODE_LINK_RELINK_TIMING: RelinkTiming = RelinkTiming {
+    debounce: CODE_LINK_RELINK_DEBOUNCE,
+    retry_min: std::time::Duration::from_secs(30),
+    retry_max: std::time::Duration::from_secs(10 * 60),
+};
+
+/// Whether code-link debt is recorded for this store's database.
+fn code_links_owed(store: &nestweaver_store::GraphStore) -> bool {
+    store
+        .db_path()
+        .is_some_and(crate::code_links::code_links_pending)
+}
+
 /// nw-677 review M3: the pool's single relink task. Woken by code jobs,
 /// it waits out a debounce (further wakes coalesce), then runs one pass off
 /// the async runtime. It never runs two passes at once, and it stops on
 /// shutdown.
+///
+/// Re-review: it also wakes itself. At startup it pays debt left by a pass a
+/// restart interrupted, and after a pass that ends with the debt still owed
+/// (failed, or stopped short of shutdown) it retries with backoff, reset by
+/// a pass that settles — so a quiet server does not keep dropped links
+/// until the next code job.
 async fn run_code_link_relinker(
     store: Arc<nestweaver_store::GraphStore>,
     reconciler: Arc<std::sync::Mutex<crate::code_links::CodeLinkReconciler>>,
@@ -926,31 +954,53 @@ async fn run_code_link_relinker(
     gate: Option<crate::write_gate::WriteGate>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     wake: Arc<tokio::sync::Notify>,
-    debounce: std::time::Duration,
+    timing: RelinkTiming,
 ) {
     let lease = relink_lease_factory(gate, shutdown.clone());
+    if code_links_owed(&store) {
+        wake.notify_one();
+    }
+    let mut retry_after = timing.retry_min;
+    let mut retry_at: Option<tokio::time::Instant> = None;
     loop {
         if *shutdown.borrow() {
             return;
         }
+        let retry = async {
+            match retry_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             _ = wake.notified() => {}
+            _ = retry => {}
             _ = shutdown.changed() => return,
         }
+        retry_at = None;
         tokio::select! {
-            _ = tokio::time::sleep(debounce) => {}
+            _ = tokio::time::sleep(timing.debounce) => {}
             _ = shutdown.changed() => return,
         }
-        let (store, reconciler, lease, stop) = (
+        let (pass_store, reconciler, lease, stop) = (
             Arc::clone(&store),
             Arc::clone(&reconciler),
             Arc::clone(&lease),
             shutdown.clone(),
         );
         let _ = tokio::task::spawn_blocking(move || {
-            relink_pass(&store, &reconciler, note_limits, &lease, &stop)
+            relink_pass(&pass_store, &reconciler, note_limits, &lease, &stop)
         })
         .await;
+        if *shutdown.borrow() {
+            return;
+        }
+        if code_links_owed(&store) {
+            retry_at = Some(tokio::time::Instant::now() + retry_after);
+            retry_after = retry_after.saturating_mul(2).min(timing.retry_max);
+        } else {
+            retry_after = timing.retry_min;
+        }
     }
 }
 
@@ -2060,7 +2110,7 @@ mod tests {
             Some(crate::write_gate::WriteGate::new()),
             shutdown_rx,
             Arc::clone(&wake),
-            std::time::Duration::from_millis(50),
+            FAST_RELINK,
         ));
         for _ in 0..5 {
             wake.notify_one();
@@ -2102,6 +2152,145 @@ mod tests {
                 .is_some()),
             "the lease must refuse after shutdown"
         );
+    }
+
+    const FAST_RELINK: RelinkTiming = RelinkTiming {
+        debounce: std::time::Duration::from_millis(50),
+        retry_min: std::time::Duration::from_millis(100),
+        retry_max: std::time::Duration::from_millis(400),
+    };
+
+    /// A server store with a code repo and a vault linked to it, then a full
+    /// code re-index: links dropped, debt recorded.
+    fn server_store_with_owed_links(tmp: &TempDir) -> Arc<nestweaver_store::GraphStore> {
+        let code_src = tmp.path().join("code-src");
+        create_source_repo(&code_src, &[("src/w.rs", "pub struct AlphaWidget;\n")]);
+        let vault_src = tmp.path().join("vault-src");
+        create_source_repo(&vault_src, &[("a.md", "# A\n\nuses AlphaWidget\n")]);
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store =
+            Arc::new(nestweaver_store::GraphStore::open(&tmp.path().join("brain.lbug")).unwrap());
+        let job = |id: i64, src: &std::path::Path| IndexJob {
+            id,
+            repo_id: format!("repo-{id}"),
+            repo_url: format!("file://{}", src.display()),
+            trigger: JobTrigger::Unindexed,
+            priority: 0,
+            status: crate::jobs::JobStatus::Running,
+            attempt: 1,
+            max_attempts: 4,
+            error_msg: None,
+            branch: None,
+            claimed_by: None,
+            created_at: 0,
+            updated_at: 0,
+            started_at: Some(0),
+            completed_at: None,
+        };
+        let run = |job: &IndexJob, repo_type: RepoType, force_full: bool| {
+            let prepared = prepare_job(job, &ws, &store, "test-instance", None, repo_type)
+                .unwrap()
+                .unwrap();
+            commit_prepared_job_with_reindex_decision_and_limits(
+                &prepared,
+                &store,
+                "test-instance",
+                force_full,
+                crate::index_limits::IndexLimits::default(),
+                crate::index_limits::NoteLimits::default(),
+                &crate::config::CrossDomainConfig::default(),
+                || Ok::<_, anyhow::Error>(()),
+            )
+            .unwrap();
+        };
+        run(&job(1, &code_src), RepoType::Code, false);
+        run(&job(2, &vault_src), RepoType::Vault, false);
+        commit_file(
+            &code_src,
+            "src/w.rs",
+            "// moved\npub struct AlphaWidget;\n",
+            "move",
+        );
+        run(&job(3, &code_src), RepoType::Code, true);
+        assert_eq!(store.count_references_code_edges().unwrap(), 0);
+        assert!(code_links_owed(&store));
+        store
+    }
+
+    async fn wait_settled(store: &nestweaver_store::GraphStore, why: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while store.count_references_code_edges().unwrap() != 2 || code_links_owed(store) {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{why}"));
+    }
+
+    fn spawn_relinker(
+        store: &Arc<nestweaver_store::GraphStore>,
+    ) -> (
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let pool = WorkerPool::new(1);
+        let task = tokio::spawn(run_code_link_relinker(
+            Arc::clone(store),
+            Arc::clone(&pool.code_link_reconciler),
+            crate::index_limits::NoteLimits::default(),
+            Some(crate::write_gate::WriteGate::new()),
+            shutdown_rx,
+            Arc::new(tokio::sync::Notify::new()),
+            FAST_RELINK,
+        ));
+        (shutdown_tx, task)
+    }
+
+    /// nw-677 re-review: debt left by a pass a restart interrupted is paid
+    /// when the relinker starts, with no code job to wake it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn owed_links_at_startup_are_relinked_without_a_code_job() {
+        let tmp = TempDir::new().unwrap();
+        let store = server_store_with_owed_links(&tmp);
+        let (shutdown, task) = spawn_relinker(&store);
+        wait_settled(&store, "startup debt was never relinked").await;
+        shutdown.send_replace(true);
+        task.await.unwrap();
+    }
+
+    /// nw-677 re-review: a pass that ends with the debt still owed (here the
+    /// vault's bare clone is unreadable, so the pass records a failure) is
+    /// retried with backoff, and settles once the clone is readable again —
+    /// with no further wake.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unsettled_relink_pass_is_retried_until_it_settles() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let store = server_store_with_owed_links(&tmp);
+        let vault_root = std::path::PathBuf::from(&store.list_vaults(None).unwrap()[0].root_path);
+        let objects = vault_root.join("objects");
+        std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (shutdown, task) = spawn_relinker(&store);
+        let db = store.db_path().unwrap().to_path_buf();
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let status = crate::code_links::code_links_status_json(Some(&db));
+                if status["failures"].as_u64().unwrap_or(0) >= 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o755)).unwrap();
+        failed.expect("the first pass must fail while the clone is unreadable");
+        assert!(code_links_owed(&store), "a failed pass keeps the debt");
+
+        wait_settled(&store, "the unsettled pass was never retried").await;
+        shutdown.send_replace(true);
+        task.await.unwrap();
     }
 
     /// Crash-between-SHA-and-content self-heal: a Repo row whose indexed_sha
