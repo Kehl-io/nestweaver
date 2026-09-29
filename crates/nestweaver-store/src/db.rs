@@ -7623,9 +7623,22 @@ pub(crate) mod engine_format_open_tests {
 
     /// Unpack one of the databases LadybugDB 0.20.4 wrote
     /// (`testdata/lbug-0.20.4/`, built by the generator beside them).
+    ///
+    /// `NESTWEAVER_OLD_ENGINE_FIXTURE_DIR`, when set, points at freshly
+    /// generated UNCOMPRESSED files instead: `regenerate.sh` uses it to check a
+    /// new fixture with this engine before replacing the committed one.
     pub(crate) fn old_engine_fixture(dir: &Path, name: &str) -> PathBuf {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/lbug-0.20.4");
         let target = dir.join(name);
+        if let Some(fresh) = std::env::var_os("NESTWEAVER_OLD_ENGINE_FIXTURE_DIR") {
+            for suffix in ["", ".wal"] {
+                let source = Path::new(&fresh).join(format!("{name}{suffix}"));
+                if source.exists() {
+                    std::fs::copy(&source, format!("{}{suffix}", target.display())).unwrap();
+                }
+            }
+            return target;
+        }
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/lbug-0.20.4");
         for suffix in ["", ".wal"] {
             let packed = source.join(format!("{name}{suffix}.zst"));
             if !packed.exists() {
