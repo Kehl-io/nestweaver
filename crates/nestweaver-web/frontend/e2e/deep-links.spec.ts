@@ -177,4 +177,85 @@ test.describe("Deep links (batch 11)", () => {
     await expect(open).toHaveAttribute("aria-disabled", "false");
     await expect(details.getByRole("heading", { name: "Node not found" })).toHaveCount(0);
   });
+
+  test.describe("Path dialog target (nw-568)", () => {
+    async function openPathDialog(page: Page, request: APIRequestContext) {
+      const from = await findSymbol(request, "releaseA");
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await persistRepresentation(page, "graph");
+      await page.goto(`/?node=${encodeURIComponent(from.uid)}&kind=${from.kind}`);
+      const details = page.getByTestId("detail-panel");
+      await expect(details.getByText("releaseA").first()).toBeVisible({ timeout: 15_000 });
+      await details
+        .getByRole("group", { name: "Node actions" })
+        .first()
+        .getByRole("button", { name: /^Path$/ })
+        .click();
+      const dialog = page.getByRole("dialog", { name: "Find path" });
+      await expect(dialog).toBeVisible();
+      return { dialog, details, from };
+    }
+
+    function pathRequests(page: Page) {
+      const seen: string[] = [];
+      page.on("request", (req) => {
+        const url = new URL(req.url());
+        if (url.pathname.startsWith("/api/v1/paths/")) {
+          seen.push(decodeURIComponent(url.pathname.slice("/api/v1/paths/".length)));
+        }
+      });
+      return seen;
+    }
+
+    test("a unique name resolves to its uid and finds the path", async ({ page, request }) => {
+      const target = await findSymbol(request, "releaseC");
+      const requests = pathRequests(page);
+      const { dialog, from } = await openPathDialog(page, request);
+      // The From label is the node's name, not its raw uid.
+      await expect(dialog).toContainText("releaseA");
+      await expect(dialog).not.toContainText(from.uid);
+
+      await dialog.getByRole("textbox", { name: "Path target" }).fill("releaseC");
+      await dialog.getByRole("textbox", { name: "Path target" }).press("Enter");
+      await expect(page.getByRole("button", { name: /^Path 1:/ }).first()).toBeVisible({ timeout: 10_000 });
+      expect(requests).toEqual([`${from.uid}/${target.uid}`]);
+    });
+
+    test("an ambiguous name offers a choice before querying", async ({ page, request }) => {
+      const search = await request.get("/api/v1/search?q=speak&limit=20");
+      const speaks = ((await search.json()) as SymbolCandidate[]).filter((s) => s.name === "speak");
+      expect(speaks.length, "fixture has two methods named speak").toBeGreaterThan(1);
+      const requests = pathRequests(page);
+      const { dialog, from } = await openPathDialog(page, request);
+
+      await dialog.getByRole("textbox", { name: "Path target" }).fill("speak");
+      await dialog.getByRole("button", { name: "Find" }).click();
+      const choices = dialog.getByRole("listbox", { name: "Matching nodes" });
+      await expect(choices.getByRole("option")).toHaveCount(speaks.length);
+      expect(requests).toEqual([]);
+
+      await choices.getByRole("option").nth(1).click();
+      await expect.poll(() => requests.length).toBe(1);
+      expect(speaks.map((s) => `${from.uid}/${s.uid}`)).toContain(requests[0]);
+    });
+
+    test("an unknown name says so instead of querying a literal segment", async ({ page, request }) => {
+      const requests = pathRequests(page);
+      const { dialog } = await openPathDialog(page, request);
+      await dialog.getByRole("textbox", { name: "Path target" }).fill("zzzNoSuchNodeName");
+      await dialog.getByRole("button", { name: "Find" }).click();
+      await expect(dialog.getByRole("alert")).toContainText(/No node named/);
+      expect(requests).toEqual([]);
+    });
+
+    test("counterweight: a full uid still finds the path", async ({ page, request }) => {
+      const target = await findSymbol(request, "releaseC");
+      const requests = pathRequests(page);
+      const { dialog, from } = await openPathDialog(page, request);
+      await dialog.getByRole("textbox", { name: "Path target" }).fill(target.uid);
+      await dialog.getByRole("button", { name: "Find" }).click();
+      await expect(page.getByRole("button", { name: /^Path 1:/ }).first()).toBeVisible({ timeout: 10_000 });
+      expect(requests).toEqual([`${from.uid}/${target.uid}`]);
+    });
+  });
 });
