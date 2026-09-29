@@ -369,12 +369,13 @@ pub struct ManifestSnapshot {
     pub failures: Vec<ManifestRepoFailure>,
 }
 
-/// Either payload shape: the snapshot, or the bare repo map written before
-/// failures were embedded (still schema version 2, so an existing sidecar
-/// stays valid across the upgrade).
+/// Either payload shape: the snapshot, or the bare repo map. The bare map is
+/// what every sidecar held before failures were embedded AND what is still
+/// written whenever nothing is refused, so a healthy sidecar is byte-for-byte
+/// the schema-version-2 shape older binaries read.
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum ManifestPayload {
+pub(crate) enum ManifestPayload {
     Snapshot(ManifestSnapshot),
     Legacy(HashMap<String, ManifestInfo>),
 }
@@ -1271,14 +1272,26 @@ pub fn save_manifest_snapshot_for_db(
     #[cfg(feature = "release-fixture-hooks")]
     crate::release_fixture::manifest_before_save()?;
     let canonical_path = manifest_cache_path(db_path);
-    crate::artifact_sidecar::save_json(
-        store,
-        &canonical_path,
-        MANIFEST_ARTIFACT_KIND,
-        MANIFEST_ARTIFACT_SCHEMA_VERSION,
-        MANIFEST_ALGORITHM_FINGERPRINT,
-        snapshot,
-    )?;
+    if snapshot.failures.is_empty() {
+        // Nothing refused: the bare map, readable by older binaries.
+        crate::artifact_sidecar::save_json(
+            store,
+            &canonical_path,
+            MANIFEST_ARTIFACT_KIND,
+            MANIFEST_ARTIFACT_SCHEMA_VERSION,
+            MANIFEST_ALGORITHM_FINGERPRINT,
+            &snapshot.repos,
+        )?;
+    } else {
+        crate::artifact_sidecar::save_json(
+            store,
+            &canonical_path,
+            MANIFEST_ARTIFACT_KIND,
+            MANIFEST_ARTIFACT_SCHEMA_VERSION,
+            MANIFEST_ALGORITHM_FINGERPRINT,
+            snapshot,
+        )?;
+    }
 
     let legacy_path = db_path.with_extension("manifests.json");
     if legacy_path != canonical_path {
@@ -3201,6 +3214,52 @@ mod release_manifest_tests {
             server.contains("re-fetch") && !server.contains("index --repo"),
             "{server}"
         );
+    }
+
+    /// Review M4: the sidecar is backed up and snapshotted through the
+    /// publication artifact contract, which must accept both shapes: the
+    /// bare map a healthy rebuild writes and the snapshot with refusals.
+    #[test]
+    fn both_manifest_payload_shapes_pass_the_artifact_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let store = nestweaver_store::GraphStore::create(&db).unwrap();
+        let repo = nestweaver_schema::Repo {
+            uid: "repo:b".into(),
+            url: "file:///fixture/b".into(),
+            indexed_sha: "sha".into(),
+            staleness_commits_behind: 0,
+            instance_id: "fixture".into(),
+            name: None,
+            root_path: None,
+        };
+        let identity = store.publication_identity().unwrap().unwrap();
+        for failures in [vec![], vec![ManifestRepoFailure::new(&repo, "bad".into())]] {
+            let refused = !failures.is_empty();
+            save_manifest_snapshot_for_db(
+                &ManifestSnapshot {
+                    repos: HashMap::from([("repo:a".into(), ManifestInfo::default())]),
+                    failures,
+                },
+                &store,
+                &db,
+            )
+            .unwrap();
+            let bytes = std::fs::read(manifest_cache_path(&db)).unwrap();
+            let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                raw["payload"].get("repos").is_some(),
+                refused,
+                "a healthy sidecar keeps the bare-map shape: {raw}"
+            );
+            crate::publication::repo_manifest_artifact_contract(
+                &bytes,
+                &identity,
+                env!("CARGO_PKG_VERSION"),
+                store.graph_generation(),
+            )
+            .unwrap();
+        }
     }
 
     /// Review M4: a sidecar written before failures were embedded (a bare
