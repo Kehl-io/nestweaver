@@ -301,6 +301,38 @@ test.describe("Deep links (batch 11)", () => {
       expect(requests).toEqual([]);
     });
 
+    test("name resolution is scoped to the active workspace", async ({ page, request }) => {
+      const catalog = (await (await request.get("/api/v1/workspaces")).json()) as {
+        workspaces: { id: string; type: string }[];
+      };
+      const workspace = catalog.workspaces.find((w) => w.type === "repo");
+      expect(workspace, "fixture has a repo workspace").toBeTruthy();
+      const from = await findSymbol(request, "releaseA");
+      const target = await findSymbol(request, "releaseC");
+      const lookups: URL[] = [];
+      page.on("request", (req) => {
+        const url = new URL(req.url());
+        if (url.pathname === "/api/v1/search" || url.pathname === "/api/v1/brain/search") lookups.push(url);
+      });
+      const requests = pathRequests(page);
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await persistRepresentation(page, "graph");
+      await page.goto(
+        `/?workspace=${encodeURIComponent(workspace!.id)}&node=${encodeURIComponent(from.uid)}&kind=${from.kind}`,
+      );
+      const details = page.getByTestId("detail-panel");
+      await expect(details.getByText("releaseA").first()).toBeVisible({ timeout: 15_000 });
+      await details.getByRole("group", { name: "Node actions" }).first().getByRole("button", { name: /^Path$/ }).click();
+      const dialog = page.getByRole("dialog", { name: "Find path" });
+      lookups.length = 0;
+      await dialog.getByRole("textbox", { name: "Path target" }).fill("releaseC");
+      await dialog.getByRole("button", { name: "Find" }).click();
+      await expect(page.getByRole("button", { name: /^Path 1:/ }).first()).toBeVisible({ timeout: 10_000 });
+      expect(requests).toEqual([`${from.uid}/${target.uid}`]);
+      expect(lookups.map((url) => url.pathname)).toEqual(["/api/v1/brain/search"]);
+      expect(lookups[0].searchParams.get("workspace")).toBe(workspace!.id);
+    });
+
     test("counterweight: a full uid still finds the path", async ({ page, request }) => {
       const target = await findSymbol(request, "releaseC");
       const requests = pathRequests(page);

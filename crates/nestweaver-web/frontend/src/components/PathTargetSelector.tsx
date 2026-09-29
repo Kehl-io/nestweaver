@@ -2,6 +2,8 @@ import { useId, useState } from "react";
 import { useStore } from "../stores";
 import { api } from "../api/client";
 import type { SymbolCandidate } from "../api/types";
+import type { ScopedSymbolSearchHit } from "../api/p1Types";
+import { brainSearchInWorkspace } from "../api/workspaces";
 import { useSymbolQuery } from "../hooks/useSymbolQuery";
 
 // A graph uid carries a type prefix; anything else is a name to resolve.
@@ -78,7 +80,20 @@ export function PathTargetSelector() {
     setResolution({ state: "resolving" });
     let hits: SymbolCandidate[];
     try {
-      hits = await api.search(trimmedTarget, 20);
+      // Scoped like the search box: the active workspace's symbols only.
+      const workspaceId = useStore.getState().activeWorkspaceId;
+      hits =
+        workspaceId === "all"
+          ? await api.search(trimmedTarget, 20)
+          : (await brainSearchInWorkspace(trimmedTarget, { workspaceId, limit: 20 })).results
+              .filter((hit): hit is ScopedSymbolSearchHit => "repo_uid" in hit && "file_path" in hit)
+              .map((hit) => ({
+                uid: hit.uid,
+                name: hit.name || hit.title,
+                kind: "symbol",
+                file_path: hit.file_path,
+                start_line: 0,
+              }));
     } catch (error) {
       setResolution({
         state: "error",
@@ -190,7 +205,8 @@ export function PathTargetSelector() {
               >
                 <span className="font-medium text-[var(--color-text)]">{candidate.name}</span>{" "}
                 <span className="text-[var(--color-text-muted)]">
-                  {candidate.kind} · {candidate.file_path}:{candidate.start_line}
+                  {candidate.kind} · {candidate.file_path}
+                  {candidate.start_line > 0 ? `:${candidate.start_line}` : ""}
                 </span>
               </li>
             ))}
