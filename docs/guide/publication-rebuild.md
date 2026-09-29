@@ -5,6 +5,65 @@ Upgrading an existing brain requires one complete graph reindex and re-embed.
 NestWeaver builds that replacement beside the incumbent database and does not
 change `CURRENT` until every artifact validates.
 
+## Storage-engine upgrade (LadybugDB 0.21): rebuild required
+
+This release updates LadybugDB to 0.21.0, which changes how text keys are
+hashed. The engine's on-disk format marker did not change, so the engine
+itself would open an older database and then silently miss lookups on
+non-ASCII keys. NestWeaver therefore records the engine format itself (a
+`storage.string_hash` row in the database and a `<db>.engine-format` file
+beside it) and refuses, before the engine touches the file, any database that
+lacks it:
+
+```text
+Error: nestweaver::db_rebuild_required
+
+  × Database must be rebuilt for this version of NestWeaver: /path/to/brain.lbug
+  help: /path/to/brain.lbug was built by a storage engine older than LadybugDB 0.21 ...
+          nestweaver publication rebuild --config /path/to/instance.toml
+```
+
+The exit code is 1. The refused database is never opened and never changed,
+and no daemon is started against it (both autostart and `daemon start` check
+first, so a supervisor cannot crash-loop on it). MCP clients receive the same
+code and command in the JSON-RPC error.
+
+To upgrade:
+
+1. Before installing, with the version you have now: stop the daemon and run
+   `nestweaver backup save <file>`.
+2. Install this release and run the command the error prints (below). The
+   rebuild reads the old database read-only through a narrow exemption that
+   scans rather than using primary-key lookups, writes the new graph into a
+   fresh publication slot, and switches `CURRENT` only after it validates.
+3. The old database stays where it is, unchanged. To roll back, reinstall the
+   previous version and restore your backup. Do not open a rebuilt database
+   with an older NestWeaver.
+
+Without an instance config there is nothing to rebuild from, so the error
+names a fresh `nestweaver index --repo <path> --db <new path>` instead; it
+never names the refused file as a write target.
+
+Snapshots follow the same fence: this release writes snapshot format 4 and
+refuses any older snapshot with a message naming the rebuild. `backup restore`
+of an archive written before the upgrade still restores it unchanged, and
+warns that the restored database must be rebuilt before use.
+
+The same release changes three crash-recovery behaviours:
+
+* A stale `<db>.wal.checkpoint` from another database is now renamed to
+  `<db>.wal.checkpoint.stale-<epoch>`, never deleted.
+* A frozen `<db>.wal.checkpoint` whose pages were already applied before a
+  crash (its `<db>.shadow` is gone) is reported with the single safe move,
+  `mv <db>.wal.checkpoint <db>.wal.checkpoint.applied`. Leave `<db>.wal` in
+  place: it holds later commits. Nothing is moved automatically.
+* A recovery that runs out of disk space or buffer pool while finishing an
+  interrupted checkpoint is reported as a resource problem, not corruption.
+  Free space (or raise `NESTWEAVER_LBUG_BUFFER_POOL_BYTES`) and open again; do
+  not move log files aside. A write whose post-commit checkpoint is deferred is
+  reported as committed and is never retried; restart the daemon so recovery
+  finishes the checkpoint.
+
 ## Upgrade
 
 Stop the daemon and any external watchers, then run:

@@ -100,8 +100,9 @@ accelerator = "cpu"
 
 ## Build from source
 
-Building from source requires Rust 1.85+, CMake, a C++20 compiler, OpenSSL and
-zstd development files, `pkg-config`, and Protocol Buffers:
+Building from source requires Rust 1.85+, CMake, a C++20 compiler, Python 3.9
+or newer (LadybugDB's build generates a header with it), OpenSSL and zstd
+development files, `pkg-config`, and Protocol Buffers:
 
 ```sh
 # macOS with Homebrew (also install the Xcode Command Line Tools)
