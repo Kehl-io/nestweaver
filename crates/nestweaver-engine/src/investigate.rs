@@ -4209,10 +4209,17 @@ mod tests {
         );
         // Debug CI hydrates this 5k-member fixture far more slowly than the
         // release bound (observed ~82s). Keep the functional asserts on every
-        // profile; pin the 10s performance contract to release builds.
+        // profile; pin the performance contract to release builds.
+        //
+        // The bound is 60s, not 10s. The capped path takes ~1s locally but
+        // 10.0-13.6s on hosted macOS runners (2026-09-28: main at a pure
+        // file-move commit failed at 13.6s), so 10s measured runner speed,
+        // not this regression. The regression is ~17x (the counterweight
+        // above: 17.07s vs 1.09s), i.e. ~170s+ on those runners, so 60s still
+        // fails it with ~3x margin while clearing runner noise.
         #[cfg(not(debug_assertions))]
         assert!(
-            elapsed < std::time::Duration::from_secs(10),
+            elapsed < std::time::Duration::from_secs(60),
             "investigate --scope project: took {elapsed:?} for a {MEMBER_COUNT}-member \
              project; nw-322 measured 110-142s on a comparable real project because every \
              fused candidate was hydrated before DEFAULT_RETRIEVAL_BREADTH discarded all \
