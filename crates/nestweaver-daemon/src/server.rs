@@ -13787,10 +13787,10 @@ pub async fn run_server(
     let publication_root_lock = (!snapshot_replica)
         .then(|| nestweaver_engine::publication::PublicationRootLock::acquire(&publication_root))
         .transpose()?;
-    let db_path = if snapshot_replica {
-        requested_db_path
+    let (db_path, expected_identity) = if snapshot_replica {
+        (requested_db_path, None)
     } else {
-        nestweaver_engine::publication::resolve_selected_database(&base_db_path)?
+        nestweaver_engine::publication::resolve_selected_database_with_identity(&base_db_path)?
     };
 
     // Parse the asserted identity before writer-authority acquisition. The
@@ -13961,7 +13961,16 @@ pub async fn run_server(
         let authority = write_authority
             .as_deref()
             .expect("a read-write daemon acquired writer authority before opening the store");
-        let store = match GraphStore::open_or_create_with_authority(&db_path, authority) {
+        // A selected publication is opened only as the publication CURRENT
+        // names, checked before any write (see
+        // `open_expecting_identity_with_authority`).
+        let opened = match expected_identity.as_ref() {
+            Some(expected) => {
+                GraphStore::open_expecting_identity_with_authority(&db_path, authority, expected)
+            }
+            None => GraphStore::open_or_create_with_authority(&db_path, authority),
+        };
+        let store = match opened {
             Ok(s) => s,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -13973,13 +13982,6 @@ pub async fn run_server(
                 });
             }
         };
-        // `resolve_selected_database` skips the graph-owned identity check when
-        // checkpoint debris makes a read-only open impossible; this writable
-        // open has just finished that checkpoint, so check it now.
-        nestweaver_engine::publication::verify_selected_publication_identity(
-            &base_db_path,
-            &store,
-        )?;
         store
     };
     drop(publication_root_lock);

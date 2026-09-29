@@ -1136,6 +1136,18 @@ pub fn read_current(publication_root: &Path) -> anyhow::Result<Option<CurrentPub
 /// the validation/activation path; repeating a multi-gigabyte graph hash on
 /// every short-lived CLI invocation would make the selector itself O(graph).
 pub fn resolve_selected_database(base_db_path: &Path) -> anyhow::Result<PathBuf> {
+    resolve_selected_database_inner(base_db_path, false).map(|(path, _)| path)
+}
+
+/// [`resolve_selected_database`] plus the identity `CURRENT` names for the
+/// selected slot (`None` when there is no `CURRENT`). A WRITABLE opener must
+/// pass it to `GraphStore::open_expecting_identity_with_authority`: when the
+/// slot carries checkpoint debris, resolution cannot read the graph's own
+/// identity (the engine refuses read-only opens), so the writable opener
+/// checks it before writing anything.
+pub fn resolve_selected_database_with_identity(
+    base_db_path: &Path,
+) -> anyhow::Result<(PathBuf, Option<nestweaver_store::PublicationIdentity>)> {
     resolve_selected_database_inner(base_db_path, false)
 }
 
@@ -1148,16 +1160,20 @@ pub fn resolve_selected_database(base_db_path: &Path) -> anyhow::Result<PathBuf>
 pub fn resolve_selected_database_allowing_legacy_engine(
     base_db_path: &Path,
 ) -> anyhow::Result<PathBuf> {
-    resolve_selected_database_inner(base_db_path, true)
+    resolve_selected_database_inner(base_db_path, true).map(|(path, _)| path)
 }
 
 fn resolve_selected_database_inner(
     base_db_path: &Path,
     allow_legacy_engine: bool,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<(PathBuf, Option<nestweaver_store::PublicationIdentity>)> {
     let publication_root = default_publication_root(base_db_path);
     let Some(pointer) = read_current(&publication_root)? else {
-        return Ok(base_db_path.to_path_buf());
+        return Ok((base_db_path.to_path_buf(), None));
+    };
+    let expected = nestweaver_store::PublicationIdentity {
+        brain_uuid: pointer.brain_uuid.clone(),
+        publication_uuid: pointer.publication_uuid.clone(),
     };
     let slot = slot_path(&publication_root, &pointer.publication_uuid)?;
     let manifest_path = slot.join(PUBLICATION_MANIFEST_FILE);
@@ -1236,14 +1252,15 @@ fn resolve_selected_database_inner(
     // read-only open would then fail resolution itself, so the daemon could
     // never reach the writable open that recovers it. The manifest identity
     // above already matched CURRENT; the graph-owned identity is verified by
-    // the writable opener instead (`verify_selected_publication_identity`).
+    // the writable opener instead, before it writes anything
+    // (`GraphStore::open_expecting_identity_with_authority`).
     let checkpoint_debris = [".wal.checkpoint", ".shadow"].iter().any(|suffix| {
         let mut name = graph_path.as_os_str().to_owned();
         name.push(suffix);
         !matches!(PathBuf::from(name).try_exists(), Ok(false))
     });
     if checkpoint_debris {
-        return Ok(graph_path);
+        return Ok((graph_path, Some(expected)));
     }
     // Keep the store error TYPED (context, not a flattened string) so a
     // rebuild refusal reaches the CLI diagnostic intact.
@@ -1266,51 +1283,7 @@ fn resolve_selected_database_inner(
     {
         anyhow::bail!("selected publication graph identity does not match CURRENT");
     }
-    Ok(graph_path)
-}
-
-/// Check the graph-owned identity of an OPEN store against the publication
-/// `CURRENT` of `base_db_path`, when that store is the selected slot. For the
-/// writable opener (the daemon) after [`resolve_selected_database`] deferred
-/// the check because checkpoint debris made a read-only open impossible.
-/// A store that is not the selected slot (no `CURRENT`, or the base itself) is
-/// accepted: there is nothing to bind it to.
-pub fn verify_selected_publication_identity(
-    base_db_path: &Path,
-    store: &nestweaver_store::GraphStore,
-) -> anyhow::Result<()> {
-    let publication_root = default_publication_root(base_db_path);
-    let Some(pointer) = read_current(&publication_root)? else {
-        return Ok(());
-    };
-    let slot_graph =
-        slot_path(&publication_root, &pointer.publication_uuid)?.join(PUBLICATION_GRAPH_FILE);
-    let Some(opened) = store.db_path() else {
-        return Ok(());
-    };
-    let same = |left: &Path, right: &Path| {
-        std::fs::canonicalize(left)
-            .ok()
-            .zip(std::fs::canonicalize(right).ok())
-            .is_some_and(|(left, right)| left == right)
-    };
-    if !same(opened, &slot_graph) {
-        return Ok(());
-    }
-    let identity = store
-        .publication_identity()
-        .map_err(|error| anyhow::anyhow!("read selected publication identity: {error}"))?
-        .ok_or_else(|| anyhow::anyhow!("selected publication graph has no identity"))?;
-    if parse_uuid("selected graph brain_uuid", &identity.brain_uuid)?
-        != parse_uuid("CURRENT brain_uuid", &pointer.brain_uuid)?
-        || parse_uuid(
-            "selected graph publication_uuid",
-            &identity.publication_uuid,
-        )? != parse_uuid("CURRENT publication_uuid", &pointer.publication_uuid)?
-    {
-        anyhow::bail!("selected publication graph identity does not match CURRENT");
-    }
-    Ok(())
+    Ok((graph_path, Some(expected)))
 }
 
 /// Durably select `next` when the currently selected publication UUID equals

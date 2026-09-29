@@ -13626,6 +13626,48 @@ fn a_pre_cutover_database_rebuilds_into_a_current_publication() {
         selected,
         "a refused rollback leaves CURRENT where it was"
     );
+
+    // A FOREIGN graph copied into the selected slot, with a leftover log so
+    // only a writable open can read it: the daemon refuses it before writing
+    // anything, and its identity is not replaced.
+    let foreign_dir = tempfile::tempdir().unwrap();
+    let foreign = foreign_dir.path().join("graph.lbug");
+    let foreign_identity = {
+        let store = nestweaver_store::GraphStore::create(&foreign).unwrap();
+        store.publication_identity().unwrap().unwrap()
+    };
+    std::fs::copy(&foreign, &selected).unwrap();
+    std::fs::copy(
+        nestweaver_store::engine_format::sidecar_path(&foreign),
+        nestweaver_store::engine_format::sidecar_path(&selected),
+    )
+    .unwrap();
+    for stale in [".wal", ".shadow"] {
+        let _ = std::fs::remove_file(format!("{}{stale}", selected.display()));
+    }
+    std::fs::write(&frozen, b"").unwrap();
+    let refused = daemon_cmd(&["brain", "status", "--db", &db_arg]);
+    let refused_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let _ = daemon_cmd(&["daemon", "--db", &db_arg, "stop"]);
+    assert_ne!(refused.status.code(), Some(0), "{refused_text}");
+    assert!(
+        refused_text.contains("is not the selected publication"),
+        "the refusal must name the identity mismatch: {refused_text}"
+    );
+    let _ = std::fs::remove_file(&frozen);
+    let after = nestweaver_store::GraphStore::open_read_only_without_migration(&selected)
+        .unwrap()
+        .publication_identity()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after, foreign_identity,
+        "the foreign graph's identity must be untouched: {refused_text}"
+    );
     assert!(
         !nestweaver_store::engine_format::sidecar_path(&db).exists(),
         "nothing may stamp the pre-cutover database as current"

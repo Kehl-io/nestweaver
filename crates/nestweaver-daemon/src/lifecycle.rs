@@ -879,21 +879,31 @@ pub fn db_wal_unreadable(db_path: &Path) -> Option<nestweaver_store::StoreError>
     }
     // Probe what the daemon would serve: the publication `CURRENT`, not a
     // base database a rebuild left behind as the rollback copy.
-    let selected = match nestweaver_engine::publication::resolve_selected_database(db_path) {
-        Ok(selected) => selected,
-        Err(error) => {
-            // Not this guard's verdict to make, but never a silent "fine":
-            // the daemon's own boot reports the same resolution error.
-            tracing::warn!("unreadable-WAL preflight could not resolve CURRENT: {error:#}");
-            return None;
-        }
-    };
+    let selected =
+        match nestweaver_engine::publication::resolve_selected_database(&preflight_anchor(db_path))
+        {
+            Ok(selected) => selected,
+            Err(error) => {
+                // Not this guard's verdict to make, but never a silent "fine":
+                // the daemon's own boot reports the same resolution error.
+                tracing::warn!("unreadable-WAL preflight could not resolve CURRENT: {error:#}");
+                return None;
+            }
+        };
     match nestweaver_store::GraphStore::open_read_only_without_migration(&selected) {
         Ok(_) => None,
         Err(error) => (error.corruption_kind()
             == Some(nestweaver_store::CorruptionKind::WalUnreadable))
         .then(|| error.with_db_path(&selected)),
     }
+}
+
+/// The database a preflight resolves `CURRENT` from, exactly as the daemon's
+/// boot does: a publication slot path (which the CLI hands the daemon after
+/// resolving `CURRENT` itself) maps back to its base, so the slot is checked
+/// against the publication `CURRENT` names rather than against nothing.
+fn preflight_anchor(db_path: &Path) -> PathBuf {
+    nestweaver_engine::publication::instance_anchor_database(&canonical_db_path(db_path))
 }
 
 /// Was the database this daemon would serve built by an older storage engine?
@@ -926,10 +936,12 @@ pub fn db_rebuild_required(db_path: &Path) -> Option<nestweaver_store::StoreErro
     if !db_path.exists() {
         return None;
     }
-    let selected = match nestweaver_engine::publication::resolve_selected_database(db_path) {
-        Ok(selected) => selected,
-        Err(error) => return rebuild_required_in(&error),
-    };
+    let selected =
+        match nestweaver_engine::publication::resolve_selected_database(&preflight_anchor(db_path))
+        {
+            Ok(selected) => selected,
+            Err(error) => return rebuild_required_in(&error),
+        };
     match nestweaver_store::GraphStore::check_engine_format(&selected) {
         Err(error) if error.is_rebuild_required() => Some(error),
         _ => None,
@@ -954,13 +966,16 @@ pub fn db_frozen_checkpoint_applied(db_path: &Path) -> Option<nestweaver_store::
     if !db_path.exists() {
         return None;
     }
-    let selected = match nestweaver_engine::publication::resolve_selected_database(db_path) {
-        Ok(selected) => selected,
-        Err(error) => {
-            tracing::warn!("frozen-checkpoint preflight could not resolve CURRENT: {error:#}");
-            return None;
-        }
-    };
+    let (selected, expected) =
+        match nestweaver_engine::publication::resolve_selected_database_with_identity(
+            &preflight_anchor(db_path),
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                tracing::warn!("frozen-checkpoint preflight could not resolve CURRENT: {error:#}");
+                return None;
+            }
+        };
     let sidecar = |suffix: &str| {
         let mut name = selected.as_os_str().to_owned();
         name.push(suffix);
@@ -975,8 +990,19 @@ pub fn db_frozen_checkpoint_applied(db_path: &Path) -> Option<nestweaver_store::
         _ => return None,
     }
     let lease = nestweaver_store::acquire_db_write_lease(&selected).ok()?;
-    match nestweaver_store::GraphStore::open_with_authority(&selected, &lease) {
+    // The same identity-checked open the daemon makes: a foreign graph in the
+    // slot is refused before anything is written, here as there.
+    let opened = match expected.as_ref() {
+        Some(expected) => nestweaver_store::GraphStore::open_expecting_identity_with_authority(
+            &selected, &lease, expected,
+        ),
+        None => nestweaver_store::GraphStore::open_with_authority(&selected, &lease),
+    };
+    match opened {
         Err(error @ nestweaver_store::StoreError::FrozenCheckpointAlreadyApplied(_)) => Some(error),
+        // A foreign graph in the slot: the daemon would refuse it on boot the
+        // same way, so say it here instead of reporting a failed spawn.
+        Err(error @ nestweaver_store::StoreError::SelectedPublicationMismatch(_)) => Some(error),
         _ => None,
     }
 }

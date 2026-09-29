@@ -796,6 +796,11 @@ pub enum StoreError {
         detail = .0.detail
     )]
     FrozenCheckpointAlreadyApplied(Box<FrozenCheckpointApplied>),
+    /// The graph at a publication slot is not the publication `CURRENT`
+    /// names, found by the identity-checked writable open before anything was
+    /// written (`GraphStore::open_expecting_identity_with_authority`).
+    #[error("{0}")]
+    SelectedPublicationMismatch(Box<str>),
 }
 
 impl StoreError {
@@ -817,7 +822,8 @@ impl StoreError {
             | StoreError::CorruptValue { .. }
             | StoreError::EmbeddingArtifactCorrupt
             | StoreError::RebuildRequired { .. }
-            | StoreError::FrozenCheckpointAlreadyApplied(_) => false,
+            | StoreError::FrozenCheckpointAlreadyApplied(_)
+            | StoreError::SelectedPublicationMismatch(_) => false,
         }
     }
 

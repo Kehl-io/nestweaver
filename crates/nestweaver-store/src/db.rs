@@ -324,9 +324,26 @@ impl ReopenableDatabase {
 
     /// Wait while an escalated reopen holds off new connections. The hold-off
     /// is bounded by the reopen's own deadline, so this wait is too.
+    ///
+    /// Never parks an async executor thread: on a multi-threaded tokio worker
+    /// the wait runs inside `block_in_place` (the worker's other tasks move to
+    /// another thread; on a blocking-pool thread it is a plain call), and on a
+    /// current-thread runtime, whose one thread IS the executor, it does not
+    /// wait at all. That reader then simply takes its connection and the
+    /// reopen waits for it, within its own bounded window.
     fn wait_out_hold_off(&self) {
-        while self.holding_off.load(std::sync::atomic::Ordering::SeqCst) {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        if !self.holding_off.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let wait = || {
+            while self.holding_off.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+            Err(_) => wait(),
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(wait),
+            Ok(_) => {}
         }
     }
 }
@@ -394,9 +411,17 @@ impl std::fmt::Display for StoreRows<'_, '_> {
     }
 }
 
+/// True when `query` has a `RETURN` clause: its rows are part of its answer.
+fn statement_returns_rows(query: &str) -> bool {
+    query
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|word| word.eq_ignore_ascii_case("RETURN"))
+}
+
 /// A prepared statement, borrowing the [`StoreConnection`] that prepared it.
 pub struct StoreStatement<'c> {
     inner: lbug::PreparedStatement,
+    returns_rows: bool,
     _connection: std::marker::PhantomData<&'c ()>,
 }
 
@@ -421,13 +446,14 @@ impl<'a> StoreConnection<'a> {
     /// Run one statement.
     pub fn query(&self, query: &str) -> Result<StoreRows<'_, 'a>, lbug::Error> {
         let result = self.conn.query(query);
-        self.settle(result)
+        self.settle(result, statement_returns_rows(query))
     }
 
     /// Prepare one statement.
     pub fn prepare(&self, query: &str) -> Result<StoreStatement<'_>, lbug::Error> {
         Ok(StoreStatement {
             inner: self.conn.prepare(query)?,
+            returns_rows: statement_returns_rows(query),
             _connection: std::marker::PhantomData,
         })
     }
@@ -439,7 +465,7 @@ impl<'a> StoreConnection<'a> {
         params: Vec<(&str, lbug::Value)>,
     ) -> Result<StoreRows<'_, 'a>, lbug::Error> {
         let result = self.conn.execute(&mut statement.inner, params);
-        self.settle(result)
+        self.settle(result, statement.returns_rows)
     }
 
     /// Bound every later statement on this connection.
@@ -450,6 +476,7 @@ impl<'a> StoreConnection<'a> {
     fn settle(
         &self,
         result: Result<lbug::QueryResult<'a>, lbug::Error>,
+        returns_rows: bool,
     ) -> Result<StoreRows<'_, 'a>, lbug::Error> {
         match result {
             Ok(rows) => Ok(StoreRows {
@@ -475,6 +502,17 @@ impl<'a> StoreConnection<'a> {
                          checkpoint; the store reopens to finish it. The write was NOT \
                          retried. Engine: {message}"
                     );
+                    if returns_rows {
+                        // The engine returned no rows for a statement that
+                        // RETURNs some: never hand back an empty result that
+                        // reads as "nothing matched". An error that still says
+                        // committed (`StoreError::is_committed_despite_error`).
+                        return Err(lbug::Error::FailedQuery(format!(
+                            "the statement COMMITTED but its rows are unavailable, because \
+                             the storage engine deferred its checkpoint; do NOT retry it. \
+                             {message}"
+                        )));
+                    }
                     // Committed: success, with no rows to read.
                     Ok(StoreRows {
                         inner: None,
@@ -1204,6 +1242,17 @@ fn probe_engine_format_marker(path: &Path, stamp_sidecar: bool) -> Result<(), St
     }
 }
 
+/// The reason a database whose sidecar and in-database marker disagree is
+/// refused.
+fn disagreeing_marker_reason(path: &Path) -> String {
+    format!(
+        "has an engine-format sidecar ({}) but no matching engine-format marker inside \
+         it, so the two disagree (the sidecar may be left over from a different database) \
+         and its format cannot be trusted",
+        crate::engine_format::sidecar_path(path).display()
+    )
+}
+
 /// Open an lbug database, auto-recovering once from crash debris that would
 /// otherwise make it permanently unopenable.
 ///
@@ -1236,11 +1285,32 @@ fn open_lbug_with_recovery(
         probe_engine_format_marker(path, read_write)?;
     }
     // A fresh file is claimed for this engine BEFORE the engine writes to it,
-    // and a failure to record that is an error: a database created without
-    // either marker would be refused as "rebuild required" on a later open if
-    // its first writer died before `init_schema` stamped the Meta row. Stamped
-    // here once, so every path below (including a recovery retry) inherits it.
-    if read_write && precheck == crate::engine_format::Precheck::Fresh {
+    // and a failure to record that is an error. If the create then fails the
+    // claim is withdrawn, so a stray sidecar can never vouch for a file that
+    // appears at this path later.
+    // A WRITABLE open of an unverified file can already change it (the engine
+    // rewrites header pages), so when only the sidecar vouches for the file,
+    // confirm the in-database marker read-only FIRST. Only when crash debris
+    // makes a read-only open impossible is the sidecar trusted up to the
+    // post-open check below: that is the ordinary crash-recovery case of a
+    // database this engine created.
+    if read_write
+        && precheck == crate::engine_format::Precheck::Current
+        && crate::engine_format::debris_present(path).is_none()
+    {
+        match probe_engine_format_marker(path, false) {
+            Ok(()) => {}
+            Err(StoreError::RebuildRequired { .. }) => {
+                return Err(crate::engine_format::rebuild_required(
+                    path,
+                    disagreeing_marker_reason(path),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let fresh = read_write && precheck == crate::engine_format::Precheck::Fresh;
+    if fresh {
         crate::engine_format::write_sidecar(path).map_err(|error| {
             StoreError::Database(format!(
                 "could not record the storage-engine format for the new database {} \
@@ -1250,6 +1320,108 @@ fn open_lbug_with_recovery(
             ))
         })?;
     }
+    let withdraw_claim = || {
+        if fresh {
+            let _ = std::fs::remove_file(crate::engine_format::sidecar_path(path));
+        }
+    };
+    let db =
+        match open_engine_with_recovery_arms(path, read_write, recovery_authority, &make_config) {
+            Ok(db) => db,
+            Err(error) => {
+                withdraw_claim();
+                return Err(error);
+            }
+        };
+    if fresh {
+        // Only a create records the marker inside the database, and it does so
+        // at once, before any NestWeaver write. `init_schema` repeats the same
+        // `CREATE NODE TABLE IF NOT EXISTS Meta` DDL, so this cannot conflict.
+        if let Err(error) = stamp_engine_format_marker(&db) {
+            drop(db);
+            withdraw_claim();
+            return Err(error);
+        }
+    } else if precheck == crate::engine_format::Precheck::Current {
+        // The sidecar says current; the database must agree. A sidecar left
+        // behind by a failed create or a deleted file must never make this
+        // engine adopt whatever database appears at the path later.
+        let marker = {
+            let conn = StoreConnection::unguarded(lbug::Connection::new(&db)?);
+            GraphStore::meta_value_by_scan(&conn, crate::engine_format::ENGINE_FORMAT_META_KEY)
+                .unwrap_or(None)
+        };
+        if marker.as_deref() != Some(crate::engine_format::ENGINE_FORMAT_VALUE) {
+            drop(db);
+            return Err(crate::engine_format::rebuild_required(
+                path,
+                disagreeing_marker_reason(path),
+            ));
+        }
+    }
+    Ok(db)
+}
+
+/// Check a freshly opened database's graph-owned identity against `expected`,
+/// reading `Meta` by scan and writing nothing. Every mismatch, absence or
+/// unreadable value fails closed.
+fn verify_identity_before_writes(
+    path: &Path,
+    db: &lbug::Database,
+    expected: &PublicationIdentity,
+) -> Result<(), StoreError> {
+    let conn = StoreConnection::unguarded(lbug::Connection::new(db)?);
+    let read = |key: &str| GraphStore::meta_value_by_scan(&conn, key).ok().flatten();
+    let same = |observed: Option<String>, wanted: &str| {
+        observed
+            .as_deref()
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .zip(uuid::Uuid::parse_str(wanted).ok())
+            .is_some_and(|(left, right)| left == right)
+    };
+    let brain = read(BRAIN_UUID_META_KEY);
+    let publication = read(PUBLICATION_UUID_META_KEY);
+    if same(brain.clone(), &expected.brain_uuid)
+        && same(publication.clone(), &expected.publication_uuid)
+    {
+        return Ok(());
+    }
+    Err(StoreError::SelectedPublicationMismatch(
+        format!(
+            "{} is not the selected publication: CURRENT names brain {} publication {}, the \
+         graph holds brain {} publication {}. Refusing to open it (nothing was written).",
+            path.display(),
+            expected.brain_uuid,
+            expected.publication_uuid,
+            brain.as_deref().unwrap_or("<none>"),
+            publication.as_deref().unwrap_or("<none>")
+        )
+        .into_boxed_str(),
+    ))
+}
+
+/// Record the engine-format marker in a database this engine has just
+/// created. See [`crate::engine_format`].
+fn stamp_engine_format_marker(db: &lbug::Database) -> Result<(), StoreError> {
+    let conn = StoreConnection::unguarded(lbug::Connection::new(db)?);
+    conn.query(
+        "CREATE NODE TABLE IF NOT EXISTS Meta(\
+            key STRING, \
+            value STRING, \
+            PRIMARY KEY(key))",
+    )
+    .map_err(|e| StoreError::Query(e.to_string()))?;
+    GraphStore::ensure_engine_format_marker_on(&conn)
+}
+
+/// The engine open plus the crash-recovery arms. Called only by
+/// [`open_lbug_with_recovery`], after the engine-format checks.
+fn open_engine_with_recovery_arms(
+    path: &Path,
+    read_write: bool,
+    recovery_authority: Option<&DbWriteLease>,
+    make_config: &impl Fn() -> lbug::SystemConfig,
+) -> Result<lbug::Database, StoreError> {
     match lbug::Database::new(path, make_config()) {
         Ok(db) => Ok(db),
         Err(e) => {
@@ -1695,18 +1867,48 @@ impl GraphStore {
     /// Runs schema migrations to ensure any new tables/columns from newer
     /// versions are present (all statements are idempotent).
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        Self::open_inner(path, None)
+        Self::open_inner(path, None, None)
     }
 
     /// Open an existing database while borrowing its canonical writer
     /// authority. Crash-debris recovery is permitted only on this path.
     pub fn open_with_authority(path: &Path, authority: &DbWriteLease) -> Result<Self, StoreError> {
         Self::require_matching_authority(path, authority)?;
-        Self::open_inner(path, Some(authority))
+        Self::open_inner(path, Some(authority), None)
     }
 
-    fn open_inner(path: &Path, authority: Option<&DbWriteLease>) -> Result<Self, StoreError> {
+    /// Open an EXISTING database that must be the publication `expected`
+    /// names, under its writer authority.
+    ///
+    /// The identity is checked right after the engine's own crash recovery and
+    /// BEFORE any NestWeaver write: no schema DDL, no column migration, no
+    /// identity minted. A foreign graph copied into a publication slot (which
+    /// only a writable open can read when it carries a leftover log) is refused
+    /// with its identity untouched. A missing file is refused, never created.
+    pub fn open_expecting_identity_with_authority(
+        path: &Path,
+        authority: &DbWriteLease,
+        expected: &PublicationIdentity,
+    ) -> Result<Self, StoreError> {
+        Self::require_matching_authority(path, authority)?;
+        if !matches!(path.try_exists(), Ok(true)) {
+            return Err(StoreError::Query(format!(
+                "the selected publication graph {} is missing; refusing to create it",
+                path.display()
+            )));
+        }
+        Self::open_inner(path, Some(authority), Some(expected))
+    }
+
+    fn open_inner(
+        path: &Path,
+        authority: Option<&DbWriteLease>,
+        expected: Option<&PublicationIdentity>,
+    ) -> Result<Self, StoreError> {
         let db = open_lbug_with_recovery(path, true, authority, hardened_system_config)?;
+        if let Some(expected) = expected {
+            verify_identity_before_writes(path, &db, expected)?;
+        }
         let store = GraphStore {
             db: ReopenableDatabase::new(db),
             access_mode: GraphStoreAccessMode::ReadWrite,
@@ -1974,7 +2176,7 @@ impl GraphStore {
     ) -> Result<Self, StoreError> {
         Self::require_matching_authority(path, authority)?;
         if path.exists() {
-            Self::open_inner(path, Some(authority))
+            Self::open_inner(path, Some(authority), None)
         } else {
             Self::create_inner(path, Some(authority))
         }
@@ -4925,10 +5127,11 @@ impl GraphStore {
         // above, so no migration can name a table that does not exist yet.
         Self::apply_column_migrations(&conn)?;
 
-        // Only ever reached by a writable open that passed the engine-format
-        // check (or an in-memory store), so stamping here can never adopt a
-        // database an older engine built.
-        Self::ensure_engine_format_marker_on(&conn)?;
+        // The engine-format marker is NOT written here: only a create records
+        // it (`open_lbug_with_recovery`), so no open can adopt a database.
+        if self.db_path.is_none() {
+            Self::ensure_engine_format_marker_on(&conn)?;
+        }
 
         Ok(())
     }
@@ -6848,6 +7051,12 @@ mod schema_migration_tests {
                     .unwrap_or_else(|error| panic!("{statement}: {error}"));
             }
         }
+        // Both halves of the engine-format claim, as a create by this engine
+        // records them.
+        {
+            let db = lbug::Database::new(path, bounded_system_config()).unwrap();
+            super::stamp_engine_format_marker(&db).unwrap();
+        }
         crate::engine_format::write_sidecar(path).unwrap();
     }
 
@@ -7542,7 +7751,7 @@ mod hardening_activity_tests {
 
 #[cfg(test)]
 pub(crate) mod engine_format_open_tests {
-    use super::{GraphStore, bounded_system_config};
+    use super::{GraphStore, PublicationIdentity, acquire_db_write_lease, bounded_system_config};
     use crate::StoreError;
     use crate::engine_format::{ENGINE_FORMAT_META_KEY, ENGINE_FORMAT_VALUE, sidecar_path};
     use std::collections::BTreeMap;
@@ -7652,6 +7861,147 @@ pub(crate) mod engine_format_open_tests {
             std::io::copy(&mut decoder, &mut out).unwrap();
         }
         target
+    }
+
+    /// A create that fails withdraws its engine-format claim, so no sidecar is
+    /// left to vouch for a file that appears at the path later.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_create_leaves_no_engine_format_claim() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"").unwrap();
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let created = GraphStore::create(&db);
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            created.is_err(),
+            "the engine cannot open an unreadable file"
+        );
+        assert!(
+            !sidecar_path(&db).exists(),
+            "a failed create must withdraw its claim"
+        );
+    }
+
+    /// A stray sidecar (left by a deleted database) must never make this
+    /// engine adopt an old-engine database that later appears at the path:
+    /// the database itself carries no marker, so the two disagree and the
+    /// open is refused, with no byte changed and no marker written.
+    #[test]
+    fn a_stray_sidecar_cannot_adopt_an_old_engine_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = old_engine_fixture(dir.path(), "pre-cutover.lbug");
+        crate::engine_format::write_sidecar(&db).unwrap();
+        let before = tree_bytes(dir.path());
+        for open in [
+            GraphStore::open(&db),
+            GraphStore::open_read_only(&db),
+            GraphStore::open_or_create(&db),
+        ] {
+            match open {
+                Err(StoreError::RebuildRequired { reason, .. }) => {
+                    assert!(reason.contains("disagree"), "{reason}")
+                }
+                Err(other) => panic!("expected a rebuild refusal, got {other}"),
+                Ok(_) => panic!("a stray sidecar adopted an old-engine database"),
+            }
+        }
+        assert_eq!(tree_bytes(dir.path()), before);
+        assert_eq!(
+            marker_in(&db),
+            None,
+            "no engine-format marker may be written into it"
+        );
+    }
+
+    fn meta_rows(path: &Path) -> Vec<(String, String)> {
+        let db = lbug::Database::new(path, bounded_system_config().read_only(true)).unwrap();
+        let conn = lbug::Connection::new(&db).unwrap();
+        let mut rows: Vec<(String, String)> = conn
+            .query("MATCH (m:Meta) RETURN m.key, m.value")
+            .unwrap()
+            .map(|row| {
+                (
+                    crate::read::extract_string(&row, 0).unwrap(),
+                    crate::read::extract_string(&row, 1).unwrap(),
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// A foreign graph in a publication slot, with a leftover log that only a
+    /// writable open can recover, is refused by the identity-checked open
+    /// BEFORE anything NestWeaver writes: its identity is not replaced, no
+    /// identity is minted, no migration runs. Absent or unparsable identities
+    /// and a missing file fail closed.
+    #[test]
+    fn the_identity_checked_open_refuses_a_foreign_graph_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = PublicationIdentity::new_brain();
+
+        let foreign = dir.path().join("foreign.lbug");
+        drop(GraphStore::create(&foreign).unwrap());
+        let before = meta_rows(&foreign);
+        std::fs::write(format!("{}.wal.checkpoint", foreign.display()), b"").unwrap();
+        let authority = acquire_db_write_lease(&foreign).unwrap();
+        let error =
+            GraphStore::open_expecting_identity_with_authority(&foreign, &authority, &expected)
+                .err()
+                .expect("a foreign graph must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("is not the selected publication"),
+            "{error}"
+        );
+        drop(authority);
+        assert_eq!(
+            meta_rows(&foreign),
+            before,
+            "its identity must be untouched"
+        );
+
+        // No identity at all: refused, and none is minted.
+        let bare = dir.path().join("bare.lbug");
+        {
+            let db = lbug::Database::new(&bare, bounded_system_config()).unwrap();
+            super::stamp_engine_format_marker(&db).unwrap();
+        }
+        crate::engine_format::write_sidecar(&bare).unwrap();
+        let authority = acquire_db_write_lease(&bare).unwrap();
+        assert!(
+            GraphStore::open_expecting_identity_with_authority(&bare, &authority, &expected)
+                .is_err()
+        );
+        drop(authority);
+        assert!(
+            meta_rows(&bare)
+                .iter()
+                .all(|(key, _)| !key.starts_with("publication.")),
+            "no identity may be minted: {:?}",
+            meta_rows(&bare)
+        );
+
+        // A missing file is refused, never created.
+        let missing = dir.path().join("missing.lbug");
+        let authority = acquire_db_write_lease(&missing).unwrap();
+        let _ = std::fs::remove_file(&missing);
+        assert!(
+            GraphStore::open_expecting_identity_with_authority(&missing, &authority, &expected)
+                .is_err()
+        );
+        drop(authority);
+
+        // Counterweight: the graph CURRENT names opens.
+        let right = dir.path().join("right.lbug");
+        drop(GraphStore::create_with_publication_identity(&right, &expected).unwrap());
+        let authority = acquire_db_write_lease(&right).unwrap();
+        GraphStore::open_expecting_identity_with_authority(&right, &authority, &expected)
+            .expect("the selected graph opens");
     }
 
     /// THE HAZARD, shown on a file the OLD engine wrote: this engine's
@@ -8324,6 +8674,105 @@ mod wal_recovery_arm_tests {
         assert!(
             !blocked.exists() || std::fs::metadata(&blocked).unwrap().len() == 0,
             "no database may be created without its engine-format claim"
+        );
+    }
+
+    /// A committed write that RETURNs rows cannot hand back its rows after the
+    /// engine defers its checkpoint. It must not read as an empty result: the
+    /// caller gets an error that still says the write committed.
+    #[test]
+    fn a_committed_write_with_return_is_never_mistaken_for_an_empty_result() {
+        super::CHECKPOINT_EVERY_COMMIT.with(|flag| flag.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = GraphStore::create(&db).unwrap();
+        super::CHECKPOINT_EVERY_COMMIT.with(|flag| flag.set(false));
+        std::fs::write(dir.path().join("brain.lbug.wal.checkpoint"), b"").unwrap();
+        let conn = store.conn().unwrap();
+        let error = conn
+            .query("CREATE (m:Meta {key: 'probe', value: 'v'}) RETURN m.key")
+            .err()
+            .expect("rows the engine did not return must not read as none");
+        let error = StoreError::from(error);
+        assert!(error.is_committed_despite_error(), "{error}");
+        assert!(store.reopen_required());
+        drop(conn);
+        let conn = store.conn().unwrap();
+        let rows: Vec<_> = conn
+            .query("MATCH (m:Meta) WHERE m.key = 'probe' RETURN m.value")
+            .unwrap()
+            .collect();
+        assert_eq!(rows.len(), 1, "the write committed exactly once");
+        assert!(super::statement_returns_rows("match (n) return n"));
+        assert!(!super::statement_returns_rows(
+            "CREATE (:Meta {key: 'returned'})"
+        ));
+    }
+
+    /// The hold-off never parks an async executor: a connection taken on a
+    /// current-thread runtime does not wait for it, and one taken on a
+    /// multi-thread worker waits inside `block_in_place` without stalling the
+    /// runtime's other tasks.
+    #[test]
+    fn the_hold_off_never_parks_an_async_executor_thread() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(GraphStore::create(&dir.path().join("brain.lbug")).unwrap());
+        // Hold new connections off for 2 s from another thread, as an
+        // escalated reopen would.
+        let hold_for_two_seconds = |store: &Arc<GraphStore>| {
+            let store = Arc::clone(store);
+            let (armed, ready) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _hold = store.db.hold_off_new_connections();
+                armed.send(()).unwrap();
+                std::thread::sleep(Duration::from_secs(2));
+            });
+            ready.recv().unwrap();
+        };
+
+        hold_for_two_seconds(&store);
+        let current = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        current.block_on(async { drop(store.conn().unwrap()) });
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a current-thread executor must not wait out the hold-off"
+        );
+
+        // One worker: if the waiting task parked it, nothing else could run.
+        let multi = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+        while store
+            .db
+            .holding_off
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        hold_for_two_seconds(&store);
+        let started = Instant::now();
+        let finished_other_work = multi.block_on(async {
+            let waiter_store = Arc::clone(&store);
+            let waiter = tokio::spawn(async move { drop(waiter_store.conn().unwrap()) });
+            tokio::task::yield_now().await;
+            let other = tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Instant::now()
+            });
+            let done = other.await.unwrap();
+            waiter.await.unwrap();
+            done
+        });
+        assert!(
+            finished_other_work.duration_since(started) < Duration::from_millis(1500),
+            "other tasks must keep running while a worker waits out the hold-off"
         );
     }
 
