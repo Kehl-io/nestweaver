@@ -64,7 +64,14 @@ export interface GraphSlice {
   requestSemanticLayout: () => void;
   clearSemanticLayoutRequest: () => void;
   cameraFitRequestId: number;
-  requestCameraFit: () => void;
+  /** Nodes the next camera fit frames (with their neighbours); null = all. */
+  cameraFitUids: string[] | null;
+  /**
+   * Refit the camera. `uids` frames those nodes and their neighbours, `null`
+   * frames everything, and omitting it keeps the current target (so a
+   * layout-settle refit does not undo a fit-to-selection).
+   */
+  requestCameraFit: (uids?: string[] | null) => void;
   setNodeTypeFilter: (kind: string, visible: boolean) => void;
   setAllNodeTypes: (visible: boolean) => void;
   setEdgeTypeFilter: (type: string, visible: boolean) => void;
@@ -183,6 +190,7 @@ export const createGraphSlice: StateCreator<
       s.selectedNodeId = id;
       s.selectedNodeKind = kind ?? null;
       s.detailFocus = "summary";
+      s.cameraFitUids = null;
       if (id === null) {
         s.previewNodeId = null;
         s.previewExpanded = false;
@@ -287,8 +295,10 @@ export const createGraphSlice: StateCreator<
     }),
 
   cameraFitRequestId: 0,
-  requestCameraFit: () =>
+  cameraFitUids: null,
+  requestCameraFit: (uids) =>
     set((s) => {
+      if (uids !== undefined) s.cameraFitUids = uids && uids.length > 0 ? uids : null;
       s.cameraFitRequestId += 1;
     }),
 

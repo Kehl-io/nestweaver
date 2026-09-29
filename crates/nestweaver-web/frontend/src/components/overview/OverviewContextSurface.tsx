@@ -1,5 +1,6 @@
 import type { OverviewLandmark, OverviewResponse } from "../../api/types";
 import type { SceneMetadata } from "../../api/p1Types";
+import { X } from "lucide-react";
 import { useStore } from "../../stores";
 import { NodeActionBar } from "../actions/NodeActionBar";
 import { WorkspaceScopeSummary } from "../workspace/WorkspaceScopeSummary";
@@ -29,6 +30,7 @@ export function OverviewContextSurface({ overview }: OverviewContextSurfaceProps
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
   const graphInstance = useStore((s) => s.graphInstance);
+  const selectNode = useStore((s) => s.selectNode);
 
   const overviewItem = findOverviewItem(overview, selectedNodeId);
   const graphSelected =
@@ -69,11 +71,22 @@ export function OverviewContextSurface({ overview }: OverviewContextSurfaceProps
                 {selected.label}
               </h2>
             </div>
+            <div className="flex shrink-0 items-center gap-1">
             {overviewItem && (
               <span className="shrink-0 rounded bg-[var(--color-surface-alt)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--color-graph-selection)]">
                 Overview
               </span>
             )}
+            <button
+              type="button"
+              onClick={() => selectNode(null)}
+              aria-label="Back to Start Here"
+              title="Clear the selection and return to Start Here"
+              className="shrink-0 rounded p-1 text-[var(--color-text-muted)] hover:bg-[var(--color-surface-alt)] hover:text-[var(--color-text)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-graph-selection)]"
+            >
+              <X className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+            </div>
           </div>
 
           <p className="mt-2 max-h-12 overflow-hidden text-xs leading-5 text-[var(--color-text-muted)]">

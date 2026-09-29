@@ -74,6 +74,7 @@ export function OverviewCommandShelf({
   const exploreNode = useStore((s) => s.exploreNode);
   const setGraphMode = useStore((s) => s.setGraphMode);
   const requestSemanticLayout = useStore((s) => s.requestSemanticLayout);
+  const requestCameraFit = useStore((s) => s.requestCameraFit);
 
   const emptyOverview = isEmptyOverview(overview);
   const selectedLandmark = findSelectedLandmark(overview, selectedNodeId);
@@ -238,7 +239,11 @@ export function OverviewCommandShelf({
             <button
               key={item.uid}
               type="button"
-              onClick={() => selectNode(item.uid, item.kind)}
+              onClick={() => {
+                // Selecting dismisses this shelf; frame the choice (nw-572).
+                selectNode(item.uid, item.kind);
+                requestCameraFit([item.uid]);
+              }}
               className={`w-full rounded px-2 py-1.5 text-left transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-graph-selection)] ${
                 selectedNodeId === item.uid
                   ? "bg-[var(--color-surface-alt)] ring-1 ring-[var(--color-graph-selection)]"

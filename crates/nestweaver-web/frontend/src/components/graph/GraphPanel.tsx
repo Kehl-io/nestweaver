@@ -222,7 +222,8 @@ function GraphModeHooks() {
     <>
       {graphMode === "overview" && representationMode === "graph" && layoutMode !== "zen" && (
         <>
-          <OverviewCommandShelf {...overviewState} />
+          {/* nw-572: a selection replaces Start Here with its context card */}
+          {!selectedNodeId && <OverviewCommandShelf {...overviewState} />}
           <OverviewContextSurface
             overview={overviewState.overview}
           />

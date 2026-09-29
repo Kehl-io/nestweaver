@@ -115,6 +115,8 @@ export function useDeepLink() {
     }
     if (nodeParam) {
       selectNode(nodeParam, kindParam);
+      // Frame the linked node once its scene is loaded (nw-572).
+      useStore.getState().requestCameraFit([nodeParam]);
     } else if (kindParam) {
       // Without a node, `kind` narrows the Overview landmarks (nw-595).
       const overviewKindParam = parseOverviewKind(kindParam);
