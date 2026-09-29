@@ -13047,6 +13047,294 @@ fn a_rebuild_applies_each_repositorys_exclude_and_unskip_policy() {
     );
 }
 
+/// Two repositories that both define `SharedWidget`, and a vault whose
+/// project note mentions it, so a correct link must be project-scoped. The
+/// incumbent is indexed the ordinary way; `rebuild` runs the upgrade.
+struct LinkedRebuildFixture {
+    _dir: tempfile::TempDir,
+    db: std::path::PathBuf,
+    config: std::path::PathBuf,
+}
+
+impl LinkedRebuildFixture {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |path: std::path::PathBuf, body: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        let alpha = dir.path().join("alpha");
+        let beta = dir.path().join("beta");
+        let vault = dir.path().join("vault");
+        write(
+            alpha.join("src/widget.rs"),
+            "pub struct SharedWidget;\npub struct AlphaGadget;\n",
+        );
+        write(alpha.join("src/extra.rs"), "pub fn alpha_extra() {}\n");
+        write(
+            beta.join("src/widget.rs"),
+            "pub struct SharedWidget;\npub struct BetaGadget;\n",
+        );
+        write(
+            vault.join("Workspaces/Alpha/design.md"),
+            "# Design\n\nThe SharedWidget wraps the AlphaGadget.\n",
+        );
+        write(
+            vault.join("Notes/beta.md"),
+            "# Beta\n\nThe BetaGadget ships next.\n",
+        );
+        let db = dir.path().join("brain.lbug");
+        let endpoint = spawn_fake_embedding_endpoint();
+        let config = dir.path().join("instance.toml");
+        let quote =
+            |path: &std::path::Path| serde_json::to_string(&path.to_string_lossy()).unwrap();
+        std::fs::write(
+            &config,
+            format!(
+                "instance_id = \"linked\"\ndb = {}\n[snapshot_storage]\nbackend = \"local\"\npath = {}\n[workspace]\nbackend = \"local\"\npath = {}\n[inference]\nendpoint = \"http://localhost:11434\"\nembedding_model = \"unused\"\nsummary_model = \"unused\"\n[embedding]\nexternal_endpoint = \"{endpoint}\"\nexternal_model = \"fake\"\n[git]\ncredential_method = \"gh\"\n[[repos]]\nurl = {}\nname = \"alpha\"\n[[repos]]\nurl = {}\nname = \"beta\"\n[[projects]]\nname = \"alpha-project\"\nvault_folder = \"Workspaces/Alpha\"\nrepos = [\"alpha\"]\n",
+                quote(&db),
+                quote(&dir.path().join("snapshots")),
+                quote(&dir.path().join("workspace")),
+                quote(&alpha.canonicalize().unwrap()),
+                quote(&beta.canonicalize().unwrap()),
+            ),
+        )
+        .unwrap();
+        for repo in [&alpha, &beta] {
+            nestweaver_cmd()
+                .args(["index", "--config"])
+                .arg(&config)
+                .arg("--repo")
+                .arg(repo)
+                .assert()
+                .success();
+        }
+        nestweaver_cmd()
+            .args(["brain", "add"])
+            .arg(&vault)
+            .arg("--config")
+            .arg(&config)
+            .assert()
+            .success();
+        Self {
+            _dir: dir,
+            db,
+            config,
+        }
+    }
+
+    fn rebuild(&self, extra: &[&str]) -> std::process::Output {
+        nestweaver_cmd()
+            .timeout(std::time::Duration::from_secs(300))
+            .args(["publication", "rebuild", "--config"])
+            .arg(&self.config)
+            .args(extra)
+            .output()
+            .unwrap()
+    }
+
+    fn selected(&self) -> std::path::PathBuf {
+        nestweaver_engine::publication::resolve_selected_database(&self.db).unwrap()
+    }
+}
+
+fn assert_exit(output: &std::process::Output, code: i32, what: &str) {
+    assert_eq!(
+        output.status.code(),
+        Some(code),
+        "{what}: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The first daemon start after an upgrade used to rebuild every note's code
+/// links under the write lock: the staged graph was published with links that
+/// disagreed with what the reconciler derives (project scoping) and with
+/// owed code-link debt. A rebuild must publish links that are already current,
+/// so the daemon's first pass has nothing to write.
+#[test]
+fn a_rebuild_publishes_current_note_code_links_with_no_debt() {
+    let fx = LinkedRebuildFixture::new();
+    let output = fx.rebuild(&[]);
+    assert_exit(&output, 0, "rebuild");
+    let selected = fx.selected();
+    assert_ne!(selected, fx.db, "CURRENT must point at the rebuilt slot");
+
+    let state = nestweaver_engine::code_links::load_code_links_state(&selected);
+    assert_eq!(state.pending, None, "a published slot owes no code links");
+    assert_eq!(
+        state.rules_version,
+        nestweaver_engine::code_links::CROSS_DOMAIN_RULES_VERSION
+    );
+
+    // Counterweight: the slot really holds links, including the scoped one.
+    let store = nestweaver_store::GraphStore::open(&selected).unwrap();
+    let before = store.list_references_code_edges().unwrap();
+    assert!(
+        before.len() >= 3,
+        "the fixture's notes must link to code: {before:?}"
+    );
+
+    // What the daemon's first pass would do: the same reconciler, the same
+    // cross-domain config and project folders. It must find nothing to write.
+    let config = nestweaver_engine::config::InstanceConfig::from_file(&fx.config).unwrap();
+    let report = nestweaver_engine::code_links::reconcile_code_links_with_folders(
+        &store,
+        &config.cross_domain,
+        nestweaver_engine::project::project_folders(&config, &config.instance_id),
+    )
+    .unwrap();
+    assert!(
+        report.rewritten.is_empty(),
+        "the daemon's first pass would rewrite {:?}",
+        report.rewritten
+    );
+    assert_eq!(report.memberships_added, 0);
+    assert_eq!(store.list_references_code_edges().unwrap(), before);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("linking notes to code"),
+        "the rebuild must report its code-link phase: {stderr}"
+    );
+}
+
+fn operation_uuid_of(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("Publication operation: "))
+        .unwrap_or_else(|| panic!("no operation uuid in: {stderr}"))
+        .trim()
+        .to_string()
+}
+
+fn staged_graph_of(db: &std::path::Path, operation: &str) -> std::path::PathBuf {
+    let root = nestweaver_engine::publication::default_publication_root(db);
+    let state = nestweaver_engine::publication_operation::load_operation(&root, operation).unwrap();
+    nestweaver_engine::publication::slot_path(&root, &state.plan.target_publication_uuid)
+        .unwrap()
+        .join(nestweaver_engine::publication::PUBLICATION_GRAPH_FILE)
+}
+
+/// The cutover gate refuses a staged graph that owes code links, so a slot
+/// can never be published into a daemon's first-pass relink.
+#[test]
+fn a_rebuild_refuses_to_seal_a_slot_that_owes_code_links() {
+    let fx = LinkedRebuildFixture::new();
+    let mut stop = nestweaver_cmd();
+    let stopped = stop
+        .timeout(std::time::Duration::from_secs(300))
+        .env("NESTWEAVER_TEST_STOP_BEFORE_PHASE", "validating")
+        .args(["publication", "rebuild", "--config"])
+        .arg(&fx.config)
+        .output()
+        .unwrap();
+    assert_exit(&stopped, 88, "rebuild stopped before validation");
+    let operation = operation_uuid_of(&stopped);
+    let staged = staged_graph_of(&fx.db, &operation);
+    nestweaver_engine::code_links::mark_code_links_pending(&staged, "injected debt");
+
+    let resumed = fx.rebuild(&["--operation", &operation]);
+    assert_exit(&resumed, 1, "resume over owed links");
+    let stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert!(
+        stderr.contains("validate the staged note→code links") && stderr.contains("injected debt"),
+        "{stderr}"
+    );
+    assert_eq!(fx.selected(), fx.db, "the incumbent stays selected");
+}
+
+/// Everything a daemon started right after an upgrade would owe the links is
+/// already settled: its first status and ranked read carry no code-link debt
+/// or open publication, and its unconditional first pass writes nothing (the
+/// graph generation it would advance stays put).
+#[test]
+fn a_daemon_started_on_a_rebuilt_brain_serves_without_a_code_link_pass() {
+    let fx = LinkedRebuildFixture::new();
+    assert_exit(&fx.rebuild(&[]), 0, "rebuild");
+    let selected = fx.selected();
+    let generation_path = nestweaver_engine::sidecar_path(&selected, ".generation");
+    let generation_before = std::fs::read(&generation_path).unwrap();
+    let reconciled_before =
+        nestweaver_engine::code_links::load_code_links_state(&selected).last_reconciled_at;
+    assert!(reconciled_before.is_some(), "the rebuild settled the links");
+
+    let daemon_cmd = || {
+        let mut cmd = Command::cargo_bin("nestweaver").unwrap();
+        cmd.env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON");
+        cmd
+    };
+    struct StopDaemon<'a>(&'a std::path::Path, Box<dyn Fn() -> Command + 'a>);
+    impl Drop for StopDaemon<'_> {
+        fn drop(&mut self) {
+            let _ = (self.1)()
+                .args(["daemon", "--db"])
+                .arg(self.0)
+                .arg("stop")
+                .output();
+        }
+    }
+    let _stop = StopDaemon(&fx.db, Box::new(daemon_cmd));
+    daemon_cmd()
+        .args(["daemon", "--db"])
+        .arg(&fx.db)
+        .args(["start", "--config"])
+        .arg(&fx.config)
+        .assert()
+        .success();
+
+    let status = || -> serde_json::Value {
+        let output = daemon_cmd()
+            .args(["brain", "status", "--json", "--db"])
+            .arg(&fx.db)
+            .output()
+            .unwrap();
+        assert_exit(&output, 0, "brain status");
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let first = status();
+    assert_eq!(first["code_links"]["pending"], false, "{first}");
+    assert_ne!(first["index_publication"]["dirty"], true, "{first}");
+    assert_eq!(
+        first["vault_derivation"]["pending_or_blocked_vaults"], 0,
+        "every rebuilt vault is admitted without a re-derivation: {first}"
+    );
+
+    let context = daemon_cmd()
+        .args(["brain", "context", "SharedWidget", "--json", "--db"])
+        .arg(&fx.db)
+        .output()
+        .unwrap();
+    assert_exit(&context, 0, "brain context");
+    let body: serde_json::Value = serde_json::from_slice(&context.stdout).unwrap();
+    assert_ne!(body["publication_in_progress"], true, "{body}");
+    assert_ne!(body["code_links_incomplete"], true, "{body}");
+
+    // The daemon's first reconcile pass is unconditional; wait for it to
+    // complete, then prove it rewrote nothing.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let now = status();
+        if now["code_links"]["last_reconciled_at"].as_str() != reconciled_before.as_deref() {
+            assert_eq!(now["code_links"]["pending"], false, "{now}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon's first code-link pass never completed: {now}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    assert_eq!(
+        std::fs::read(&generation_path).unwrap(),
+        generation_before,
+        "the daemon's first pass rewrote links (the graph generation moved)"
+    );
+}
+
 /// A minimal OpenAI-compatible `/v1/embeddings` endpoint on loopback, so a
 /// complete `publication rebuild` (which re-embeds by contract) runs without a
 /// model download. Deterministic, non-zero 8-dimensional vectors per input.

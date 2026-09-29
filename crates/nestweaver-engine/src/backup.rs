@@ -2031,6 +2031,13 @@ fn backup_artifact_contract(
                 1,
                 "nestweaver-vault-registrations-v1",
             ),
+            // A rebuild stamps each vault it indexed in full as derived by
+            // the current Markdown link rules, bound to the slot's identity.
+            Some(crate::markdown_derivation::RECORD_SUFFIX) => (
+                ArtifactKind::CompatibilityStamp,
+                1,
+                "nestweaver-markdown-derivation-v1",
+            ),
             Some(crate::index_md::SKIPPED_NOTES_SIDECAR_SUFFIX) => {
                 (ArtifactKind::FileMetadata, 1, "nestweaver-skipped-notes-v1")
             }

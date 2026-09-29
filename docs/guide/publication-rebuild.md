@@ -22,8 +22,13 @@ nestweaver daemon start --config /path/to/instance.toml
 ```
 
 The rebuild captures the exact repository and vault inputs, rebuilds the graph,
-projects, BM25, per-scope regex shards, embeddings, and ranking metadata, then
-revalidates the inputs before the atomic switch. Interaction history is copied
+projects, note→code links, BM25, per-scope regex shards, embeddings, and
+ranking metadata, then revalidates the inputs before the atomic switch. Note→code
+links are built with the same reconciler the daemon uses (`[Graph] linking notes
+to code`), and every fully indexed vault is recorded as derived by the current
+Markdown link rules, so the first daemon start after the switch serves at once:
+it owes no code-link debt and re-derives no vault. Validation refuses a staged
+graph whose links are owed or were built by other link rules. Interaction history is copied
 only for stable graph UIDs that still exist; the sealed preservation receipt
 reports captured, imported, and deliberately pruned counts and checksums.
 

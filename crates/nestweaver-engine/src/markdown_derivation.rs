@@ -2,7 +2,9 @@
 //!
 //! This version is independent of manifest snapshots, package versions and
 //! code resolver generations. Only the daemon's admitted writer may persist
-//! transitions. Loading and admission never mutate graph or sidecar state.
+//! transitions, plus a publication rebuild for the staged slot it alone
+//! writes ([`stamp_rebuilt_vault`]). Loading and admission never mutate graph
+//! or sidecar state.
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -15,7 +17,7 @@ pub const RECORD_SCHEMA_VERSION: u32 = 1;
 pub const DERIVATION_VERSION: u32 = crate::index_md::MARKDOWN_LINK_DERIVATION_VERSION;
 const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_VAULT_RECORDS: usize = 10_000;
-const RECORD_SUFFIX: &str = ".markdown-derivation.json";
+pub const RECORD_SUFFIX: &str = ".markdown-derivation.json";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -869,6 +871,81 @@ pub fn inventory_digest(notes: &[nestweaver_schema::Note]) -> String {
     blake3::hash(&serde_json::to_vec(&rows).unwrap_or_default())
         .to_hex()
         .to_string()
+}
+
+/// Record a vault a publication rebuild just indexed in full into its staged
+/// slot as Current, with the same completion evidence the daemon's derivation
+/// writer stamps after a full refresh. Without it the published slot holds no
+/// records, and the first daemon start re-derives every vault — a full vault
+/// refresh that drops and relinks every note's code links under the write
+/// lock. The slot's BM25 index is built from this graph before the slot can be
+/// sealed, which is the search reconciliation the witness claims.
+///
+/// A vault whose index disclosed a coverage gap is left unrecorded (any
+/// earlier record is removed), so the daemon derives and discloses it exactly
+/// as it would after an ordinary refresh. Returns whether it was stamped.
+pub fn stamp_rebuilt_vault(
+    db_path: &Path,
+    indexed: &crate::index_md::MarkdownIndexResult,
+    data_instance_id: &str,
+    extra_ignore_patterns: &[String],
+    max_note_bytes: u64,
+) -> anyhow::Result<bool> {
+    let store = nestweaver_store::GraphStore::open_read_only_without_migration(db_path)
+        .map_err(|error| anyhow::anyhow!("open staged graph for derivation records: {error}"))?;
+    let identity = store
+        .publication_identity()
+        .map_err(|error| anyhow::anyhow!("read staged publication identity: {error}"))?
+        .ok_or_else(|| anyhow::anyhow!("staged graph has no publication identity"))?;
+    let expected = expectation(&identity, data_instance_id);
+    let mut records = load_records(db_path, &expected)?.unwrap_or_default();
+    if indexed.skipped.iter().any(is_coverage_gap) {
+        if records.vaults.remove(&indexed.vault_uid).is_some() {
+            save_records(db_path, &records, &expected)?;
+        }
+        return Ok(false);
+    }
+    let vault = store
+        .list_vaults(None)
+        .map_err(|error| anyhow::anyhow!("list staged vaults: {error}"))?
+        .into_iter()
+        .find(|vault| vault.uid == indexed.vault_uid)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "indexed vault {} is not in the staged graph",
+                indexed.vault_uid
+            )
+        })?;
+    let notes = store
+        .list_notes(Some(&vault.uid))
+        .map_err(|error| anyhow::anyhow!("list staged notes: {error}"))?;
+    let graph_generation = store.graph_generation();
+    drop(store);
+    let source = filesystem_source(Path::new(&vault.root_path))?;
+    let coverage = coverage_identity(
+        Path::new(&source.canonical_root),
+        extra_ignore_patterns,
+        max_note_bytes,
+        CoverageScope::FullRegisteredPolicy,
+    )?;
+    let mut record = VaultDerivationRecord::pending(&vault, source.clone(), coverage.clone());
+    record.phase = DerivationPhase::Current;
+    record.completed_generation = Some(graph_generation);
+    record.witness = Some(CompletionWitness {
+        publication_identity: identity.clone(),
+        vault_uid: vault.uid.clone(),
+        source,
+        coverage,
+        derivation_version: DERIVATION_VERSION,
+        source_inventory_digest: inventory_digest(&notes),
+        notes_count: notes.len() as u64,
+        graph_generation,
+        search_reconciled: true,
+    });
+    check_record(&record, &identity)?;
+    records.vaults.insert(vault.uid.clone(), record);
+    save_records(db_path, &records, &expected)?;
+    Ok(true)
 }
 
 pub fn expectation<'a>(

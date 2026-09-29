@@ -1586,6 +1586,10 @@ const ENV_REGISTRY: &[EnvVar] = &[
         role: EnvRole::Internal,
     },
     EnvVar {
+        name: "NESTWEAVER_TEST_STOP_BEFORE_PHASE",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
         name: "NESTWEAVER_TEST_XDG_DEFAULT_CHILD",
         role: EnvRole::Internal,
     },
@@ -29744,6 +29748,14 @@ fn run_publication_rebuild(
                 );
             }
             use nestweaver_engine::publication_operation::PublicationPhase;
+            // Test seam: stop the worker, as an interruption would, before it
+            // starts the named phase (e.g. `validating`).
+            #[cfg(debug_assertions)]
+            if std::env::var("NESTWEAVER_TEST_STOP_BEFORE_PHASE").is_ok_and(|phase| {
+                phase.eq_ignore_ascii_case(&format!("{:?}", state.phase))
+            }) {
+                std::process::exit(88);
+            }
             match state.phase {
                 PublicationPhase::Planned => {
                     nestweaver_engine::publication_operation::ensure_planned_database(
@@ -29861,13 +29873,23 @@ fn run_publication_rebuild(
                             total,
                             format!("indexing vault {}", vault.name),
                         )?;
-                        index_markdown_directory_with_ignore_and_note_limits(
+                        let indexed = index_markdown_directory_with_ignore_and_note_limits(
                             Path::new(&vault.root_path),
                             &target_db,
                             &vault.instance_id,
                             &vault.name,
                             &[],
                             config.indexing.note_limits(),
+                        )?;
+                        // The daemon admits a vault's Markdown links only
+                        // with a current derivation record; without one its
+                        // first start re-derives (fully refreshes) the vault.
+                        nestweaver_engine::markdown_derivation::stamp_rebuilt_vault(
+                            &target_db,
+                            &indexed,
+                            &config.instance_id,
+                            &[],
+                            config.indexing.note_limits().max_note_bytes(),
                         )?;
                         state = nestweaver_engine::publication_operation::record_artifact(
                             &publication_root,
@@ -29928,13 +29950,14 @@ fn run_publication_rebuild(
                             eprintln!("{summary}");
                         }
                     }
-                    nestweaver_engine::discover_cross_domain_links_with_config(
-                        &store,
-                        &config.cross_domain,
+                    state = publication_progress(
+                        &publication_root,
+                        &state,
+                        total,
+                        total,
+                        "linking notes to code".to_string(),
                     )?;
-                    // nw-670 review L7: every note of this fresh graph was
-                    // just linked by the current rules.
-                    nestweaver_engine::code_links::record_rules_version(&target_db);
+                    link_staged_notes_to_code(&store, &config, &target_db)?;
                     drop(store);
                     let receipt = preserved_state.clone().import_into(&target_db)?;
                     receipt.write_bound(&target_db)?;
@@ -30095,6 +30118,14 @@ fn run_publication_rebuild(
                             "publication sources, configuration, or preserved user state changed during rebuild; resume starts only after the inputs are stable"
                         );
                     }
+                    // Links are built in the graph phase, before the
+                    // topology and ranking that depend on them; a slot whose
+                    // links are not current cannot be repaired here.
+                    staged_code_links_current(&target_db).map_err(|error| {
+                        nestweaver_engine::publication_operation::PermanentPublicationFailure(
+                            format!("validate the staged note→code links: {error:#}"),
+                        )
+                    })?;
                     let _authority = acquire_publication_write_authority(
                         &target_db,
                         "seal the staged publication",
@@ -30242,6 +30273,74 @@ fn run_publication_rebuild(
             EXIT_SUCCESS
         },
     )
+}
+
+/// Build every note's code links in the staged graph with the machinery the
+/// daemon settles code-link debt with: the same project repo membership
+/// rebuild, then the same reconciler with the same project folders. The
+/// published slot then starts with links the daemon's first pass agrees with
+/// and no owed code-link debt, instead of the daemon relinking the whole
+/// brain under its write lock after the cutover.
+fn link_staged_notes_to_code(
+    store: &GraphStore,
+    config: &nestweaver_engine::config::InstanceConfig,
+    target_db: &Path,
+) -> anyhow::Result<()> {
+    // A fresh graph holds no links built by other rules, so this pass builds
+    // every note's links rather than migrating (purging) first.
+    nestweaver_engine::code_links::record_rules_version(target_db);
+    if config
+        .projects
+        .iter()
+        .any(|project| !project.repos.is_empty())
+    {
+        nestweaver_engine::project::rebuild_project_repo_membership(
+            store,
+            config,
+            &config.instance_id,
+            target_db,
+            None,
+        )?;
+    }
+    let report = nestweaver_engine::code_links::reconcile_code_links_with_folders(
+        store,
+        &config.cross_domain,
+        nestweaver_engine::project::project_folders(config, &config.instance_id),
+    )?;
+    if !report.unreadable.is_empty() {
+        anyhow::bail!(
+            "{} note(s) could not be read while linking notes to code, e.g. {}",
+            report.unreadable.len(),
+            report.unreadable.join("; ")
+        );
+    }
+    eprintln!(
+        "Code links: {} note(s) checked, {} linked ({} edge(s)).",
+        report.notes_checked,
+        report.rewritten.len(),
+        report.edges_written
+    );
+    staged_code_links_current(target_db)
+}
+
+/// The cutover gate for note→code links: the staged graph's links were built
+/// by the current rules and nothing is owed.
+fn staged_code_links_current(target_db: &Path) -> anyhow::Result<()> {
+    let links = nestweaver_engine::code_links::load_code_links_state(target_db);
+    if links.rules_version != nestweaver_engine::code_links::CROSS_DOMAIN_RULES_VERSION {
+        anyhow::bail!(
+            "staged note→code links were built by link rules v{}, not v{}; discard this operation and rebuild",
+            links.rules_version,
+            nestweaver_engine::code_links::CROSS_DOMAIN_RULES_VERSION
+        );
+    }
+    if let Some(pending) = links.pending {
+        anyhow::bail!(
+            "staged note→code links are owed ({}); discard this operation and rebuild",
+            pending.reason
+        );
+    }
+    Ok(())
 }
 
 fn acquire_publication_write_authority(
