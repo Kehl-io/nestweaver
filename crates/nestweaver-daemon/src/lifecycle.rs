@@ -879,7 +879,15 @@ pub fn db_wal_unreadable(db_path: &Path) -> Option<nestweaver_store::StoreError>
     }
     // Probe what the daemon would serve: the publication `CURRENT`, not a
     // base database a rebuild left behind as the rollback copy.
-    let selected = nestweaver_engine::publication::resolve_selected_database(db_path).ok()?;
+    let selected = match nestweaver_engine::publication::resolve_selected_database(db_path) {
+        Ok(selected) => selected,
+        Err(error) => {
+            // Not this guard's verdict to make, but never a silent "fine":
+            // the daemon's own boot reports the same resolution error.
+            tracing::warn!("unreadable-WAL preflight could not resolve CURRENT: {error:#}");
+            return None;
+        }
+    };
     match nestweaver_store::GraphStore::open_read_only_without_migration(&selected) {
         Ok(_) => None,
         Err(error) => (error.corruption_kind()
@@ -946,7 +954,13 @@ pub fn db_frozen_checkpoint_applied(db_path: &Path) -> Option<nestweaver_store::
     if !db_path.exists() {
         return None;
     }
-    let selected = nestweaver_engine::publication::resolve_selected_database(db_path).ok()?;
+    let selected = match nestweaver_engine::publication::resolve_selected_database(db_path) {
+        Ok(selected) => selected,
+        Err(error) => {
+            tracing::warn!("frozen-checkpoint preflight could not resolve CURRENT: {error:#}");
+            return None;
+        }
+    };
     let sidecar = |suffix: &str| {
         let mut name = selected.as_os_str().to_owned();
         name.push(suffix);

@@ -1458,7 +1458,7 @@ impl GraphStore {
     /// Like [`lookup_symbols_by_repo`] but on an externally-provided connection
     /// (for use inside an open transaction).
     pub fn lookup_symbols_by_repo_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         repo_uid: &str,
     ) -> Result<Vec<Symbol>, StoreError> {
         let safe_repo = repo_uid.replace('\'', "\\'");

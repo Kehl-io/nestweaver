@@ -29805,6 +29805,18 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
             )?;
             let store =
                 GraphStore::open_with_authority(&predecessor_db, &authority).map_err(|error| {
+                    if error.is_rebuild_required() {
+                        // A predecessor from before the storage-engine upgrade
+                        // cannot be served by this version at all.
+                        return anyhow::anyhow!(
+                            "the retained predecessor {} was built by a storage engine older \
+                             than LadybugDB 0.21, which this version cannot open, so it cannot \
+                             be rolled back to here. To roll back across the upgrade, reinstall \
+                             the previous NestWeaver version and restore the backup you took \
+                             before rebuilding.",
+                            predecessor_db.display()
+                        );
+                    }
                     anyhow::anyhow!("open retained predecessor for rollback: {error}")
                 })?;
             if let Some(cfg) = cfg.as_ref() {

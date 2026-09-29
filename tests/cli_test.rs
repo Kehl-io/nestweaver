@@ -13540,6 +13540,75 @@ fn a_pre_cutover_database_rebuilds_into_a_current_publication() {
         legacy_bytes,
         "the pre-cutover database is the rollback copy and must be untouched"
     );
+
+    // A crash mid-checkpoint on the selected slot: the engine refuses every
+    // READ-ONLY open until a writable one finishes the checkpoint. Resolving
+    // CURRENT must not depend on a read-only open, or the daemon could never
+    // boot to recover it.
+    let frozen = std::path::PathBuf::from(format!("{}.wal.checkpoint", selected.display()));
+    std::fs::write(&frozen, b"").unwrap();
+    assert!(nestweaver_store::GraphStore::open_read_only(&selected).is_err());
+    assert_eq!(
+        nestweaver_engine::publication::resolve_selected_database(&db).unwrap(),
+        selected,
+        "CURRENT resolution must survive checkpoint debris on the slot"
+    );
+    let state = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let sock = tempfile::tempdir().unwrap();
+    let daemon_cmd = |args: &[&str]| {
+        let mut command = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"));
+        command
+            .args(args)
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+            .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
+            .env("XDG_STATE_HOME", state.path())
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+            .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "60");
+        command.output().unwrap()
+    };
+    let db_arg = db.display().to_string();
+    let booted = daemon_cmd(&["brain", "status", "--db", &db_arg]);
+    let booted_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&booted.stdout),
+        String::from_utf8_lossy(&booted.stderr)
+    );
+    let _ = daemon_cmd(&["daemon", "--db", &db_arg, "stop"]);
+    assert_eq!(
+        booted.status.code(),
+        Some(0),
+        "the daemon must boot and recover the slot: {booted_text}"
+    );
+    assert!(
+        !frozen.exists(),
+        "the daemon's writable open finished the checkpoint"
+    );
+
+    // Rolling back to the pre-upgrade database is not something this
+    // version can serve; the refusal names the way back instead.
+    let rollback = nestweaver_cmd()
+        .args(["publication", "rollback", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    let rollback_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&rollback.stdout),
+        String::from_utf8_lossy(&rollback.stderr)
+    );
+    assert_ne!(rollback.status.code(), Some(0), "{rollback_text}");
+    assert!(
+        rollback_text.contains("reinstall the previous NestWeaver version"),
+        "{rollback_text}"
+    );
+    assert_eq!(
+        nestweaver_engine::publication::resolve_selected_database(&db).unwrap(),
+        selected,
+        "a refused rollback leaves CURRENT where it was"
+    );
     assert!(
         !nestweaver_store::engine_format::sidecar_path(&db).exists(),
         "nothing may stamp the pre-cutover database as current"

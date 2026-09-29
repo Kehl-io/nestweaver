@@ -1077,8 +1077,8 @@ impl GraphStore {
     /// `impact_bfs` calls this once per visited node, so this setup is paid
     /// once per traversal instead of once per node (nw-065).
     fn direct_callers_prepared(
-        conn: &lbug::Connection<'_>,
-        stmts: &mut [(String, lbug::PreparedStatement)],
+        conn: &crate::db::StoreConnection<'_>,
+        stmts: &mut [(String, crate::db::StoreStatement<'_>)],
         uid: &str,
         min_confidence: f32,
         edges: &[EdgeType],
@@ -1153,10 +1153,10 @@ impl GraphStore {
     /// Prepare one caller-lookup statement per edge type, for reuse across a
     /// whole traversal. Edge types whose relationship table does not exist are
     /// skipped (same tolerance as the per-call path).
-    fn prepare_caller_stmts(
-        conn: &lbug::Connection<'_>,
+    fn prepare_caller_stmts<'c>(
+        conn: &'c crate::db::StoreConnection<'_>,
         edges: &[EdgeType],
-    ) -> Vec<(String, lbug::PreparedStatement)> {
+    ) -> Vec<(String, crate::db::StoreStatement<'c>)> {
         let mut out = Vec::new();
         for edge_type in edges.iter().map(|e| e.rel_table_name()) {
             let q = format!(

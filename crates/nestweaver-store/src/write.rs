@@ -32,7 +32,7 @@ pub(crate) enum RegexAck {
 /// concurrent writer's outbox row exactly as it left it.
 fn finish_regex_ack(
     store: &GraphStore,
-    conn: &lbug::Connection<'_>,
+    conn: &crate::db::StoreConnection<'_>,
     result: Result<RegexAck, StoreError>,
 ) -> Result<RegexAck, StoreError> {
     match result {
@@ -811,7 +811,7 @@ fn count_parameterized_write() {
 }
 
 fn exec_params(
-    conn: &lbug::Connection<'_>,
+    conn: &crate::db::StoreConnection<'_>,
     query: &str,
     params: Vec<(&str, lbug::Value)>,
 ) -> Result<(), StoreError> {
@@ -834,7 +834,7 @@ pub(crate) const CROSS_DOMAIN_ROWS_PER_STATEMENT: usize = 10_000;
 /// [`CROSS_DOMAIN_ROWS_PER_STATEMENT`]; returns the statements executed.
 /// `tail` sees each row as `r.src`, `r.dst`, `r.conf` and `r.origin`.
 fn insert_references_code_rows_on(
-    conn: &lbug::Connection<'_>,
+    conn: &crate::db::StoreConnection<'_>,
     tail: &str,
     edges: &[(&str, &str, f32, &str)],
 ) -> Result<usize, StoreError> {
@@ -953,7 +953,10 @@ impl GraphStore {
     }
 
     /// Insert a Repo node using an externally-provided transaction.
-    pub fn insert_repo_on(conn: &lbug::Connection<'_>, repo: &Repo) -> Result<(), StoreError> {
+    pub fn insert_repo_on(
+        conn: &crate::db::StoreConnection<'_>,
+        repo: &Repo,
+    ) -> Result<(), StoreError> {
         exec_params(
             conn,
             "CREATE (:Repo {uid: $uid, url: $url, indexed_sha: $sha, \
@@ -989,7 +992,10 @@ impl GraphStore {
     ///
     /// Uses `MERGE` so that re-indexing a modified file upserts the node
     /// instead of failing with a duplicate primary-key error.
-    pub fn insert_file_on(conn: &lbug::Connection<'_>, file: &File) -> Result<(), StoreError> {
+    pub fn insert_file_on(
+        conn: &crate::db::StoreConnection<'_>,
+        file: &File,
+    ) -> Result<(), StoreError> {
         exec_params(
             conn,
             "MERGE (f:File {uid: $uid}) \
@@ -1044,7 +1050,7 @@ impl GraphStore {
 
     pub(crate) fn insert_symbol_with_conn(
         &self,
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         symbol: &Symbol,
     ) -> Result<(), StoreError> {
         Self::insert_symbol_with_conn_static(conn, symbol)
@@ -1052,7 +1058,7 @@ impl GraphStore {
 
     /// Static version of `insert_symbol_with_conn` for use without `&self`.
     pub(crate) fn insert_symbol_with_conn_static(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         symbol: &Symbol,
     ) -> Result<(), StoreError> {
         exec_params(
@@ -1121,7 +1127,7 @@ impl GraphStore {
 
     /// Insert symbols using an externally-provided connection (for transaction batching).
     pub fn batch_insert_symbols_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         symbols: &[Symbol],
     ) -> Result<(), StoreError> {
         if symbols.is_empty() {
@@ -1144,7 +1150,7 @@ impl GraphStore {
 
     /// Insert files using an externally-provided connection (for transaction batching).
     pub fn batch_insert_files_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         files: &[File],
     ) -> Result<(), StoreError> {
         if files.is_empty() {
@@ -1167,7 +1173,7 @@ impl GraphStore {
 
     /// Insert repo-file edges using an externally-provided connection.
     pub fn batch_insert_repo_file_edges_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let mut stmt = conn
@@ -1196,7 +1202,7 @@ impl GraphStore {
 
     /// Insert file-symbol edges using an externally-provided connection.
     pub fn batch_insert_file_symbol_edges_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         if edges.is_empty() {
@@ -1221,7 +1227,7 @@ impl GraphStore {
 
     /// Insert a single repo-file edge using an externally-provided connection.
     pub fn insert_repo_file_edge_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         repo_uid: &str,
         file_uid: &str,
     ) -> Result<(), StoreError> {
@@ -1280,7 +1286,7 @@ impl GraphStore {
 
     /// Insert service-symbol edges using an externally-provided connection.
     pub fn batch_insert_service_symbol_edges_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         if edges.is_empty() {
@@ -1305,7 +1311,7 @@ impl GraphStore {
 
     pub(crate) fn insert_edge_with_conn(
         &self,
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         edge: &ResolvedEdge,
     ) -> Result<(), StoreError> {
         let src = edge.source_uid.clone();
@@ -1466,7 +1472,7 @@ impl GraphStore {
     /// existing connection/transaction.
     #[allow(clippy::too_many_arguments)]
     pub fn bulk_index_write_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         files: &[File],
         symbols: &[Symbol],
         repo_file_edges: &[(&str, &str)],
@@ -1508,7 +1514,7 @@ impl GraphStore {
     /// Bulk and incremental writers must use this variant so the graph
     /// mutation and its derived-index invalidation commit atomically.
     pub fn mark_regex_scope_dirty_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         scope_uid: &str,
         tombstone: bool,
     ) -> Result<u64, StoreError> {
@@ -1906,7 +1912,7 @@ impl GraphStore {
     /// delete so the two are atomic for concurrent readers).
     #[allow(clippy::too_many_arguments)]
     pub fn bulk_vault_write_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         notes: &[Note],
         headings: &[Heading],
         sections: &[Section],
@@ -2180,7 +2186,7 @@ impl GraphStore {
 
     /// Insert resolved edges using an externally-provided connection (for transaction batching).
     pub fn batch_insert_edges_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         edges: &[ResolvedEdge],
     ) -> Result<(), StoreError> {
         // Group edges by their SQL query string so we prepare each statement only once.
@@ -2385,7 +2391,7 @@ impl GraphStore {
 
     /// Insert notes using an externally-provided connection (for transaction batching).
     pub fn batch_insert_notes_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         notes: &[Note],
     ) -> Result<(), StoreError> {
         let mut stmt = conn
@@ -2457,7 +2463,7 @@ impl GraphStore {
 
     /// Insert vault-note edges using an externally-provided connection (for transaction batching).
     pub fn batch_insert_vault_note_edges_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let mut stmt = conn
@@ -2507,7 +2513,7 @@ impl GraphStore {
 
     /// Insert headings using an externally-provided connection (for transaction batching).
     pub fn batch_insert_headings_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         headings: &[Heading],
     ) -> Result<(), StoreError> {
         let mut stmt = conn
@@ -2596,7 +2602,7 @@ impl GraphStore {
 
     /// Insert sections using an externally-provided connection (for transaction batching).
     pub fn batch_insert_sections_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         sections: &[Section],
     ) -> Result<(), StoreError> {
         let mut stmt = conn
@@ -2639,7 +2645,7 @@ impl GraphStore {
 
     /// Insert note-heading edges using an externally-provided connection (for transaction batching).
     pub fn batch_insert_note_heading_edges_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let mut stmt = conn
@@ -2671,7 +2677,7 @@ impl GraphStore {
 
     /// Insert note-section edges using an externally-provided connection (for transaction batching).
     pub fn batch_insert_note_section_edges_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let mut stmt = conn
@@ -2703,7 +2709,7 @@ impl GraphStore {
 
     /// Insert heading-section edges using an externally-provided connection (for transaction batching).
     pub fn batch_insert_heading_section_edges_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let mut stmt = conn
@@ -2735,7 +2741,7 @@ impl GraphStore {
 
     /// Insert heading-parent edges using an externally-provided connection (for transaction batching).
     pub fn batch_insert_heading_parent_edges_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let mut stmt = conn
@@ -2779,7 +2785,7 @@ impl GraphStore {
 
     /// Insert tags using an externally-provided connection (for transaction batching).
     pub fn batch_insert_tags_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         tags: &[Tag],
     ) -> Result<(), StoreError> {
         let mut stmt = conn
@@ -2804,7 +2810,10 @@ impl GraphStore {
         Self::insert_project_on(&conn, project)
     }
 
-    fn insert_project_on(conn: &lbug::Connection<'_>, project: &Project) -> Result<(), StoreError> {
+    fn insert_project_on(
+        conn: &crate::db::StoreConnection<'_>,
+        project: &Project,
+    ) -> Result<(), StoreError> {
         exec_params(
             conn,
             "CREATE (:Project {uid: $uid, name: $name, summary: $summary, instance_id: $iid})",
@@ -2820,7 +2829,10 @@ impl GraphStore {
         )
     }
 
-    fn merge_project_on(conn: &lbug::Connection<'_>, project: &Project) -> Result<(), StoreError> {
+    fn merge_project_on(
+        conn: &crate::db::StoreConnection<'_>,
+        project: &Project,
+    ) -> Result<(), StoreError> {
         exec_params(
             conn,
             "MERGE (p:Project {uid: $uid}) \
@@ -2896,7 +2908,7 @@ impl GraphStore {
     /// Insert unresolved wikilinks on a caller-provided connection, so a larger
     /// transaction (e.g. `reparent_vault`) can batch them with its other work.
     pub fn batch_insert_unresolved_wikilinks_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         records: &[UnresolvedWikilinkRecord],
     ) -> Result<(), StoreError> {
         if records.is_empty() {
@@ -2939,7 +2951,7 @@ impl GraphStore {
     }
 
     fn delete_unresolved_wikilinks_for_note_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         note_uid: &str,
     ) -> Result<(), StoreError> {
         if let Err(e) = exec_params(
@@ -2998,7 +3010,7 @@ impl GraphStore {
     /// Like [`clear_repo_contracts`](Self::clear_repo_contracts) but operates on
     /// an existing connection/transaction.
     pub fn clear_repo_contracts_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         repo_uid: &str,
     ) -> Result<(), StoreError> {
         exec_params(
@@ -3021,7 +3033,7 @@ impl GraphStore {
     /// operates on an existing connection/transaction. The tempdir holding the
     /// staged CSV is kept alive for the whole call so it outlives the COPY.
     pub fn batch_insert_contracts_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         contracts: &[Contract],
     ) -> Result<(), StoreError> {
         if contracts.is_empty() {
@@ -3047,7 +3059,7 @@ impl GraphStore {
 
     /// Insert wikilink-to-note edges using an externally-provided connection (for transaction batching).
     pub fn batch_insert_wikilink_to_note_edges_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         edges: &[(&str, &str, f32, &str, &str)],
     ) -> Result<(), StoreError> {
         let mut stmt = conn
@@ -3082,7 +3094,7 @@ impl GraphStore {
 
     /// Insert wikilink-to-heading edges using an externally-provided connection (for transaction batching).
     pub fn batch_insert_wikilink_to_heading_edges_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         edges: &[(&str, &str, f32, &str, &str)],
     ) -> Result<(), StoreError> {
         let mut stmt = conn
@@ -3114,7 +3126,7 @@ impl GraphStore {
 
     /// Insert note-tag edges using an externally-provided connection (for transaction batching).
     pub fn batch_insert_note_tag_edges_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let mut stmt = conn
@@ -3143,7 +3155,7 @@ impl GraphStore {
 
     /// Insert section-tag edges using an externally-provided connection (for transaction batching).
     pub fn batch_insert_section_tag_edges_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let mut stmt = conn
@@ -3297,7 +3309,7 @@ impl GraphStore {
     }
 
     fn delete_note_cascade_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         note_uid: &str,
     ) -> Result<(), StoreError> {
         // 1. Drop every Section whose ownership property references this
@@ -3763,7 +3775,7 @@ impl GraphStore {
     }
 
     fn exact_uids_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         query: &str,
         parameter: &'static str,
         scope: &str,
@@ -3841,14 +3853,14 @@ impl GraphStore {
     /// never observe the empty intermediate between the delete and the insert.
     /// Returns the number of notes that were present before the delete.
     pub fn delete_vault_cascade_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         vault_uid: &str,
     ) -> Result<usize, StoreError> {
         Ok(Self::delete_vault_cascade_with_outcome_on(conn, vault_uid)?.notes_deleted)
     }
 
     fn delete_vault_cascade_with_outcome_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         vault_uid: &str,
     ) -> Result<DeleteVaultCascadeOutcome, StoreError> {
         Self::delete_vault_cascade_with_outcome_on_with_faults(
@@ -3859,7 +3871,7 @@ impl GraphStore {
     }
 
     fn delete_vault_cascade_with_outcome_on_with_faults(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         vault_uid: &str,
         faults: VaultCascadeFaults,
     ) -> Result<DeleteVaultCascadeOutcome, StoreError> {
@@ -4094,7 +4106,7 @@ impl GraphStore {
     /// matches nothing and creates nothing, rather than failing the batch
     /// (which `COPY` would).
     pub fn batch_insert_note_to_symbol_edges_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         edges: &[(&str, &str, f32, &str)],
     ) -> Result<usize, StoreError> {
         insert_references_code_rows_on(
@@ -4109,7 +4121,7 @@ impl GraphStore {
     /// Section → Symbol twin of [`Self::batch_insert_note_to_symbol_edges_on`]
     /// (same row shape, same set-based statement, same count returned).
     pub fn batch_insert_section_to_symbol_edges_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         edges: &[(&str, &str, f32, &str)],
     ) -> Result<usize, StoreError> {
         insert_references_code_rows_on(
@@ -4131,7 +4143,7 @@ impl GraphStore {
     /// Run it inside the same transaction as the inserts that replace the
     /// edges and a failure rolls back to the note's previous edges.
     pub fn delete_cross_domain_edges_for_notes_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         note_uids: &[&str],
     ) -> Result<usize, StoreError> {
         if note_uids.is_empty() {
@@ -4194,7 +4206,7 @@ impl GraphStore {
     /// `GraphStore::tombstone_deleted_symbol_embeddings`, which differences it
     /// against the post-commit graph before anything is tombstoned.
     pub fn delete_symbols_in_file_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         repo_uid: &str,
         file_path: &str,
     ) -> Result<Vec<String>, StoreError> {
@@ -4337,7 +4349,7 @@ impl GraphStore {
 
     /// Delete a File node using an externally-provided connection (for transaction batching).
     pub fn delete_file_node_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         file_uid: &str,
     ) -> Result<(), StoreError> {
         exec_params(
@@ -4361,7 +4373,7 @@ impl GraphStore {
     /// nw-678: the projects a repo is a member of, as `(project_uid,
     /// confidence)`, read before a Repo node is re-created.
     fn project_repo_memberships_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         repo_uid: &str,
     ) -> Result<Vec<(String, f64)>, StoreError> {
         let mut stmt = conn
@@ -4392,7 +4404,7 @@ impl GraphStore {
     /// nw-678: re-attach memberships read by
     /// [`Self::project_repo_memberships_on`] to the re-created Repo node.
     fn restore_project_repo_memberships_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         repo_uid: &str,
         memberships: &[(String, f64)],
     ) -> Result<(), StoreError> {
@@ -4422,7 +4434,7 @@ impl GraphStore {
     /// Update the `indexed_sha` field using an externally-provided connection
     /// (for transaction batching). Does NOT begin/commit its own transaction.
     pub fn update_repo_sha_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         repo_uid: &str,
         new_sha: &str,
     ) -> Result<(), StoreError> {
@@ -4967,7 +4979,7 @@ impl GraphStore {
     // for the regression benchmark and the full refuted-claims record.
     /// Returns `(file_count, symbol_count, deleted_symbol_uids)`.
     pub fn bulk_delete_repo_files_and_symbols_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         repo_uid: &str,
     ) -> Result<(usize, usize, Vec<String>), StoreError> {
         let rid = lbug::Value::String(repo_uid.to_string());
@@ -5059,7 +5071,7 @@ impl GraphStore {
     /// Like [`clear_repo_derived_nodes`](Self::clear_repo_derived_nodes) but
     /// operates on an existing connection/transaction.
     pub fn clear_repo_derived_nodes_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         repo_uid: &str,
     ) -> Result<(), StoreError> {
         // Service nodes for this repo.
@@ -5640,7 +5652,7 @@ impl GraphStore {
     /// Insert materialized project-note membership using an existing
     /// transaction connection.
     pub fn batch_insert_project_note_edges_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         edges: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let owned = edges
@@ -5665,7 +5677,7 @@ impl GraphStore {
     }
 
     fn copy_project_edges_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         relationship: &'static str,
         edges: &[(String, String)],
         confidence: f32,
@@ -5696,7 +5708,7 @@ impl GraphStore {
     /// Keep bulk COPY for the high-volume Note/Symbol memberships, but avoid
     /// that unsafe native COPY rollback combination for topology relationships.
     fn insert_project_topology_edges_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         relationship: &'static str,
         edges: &[(String, String)],
     ) -> Result<(), StoreError> {
@@ -6184,7 +6196,7 @@ impl GraphStore {
     }
 
     fn list_string_targets_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         query: &str,
         uid: &str,
         stage: &str,
@@ -6206,7 +6218,7 @@ impl GraphStore {
     }
 
     fn list_string_pairs_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         query: &str,
         uid: &str,
         stage: &str,
@@ -6516,7 +6528,7 @@ impl GraphStore {
     }
 
     fn delete_project_edge_pairs_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         relationship: &'static str,
         target_label: &'static str,
         edges: &[(String, String)],
@@ -6961,7 +6973,7 @@ impl GraphStore {
     }
 
     fn project_cascade_pre_mutation_error(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         rollback_query: &str,
         project_uid: &str,
         project_name: Option<String>,
@@ -6977,7 +6989,7 @@ impl GraphStore {
     }
 
     fn project_cascade_rollback(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         rollback_query: &str,
     ) -> Option<StoreError> {
         conn.query(rollback_query)
@@ -7022,7 +7034,7 @@ impl GraphStore {
 
     fn finish_project_transaction<T>(
         &self,
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         mutation: Result<T, StoreError>,
         operation: &str,
     ) -> Result<T, StoreError> {
@@ -7043,7 +7055,7 @@ impl GraphStore {
     }
 
     fn rollback_project_transaction(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         error: StoreError,
         operation: &str,
     ) -> StoreError {
@@ -8660,7 +8672,7 @@ impl GraphStore {
     /// This function never commits: graph changes and their policy proof must
     /// become visible together, or both roll back.
     pub fn set_repo_index_policy_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         repo_uid: &str,
         fingerprint: &str,
     ) -> Result<(), StoreError> {
@@ -8737,7 +8749,7 @@ impl GraphStore {
 
     /// Clear a repository's failure marker on the caller's transaction.
     pub fn clear_contract_derivation_failed_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         repo_uid: &str,
     ) -> Result<(), StoreError> {
         exec_params(
@@ -8757,7 +8769,9 @@ impl GraphStore {
     /// removes every legacy row, marks every indexed repo as owing a v2
     /// derivation, and records the generation atomically. The current repo's
     /// debt is cleared only after its scoped rows and edges have landed.
-    pub fn ensure_contract_derivation_v2_on(conn: &lbug::Connection<'_>) -> Result<(), StoreError> {
+    pub fn ensure_contract_derivation_v2_on(
+        conn: &crate::db::StoreConnection<'_>,
+    ) -> Result<(), StoreError> {
         let generation = {
             let mut stmt = conn
                 .prepare("MATCH (m:Meta {key: $k}) RETURN m.value")
@@ -8833,7 +8847,7 @@ impl GraphStore {
 
     /// Clear one repository's migration debt on the caller's transaction.
     pub fn clear_contract_derivation_debt_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         repo_uid: &str,
     ) -> Result<(), StoreError> {
         exec_params(
@@ -8942,6 +8956,7 @@ mod copy_from_tests {
         let result_with_header = {
             let conn = store.conn().unwrap();
             conn.query(&format!("COPY Symbol FROM '{csv_str}' (HEADER=true)"))
+                .map(|rows| rows.to_string())
         };
 
         let count_after = {
@@ -8987,6 +9002,7 @@ mod copy_from_tests {
             let result_no_header = {
                 let conn = store.conn().unwrap();
                 conn.query(&format!("COPY Symbol FROM '{csv_no_hdr_str}'"))
+                    .map(|rows| rows.to_string())
             };
 
             let count_no_hdr = {
@@ -9060,9 +9076,12 @@ mod copy_from_tests {
 
         let csv_str = csv_path.to_str().unwrap();
 
+        // Consumed inside the block: a result may not outlive the
+        // connection that produced it.
         let result = {
             let conn = store.conn().unwrap();
             conn.query(&format!("COPY REPO_HAS_FILE FROM '{csv_str}'"))
+                .map(|_| ())
         };
 
         match result {

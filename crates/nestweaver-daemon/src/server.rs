@@ -13961,7 +13961,7 @@ pub async fn run_server(
         let authority = write_authority
             .as_deref()
             .expect("a read-write daemon acquired writer authority before opening the store");
-        match GraphStore::open_or_create_with_authority(&db_path, authority) {
+        let store = match GraphStore::open_or_create_with_authority(&db_path, authority) {
             Ok(s) => s,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -13972,7 +13972,15 @@ pub async fn run_server(
                     )
                 });
             }
-        }
+        };
+        // `resolve_selected_database` skips the graph-owned identity check when
+        // checkpoint debris makes a read-only open impossible; this writable
+        // open has just finished that checkpoint, so check it now.
+        nestweaver_engine::publication::verify_selected_publication_identity(
+            &base_db_path,
+            &store,
+        )?;
+        store
     };
     drop(publication_root_lock);
     #[cfg(feature = "release-fixture-hooks")]

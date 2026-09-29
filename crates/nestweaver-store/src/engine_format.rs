@@ -112,22 +112,29 @@ pub(crate) fn check(db_path: &Path) -> Result<Precheck, crate::StoreError> {
             )));
         }
     }
-    for debris in debris_paths(db_path) {
-        // `try_exists` distinguishes "absent" from "could not tell"; an
-        // undecidable answer is treated as present, which refuses.
-        if !matches!(debris.try_exists(), Ok(false)) {
-            return Err(rebuild_required(
-                db_path,
-                format!(
-                    "has no engine-format marker and has crash debris beside it ({}), so its \
-                     format cannot be verified without replaying a log this engine may not \
-                     be able to read",
-                    debris.display()
-                ),
-            ));
-        }
+    if let Some(debris) = debris_present(db_path) {
+        return Err(rebuild_required(
+            db_path,
+            format!(
+                "has no engine-format marker and has crash debris beside it ({}), so its \
+                 format cannot be verified without replaying a log this engine may not be \
+                 able to read. If the previous NestWeaver version built it, open it once with \
+                 that version to finish its checkpoint, then back it up and rebuild",
+                debris.display()
+            ),
+        ));
     }
     Ok(Precheck::NeedsProbe)
+}
+
+/// The first `.wal`, `.wal.checkpoint` or `.shadow` beside `db_path`, or one
+/// whose existence cannot be determined (treated as present).
+pub(crate) fn debris_present(db_path: &Path) -> Option<PathBuf> {
+    // `try_exists` distinguishes "absent" from "could not tell"; an
+    // undecidable answer is treated as present, which refuses.
+    debris_paths(db_path)
+        .into_iter()
+        .find(|debris| !matches!(debris.try_exists(), Ok(false)))
 }
 
 /// The refusal for a database built by an older engine.
