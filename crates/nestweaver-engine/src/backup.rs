@@ -262,6 +262,10 @@ pub struct StagedBackup {
     publication_identity: nestweaver_store::PublicationIdentity,
     source_graph_generation: u64,
     logical_instance_id: String,
+    /// The graph was built by a storage engine older than LadybugDB 0.21 and
+    /// was read through the store's legacy read-only exemption. The archive
+    /// is sealed at the pre-cutover bundle format so a restore warns.
+    pre_cutover_engine: bool,
 }
 
 /// Resolve portable backup identity from graph ownership, never a runtime path hash.
@@ -369,12 +373,18 @@ fn stage_backup_with_statistics(
         .map_err(|error| anyhow::anyhow!("refusing backup of dirty index publication: {error}"))?;
     let staging = tempfile::tempdir()?;
 
-    store
-        .compact_embedding_index()
-        .map_err(|e| anyhow::anyhow!("failed to compact embedding index: {e}"))?;
-    store
-        .checkpoint()
-        .map_err(|e| anyhow::anyhow!("CHECKPOINT failed: {e}"))?;
+    // A pre-cutover graph is read, never written: no compaction and no
+    // CHECKPOINT (a 0.21 checkpoint would rewrite its pages with the new
+    // hash). Its log, if any, is copied as it is.
+    let pre_cutover_engine = store.is_legacy_engine();
+    if !pre_cutover_engine {
+        store
+            .compact_embedding_index()
+            .map_err(|e| anyhow::anyhow!("failed to compact embedding index: {e}"))?;
+        store
+            .checkpoint()
+            .map_err(|e| anyhow::anyhow!("CHECKPOINT failed: {e}"))?;
+    }
 
     // Copy files while the caller holds the write lock (sidecars are non-atomic).
     copy_db_files(
@@ -422,6 +432,7 @@ fn stage_backup_with_statistics(
         publication_identity,
         source_graph_generation,
         logical_instance_id,
+        pre_cutover_engine,
     })
 }
 
@@ -432,8 +443,17 @@ pub fn backup_save(config: &BackupConfig) -> anyhow::Result<BackupResult> {
             config.db_path.display()
         )
     })?;
-    let store = nestweaver_store::GraphStore::open_with_authority(&config.db_path, &authority)
-        .map_err(|e| anyhow::anyhow!("failed to open database: {e}"))?;
+    // "Back up before upgrading" must work after the upgrade too: a database
+    // an older storage engine built is read through the store's legacy
+    // read-only exemption (scans only, no writes), under the same authority.
+    let store = match nestweaver_store::GraphStore::open_with_authority(&config.db_path, &authority)
+    {
+        Err(nestweaver_store::StoreError::RebuildRequired { .. }) => {
+            nestweaver_store::GraphStore::open_legacy_engine_read_only(&config.db_path)
+        }
+        other => other,
+    }
+    .map_err(|e| anyhow::anyhow!("failed to open database: {e}"))?;
     let staged = stage_backup_from_store(&store, config)?;
     drop(store);
     drop(authority);
@@ -452,6 +472,7 @@ pub fn package_staged(config: &BackupConfig, staged: StagedBackup) -> anyhow::Re
         publication_identity,
         source_graph_generation,
         logical_instance_id,
+        pre_cutover_engine,
     } = staged;
     let activity_path = staging.path().join(
         config
@@ -467,12 +488,18 @@ pub fn package_staged(config: &BackupConfig, staged: StagedBackup) -> anyhow::Re
             .context("exclude legacy activity from backup staging")?;
         warnings.push("Legacy unversioned git-activity scores were excluded from this backup because repository ownership cannot be recovered safely. Graph data is preserved; reindex repositories with --with-git-activity after restore to rebuild activity ranking.".to_string());
     }
-    let bundle = build_backup_publication_bundle(
+    let mut bundle = build_backup_publication_bundle(
         config,
         staging.path(),
         &publication_identity,
         source_graph_generation,
     )?;
+    if pre_cutover_engine {
+        // Seal a pre-cutover graph at the pre-cutover format: a reader must
+        // never mistake it for a graph this engine can open.
+        bundle.format_version = crate::snapshot::LEGACY_ENGINE_SNAPSHOT_FORMAT_VERSION;
+        bundle.validate_metadata(crate::snapshot::LEGACY_ENGINE_SNAPSHOT_FORMAT_VERSION)?;
+    }
     let publication_bytes = serde_json::to_vec_pretty(&bundle)?;
     std::fs::write(
         staging
@@ -490,6 +517,15 @@ pub fn package_staged(config: &BackupConfig, staged: StagedBackup) -> anyhow::Re
         publication_manifest_blake3,
     )?;
     manifest.instance_id = logical_instance_id;
+    if pre_cutover_engine {
+        warnings.push(
+            "this archive holds a database built by a storage engine older than LadybugDB \
+             0.21, backed up unchanged (read-only, no checkpoint). Keep it as the rollback \
+             copy; the database itself must be rebuilt before this version opens it: stop \
+             the daemon and run `nestweaver publication rebuild --config <instance.toml>`"
+                .to_string(),
+        );
+    }
     manifest.warnings = warnings;
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
     std::fs::write(staging.path().join("manifest.json"), &manifest_json)?;
@@ -2231,8 +2267,8 @@ fn verify_backup_checksums(data_dir: &Path, manifest: &BackupManifest) -> anyhow
 /// The warning a restore of a pre-cutover archive carries.
 pub fn pre_cutover_restore_warning(manifest: &BackupManifest) -> String {
     format!(
-        "this archive was written by NestWeaver {} with a storage engine older than \
-         LadybugDB 0.21. It was restored unchanged, but this version refuses to open the \
+        "this archive (written by NestWeaver {}) holds a database built by a storage \
+         engine older than LadybugDB 0.21. It was restored unchanged, but this version refuses to open the \
          restored database (nestweaver::db_rebuild_required) until it is rebuilt: stop the \
          daemon and run `nestweaver publication rebuild --config <instance.toml>`, or use \
          the NestWeaver version that wrote the archive",

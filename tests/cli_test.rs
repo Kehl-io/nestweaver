@@ -13487,3 +13487,55 @@ fn a_pre_cutover_database_rebuilds_into_a_current_publication() {
         "nothing may stamp the pre-cutover database as current"
     );
 }
+
+/// "Back up before upgrading" has to work after installing the upgrade:
+/// `backup save` reads a pre-cutover database through the legacy read-only
+/// exemption, changes no byte of it, and seals the archive as pre-cutover so
+/// the restore warns and the restored database is refused until rebuilt.
+#[test]
+fn backup_save_works_on_a_pre_cutover_database_and_the_restore_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = pre_cutover_db(dir.path());
+    let before = std::fs::read(&db).unwrap();
+    let archive = dir.path().join("before-upgrade.nwsnap.zst");
+
+    let saved = nestweaver_cmd()
+        .args(["backup", "save"])
+        .arg(&archive)
+        .arg("--db")
+        .arg(&db)
+        .output()
+        .unwrap();
+    let saved_text = String::from_utf8_lossy(&saved.stderr).to_string();
+    assert_eq!(saved.status.code(), Some(0), "{saved_text}");
+    assert!(saved_text.contains("LadybugDB 0.21"), "{saved_text}");
+    assert_eq!(std::fs::read(&db).unwrap(), before, "backup changed the database");
+    assert!(
+        !nestweaver_store::engine_format::sidecar_path(&db).exists(),
+        "backup must not stamp the pre-cutover database as current"
+    );
+
+    let restored_dir = dir.path().join("restored");
+    let restored = nestweaver_cmd()
+        .args(["backup", "restore"])
+        .arg(&archive)
+        .arg("--data-dir")
+        .arg(&restored_dir)
+        .output()
+        .unwrap();
+    let restored_text = String::from_utf8_lossy(&restored.stderr).to_string();
+    assert_eq!(restored.status.code(), Some(0), "{restored_text}");
+    assert!(
+        restored_text.contains("It was restored unchanged")
+            && restored_text.contains("nestweaver publication rebuild"),
+        "{restored_text}"
+    );
+    let restored_db = restored_dir.join("brain.lbug");
+    assert_eq!(std::fs::read(&restored_db).unwrap(), before);
+    assert!(
+        nestweaver_store::GraphStore::open(&restored_db)
+            .err()
+            .expect("the restored pre-cutover database must be refused")
+            .is_rebuild_required()
+    );
+}

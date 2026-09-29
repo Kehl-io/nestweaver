@@ -10016,6 +10016,40 @@ fn resolve_db_with_config_source(
     Ok((selected, source))
 }
 
+/// [`resolve_db_with_config`] for `backup save`, the one ordinary command
+/// that must also read a database an older storage engine built ("back up
+/// before upgrading" has to work after installing the upgrade). Follows
+/// `CURRENT` through a slot sealed before the cutover and checks the
+/// config's expected brain through the store's legacy read-only exemption.
+/// Everything else keeps refusing such a database.
+fn resolve_db_with_config_allowing_legacy_engine(
+    db: Option<PathBuf>,
+    config: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    let (resolved, cfg, _) = resolve_base_db_with_config_source(db, config)?;
+    let selected =
+        nestweaver_engine::publication::resolve_selected_database_allowing_legacy_engine(
+            &resolved,
+        )?;
+    if let Some(config) = cfg.as_ref()
+        && config.expected_brain_uuid.is_some()
+        && selected.exists()
+    {
+        let store = nestweaver_store::GraphStore::open_read_only_allowing_legacy_engine(&selected)
+            .with_context(|| {
+                format!(
+                    "open {} to verify expected_brain_uuid for instance '{}'",
+                    selected.display(),
+                    config.instance_id
+                )
+            })?;
+        config.assert_expected_brain(&store)?;
+    } else if let Some(config) = cfg.as_ref() {
+        assert_config_expected_brain(config, &selected)?;
+    }
+    Ok(selected)
+}
+
 /// Resolve the stable database anchor without following publication
 /// `CURRENT`. Publication administration derives its root from this path;
 /// ordinary reads and writes must use [`resolve_db_with_config`] instead.

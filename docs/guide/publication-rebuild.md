@@ -30,9 +30,11 @@ code and command in the JSON-RPC error.
 
 To upgrade:
 
-1. Before installing, with the version you have now: stop the daemon and run
-   `nestweaver backup save <file>`.
-2. Install this release and run the command the error prints (below). The
+1. Stop the daemon and run `nestweaver backup save <file>`. This works with
+   either version: this release reads the old database read-only (no
+   checkpoint, no marker) and seals the archive as pre-upgrade, so restoring
+   it later warns that it must be rebuilt.
+2. Run the command the error prints (below). The
    rebuild reads the old database read-only through a narrow exemption that
    scans rather than using primary-key lookups, writes the new graph into a
    fresh publication slot, and switches `CURRENT` only after it validates.
