@@ -18612,7 +18612,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
         Commands::Interactions { command } => match command {
             InteractionCommands::Status { db } => {
-                let db_path = db.unwrap_or_else(default_db_path);
+                // History lives beside the graph the daemon serves: follow the
+                // publication CURRENT, not a base left behind by a rebuild.
+                let db_path = selected_db_path(&db.unwrap_or_else(default_db_path))?;
                 match nestweaver_engine::load_interaction_data(&db_path) {
                     Some(data) => {
                         let node_count = data.scores.len();
@@ -18635,7 +18637,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Ok((EXIT_SUCCESS, None))
             }
             InteractionCommands::Clear { db } => {
-                let db_path = db.unwrap_or_else(default_db_path);
+                // History lives beside the graph the daemon serves: follow the
+                // publication CURRENT, not a base left behind by a rebuild.
+                let db_path = selected_db_path(&db.unwrap_or_else(default_db_path))?;
                 if nestweaver_engine::clear_interaction_sidecar(&db_path) {
                     println!("Interaction memory cleared.");
                 } else {
@@ -18683,7 +18687,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
             InteractionCommands::Show { uid, top, kind, db } => {
-                let db_path = db.unwrap_or_else(default_db_path);
+                // History lives beside the graph the daemon serves: follow the
+                // publication CURRENT, not a base left behind by a rebuild.
+                let db_path = selected_db_path(&db.unwrap_or_else(default_db_path))?;
                 if let Some(n) = top {
                     let rows = nestweaver_engine::top_uids_by_kind(&db_path, &kind, n);
                     if rows.is_empty() {

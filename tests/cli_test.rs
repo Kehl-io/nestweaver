@@ -13415,6 +13415,22 @@ fn a_pre_cutover_database_rebuilds_into_a_current_publication() {
         .arg(&repo)
         .assert()
         .success();
+    // Interaction history recorded before the upgrade, against a real node.
+    let remembered = {
+        let store = nestweaver_store::GraphStore::open_read_only(&db).unwrap();
+        store
+            .list_all_symbols()
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.name == "grüßen")
+            .expect("indexed symbol")
+            .uid
+    };
+    {
+        let tracker = nestweaver_engine::interactions::InteractionTracker::new(&db);
+        tracker.record_access("test", &remembered);
+        tracker.flush().unwrap();
+    }
     make_pre_cutover(&db);
     let legacy_bytes = std::fs::read(&db).unwrap();
 
@@ -13477,6 +13493,32 @@ fn a_pre_cutover_database_rebuilds_into_a_current_publication() {
         nestweaver_daemon::lifecycle::db_rebuild_required(&db).is_none(),
         "the daemon guard follows CURRENT, not the retained base"
     );
+    // The history carried over, and the interactions commands read it
+    // through CURRENT: the uid is deterministic, so it still names the node.
+    // One more access recorded where the daemon now records (the selected
+    // slot) tells a CURRENT read (2) apart from a stale base read (1).
+    {
+        let tracker = nestweaver_engine::interactions::InteractionTracker::new(&selected);
+        tracker.record_access("test", &remembered);
+        tracker.flush().unwrap();
+    }
+    let history = nestweaver_cmd()
+        .args(["interactions", "show", "--uid", &remembered, "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let history_text = String::from_utf8_lossy(&history.stdout).to_string();
+    assert_eq!(history.status.code(), Some(0), "{history_text}");
+    assert!(
+        history_text.contains("access_count:           2"),
+        "{history_text}"
+    );
+    let selected_history = nestweaver_engine::interactions::load_node_score(&selected, &remembered);
+    assert!(
+        selected_history.is_some(),
+        "the rebuilt slot must hold the carried-over history"
+    );
+
     // Commands that open the store directly follow CURRENT too, instead of
     // refusing the rollback copy left at the base path.
     for args in [
