@@ -197,6 +197,8 @@ export const createGraphSlice: StateCreator<
       if (id === null) {
         s.previewNodeId = null;
         s.previewExpanded = false;
+        // Nothing selected: the next refit frames the whole scene.
+        s.cameraFitUids = null;
       }
     }),
 

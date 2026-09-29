@@ -102,6 +102,49 @@ test.describe("Start Here (nw-572)", () => {
     expect(await cameraFit(page)).toBe(repo.uid);
   });
 
+  test("deselecting drops the fit target, so the next refit frames everything", async ({
+    page,
+    request,
+  }) => {
+    const data = await overview(request);
+    const entry = data.start_here[0];
+    await openPanels(page, "/");
+    const shelf = page.getByRole("region", { name: "Start Here" });
+    await shelf.getByRole("button", { name: new RegExp(entry.label) }).first().click();
+    await expect.poll(() => cameraFit(page)).toBe(entry.uid);
+
+    await page
+      .getByRole("complementary", { name: "Overview context" })
+      .getByRole("button", { name: "Back to Start Here" })
+      .click();
+    await expect(shelf).toBeVisible();
+    // A resize refits the camera.
+    await page.setViewportSize({ width: 1300, height: 860 });
+    await expect.poll(() => cameraFit(page)).toBe("all");
+  });
+
+  test("switching workspace drops the fit target", async ({ page, request }) => {
+    const data = await overview(request);
+    const entry = data.start_here[0];
+    const catalog = (await (await request.get("/api/v1/workspaces")).json()) as {
+      workspaces: { id: string; type: string; label: string }[];
+    };
+    const workspace = catalog.workspaces.find((w) => w.type === "repo");
+    expect(workspace, "fixture has a repo workspace").toBeTruthy();
+    await openPanels(page, "/");
+    await page
+      .getByRole("region", { name: "Start Here" })
+      .getByRole("button", { name: new RegExp(entry.label) })
+      .first()
+      .click();
+    await expect.poll(() => cameraFit(page)).toBe(entry.uid);
+
+    await page.getByLabel("Workspace").click();
+    await page.getByRole("option", { name: new RegExp(workspace!.label) }).click();
+    await expect(page.getByTestId("status-bar")).toContainText(workspace!.label);
+    await expect.poll(() => cameraFit(page)).toBe("all");
+  });
+
   test("counterweight: Start Here still shows on a fresh / with no node", async ({ page }) => {
     await openPanels(page, "/");
     await expect(page.getByRole("region", { name: "Start Here" })).toBeVisible();
