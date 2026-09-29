@@ -1,0 +1,10 @@
+[package]
+name = "gen020"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+lbug = "=0.20.4"
+
+[workspace]

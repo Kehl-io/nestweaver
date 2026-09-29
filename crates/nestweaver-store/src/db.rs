@@ -7621,6 +7621,124 @@ pub(crate) mod engine_format_open_tests {
         }
     }
 
+    /// Unpack one of the databases LadybugDB 0.20.4 wrote
+    /// (`testdata/lbug-0.20.4/`, built by the generator beside them).
+    pub(crate) fn old_engine_fixture(dir: &Path, name: &str) -> PathBuf {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/lbug-0.20.4");
+        let target = dir.join(name);
+        for suffix in ["", ".wal"] {
+            let packed = source.join(format!("{name}{suffix}.zst"));
+            if !packed.exists() {
+                continue;
+            }
+            let mut decoder =
+                crate::zstd::Decoder::new(std::fs::File::open(&packed).unwrap()).unwrap();
+            let mut out =
+                std::fs::File::create(PathBuf::from(format!("{}{suffix}", target.display())))
+                    .unwrap();
+            std::io::copy(&mut decoder, &mut out).unwrap();
+        }
+        target
+    }
+
+    /// THE HAZARD, shown on a file the OLD engine wrote: this engine's
+    /// primary-key lookup misses a non-ASCII key, while a scan finds the row.
+    /// An ASCII key is unaffected. This is why a pre-cutover database is
+    /// refused, and why every read the exemption makes is a scan.
+    #[test]
+    fn a_pk_lookup_misses_a_non_ascii_key_the_old_engine_wrote_but_a_scan_finds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = old_engine_fixture(dir.path(), "pre-cutover.lbug");
+        let raw = lbug::Database::new(&db, bounded_system_config().read_only(true)).unwrap();
+        let conn = lbug::Connection::new(&raw).unwrap();
+        let count = |query: &str| conn.query(query).unwrap().count();
+        assert_eq!(
+            count("MATCH (r:Repo {uid: 'repo:default:café'}) RETURN r.uid"),
+            0,
+            "the old engine's hash for a non-ASCII key is not where this engine looks"
+        );
+        let scanned: Vec<String> = conn
+            .query("MATCH (r:Repo) RETURN r.uid")
+            .unwrap()
+            .map(|row| crate::read::extract_string(&row, 0).unwrap())
+            .collect();
+        assert!(
+            scanned.iter().any(|uid| uid == "repo:default:café"),
+            "{scanned:?}"
+        );
+        assert_eq!(
+            count("MATCH (m:Meta {key: 'publication.brain_uuid'}) RETURN m.value"),
+            1,
+            "an ASCII key hashes the same under both engines"
+        );
+    }
+
+    /// The same file through NestWeaver: refused on every constructor with no
+    /// byte changed, and the legacy exemption reads its identity and its
+    /// non-ASCII repository by scan.
+    #[test]
+    fn a_database_the_old_engine_wrote_is_refused_and_read_only_by_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = old_engine_fixture(dir.path(), "pre-cutover.lbug");
+        let before = tree_bytes(dir.path());
+        for open in [
+            GraphStore::open(&db),
+            GraphStore::open_read_only(&db),
+            GraphStore::open_read_only_without_migration(&db),
+        ] {
+            assert!(
+                matches!(open, Err(StoreError::RebuildRequired { .. })),
+                "{:?}",
+                open.err()
+            );
+        }
+        assert_eq!(tree_bytes(dir.path()), before);
+        let store = GraphStore::open_read_only_allowing_legacy_engine(&db).unwrap();
+        assert!(store.is_legacy_engine());
+        assert_eq!(
+            store.publication_identity().unwrap().unwrap().brain_uuid,
+            "3f2b8c1e-5d4a-4e6f-9a7b-1c2d3e4f5a6b"
+        );
+        assert_eq!(
+            store.data_instance_id().unwrap().as_deref(),
+            Some("default")
+        );
+        let repos = store.list_repos(None).unwrap();
+        assert_eq!(repos.len(), 1, "{repos:?}");
+        assert_eq!(repos[0].uid, "repo:default:café");
+        drop(store);
+        assert_eq!(
+            tree_bytes(dir.path()),
+            before,
+            "the exemption writes nothing"
+        );
+    }
+
+    /// An old-engine file with its last write still in the log is refused
+    /// BEFORE any engine replays it, and the exemption names the way out.
+    #[test]
+    fn an_old_engine_log_is_refused_before_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = old_engine_fixture(dir.path(), "pre-cutover-wal.lbug");
+        assert!(dir.path().join("pre-cutover-wal.lbug.wal").exists());
+        let before = tree_bytes(dir.path());
+        let refused = GraphStore::open(&db).err().expect("refused");
+        assert!(refused.is_rebuild_required(), "{refused}");
+        assert!(refused.to_string().contains(".wal"), "{refused}");
+        let exempt = GraphStore::open_legacy_engine_read_only(&db)
+            .err()
+            .expect("the exemption must not replay an old-engine log");
+        assert!(
+            exempt.to_string().contains("previous NestWeaver version"),
+            "{exempt}"
+        );
+        assert_eq!(
+            tree_bytes(dir.path()),
+            before,
+            "nothing replayed, nothing written"
+        );
+    }
+
     #[test]
     fn a_fresh_database_carries_both_markers_and_reopens() {
         let dir = tempfile::tempdir().unwrap();

@@ -13070,11 +13070,28 @@ fn make_pre_cutover(db: &std::path::Path) {
     }
 }
 
-fn pre_cutover_db(dir: &std::path::Path) -> std::path::PathBuf {
+/// A database LadybugDB 0.20.4 itself wrote (`testdata/lbug-0.20.4/`, built by
+/// the generator beside it), with NestWeaver's schema, an identity, and a
+/// repository and symbols whose keys are not ASCII: the case the 0.21 hash
+/// change breaks. Unpacked as `<dir>/brain.lbug` (plus its log, if any).
+fn old_engine_db(dir: &std::path::Path, fixture: &str) -> std::path::PathBuf {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/lbug-0.20.4");
     let db = dir.join("brain.lbug");
-    drop(nestweaver_store::GraphStore::open_or_create(&db).unwrap());
-    make_pre_cutover(&db);
+    for suffix in ["", ".wal"] {
+        let packed = source.join(format!("{fixture}{suffix}.zst"));
+        if !packed.exists() {
+            continue;
+        }
+        let mut decoder =
+            nestweaver_store::zstd::Decoder::new(std::fs::File::open(&packed).unwrap()).unwrap();
+        let mut out = std::fs::File::create(format!("{}{suffix}", db.display())).unwrap();
+        std::io::copy(&mut decoder, &mut out).unwrap();
+    }
     db
+}
+
+fn pre_cutover_db(dir: &std::path::Path) -> std::path::PathBuf {
+    old_engine_db(dir, "pre-cutover.lbug")
 }
 
 #[test]
@@ -13700,5 +13717,97 @@ fn the_frozen_checkpoint_preflight_declines_everything_but_its_exact_state() {
     assert!(
         !frozen.exists(),
         "the probe's open recovered the empty frozen log"
+    );
+}
+
+/// The rebuild path on a file the OLD engine wrote: its non-ASCII repository
+/// is read by scan (a primary-key lookup would miss it), re-indexed from its
+/// working tree, and served from the new CURRENT; the old file is untouched.
+#[test]
+fn an_old_engine_database_rebuilds_into_a_current_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = pre_cutover_db(dir.path());
+    let before = std::fs::read(&db).unwrap();
+    // The fixture records its repository root as `fixture-repo`, relative to
+    // where the rebuild runs.
+    let repo = dir.path().join("fixture-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join("café.js"),
+        "export function grüßen(name) { return `hi ${name}`; }\n",
+    )
+    .unwrap();
+    let endpoint = spawn_fake_embedding_endpoint();
+    let config = dir.path().join("instance.toml");
+    let quote = |path: &std::path::Path| serde_json::to_string(&path.to_string_lossy()).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "instance_id = \"default\"\ndb = {}\n[snapshot_storage]\nbackend = \"local\"\npath = {}\n[workspace]\nbackend = \"local\"\npath = {}\n[inference]\nendpoint = \"http://localhost:11434\"\nembedding_model = \"unused\"\nsummary_model = \"unused\"\n[embedding]\nexternal_endpoint = \"{endpoint}\"\nexternal_model = \"fake\"\n[git]\ncredential_method = \"gh\"\n",
+            quote(&db),
+            quote(&dir.path().join("snapshots")),
+            quote(&dir.path().join("workspace")),
+        ),
+    )
+    .unwrap();
+    let output = nestweaver_cmd()
+        .current_dir(dir.path())
+        .timeout(std::time::Duration::from_secs(300))
+        .args(["publication", "rebuild", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(0), "rebuild failed: {combined}");
+    let selected = nestweaver_engine::publication::resolve_selected_database(&db).unwrap();
+    assert_ne!(selected, db);
+    let store = nestweaver_store::GraphStore::open_read_only(&selected).unwrap();
+    let repos = store.list_repos(None).unwrap();
+    assert!(
+        repos.iter().any(|repo| repo.url == "file:///fixture/café"),
+        "the non-ASCII repository carried over: {repos:?}"
+    );
+    assert!(
+        store
+            .list_all_symbols()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol.name == "grüßen"),
+        "and was re-indexed from its working tree"
+    );
+    drop(store);
+    assert_eq!(
+        std::fs::read(&db).unwrap(),
+        before,
+        "the old file is untouched"
+    );
+}
+
+/// "Back up before upgrading" on a file the old engine left with a write
+/// still in its log: refused before any replay, naming the way out.
+#[test]
+fn backup_save_of_an_old_engine_database_with_a_pending_log_names_the_way_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = old_engine_db(dir.path(), "pre-cutover-wal.lbug");
+    let wal = std::path::PathBuf::from(format!("{}.wal", db.display()));
+    let before = (std::fs::read(&db).unwrap(), std::fs::read(&wal).unwrap());
+    let output = nestweaver_cmd()
+        .args(["backup", "save"])
+        .arg(dir.path().join("out.nwsnap.zst"))
+        .arg("--db")
+        .arg(&db)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stderr).to_string();
+    assert_ne!(output.status.code(), Some(0), "{text}");
+    assert!(text.contains("previous NestWeaver version"), "{text}");
+    assert_eq!(
+        (std::fs::read(&db).unwrap(), std::fs::read(&wal).unwrap()),
+        before,
+        "the database and its old-engine log must be untouched"
     );
 }
