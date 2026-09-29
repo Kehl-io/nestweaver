@@ -774,12 +774,32 @@ async fn overview_kind_filters_before_the_per_kind_cap() {
         "kind=note returns every note up to the limit"
     );
     assert!(landmarks.iter().all(|item| item["kind"] == "note"));
+    assert_eq!(
+        notes["_meta"]["truncation"]["truncated"], false,
+        "a complete note-only scene is not reported as truncated: {}",
+        notes["_meta"]
+    );
+    assert!(
+        notes["_meta"]["truncation"]["omitted_count"].is_null(),
+        "nothing is omitted from a complete scene"
+    );
+
+    let (status, capped) = get_json(&app, "/api/v1/overview?limit=6&kind=note").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(capped["landmarks"].as_array().unwrap().len(), 6);
+    assert_eq!(capped["_meta"]["truncation"]["truncated"], true);
+    assert_eq!(
+        capped["_meta"]["truncation"]["omitted_count"], 14,
+        "omitted counts only notes: {}",
+        capped["_meta"]
+    );
 
     let (status, repos) = get_json(&app, "/api/v1/overview?kind=repo").await;
     assert_eq!(status, StatusCode::OK);
     let repo_landmarks = repos["landmarks"].as_array().unwrap();
     assert!(!repo_landmarks.is_empty());
     assert!(repo_landmarks.iter().all(|item| item["kind"] == "repo"));
+    assert_eq!(repos["_meta"]["truncation"]["truncated"], false);
 
     let (status, body) = get_json(&app, "/api/v1/overview?kind=Function").await;
     assert_eq!(

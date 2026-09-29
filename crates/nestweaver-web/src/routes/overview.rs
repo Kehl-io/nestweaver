@@ -212,6 +212,15 @@ fn overview_response(state: &Arc<AppState>, params: &OverviewParams) -> Result<R
         landmark.bridge_score = bridge_scores.get(&landmark.uid).copied();
     }
 
+    // With a kind filter the scene can only hold that kind, so its total
+    // (and any omitted count) is that kind's count, not the whole scope's.
+    let total_landmark_count = match only {
+        None => meta_state.total_landmark_count,
+        Some(LandmarkKind::Repo) => counts.repo_count,
+        Some(LandmarkKind::Service) => counts.service_count,
+        Some(LandmarkKind::Symbol) => counts.symbol_count,
+        Some(LandmarkKind::Note) => counts.note_count,
+    };
     let meta = workspaces::p1_meta_for_result_set(
         &workspace,
         meta_state.result,
@@ -219,7 +228,7 @@ fn overview_response(state: &Arc<AppState>, params: &OverviewParams) -> Result<R
         vec![meta_state.provenance],
         Some(limit),
         landmarks.len(),
-        Some(meta_state.total_landmark_count),
+        Some(total_landmark_count),
     );
 
     let start_here = landmarks.iter().take(8).cloned().collect();
