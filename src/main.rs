@@ -11159,9 +11159,19 @@ fn daemon_held_store_error(path: &Path, upstream: nestweaver_store::StoreError) 
     anyhow::Error::new(upstream).context(format!("failed to open database at {}", path.display()))
 }
 
+/// The database a command that opens the store directly must use for `db`:
+/// the publication `CURRENT` selects, exactly as the daemon does
+/// (`resolve_selected_database`). Without a `CURRENT` this is `db` itself. A
+/// base database left behind by `publication rebuild` is the rollback copy,
+/// may predate the storage engine, and must not be what a command opens.
+fn selected_db_path(db: &Path) -> anyhow::Result<PathBuf> {
+    nestweaver_engine::publication::resolve_selected_database(db)
+}
+
 fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     let default = default_db_path();
-    let path = db.unwrap_or(&default);
+    let selected = selected_db_path(db.unwrap_or(&default))?;
+    let path = selected.as_path();
     // Absent file → the canonical `db_not_found` diagnostic, at the one place
     // every read-only open funnels through.
     //
@@ -15675,7 +15685,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             dry_run,
             force,
         } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = selected_db_path(&db.unwrap_or_else(default_db_path))?;
             require_existing_db(&db_path)?;
             let code = run_repair_index_publication(&db_path, json, dry_run, force)?;
             Ok((code, None))
@@ -22703,7 +22713,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         }
 
         Commands::DetectImplicitProjects { vault, dry_run, db } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = selected_db_path(&db.unwrap_or_else(default_db_path))?;
             require_existing_db(&db_path)?;
 
             if !vault.exists() || !vault.is_dir() {

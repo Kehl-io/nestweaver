@@ -13477,6 +13477,22 @@ fn a_pre_cutover_database_rebuilds_into_a_current_publication() {
         nestweaver_daemon::lifecycle::db_rebuild_required(&db).is_none(),
         "the daemon guard follows CURRENT, not the retained base"
     );
+    // Commands that open the store directly follow CURRENT too, instead of
+    // refusing the rollback copy left at the base path.
+    for args in [
+        vec!["instance", "identity", "--db"],
+        vec!["repo-map", "--db"],
+        vec!["repair", "--dry-run", "--db"],
+    ] {
+        let output = nestweaver_cmd().args(&args).arg(&db).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     assert_eq!(
         std::fs::read(&db).unwrap(),
         legacy_bytes,

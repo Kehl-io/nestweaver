@@ -2195,6 +2195,8 @@ pub(crate) fn run_brain(
             // protect: `open_store` below is read-only, so nothing else holds the
             // database while the sidecar is rewritten, and any client connect
             // autostarts a daemon.
+            // The direct rebuild targets what the daemon would serve.
+            let db_path = selected_db_path(&db_path)?;
             let write_lease = require_exclusive_store_access(&db_path, "rebuild the search index")?;
 
             let sidecar = tantivy_sidecar_path_for(&db_path);

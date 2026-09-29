@@ -877,11 +877,14 @@ pub fn db_wal_unreadable(db_path: &Path) -> Option<nestweaver_store::StoreError>
     if !db_path.exists() {
         return None;
     }
-    match nestweaver_store::GraphStore::open_read_only_without_migration(db_path) {
+    // Probe what the daemon would serve: the publication `CURRENT`, not a
+    // base database a rebuild left behind as the rollback copy.
+    let selected = nestweaver_engine::publication::resolve_selected_database(db_path).ok()?;
+    match nestweaver_store::GraphStore::open_read_only_without_migration(&selected) {
         Ok(_) => None,
         Err(error) => (error.corruption_kind()
             == Some(nestweaver_store::CorruptionKind::WalUnreadable))
-        .then(|| error.with_db_path(db_path)),
+        .then(|| error.with_db_path(&selected)),
     }
 }
 
