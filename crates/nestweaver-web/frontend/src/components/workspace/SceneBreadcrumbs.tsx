@@ -22,7 +22,6 @@ function compactNodeLabel(
 export function SceneBreadcrumbs() {
   const workspace = useStore((s) => s.selectedWorkspace());
   const activeLens = useStore((s) => s.activeLens);
-  const representationMode = useStore((s) => s.representationMode);
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
   const graphInstance = useStore((s) => s.graphInstance);
@@ -53,6 +52,15 @@ export function SceneBreadcrumbs() {
       : null) ?? previewName;
   const lensMode = graphModeForLens(activeLens.lens);
 
+  const homeLabel = workspace?.label ?? "All indexed content";
+  // nw-663: the nav gets ~190px at 1280px. Priority is selection > home >
+  // lens: with a node selected the home crumb collapses to its icon (the
+  // name stays in its accessible name and title), the lens crumb shrinks
+  // with an ellipsis, and the selection keeps its natural width unless even
+  // that does not fit, when it too ends in an ellipsis. The representation
+  // crumb repeated RepresentationTabs and is gone.
+  const hasSelection = Boolean(selectedNodeId);
+
   return (
     <nav
       aria-label="Scene breadcrumbs"
@@ -70,45 +78,43 @@ export function SceneBreadcrumbs() {
           });
           setRepresentationMode("graph");
         }}
-        className="inline-flex h-7 shrink-0 items-center gap-1 overflow-hidden rounded px-1.5 font-medium text-[var(--color-text)] outline-none hover:bg-[var(--color-surface-alt)] focus-visible:ring-2 focus-visible:ring-[var(--color-graph-selection)]"
-        title={`${workspace?.label ?? "All indexed content"} (go to overview)`}
+        className={`inline-flex h-7 items-center gap-1 overflow-hidden rounded px-1.5 font-medium text-[var(--color-text)] outline-none hover:bg-[var(--color-surface-alt)] focus-visible:ring-2 focus-visible:ring-[var(--color-graph-selection)] ${
+          hasSelection ? "shrink-0" : "min-w-[4.5rem]"
+        }`}
+        title={`${homeLabel} (go to overview)`}
+        aria-label={hasSelection ? `${homeLabel} (go to overview)` : undefined}
       >
         <Home className="h-3.5 w-3.5 shrink-0" />
-        <span className="min-w-[3rem] max-w-[8rem] truncate">
-          {workspace?.label ?? "All indexed content"}
+        <span className={hasSelection ? "sr-only" : "min-w-0 max-w-[8rem] truncate"}>
+          {homeLabel}
         </span>
       </button>
-      <ChevronRight className="h-3.5 w-3.5 shrink-0" />
+      <ChevronRight className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
       <button
         type="button"
         onClick={() => {
           if (lensMode) setGraphMode(lensMode);
         }}
-        className="h-7 min-w-[3rem] max-w-[8rem] shrink-0 truncate rounded px-1.5 font-medium text-[var(--color-text)] outline-none hover:bg-[var(--color-surface-alt)] focus-visible:ring-2 focus-visible:ring-[var(--color-graph-selection)]"
+        className="h-7 min-w-[2rem] max-w-[8rem] truncate rounded px-1.5 font-medium text-[var(--color-text)] outline-none hover:bg-[var(--color-surface-alt)] focus-visible:ring-2 focus-visible:ring-[var(--color-graph-selection)]"
         title={`Lens: ${activeLens.label}`}
       >
         {activeLens.label}
       </button>
-      <ChevronRight className="h-3.5 w-3.5 shrink-0" />
-      <span
-        className="min-w-[4rem] max-w-[10rem] truncate rounded px-1.5 py-1 font-medium text-[var(--color-text)]"
-        title={
-          notFound && selectedNodeId
-            ? `Not found: ${selectedNodeId}`
-            : selectedNodeId ?? "No selected node"
-        }
-      >
-        {notFound ? "Not found" : compactNodeLabel(selectedNodeId, graphLabel)}
-      </span>
-      <ChevronRight className="hidden h-3.5 w-3.5 shrink-0 xl:block" />
-      <button
-        type="button"
-        onClick={() => setRepresentationMode(representationMode)}
-        className="hidden h-7 shrink-0 rounded px-1.5 font-medium capitalize text-[var(--color-graph-selection)] outline-none hover:bg-[var(--color-surface-alt)] focus-visible:ring-2 focus-visible:ring-[var(--color-graph-selection)] xl:inline"
-        title="Current representation"
-      >
-        {representationMode === "table" ? "table" : representationMode}
-      </button>
+      {hasSelection && (
+        <>
+          <ChevronRight className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+          <span
+            className="shrink-0 truncate rounded px-1.5 py-1 font-medium text-[var(--color-text)]"
+            // Whole when it fits; otherwise capped to the room left after the
+            // icon-only home crumb, both chevrons and a minimal lens crumb,
+            // so a long name ends in an ellipsis instead of being clipped.
+            style={{ maxWidth: "min(10rem, calc(100% - 6.5rem))" }}
+            title={notFound ? `Not found: ${selectedNodeId}` : selectedNodeId ?? undefined}
+          >
+            {notFound ? "Not found" : compactNodeLabel(selectedNodeId, graphLabel)}
+          </span>
+        </>
+      )}
     </nav>
   );
 }
