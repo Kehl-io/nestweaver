@@ -12954,3 +12954,164 @@ fn brain_refresh_json_and_fail_on_skip_on_the_direct_route() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// A rebuild re-indexes every repository from scratch, so it has to apply the
+/// same per-repository directory policy an ordinary `index --config` applies:
+/// `exclude` keeps committed vendored code out, and `unskip` re-admits a
+/// directory the default skip list would prune. Before this held, the upgrade
+/// rebuild silently brought excluded code back and dropped re-admitted code.
+#[test]
+fn a_rebuild_applies_each_repositorys_exclude_and_unskip_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    for (path, body) in [
+        ("src/main.js", "export function ownCode() { return 1; }\n"),
+        (
+            "bundled/lib.js",
+            "export function vendoredHelper() { return 2; }\n",
+        ),
+        (
+            "public/widget.js",
+            "export function publicWidget() { return 3; }\n",
+        ),
+    ] {
+        let file = repo.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, body).unwrap();
+    }
+    let db = dir.path().join("brain.lbug");
+    let endpoint = spawn_fake_embedding_endpoint();
+    let config = dir.path().join("instance.toml");
+    let quote = |path: &std::path::Path| serde_json::to_string(&path.to_string_lossy()).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "instance_id = \"policy\"\ndb = {}\n[snapshot_storage]\nbackend = \"local\"\npath = {}\n[workspace]\nbackend = \"local\"\npath = {}\n[inference]\nendpoint = \"http://localhost:11434\"\nembedding_model = \"unused\"\nsummary_model = \"unused\"\n[embedding]\nexternal_endpoint = \"{endpoint}\"\nexternal_model = \"fake\"\n[git]\ncredential_method = \"gh\"\n[[repos]]\nurl = {}\nexclude = [\"bundled/**\"]\nunskip = [\"public\"]\n",
+            quote(&db),
+            quote(&dir.path().join("snapshots")),
+            quote(&dir.path().join("workspace")),
+            quote(&repo.canonicalize().unwrap()),
+        ),
+    )
+    .unwrap();
+    let names = |path: &std::path::Path| -> std::collections::BTreeSet<String> {
+        nestweaver_store::GraphStore::open_read_only(path)
+            .unwrap()
+            .list_all_symbols()
+            .unwrap()
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect()
+    };
+    let expected: std::collections::BTreeSet<String> = ["ownCode", "publicWidget"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+    nestweaver_cmd()
+        .args(["index", "--config"])
+        .arg(&config)
+        .arg("--repo")
+        .arg(&repo)
+        .assert()
+        .success();
+    // Counterweight: the incumbent already honours the policy, so a rebuild
+    // that ignored it would produce a visibly different symbol set.
+    let incumbent = names(&db);
+    assert!(incumbent.contains("ownCode"), "{incumbent:?}");
+    assert!(!incumbent.contains("vendoredHelper"), "{incumbent:?}");
+    assert!(incumbent.contains("publicWidget"), "{incumbent:?}");
+
+    let output = nestweaver_cmd()
+        .timeout(std::time::Duration::from_secs(300))
+        .args(["publication", "rebuild", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "rebuild failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let selected = nestweaver_engine::publication::resolve_selected_database(&db).unwrap();
+    assert_ne!(selected, db, "CURRENT must point at the rebuilt slot");
+    let rebuilt: std::collections::BTreeSet<String> = names(&selected)
+        .into_iter()
+        .filter(|name| ["ownCode", "vendoredHelper", "publicWidget"].contains(&name.as_str()))
+        .collect();
+    assert_eq!(
+        rebuilt, expected,
+        "the rebuild must apply exclude and unskip"
+    );
+}
+
+/// A minimal OpenAI-compatible `/v1/embeddings` endpoint on loopback, so a
+/// complete `publication rebuild` (which re-embeds by contract) runs without a
+/// model download. Deterministic, non-zero 8-dimensional vectors per input.
+fn spawn_fake_embedding_endpoint() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 16384];
+            let header_end = loop {
+                let Ok(read) = stream.read(&mut chunk) else {
+                    break None;
+                };
+                if read == 0 {
+                    break None;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                if let Some(at) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break Some(at + 4);
+                }
+            };
+            let Some(header_end) = header_end else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&buffer[..header_end]).to_lowercase();
+            let length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while buffer.len() < header_end + length {
+                let Ok(read) = stream.read(&mut chunk) else {
+                    break;
+                };
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            let request: serde_json::Value =
+                serde_json::from_slice(&buffer[header_end..]).unwrap_or_default();
+            let inputs = request["input"].as_array().cloned().unwrap_or_default();
+            let data: Vec<_> = inputs
+                .iter()
+                .map(|input| {
+                    let text = input.as_str().unwrap_or_default();
+                    let seed = text.bytes().fold(7u32, |acc, byte| {
+                        acc.wrapping_mul(31).wrapping_add(u32::from(byte))
+                    });
+                    let embedding: Vec<f32> = (0..8)
+                        .map(|i| 1.0 + ((seed.rotate_left(i * 4) & 0xff) as f32) / 255.0)
+                        .collect();
+                    serde_json::json!({ "embedding": embedding })
+                })
+                .collect();
+            let body = serde_json::json!({ "data": data }).to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    format!("http://{address}")
+}
