@@ -147,13 +147,16 @@ pub async fn suggest_links(State(state): State<Arc<AppState>>) -> Result<Respons
                 ),
             ));
         }
-        Ok(Json(
-            json!({ "links": suggestions.links, "features": suggestions.features,
-                "graph_generation": generation,
-                "manifest_revision": state2.manifest_recovery.get().map(|s| s.status().revision),
-            }),
-        )
-        .into_response())
+        let mut body = json!({ "links": suggestions.links, "features": suggestions.features,
+            "graph_generation": generation,
+            "manifest_revision": state2.manifest_recovery.get().map(|s| s.status().revision),
+        });
+        // nw-705: name the repositories whose manifests could not be rebuilt.
+        let failures = nestweaver_engine::manifest::manifest_failures_json(&state2.db_path);
+        if failures.as_array().is_some_and(|rows| !rows.is_empty()) {
+            body["manifest_failures"] = failures;
+        }
+        Ok(Json(body).into_response())
     })
     .await
     .map_err(|e| ApiError::from(anyhow::anyhow!("suggestions worker failed: {e}")))?
@@ -184,6 +187,66 @@ mod tests {
             error.message.contains("ranking"),
             "the error must name ranking as unavailable: {}",
             error.message
+        );
+    }
+
+    /// nw-705: `suggest-links` answers from the repos whose manifests are
+    /// current and names the one the rebuild refused, with its remedy.
+    #[tokio::test]
+    async fn suggest_links_names_a_repo_whose_manifest_was_refused() {
+        use nestweaver_engine::manifest;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        let mut repos = Vec::new();
+        for uid in ["repo:alpha", "repo:beta"] {
+            let repo = nestweaver_schema::Repo {
+                uid: uid.into(),
+                url: format!("file:///src/{uid}"),
+                indexed_sha: "sha".into(),
+                staleness_commits_behind: 0,
+                instance_id: "default".into(),
+                name: None,
+                root_path: None,
+            };
+            store.insert_repo(&repo).unwrap();
+            repos.push(repo);
+        }
+        manifest::save_manifest_snapshot_for_db(
+            &manifest::ManifestSnapshot {
+                repos: std::collections::HashMap::from([(
+                    "repo:alpha".to_string(),
+                    nestweaver_engine::ManifestInfo::default(),
+                )]),
+                failures: vec![manifest::ManifestRepoFailure::new(
+                    &repos[1],
+                    "invalid package.json".to_string(),
+                )],
+            },
+            &store,
+            &db_path,
+        )
+        .unwrap();
+        let state = AppState::new(store, None, db_path);
+
+        let Ok(response) = suggest_links(State(state)).await else {
+            panic!("suggest-links failed");
+        };
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let failures = body["manifest_failures"].as_array().unwrap();
+        assert_eq!(failures.len(), 1, "{body}");
+        assert_eq!(failures[0]["repo_uid"], "repo:beta");
+        // The root /src/repo:beta does not exist: restore or remove it.
+        let remedy = failures[0]["remedy"].as_str().unwrap();
+        assert!(
+            remedy.contains("nestweaver remove-repo repo:beta"),
+            "{remedy}"
         );
     }
 

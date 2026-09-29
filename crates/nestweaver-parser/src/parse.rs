@@ -113,6 +113,12 @@ pub enum ReferenceKind {
     /// turns these into named bindings so calls to the alias resolve to the
     /// original item.
     ImportAlias,
+    /// nw-688: a local name a JS/TS file binds from a PACKAGE (non-relative)
+    /// specifier — `isEmpty` in `import { isEmpty } from 'lodash'` or
+    /// `const { isEmpty } = require('lodash')`. `name` is the local binding,
+    /// `context` the specifier. Resolution ignores it; the cross-repo name
+    /// matcher uses it to leave npm-package calls unattributed.
+    PackageBinding,
     Extends,
     Implements,
     Includes,
@@ -1613,6 +1619,27 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 };
                 let name = name_arena.to_string();
 
+                // nw-688: a JS/TS test-runner block (`describe('getTier', fn)`)
+                // was named after its title alone, so it minted a second
+                // Function `getTier` that shadowed the real one: the name went
+                // ambiguous and the test's own `getTier()` call bound to the
+                // block. Prefixing the runner (`describe getTier`) gives a
+                // name no identifier can spell, while the block keeps its
+                // symbol — calls inside it still attach to a TestEntry.
+                let name = if matches!(lang, Language::JavaScript | Language::TypeScript)
+                    && node.kind() == "call_expression"
+                {
+                    match node
+                        .child_by_field_name("function")
+                        .and_then(|f| f.utf8_text(source_bytes).ok())
+                    {
+                        Some(runner) => format!("{runner} {name}"),
+                        None => name,
+                    }
+                } else {
+                    name
+                };
+
                 // nw-291 (M4): `_` is a DISCARD binding, not a name. Rust's
                 // `const _: () = assert!(..)`, Go's blank identifier and JS's
                 // `const _ = require('lodash')` all produced a graph symbol
@@ -1914,6 +1941,11 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
             }
             // Skip "name" captures — used via find_name_capture above
         }
+    }
+
+    // nw-688: names bound from package (non-relative) specifiers.
+    if matches!(lang, Language::JavaScript | Language::TypeScript) {
+        collect_js_package_bindings(tree.root_node(), source_bytes, &mut references);
     }
 
     // nw-151: recover calls written inside Rust macro bodies.
@@ -2947,6 +2979,137 @@ fn find_name_capture(
     None
 }
 
+/// nw-688: record each local name a JS/TS file binds from a PACKAGE specifier
+/// (anything not starting with `.` or `/`) as a
+/// [`ReferenceKind::PackageBinding`]. Covers module-level ES imports (default,
+/// namespace and named, including `as` renames) and module-level
+/// `const|let|var X = require('pkg')` / `const { a, b: c } = require('pkg')`.
+fn collect_js_package_bindings(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    references: &mut Vec<RawReference>,
+) {
+    let text = |node: tree_sitter::Node<'_>| node.utf8_text(source).unwrap_or("").to_string();
+    let package_specifier = |node: tree_sitter::Node<'_>| {
+        let spec = strip_quotes(&text(node));
+        (!spec.is_empty() && !spec.starts_with('.') && !spec.starts_with('/')).then_some(spec)
+    };
+    let mut push = |name: String, spec: &str, node: tree_sitter::Node<'_>| {
+        references.push(RawReference {
+            name,
+            kind: ReferenceKind::PackageBinding,
+            start_line: node.start_position().row as u32 + 1,
+            context: spec.to_string(),
+            receiver: None,
+        });
+    };
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        match statement.kind() {
+            "import_statement" => {
+                let Some(spec) = statement
+                    .child_by_field_name("source")
+                    .and_then(package_specifier)
+                else {
+                    continue;
+                };
+                let mut c = statement.walk();
+                let Some(clause) = statement
+                    .named_children(&mut c)
+                    .find(|n| n.kind() == "import_clause")
+                else {
+                    continue;
+                };
+                let mut c = clause.walk();
+                for part in clause.named_children(&mut c) {
+                    match part.kind() {
+                        "identifier" => push(text(part), &spec, part),
+                        "namespace_import" => {
+                            let mut c = part.walk();
+                            if let Some(id) = part
+                                .named_children(&mut c)
+                                .find(|n| n.kind() == "identifier")
+                            {
+                                push(text(id), &spec, id);
+                            }
+                        }
+                        "named_imports" => {
+                            let mut c = part.walk();
+                            for specifier in part
+                                .named_children(&mut c)
+                                .filter(|n| n.kind() == "import_specifier")
+                            {
+                                if let Some(local) = specifier
+                                    .child_by_field_name("alias")
+                                    .or_else(|| specifier.child_by_field_name("name"))
+                                {
+                                    push(text(local), &spec, local);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "lexical_declaration" | "variable_declaration" => {
+                let mut c = statement.walk();
+                for declarator in statement
+                    .named_children(&mut c)
+                    .filter(|n| n.kind() == "variable_declarator")
+                {
+                    let Some(value) = declarator.child_by_field_name("value") else {
+                        continue;
+                    };
+                    if value.kind() != "call_expression"
+                        || value
+                            .child_by_field_name("function")
+                            .is_none_or(|f| f.kind() != "identifier" || text(f) != "require")
+                    {
+                        continue;
+                    }
+                    let Some(spec) = value.child_by_field_name("arguments").and_then(|args| {
+                        let mut c = args.walk();
+                        args.named_children(&mut c)
+                            .next()
+                            .filter(|a| a.kind() == "string")
+                            .and_then(package_specifier)
+                    }) else {
+                        continue;
+                    };
+                    let Some(target) = declarator.child_by_field_name("name") else {
+                        continue;
+                    };
+                    match target.kind() {
+                        "identifier" => push(text(target), &spec, target),
+                        "object_pattern" => {
+                            let mut c = target.walk();
+                            for prop in target.named_children(&mut c) {
+                                let local = match prop.kind() {
+                                    "shorthand_property_identifier_pattern" => Some(prop),
+                                    "pair_pattern" => prop
+                                        .child_by_field_name("value")
+                                        .filter(|v| v.kind() == "identifier"),
+                                    "object_assignment_pattern" => {
+                                        prop.child_by_field_name("left").filter(|l| {
+                                            l.kind() == "shorthand_property_identifier_pattern"
+                                        })
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(local) = local {
+                                    push(text(local), &spec, local);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Remove surrounding quotes from string literals.
 fn strip_quotes(s: &str) -> String {
     let s = s.trim();
@@ -3204,18 +3367,19 @@ mod tests {
 
     #[test]
     fn parse_js_extracts_test_runner_call_as_symbol() {
-        // `test('name', () => foo())` should yield a symbol named after the test
-        // title, spanning the call so the inner call to `foo` attaches to it.
+        // `test('name', () => foo())` should yield a symbol named after the
+        // runner and test title (nw-688: `test greets`, never bare `greets`),
+        // spanning the call so the inner call to `foo` attaches to it.
         let source = "import { foo } from './x';\ntest('greets', () => { foo('a'); });\n";
         let parsed = parse_source(Path::new("app.test.js"), source).unwrap();
 
         let test_sym = parsed
             .symbols
             .iter()
-            .find(|s| s.name == "greets")
+            .find(|s| s.name == "test greets")
             .unwrap_or_else(|| {
                 panic!(
-                    "should find a symbol named 'greets'; got: {:?}",
+                    "should find a symbol named 'test greets'; got: {:?}",
                     parsed.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
                 )
             });
@@ -3293,13 +3457,95 @@ mod tests {
         let parsed = parse_source(Path::new("app.test.ts"), source).unwrap();
         let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(
-            names.contains(&"suite"),
-            "should find describe-block symbol 'suite'; got: {names:?}"
+            names.contains(&"describe suite"),
+            "should find describe-block symbol 'describe suite'; got: {names:?}"
         );
         assert!(
-            names.contains(&"does a thing"),
-            "should find it-block symbol 'does a thing'; got: {names:?}"
+            names.contains(&"it does a thing"),
+            "should find it-block symbol 'it does a thing'; got: {names:?}"
         );
+    }
+
+    /// nw-688: `describe('getTier', fn)` was a Function named `getTier`, so it
+    /// shadowed the real `getTier` and made the name ambiguous. The test block
+    /// keeps its own symbol (calls inside it still attach to a TestEntry), but
+    /// under a runner-prefixed name no identifier can spell.
+    #[test]
+    fn js_and_ts_test_blocks_do_not_shadow_real_definitions() {
+        for file in ["instructor.test.js", "instructor.test.ts"] {
+            let source = "function getTier() {}\n\
+describe('getTier', () => {\n  it('getTier', () => {\n    getTier();\n  });\n});\n";
+            let parsed = parse_source(Path::new(file), source).unwrap();
+            let real: Vec<_> = parsed
+                .symbols
+                .iter()
+                .filter(|s| s.name == "getTier")
+                .collect();
+            assert_eq!(
+                real.len(),
+                1,
+                "{file}: only the real function may be named getTier: {:#?}",
+                parsed.symbols
+            );
+            assert_eq!(real[0].start_line, 1, "{file}: {real:#?}");
+            // Counterweight: the test blocks still exist, as test entries,
+            // under distinct names.
+            for block in ["describe getTier", "it getTier"] {
+                let sym = parsed
+                    .symbols
+                    .iter()
+                    .find(|s| s.name == block)
+                    .unwrap_or_else(|| panic!("{file}: no {block} in {:#?}", parsed.symbols));
+                assert_eq!(sym.entry_point_kind, Some(EntryPointKind::TestEntry));
+            }
+        }
+    }
+
+    /// nw-688: the `require()` import rule matched ANY identifier call whose
+    /// first argument is a string, so `loadFixture('./helpers')` and
+    /// `describe('getTier', ..)` were imports.
+    #[test]
+    fn js_require_import_rule_matches_require_only() {
+        let source = "const h = require('./helpers');\nloadFixture('./fixtures');\ndescribe('suite', () => {});\n";
+        let parsed = parse_source(Path::new("app.js"), source).unwrap();
+        let imports: Vec<&str> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(imports, vec!["./helpers"], "{:#?}", parsed.references);
+    }
+
+    /// nw-688: names bound by an import from a package (non-relative)
+    /// specifier are recorded, so the cross-repo name matcher can tell an npm
+    /// `isEmpty` from a call it might attribute to another indexed repo.
+    #[test]
+    fn js_and_ts_package_import_bindings_are_recorded() {
+        let source = "import def, { isEmpty, pick as choose } from 'lodash';\n\
+import * as fs from 'node:fs';\n\
+import { local } from './local';\n\
+const { get, set: assign } = require('lodash/fp');\n\
+const rel = require('../rel');\n\
+const whole = require('express');\n";
+        for file in ["app.js", "app.ts"] {
+            let parsed = parse_source(Path::new(file), source).unwrap();
+            let mut bound: Vec<&str> = parsed
+                .references
+                .iter()
+                .filter(|r| r.kind == ReferenceKind::PackageBinding)
+                .map(|r| r.name.as_str())
+                .collect();
+            bound.sort_unstable();
+            // Counterweight: `local` and `rel` come from relative specifiers
+            // and must NOT be package bindings.
+            assert_eq!(
+                bound,
+                vec!["assign", "choose", "def", "fs", "get", "isEmpty", "whole"],
+                "{file}: {:#?}",
+                parsed.references
+            );
+        }
     }
 
     // ── TS tests ────────────────────────────────────────────────────────────

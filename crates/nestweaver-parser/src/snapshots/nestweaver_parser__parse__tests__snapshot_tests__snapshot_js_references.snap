@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 6239
+assertion_line: 8428
 expression: "parsed_references(\"simple.js\", &source)"
 ---
 - name: fs
@@ -8,10 +8,20 @@ expression: "parsed_references(\"simple.js\", &source)"
   start_line: 1
   context: "fs = require('fs')"
   receiver: ~
+- name: fs
+  kind: PackageBinding
+  start_line: 1
+  context: fs
+  receiver: ~
 - name: require
   kind: Call
   start_line: 1
   context: "fs = require('fs')"
+  receiver: ~
+- name: EventEmitter
+  kind: PackageBinding
+  start_line: 3
+  context: events
   receiver: ~
 - name: events
   kind: Import
@@ -40,11 +50,6 @@ expression: "parsed_references(\"simple.js\", &source)"
   receiver: ~
 - name: greet
   kind: Call
-  start_line: 28
-  context: "greet('world');"
-  receiver: ~
-- name: world
-  kind: Import
   start_line: 28
   context: "greet('world');"
   receiver: ~

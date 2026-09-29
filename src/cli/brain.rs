@@ -498,6 +498,11 @@ pub(crate) fn run_brain(
                     {
                         println!("  {line}");
                     }
+                    for line in format_manifest_failures_status(
+                        &nestweaver_proto::manifest_failures_from_status_json(&value),
+                    ) {
+                        println!("  {line}");
+                    }
                     for line in vault_derivation_status_lines(&value) {
                         println!("  {line}");
                     }

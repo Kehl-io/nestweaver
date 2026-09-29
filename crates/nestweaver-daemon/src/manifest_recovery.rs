@@ -18,6 +18,9 @@ pub(super) struct Snapshot {
     inventory: String,
     debt: Option<Vec<u8>>,
     inputs: Vec<(String, ManifestInputs)>,
+    /// nw-705: repositories this capture refused, each with its reason. The
+    /// rebuild keeps the others current instead of failing as a whole.
+    pub(super) failures: Vec<manifest::ManifestRepoFailure>,
 }
 
 pub(super) fn capture(state: &DaemonState, deadline: Instant) -> anyhow::Result<Snapshot> {
@@ -38,86 +41,32 @@ pub(super) fn capture(state: &DaemonState, deadline: Instant) -> anyhow::Result<
     repos.sort_by(|a, b| a.uid.cmp(&b.uid));
     let mut inventory = Vec::new();
     let mut inputs = Vec::new();
+    let mut failures = Vec::new();
     let mut remaining = 32 * 1024 * 1024;
     for repo in &repos {
-        let root = repo.local_root().map(Path::new);
-        let reader: Box<dyn ContentReader> = if let Some(root) = root {
-            let unskip = config
-                .as_ref()
-                .map(|c| c.unskip_names_for(&repo.url, Some(root)))
-                .unwrap_or(&[]);
-            let excludes = config
-                .as_ref()
-                .map(|c| c.exclude_globs_for(&repo.url, Some(root)))
-                .unwrap_or(&[]);
-            Box::new(
-                FilesystemReader::with_limits(root, limits)
-                    .unskipping(unskip)
-                    .excluding(excludes)?
-                    .strict_enumeration(),
-            )
-        } else {
-            anyhow::ensure!(
-                state.server_mode,
-                "{}: no recorded local source root",
-                repo.uid
-            );
-            anyhow::ensure!(
-                !repo.indexed_sha.is_empty(),
-                "{}: no completed bare revision",
-                repo.uid
-            );
-            let workspace = nestweaver_engine::bare_clone::BareCloneWorkspace {
-                root: state
-                    .db_path
-                    .parent()
-                    .unwrap_or(Path::new("."))
-                    .join("workspace"),
-            };
-            let clones = workspace.list_clones()?;
-            let mut matching = clones
-                .into_iter()
-                .filter(|clone| clone.url.trim_end_matches('/') == repo.url.trim_end_matches('/'));
-            let clone = matching.next().ok_or_else(|| {
-                anyhow::anyhow!("{}: recorded bare clone is unavailable", repo.uid)
-            })?;
-            anyhow::ensure!(
-                matching.next().is_none(),
-                "{}: multiple recorded bare clones",
-                repo.uid
-            );
-            Box::new(
-                GitBareReader::with_limits(&clone.path, &repo.indexed_sha, limits)
-                    .local_objects_only(),
-            )
-        };
-        let policy = state.store.get_repo_index_policy(&repo.uid)?;
-        // nw-680: a policy recorded under a SUPERSEDED fingerprint version,
-        // with the same configured parameters, is accepted. Demanding the
-        // current version meant that after nw-652's v2 bump any one repo not
-        // yet re-indexed failed this capture for EVERY repo, so the sidecar
-        // stayed at its old generation and the debt was never paid. The
-        // trade-off: such a repo's graph may still lack a non-build `target/`
-        // (what v2 restores on its next index), and a manifest inside one is
-        // captured here anyway, which can add an entry root, never remove one.
-        // A policy that differs in its configured parameters still refuses.
-        let accepted = policy.as_deref().is_some_and(|recorded| {
-            recorded == reader.eligibility_fingerprint()
-                || reader
-                    .superseded_eligibility_fingerprints()
-                    .iter()
-                    .any(|old| old == recorded)
-        });
-        anyhow::ensure!(
-            accepted,
-            "{}: recorded source eligibility is absent or differs from current configuration; \
-             re-index it with `nestweaver index --repo <path>`",
-            repo.uid
-        );
-        inventory.push(serde_json::json!({ "repo": repo, "policy": policy }));
-        let captured = manifest::capture_manifest_inputs(reader.as_ref(), &mut remaining, deadline)
-            .map_err(|e| anyhow::anyhow!("{}: {e:#}", repo.uid))?;
-        inputs.push((repo.uid.clone(), captured));
+        // nw-705: each repository is captured on its own. One that is refused
+        // (a policy recorded under other settings, a missing root, a
+        // malformed manifest, a budget overrun) is recorded by name and the
+        // rest are still rebuilt; it used to fail the capture for EVERY repo.
+        // A refused repo's partial reads do not spend the shared budget.
+        let mut budget = remaining;
+        match capture_repo(state, config.as_ref(), limits, repo, &mut budget, deadline) {
+            Ok((policy, captured)) => {
+                remaining = budget;
+                inventory.push(serde_json::json!({ "repo": repo, "policy": policy }));
+                inputs.push((repo.uid.clone(), captured));
+            }
+            Err(error) => {
+                let failure = manifest::ManifestRepoFailure::new(repo, format!("{error:#}"));
+                tracing::warn!(
+                    repo = %repo.uid,
+                    reason = %failure.reason,
+                    remedy = %failure.remedy,
+                    "manifest rebuild refused a repository; the others stay current"
+                );
+                failures.push(failure);
+            }
+        }
     }
     manifest::ensure_manifest_generation(&state.store, generation)?;
     Ok(Snapshot {
@@ -127,7 +76,93 @@ pub(super) fn capture(state: &DaemonState, deadline: Instant) -> anyhow::Result<
         inventory: serde_json::to_string(&inventory)?,
         debt: manifest::manifest_debt_revision(&state.db_path)?,
         inputs,
+        failures,
     })
+}
+
+/// Capture one repository's manifest inputs, or say why it cannot be.
+fn capture_repo(
+    state: &DaemonState,
+    config: Option<&Arc<nestweaver_engine::InstanceConfig>>,
+    limits: nestweaver_engine::index_limits::IndexLimits,
+    repo: &nestweaver_schema::Repo,
+    remaining: &mut usize,
+    deadline: Instant,
+) -> anyhow::Result<(Option<String>, ManifestInputs)> {
+    let root = repo.local_root().map(Path::new);
+    let reader: Box<dyn ContentReader> = if let Some(root) = root {
+        let unskip = config
+            .map(|c| c.unskip_names_for(&repo.url, Some(root)))
+            .unwrap_or(&[]);
+        let excludes = config
+            .map(|c| c.exclude_globs_for(&repo.url, Some(root)))
+            .unwrap_or(&[]);
+        Box::new(
+            FilesystemReader::with_limits(root, limits)
+                .unskipping(unskip)
+                .excluding(excludes)?
+                .strict_enumeration(),
+        )
+    } else {
+        anyhow::ensure!(
+            state.server_mode,
+            "{}: no recorded local source root",
+            repo.uid
+        );
+        anyhow::ensure!(
+            !repo.indexed_sha.is_empty(),
+            "{}: no completed bare revision",
+            repo.uid
+        );
+        let workspace = nestweaver_engine::bare_clone::BareCloneWorkspace {
+            root: state
+                .db_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join("workspace"),
+        };
+        let clones = workspace.list_clones()?;
+        let mut matching = clones
+            .into_iter()
+            .filter(|clone| clone.url.trim_end_matches('/') == repo.url.trim_end_matches('/'));
+        let clone = matching
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("{}: recorded bare clone is unavailable", repo.uid))?;
+        anyhow::ensure!(
+            matching.next().is_none(),
+            "{}: multiple recorded bare clones",
+            repo.uid
+        );
+        Box::new(
+            GitBareReader::with_limits(&clone.path, &repo.indexed_sha, limits).local_objects_only(),
+        )
+    };
+    let policy = state.store.get_repo_index_policy(&repo.uid)?;
+    // nw-680: a policy recorded under a SUPERSEDED fingerprint version, with
+    // the same configured parameters, is accepted. Demanding the current
+    // version meant that after nw-652's v2 bump any one repo not yet
+    // re-indexed failed this capture for EVERY repo, so the sidecar stayed at
+    // its old generation and the debt was never paid. The trade-off: such a
+    // repo's graph may still lack a non-build `target/` (what v2 restores on
+    // its next index), and a manifest inside one is captured here anyway,
+    // which can add an entry root, never remove one. A policy that differs in
+    // its configured parameters still refuses (nw-705: this repo only).
+    let accepted = policy.as_deref().is_some_and(|recorded| {
+        recorded == reader.eligibility_fingerprint()
+            || reader
+                .superseded_eligibility_fingerprints()
+                .iter()
+                .any(|old| old == recorded)
+    });
+    anyhow::ensure!(
+        accepted,
+        "{}: recorded source eligibility is absent or differs from current configuration; \
+         re-index it with `nestweaver index --repo <path>`",
+        repo.uid
+    );
+    let captured = manifest::capture_manifest_inputs(reader.as_ref(), remaining, deadline)
+        .map_err(|e| anyhow::anyhow!("{}: {e:#}", repo.uid))?;
+    Ok((policy, captured))
 }
 
 pub(super) fn reconcile(state: &DaemonState, before: Snapshot) -> anyhow::Result<()> {
@@ -150,7 +185,8 @@ pub(super) fn reconcile(state: &DaemonState, before: Snapshot) -> anyhow::Result
             && before.identity == after.identity
             && before.inventory == after.inventory
             && before.debt == after.debt
-            && before.inputs == after.inputs,
+            && before.inputs == after.inputs
+            && before.failures == after.failures,
         "manifest sources changed during derivation; retrying a fresh snapshot"
     );
     drop(before);
@@ -166,7 +202,17 @@ pub(super) fn reconcile(state: &DaemonState, before: Snapshot) -> anyhow::Result
         )?;
     }
     let publication_debt = manifest::manifest_debt_revision(&state.db_path)?;
-    manifest::save_manifest_cache_for_db(&manifests, &state.store, &state.db_path)?;
+    // nw-705: the refused repositories travel in the same envelope as the
+    // manifests (review M4), so no reader can take a partial snapshot as
+    // complete coverage.
+    manifest::save_manifest_snapshot_for_db(
+        &manifest::ManifestSnapshot {
+            repos: manifests,
+            failures: after.failures.clone(),
+        },
+        &state.store,
+        &state.db_path,
+    )?;
     // Fail closed if an external editor changed bytes during the atomic save.
     // Leave durable debt; never let the new envelope hide this pending work.
     let verified = capture(state, after.deadline)?;
@@ -174,6 +220,7 @@ pub(super) fn reconcile(state: &DaemonState, before: Snapshot) -> anyhow::Result
         || after.generation != verified.generation
         || after.inventory != verified.inventory
         || after.inputs != verified.inputs
+        || after.failures != verified.failures
         || publication_debt != verified.debt
     {
         manifest::mark_manifest_reconciliation_pending(
@@ -186,6 +233,46 @@ pub(super) fn reconcile(state: &DaemonState, before: Snapshot) -> anyhow::Result
         &manifest::manifest_debt_path(&state.db_path),
     )?;
     Ok(())
+}
+
+/// Review M5: first and longest wait between probes of refused repos.
+const PARTIAL_PROBE_BACKOFF_MIN: Duration = Duration::from_secs(30);
+const PARTIAL_PROBE_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
+
+fn next_partial_backoff(current: Duration) -> Duration {
+    current.saturating_mul(2).min(PARTIAL_PROBE_BACKOFF_MAX)
+}
+
+/// Review M5: probe only the refused repositories. True when one is gone,
+/// now captures, or is refused for a different reason — a full rebuild then
+/// publishes the change. Each probe gets its own budget and deadline, so
+/// the healthy repos are not re-listed.
+pub(super) fn refused_repos_changed(
+    state: &DaemonState,
+    failures: &[manifest::ManifestRepoFailure],
+) -> bool {
+    let Ok(repos) = state.store.list_repos(None) else {
+        return true;
+    };
+    let Ok(config) = current_repo_eligibility_config(state) else {
+        return true;
+    };
+    let limits = state
+        .instance_cfg
+        .as_ref()
+        .map(|c| c.indexing.limits())
+        .unwrap_or_default();
+    failures.iter().any(|failure| {
+        let Some(repo) = repos.iter().find(|r| r.uid == failure.repo_uid) else {
+            return true;
+        };
+        let mut budget = 32 * 1024 * 1024;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        match capture_repo(state, config.as_ref(), limits, repo, &mut budget, deadline) {
+            Ok(_) => true,
+            Err(error) => format!("{error:#}") != failure.reason,
+        }
+    })
 }
 
 /// Three immediate attempts, then a cooldown that can recover from repaired
@@ -221,6 +308,14 @@ pub(super) async fn run(state: Arc<DaemonState>) {
     }
     let mut shutdown = state.shutdown_tx.subscribe();
     let mut last_key = String::new();
+    // nw-705: the capture key a partial rebuild last settled, and when the
+    // refused repositories were last probed again.
+    let mut settled_key = String::new();
+    let mut last_partial_probe: Option<Instant> = None;
+    // Review M5: how long until the refused repos are probed again. Doubles
+    // on each probe that finds nothing changed; reset whenever any other
+    // path runs (a re-index marks debt, which takes that path).
+    let mut partial_backoff = PARTIAL_PROBE_BACKOFF_MIN;
     let mut retry = RetryBudget::default();
     let mut delay = 0;
     loop {
@@ -242,13 +337,56 @@ pub(super) async fn run(state: Arc<DaemonState>) {
         .await;
         let problem = match health {
             Ok(Ok(_)) => {
-                runtime.publish("ready", 0, None, None);
-                retry = RetryBudget::default();
-                last_key.clear();
+                let failures = manifest::load_manifest_failures(&state.db_path);
+                if failures.is_empty() {
+                    runtime.publish("ready", 0, None, None);
+                    retry = RetryBudget::default();
+                    last_key.clear();
+                    settled_key.clear();
+                    last_partial_probe = None;
+                    partial_backoff = PARTIAL_PROBE_BACKOFF_MIN;
+                    delay = 2;
+                    continue;
+                }
+                // nw-705: the other repositories are current; keep naming the
+                // refused ones. Review M5: re-probe ONLY those repos, with
+                // exponential backoff, and rebuild only when one changed, so
+                // a repo that stays broken costs neither a full listing every
+                // 30 s nor a flapping deadline.
+                let partial = ManifestUnavailable::new(
+                    ManifestUnavailableReason::IncompleteCoverage,
+                    state.store.graph_generation(),
+                    manifest::describe_manifest_failures(&failures),
+                );
+                runtime.publish(
+                    "partial",
+                    0,
+                    Some(partial_backoff.as_secs()),
+                    Some(partial.clone()),
+                );
                 delay = 2;
-                continue;
+                if last_partial_probe.is_some_and(|at| at.elapsed() < partial_backoff) {
+                    continue;
+                }
+                last_partial_probe = Some(Instant::now());
+                let probe_state = Arc::clone(&state);
+                let changed = tokio::task::spawn_blocking(move || {
+                    refused_repos_changed(&probe_state, &failures)
+                })
+                .await
+                .unwrap_or(true);
+                if !changed {
+                    partial_backoff = next_partial_backoff(partial_backoff);
+                    continue;
+                }
+                partial_backoff = PARTIAL_PROBE_BACKOFF_MIN;
+                partial
             }
-            Ok(Err(error)) => error,
+            Ok(Err(error)) => {
+                partial_backoff = PARTIAL_PROBE_BACKOFF_MIN;
+                last_partial_probe = None;
+                error
+            }
             Err(error) => {
                 tracing::error!(%error, "manifest inspection worker failed");
                 delay = 4;
@@ -305,13 +443,23 @@ pub(super) async fn run(state: Arc<DaemonState>) {
             .map(|(uid, inputs)| (uid, inputs.digest()))
             .collect();
         let key = format!(
-            "{}:{}:{:?}:{:?}",
-            snapshot.generation, snapshot.inventory, snapshot.debt, source_digests
+            "{}:{}:{:?}:{:?}:{:?}",
+            snapshot.generation,
+            snapshot.inventory,
+            snapshot.debt,
+            source_digests,
+            snapshot.failures
         );
+        if key == settled_key {
+            // Nothing changed since the partial rebuild that recorded these
+            // refusals: no rewrite, no write lease.
+            continue;
+        }
         if key != last_key {
             retry = RetryBudget::default();
-            last_key = key;
+            last_key = key.clone();
         }
+        let partial = !snapshot.failures.is_empty();
         if !retry.admit(Instant::now()) {
             runtime.publish("deferred", retry.attempts, Some(30), Some(problem));
             delay = 30;
@@ -334,7 +482,12 @@ pub(super) async fn run(state: Arc<DaemonState>) {
         .await;
         match result {
             Ok(Ok(())) => {
-                runtime.publish("ready", retry.attempts, None, None);
+                if partial {
+                    settled_key = key;
+                    last_partial_probe = Some(Instant::now());
+                } else {
+                    runtime.publish("ready", retry.attempts, None, None);
+                }
                 retry = RetryBudget::default();
                 last_key.clear();
                 delay = 2;
@@ -369,6 +522,17 @@ pub(super) async fn run(state: Arc<DaemonState>) {
 #[cfg(test)]
 mod retry_tests {
     use super::*;
+
+    #[test]
+    fn partial_probe_backoff_doubles_to_thirty_minutes() {
+        let mut backoff = PARTIAL_PROBE_BACKOFF_MIN;
+        let mut seen = vec![backoff.as_secs()];
+        for _ in 0..8 {
+            backoff = next_partial_backoff(backoff);
+            seen.push(backoff.as_secs());
+        }
+        assert_eq!(seen, [30, 60, 120, 240, 480, 960, 1800, 1800, 1800]);
+    }
 
     #[test]
     fn exhausted_budget_rearms_after_cooldown_without_source_change() {

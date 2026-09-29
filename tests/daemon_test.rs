@@ -7636,8 +7636,14 @@ fn suggest_links_with_owed_manifests_does_not_advise_starting_a_running_daemon()
         ],
     );
     create_db(&repo_dir, &db_path);
-    // A malformed manifest keeps the daemon's rebuild from paying the debt.
-    std::fs::write(repo_dir.join("package.json"), "{").unwrap();
+    // A corrupt manifest sidecar is evidence the daemon refuses to replace,
+    // so the manifests stay owed. (nw-705: a malformed package.json no
+    // longer does — it refuses only its own repo; see the test below.)
+    std::fs::write(
+        nestweaver_engine::manifest_cache_path(&db_path),
+        b"corrupt evidence",
+    )
+    .unwrap();
     nestweaver_engine::manifest::mark_manifest_reconciliation_pending(&db_path, "nw680 fixture")
         .unwrap();
     let _guard = DaemonGuard::new(&db_path);
@@ -7657,6 +7663,69 @@ fn suggest_links_with_owed_manifests_does_not_advise_starting_a_running_daemon()
     assert!(
         !stderr.contains("daemon unavailable") && !stderr.contains(" start`"),
         "must not advise starting a running daemon: {stderr}"
+    );
+}
+
+/// nw-705: a repo whose manifest the daemon must refuse (here a malformed
+/// package.json) no longer blocks `suggest-links` for every repo. Once the
+/// daemon has rebuilt the rest, suggest-links answers and names the refused
+/// repo with its remedy, and `brain status --json` carries the same row.
+#[test]
+fn suggest_links_names_a_repo_whose_manifest_the_daemon_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("sl").join("test.lbug");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    write_repo_files(
+        &repo_dir,
+        &[
+            ("main.js", "function greet(name) { return name; }\n"),
+            ("package.json", "{\"name\":\"nw705\"}\n"),
+        ],
+    );
+    create_db(&repo_dir, &db_path);
+    std::fs::write(repo_dir.join("package.json"), "{").unwrap();
+    nestweaver_engine::manifest::mark_manifest_reconciliation_pending(&db_path, "nw705 fixture")
+        .unwrap();
+    let _guard = DaemonGuard::new(&db_path);
+    start_daemon(&db_path);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let stdout = loop {
+        let output = daemon_cmd()
+            .args(["suggest-links", "--json", "--db"])
+            .arg(&db_path)
+            .output()
+            .unwrap();
+        if output.status.success() {
+            break String::from_utf8_lossy(&output.stdout).to_string();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "suggest-links never answered: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    };
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let failures = value["manifest_failures"].as_array().expect(&stdout);
+    assert_eq!(failures.len(), 1, "{stdout}");
+    let remedy = failures[0]["remedy"].as_str().unwrap();
+    assert!(
+        remedy.starts_with("nestweaver index --repo ") && remedy.ends_with("repo"),
+        "{remedy}"
+    );
+
+    let status = daemon_cmd()
+        .args(["brain", "status", "--json", "--db"])
+        .arg(&db_path)
+        .output()
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(
+        status["manifest_failures"].as_array().map(Vec::len),
+        Some(1),
+        "{status}"
     );
 }
 
