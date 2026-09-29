@@ -11,6 +11,7 @@ import { RepoPicker } from "../detail/RepoPicker";
 import { KindBadge } from "../shared/KindBadge";
 import { NodeNotFound } from "../shared/NodeNotFound";
 import { fetchSymbol, isNotFoundError } from "../../api/symbolQuery";
+import { useSymbolQueryGeneration } from "../../hooks/useSymbolQuery";
 
 interface SourceEvidencePanelProps {
   compact?: boolean;
@@ -50,6 +51,8 @@ export function SourceEvidencePanel({
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
   const graphInstance = useStore((s) => s.graphInstance);
   const detailFocus = useStore((s) => s.detailFocus);
+  // Re-read the selection after a graph update drops the shared cache.
+  const symbolGeneration = useSymbolQueryGeneration();
   const [symbolDetail, setSymbolDetail] = useState<SymbolDetail | null>(null);
   const [noteDetail, setNoteDetail] = useState<NoteDetail | null>(null);
   const [fileSymbols, setFileSymbols] = useState<SymbolCandidate[]>([]);
@@ -198,7 +201,7 @@ export function SourceEvidencePanel({
 
     setLoading(false);
     return () => controller.abort();
-  }, [selectedNodeId, selectedNodeKind, pickedRepo]);
+  }, [selectedNodeId, selectedNodeKind, pickedRepo, symbolGeneration]);
 
   const pickRepo = (uid: string, candidates: string[]) => {
     if (selectedNodeId) setRepoChoice({ path: selectedNodeId, candidates, repo: uid });

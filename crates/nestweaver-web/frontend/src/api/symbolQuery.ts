@@ -14,6 +14,19 @@ import type { SymbolDetail } from "./types";
  */
 const MAX_ENTRIES = 16;
 const entries = new Map<string, Promise<SymbolDetail>>();
+// Bumped whenever remembered results are dropped, so views re-query the
+// node they show (a missing node may exist after a re-index).
+let generation = 0;
+const listeners = new Set<() => void>();
+
+export function subscribeSymbolQueries(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+export function symbolQueryGeneration(): number {
+  return generation;
+}
 
 export function isNotFoundError(error: unknown): boolean {
   return error instanceof ApiError && error.status === 404;
@@ -45,4 +58,6 @@ export function fetchSymbol(uid: string): Promise<SymbolDetail> {
 /** Forget every settled result, e.g. after the graph was re-indexed. */
 export function clearSymbolQueries(): void {
   entries.clear();
+  generation += 1;
+  listeners.forEach((listener) => listener());
 }

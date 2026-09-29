@@ -160,6 +160,50 @@ test.describe("Deep links (batch 11)", () => {
     await expect.poll(() => urlParam(page, "node")).toBeNull();
   });
 
+  test("a missing node that appears after a graph update recovers without reselecting (nw-567)", async ({
+    page,
+    request,
+  }) => {
+    const symbol = await findSymbol(request, "greet");
+    // Stand in for a re-index: the symbol 404s until the "index" lands, and
+    // the SSE stream then delivers one graph:updated event.
+    let indexed = false;
+    let pendingUpdate = false;
+    await page.route("**/api/v1/symbol/**", (route) =>
+      indexed
+        ? route.continue()
+        : route.fulfill({
+            status: 404,
+            contentType: "application/json",
+            body: JSON.stringify({ error: "not_found", message: "symbol not found" }),
+          }),
+    );
+    await page.route("**/api/v1/events", (route) => {
+      const body = pendingUpdate ? "retry: 200\nevent: graph:updated\ndata: {}\n\n" : "retry: 200\n\n";
+      pendingUpdate = false;
+      return route.fulfill({ status: 200, contentType: "text/event-stream", body });
+    });
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await persistRepresentation(page, "graph");
+    await page.goto(`/?node=${encodeURIComponent(symbol.uid)}&kind=${symbol.kind}`);
+
+    const details = page.getByTestId("detail-panel");
+    const evidence = page.getByRole("complementary", { name: "Source and note evidence" });
+    const open = details.getByRole("group", { name: "Node actions" }).first().getByRole("button", { name: /^Open source/ });
+    await expect(details.getByRole("heading", { name: "Node not found" })).toBeVisible({ timeout: 15_000 });
+    await expect(evidence.getByRole("heading", { name: "Node not found" })).toBeVisible();
+    await expect(open).toHaveAttribute("aria-disabled", "true");
+
+    indexed = true;
+    pendingUpdate = true;
+    await expect(details.getByRole("heading", { name: "Node not found" })).toHaveCount(0, { timeout: 10_000 });
+    await expect(evidence.getByRole("heading", { name: "Node not found" })).toHaveCount(0);
+    await expect(evidence.getByRole("heading", { name: symbol.name })).toBeVisible();
+    await expect(open).toHaveAttribute("aria-disabled", "false");
+    await expect(page.getByRole("navigation", { name: "Scene breadcrumbs" })).toContainText(symbol.name);
+    expect(urlParam(page, "node")).toBe(symbol.uid);
+  });
+
   test("counterweight: a real Function deep link still enables the actions (nw-567)", async ({
     page,
     request,

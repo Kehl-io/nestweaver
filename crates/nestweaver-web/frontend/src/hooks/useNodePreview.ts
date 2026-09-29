@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { ApiError, apiErrorFromBody } from "../api/errors";
 import { isFileSelection, isNoteSelection } from "../api/kinds";
 import { fetchSymbol, isNotFoundError } from "../api/symbolQuery";
+import { useSymbolQueryGeneration } from "./useSymbolQuery";
 import type {
   NoteDetail,
   SourceResponse,
@@ -61,6 +62,7 @@ export function useNodePreview(
   const [error, setError] = useState<string | null>(null);
   const [notFound, setNotFound] = useState(false);
   const requestSeqRef = useRef(0);
+  const symbolGeneration = useSymbolQueryGeneration();
 
   useEffect(() => {
     const requestSeq = requestSeqRef.current + 1;
@@ -186,7 +188,7 @@ export function useNodePreview(
 
     fetchData();
     return () => controller.abort();
-  }, [nodeId, nodeKind]);
+  }, [nodeId, nodeKind, symbolGeneration]);
 
   return { data, loading, error, notFound };
 }
