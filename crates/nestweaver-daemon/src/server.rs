@@ -13970,7 +13970,7 @@ pub async fn run_server(
             }
             None => GraphStore::open_or_create_with_authority(&db_path, authority),
         };
-        let store = match opened {
+        match opened {
             Ok(s) => s,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -13981,8 +13981,7 @@ pub async fn run_server(
                     )
                 });
             }
-        };
-        store
+        }
     };
     drop(publication_root_lock);
     #[cfg(feature = "release-fixture-hooks")]

@@ -8691,8 +8691,7 @@ mod wal_recovery_arm_tests {
         let conn = store.conn().unwrap();
         let error = conn
             .query("CREATE (m:Meta {key: 'probe', value: 'v'}) RETURN m.key")
-            .err()
-            .expect("rows the engine did not return must not read as none");
+            .expect_err("rows the engine did not return must not read as none");
         let error = StoreError::from(error);
         assert!(error.is_committed_despite_error(), "{error}");
         assert!(store.reopen_required());
