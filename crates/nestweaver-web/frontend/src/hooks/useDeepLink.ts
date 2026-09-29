@@ -34,6 +34,9 @@ const representationModes: RepresentationMode[] = [
   "json",
 ];
 
+// Params that make a URL a scene deep link (as opposed to a bare `/`).
+const NAVIGATION_PARAMS = ["seeds", "mode", "workspace", "node", "kind", "lens"];
+
 function validGraphMode(value: string | null): GraphMode | null {
   return value && graphModes.includes(value as GraphMode)
     ? (value as GraphMode)
@@ -112,6 +115,10 @@ export function useDeepLink() {
     }
     if (representationParam) {
       setRepresentationMode(representationParam);
+    } else if (NAVIGATION_PARAMS.some((name) => params.has(name))) {
+      // A deep link describes a whole scene: with no representation it means
+      // the graph, not whatever mode the last session left in storage (nw-571).
+      setRepresentationMode("graph");
     }
     const depthParam = parseNumberParam(params.get("depth"));
     const confidenceParam = parseNumberParam(params.get("confidence"));
