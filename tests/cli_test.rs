@@ -2370,12 +2370,62 @@ fn cli_snapshot_build_and_verify() {
 #[test]
 fn cli_snapshot_push_succeeds() {
     let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("push.lbug");
+    let snap_dir = dir.path().join("snapshot");
+    let storage_dir = dir.path().join("storage");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&storage_dir).unwrap();
+    std::fs::write(repo_dir.join("a.js"), "export function a() { return 1; }\n").unwrap();
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    nestweaver_cmd()
+        .args(["snapshot", "build", "--db"])
+        .arg(&db_path)
+        .arg("--output")
+        .arg(&snap_dir)
+        .assert()
+        .success();
+
+    nestweaver_cmd()
+        .args([
+            "snapshot",
+            "push",
+            "--snapshot-dir",
+            &snap_dir.display().to_string(),
+            "--backend",
+            "local",
+            "--backend-path",
+            &storage_dir.display().to_string(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("Snapshot pushed"));
+
+    let versioned = storage_dir.join(format!("v{}", env!("CARGO_PKG_VERSION")));
+    assert!(
+        versioned.exists(),
+        "expected versioned snapshot directory {} in storage",
+        versioned.display()
+    );
+}
+
+/// A snapshot written before the storage-engine cutover (here a minimal
+/// format-0 one) is refused by `push`, and the refusal names the rebuild.
+#[test]
+fn cli_snapshot_push_refuses_a_pre_cutover_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
     let snap_dir = dir.path().join("snapshot");
     let storage_dir = dir.path().join("storage");
     std::fs::create_dir_all(&snap_dir).unwrap();
     std::fs::create_dir_all(&storage_dir).unwrap();
 
-    // Minimal valid snapshot files
     let graph_bytes = b"fake-graph-data";
     let manifest_bytes = b"{\"repos\":[]}";
     let stamp_bytes = br#"{
@@ -2390,12 +2440,9 @@ fn cli_snapshot_push_succeeds() {
         "built_at": "2026-06-01T00:00:00Z",
         "repos": []
     }"#;
-
     std::fs::write(snap_dir.join("graph.lbug"), graph_bytes).unwrap();
     std::fs::write(snap_dir.join("manifest.json"), manifest_bytes).unwrap();
     std::fs::write(snap_dir.join("stamp.json"), stamp_bytes).unwrap();
-
-    // Compute per-file checksums (blake3 format)
     let checksums = [
         ("graph.lbug", graph_bytes.as_slice()),
         ("manifest.json", manifest_bytes.as_slice()),
@@ -2420,14 +2467,10 @@ fn cli_snapshot_push_succeeds() {
             &storage_dir.display().to_string(),
         ])
         .assert()
-        .success()
-        .stdout(contains("Snapshot pushed"));
-
-    // A versioned directory v0.1.0 should exist in the storage dir
-    assert!(
-        storage_dir.join("v0.1.0").exists(),
-        "expected versioned snapshot directory v0.1.0 in storage"
-    );
+        .failure()
+        .stderr(contains("LadybugDB 0.21"))
+        .stderr(contains("nestweaver publication rebuild"));
+    assert!(!storage_dir.join("v0.1.0").exists());
 }
 
 #[test]

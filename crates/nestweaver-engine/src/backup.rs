@@ -1392,7 +1392,12 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
     let manifest_path = temp_dir.path().join("manifest.json");
     let manifest_str = std::fs::read_to_string(&manifest_path)
         .map_err(|e| anyhow::anyhow!("failed to read manifest.json after extraction: {e}"))?;
-    let manifest: BackupManifest = serde_json::from_str(&manifest_str)?;
+    let mut manifest: BackupManifest = serde_json::from_str(&manifest_str)?;
+    // Set when the archive's graph was built by a storage engine older than
+    // LadybugDB 0.21. It is restored byte-for-byte (it is the operator's data
+    // and their rollback path), read only through the store's legacy
+    // exemption, and the operator is told it must be rebuilt before use.
+    let mut pre_cutover_engine = false;
 
     // Verify integrity before committing to the target directory.
     if let Err(e) = verify_backup_checksums(temp_dir.path(), &manifest) {
@@ -1424,16 +1429,18 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
             hashes.insert(path, digest);
         }
         validate_backup_publication_inventory(&manifest, &publication, &sizes, &hashes)?;
+        pre_cutover_engine |= publication.format_version < crate::snapshot::SNAPSHOT_FORMAT_VERSION;
 
         let graph = publication
             .artifacts
             .iter()
             .find(|artifact| artifact.kind == crate::publication::ArtifactKind::Graph)
             .ok_or_else(|| anyhow::anyhow!("backup publication has no graph artifact"))?;
-        let graph_store = nestweaver_store::GraphStore::open_read_only_without_migration(
+        let graph_store = nestweaver_store::GraphStore::open_read_only_allowing_legacy_engine(
             &temp_dir.path().join(&graph.path),
         )
         .map_err(|error| anyhow::anyhow!("open restored graph identity: {error}"))?;
+        pre_cutover_engine |= graph_store.is_legacy_engine();
         validate_restored_logical_identity(&manifest, &graph_store)?;
         let graph_identity = graph_store
             .publication_identity()
@@ -1465,11 +1472,17 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
                 "legacy backup has no unambiguous graph payload for logical identity validation"
             );
         };
-        let store = nestweaver_store::GraphStore::open_read_only_without_migration(
+        let store = nestweaver_store::GraphStore::open_read_only_allowing_legacy_engine(
             &temp_dir.path().join(graph),
         )
         .map_err(|error| anyhow::anyhow!("open legacy restored graph identity: {error}"))?;
         validate_restored_logical_identity(&manifest, &store)?;
+        pre_cutover_engine |= store.is_legacy_engine();
+    }
+    if pre_cutover_engine {
+        manifest
+            .warnings
+            .push(pre_cutover_restore_warning(&manifest));
     }
 
     // The backup saves clones under `clones/` (historical name), but the
@@ -2215,13 +2228,33 @@ fn verify_backup_checksums(data_dir: &Path, manifest: &BackupManifest) -> anyhow
     Ok(())
 }
 
+/// The warning a restore of a pre-cutover archive carries.
+pub fn pre_cutover_restore_warning(manifest: &BackupManifest) -> String {
+    format!(
+        "this archive was written by NestWeaver {} with a storage engine older than \
+         LadybugDB 0.21. It was restored unchanged, but this version refuses to open the \
+         restored database (nestweaver::db_rebuild_required) until it is rebuilt: stop the \
+         daemon and run `nestweaver publication rebuild --config <instance.toml>`, or use \
+         the NestWeaver version that wrote the archive",
+        manifest.nestweaver_version
+    )
+}
+
 fn validate_backup_publication_inventory(
     manifest: &BackupManifest,
     publication: &crate::publication::PublicationBundleV3,
     file_sizes: &HashMap<String, u64>,
     file_hashes: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
-    publication.validate_metadata(crate::snapshot::SNAPSHOT_FORMAT_VERSION)?;
+    // A pre-cutover archive (the last format before the storage-engine
+    // change) is still restorable; the caller warns that it must be rebuilt.
+    publication.validate_metadata(
+        if publication.format_version == crate::snapshot::LEGACY_ENGINE_SNAPSHOT_FORMAT_VERSION {
+            crate::snapshot::LEGACY_ENGINE_SNAPSHOT_FORMAT_VERSION
+        } else {
+            crate::snapshot::SNAPSHOT_FORMAT_VERSION
+        },
+    )?;
     if publication.brain_uuid != manifest.brain_uuid
         || publication.publication_uuid != manifest.publication_uuid
     {
@@ -3746,6 +3779,153 @@ mod tests {
         let restored_db = restore_dir.join("test.lbug");
         let store = nestweaver_store::GraphStore::open_read_only(&restored_db).unwrap();
         assert!(store.db_path().is_some());
+    }
+
+    /// Rewrite a current archive into the shape a pre-cutover release wrote:
+    /// bundle format 3, a graph with no engine-format marker and no
+    /// `.engine-format` artifact, every checksum and descriptor recomputed so
+    /// the archive is internally consistent. Returns the legacy graph's bytes.
+    fn rewrite_as_pre_cutover(archive: &Path, out: &Path) -> Vec<u8> {
+        let staging = tempfile::tempdir().unwrap();
+        let decoder =
+            nestweaver_store::zstd::Decoder::new(std::fs::File::open(archive).unwrap()).unwrap();
+        tar::Archive::new(decoder).unpack(staging.path()).unwrap();
+        let mut manifest: BackupManifest =
+            serde_json::from_slice(&std::fs::read(staging.path().join("manifest.json")).unwrap())
+                .unwrap();
+        let publication_path = staging
+            .path()
+            .join(crate::publication::PUBLICATION_MANIFEST_FILE);
+        let mut publication: crate::publication::PublicationBundleV3 =
+            serde_json::from_slice(&std::fs::read(&publication_path).unwrap()).unwrap();
+        let graph_rel = publication
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == crate::publication::ArtifactKind::Graph)
+            .unwrap()
+            .path
+            .clone();
+        let graph = staging.path().join(&graph_rel);
+        let before: std::collections::BTreeSet<_> = walkdir::WalkDir::new(staging.path())
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.path().to_path_buf())
+            .collect();
+        {
+            let store = nestweaver_store::GraphStore::open(&graph).unwrap();
+            let conn = store.begin_transaction().unwrap();
+            conn.query(&format!(
+                "MATCH (m:Meta) WHERE m.key = '{}' DELETE m",
+                nestweaver_store::engine_format::ENGINE_FORMAT_META_KEY
+            ))
+            .unwrap();
+            store.commit_transaction(&conn).unwrap();
+            drop(conn);
+            store.checkpoint().unwrap();
+        }
+        // Drop the sidecar and anything the edit itself created.
+        let sidecar_rel = format!(
+            "{graph_rel}{}",
+            nestweaver_store::engine_format::ENGINE_FORMAT_SIDECAR_SUFFIX
+        );
+        for entry in walkdir::WalkDir::new(staging.path()).into_iter().flatten() {
+            if entry.file_type().is_file() && !before.contains(entry.path()) {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        std::fs::remove_file(staging.path().join(&sidecar_rel)).unwrap();
+        publication
+            .artifacts
+            .retain(|artifact| artifact.path != sidecar_rel);
+        let (size, digest) = crate::hash::blake3_file(&graph).unwrap();
+        for artifact in &mut publication.artifacts {
+            if artifact.path == graph_rel {
+                artifact.byte_size = size;
+                artifact.blake3 = digest.clone();
+            }
+        }
+        publication.format_version = crate::snapshot::LEGACY_ENGINE_SNAPSHOT_FORMAT_VERSION;
+        let publication_bytes = serde_json::to_vec_pretty(&publication).unwrap();
+        std::fs::write(&publication_path, &publication_bytes).unwrap();
+        manifest.publication_manifest_blake3 = crate::hash::blake3_hex_bytes(&publication_bytes);
+        manifest.checksums.remove(&sidecar_rel);
+        for (path, checksum) in manifest.checksums.iter_mut() {
+            *checksum = sha256_stream_path(staging.path().join(path)).unwrap();
+        }
+        std::fs::write(
+            staging.path().join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        package_tar_zstd(staging.path(), out).unwrap();
+        std::fs::read(&graph).unwrap()
+    }
+
+    /// A pre-cutover archive is the operator's data and their rollback path:
+    /// it restores byte-for-byte, the restore WARNS that the result must be
+    /// rebuilt, and the restored database is then refused, not opened.
+    #[test]
+    fn a_pre_cutover_archive_restores_unchanged_and_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        drop(nestweaver_store::GraphStore::create(&db_path).unwrap());
+        let current = dir.path().join("current.nwsnap.zst");
+        backup_save(&BackupConfig {
+            db_path: db_path.clone(),
+            output_path: current.clone(),
+            include_clones: false,
+            instance_id: "test".to_string(),
+            workspace_path: None,
+        })
+        .unwrap();
+
+        // Counterweight: a current archive restores without the warning.
+        let fresh = backup_restore(&RestoreConfig {
+            snapshot_path: current.clone(),
+            data_dir: dir.path().join("fresh"),
+        })
+        .unwrap();
+        assert!(
+            !fresh
+                .manifest
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("LadybugDB 0.21")),
+            "{:?}",
+            fresh.manifest.warnings
+        );
+
+        let legacy = dir.path().join("legacy.nwsnap.zst");
+        let legacy_graph = rewrite_as_pre_cutover(&current, &legacy);
+        let restore_dir = dir.path().join("restored");
+        let result = backup_restore(&RestoreConfig {
+            snapshot_path: legacy,
+            data_dir: restore_dir.clone(),
+        })
+        .expect("a pre-cutover archive must still restore");
+        let warning = result
+            .manifest
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("LadybugDB 0.21"))
+            .unwrap_or_else(|| panic!("no cutover warning: {:?}", result.manifest.warnings));
+        assert!(
+            warning.contains("nestweaver publication rebuild"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("nestweaver::db_rebuild_required"),
+            "{warning}"
+        );
+
+        let restored = restore_dir.join("test.lbug");
+        assert_eq!(std::fs::read(&restored).unwrap(), legacy_graph);
+        assert!(
+            nestweaver_store::GraphStore::open(&restored)
+                .err()
+                .expect("the restored pre-cutover graph must be refused")
+                .is_rebuild_required()
+        );
     }
 
     #[test]
