@@ -8542,7 +8542,12 @@ impl GraphStore {
                 "MATCH (m:Meta {key: $k}) DETACH DELETE m",
                 vec![("k", lbug::Value::String("embedding".to_string()))],
             )?;
-            conn.query("COMMIT").map_err(|error| {
+            self.settle_commit(
+                conn.query("COMMIT")
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+            )
+            .map_err(|error| {
                 StoreError::Query(format!("commit embedding identity reset: {error}"))
             })?;
             Ok(())
@@ -8611,7 +8616,12 @@ impl GraphStore {
                     ("v", lbug::Value::String(value)),
                 ],
             )?;
-            conn.query("COMMIT").map_err(|error| {
+            self.settle_commit(
+                conn.query("COMMIT")
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+            )
+            .map_err(|error| {
                 StoreError::Query(format!("commit embedding pipeline update: {error}"))
             })?;
             Ok(())

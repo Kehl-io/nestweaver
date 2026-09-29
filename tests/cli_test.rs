@@ -7193,6 +7193,7 @@ fn opening_a_corrupted_database_never_dies_on_a_signal() {
     );
 
     let mut crashed_at_least_once = false;
+    let mut failed_closed_at_least_once = false;
     for (index, (from, to)) in [(0.005, 0.2), (0.05, 0.95), (0.4, 0.6)].iter().enumerate() {
         let db = dir.path().join(format!("corrupt{index}.lbug"));
         std::fs::copy(&pristine, &db).unwrap();
@@ -7251,8 +7252,15 @@ fn opening_a_corrupted_database_never_dies_on_a_signal() {
             stderr.contains(&file_name),
             "the error must name the database it could not open: {stderr}"
         );
+        // LadybugDB 0.21 validates index headers on open and returns an
+        // ordinary error for most of the damage 0.20 faulted on. Failing
+        // closed WITH a corruption diagnostic is the other honest outcome.
+        if stderr.contains("nestweaver::db_corrupt") {
+            failed_closed_at_least_once = true;
+        }
         if stderr.contains("the storage engine crashed while reading it") {
             crashed_at_least_once = true;
+            failed_closed_at_least_once = true;
             assert!(
                 stderr.contains("restore") || stderr.contains("re-index"),
                 "a crash attribution must offer a way out: {stderr}"
@@ -7260,12 +7268,16 @@ fn opening_a_corrupted_database_never_dies_on_a_signal() {
         }
     }
 
-    // If NO range faulted, this fixture never exercised the guard and the test
-    // would be green while proving nothing — say so rather than pass.
+    // If NO range either faulted or failed closed with a corruption
+    // diagnostic, this fixture exercised nothing and the test would be green
+    // while proving nothing: say so rather than pass. (Whether a crash still
+    // occurs at all depends on the engine version; the invariant above, never
+    // dying on a signal, is what must hold.)
+    let _ = crashed_at_least_once;
     assert!(
-        crashed_at_least_once,
-        "no corruption range reached the crashing code path, so this run did \
-         not exercise the crash-attribution guard at all"
+        failed_closed_at_least_once,
+        "no corruption range reached either the crash guard or a corruption \
+         diagnostic, so this run exercised neither"
     );
 }
 

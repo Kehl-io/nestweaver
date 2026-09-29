@@ -380,6 +380,11 @@ pub struct GraphStore {
     /// `(sorted seed_uids, damping, max_iterations, scope_hash, intent, graph_generation)`.
     /// Repeated queries with the same seeds skip the iterative PPR computation entirely.
     pub(crate) ppr_result_cache: Mutex<lru::LruCache<u64, Vec<(String, f64)>>>,
+    /// Set when the engine reported a COMMITTED write whose checkpoint it had
+    /// to defer (see [`crate::error::CheckpointFailure::CommittedCheckpointDeferred`]).
+    /// The data is durable; the handle needs a reopen so recovery can finish
+    /// the pending checkpoint. See [`GraphStore::reopen_required`].
+    checkpoint_deferred: std::sync::atomic::AtomicBool,
 }
 
 /// Capability fixed by the constructor that opened a [`GraphStore`].
@@ -507,42 +512,58 @@ fn is_stale_checkpoint_error(msg: &str) -> bool {
     msg.contains("wal.checkpoint") && msg.contains("does not match")
 }
 
-/// Remove the stale checkpoint sidecars lbug's error tells us to delete — but ONLY
-/// when the shadow file is absent or empty (0 bytes), the exact signature of an
-/// aborted checkpoint. A non-empty shadow could belong to a live mid-checkpoint
-/// writer; never touch that. Returns true if the checkpoint file was removed
-/// (worth a retry).
+/// Move the stale checkpoint log aside, never delete it, and only in the exact
+/// signature of an aborted checkpoint: `.shadow` absent or empty. A non-empty
+/// shadow could belong to a live mid-checkpoint writer; never touch that.
+/// Returns where the log went (worth a retry).
 ///
-/// nw-373. THE SENTENCE THAT USED TO BE HERE IS DELETED, not softened, because
-/// it was the reasoning that produced the bug: *"Reaching the stale-checkpoint
-/// error already implies no other process holds the write lock — that would
-/// surface as a lock error instead."* That is FALSE on the path that reached it
-/// most often. A READ-ONLY open never contends for the write lock at all, so it
-/// can never surface a lock error, so the implication has no antecedent — and
-/// this function was deleting `<db>.wal.checkpoint` and `<db>.shadow` of a
-/// database another process was writing, on the strength of it. An inference
-/// about what a caller did NOT observe is not a proof of exclusivity.
+/// WHY A RENAME. The ID-mismatch error this keys on comes from LadybugDB 0.21's
+/// frozen-log branch for a log WITHOUT a CHECKPOINT record
+/// (`WALReplayer::replayFrozenWAL` in `src/storage/wal/wal_replayer.cpp`), and
+/// that branch holds committed-but-unapplied records. The engine removes
+/// `.shadow` itself on that branch BEFORE comparing IDs, so "shadow absent or
+/// empty" proves nothing about whether the log is worthless; only the engine's
+/// ID comparison does. If that comparison were ever wrong, a delete would
+/// destroy committed data. A timestamped rename keeps every byte.
+///
+/// DECLINES ON DOUBT. A `.shadow` whose size or existence cannot be determined
+/// (permissions, a symlink loop) is treated as possibly live, not as empty.
 ///
 /// nw-373: mutation requires a matching borrowed [`DbWriteLease`]. The lease is
-/// held across the failed open, artifact inspection/removal, and retry; missing
+/// held across the failed open, artifact inspection/rename, and retry; missing
 /// or sibling authority leaves every byte untouched.
-fn remove_stale_checkpoint_sidecars(path: &Path, authority: Option<&DbWriteLease>) -> bool {
+fn quarantine_stale_checkpoint(path: &Path, authority: Option<&DbWriteLease>) -> Option<PathBuf> {
     if !authority.is_some_and(|authority| authority.authorizes(path)) {
-        return false;
+        return None;
     }
     let shadow = PathBuf::from(format!("{}.shadow", path.display()));
     let checkpoint = PathBuf::from(format!("{}.wal.checkpoint", path.display()));
-    let shadow_empty = std::fs::metadata(&shadow)
-        .map(|m| m.len() == 0)
-        .unwrap_or(true);
-    if !shadow_empty {
-        return false;
+    let shadow_empty = match std::fs::metadata(&shadow) {
+        Ok(metadata) => metadata.len() == 0,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // `metadata` follows symlinks: a dangling or looping link reads as
+            // NotFound or an error; only a plain absence counts as absent.
+            match std::fs::symlink_metadata(&shadow) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                _ => return None,
+            }
+        }
+        Err(_) => return None,
+    };
+    if !shadow_empty || !matches!(checkpoint.try_exists(), Ok(true)) {
+        return None;
     }
-    let removed = std::fs::remove_file(&checkpoint).is_ok();
-    if shadow.exists() {
-        let _ = std::fs::remove_file(&shadow);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let aside = PathBuf::from(format!("{}.wal.checkpoint.stale-{stamp}", path.display()));
+    std::fs::rename(&checkpoint, &aside).ok()?;
+    // An empty shadow holds no pages; keep it beside the log it came with.
+    if matches!(shadow.try_exists(), Ok(true)) {
+        let _ = std::fs::rename(&shadow, format!("{}.shadow.stale-{stamp}", path.display()));
     }
-    removed
+    Some(aside)
 }
 
 /// Open an lbug database, auto-recovering once from a stale WAL checkpoint left by
@@ -760,7 +781,15 @@ fn quarantine_orphaned_wal(path: &Path, authority: Option<&DbWriteLease>) -> Opt
     let wal = PathBuf::from(format!("{}.wal", path.display()));
     let shadow = PathBuf::from(format!("{}.shadow", path.display()));
     let frozen = PathBuf::from(format!("{}.wal.checkpoint", path.display()));
-    if !wal.exists() || shadow.exists() || frozen.exists() {
+    // `try_exists` separates "absent" from "could not tell"; anything but a
+    // definite answer for all three declines, because moving a log on a guess
+    // is how committed writes are lost. (LadybugDB 0.21 no longer fails an
+    // open on a log with no `.shadow`, so this arm rarely fires; it stays for
+    // the engine versions and shapes that still do.)
+    if !matches!(
+        (wal.try_exists(), shadow.try_exists(), frozen.try_exists()),
+        (Ok(true), Ok(false), Ok(false))
+    ) {
         return None;
     }
     let stamp = std::time::SystemTime::now()
@@ -771,6 +800,38 @@ fn quarantine_orphaned_wal(path: &Path, authority: Option<&DbWriteLease>) -> Opt
     std::fs::rename(&wal, &quarantined)
         .ok()
         .map(|()| quarantined)
+}
+
+/// The frozen-log state whose pages the data file already holds.
+///
+/// LadybugDB 0.21 checkpoints in this order (`logCheckpointAndApplyShadowPagesForStorage`
+/// in `src/storage/checkpointer.cpp`, `ShadowFile::clear` in
+/// `src/storage/shadow_file.cpp`): write a CHECKPOINT record to the frozen log
+/// `<db>.wal.checkpoint`, apply the shadow pages to the data file, truncate and
+/// unlink `<db>.shadow`, and only then remove the frozen log. A crash between
+/// the unlink and the removal leaves a frozen log ending in CHECKPOINT with no
+/// `.shadow`. On the next open `WALReplayer::replayFrozenWAL` sees the
+/// CHECKPOINT record and calls `ShadowFile::replayShadowPageRecords`, which
+/// fails to open the missing `.shadow` ("Cannot open file <db>.shadow: No such
+/// file or directory"). Frozen-log replay runs BEFORE the active log, so that
+/// error with the frozen log present can only come from this branch.
+///
+/// The pages were applied before the shadow was unlinked, so moving ONLY the
+/// frozen log aside loses nothing, while the active `<db>.wal` holds writes
+/// committed after the checkpoint began and must stay. Shipped as a targeted
+/// diagnostic naming that one move, not as an automatic arm. Returns the
+/// frozen log's path when the state matches exactly; declines on any doubt.
+fn frozen_checkpoint_already_applied(path: &Path, msg: &str) -> Option<PathBuf> {
+    if !is_orphaned_wal_error(msg) {
+        return None;
+    }
+    let frozen = PathBuf::from(format!("{}.wal.checkpoint", path.display()));
+    let shadow = PathBuf::from(format!("{}.shadow", path.display()));
+    matches!(
+        (frozen.try_exists(), shadow.try_exists()),
+        (Ok(true), Ok(false))
+    )
+    .then_some(frozen)
 }
 
 /// Turn a failed open into a `StoreError`, consulting the write lease when — and
@@ -888,6 +949,8 @@ fn probe_engine_format_marker(path: &Path, stamp_sidecar: bool) -> Result<(), St
 /// `read_write` still selects diagnostics and forbids all recovery from a
 /// read-only open. Actual filesystem recovery additionally requires an exact
 /// `recovery_authority`, borrowed across this complete attempt and retry.
+use crate::error::classify_checkpoint_failure;
+
 fn open_lbug_with_recovery(
     path: &Path,
     read_write: bool,
@@ -935,12 +998,25 @@ fn open_lbug_with_recovery(
                         .map(|()| authority)
                         .ok()
                 });
-            if is_stale_checkpoint_error(&msg) && remove_stale_checkpoint_sidecars(path, authority)
+            // LadybugDB 0.21 finishes an interrupted checkpoint during a
+            // writable open; running out of disk or buffer pool there is a
+            // resource failure, never corruption, and no arm below applies.
+            if classify_checkpoint_failure(&msg)
+                == Some(crate::error::CheckpointFailure::RecoveryCheckpointInterrupted)
+            {
+                return Err(StoreError::Database(
+                    crate::error::recovery_checkpoint_resource_disclosure(path, &msg),
+                ));
+            }
+            if is_stale_checkpoint_error(&msg)
+                && let Some(aside) = quarantine_stale_checkpoint(path, authority)
             {
                 tracing::warn!(
-                    "recovered a stale WAL checkpoint for {} (a prior crash left \
-                     .wal.checkpoint/.shadow that made the DB unopenable); retrying open",
-                    path.display()
+                    "recovered a stale WAL checkpoint for {} (a prior crash left a \
+                     .wal.checkpoint from another database id that made the DB \
+                     unopenable); moved it to {} and retried — it was NOT deleted",
+                    path.display(),
+                    aside.display()
                 );
                 return lbug::Database::new(path, make_config())
                     .map_err(|e| open_failure(path, e.to_string(), read_write));
@@ -959,6 +1035,15 @@ fn open_lbug_with_recovery(
                 );
                 return lbug::Database::new(path, make_config())
                     .map_err(|e| open_failure(path, e.to_string(), read_write));
+            }
+            if let Some(frozen) = frozen_checkpoint_already_applied(path, &msg) {
+                return Err(StoreError::FrozenCheckpointAlreadyApplied(Box::new(
+                    crate::error::FrozenCheckpointApplied {
+                        path: path.to_path_buf(),
+                        frozen,
+                        detail: msg,
+                    },
+                )));
             }
             // nw-346 / nw-404. This is the frame that knows WHICH database
             // failed AND whether this open could be the one writing it — the
@@ -1230,6 +1315,7 @@ impl GraphStore {
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
             )),
+            checkpoint_deferred: std::sync::atomic::AtomicBool::new(false),
         };
         store.init_schema()?;
         store.ensure_publication_identity()?;
@@ -1325,6 +1411,7 @@ impl GraphStore {
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
             )),
+            checkpoint_deferred: std::sync::atomic::AtomicBool::new(false),
         };
         store.init_schema()?;
         store.initialize_publication_identity(identity)?;
@@ -1375,6 +1462,7 @@ impl GraphStore {
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
             )),
+            checkpoint_deferred: std::sync::atomic::AtomicBool::new(false),
         };
         store.init_schema()?;
         store.ensure_publication_identity()?;
@@ -1576,6 +1664,7 @@ impl GraphStore {
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
             )),
+            checkpoint_deferred: std::sync::atomic::AtomicBool::new(false),
         };
         store.load_graph_generation(&store.generation_sidecar_path());
         store.load_recorded_embedding_model_into_index();
@@ -1656,6 +1745,7 @@ impl GraphStore {
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
             )),
+            checkpoint_deferred: std::sync::atomic::AtomicBool::new(false),
         };
         store.init_schema()?;
         store.ensure_publication_identity()?;
@@ -3648,9 +3738,12 @@ impl GraphStore {
         })();
         match result {
             Ok(value) => {
-                conn.query("COMMIT").map_err(|error| {
-                    StoreError::Query(format!("commit data instance id: {error}"))
-                })?;
+                self.settle_commit(
+                    conn.query("COMMIT")
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                )
+                .map_err(|error| StoreError::Query(format!("commit data instance id: {error}")))?;
                 Ok(value)
             }
             Err(error) => {
@@ -3732,7 +3825,12 @@ impl GraphStore {
         })();
         match result {
             Ok(moved) => {
-                conn.query("COMMIT").map_err(|error| {
+                self.settle_commit(
+                    conn.query("COMMIT")
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                )
+                .map_err(|error| {
                     StoreError::Query(format!("commit re-record instance id: {error}"))
                 })?;
                 Ok(moved)
@@ -3826,7 +3924,12 @@ impl GraphStore {
 
         match result {
             Ok(identity) => {
-                conn.query("COMMIT").map_err(|error| {
+                self.settle_commit(
+                    conn.query("COMMIT")
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                )
+                .map_err(|error| {
                     StoreError::Query(format!("commit publication identity: {error}"))
                 })?;
                 Ok(identity)
@@ -3850,9 +3953,57 @@ impl GraphStore {
 
     /// Commit the explicit transaction opened by `begin_transaction`.
     pub fn commit_transaction(&self, conn: &lbug::Connection<'_>) -> Result<(), StoreError> {
-        conn.query("COMMIT")
-            .map_err(|e| StoreError::Query(format!("commit: {e}")))?;
-        Ok(())
+        let result = conn.query("COMMIT").map(|_| ()).map_err(|e| e.to_string());
+        self.settle_commit(result)
+    }
+
+    /// Turn a COMMIT result into the caller's answer.
+    ///
+    /// LadybugDB 0.21 can return an error from a COMMIT that SUCCEEDED: the
+    /// transaction is durable and only the checkpoint after it failed, most
+    /// often because the frozen log of an earlier interrupted checkpoint is
+    /// still pending (`WAL::rotateForCheckpoint`, `src/storage/wal/wal.cpp`;
+    /// wrapped by `TransactionManager::commit`,
+    /// `src/transaction/transaction_manager.cpp`). Reporting that as a failure
+    /// invites a retry that applies the write twice, or a rollback that the
+    /// engine can no longer perform. So it is reported as committed, and the
+    /// handle is flagged: it needs a reopen for recovery to finish the pending
+    /// checkpoint. See [`Self::reopen_required`].
+    pub(crate) fn settle_commit(&self, result: Result<(), String>) -> Result<(), StoreError> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(message)
+                if classify_checkpoint_failure(&message)
+                    == Some(crate::error::CheckpointFailure::CommittedCheckpointDeferred) =>
+            {
+                self.note_checkpoint_deferred(&message);
+                Ok(())
+            }
+            Err(message) => Err(StoreError::Query(format!("commit: {message}"))),
+        }
+    }
+
+    fn note_checkpoint_deferred(&self, message: &str) {
+        self.checkpoint_deferred
+            .store(true, std::sync::atomic::Ordering::Release);
+        tracing::warn!(
+            "{}: a write COMMITTED and is durable, but the storage engine deferred its \
+             checkpoint and needs the database reopened to finish it (restart the daemon). \
+             The write was NOT retried. Engine: {message}",
+            self.db_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "in-memory graph".to_string())
+        );
+    }
+
+    /// True once the engine has deferred a checkpoint behind a committed write
+    /// on this handle. Nothing was lost; the database must be reopened (for the
+    /// daemon, a restart) so recovery completes the pending checkpoint. Until
+    /// then every later checkpoint fails the same way and the log keeps growing.
+    pub fn reopen_required(&self) -> bool {
+        self.checkpoint_deferred
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Roll back the explicit transaction opened by [`Self::begin_transaction`].
@@ -3869,8 +4020,18 @@ impl GraphStore {
     /// Merge the WAL into the main database file.
     pub fn checkpoint(&self) -> Result<(), StoreError> {
         let conn = self.conn()?;
-        conn.query("CHECKPOINT")
-            .map_err(|e| StoreError::Query(format!("checkpoint: {e}")))?;
+        conn.query("CHECKPOINT").map_err(|e| {
+            let message = e.to_string();
+            // Nothing is lost when the engine refuses to checkpoint over a
+            // pending frozen log, but the log is NOT merged, so the caller
+            // still gets an error; the handle is flagged for a reopen.
+            if classify_checkpoint_failure(&message)
+                == Some(crate::error::CheckpointFailure::CommittedCheckpointDeferred)
+            {
+                self.note_checkpoint_deferred(&message);
+            }
+            StoreError::Query(format!("checkpoint: {message}"))
+        })?;
         Ok(())
     }
 
@@ -5226,14 +5387,14 @@ mod tests {
         std::fs::write(&cp, b"stale-checkpoint-bytes").unwrap();
         std::fs::write(&shadow, b"").unwrap();
 
-        assert!(!remove_stale_checkpoint_sidecars(&db, None));
+        assert!(quarantine_stale_checkpoint(&db, None).is_none());
         assert!(cp.exists(), "the checkpoint must survive a read-only open");
         assert!(shadow.exists(), "and so must the shadow");
 
         let sibling = dir.path().join("sibling.lbug");
         let wrong = acquire_db_write_lease(&sibling).unwrap();
         assert!(
-            !remove_stale_checkpoint_sidecars(&db, Some(&wrong)),
+            quarantine_stale_checkpoint(&db, Some(&wrong)).is_none(),
             "a sibling authority must preserve every artifact"
         );
         assert!(cp.exists());
@@ -5242,7 +5403,7 @@ mod tests {
 
         let authority = acquire_db_write_lease(&db).unwrap();
         assert!(
-            remove_stale_checkpoint_sidecars(&db, Some(&authority)),
+            quarantine_stale_checkpoint(&db, Some(&authority)).is_some(),
             "the read-write self-heal is the reason this recovery exists and must \
              still fire — gating it into uselessness would restore the crash loop"
         );
@@ -5257,18 +5418,18 @@ mod tests {
         let cp = dir.path().join("db.lbug.wal.checkpoint");
         let shadow = dir.path().join("db.lbug.shadow");
 
-        // Empty shadow + checkpoint present → recover (remove both).
+        // Empty shadow + checkpoint present → recover (move both aside).
         std::fs::write(&cp, b"stale-checkpoint-bytes").unwrap();
         std::fs::write(&shadow, b"").unwrap();
         let authority = acquire_db_write_lease(&db).unwrap();
-        assert!(remove_stale_checkpoint_sidecars(&db, Some(&authority)));
-        assert!(!cp.exists(), "stale checkpoint should be removed");
-        assert!(!shadow.exists(), "empty shadow should be removed");
+        assert!(quarantine_stale_checkpoint(&db, Some(&authority)).is_some());
+        assert!(!cp.exists(), "stale checkpoint should be moved aside");
+        assert!(!shadow.exists(), "empty shadow should be moved aside");
 
         // Non-empty shadow (possible live writer) → do NOT touch the checkpoint.
         std::fs::write(&cp, b"stale").unwrap();
         std::fs::write(&shadow, b"live-writer-state").unwrap();
-        assert!(!remove_stale_checkpoint_sidecars(&db, Some(&authority)));
+        assert!(quarantine_stale_checkpoint(&db, Some(&authority)).is_none());
         assert!(
             cp.exists(),
             "must not remove checkpoint when shadow is non-empty"
@@ -7142,5 +7303,255 @@ pub(crate) mod engine_format_open_tests {
         assert!(text.contains(crate::DB_REBUILD_REQUIRED_CODE), "{text}");
         assert!(text.contains("nestweaver publication rebuild"), "{text}");
         assert!(text.contains(&db.display().to_string()), "{text}");
+    }
+}
+
+/// The crash-recovery arms re-derived against LadybugDB 0.21's recovery
+/// (`src/storage/wal/wal_replayer.cpp`, `src/storage/checkpointer.cpp`,
+/// `src/storage/wal/wal.cpp`).
+#[cfg(test)]
+mod wal_recovery_arm_tests {
+    use super::*;
+    use crate::error::{CheckpointFailure, classify_checkpoint_failure};
+
+    fn stale_files(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(prefix)
+            })
+            .collect()
+    }
+
+    /// A committed-but-uncheckpointed log from ANOTHER database, dropped in as
+    /// this database's frozen log: exactly the ID mismatch the stale arm keys
+    /// on. The arm must recover the open AND keep every byte of the log.
+    #[test]
+    fn a_foreign_frozen_log_is_renamed_aside_and_the_open_recovers() {
+        let other = tempfile::tempdir().unwrap();
+        let other_db = other.path().join("other.lbug");
+        let other_store = GraphStore::create(&other_db).unwrap();
+        other_store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:other".to_string(),
+                url: "file:///other".to_string(),
+                indexed_sha: "x".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        let foreign_log = std::fs::read(format!("{}.wal", other_db.display())).unwrap();
+        drop(other_store);
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        drop(GraphStore::create(&db).unwrap());
+        std::fs::write(format!("{}.wal.checkpoint", db.display()), &foreign_log).unwrap();
+
+        let authority = acquire_db_write_lease(&db).unwrap();
+        let store = GraphStore::open_with_authority(&db, &authority)
+            .expect("the stale-checkpoint arm must recover the open");
+        drop(store);
+
+        assert!(!dir.path().join("brain.lbug.wal.checkpoint").exists());
+        let aside = stale_files(dir.path(), "brain.lbug.wal.checkpoint.stale-");
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert_eq!(
+            std::fs::read(&aside[0]).unwrap(),
+            foreign_log,
+            "renamed, never deleted: every byte of the log survives"
+        );
+    }
+
+    /// A `.shadow` the filesystem cannot describe (here a symlink loop) is
+    /// possibly live. Both arms used to read it as absent or empty
+    /// (`exists()` is false on error, `unwrap_or(true)` called it empty).
+    #[cfg(unix)]
+    #[test]
+    fn both_arms_decline_when_the_shadow_cannot_be_inspected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        std::os::unix::fs::symlink("brain.lbug.shadow", dir.path().join("brain.lbug.shadow"))
+            .unwrap();
+        std::fs::write(dir.path().join("brain.lbug.wal.checkpoint"), b"frozen").unwrap();
+        let authority = acquire_db_write_lease(&db).unwrap();
+        assert!(quarantine_stale_checkpoint(&db, Some(&authority)).is_none());
+        assert!(dir.path().join("brain.lbug.wal.checkpoint").exists());
+
+        std::fs::remove_file(dir.path().join("brain.lbug.wal.checkpoint")).unwrap();
+        std::fs::write(dir.path().join("brain.lbug.wal"), b"live").unwrap();
+        assert!(quarantine_orphaned_wal(&db, Some(&authority)).is_none());
+        assert_eq!(
+            std::fs::read(dir.path().join("brain.lbug.wal")).unwrap(),
+            b"live"
+        );
+    }
+
+    const SHADOW_MISSING: &str = "IO exception: Cannot open file /x/brain.lbug.shadow: \
+                                  No such file or directory";
+
+    /// A frozen log ending in CHECKPOINT whose pages were applied before the
+    /// crash: named precisely, with the ONE move that fixes it, and nothing is
+    /// moved automatically.
+    #[test]
+    fn a_frozen_log_whose_pages_were_applied_gets_a_targeted_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        let frozen = dir.path().join("brain.lbug.wal.checkpoint");
+        std::fs::write(&frozen, b"frozen-ending-in-checkpoint").unwrap();
+        std::fs::write(dir.path().join("brain.lbug.wal"), b"later-commits").unwrap();
+
+        assert_eq!(
+            frozen_checkpoint_already_applied(&db, SHADOW_MISSING),
+            Some(frozen.clone())
+        );
+        assert!(frozen.exists(), "a diagnostic, not an automatic move");
+        assert!(dir.path().join("brain.lbug.wal").exists());
+
+        let error = StoreError::FrozenCheckpointAlreadyApplied(Box::new(
+            crate::error::FrozenCheckpointApplied {
+                path: db.clone(),
+                frozen: frozen.clone(),
+                detail: SHADOW_MISSING.to_string(),
+            },
+        ));
+        let text = error.to_string();
+        assert!(
+            text.contains(&format!(
+                "mv {} {}.applied",
+                frozen.display(),
+                frozen.display()
+            )),
+            "{text}"
+        );
+        assert!(text.contains("Do NOT move"), "{text}");
+        assert!(
+            crate::error::classify_engine_corruption(&text).is_none(),
+            "not corruption: {text}"
+        );
+
+        // Counterweights: any other shape is not this state.
+        std::fs::write(dir.path().join("brain.lbug.shadow"), b"s").unwrap();
+        assert!(frozen_checkpoint_already_applied(&db, SHADOW_MISSING).is_none());
+        std::fs::remove_file(dir.path().join("brain.lbug.shadow")).unwrap();
+        assert!(frozen_checkpoint_already_applied(&db, "database is locked").is_none());
+        std::fs::remove_file(&frozen).unwrap();
+        assert!(frozen_checkpoint_already_applied(&db, SHADOW_MISSING).is_none());
+    }
+
+    /// The real engine: a frozen log still pending makes the next checkpoint
+    /// refuse. The COMMIT that triggers it succeeded, and the classifier must
+    /// say so from the engine's exact words.
+    #[test]
+    fn a_post_commit_checkpoint_over_a_pending_frozen_log_is_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.lbug");
+        let db = lbug::Database::new(
+            &path,
+            bounded_system_config()
+                .auto_checkpoint(true)
+                .checkpoint_threshold(0),
+        )
+        .unwrap();
+        let conn = lbug::Connection::new(&db).unwrap();
+        conn.query("CREATE NODE TABLE T(k STRING, PRIMARY KEY(k))")
+            .unwrap();
+        std::fs::write(format!("{}.wal.checkpoint", path.display()), b"").unwrap();
+        let message = match conn.query("CREATE (:T {k: 'kept'})") {
+            Ok(_) => panic!("the post-commit checkpoint must refuse over a pending frozen log"),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(
+            classify_checkpoint_failure(&message),
+            Some(CheckpointFailure::CommittedCheckpointDeferred),
+            "{message}"
+        );
+        assert!(
+            crate::error::classify_engine_corruption(&message).is_none(),
+            "{message}"
+        );
+        let rows: Vec<_> = conn.query("MATCH (t:T) RETURN t.k").unwrap().collect();
+        assert_eq!(rows.len(), 1, "the write committed: {message}");
+    }
+
+    /// Through the store: a committed write is reported as committed (never
+    /// an error that invites a retry), and the handle asks for a reopen.
+    #[test]
+    fn the_store_reports_a_deferred_checkpoint_as_committed_and_flags_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = GraphStore::create(&db).unwrap();
+        assert!(!store.reopen_required());
+        let committed_elsewhere = "Checkpoint exception: Transaction committed successfully, \
+             but the post-commit checkpoint failed. The committed data is durable and will be \
+             recovered on restart: Runtime exception: Cannot checkpoint: the frozen WAL of an \
+             earlier checkpoint is still pending. Reopen the database to recover it.";
+        store
+            .settle_commit(Err(committed_elsewhere.to_string()))
+            .expect("a committed write is not a failure");
+        assert!(store.reopen_required());
+        assert!(
+            store
+                .settle_commit(Err("Runtime exception: write-write conflict".to_string()))
+                .is_err(),
+            "counterweight: a genuine commit failure is still an error"
+        );
+
+        // And the real engine refusal on an explicit checkpoint.
+        let fresh = GraphStore::create(&dir.path().join("second.lbug")).unwrap();
+        std::fs::write(dir.path().join("second.lbug.wal.checkpoint"), b"").unwrap();
+        let error = fresh.checkpoint().unwrap_err();
+        assert_eq!(
+            error.checkpoint_failure(),
+            Some(CheckpointFailure::CommittedCheckpointDeferred),
+            "{error}"
+        );
+        assert!(fresh.reopen_required());
+    }
+
+    /// An interrupted checkpoint that recovery could not finish for lack of
+    /// disk or buffer pool is a resource problem. The exact upstream wrapper,
+    /// around causes that would otherwise read as corruption.
+    #[test]
+    fn a_recovery_checkpoint_failure_is_a_resource_problem_never_corruption() {
+        for cause in [
+            "Buffer manager exception: Unable to allocate memory! The buffer pool is full",
+            "IO exception: Cannot write to file: No space left on device",
+            "Corrupted wal file. Read out invalid WAL record type.",
+        ] {
+            let message = format!(
+                "Checkpoint exception: Failed while completing an interrupted checkpoint \
+                 during recovery: {cause}"
+            );
+            assert_eq!(
+                classify_checkpoint_failure(&message),
+                Some(CheckpointFailure::RecoveryCheckpointInterrupted),
+                "{message}"
+            );
+            assert!(
+                crate::error::classify_engine_corruption(&message).is_none(),
+                "{message}"
+            );
+            let disclosure = crate::error::recovery_checkpoint_resource_disclosure(
+                Path::new("/x/brain.lbug"),
+                &message,
+            );
+            assert!(disclosure.contains("NOT corrupt"), "{disclosure}");
+            assert!(disclosure.contains("NESTWEAVER_LBUG_BUFFER_POOL_BYTES"));
+            assert!(disclosure.contains("Do NOT move"));
+            assert!(
+                crate::error::classify_engine_corruption(&disclosure).is_none(),
+                "the disclosure itself must not re-classify as corruption: {disclosure}"
+            );
+        }
     }
 }

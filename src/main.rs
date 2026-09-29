@@ -1048,6 +1048,25 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
     if let Some((path, reason)) = parse_rebuild_required(&format!("{err:#}")) {
         return rebuild_required_diagnostic(path, reason);
     }
+    // LadybugDB 0.21's two non-corruption checkpoint states. Their store
+    // errors already carry the one safe remedy in their own words; they must
+    // not reach the heuristic arms below, which read "no such file" as a
+    // missing database and "wal" as a runbook that discards committed writes.
+    if err
+        .chain()
+        .filter_map(|source| source.downcast_ref::<nestweaver_store::StoreError>())
+        .any(|store_error| {
+            matches!(
+                store_error,
+                nestweaver_store::StoreError::FrozenCheckpointAlreadyApplied(_)
+            ) || store_error.checkpoint_failure().is_some()
+        })
+        || nestweaver_store::classify_checkpoint_failure(&format!("{err:#}")).is_some()
+        || format!("{err:#}")
+            .contains("frozen write-ahead log of a checkpoint that already finished")
+    {
+        return miette::Report::msg(redact_build_paths(&format!("{err:#}")));
+    }
 
     let typed = err
         .chain()

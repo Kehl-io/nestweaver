@@ -125,6 +125,69 @@ pub const DB_REBUILD_REQUIRED_REMEDY: &str = concat!(
     "validates; this file is left exactly as it is"
 );
 
+/// A checkpoint failure the storage engine reports that is NOT corruption.
+///
+/// LadybugDB 0.21 added two messages whose remedies are the opposite of the
+/// corrupt-log runbook: following that runbook (moving the log files aside)
+/// would discard committed transactions in both cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointFailure {
+    /// The transaction COMMITTED and is durable; only the checkpoint after it
+    /// failed. Upstream `WAL::rotateForCheckpoint` (`src/storage/wal/wal.cpp`)
+    /// refuses to rotate while a frozen log from an earlier interrupted
+    /// checkpoint is still on disk ("the frozen WAL of an earlier checkpoint is
+    /// still pending. Reopen the database to recover it."), and
+    /// `TransactionManager::commit` (`src/transaction/transaction_manager.cpp`)
+    /// wraps any post-commit checkpoint failure in "Transaction committed
+    /// successfully, but the post-commit checkpoint failed. The committed data
+    /// is durable and will be recovered on restart". Retrying the write would
+    /// apply it twice; the fix is to reopen the database so recovery finishes
+    /// the pending checkpoint.
+    CommittedCheckpointDeferred,
+    /// Recovery replayed a frozen log and then failed to finish the checkpoint
+    /// the crash interrupted. Upstream `WALReplayer::completeInterruptedCheckpoint`
+    /// (`src/storage/wal/wal_replayer.cpp`) raises "Failed while completing an
+    /// interrupted checkpoint during recovery: <cause>". The frozen log stays
+    /// on disk and the next writable open retries it, so the failure is a
+    /// RESOURCE problem (disk space, buffer pool), never damage.
+    RecoveryCheckpointInterrupted,
+}
+
+const RECOVERY_CHECKPOINT_INTERRUPTED: &str =
+    "failed while completing an interrupted checkpoint during recovery";
+const POST_COMMIT_CHECKPOINT_FAILED: &str =
+    "transaction committed successfully, but the post-commit checkpoint failed";
+const FROZEN_WAL_STILL_PENDING: &str = "frozen wal of an earlier checkpoint is still pending";
+
+/// Classify the two LadybugDB 0.21 checkpoint failures. See
+/// [`CheckpointFailure`]. Recovery is tested first: its wrapped cause can be
+/// any engine sentence, including one that mentions the log.
+pub fn classify_checkpoint_failure(message: &str) -> Option<CheckpointFailure> {
+    let lower = message.to_lowercase();
+    if lower.contains(RECOVERY_CHECKPOINT_INTERRUPTED) {
+        return Some(CheckpointFailure::RecoveryCheckpointInterrupted);
+    }
+    if lower.contains(POST_COMMIT_CHECKPOINT_FAILED) || lower.contains(FROZEN_WAL_STILL_PENDING) {
+        return Some(CheckpointFailure::CommittedCheckpointDeferred);
+    }
+    None
+}
+
+/// The disclosure attached to [`CheckpointFailure::RecoveryCheckpointInterrupted`]
+/// at the open funnel. It names the resource remedy and forbids the move-aside.
+pub fn recovery_checkpoint_resource_disclosure(db_path: &Path, detail: &str) -> String {
+    format!(
+        "the storage engine replayed the write-ahead log of {} but could not finish \
+         the checkpoint a crash interrupted, because it ran out of a resource (disk \
+         space or buffer pool). The database is NOT corrupt and nothing was discarded: \
+         the frozen log stays on disk and the next read-write open retries it. Free \
+         disk space on that volume or raise NESTWEAVER_LBUG_BUFFER_POOL_BYTES, then \
+         open the database again. Do NOT move the write-ahead log files aside; that \
+         discards committed transactions. The storage engine's own words: {detail}",
+        db_path.display()
+    )
+}
+
 /// Replace any absolute path into a Rust build tree with the crate it points
 /// at, so a message the storage engine wrote with `__FILE__` cannot ship a
 /// developer's home directory to a user.
@@ -425,6 +488,12 @@ pub fn live_writer_holds_write_lease(db_path: &Path) -> bool {
 /// [`classify_engine_corruption_for_db`] — the variant the store's open funnel
 /// calls, where a path is in hand.
 pub fn classify_engine_corruption(message: &str) -> Option<CorruptionKind> {
+    // LadybugDB 0.21: a committed-but-not-checkpointed write and a recovery
+    // that ran out of resources are never corruption, whatever cause they
+    // wrap. Moving the log aside would discard committed transactions.
+    if classify_checkpoint_failure(message).is_some() {
+        return None;
+    }
     let lower = message.to_lowercase();
     // These signatures are unambiguous and must win before the deliberately
     // broad WAL heuristic below. A daemon-refusal path such as `/walnut/...`
@@ -494,6 +563,14 @@ pub fn classify_engine_corruption(message: &str) -> Option<CorruptionKind> {
     if lower.contains("shadow pages") || (lower.contains("replay") && lower.contains("read-only")) {
         return Some(CorruptionKind::WalUnreplayed);
     }
+    // LadybugDB 0.21 validates on-disk index and disk-array headers on open and
+    // says so in one trailing sentence ("The database file may be corrupted.",
+    // `hash_index_header.h`, `disk_array_collection.cpp`, `file_handle.h`),
+    // where 0.20 dereferenced the garbage and faulted. The engine names no
+    // finer cause, so neither does this.
+    if lower.contains("database file may be corrupted") {
+        return Some(CorruptionKind::Unclassified);
+    }
     None
 }
 
@@ -539,6 +616,19 @@ pub fn classify_engine_corruption_for_db(message: &str, db_path: &Path) -> Optio
         return None;
     }
     Some(kind)
+}
+
+/// The payload of [`StoreError::FrozenCheckpointAlreadyApplied`], boxed for
+/// the same reason [`EngineCorruption`] is: the rarest failure must not grow
+/// every `Result` that carries a `StoreError`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrozenCheckpointApplied {
+    /// The database.
+    pub path: PathBuf,
+    /// Its frozen write-ahead log, `<db>.wal.checkpoint`.
+    pub frozen: PathBuf,
+    /// The engine's own words, verbatim.
+    pub detail: String,
 }
 
 /// The payload of [`StoreError::Corruption`].
@@ -649,6 +739,28 @@ pub enum StoreError {
         path: Box<PathBuf>,
         reason: Box<str>,
     },
+    /// An interrupted checkpoint left its frozen log (`<db>.wal.checkpoint`,
+    /// ending in a CHECKPOINT record) after the shadow pages were already
+    /// applied and `<db>.shadow` unlinked, and the engine refuses to open
+    /// because it tries to re-apply them from the missing shadow. The one safe
+    /// remedy is to move ONLY the frozen log aside; the active `<db>.wal` holds
+    /// later commits and must stay. Not corruption, and never automated here.
+    #[error(
+        "database cannot open: {} is the frozen write-ahead log of a checkpoint that \
+         already finished applying its pages to the database file before a crash \
+         (the engine deletes {}.shadow only after applying it), but the engine still \
+         tries to re-apply them from that missing file. Move ONLY the frozen log \
+         aside, then open the database again:\n  mv {} {}.applied\nDo NOT move \
+         {}.wal: it holds writes committed after that checkpoint began. The storage \
+         engine's own words: {detail}",
+        .0.frozen.display(),
+        .0.path.display(),
+        .0.frozen.display(),
+        .0.frozen.display(),
+        .0.path.display(),
+        detail = .0.detail
+    )]
+    FrozenCheckpointAlreadyApplied(Box<FrozenCheckpointApplied>),
 }
 
 impl StoreError {
@@ -669,7 +781,8 @@ impl StoreError {
             | StoreError::Cancelled(_)
             | StoreError::CorruptValue { .. }
             | StoreError::EmbeddingArtifactCorrupt
-            | StoreError::RebuildRequired { .. } => false,
+            | StoreError::RebuildRequired { .. }
+            | StoreError::FrozenCheckpointAlreadyApplied(_) => false,
         }
     }
 
@@ -677,6 +790,23 @@ impl StoreError {
     /// it. See [`StoreError::RebuildRequired`].
     pub fn is_rebuild_required(&self) -> bool {
         matches!(self, StoreError::RebuildRequired { .. })
+    }
+
+    /// The LadybugDB 0.21 checkpoint failure this error carries, if any. See
+    /// [`CheckpointFailure`].
+    pub fn checkpoint_failure(&self) -> Option<CheckpointFailure> {
+        match self {
+            StoreError::Database(msg) | StoreError::Query(msg) => classify_checkpoint_failure(msg),
+            _ => None,
+        }
+    }
+
+    /// True when the write this error came from COMMITTED and is durable even
+    /// though the engine returned an error. A caller must not retry it (that
+    /// would apply it twice); the database needs a reopen so recovery finishes
+    /// the checkpoint the engine deferred.
+    pub fn is_committed_despite_error(&self) -> bool {
+        self.checkpoint_failure() == Some(CheckpointFailure::CommittedCheckpointDeferred)
     }
 
     /// True when this error represents a cancelled (incomplete) computation.
