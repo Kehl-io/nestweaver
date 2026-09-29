@@ -145,8 +145,8 @@ pub(crate) fn repo_manifest_artifact_contract(
                 "repository manifest sidecar is not a self-describing v2 artifact envelope: {error}"
             )
         })?;
-    let _: std::collections::HashMap<String, crate::manifest::ManifestInfo> = envelope
-        .validate_and_decode(nestweaver_store::artifact_envelope::ArtifactExpectation {
+    let _: crate::manifest::ManifestPayload =
+        envelope.validate_and_decode(nestweaver_store::artifact_envelope::ArtifactExpectation {
             artifact_kind: crate::manifest::MANIFEST_ARTIFACT_KIND,
             artifact_schema_version: crate::manifest::MANIFEST_ARTIFACT_SCHEMA_VERSION,
             identity,

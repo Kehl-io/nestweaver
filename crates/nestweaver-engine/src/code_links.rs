@@ -417,6 +417,9 @@ pub struct CodeLinkReconciler {
     config: CrossDomainConfig,
     project_folders: Vec<crate::project::ProjectFolder>,
     cache: HashMap<String, CachedMentions>,
+    /// nw-677: per vault uid, a reader over the vault's committed text when
+    /// it has no working tree (a server-mode bare clone).
+    vault_readers: HashMap<String, Box<dyn crate::content_reader::ContentReader>>,
 }
 
 /// An edge in comparable form: `(from_uid, symbol_uid, confidence × 10⁴)`.
@@ -436,12 +439,24 @@ impl CodeLinkReconciler {
             config,
             project_folders: Vec::new(),
             cache: HashMap::new(),
+            vault_readers: HashMap::new(),
         }
     }
 
     pub fn with_project_folders(mut self, folders: Vec<crate::project::ProjectFolder>) -> Self {
         self.project_folders = folders;
         self
+    }
+
+    /// nw-677: read these vaults' notes through their readers (keyed by vault
+    /// uid) instead of the filesystem — the server worker passes readers over
+    /// the bare clones at each vault's indexed revision. Replaces any readers
+    /// set before; the mention cache is kept.
+    pub fn set_vault_readers(
+        &mut self,
+        readers: HashMap<String, Box<dyn crate::content_reader::ContentReader>>,
+    ) {
+        self.vault_readers = readers;
     }
 
     /// Run one pass: bring every locally readable note's code links in line
@@ -707,23 +722,34 @@ impl CodeLinkReconciler {
             return NoteText::Mentions(Arc::clone(&cached.mentions));
         }
         self.cache.remove(&note.uid);
-        // A note with no local vault directory (a wiki note, a server-mode
-        // bare clone) is not this reconciler's to link.
-        let Some(root) = roots.get(&note.vault_uid).filter(|root| root.is_dir()) else {
-            return NoteText::NotLocal;
-        };
-        let path = root.join(&note.file_path);
-        let source = match std::fs::read_to_string(&path) {
-            Ok(source) => source,
-            // nw-670 re-review R2: a note deleted on disk but still in the
-            // graph is a stale index (the watcher or the next refresh removes
-            // it), exactly like an edited one — not links the pass owes.
-            // Treating it as unreadable kept the debt open forever and
-            // stamped every ranked read.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return NoteText::Changed;
+        // nw-677: a vault with a reader (a server-mode bare clone) is read
+        // at its indexed revision, which is the text the graph committed.
+        let source = if let Some(reader) = self.vault_readers.get(&note.vault_uid) {
+            match reader.read_file(Path::new(&note.file_path)) {
+                Ok(source) => source,
+                Err(error) => {
+                    return NoteText::Unreadable(format!("{}: {error:#}", note.file_path));
+                }
             }
-            Err(error) => return NoteText::Unreadable(format!("{}: {error}", path.display())),
+        } else {
+            // A note with no local vault directory (a wiki note, a server-mode
+            // bare clone without a reader) is not this reconciler's to link.
+            let Some(root) = roots.get(&note.vault_uid).filter(|root| root.is_dir()) else {
+                return NoteText::NotLocal;
+            };
+            let path = root.join(&note.file_path);
+            match std::fs::read_to_string(&path) {
+                Ok(source) => source,
+                // nw-670 re-review R2: a note deleted on disk but still in the
+                // graph is a stale index (the watcher or the next refresh removes
+                // it), exactly like an edited one — not links the pass owes.
+                // Treating it as unreadable kept the debt open forever and
+                // stamped every ranked read.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return NoteText::Changed;
+                }
+                Err(error) => return NoteText::Unreadable(format!("{}: {error}", path.display())),
+            }
         };
         if nestweaver_parser::note_content_hash(&source) != note.content_hash {
             return NoteText::Changed;
@@ -923,6 +949,44 @@ fn purge_links(store: &GraphStore, lease: CodeLinkLease<'_>) -> Result<(), anyho
         "removed every link built by the previous rules; relinking".to_string(),
     );
     Ok(())
+}
+
+/// nw-677: readers over every server-mode vault's bare clone, at the
+/// revision its notes were indexed from, keyed by vault uid. A vault whose
+/// root is not a bare clone (a local working tree) or that has no indexed
+/// revision gets none and is read from disk as before.
+pub fn bare_clone_vault_readers(
+    store: &GraphStore,
+    limits: crate::index_limits::IndexLimits,
+) -> Result<HashMap<String, Box<dyn crate::content_reader::ContentReader>>, anyhow::Error> {
+    let mut readers: HashMap<String, Box<dyn crate::content_reader::ContentReader>> =
+        HashMap::new();
+    for vault in store
+        .list_vaults(None)
+        .context("list vaults for bare-clone readers")?
+    {
+        let root = Path::new(&vault.root_path);
+        if !(root.join("HEAD").is_file() && root.join("objects").is_dir()) {
+            continue;
+        }
+        let repo_uid = nestweaver_schema::repo_uid(&vault.instance_id, &vault.name);
+        let Some(repo) = store
+            .lookup_repo(&repo_uid)
+            .map_err(|e| anyhow::anyhow!("lookup vault repo {repo_uid}: {e}"))?
+            .filter(|repo| !repo.indexed_sha.is_empty())
+        else {
+            continue;
+        };
+        readers.insert(
+            vault.uid,
+            Box::new(crate::content_reader::GitBareReader::with_limits(
+                root,
+                &repo.indexed_sha,
+                limits,
+            )),
+        );
+    }
+    Ok(readers)
 }
 
 /// One complete pass for a caller with exclusive write authority (the

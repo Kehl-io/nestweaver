@@ -4,7 +4,13 @@ use std::path::Path;
 use nestweaver_parser::{AstTypeBinding, RawReference, RawSymbol};
 use serde::{Deserialize, Serialize};
 
-const CACHE_VERSION: u32 = 1;
+/// Bump whenever a parser or query change alters what a file parses to: the
+/// cache is keyed by content hash alone, so an unchanged file would otherwise
+/// keep its old parse through every non-`--force` index.
+///
+/// 2 — nw-688: JS/TS test blocks are named `<runner> <title>`, `require()` is
+///     the only call-shaped import, and package bindings are recorded.
+const CACHE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedParseResult {
@@ -163,6 +169,25 @@ mod tests {
 
         let cache = ParsedCache::load(&path);
         assert!(cache.is_empty());
+    }
+
+    /// nw-688: a parse cached before the test-title change (version 1, where
+    /// `describe('getTier')` parsed to a Function `getTier`) must not be
+    /// reused by an incremental index of the unchanged file.
+    #[test]
+    fn a_pre_nw_688_parse_is_not_reused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.parsed_cache.bin");
+        let mut stale = sample_result();
+        stale.symbols[0].name = "getTier".into();
+        let file = ParsedCacheFile {
+            version: 1,
+            entries: HashMap::from([("hash1".to_string(), stale)]),
+        };
+        std::fs::write(&path, rmp_serde::to_vec(&file).unwrap()).unwrap();
+
+        let cache = ParsedCache::load(&path);
+        assert!(cache.get("hash1").is_none(), "a version-1 parse was reused");
     }
 
     #[test]

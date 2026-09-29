@@ -9477,6 +9477,7 @@ impl NestWeaverDaemon for DaemonService {
             skipped_notes,
             notes_near_size_limit,
             code_links: nestweaver_proto::code_links_from_status_json(&value),
+            manifest_failures: nestweaver_proto::manifest_failures_from_status_json(&value),
         }))
     }
 
@@ -10515,7 +10516,15 @@ impl NestWeaverDaemon for DaemonService {
                     nestweaver_engine::manifest::ManifestUnavailableReason::PendingSourceChange,
                     generation, "manifest source changed while computing suggestions")));
                 }
-                serde_json::to_string(&suggestions)
+                let mut body = serde_json::to_value(&suggestions)
+                    .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))?;
+                // nw-705: repositories whose manifests could not be rebuilt
+                // are missing from these suggestions; name them.
+                let failures = nestweaver_engine::manifest::manifest_failures_json(&state.db_path);
+                if failures.as_array().is_some_and(|rows| !rows.is_empty()) {
+                    body["manifest_failures"] = failures;
+                }
+                serde_json::to_string(&body)
                     .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
             })
             .await
@@ -24000,19 +24009,125 @@ repos = ["alpha"]
         );
 
         // Counterweight: a policy that differs in its configured parameters
-        // still refuses the capture.
+        // still refuses that repo (nw-705: only that repo).
         state
             .store
             .set_repo_index_policy("repo:beta", "a-different-policy")
             .unwrap();
-        let error = match super::manifest_recovery::capture(
-            &state,
-            Instant::now() + Duration::from_secs(60),
-        ) {
-            Err(error) => error.to_string(),
-            Ok(_) => panic!("a differing policy was accepted"),
-        };
-        assert!(error.contains("repo:beta"), "{error}");
+        let snapshot =
+            super::manifest_recovery::capture(&state, Instant::now() + Duration::from_secs(60))
+                .unwrap();
+        let refused: Vec<&str> = snapshot
+            .failures
+            .iter()
+            .map(|f| f.repo_uid.as_str())
+            .collect();
+        assert_eq!(refused, ["repo:beta"], "{:?}", snapshot.failures);
+    }
+
+    /// nw-705: the manifest rebuild is per repository. One repo it must refuse
+    /// (a policy recorded under other settings, then a malformed manifest)
+    /// no longer keeps the other repo's manifests stale and the debt unpaid:
+    /// the good repo's manifest is published, the debt is paid, and the bad
+    /// repo is named with its reason and remedy. Counterweight: the good
+    /// repo's manifest is really current (its dependency is read), and the
+    /// refused repo is absent rather than served stale.
+    #[tokio::test]
+    async fn one_refused_repo_leaves_the_others_manifests_current_and_named() {
+        use nestweaver_engine::manifest;
+        for break_beta in ["policy", "malformed"] {
+            let state = test_state_with_writer();
+            manifest_recovery_fixture(&state);
+            let beta = state.db_path.parent().unwrap().join("beta");
+            match break_beta {
+                "policy" => state
+                    .store
+                    .set_repo_index_policy("repo:beta", "a-different-policy")
+                    .unwrap(),
+                _ => std::fs::write(beta.join("package.json"), "{").unwrap(),
+            }
+            manifest::mark_manifest_reconciliation_pending(&state.db_path, "repository index")
+                .unwrap();
+
+            let task = tokio::spawn(super::manifest_recovery::run(Arc::clone(&state)));
+            state.manifest_recovery.wake.notify_one();
+            let settled = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if manifest::current_manifest_snapshot(&state.store, &state.db_path).is_ok()
+                        && state.manifest_recovery.status().state == "partial"
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            let status = state.manifest_recovery.status();
+            state.shutdown_started.store(true, Ordering::SeqCst);
+            state.shutdown_tx.send_replace(true);
+            let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+            assert!(settled.is_ok(), "{break_beta}: never settled: {status:?}");
+
+            let manifests =
+                manifest::current_manifest_snapshot(&state.store, &state.db_path).unwrap();
+            assert_eq!(
+                manifests["repo:alpha"].dependencies,
+                ["beta"],
+                "{break_beta}"
+            );
+            assert!(!manifests.contains_key("repo:beta"), "{break_beta}");
+            assert!(
+                manifest::manifest_debt_revision(&state.db_path)
+                    .unwrap()
+                    .is_none(),
+                "{break_beta}: the debt must be paid for the good repo"
+            );
+            let failures = manifest::load_manifest_failures(&state.db_path);
+            assert_eq!(failures.len(), 1, "{break_beta}: {failures:?}");
+            assert_eq!(failures[0].repo_uid, "repo:beta");
+            assert_eq!(
+                failures[0].remedy,
+                format!("nestweaver index --repo {}", beta.display())
+            );
+            // Review M5: the probe of the refused repo alone sees no change
+            // while it stays broken — even with alpha's manifest edited, which
+            // only a full rebuild (after its re-index marks debt) picks up —
+            // and sees the repair once beta is fixed.
+            std::fs::write(
+                state.db_path.parent().unwrap().join("alpha/package.json"),
+                r#"{"name":"alpha","dependencies":{"gamma":"1"}}"#,
+            )
+            .unwrap();
+            assert!(!super::manifest_recovery::refused_repos_changed(
+                &state, &failures
+            ));
+            match break_beta {
+                "policy" => {
+                    use nestweaver_engine::content_reader::ContentReader;
+                    state
+                        .store
+                        .set_repo_index_policy(
+                            "repo:beta",
+                            &nestweaver_engine::content_reader::FilesystemReader::new(&beta)
+                                .eligibility_fingerprint(),
+                        )
+                        .unwrap()
+                }
+                _ => std::fs::write(beta.join("package.json"), r#"{"name":"beta"}"#).unwrap(),
+            }
+            assert!(super::manifest_recovery::refused_repos_changed(
+                &state, &failures
+            ));
+            let message = status.error.map(|e| e.message).unwrap_or_default();
+            assert!(message.contains("repo:beta"), "{break_beta}: {message}");
+            // `brain status` carries the same rows.
+            let rows = nestweaver_proto::manifest_failures_from_status_json(&serde_json::json!({
+                "manifest_failures": manifest::manifest_failures_json(&state.db_path)
+            }));
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].repo_uid, "repo:beta");
+            assert!(!rows[0].reason.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -24055,14 +24170,16 @@ repos = ["alpha"]
         manifest_recovery_fixture(&state);
         let path = state.db_path.parent().unwrap().join("alpha/package.json");
         std::fs::write(&path, "{").unwrap();
-        let error = match super::manifest_recovery::capture(
-            &state,
-            Instant::now() + Duration::from_secs(60),
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("malformed source was accepted"),
+        // nw-705: a malformed source refuses its own repo, by name.
+        let refused = |state: &DaemonState| {
+            super::manifest_recovery::capture(state, Instant::now() + Duration::from_secs(60))
+                .unwrap()
+                .failures
+                .into_iter()
+                .map(|f| f.repo_uid)
+                .collect::<Vec<_>>()
         };
-        assert!(error.to_string().contains("repo:alpha"));
+        assert_eq!(refused(&state), ["repo:alpha"]);
         std::fs::write(&path, r#"{"name":"alpha"}"#).unwrap();
         nestweaver_engine::manifest::mark_manifest_reconciliation_pending(
             &state.db_path,
@@ -24076,10 +24193,7 @@ repos = ["alpha"]
         ] {
             let malformed = path.parent().unwrap().join(name);
             std::fs::write(&malformed, content).unwrap();
-            assert!(super::manifest_recovery::capture(
-                &state,
-                Instant::now() + Duration::from_secs(60),
-            ).is_err());
+            assert_eq!(refused(&state), ["repo:alpha"]);
             assert_eq!(
                 nestweaver_engine::manifest::manifest_debt_revision(&state.db_path).unwrap(),
                 debt
@@ -24088,10 +24202,7 @@ repos = ["alpha"]
             std::fs::remove_file(malformed).unwrap();
         }
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
-        assert!(
-            super::manifest_recovery::capture(&state, Instant::now() + Duration::from_secs(60))
-                .is_err()
-        );
+        assert_eq!(refused(&state), ["repo:alpha"]);
     }
 
     fn write_provenance_test_config(path: &Path, root: &Path) {

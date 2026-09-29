@@ -427,7 +427,10 @@ fn resolve_single_reference(
         ReferenceKind::Includes => EdgeType::Includes,
         ReferenceKind::TypeRef => EdgeType::Uses,
         ReferenceKind::ReadAccess | ReferenceKind::WriteAccess => EdgeType::Accesses,
-        ReferenceKind::Import | ReferenceKind::ImportAlias | ReferenceKind::Uses => return None,
+        ReferenceKind::Import
+        | ReferenceKind::ImportAlias
+        | ReferenceKind::PackageBinding
+        | ReferenceKind::Uses => return None,
     };
 
     // nw-349 (1). The three cases are now distinguishable, and only two of them

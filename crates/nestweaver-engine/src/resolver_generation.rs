@@ -246,7 +246,20 @@ use std::path::Path;
 ///     (`module.exports.f = f`), are now `Visibility::Public` and root like
 ///     an equivalent ES export instead of parsing `Private`/non-entry, the
 ///     same persisted-column shape as generations 5/6 above.
-pub const RESOLVER_GENERATION: u32 = 7;
+///
+/// 8 — nw-688: a JS/TS test-runner block (`describe('getTier', fn)`) was a
+///     `Function` named after its title, so it shadowed the real `getTier`:
+///     the name went ambiguous and the test's own `getTier()` call bound to
+///     the block instead of the definition, hiding the test from
+///     `affected-tests`. Blocks are now named `<runner> <title>`
+///     (`describe getTier`), which changes their `(repo, path, name,
+///     start_line)` UIDs and the source of every CALLS edge inside them. The
+///     `require()` import rule now matches `require` only (any
+///     `f('string')` call used to be an import), and a call bound from an npm
+///     package no longer earns a name-matched `CROSS_REPO_LINK` to another
+///     repo's same-named symbol. A stale graph keeps the shadowing symbols and
+///     the wrong edges until re-indexed.
+pub const RESOLVER_GENERATION: u32 = 8;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would
