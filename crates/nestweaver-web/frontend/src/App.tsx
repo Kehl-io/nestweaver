@@ -12,7 +12,7 @@ import { SourceEvidencePanel } from "./components/workspace/SourceEvidencePanel"
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useTheme } from "./hooks/useTheme";
 import { useDeepLink } from "./hooks/useDeepLink";
-import { useWasmEngine } from "./hooks/useWasmEngine";
+import { useWasmEngineLifecycle } from "./hooks/useWasmEngine";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useStore } from "./stores";
 import { ShortcutsOverlay } from "./components/ShortcutsOverlay";
@@ -30,7 +30,7 @@ function AppContent() {
   useKeyboardShortcuts();
   useTheme();
   useDeepLink();
-  useWasmEngine();
+  useWasmEngineLifecycle();
   const activeView = useStore((s) => s.activeView);
   const layoutMode = useStore((s) => s.layoutMode);
   const setLayoutMode = useStore((s) => s.setLayoutMode);

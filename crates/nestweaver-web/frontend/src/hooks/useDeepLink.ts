@@ -3,6 +3,7 @@ import { useStore } from "../stores";
 import type { GraphMode } from "../api/types";
 import type { ActiveLens, RepresentationMode } from "../api/p1Types";
 import { parseOverviewKind } from "../stores/graphSlice";
+import { ENGINE_MODE } from "../engine/wasmEngine";
 import {
   DEFAULT_IMPACT_CONFIDENCE,
   DEFAULT_IMPACT_DEPTH,
@@ -176,6 +177,9 @@ export function useDeepLink() {
     }
 
     const params = new URLSearchParams();
+    // The engine is fixed for the page's lifetime; keep it in the address
+    // bar so a reload or shared link stays on the same engine (nw-570).
+    if (ENGINE_MODE === "wasm") params.set("engine", "wasm");
     if (seeds.length > 0) params.set("seeds", seeds.join(","));
     if (graphMode !== "overview") params.set("mode", graphMode);
     if (activeWorkspaceId !== "all") params.set("workspace", activeWorkspaceId);
