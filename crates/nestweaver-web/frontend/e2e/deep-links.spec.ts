@@ -151,7 +151,16 @@ test.describe("Deep links (batch 11)", () => {
       await expect(action).toHaveAttribute("aria-disabled", "true");
     }
 
-    await page.waitForTimeout(1_500);
+    // Details, Evidence and the breadcrumb have all settled on the miss
+    // above, so every consumer has asked. A follow-up render (a round trip
+    // through another representation) must not ask again.
+    expect(symbolFetches).toBe(1);
+    const representation = page.getByRole("tablist", { name: "Result representation" });
+    await representation.getByRole("tab", { name: "Table representation" }).click();
+    await expect(page.getByRole("table")).toBeVisible();
+    await representation.getByRole("tab", { name: "Graph representation" }).click();
+    await expect(details.getByRole("heading", { name: "Node not found" })).toBeVisible();
+    await expect(evidence.getByRole("heading", { name: "Node not found" })).toBeVisible();
     expect(symbolFetches).toBe(1);
 
     // The not-found state offers a way out.

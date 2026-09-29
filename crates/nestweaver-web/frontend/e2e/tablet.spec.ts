@@ -70,7 +70,12 @@ test.describe("Tablet width (nw-593)", () => {
     const symbol = await findSymbol(request, "greet");
     for (const path of ["/", `/?node=${encodeURIComponent(symbol.uid)}&kind=${symbol.kind}`]) {
       await open(page, 768, path);
-      await page.waitForTimeout(500);
+      // Wait for the chrome that loads last: the result tabs and, on a
+      // node link, the loaded Details for it.
+      await expect(page.getByRole("tablist", { name: "Result representation" })).toBeVisible();
+      if (path !== "/") {
+        await expect(page.getByRole("navigation", { name: "Scene breadcrumbs" })).toContainText(symbol.name);
+      }
       const unnamed = await page.evaluate(() =>
         Array.from(document.querySelectorAll("button, [role=button], [role=tab], a[href]"))
           .filter((el) => {
