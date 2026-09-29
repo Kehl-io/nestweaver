@@ -3,6 +3,7 @@ pub mod cache;
 pub mod context_graph;
 pub mod db;
 pub mod durable_sidecar;
+pub mod engine_format;
 pub mod error;
 pub mod generation;
 pub mod git_activity_sidecar;
@@ -26,9 +27,9 @@ pub use db::{
     PublicationIdentity,
 };
 pub use error::{
-    CancelReason, CorruptionKind, EngineCorruption, SelfHeldWriteLease, StoreError,
-    classify_engine_corruption, live_writer_holds_write_lease, note_self_held_write_lease,
-    redact_build_paths, self_holds_write_lease,
+    CancelReason, CorruptionKind, DB_REBUILD_REQUIRED_CODE, EngineCorruption, SelfHeldWriteLease,
+    StoreError, classify_engine_corruption, live_writer_holds_write_lease,
+    note_self_held_write_lease, redact_build_paths, self_holds_write_lease,
 };
 
 /// Re-export the LadybugDB connection type so callers can use transactional

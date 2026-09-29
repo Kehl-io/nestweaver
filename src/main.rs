@@ -699,9 +699,114 @@ enum CliDiagnostic {
     )]
     ExportScopeUnsupported { format: String, scope: String },
 
+    /// A database built by a storage engine older than the one this binary
+    /// links (LadybugDB before 0.21), refused before the engine opened it.
+    ///
+    /// Not corruption and not an outage that clears: the file is intact, it is
+    /// the wrong format for this engine, and the engine itself cannot tell
+    /// because the upgrade changed the string hash without bumping the storage
+    /// version. Opening it anyway would silently miss lookups on non-ASCII keys.
+    /// The remedy is ONE command, rendered by [`rebuild_remedy_command`]: a
+    /// `publication rebuild` when the invocation named a config, or a fresh
+    /// `index` into a NEW path when it did not. Neither writes to this file.
+    #[error("Database must be rebuilt for this version of NestWeaver: {path}")]
+    #[diagnostic(
+        code(nestweaver::db_rebuild_required),
+        help(
+            "{path} {reason}.\n\
+             This NestWeaver's storage engine (LadybugDB 0.21) hashes text keys \
+             differently from the engine that built this database, and the file \
+             format did not change to say so, so the database was NOT opened and \
+             nothing in it was changed.\n\
+             Stop the daemon, then rebuild. The rebuild writes a new database \
+             beside this one and switches to it only after it validates; this \
+             file is left exactly as it is, so it remains your rollback copy for \
+             the previous NestWeaver version:\n  \
+             {remedy}"
+        )
+    )]
+    DatabaseRebuildRequired {
+        path: String,
+        reason: String,
+        remedy: String,
+    },
+
     #[error("{message}")]
     #[diagnostic(code(nestweaver::error))]
     General { message: String },
+}
+
+/// The configuration file this invocation loaded, if any. Set by the config
+/// resolvers, read only by [`rebuild_remedy_command`] so the rebuild remedy can
+/// name the real `--config` rather than a placeholder.
+static LAST_CONFIG_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+fn record_config_path(path: &Path) {
+    if let Ok(mut slot) = LAST_CONFIG_PATH.lock() {
+        *slot = Some(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+    }
+}
+
+/// The ONE command that rebuilds a database this engine refused.
+///
+/// With a config: `publication rebuild`, which reindexes every declared source
+/// into a new slot and cuts over only after validation. Without one there is
+/// nothing to rebuild FROM, so the remedy indexes into a NEW file beside the
+/// refused one; it never names the refused path as a write target.
+fn rebuild_remedy_command(db_path: &str) -> String {
+    let config = LAST_CONFIG_PATH.lock().ok().and_then(|slot| slot.clone());
+    match config {
+        Some(config) => format!(
+            "nestweaver publication rebuild --config {}",
+            shell_quote(&config.display().to_string())
+        ),
+        None => {
+            let refused = Path::new(db_path);
+            let stem = refused
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+                .unwrap_or_else(|| "nestweaver".to_string());
+            let fresh = refused.with_file_name(format!("{stem}-rebuilt.lbug"));
+            format!(
+                "nestweaver index --repo <path> --db {}",
+                shell_quote(&fresh.display().to_string())
+            )
+        }
+    }
+}
+
+fn rebuild_required_diagnostic(path: String, reason: String) -> miette::Report {
+    let remedy = rebuild_remedy_command(&path);
+    CliDiagnostic::DatabaseRebuildRequired {
+        path,
+        reason,
+        remedy,
+    }
+    .into()
+}
+
+/// Recover path and reason from the RENDERED [`nestweaver_store::StoreError::RebuildRequired`]
+/// when an intermediate frame flattened it to text (a relayed daemon error, or
+/// an `anyhow!("...: {error}")`).
+fn parse_rebuild_required(message: &str) -> Option<(String, String)> {
+    let marker = format!("({}): ", nestweaver_store::DB_REBUILD_REQUIRED_CODE);
+    let rest = &message[message.find(&marker)? + marker.len()..];
+    const REASON_STARTS: &[&str] = &[
+        " was built by",
+        " has no engine-format marker",
+        " carries an engine-format marker",
+        " records an engine format",
+    ];
+    let (at, _) = REASON_STARTS
+        .iter()
+        .filter_map(|start| rest.find(start).map(|at| (at, start)))
+        .min_by_key(|(at, _)| *at)?;
+    let path = rest[..at].trim().to_string();
+    let reason_end = rest[at..]
+        .find(". This NestWeaver")
+        .map(|end| at + end)
+        .unwrap_or(rest.len());
+    Some((path, rest[at..reason_end].trim().to_string()))
 }
 
 /// Replace any absolute path into a Rust build tree with the crate it points
@@ -905,6 +1010,16 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
                 detail: detail.clone(),
             }
             .into(),
+            CliDiagnostic::DatabaseRebuildRequired {
+                path,
+                reason,
+                remedy,
+            } => CliDiagnostic::DatabaseRebuildRequired {
+                path: path.clone(),
+                reason: reason.clone(),
+                remedy: remedy.clone(),
+            }
+            .into(),
             // Every other variant is currently produced BY this function rather
             // than raised as an error, so there is nothing to pass through.
             // A variant that starts being raised directly adds its arm here.
@@ -918,6 +1033,22 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
     // below remain for errors that arrive from OUTSIDE the store — relayed
     // over gRPC as a string, or synthesised by a CLI layer — where no type
     // survived to consult.
+    // A database an older storage engine built. Asked before corruption:
+    // the file is intact, and the corruption remedies would all be wrong.
+    if let Some(nestweaver_store::StoreError::RebuildRequired { path, reason }) = err
+        .chain()
+        .filter_map(|source| source.downcast_ref::<nestweaver_store::StoreError>())
+        .find(|store_error| store_error.is_rebuild_required())
+    {
+        return rebuild_required_diagnostic(
+            redact_build_paths(&path.display().to_string()),
+            reason.to_string(),
+        );
+    }
+    if let Some((path, reason)) = parse_rebuild_required(&format!("{err:#}")) {
+        return rebuild_required_diagnostic(path, reason);
+    }
+
     let typed = err
         .chain()
         .find_map(|source| source.downcast_ref::<nestweaver_store::StoreError>())
@@ -9847,6 +9978,9 @@ fn resolve_base_db_with_config_source(
     db: Option<PathBuf>,
     config: Option<&Path>,
 ) -> anyhow::Result<(PathBuf, Option<nestweaver_engine::InstanceConfig>, DbSource)> {
+    if let Some(cfg_path) = config {
+        record_config_path(cfg_path);
+    }
     let cfg = config
         .map(|cfg_path| {
             nestweaver_engine::InstanceConfig::from_file(cfg_path)
@@ -23343,6 +23477,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 db_path.display()
                             )));
                         }
+                        // Same guard autostart runs: never spawn (or install a
+                        // launchd job for) a daemon that would crash-loop on a
+                        // database an older storage engine built.
+                        if let Some(error) =
+                            nestweaver_daemon::lifecycle::db_rebuild_required(&db_path)
+                        {
+                            return Err(anyhow::Error::new(error).context(format!(
+                                "refusing to start a daemon against the database at {}",
+                                db_path.display()
+                            )));
+                        }
                         Ok(())
                     };
 
@@ -25815,6 +25960,7 @@ mod cli_help_contract_tests {
             CliDiagnostic::DatabaseWalCorrupt { .. } => "db_wal_corrupt",
             CliDiagnostic::DatabaseCheckpointDebris { .. } => "db_checkpoint_debris",
             CliDiagnostic::ExportScopeUnsupported { .. } => "export_scope_unsupported",
+            CliDiagnostic::DatabaseRebuildRequired { .. } => "db_rebuild_required",
             CliDiagnostic::General { .. } => "error",
         }
     }
@@ -25944,6 +26090,23 @@ mod cli_help_contract_tests {
                      to the invocation the caller is already writing",
                 ),
             ),
+            (
+                // A database an older storage engine built. It never clears:
+                // nothing that runs later changes the file's format. The remedy
+                // WRITES, but only to a NEW database beside this one (a
+                // publication slot, or a fresh `--db` path), and the refusal
+                // itself establishes that this file is untouched and stays the
+                // rollback copy, so the write cannot destroy the data it is
+                // about. Both rendered forms are real invocations.
+                CliDiagnostic::DatabaseRebuildRequired {
+                    path: sample("d"),
+                    reason: sample("was built by an older engine"),
+                    remedy: sample("nestweaver publication rebuild --config instance.toml"),
+                },
+                Clears::Never,
+                WriteRemedy::Allowed,
+                Remedy::Invocation,
+            ),
             // The catch-all. Its remedy is whatever the wrapped `anyhow` chain
             // said, so no static tier can check it — nw-334/G3.
             (
@@ -25985,7 +26148,7 @@ mod cli_help_contract_tests {
         // this equality is what then forces it into the inventory too.
         assert_eq!(
             inventory.len(),
-            12,
+            13,
             "a `CliDiagnostic` variant was added or removed without \
              classifying it here"
         );

@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 /// finds an unfamiliar file beside `<db>.lbug` should be able to find this
 /// list rather than guess whether it is safe to touch.
 ///
-/// A fresh index with `--with-trigrams` lays down all twelve of:
-/// `.filemeta.json`, `.generation`, `.manifests.json`, `.pagerank.json`,
+/// A fresh index with `--with-trigrams` lays down all thirteen of:
+/// `.engine-format`, `.filemeta.json`, `.generation`, `.manifests.json`, `.pagerank.json`,
 /// `.parsed_cache.bin`, `.publications/`, `.resolution_deps.bin`,
 /// `.resolver_generation.json`, `.tantivy/`, `.wal`, `.write.lock`, and
 /// `.regex-v3/`. [`SIDECAR_SUFFIXES`] below is the subset a backup archives —
@@ -79,6 +79,9 @@ const SIDECAR_SUFFIXES: &[&str] = &[
     ".embeddings",
     crate::publication::SOURCE_MANIFEST_SUFFIX,
     crate::publication::PRESERVED_STATE_SUFFIX,
+    // The storage-engine format the graph file was built with. It travels with
+    // the graph so a restored database opens without re-deriving it.
+    nestweaver_store::engine_format::ENGINE_FORMAT_SIDECAR_SUFFIX,
 ];
 
 /// Current backup manifest version. Version 2 embeds the same typed
@@ -2022,6 +2025,14 @@ fn backup_artifact_contract(
             Some(".filemeta.json") => {
                 (ArtifactKind::FileMetadata, 1, "nestweaver-file-metadata-v1")
             }
+            // Which storage-engine string hash built the graph file beside it.
+            // A compatibility stamp, like the resolver generation: it describes
+            // the graph, so it travels with it.
+            Some(nestweaver_store::engine_format::ENGINE_FORMAT_SIDECAR_SUFFIX) => (
+                ArtifactKind::CompatibilityStamp,
+                1,
+                "nestweaver-engine-format-v1",
+            ),
             Some(".manifests.json") => anyhow::bail!(
                 "repository manifest contract requires payload inspection; use backup_artifact_contract_for_payload"
             ),

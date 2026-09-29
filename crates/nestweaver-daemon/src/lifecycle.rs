@@ -885,6 +885,46 @@ pub fn db_wal_unreadable(db_path: &Path) -> Option<nestweaver_store::StoreError>
     }
 }
 
+/// Was the database this daemon would serve built by an older storage engine?
+///
+/// `Some(StoreError::RebuildRequired)` means a daemon started against it would
+/// refuse the open on boot, exit, and be restarted by its supervisor into the
+/// same refusal: a crash loop that hides the one sentence that matters. So the
+/// autostart and `daemon start` sites ask this FIRST and refuse to spawn.
+///
+/// Resolves the publication `CURRENT` pointer exactly as the daemon does, so a
+/// base database left behind as the rollback copy after a rebuild does not
+/// block a daemon that would serve the new selected slot. Every other answer,
+/// including a probe that fails for an unrelated reason, is `None`: this guard
+/// refuses only what it can prove, and the daemon's own open still reports the
+/// rest.
+pub fn db_rebuild_required(db_path: &Path) -> Option<nestweaver_store::StoreError> {
+    fn rebuild_required_in(error: &anyhow::Error) -> Option<nestweaver_store::StoreError> {
+        error.chain().find_map(|source| {
+            match source.downcast_ref::<nestweaver_store::StoreError>()? {
+                nestweaver_store::StoreError::RebuildRequired { path, reason } => {
+                    Some(nestweaver_store::StoreError::RebuildRequired {
+                        path: path.clone(),
+                        reason: reason.clone(),
+                    })
+                }
+                _ => None,
+            }
+        })
+    }
+    if !db_path.exists() {
+        return None;
+    }
+    let selected = match nestweaver_engine::publication::resolve_selected_database(db_path) {
+        Ok(selected) => selected,
+        Err(error) => return rebuild_required_in(&error),
+    };
+    match nestweaver_store::GraphStore::check_engine_format(&selected) {
+        Err(error) if error.is_rebuild_required() => Some(error),
+        _ => None,
+    }
+}
+
 /// nw-367. Distinguish a LIVE checkpoint from the debris a crashed one leaves.
 ///
 /// The engine raises one message —

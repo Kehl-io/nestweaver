@@ -663,6 +663,15 @@ fn ensure_daemon_with_spawn_lock_impl(
             db_path.display()
         )));
     }
+    // A database an older storage engine built: the daemon would refuse it on
+    // boot and its supervisor would restart it into the same refusal. Say the
+    // one thing that matters, here, before any process exists.
+    if let Some(error) = nestweaver_daemon::lifecycle::db_rebuild_required(db_path) {
+        return Err(anyhow::Error::new(error).context(format!(
+            "refusing to start a daemon against the database at {}",
+            db_path.display()
+        )));
+    }
 
     // Spawn the daemon as a detached child.
     let mut launcher = spawn_daemon(db_path, restart_config.as_path(), spawn_lock, usage)?;

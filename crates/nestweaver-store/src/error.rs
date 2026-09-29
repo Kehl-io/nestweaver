@@ -109,6 +109,22 @@ impl std::fmt::Display for CorruptionKind {
 /// truncated file or an engine assertion reported in the same error chain.
 pub const LIVE_WRITER_DISCLOSURE: &str = "another process holds the write lease";
 
+/// Diagnostic code carried by [`StoreError::RebuildRequired`].
+///
+/// It lives in the error's own `Display` as well as in the CLI diagnostic, so
+/// every surface that only relays error TEXT (the MCP and web error envelopes,
+/// a daemon status line, a log) still names the condition and the remedy.
+pub const DB_REBUILD_REQUIRED_CODE: &str = "nestweaver::db_rebuild_required";
+
+/// The remedy [`StoreError::RebuildRequired`] names when the caller cannot
+/// supply the concrete configuration path. The CLI renders a concrete command.
+pub const DB_REBUILD_REQUIRED_REMEDY: &str = concat!(
+    "stop the daemon, then run ",
+    "`nestweaver publication rebuild --config <instance.toml>`. ",
+    "The rebuild builds a new database beside this one and switches to it only after it ",
+    "validates; this file is left exactly as it is"
+);
+
 /// Replace any absolute path into a Rust build tree with the crate it points
 /// at, so a message the storage engine wrote with `__FILE__` cannot ship a
 /// developer's home directory to a user.
@@ -611,6 +627,28 @@ pub enum StoreError {
         "embedding artifact payload failed its checksum; semantic search is unavailable until a re-embed"
     )]
     EmbeddingArtifactCorrupt,
+    /// The database was built by a storage engine older than the one this
+    /// binary links, and the two disagree about how text keys are hashed.
+    ///
+    /// LadybugDB 0.21 changed the string hash for bytes at or above 0x80 on
+    /// signed-char platforms without bumping its storage version, so the
+    /// engine itself opens an older file without complaint and then silently
+    /// misses primary-key lookups on non-ASCII keys. Refused BEFORE the engine
+    /// opens the file (a writable 0.21 open replays and checkpoints the log),
+    /// so the bytes on disk are untouched. Never [`Self::Corruption`]: the file
+    /// is intact, it is simply the wrong format for this engine.
+    #[error(
+        "database rebuild required ({code}): {path} {reason}. This NestWeaver's storage engine          (LadybugDB 0.21) hashes text keys differently from the engine that built it, so the          database was NOT opened and nothing in it was changed. To rebuild: {remedy}",
+        path = .path.display(),
+        code = DB_REBUILD_REQUIRED_CODE,
+        remedy = DB_REBUILD_REQUIRED_REMEDY
+    )]
+    ///
+    /// Fields are boxed so this rare variant does not grow every `Result`.
+    RebuildRequired {
+        path: Box<PathBuf>,
+        reason: Box<str>,
+    },
 }
 
 impl StoreError {
@@ -630,8 +668,15 @@ impl StoreError {
             | StoreError::PresentationLimitExceeded { .. }
             | StoreError::Cancelled(_)
             | StoreError::CorruptValue { .. }
-            | StoreError::EmbeddingArtifactCorrupt => false,
+            | StoreError::EmbeddingArtifactCorrupt
+            | StoreError::RebuildRequired { .. } => false,
         }
+    }
+
+    /// True when this database must be rebuilt before this binary may open
+    /// it. See [`StoreError::RebuildRequired`].
+    pub fn is_rebuild_required(&self) -> bool {
+        matches!(self, StoreError::RebuildRequired { .. })
     }
 
     /// True when this error represents a cancelled (incomplete) computation.
@@ -1262,7 +1307,7 @@ mod corruption_classification_tests {
     fn redact_build_paths_strips_home_and_registry_prefix() {
         let raw = "query error: Assertion failed in file \
                    \"/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/\
-lbug-0.20.4/lbug-src/src/include/common/concurrent_vector.h\" on line 76: \
+lbug-0.21.0/lbug-src/src/include/common/concurrent_vector.h\" on line 76: \
                    index != nullptr";
         let redacted = super::redact_build_paths(raw);
         assert!(
@@ -1274,7 +1319,7 @@ lbug-0.20.4/lbug-src/src/include/common/concurrent_vector.h\" on line 76: \
             "the runner home survived: {redacted}"
         );
         assert!(
-            redacted.contains("<dep>/lbug-0.20.4/"),
+            redacted.contains("<dep>/lbug-0.21.0/"),
             "the crate-relative remainder must survive: {redacted}"
         );
         assert!(

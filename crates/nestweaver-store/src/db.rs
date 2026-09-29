@@ -387,6 +387,11 @@ pub struct GraphStore {
 pub enum GraphStoreAccessMode {
     ReadWrite,
     ReadOnly,
+    /// Read-only access to a database an OLDER storage engine built, admitted
+    /// only by [`GraphStore::open_legacy_engine_read_only`] so a rebuild or a
+    /// restore can read what it needs to replace it. Every identity read on
+    /// such a handle scans instead of using a primary-key lookup.
+    LegacyEngineReadOnly,
 }
 
 /// Persistent identity of one NestWeaver brain and its current publication
@@ -816,6 +821,67 @@ fn open_failure(path: &Path, message: String, read_write: bool) -> StoreError {
     StoreError::from_engine_message_for_db(message, path)
 }
 
+/// Write `<db>.engine-format` for a database this engine just created.
+///
+/// Best effort: the same fact is recorded inside the database by
+/// `init_schema`, and a missing sidecar is recovered by the read-only probe on
+/// the next open, so a failed write degrades to one extra probe, not a refusal.
+fn stamp_engine_format_sidecar(path: &Path) {
+    if let Err(error) = crate::engine_format::write_sidecar(path) {
+        tracing::warn!(
+            "could not write the engine-format marker {}: {error}; the next open \
+             re-derives it from the database",
+            crate::engine_format::sidecar_path(path).display()
+        );
+    }
+}
+
+/// Read the engine-format `Meta` row through a READ-ONLY open, by a full scan
+/// (never a primary-key lookup, see [`GraphStore::meta_value_by_scan`]).
+/// Called only when no sidecar exists and no crash debris is present, so the
+/// read-only open replays nothing. Refuses when the marker is absent; when it
+/// is found, rewrites the sidecar if `stamp_sidecar` (writable opens only).
+fn probe_engine_format_marker(path: &Path, stamp_sidecar: bool) -> Result<(), StoreError> {
+    use crate::engine_format::{ENGINE_FORMAT_META_KEY, ENGINE_FORMAT_VALUE};
+    let db = lbug::Database::new(path, bounded_system_config().read_only(true))
+        .map_err(|error| open_failure(path, error.to_string(), false))?;
+    let marker = {
+        let conn = lbug::Connection::new(&db)
+            .map_err(|error| open_failure(path, error.to_string(), false))?;
+        match GraphStore::meta_value_by_scan(&conn, ENGINE_FORMAT_META_KEY) {
+            Ok(marker) => marker,
+            // No `Meta` table at all: no marker, and not a NestWeaver graph
+            // this engine built.
+            Err(error)
+                if error.to_string().contains("Meta")
+                    && error.to_string().to_lowercase().contains("does not exist") =>
+            {
+                None
+            }
+            // Anything else (a damaged file, say) is reported as itself, never
+            // disguised as a format question.
+            Err(error) => return Err(open_failure(path, error.to_string(), false)),
+        }
+    };
+    drop(db);
+    match marker {
+        Some(value) if value == ENGINE_FORMAT_VALUE => {
+            if stamp_sidecar {
+                stamp_engine_format_sidecar(path);
+            }
+            Ok(())
+        }
+        Some(value) => Err(crate::engine_format::rebuild_required(
+            path,
+            format!("records an engine format this build does not recognise ({value:?})"),
+        )),
+        None => Err(crate::engine_format::rebuild_required(
+            path,
+            crate::engine_format::NO_MARKER_REASON,
+        )),
+    }
+}
+
 /// Open an lbug database, auto-recovering once from crash debris that would
 /// otherwise make it permanently unopenable.
 ///
@@ -836,8 +902,22 @@ fn open_lbug_with_recovery(
     // `open_crash_guard` for why a header check and an out-of-process probe
     // were both rejected.
     let _crash_guard = crate::open_crash_guard::arm(path);
+    // Refuse a database an older storage engine built BEFORE the engine sees
+    // it: a writable open replays the log and checkpoints it into the file.
+    let precheck = crate::engine_format::check(path)?;
+    if precheck == crate::engine_format::Precheck::NeedsProbe {
+        // Only a writable open rewrites the sidecar: a read-only open (a
+        // sealed snapshot, a restore being validated) must not add a file to
+        // a directory whose inventory was just checked.
+        probe_engine_format_marker(path, read_write)?;
+    }
     match lbug::Database::new(path, make_config()) {
-        Ok(db) => Ok(db),
+        Ok(db) => {
+            if read_write && precheck == crate::engine_format::Precheck::Fresh {
+                stamp_engine_format_sidecar(path);
+            }
+            Ok(db)
+        }
         Err(e) => {
             let msg = e.to_string();
             // The failed engine open just closed its database descriptor.
@@ -1341,6 +1421,52 @@ impl GraphStore {
             bounded_system_config().read_only(true)
         })?;
         Self::finish_read_only_open(path, db)
+    }
+
+    /// Open a database an OLDER storage engine built, read-only, for the one
+    /// job of replacing it.
+    ///
+    /// This is the narrow exemption from the engine-format refusal: it skips
+    /// the marker check and every recovery arm, never runs DDL, never stamps a
+    /// marker, and returns a handle whose identity reads scan `Meta` instead of
+    /// using a primary-key lookup (the lookup structure is what changed). Only
+    /// `publication rebuild` (reading the incumbent it rebuilds from) and
+    /// `backup restore` (validating a pre-upgrade archive) call it. Any other
+    /// caller should get [`StoreError::RebuildRequired`] instead.
+    pub fn open_legacy_engine_read_only(path: &Path) -> Result<Self, StoreError> {
+        let _crash_guard = crate::open_crash_guard::arm(path);
+        let db = lbug::Database::new(path, bounded_system_config().read_only(true))
+            .map_err(|error| open_failure(path, error.to_string(), false))?;
+        let mut store = Self::finish_read_only_open(path, db)?;
+        store.access_mode = GraphStoreAccessMode::LegacyEngineReadOnly;
+        Ok(store)
+    }
+
+    /// Open read-only, falling back to [`Self::open_legacy_engine_read_only`]
+    /// ONLY when the database was refused as built by an older engine. For the
+    /// rebuild and restore paths; see that function.
+    pub fn open_read_only_allowing_legacy_engine(path: &Path) -> Result<Self, StoreError> {
+        match Self::open_read_only_without_migration(path) {
+            Err(StoreError::RebuildRequired { .. }) => Self::open_legacy_engine_read_only(path),
+            other => other,
+        }
+    }
+
+    /// Decide, without a writable open, whether this binary may open `path`:
+    /// `Err(StoreError::RebuildRequired)` for a database an older storage
+    /// engine built. The same check every constructor runs first, exposed for
+    /// preflights that must refuse BEFORE spawning a process that would open
+    /// it. Never mutates the database; may rewrite the engine-format sidecar.
+    pub fn check_engine_format(path: &Path) -> Result<(), StoreError> {
+        if crate::engine_format::check(path)? == crate::engine_format::Precheck::NeedsProbe {
+            probe_engine_format_marker(path, false)?;
+        }
+        Ok(())
+    }
+
+    /// True when this handle reads a database an older storage engine built.
+    pub fn is_legacy_engine(&self) -> bool {
+        self.access_mode == GraphStoreAccessMode::LegacyEngineReadOnly
     }
 
     /// Catalog migrations this handle still needs, rendered as
@@ -3369,8 +3495,13 @@ impl GraphStore {
     /// artifacts to this graph.
     pub fn publication_identity(&self) -> Result<Option<PublicationIdentity>, StoreError> {
         let conn = self.conn()?;
-        let brain_uuid = Self::publication_meta_value_on(&conn, BRAIN_UUID_META_KEY)?;
-        let publication_uuid = Self::publication_meta_value_on(&conn, PUBLICATION_UUID_META_KEY)?;
+        let read = if self.access_mode == GraphStoreAccessMode::LegacyEngineReadOnly {
+            Self::meta_value_by_scan
+        } else {
+            Self::publication_meta_value_on
+        };
+        let brain_uuid = read(&conn, BRAIN_UUID_META_KEY)?;
+        let publication_uuid = read(&conn, PUBLICATION_UUID_META_KEY)?;
         match (brain_uuid, publication_uuid) {
             (None, None) => Ok(None),
             (Some(brain_uuid), Some(publication_uuid)) => {
@@ -3443,6 +3574,9 @@ impl GraphStore {
     /// `None` means a database predating nw-246, or one with no data yet.
     pub fn data_instance_id(&self) -> Result<Option<String>, StoreError> {
         let conn = self.conn()?;
+        if self.access_mode == GraphStoreAccessMode::LegacyEngineReadOnly {
+            return Self::meta_value_by_scan(&conn, DATA_INSTANCE_ID_META_KEY);
+        }
         Self::publication_meta_value_on(&conn, DATA_INSTANCE_ID_META_KEY)
     }
 
@@ -4177,7 +4311,50 @@ impl GraphStore {
         // above, so no migration can name a table that does not exist yet.
         Self::apply_column_migrations(&conn)?;
 
+        // Only ever reached by a writable open that passed the engine-format
+        // check (or an in-memory store), so stamping here can never adopt a
+        // database an older engine built.
+        Self::ensure_engine_format_marker_on(&conn)?;
+
         Ok(())
+    }
+
+    /// Record, inside the database, which string-hash format built it. See
+    /// [`crate::engine_format`]. Idempotent: an existing current marker is left
+    /// alone; a different one is refused rather than overwritten.
+    fn ensure_engine_format_marker_on(conn: &lbug::Connection<'_>) -> Result<(), StoreError> {
+        use crate::engine_format::{ENGINE_FORMAT_META_KEY, ENGINE_FORMAT_VALUE};
+        match Self::publication_meta_value_on(conn, ENGINE_FORMAT_META_KEY)? {
+            Some(value) if value == ENGINE_FORMAT_VALUE => Ok(()),
+            Some(value) => Err(StoreError::Query(format!(
+                "database records engine format {value:?} under {ENGINE_FORMAT_META_KEY}, \
+                 expected {ENGINE_FORMAT_VALUE:?}; refusing to overwrite it"
+            ))),
+            None => {
+                Self::create_publication_meta_on(conn, ENGINE_FORMAT_META_KEY, ENGINE_FORMAT_VALUE)
+            }
+        }
+    }
+
+    /// The engine-format marker, read by a FULL SCAN of `Meta`.
+    ///
+    /// A primary-key lookup (`MATCH (m:Meta {key: $key})`) goes through the
+    /// engine's hash index, which is exactly the structure whose hash changed
+    /// in LadybugDB 0.21. Every read of a database that may predate that change
+    /// scans instead; `Meta` holds a handful of rows.
+    fn meta_value_by_scan(
+        conn: &lbug::Connection<'_>,
+        key: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let rows = conn
+            .query("MATCH (m:Meta) RETURN m.key, m.value")
+            .map_err(|error| StoreError::Query(format!("scan Meta: {error}")))?;
+        for row in rows {
+            if crate::read::extract_string(&row, 0)? == key {
+                return crate::read::extract_string(&row, 1).map(Some);
+            }
+        }
+        Ok(None)
     }
 
     /// Apply every declared additive column migration, reporting anything that
@@ -6039,13 +6216,21 @@ mod schema_migration_tests {
     }
 
     /// Run DDL against a closed database.
+    ///
+    /// Fixtures built here model a previous NestWeaver release on the SAME
+    /// storage engine: the schema is old, the engine format is current, so the
+    /// engine-format sidecar is written. (The engine-format refusal has its own
+    /// tests; these are about column migrations.)
     fn run(path: &std::path::Path, statements: &[String]) {
-        let db = lbug::Database::new(path, bounded_system_config()).unwrap();
-        let conn = lbug::Connection::new(&db).unwrap();
-        for statement in statements {
-            conn.query(statement)
-                .unwrap_or_else(|error| panic!("{statement}: {error}"));
+        {
+            let db = lbug::Database::new(path, bounded_system_config()).unwrap();
+            let conn = lbug::Connection::new(&db).unwrap();
+            for statement in statements {
+                conn.query(statement)
+                    .unwrap_or_else(|error| panic!("{statement}: {error}"));
+            }
         }
+        crate::engine_format::write_sidecar(path).unwrap();
     }
 
     fn rows(conn: &lbug::Connection<'_>, query: &str) -> Vec<Vec<lbug::Value>> {
@@ -6734,5 +6919,228 @@ mod hardening_activity_tests {
             ("retained".into(), HashMap::from([("same.rs".into(), 0.2)])),
         ]));
         assert_eq!(store.git_activity_score("removed", "same.rs"), Some(0.1));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod engine_format_open_tests {
+    use super::{GraphStore, bounded_system_config};
+    use crate::StoreError;
+    use crate::engine_format::{ENGINE_FORMAT_META_KEY, ENGINE_FORMAT_VALUE, sidecar_path};
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    /// Every regular file under `dir`, with its bytes.
+    pub(crate) fn tree_bytes(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.insert(path.clone(), std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    fn repo(uid: &str) -> nestweaver_schema::Repo {
+        nestweaver_schema::Repo {
+            uid: uid.to_string(),
+            url: format!("file:///{uid}"),
+            indexed_sha: "sha".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "default".to_string(),
+            name: None,
+            root_path: None,
+        }
+    }
+
+    /// A database in the shape every release before the LadybugDB 0.21 cutover
+    /// left behind: a complete NestWeaver schema and identity, NO engine-format
+    /// `Meta` row and NO sidecar. Built by creating a current database and then
+    /// removing both markers, because this build cannot run the old engine.
+    /// The pre-open check never reads anything the old engine would have
+    /// written differently, so the shape is what matters.
+    pub(crate) fn make_legacy_fixture(path: &Path) {
+        {
+            let store = GraphStore::create(path).unwrap();
+            store.insert_repo(&repo("repo:café")).unwrap();
+        }
+        {
+            let db = lbug::Database::new(path, bounded_system_config()).unwrap();
+            let conn = lbug::Connection::new(&db).unwrap();
+            conn.query(&format!(
+                "MATCH (m:Meta) WHERE m.key = '{ENGINE_FORMAT_META_KEY}' DELETE m"
+            ))
+            .unwrap();
+            conn.query("CHECKPOINT").unwrap();
+        }
+        std::fs::remove_file(sidecar_path(path)).unwrap();
+        for suffix in [".wal", ".wal.checkpoint", ".shadow"] {
+            let debris = PathBuf::from(format!("{}{suffix}", path.display()));
+            assert!(!debris.exists(), "fixture left {}", debris.display());
+        }
+    }
+
+    fn marker_in(path: &Path) -> Option<String> {
+        let db = lbug::Database::new(path, bounded_system_config().read_only(true)).unwrap();
+        let conn = lbug::Connection::new(&db).unwrap();
+        GraphStore::meta_value_by_scan(&conn, ENGINE_FORMAT_META_KEY).unwrap()
+    }
+
+    fn assert_rebuild_required(result: Result<GraphStore, StoreError>, what: &str) {
+        match result {
+            Err(StoreError::RebuildRequired { path, reason }) => {
+                assert!(path.ends_with("graph.lbug"), "{what}: {}", path.display());
+                assert!(!reason.is_empty(), "{what}");
+            }
+            Err(other) => panic!("{what}: expected RebuildRequired, got {other}"),
+            Ok(_) => panic!("{what}: a pre-cutover database was opened"),
+        }
+    }
+
+    #[test]
+    fn a_fresh_database_carries_both_markers_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        drop(GraphStore::create(&db).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(sidecar_path(&db)).unwrap().trim(),
+            ENGINE_FORMAT_VALUE
+        );
+        assert_eq!(marker_in(&db).as_deref(), Some(ENGINE_FORMAT_VALUE));
+        drop(GraphStore::open(&db).unwrap());
+        drop(GraphStore::open_read_only(&db).unwrap());
+    }
+
+    /// The owner's decision: refused on EVERY constructor, with the typed
+    /// error, and the refusal changes no byte on disk (the engine never opened
+    /// the file writable, so nothing replayed or checkpointed).
+    #[test]
+    fn a_database_without_the_marker_is_refused_on_every_open_and_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        make_legacy_fixture(&db);
+        let before = tree_bytes(dir.path());
+
+        assert_rebuild_required(GraphStore::open(&db), "open");
+        assert_rebuild_required(GraphStore::create(&db), "create over it");
+        assert_rebuild_required(GraphStore::open_or_create(&db), "open_or_create");
+        assert_rebuild_required(GraphStore::open_read_only(&db), "open_read_only");
+        assert_rebuild_required(
+            GraphStore::open_read_only_without_migration(&db),
+            "open_read_only_without_migration",
+        );
+        assert!(
+            GraphStore::check_engine_format(&db)
+                .unwrap_err()
+                .is_rebuild_required()
+        );
+
+        assert_eq!(
+            tree_bytes(dir.path()),
+            before,
+            "a refused open changed the database directory"
+        );
+    }
+
+    #[test]
+    fn a_lost_sidecar_is_rederived_from_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        drop(GraphStore::create(&db).unwrap());
+        std::fs::remove_file(sidecar_path(&db)).unwrap();
+
+        drop(GraphStore::open_read_only(&db).unwrap());
+        assert!(
+            !sidecar_path(&db).exists(),
+            "a read-only open verifies but never adds a file"
+        );
+        drop(GraphStore::open(&db).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(sidecar_path(&db)).unwrap().trim(),
+            ENGINE_FORMAT_VALUE,
+            "a writable open rewrites the sidecar it verified"
+        );
+    }
+
+    /// A current database whose writer died before a checkpoint: the image is
+    /// the data file plus a live `.wal`, captured while the store is open.
+    fn crashed_image(sidecar: bool) -> (tempfile::TempDir, PathBuf) {
+        let live = tempfile::tempdir().unwrap();
+        let live_db = live.path().join("graph.lbug");
+        let crashed = tempfile::tempdir().unwrap();
+        let crashed_db = crashed.path().join("graph.lbug");
+        let store = GraphStore::create(&live_db).unwrap();
+        store.insert_repo(&repo("repo:after-crash")).unwrap();
+        let wal = PathBuf::from(format!("{}.wal", live_db.display()));
+        assert!(wal.exists(), "the write must still be in the log");
+        std::fs::copy(&live_db, &crashed_db).unwrap();
+        std::fs::copy(&wal, format!("{}.wal", crashed_db.display())).unwrap();
+        if sidecar {
+            std::fs::copy(sidecar_path(&live_db), sidecar_path(&crashed_db)).unwrap();
+        }
+        drop(store);
+        (crashed, crashed_db)
+    }
+
+    #[test]
+    fn a_fresh_database_that_crashed_mid_write_still_recovers() {
+        let (_dir, db) = crashed_image(true);
+        let store = GraphStore::open(&db).unwrap();
+        let repos = store.list_repos(None).unwrap();
+        assert!(
+            repos.iter().any(|repo| repo.uid == "repo:after-crash"),
+            "the committed write in the log must be replayed: {repos:?}"
+        );
+    }
+
+    /// Conservative by design: without the sidecar, a log beside the file
+    /// means even a read-only probe would replay records of an unknown format.
+    #[test]
+    fn a_crashed_database_that_also_lost_its_sidecar_is_refused_untouched() {
+        let (dir, db) = crashed_image(false);
+        let before = tree_bytes(dir.path());
+        let error = GraphStore::open(&db).err().expect("must refuse");
+        assert!(error.is_rebuild_required(), "{error}");
+        assert!(error.to_string().contains(".wal"), "{error}");
+        assert_eq!(tree_bytes(dir.path()), before);
+    }
+
+    #[test]
+    fn the_legacy_exemption_reads_identity_by_scan_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        make_legacy_fixture(&db);
+        let before = tree_bytes(dir.path());
+
+        let store = GraphStore::open_read_only_allowing_legacy_engine(&db).unwrap();
+        assert!(store.is_legacy_engine());
+        assert!(!store.is_read_write());
+        assert!(store.publication_identity().unwrap().is_some());
+        let repos = store.list_repos(None).unwrap();
+        assert_eq!(repos.len(), 1, "{repos:?}");
+        drop(store);
+
+        assert_eq!(tree_bytes(dir.path()), before);
+        assert!(
+            !sidecar_path(&db).exists(),
+            "the exemption must never stamp"
+        );
+    }
+
+    #[test]
+    fn the_refusal_names_the_code_and_the_rebuild_in_its_own_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        make_legacy_fixture(&db);
+        let text = GraphStore::open(&db).err().unwrap().to_string();
+        assert!(text.contains(crate::DB_REBUILD_REQUIRED_CODE), "{text}");
+        assert!(text.contains("nestweaver publication rebuild"), "{text}");
+        assert!(text.contains(&db.display().to_string()), "{text}");
     }
 }

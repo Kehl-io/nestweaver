@@ -7196,6 +7196,13 @@ fn opening_a_corrupted_database_never_dies_on_a_signal() {
     for (index, (from, to)) in [(0.005, 0.2), (0.05, 0.95), (0.4, 0.6)].iter().enumerate() {
         let db = dir.path().join(format!("corrupt{index}.lbug"));
         std::fs::copy(&pristine, &db).unwrap();
+        // Keep the engine-format sidecar with its database, so the open goes
+        // straight to the engine rather than through the marker probe.
+        std::fs::copy(
+            nestweaver_store::engine_format::sidecar_path(&pristine),
+            nestweaver_store::engine_format::sidecar_path(&db),
+        )
+        .unwrap();
         let start = (size as f64 * from) as u64;
         let end = (size as f64 * to) as u64;
         assert!(
@@ -12952,5 +12959,310 @@ fn brain_refresh_json_and_fail_on_skip_on_the_direct_route() {
         Some(0),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ── Storage-engine cutover (LadybugDB 0.21) ─────────────────────────────────
+//
+// LadybugDB 0.21 changed how text keys are hashed and kept the same storage
+// version, so the engine opens an older file without complaint and then
+// silently misses lookups on non-ASCII keys. NestWeaver refuses such a file
+// BEFORE the engine opens it, prints `nestweaver::db_rebuild_required` with one
+// rebuild command, exits 1, and changes no byte on disk.
+
+/// Every regular file under `dir`, with its bytes.
+fn engine_cutover_tree_bytes(
+    dir: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.insert(path.clone(), std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    out
+}
+
+/// Turn a database this build created into the shape every pre-cutover
+/// release left behind: no engine-format `Meta` row and no
+/// `<db>.engine-format` sidecar. (This build cannot run the old engine; the
+/// refusal never reads anything the old engine would have written differently.)
+fn make_pre_cutover(db: &std::path::Path) {
+    {
+        let store = nestweaver_store::GraphStore::open(db).unwrap();
+        let conn = store.begin_transaction().unwrap();
+        conn.query(&format!(
+            "MATCH (m:Meta) WHERE m.key = '{}' DELETE m",
+            nestweaver_store::engine_format::ENGINE_FORMAT_META_KEY
+        ))
+        .unwrap();
+        store.commit_transaction(&conn).unwrap();
+        drop(conn);
+        store.checkpoint().unwrap();
+    }
+    std::fs::remove_file(nestweaver_store::engine_format::sidecar_path(db)).unwrap();
+    for suffix in [".wal", ".wal.checkpoint", ".shadow"] {
+        assert!(
+            !std::path::PathBuf::from(format!("{}{suffix}", db.display())).exists(),
+            "fixture left {suffix} debris"
+        );
+    }
+}
+
+fn pre_cutover_db(dir: &std::path::Path) -> std::path::PathBuf {
+    let db = dir.join("brain.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db).unwrap());
+    make_pre_cutover(&db);
+    db
+}
+
+#[test]
+fn a_pre_cutover_database_is_refused_with_the_rebuild_command_and_left_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = pre_cutover_db(dir.path());
+    let before = engine_cutover_tree_bytes(dir.path());
+
+    let output = nestweaver_cmd()
+        .args(["brain", "status", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a valid invocation the database cannot satisfy exits 1: {combined}"
+    );
+    assert!(
+        combined.contains("nestweaver::db_rebuild_required"),
+        "{combined}"
+    );
+    // No config on this invocation: the remedy indexes into a NEW path and
+    // never names the refused file as a write target.
+    let fresh = dir.path().join("brain-rebuilt.lbug");
+    assert!(
+        combined.contains(&format!(
+            "nestweaver index --repo <path> --db {}",
+            fresh.display()
+        )),
+        "{combined}"
+    );
+    assert!(
+        !combined.contains(&format!("--db {} ", db.display())),
+        "the remedy must not write to the refused database: {combined}"
+    );
+    assert!(
+        !combined.contains("db_corrupt") && !combined.contains("db_wal_corrupt"),
+        "an intact file of the wrong format is not corruption: {combined}"
+    );
+    assert_eq!(
+        engine_cutover_tree_bytes(dir.path()),
+        before,
+        "the refusal changed bytes on disk"
+    );
+}
+
+#[test]
+fn the_rebuild_remedy_names_the_config_the_invocation_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = pre_cutover_db(dir.path());
+    let config = dir.path().join("instance.toml");
+    let quote = |path: &std::path::Path| serde_json::to_string(&path.to_string_lossy()).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "instance_id = \"cutover\"\ndb = {}\n[snapshot_storage]\nbackend = \"local\"\npath = {}\n[workspace]\nbackend = \"local\"\npath = {}\n[inference]\nendpoint = \"http://localhost:11434\"\nembedding_model = \"unused\"\nsummary_model = \"unused\"\n[git]\ncredential_method = \"gh\"\n",
+            quote(&db),
+            quote(&dir.path().join("snapshots")),
+            quote(&dir.path().join("workspace")),
+        ),
+    )
+    .unwrap();
+
+    let output = nestweaver_cmd()
+        .args(["brain", "status", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1), "{combined}");
+    let canonical = std::fs::canonicalize(&config).unwrap();
+    assert!(
+        combined.contains(&format!(
+            "nestweaver publication rebuild --config {}",
+            canonical.display()
+        )),
+        "{combined}"
+    );
+}
+
+/// The daemon guard. A daemon started against a pre-cutover database would
+/// refuse it on boot and exit; under a supervisor that is a crash loop that
+/// buries the one sentence that matters. Both spawn routes refuse FIRST.
+#[test]
+fn no_daemon_is_spawned_for_a_pre_cutover_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = pre_cutover_db(dir.path());
+    let before = engine_cutover_tree_bytes(dir.path());
+
+    for args in [
+        vec!["brain", "status", "--db"],
+        vec!["daemon", "start", "--db"],
+    ] {
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let sock = tempfile::tempdir().unwrap();
+        let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+            .args(&args)
+            .arg(&db)
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+            .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
+            .env("XDG_STATE_HOME", state.path())
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+            .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "10")
+            .output()
+            .unwrap();
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {combined}");
+        assert!(
+            combined.contains("nestweaver::db_rebuild_required"),
+            "{args:?}: {combined}"
+        );
+        assert!(
+            !combined.contains("did not become healthy")
+                && !combined.contains("exited before becoming healthy"),
+            "{args:?}: the refusal must come before any spawn: {combined}"
+        );
+        let pidfiles = engine_cutover_tree_bytes(runtime.path())
+            .into_keys()
+            .filter(|path| path.ends_with("daemon.pid"))
+            .collect::<Vec<_>>();
+        assert!(
+            pidfiles.is_empty(),
+            "{args:?}: a daemon was spawned: {pidfiles:?}"
+        );
+    }
+    assert_eq!(engine_cutover_tree_bytes(dir.path()), before);
+}
+
+#[test]
+fn the_daemon_rebuild_guard_refuses_only_a_pre_cutover_database() {
+    use nestweaver_daemon::lifecycle::db_rebuild_required;
+    let dir = tempfile::tempdir().unwrap();
+    assert!(db_rebuild_required(&dir.path().join("absent.lbug")).is_none());
+    let healthy = dir.path().join("healthy.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&healthy).unwrap());
+    assert!(db_rebuild_required(&healthy).is_none());
+    let old = dir.path().join("old");
+    std::fs::create_dir_all(&old).unwrap();
+    let legacy = pre_cutover_db(&old);
+    assert!(
+        db_rebuild_required(&legacy)
+            .expect("a pre-cutover database must be refused")
+            .is_rebuild_required()
+    );
+}
+
+/// The MCP and web surfaces relay error TEXT, not the CLI diagnostic, so the
+/// code and the rebuild command must survive in the text itself: an MCP client
+/// gets them in the JSON-RPC error frame, a `ui` operator on stderr.
+#[test]
+fn mcp_and_ui_surfaces_carry_the_rebuild_code_and_command() {
+    let scratch = tempfile::Builder::new()
+        .prefix("nw-cutover-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let db = pre_cutover_db(scratch.path());
+    let home = scratch.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let isolated = |command: &mut StdCommand| {
+        command
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+            .env_remove("NESTWEAVER_UPSTREAM")
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_CACHE_HOME", home.join("cache"))
+            .env("XDG_DATA_HOME", home.join("data"))
+            .env("XDG_STATE_HOME", home.join("state"))
+            .env("XDG_RUNTIME_DIR", home.join("runtime"))
+            .env("NESTWEAVER_SOCK_FALLBACK_DIR", home.join("sock"))
+            .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
+            .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "10");
+    };
+
+    let init = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05" }
+    });
+    let mut mcp = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"));
+    mcp.args(["mcp", "--db"])
+        .arg(&db)
+        .env_remove("NESTWEAVER_NO_DAEMON");
+    isolated(&mut mcp);
+    let mut child = mcp
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn nestweaver mcp");
+    {
+        use std::io::Write;
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, "{}", serde_json::to_string(&init).unwrap()).unwrap();
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(output.status.code(), Some(0), "{stderr}");
+    let frame: serde_json::Value = stdout
+        .lines()
+        .find_map(|line| serde_json::from_str(line).ok())
+        .unwrap_or_else(|| panic!("no JSON-RPC frame on stdout: {stdout:?}\n{stderr}"));
+    let message = frame["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("nestweaver::db_rebuild_required")
+            && message.contains("nestweaver publication rebuild"),
+        "the MCP error frame must carry the code and the rebuild command: {frame}"
+    );
+
+    let mut ui = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"));
+    ui.args(["ui", "--no-open", "--port", "0", "--db"])
+        .arg(&db)
+        .env_remove("NESTWEAVER_NO_DAEMON");
+    isolated(&mut ui);
+    let output = ui.output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1), "{combined}");
+    assert!(
+        combined.contains("nestweaver::db_rebuild_required"),
+        "{combined}"
     );
 }

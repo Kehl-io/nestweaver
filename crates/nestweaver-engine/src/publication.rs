@@ -1911,24 +1911,43 @@ mod tests {
         let generation = store.graph_generation();
         drop(store);
         let graph = std::fs::read(&graph_path).unwrap();
+        let engine_format_name = format!(
+            "{PUBLICATION_GRAPH_FILE}{}",
+            nestweaver_store::engine_format::ENGINE_FORMAT_SIDECAR_SUFFIX
+        );
+        let engine_format = std::fs::read(slot.join(&engine_format_name)).unwrap();
         let bundle = PublicationBundleV3 {
             format_version: crate::snapshot::SNAPSHOT_FORMAT_VERSION,
             brain_uuid: identity.brain_uuid.clone(),
             publication_uuid: identity.publication_uuid.clone(),
             producer_version: env!("CARGO_PKG_VERSION").to_string(),
             source_graph_generation: generation,
-            artifacts: vec![ArtifactDescriptor {
-                path: PUBLICATION_GRAPH_FILE.to_string(),
-                kind: ArtifactKind::Graph,
-                artifact_schema_version: 1,
-                byte_size: graph.len() as u64,
-                blake3: crate::hash::blake3_hex_bytes(&graph),
-                brain_uuid: identity.brain_uuid.clone(),
-                publication_uuid: identity.publication_uuid.clone(),
-                producer_version: env!("CARGO_PKG_VERSION").to_string(),
-                source_graph_generation: generation,
-                algorithm_fingerprint: "ladybugdb-graph-v1".to_string(),
-            }],
+            artifacts: vec![
+                ArtifactDescriptor {
+                    path: PUBLICATION_GRAPH_FILE.to_string(),
+                    kind: ArtifactKind::Graph,
+                    artifact_schema_version: 1,
+                    byte_size: graph.len() as u64,
+                    blake3: crate::hash::blake3_hex_bytes(&graph),
+                    brain_uuid: identity.brain_uuid.clone(),
+                    publication_uuid: identity.publication_uuid.clone(),
+                    producer_version: env!("CARGO_PKG_VERSION").to_string(),
+                    source_graph_generation: generation,
+                    algorithm_fingerprint: "ladybugdb-graph-v1".to_string(),
+                },
+                ArtifactDescriptor {
+                    path: engine_format_name,
+                    kind: ArtifactKind::CompatibilityStamp,
+                    artifact_schema_version: 1,
+                    byte_size: engine_format.len() as u64,
+                    blake3: crate::hash::blake3_hex_bytes(&engine_format),
+                    brain_uuid: identity.brain_uuid.clone(),
+                    publication_uuid: identity.publication_uuid.clone(),
+                    producer_version: env!("CARGO_PKG_VERSION").to_string(),
+                    source_graph_generation: generation,
+                    algorithm_fingerprint: "nestweaver-engine-format-v1".to_string(),
+                },
+            ],
         };
         let manifest = serde_json::to_vec_pretty(&bundle).unwrap();
         std::fs::write(slot.join(PUBLICATION_MANIFEST_FILE), &manifest).unwrap();
