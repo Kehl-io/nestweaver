@@ -150,6 +150,37 @@ test.describe("Tablet width (nw-593)", () => {
     await expect(liveRegion(page)).toContainText(/Compare ready: \d+ shared/, { timeout: 15_000 });
   });
 
+  test("an identical result is announced again", async ({ page, request }) => {
+    const from = await findSymbol(request, "releaseA");
+    await open(page, 1440, `/?node=${encodeURIComponent(from.uid)}&kind=${from.kind}`);
+    await expect(page.getByTestId("detail-panel").getByText("releaseA").first()).toBeVisible();
+    // Record every text the live region takes, so a repeat is visible even
+    // when it ends on the same string.
+    await liveRegion(page).evaluate((el) => {
+      const seen: string[] = [];
+      (window as unknown as { __live: string[] }).__live = seen;
+      new MutationObserver(() => seen.push(el.textContent ?? "")).observe(el, {
+        childList: true,
+        characterData: true,
+        subtree: true,
+      });
+    });
+    const announcements = () =>
+      page.evaluate(() =>
+        (window as unknown as { __live: string[] }).__live.filter((t) => t === "Found 1 path."),
+      );
+
+    const actions = page.getByTestId("detail-panel").getByRole("group", { name: "Node actions" }).first();
+    for (let round = 1; round <= 2; round += 1) {
+      await actions.getByRole("button", { name: /^Path$/ }).click();
+      const dialog = page.getByRole("dialog", { name: "Find path" });
+      await dialog.getByRole("textbox", { name: "Path target" }).fill("releaseC");
+      await dialog.getByRole("button", { name: "Find" }).click();
+      await expect.poll(async () => (await announcements()).length).toBe(round);
+      await expect(liveRegion(page)).toHaveText("Found 1 path.");
+    }
+  });
+
   test("counterweight: at 1440px the panes stay inline with no drawer", async ({ page, request }) => {
     const symbol = await findSymbol(request, "greet");
     await open(page, 1440, `/?node=${encodeURIComponent(symbol.uid)}&kind=${symbol.kind}`);

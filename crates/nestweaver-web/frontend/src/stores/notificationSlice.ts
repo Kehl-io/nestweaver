@@ -20,6 +20,8 @@ export interface NotifyInput {
 export interface NotificationSlice {
   notifications: Notification[];
   liveMessage: string;
+  /** Bumped on every announcement, so a repeated message is spoken again. */
+  liveMessageId: number;
   notify: (input: NotifyInput) => string;
   dismissNotification: (id: string) => void;
   announce: (message: string) => void;
@@ -35,6 +37,15 @@ function createNotificationId() {
   return `notification-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
+/** Write an announcement from inside any slice's immer producer. */
+export function setLiveMessage(
+  s: { liveMessage: string; liveMessageId: number },
+  message: string,
+) {
+  s.liveMessage = message;
+  s.liveMessageId += 1;
+}
+
 function formatLiveMessage(input: NotifyInput) {
   return input.message ? `${input.title}. ${input.message}` : input.title;
 }
@@ -47,6 +58,7 @@ export const createNotificationSlice: StateCreator<
 > = (set) => ({
   notifications: [],
   liveMessage: "",
+  liveMessageId: 0,
   notify: (input) => {
     let id = createNotificationId();
     set((s) => {
@@ -70,7 +82,7 @@ export const createNotificationSlice: StateCreator<
         });
         s.notifications = s.notifications.slice(0, MAX_NOTIFICATIONS);
       }
-      s.liveMessage = formatLiveMessage(input);
+      setLiveMessage(s, formatLiveMessage(input));
     });
     return id;
   },
@@ -80,6 +92,6 @@ export const createNotificationSlice: StateCreator<
     }),
   announce: (message) =>
     set((s) => {
-      s.liveMessage = message;
+      setLiveMessage(s, message);
     }),
 });

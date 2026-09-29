@@ -1,6 +1,7 @@
 import type { StateCreator } from "zustand";
 import type { ActiveLensState } from "../api/p1Types";
 import type { StoreState } from "./index";
+import { setLiveMessage } from "./notificationSlice";
 import type {
   BacklinkRow,
   BrainContextResult,
@@ -231,10 +232,12 @@ export const createAnalysisSlice: StateCreator<
       s.pathStatus = results.length > 0 ? "success" : "empty";
       s.pathError = null;
       s.selectedPathIndex = 0;
-      s.liveMessage =
+      setLiveMessage(
+        s,
         results.length > 0
           ? `Found ${results.length} path${results.length === 1 ? "" : "s"}.`
-          : "No path was found between these nodes.";
+          : "No path was found between these nodes.",
+      );
     }),
 
   setPathError: (error, request) =>
@@ -244,7 +247,7 @@ export const createAnalysisSlice: StateCreator<
       s.pathStatus = "error";
       s.pathError = error;
       s.selectedPathIndex = 0;
-      s.liveMessage = `Path query failed. ${error}`;
+      setLiveMessage(s, `Path query failed. ${error}`);
     }),
 
   isCurrentPathRequest: (request) => pathRequestMatches(get(), request),
@@ -287,7 +290,10 @@ export const createAnalysisSlice: StateCreator<
     set((s) => {
       s.diffState.snapshotB = snapshotB;
       s.diffState.seedsB = seedsB;
-      s.liveMessage = compareAnnouncement(s.diffState.snapshotA as BrainContextResult | null, snapshotB);
+      setLiveMessage(
+        s,
+        compareAnnouncement(s.diffState.snapshotA as BrainContextResult | null, snapshotB),
+      );
     }),
 
   clearDiff: () =>
