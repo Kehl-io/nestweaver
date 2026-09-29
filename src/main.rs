@@ -1737,6 +1737,12 @@ const ENV_REGISTRY: &[EnvVar] = &[
         name: "NESTWEAVER_OLD_ENGINE_FIXTURE_DIR",
         role: EnvRole::Internal,
     },
+    // Measurement switch: turns off the primary-key display repair in impact
+    // traversal, to A/B whether the storage engine still needs it.
+    EnvVar {
+        name: "NESTWEAVER_SKIP_PK_DISPLAY_REPAIR",
+        role: EnvRole::Internal,
+    },
     EnvVar {
         name: "NESTWEAVER_TEST_SERVER_TIMEOUT_SECS",
         role: EnvRole::Internal,
