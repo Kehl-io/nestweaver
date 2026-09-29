@@ -66,6 +66,39 @@ test.describe("Tablet width (nw-593)", () => {
     await expect(toggle).toBeFocused();
   });
 
+  test("reopening the drawer focuses the pane it was left on", async ({ page, request }) => {
+    const symbol = await findSymbol(request, "greet");
+    await open(page, 768, `/?node=${encodeURIComponent(symbol.uid)}&kind=${symbol.kind}`);
+    const toggle = page.getByRole("button", { name: "Inspector", exact: true });
+    await toggle.click();
+    const tabs = page.getByRole("tablist", { name: "Inspector panes" });
+    await tabs.getByRole("tab", { name: "Evidence" }).click();
+    await page.getByRole("button", { name: "Close inspector" }).click();
+    await expect(toggle).toBeFocused();
+    await toggle.click();
+    await expect(tabs.getByRole("tab", { name: "Evidence" })).toBeFocused();
+    await expect(tabs.getByRole("tab", { name: "Evidence" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  test("widening past the breakpoint closes the drawer so narrowing again does not steal focus", async ({
+    page,
+    request,
+  }) => {
+    const symbol = await findSymbol(request, "greet");
+    await open(page, 768, `/?node=${encodeURIComponent(symbol.uid)}&kind=${symbol.kind}`);
+    await page.getByRole("button", { name: "Inspector", exact: true }).click();
+    await expect(page.getByRole("complementary", { name: "Inspector" })).toBeVisible();
+
+    await page.setViewportSize({ width: 1440, height: 1024 });
+    await expect(page.getByTestId("detail-panel")).toBeVisible();
+    await page.getByTestId("search-input").focus();
+    await page.setViewportSize({ width: 768, height: 1024 });
+    const toggle = page.getByRole("button", { name: "Inspector", exact: true });
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await expect(page.getByRole("complementary", { name: "Inspector" })).toHaveCount(0);
+    await expect(page.getByTestId("search-input")).toBeFocused();
+  });
+
   test("every visible control at 768px has an aria-label or text", async ({ page, request }) => {
     const symbol = await findSymbol(request, "greet");
     for (const path of ["/", `/?node=${encodeURIComponent(symbol.uid)}&kind=${symbol.kind}`]) {

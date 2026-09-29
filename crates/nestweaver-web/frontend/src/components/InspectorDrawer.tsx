@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { useStore } from "../stores";
+import { useMediaQuery } from "../hooks/useMediaQuery";
 import { DetailPanel } from "./detail/DetailPanel";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { SourceEvidencePanel } from "./workspace/SourceEvidencePanel";
@@ -23,13 +24,23 @@ export function InspectorDrawer() {
   const open = useStore((s) => s.inspectorOpen);
   const setOpen = useStore((s) => s.setInspectorOpen);
   const [pane, setPane] = useState<Pane>("details");
-  const firstTabRef = useRef<HTMLButtonElement>(null);
+  const paneRef = useRef<Pane>(pane);
+  paneRef.current = pane;
+  const drawerWidth = useMediaQuery(INSPECTOR_DRAWER_QUERY);
 
+  // Opening focuses the pane the drawer was left on. Only `open` triggers
+  // it; switching panes moves focus through the tablist itself.
   useEffect(() => {
-    if (open) firstTabRef.current?.focus();
+    if (open) document.getElementById(`inspector-tab-${paneRef.current}`)?.focus();
   }, [open]);
 
-  if (!open) return null;
+  // Widening past the breakpoint puts Details/Evidence back inline; close
+  // the drawer so narrowing again does not reopen it and steal focus.
+  useEffect(() => {
+    if (!drawerWidth && open) setOpen(false);
+  }, [drawerWidth, open, setOpen]);
+
+  if (!open || !drawerWidth) return null;
 
   const close = () => {
     setOpen(false);
@@ -62,10 +73,9 @@ export function InspectorDrawer() {
             document.getElementById(`inspector-tab-${next}`)?.focus();
           }}
         >
-          {panes.map(({ key, label }, index) => (
+          {panes.map(({ key, label }) => (
             <button
               key={key}
-              ref={index === 0 ? firstTabRef : undefined}
               id={`inspector-tab-${key}`}
               type="button"
               role="tab"

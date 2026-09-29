@@ -173,7 +173,8 @@ function AppContent() {
             </>
           )}
         </Group>
-        {hideDetail && <InspectorDrawer />}
+        {/* Always mounted so it can close itself when the window widens. */}
+        <InspectorDrawer />
         </div>
       )}
       <StatusBar />
