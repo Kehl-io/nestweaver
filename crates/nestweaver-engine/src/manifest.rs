@@ -87,12 +87,15 @@ pub fn manifest_cache_path(db_path: &Path) -> PathBuf {
     crate::sidecar_path(db_path, ".manifests.json")
 }
 
-/// nw-688: each indexed repo's declared package name, keyed by repo uid, as a
-/// best-effort HINT for cross-repo call attribution. It reads the sidecar's
-/// payload without the generation check [`load_manifest_cache_for_db`]
-/// applies: package names rarely change, and a stale name can at worst
-/// restore a low-confidence name-matched hint, never remove a definition.
-/// Missing or unreadable is empty.
+/// nw-688: each indexed repo's declared package name, keyed by repo uid, for
+/// cross-repo call attribution. A call bound from a specifier that names one
+/// of these packages links to that repo as IMPORT-CORROBORATED (0.50): the
+/// manifest name match is real corroboration, not a bare name guess. It reads
+/// the sidecar's payload without the generation check
+/// [`load_manifest_cache_for_db`] applies, because package names rarely
+/// change; the cost of a stale name is at worst one corroborated link to the
+/// repo that last declared it, never a removed definition. Missing or
+/// unreadable is empty.
 pub fn package_names_hint(db_path: &Path) -> HashMap<String, String> {
     manifest_snapshot_hint(db_path)
         .repos
