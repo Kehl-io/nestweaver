@@ -1,22 +1,14 @@
-import { useEffect, useState } from "react";
 import { useStore } from "../../stores";
 
 /**
- * Polite live region. Screen readers only speak a change, so each
- * announcement first empties the region and then writes the message a
- * moment later (after the empty state has rendered, which a same-frame
- * write would not guarantee); an identical repeat is therefore spoken again.
+ * Polite live region. Each announcement renders a fresh text node, keyed on
+ * the store's liveMessageId, so React replaces the node even when the text
+ * is identical to the previous message. Screen readers announce the added
+ * node, so a repeated result is spoken again, with no timer involved.
  */
 export function LiveAnnouncer() {
   const liveMessage = useStore((s) => s.liveMessage);
   const liveMessageId = useStore((s) => s.liveMessageId);
-  const [text, setText] = useState(liveMessage);
-
-  useEffect(() => {
-    setText("");
-    const timer = setTimeout(() => setText(liveMessage), 50);
-    return () => clearTimeout(timer);
-  }, [liveMessage, liveMessageId]);
 
   return (
     <div
@@ -26,7 +18,11 @@ export function LiveAnnouncer() {
       aria-atomic="true"
       data-testid="live-announcer"
     >
-      {text}
+      {liveMessage && (
+        <span key={liveMessageId} data-message-id={liveMessageId}>
+          {liveMessage}
+        </span>
+      )}
     </div>
   );
 }

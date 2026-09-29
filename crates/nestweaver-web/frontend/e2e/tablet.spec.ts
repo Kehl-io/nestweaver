@@ -154,31 +154,30 @@ test.describe("Tablet width (nw-593)", () => {
     const from = await findSymbol(request, "releaseA");
     await open(page, 1440, `/?node=${encodeURIComponent(from.uid)}&kind=${from.kind}`);
     await expect(page.getByTestId("detail-panel").getByText("releaseA").first()).toBeVisible();
-    // Record every text the live region takes, so a repeat is visible even
-    // when it ends on the same string.
-    await liveRegion(page).evaluate((el) => {
-      const seen: string[] = [];
-      (window as unknown as { __live: string[] }).__live = seen;
-      new MutationObserver(() => seen.push(el.textContent ?? "")).observe(el, {
-        childList: true,
-        characterData: true,
-        subtree: true,
-      });
-    });
-    const announcements = () =>
-      page.evaluate(() =>
-        (window as unknown as { __live: string[] }).__live.filter((t) => t === "Found 1 path."),
-      );
 
     const actions = page.getByTestId("detail-panel").getByRole("group", { name: "Node actions" }).first();
-    for (let round = 1; round <= 2; round += 1) {
+    const message = liveRegion(page).locator("[data-message-id]");
+    const findPath = async () => {
       await actions.getByRole("button", { name: /^Path$/ }).click();
       const dialog = page.getByRole("dialog", { name: "Find path" });
       await dialog.getByRole("textbox", { name: "Path target" }).fill("releaseC");
+      const done = page.waitForResponse((r) => new URL(r.url()).pathname.startsWith("/api/v1/paths/"));
       await dialog.getByRole("button", { name: "Find" }).click();
-      await expect.poll(async () => (await announcements()).length).toBe(round);
-      await expect(liveRegion(page)).toHaveText("Found 1 path.");
-    }
+      await done;
+    };
+
+    await findPath();
+    await expect(message).toHaveText("Found 1 path.");
+    const firstId = await message.getAttribute("data-message-id");
+    const firstNode = await message.elementHandle();
+
+    // The second, identical query: wait for the app's own signal (a new
+    // message id), then check the text node was replaced, not reused.
+    await findPath();
+    await expect(message).not.toHaveAttribute("data-message-id", firstId ?? "");
+    await expect(message).toHaveText("Found 1 path.");
+    expect(await firstNode!.evaluate((node) => node.isConnected)).toBe(false);
+    await expect(liveRegion(page).locator("[data-message-id]")).toHaveCount(1);
   });
 
   test("counterweight: at 1440px the panes stay inline with no drawer", async ({ page, request }) => {
