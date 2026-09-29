@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../api/client";
 import type { Repo, SymbolCandidate } from "../../api/types";
 import { useStore } from "../../stores";
+import { GLOBAL_SINGLE_KEYS } from "../../hooks/useKeyboardShortcuts";
 
 interface TreeNode {
   name: string;
@@ -271,7 +272,16 @@ function FileTree({
         activate(row);
         break;
       default:
-        if (event.key.length === 1 && /\S/.test(event.key) && !event.metaKey && !event.ctrlKey) {
+        // Type-ahead: an unmodified letter or digit that is not an app-wide
+        // shortcut. Everything else (/, ?, c, m, t, digits 1-6, modified
+        // keys) passes through to the global handlers.
+        if (
+          /^[a-z0-9]$/i.test(event.key) &&
+          !GLOBAL_SINGLE_KEYS.has(event.key.toLowerCase()) &&
+          !event.altKey &&
+          !event.metaKey &&
+          !event.ctrlKey
+        ) {
           const key = event.key.toLowerCase();
           const ordered = [...rows.slice(index + 1), ...rows.slice(0, index)];
           moveTo(ordered.find((candidate) => candidate.label.toLowerCase().startsWith(key)));

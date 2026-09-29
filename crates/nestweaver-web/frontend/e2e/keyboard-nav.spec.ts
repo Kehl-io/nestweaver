@@ -97,4 +97,40 @@ test.describe("Keyboard navigation (nw-565)", () => {
     await page.keyboard.press("Home");
     await expect(repo).toBeFocused();
   });
+
+  test("tree type-ahead leaves global shortcuts working (c, m, t, /)", async ({ page }) => {
+    await openPanels(page);
+    const tree = page.getByRole("tree", { name: "Files" });
+    const items = tree.getByRole("treeitem");
+    await items.first().focus();
+
+    const minimap = page.getByRole("button", { name: /minimap$/ });
+    const before = await minimap.getAttribute("aria-pressed");
+    await page.keyboard.press("m");
+    await expect(minimap).not.toHaveAttribute("aria-pressed", before ?? "");
+
+    // A letter with no app binding is the tree's type-ahead.
+    const reserved = new Set(["1", "2", "3", "4", "5", "6", "c", "m", "t", "i", "p"]);
+    const firsts = (await items.allTextContents()).map((label) => label.replace(/^[^A-Za-z0-9]+/, "").charAt(0).toLowerCase());
+    // The first item (after the focused one) whose letter no earlier item shares.
+    const target = firsts.findIndex(
+      (ch, i) => i > 0 && /[a-z0-9]/.test(ch) && !reserved.has(ch) && !firsts.slice(1, i).includes(ch),
+    );
+    expect(target, `fixture tree has a type-ahead target in ${firsts.join("")}`).toBeGreaterThan(0);
+    const letter = firsts[target];
+    await items.first().focus();
+    await page.keyboard.press(letter);
+    await expect(items.nth(target)).toBeFocused();
+
+    // Modified letters are not type-ahead.
+    await items.first().focus();
+    await page.keyboard.press(`Alt+${letter}`);
+    await expect(items.first()).toBeFocused();
+    await items.nth(target).focus();
+    await expect(items.nth(target)).toBeFocused();
+
+    // "/" still jumps to search.
+    await page.keyboard.press("/");
+    await expect(page.getByTestId("search-input")).toBeFocused();
+  });
 });
