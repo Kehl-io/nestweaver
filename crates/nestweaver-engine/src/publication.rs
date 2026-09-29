@@ -1136,6 +1136,25 @@ pub fn read_current(publication_root: &Path) -> anyhow::Result<Option<CurrentPub
 /// the validation/activation path; repeating a multi-gigabyte graph hash on
 /// every short-lived CLI invocation would make the selector itself O(graph).
 pub fn resolve_selected_database(base_db_path: &Path) -> anyhow::Result<PathBuf> {
+    resolve_selected_database_inner(base_db_path, false)
+}
+
+/// [`resolve_selected_database`] for the one caller that must read a slot an
+/// OLDER storage engine built: `publication rebuild`, which reads the incumbent
+/// it replaces. A selected slot sealed at the pre-cutover bundle format (see
+/// [`crate::snapshot::LEGACY_ENGINE_SNAPSHOT_FORMAT_VERSION`]) is admitted, and
+/// its graph is opened through the store's legacy read-only exemption. Every
+/// other caller gets `StoreError::RebuildRequired` for such a slot.
+pub fn resolve_selected_database_allowing_legacy_engine(
+    base_db_path: &Path,
+) -> anyhow::Result<PathBuf> {
+    resolve_selected_database_inner(base_db_path, true)
+}
+
+fn resolve_selected_database_inner(
+    base_db_path: &Path,
+    allow_legacy_engine: bool,
+) -> anyhow::Result<PathBuf> {
     let publication_root = default_publication_root(base_db_path);
     let Some(pointer) = read_current(&publication_root)? else {
         return Ok(base_db_path.to_path_buf());
@@ -1158,7 +1177,13 @@ pub fn resolve_selected_database(base_db_path: &Path) -> anyhow::Result<PathBuf>
                 manifest_path.display()
             )
         })?;
-    bundle.validate_metadata(crate::snapshot::SNAPSHOT_FORMAT_VERSION)?;
+    let legacy_engine_bundle =
+        bundle.format_version == crate::snapshot::LEGACY_ENGINE_SNAPSHOT_FORMAT_VERSION;
+    bundle.validate_metadata(if legacy_engine_bundle {
+        crate::snapshot::LEGACY_ENGINE_SNAPSHOT_FORMAT_VERSION
+    } else {
+        crate::snapshot::SNAPSHOT_FORMAT_VERSION
+    })?;
     if parse_uuid("CURRENT brain_uuid", &pointer.brain_uuid)?
         != parse_uuid("bundle brain_uuid", &bundle.brain_uuid)?
         || parse_uuid("CURRENT publication_uuid", &pointer.publication_uuid)?
@@ -1189,8 +1214,30 @@ pub fn resolve_selected_database(base_db_path: &Path) -> anyhow::Result<PathBuf>
     // A selected local graph remains writable after cutover, so its live size
     // and checksum legitimately advance beyond the sealed baseline. The graph
     // identity is the stable binding that must never change.
-    let store = nestweaver_store::GraphStore::open_read_only_without_migration(&graph_path)
-        .map_err(|error| anyhow::anyhow!("open selected publication graph: {error}"))?;
+    // A slot sealed before the storage-engine cutover holds a graph this
+    // engine must not open; say so with the typed refusal (its remedy is the
+    // rebuild) instead of a bundle-format mismatch nobody can act on.
+    if legacy_engine_bundle && !allow_legacy_engine {
+        return Err(anyhow::Error::new(
+            nestweaver_store::StoreError::RebuildRequired {
+                path: Box::new(graph_path),
+                reason: format!(
+                    "is the selected publication, sealed at bundle format {} by a storage engine \
+                 older than LadybugDB 0.21",
+                    bundle.format_version
+                )
+                .into_boxed_str(),
+            },
+        ));
+    }
+    // Keep the store error TYPED (context, not a flattened string) so a
+    // rebuild refusal reaches the CLI diagnostic intact.
+    let store = if allow_legacy_engine {
+        nestweaver_store::GraphStore::open_read_only_allowing_legacy_engine(&graph_path)
+    } else {
+        nestweaver_store::GraphStore::open_read_only_without_migration(&graph_path)
+    }
+    .map_err(|error| anyhow::Error::new(error).context("open selected publication graph"))?;
     let identity = store
         .publication_identity()
         .map_err(|error| anyhow::anyhow!("read selected publication identity: {error}"))?

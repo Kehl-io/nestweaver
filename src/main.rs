@@ -29691,6 +29691,22 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
     }
 }
 
+/// Open the incumbent a `publication rebuild` reads from.
+///
+/// The ordinary read-only open (with its schema migration) for a database this
+/// engine built; the store's legacy read-only exemption ONLY when that open
+/// refused the database as built by an older storage engine. The exemption
+/// never writes, and every read the rebuild makes through it (identity, the
+/// repository and vault inventories) is a scan, never a primary-key lookup.
+fn open_rebuild_incumbent(path: &Path) -> Result<GraphStore, nestweaver_store::StoreError> {
+    match GraphStore::open_read_only(path) {
+        Err(nestweaver_store::StoreError::RebuildRequired { .. }) => {
+            GraphStore::open_legacy_engine_read_only(path)
+        }
+        other => other,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_publication_rebuild(
     db: Option<PathBuf>,
@@ -29711,7 +29727,8 @@ fn run_publication_rebuild(
     // reclaim or reselect a slot this one is building.
     let root_lock =
         nestweaver_engine::publication::PublicationRootLock::acquire(&publication_root)?;
-    let incumbent_db = nestweaver_engine::publication::resolve_selected_database(&base_db)?;
+    let incumbent_db =
+        nestweaver_engine::publication::resolve_selected_database_allowing_legacy_engine(&base_db)?;
     if !incumbent_db.exists() {
         anyhow::bail!(
             "incumbent database not found at {}; index the configured sources first",
@@ -29719,8 +29736,15 @@ fn run_publication_rebuild(
         );
     }
     ensure_no_live_daemon_for_snapshot_build(&incumbent_db)?;
-    let incumbent_store = GraphStore::open_read_only(&incumbent_db)
+    let incumbent_store = open_rebuild_incumbent(&incumbent_db)
         .map_err(|error| anyhow::anyhow!("open incumbent publication: {error}"))?;
+    if incumbent_store.is_legacy_engine() {
+        eprintln!(
+            "Rebuilding {} for the new storage engine. It was built by an older engine; it is \
+             read (never written) and stays in place as the rollback copy.",
+            incumbent_db.display()
+        );
+    }
     config.assert_expected_brain(&incumbent_store)?;
     let incumbent_identity = incumbent_store
         .publication_identity()?
@@ -30154,8 +30178,8 @@ fn run_publication_rebuild(
                     )?;
                 }
                 PublicationPhase::Validating => {
-                    let active_db = nestweaver_engine::publication::resolve_selected_database(&base_db)?;
-                    let active = GraphStore::open_read_only(&active_db)?;
+                    let active_db = nestweaver_engine::publication::resolve_selected_database_allowing_legacy_engine(&base_db)?;
+                    let active = open_rebuild_incumbent(&active_db)?;
                     let observed = sources.recapture_for_validation(&active)?;
                     drop(active);
                     let observed_state = nestweaver_engine::publication_state::PreservedStateSnapshot::capture(&active_db)?;
@@ -30192,7 +30216,18 @@ fn run_publication_rebuild(
                         &incumbent_db,
                         "activate the staged publication",
                     )?;
-                    let store = GraphStore::open_with_authority(&incumbent_db, &authority).map_err(|error| {
+                    // An incumbent an older storage engine built is never
+                    // opened writable (that would checkpoint it with the new
+                    // hash): the publication lease is process-local, so a
+                    // read-only handle serves the switch under the same
+                    // write authority.
+                    let store = match GraphStore::open_with_authority(&incumbent_db, &authority) {
+                        Err(nestweaver_store::StoreError::RebuildRequired { .. }) => {
+                            GraphStore::open_legacy_engine_read_only(&incumbent_db)
+                        }
+                        other => other,
+                    }
+                    .map_err(|error| {
                         anyhow::anyhow!(
                             "open retained incumbent publication for activation: {error}"
                         )

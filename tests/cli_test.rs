@@ -13321,3 +13321,169 @@ fn mcp_and_ui_surfaces_carry_the_rebuild_code_and_command() {
         "{combined}"
     );
 }
+
+/// A minimal OpenAI-compatible `/v1/embeddings` endpoint on loopback, so a
+/// complete `publication rebuild` (which re-embeds by contract) runs without a
+/// model download. Deterministic, non-zero 8-dimensional vectors per input.
+fn spawn_fake_embedding_endpoint() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 16384];
+            let header_end = loop {
+                let Ok(read) = stream.read(&mut chunk) else {
+                    break None;
+                };
+                if read == 0 {
+                    break None;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                if let Some(at) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break Some(at + 4);
+                }
+            };
+            let Some(header_end) = header_end else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&buffer[..header_end]).to_lowercase();
+            let length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while buffer.len() < header_end + length {
+                let Ok(read) = stream.read(&mut chunk) else {
+                    break;
+                };
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            let request: serde_json::Value =
+                serde_json::from_slice(&buffer[header_end..]).unwrap_or_default();
+            let inputs = request["input"].as_array().cloned().unwrap_or_default();
+            let data: Vec<_> = inputs
+                .iter()
+                .map(|input| {
+                    let text = input.as_str().unwrap_or_default();
+                    let seed = text.bytes().fold(7u32, |acc, byte| {
+                        acc.wrapping_mul(31).wrapping_add(u32::from(byte))
+                    });
+                    let embedding: Vec<f32> = (0..8)
+                        .map(|i| 1.0 + ((seed.rotate_left(i * 4) & 0xff) as f32) / 255.0)
+                        .collect();
+                    serde_json::json!({ "embedding": embedding })
+                })
+                .collect();
+            let body = serde_json::json!({ "data": data }).to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    format!("http://{address}")
+}
+
+/// The rebuild path end to end: a pre-cutover database is refused everywhere
+/// EXCEPT by `publication rebuild`, which reads it through the store's legacy
+/// read-only exemption (no primary-key lookups, no writes), builds a fresh
+/// publication beside it, and switches CURRENT. Afterwards the ordinary open
+/// path serves the new graph, the daemon guard lets a daemon start, and the old
+/// file is byte-for-byte what it was: the rollback copy.
+#[test]
+fn a_pre_cutover_database_rebuilds_into_a_current_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join("café.js"),
+        "export function grüßen(name) { return `hi ${name}`; }\nexport function main() { return grüßen('x'); }\n",
+    )
+    .unwrap();
+    let db = dir.path().join("brain.lbug");
+    nestweaver_cmd()
+        .args(["index", "--db"])
+        .arg(&db)
+        .arg("--repo")
+        .arg(&repo)
+        .assert()
+        .success();
+    make_pre_cutover(&db);
+    let legacy_bytes = std::fs::read(&db).unwrap();
+
+    let endpoint = spawn_fake_embedding_endpoint();
+    let config = dir.path().join("instance.toml");
+    let quote = |path: &std::path::Path| serde_json::to_string(&path.to_string_lossy()).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "instance_id = \"cutover\"\ndb = {}\n[snapshot_storage]\nbackend = \"local\"\npath = {}\n[workspace]\nbackend = \"local\"\npath = {}\n[inference]\nendpoint = \"http://localhost:11434\"\nembedding_model = \"unused\"\nsummary_model = \"unused\"\n[embedding]\nexternal_endpoint = \"{endpoint}\"\nexternal_model = \"fake\"\n[git]\ncredential_method = \"gh\"\n",
+            quote(&db),
+            quote(&dir.path().join("snapshots")),
+            quote(&dir.path().join("workspace")),
+        ),
+    )
+    .unwrap();
+
+    // Before: refused, with this exact command as the remedy.
+    let refused = nestweaver_cmd()
+        .args(["brain", "status", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(1));
+
+    let output = nestweaver_cmd()
+        .timeout(std::time::Duration::from_secs(300))
+        .args(["publication", "rebuild", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(0), "rebuild failed: {combined}");
+
+    let selected = nestweaver_engine::publication::resolve_selected_database(&db)
+        .expect("CURRENT must select the rebuilt publication");
+    assert_ne!(selected, db, "CURRENT must point at the new slot");
+    let store = nestweaver_store::GraphStore::open_read_only(&selected).unwrap();
+    assert!(!store.is_legacy_engine());
+    let symbols = store.count_symbols().unwrap();
+    assert!(symbols > 0, "the rebuilt graph holds the re-indexed repo");
+    drop(store);
+
+    let status = nestweaver_cmd()
+        .args(["brain", "status", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert_eq!(
+        status.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        nestweaver_daemon::lifecycle::db_rebuild_required(&db).is_none(),
+        "the daemon guard follows CURRENT, not the retained base"
+    );
+    assert_eq!(
+        std::fs::read(&db).unwrap(),
+        legacy_bytes,
+        "the pre-cutover database is the rollback copy and must be untouched"
+    );
+    assert!(
+        !nestweaver_store::engine_format::sidecar_path(&db).exists(),
+        "nothing may stamp the pre-cutover database as current"
+    );
+}
