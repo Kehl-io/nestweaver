@@ -16,8 +16,13 @@
 //!
 //! Writers within one process serialize on a lock and merge instead of
 //! overwriting: a full save keeps entries another writer added after this
-//! cache was loaded. (Only one process writes a database at a time: the
-//! database write lease.)
+//! cache was loaded.
+//!
+//! Invariant: only the process holding the database's write lease writes
+//! these files (one writer process at a time). The in-process lock is the
+//! only coordination, so appends from two processes could interleave; the
+//! lease is what rules that out. Debug builds assert that nobody else
+//! changed the log since this process last appended to it.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, Write};
@@ -293,7 +298,21 @@ fn write_base(
     Ok(())
 }
 
+/// Forget the log length this process recorded, as a new process would
+/// not know it (tests that damage the log by hand).
+#[cfg(test)]
+pub(crate) fn forget_log_length(path: &Path) {
+    VALID_LOG_LEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&log_path(path));
+}
+
 fn remove_log(path: &Path) {
+    VALID_LOG_LEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&log_path(path));
     match std::fs::remove_file(log_path(path)) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -304,6 +323,9 @@ fn remove_log(path: &Path) {
 /// Add `entries` to the cache at `path` by appending to its log: no base
 /// rewrite. Best effort (a lost entry costs a later re-parse). A log that
 /// has outgrown the base is folded into it.
+///
+/// Safe only under the database write lease: this process must be the one
+/// writer process (see the module doc).
 pub fn append_entries<'a>(
     path: &Path,
     entries: impl IntoIterator<Item = (&'a str, &'a CachedParseResult)>,
@@ -339,6 +361,14 @@ pub fn append_entries<'a>(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&log)
         .copied();
+    // One writer process: once this process has appended, only it (or its
+    // own saves, which forget the length) changes the log.
+    debug_assert!(
+        known.is_none_or(|known| known == current),
+        "the parse cache log {} changed outside this process ({known:?} -> {current} bytes): \
+         only the database write lease holder may write it",
+        log.display()
+    );
     if current > 0 && known != Some(current) {
         let valid = read_log(path, 0, |_, _| {});
         if valid < current
@@ -589,6 +619,8 @@ mod tests {
             .unwrap();
         log.write_all(&[7, 0, 0, 0, 1, 2]).unwrap();
         drop(log);
+        // A torn tail is a crash: the next append is a new process.
+        forget_log_length(&path);
         append_entries(&path, [("two", &sample_result())]);
         let loaded = ParsedCache::load(&path);
         for hash in ["base", "one", "two"] {
@@ -596,5 +628,23 @@ mod tests {
         }
         cache.refresh(&path);
         assert!(cache.get("two").is_some());
+    }
+
+    /// Debug builds catch a second writer: the log changed behind this
+    /// process's last append.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "changed outside this process")]
+    fn a_second_log_writer_trips_the_debug_assertion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("g.parsed_cache.bin");
+        append_entries(&path, [("one", &sample_result())]);
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(log_path(&path))
+            .unwrap();
+        log.write_all(&[0, 0, 0, 0]).unwrap();
+        drop(log);
+        append_entries(&path, [("two", &sample_result())]);
     }
 }

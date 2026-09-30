@@ -310,10 +310,13 @@ pub fn reconcile_cross_repo_links_with_cache(
     // A graph write that landed after this is read makes the result stale,
     // whether or not its route has recorded its mark yet.
     let generation_at_start = store.graph_generation();
-    let moved = || {
-        load_cross_repo_links_state(db_path).marks != marks_at_start
-            || store.graph_generation() != generation_at_start
-    };
+    // A new mark means a code route changed a repository since the pass
+    // began: a refusal on the state it read is superseded by that write.
+    let marks_moved = || load_cross_repo_links_state(db_path).marks != marks_at_start;
+    // Any graph write (including unrelated publications: note links, vaults,
+    // embeddings) makes the INFERRED RESULT stale for writing, but does not
+    // explain a refusal; a refusal without a new mark is real.
+    let moved = || marks_moved() || store.graph_generation() != generation_at_start;
     let package_names = crate::manifest::package_names_hint(db_path);
     let inference = match crate::index::infer_whole_graph_cross_repo_links(
         store,
@@ -331,7 +334,7 @@ pub fn reconcile_cross_repo_links_with_cache(
                 ..CrossRepoReconcileReport::default()
             });
         }
-        Err(error) if moved() => {
+        Err(error) if marks_moved() => {
             tracing::debug!(
                 error = %format!("{error:#}"),
                 "cross-repo inference read state a newer write replaced; superseded"
@@ -888,6 +891,9 @@ mod tests {
                 }
                 Some(bytes) => fs::write(&log, bytes).unwrap(),
             }
+            // As after a crash and restart: this process no longer knows
+            // the log's length.
+            crate::parsed_cache::forget_log_length(&cache);
             // Drop the links so the pass has something to restore.
             store.replace_inferred_cross_repo_links(&[]).unwrap();
             let report = reconcile(&store, &fx.db).unwrap();
@@ -1155,6 +1161,44 @@ mod tests {
         let status = cross_repo_links_status_json(Some(&fx.db));
         assert_eq!(status["pending"], true, "{status}");
         assert_eq!(status["failures"], 0, "{status}");
+    }
+
+    /// An unrelated publication (note links, a vault, embeddings) moves the
+    /// graph generation without a new mark. It must not turn a genuine
+    /// refusal (a stale repository nobody is re-indexing) into "superseded":
+    /// the failure is recorded, so the relinker backs off instead of
+    /// re-trying it every tick.
+    #[test]
+    fn an_unrelated_publication_does_not_hide_a_real_refusal() {
+        let fx = fixture();
+        let store = GraphStore::open(&fx.db).unwrap();
+        fs::remove_file(crate::sidecar_path(&fx.db, ".parsed_cache.bin")).unwrap();
+        fs::write(
+            fx.alpha.join("src/helper.js"),
+            "export function staleAndUnwatched() { return 3; }\n",
+        )
+        .unwrap();
+        mark_cross_repo_links_pending(&fx.db, "test");
+        let error = reconcile_cross_repo_links(
+            &store,
+            &fx.db,
+            crate::index_limits::IndexLimits::default(),
+            None,
+            &|| {
+                store.bump_graph_generation();
+                false
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::index::CrossRepoInferenceInputsUnavailable>()
+                .is_some(),
+            "{error:#}"
+        );
+        let status = cross_repo_links_status_json(Some(&fx.db));
+        assert_eq!(status["failures"], 1, "{status}");
+        assert!(status["last_error"].is_string(), "{status}");
     }
 
     /// A graph write that lands during inference supersedes the pass even
