@@ -483,10 +483,10 @@ pub fn incompatible_repos_for_store(store: &GraphStore) -> anyhow::Result<Vec<St
 /// A stale repository now degrades the answer only when the graph has
 /// evidence it can matter:
 /// - it OWNS a changed file, or
-/// - it could REACH one: it shares a recorded symbol-to-symbol edge (any
-///   `CALLS`/`IMPORTS`/`CROSS_REPO_LINK`/... table), or a declared
-///   `[[links]]` entry in the instance config, with a repository that owns a
-///   changed file. Either direction counts.
+/// - it could REACH one: it is connected to a repository that owns a changed
+///   file through any chain of repo links, each a recorded symbol-to-symbol
+///   edge (any `CALLS`/`IMPORTS`/`CROSS_REPO_LINK`/... table) or a declared
+///   `[[links]]` entry in the instance config. Either direction counts.
 ///
 /// Anything else is `unrelated`: it is DISCLOSED, by name and with its remedy,
 /// and does not degrade the answer. Recorded plus declared links are the
@@ -497,8 +497,9 @@ pub struct ResolverIncompatibility {
     /// Incompatible repositories that own at least one changed file. The
     /// caller can re-index these themselves.
     pub owning_changed_files: Vec<String>,
-    /// Incompatible repositories linked to an owning repository by a recorded
-    /// cross-repo edge or a declared link. These degrade the answer too.
+    /// Incompatible repositories reachable from an owning repository through
+    /// any chain of recorded or declared repo links. These degrade the answer
+    /// too.
     pub linked: Vec<String>,
     /// Incompatible repositories with no link to any changed file. Disclosed
     /// only; they do not degrade the answer.
@@ -755,26 +756,41 @@ pub fn incompatibility_for_changed_files_at(
     } else {
         Vec::new()
     };
-    let mut linked = Vec::new();
-    let mut unrelated = Vec::new();
-    for uid in rest {
-        let declared_link = declared
-            .iter()
-            .any(|(a, b)| (a == &uid && owning.contains(b)) || (b == &uid && owning.contains(a)));
-        // A store error here must not quietly demote the repository to
+    // Every repository reachable from the owning set through ANY chain of
+    // repo links: a recorded symbol edge (either direction) or a declared
+    // link (either orientation). One hop was not enough: a stale repository
+    // that calls B, where B calls the changed repository, can still hide
+    // impact through its own missing edges. Breadth-first; the repository
+    // count is small, and the walk stops once every stale repository is
+    // placed.
+    let mut reachable: std::collections::BTreeSet<String> = owning.clone();
+    let mut queue: std::collections::VecDeque<String> = owning.iter().cloned().collect();
+    while let Some(uid) = queue.pop_front() {
+        if rest.iter().all(|stale| reachable.contains(stale)) {
+            break;
+        }
+        // A store error here must not quietly demote a repository to
         // "unrelated": propagate it, the way listing the repositories does.
-        let recorded_link = declared_link
-            || store
-                .repos_sharing_symbol_edges(&uid)
-                .with_context(|| format!("list cross-repo edges of {uid}"))?
-                .iter()
-                .any(|neighbour| owning.contains(neighbour));
-        if recorded_link {
-            linked.push(uid);
-        } else {
-            unrelated.push(uid);
+        let mut neighbours = store
+            .repos_sharing_symbol_edges(&uid)
+            .with_context(|| format!("list cross-repo edges of {uid}"))?;
+        neighbours.extend(declared.iter().filter_map(|(a, b)| {
+            if a == &uid {
+                Some(b.clone())
+            } else if b == &uid {
+                Some(a.clone())
+            } else {
+                None
+            }
+        }));
+        for neighbour in neighbours {
+            if reachable.insert(neighbour.clone()) {
+                queue.push_back(neighbour);
+            }
         }
     }
+    let (linked, unrelated): (Vec<String>, Vec<String>) =
+        rest.into_iter().partition(|uid| reachable.contains(uid));
     Ok(ResolverIncompatibility {
         owning_changed_files,
         linked,
@@ -1413,6 +1429,83 @@ type = "http-api"
             )
             .unwrap(),
         )
+    }
+
+    /// Reachability is TRANSITIVE and runs both ways on every link kind.
+    /// `top` calls `far`, which calls `mid`, which calls the changed
+    /// repository `mine` (three hops); `mine`
+    /// calls `rev`; a declared link runs from `mine` to `back`. All four are
+    /// reachable from the change, so a stale one degrades; `lone` has no link
+    /// and is only disclosed.
+    #[test]
+    fn a_stale_repo_reachable_through_any_chain_of_links_degrades() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        for name in ["mine", "mid", "far", "top", "rev", "back", "lone"] {
+            let uid = format!("repo:{name}");
+            store
+                .insert_repo(&Repo {
+                    uid: uid.clone(),
+                    url: format!("file:///src/{name}"),
+                    indexed_sha: "deadbeef".into(),
+                    staleness_commits_behind: 0,
+                    instance_id: "default".into(),
+                    name: None,
+                    root_path: Some(format!("/src/{name}")),
+                })
+                .unwrap();
+            store
+                .insert_symbol(&nestweaver_schema::Symbol {
+                    uid: format!("s_{name}"),
+                    name: format!("s_{name}"),
+                    kind: nestweaver_schema::SymbolKind::Function,
+                    repo_uid: uid,
+                    file_path: format!("src/{name}.rs"),
+                    start_line: 1,
+                    end_line: 2,
+                    signature: String::new(),
+                    summary: None,
+                    content_hash: name.to_string(),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: nestweaver_schema::Visibility::Public,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+        }
+        for (from, to) in [
+            ("s_top", "s_far"),
+            ("s_far", "s_mid"),
+            ("s_mid", "s_mine"),
+            ("s_mine", "s_rev"),
+        ] {
+            store
+                .insert_cross_repo_link(from, to, 0.9, "http_api")
+                .unwrap();
+        }
+        let mut config = (*declared_link_config()).clone();
+        for link in config.links.iter_mut().flatten() {
+            link.from = "mine".to_string();
+            link.to = "back".to_string();
+        }
+        set_declared_link_config(Some(std::sync::Arc::new(config)));
+        record(&db, "repo:mine").unwrap();
+
+        let verdict =
+            incompatibility_for_changed_files(&store, &["src/mine.rs".to_string()]).unwrap();
+        set_declared_link_config(None);
+        assert!(verdict.owning_changed_files.is_empty(), "{verdict:?}");
+        assert_eq!(
+            verdict.linked,
+            ["repo:back", "repo:far", "repo:mid", "repo:rev", "repo:top"].map(String::from),
+            "{verdict:?}"
+        );
+        assert_eq!(verdict.unrelated, vec!["repo:lone".to_string()]);
     }
 
     /// Both directions on one fixture. An unrelated stale repository

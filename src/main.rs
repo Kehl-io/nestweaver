@@ -10199,6 +10199,23 @@ fn format_code_links_status(links: &nestweaver_proto::CodeLinksStatus) -> Option
     Some(line)
 }
 
+/// Install the declared `[[links]]` the resolver-generation gate reads, for
+/// a route that answers without the daemon: the explicit `--config`, else the
+/// config this database's daemon last started with. The daemon and MCP server
+/// install their own; without this the direct route never saw a declared
+/// link, so a stale repository linked only by one read as unrelated.
+fn install_declared_links_for_direct_route(db_path: &Path, explicit: Option<&Path>) {
+    let path = explicit.map(Path::to_path_buf).or_else(|| {
+        nestweaver_daemon::lifecycle::read_last_successful_config(db_path)
+            .ok()
+            .map(|record| PathBuf::from(record.config_path))
+    });
+    let config = path
+        .and_then(|path| nestweaver_engine::InstanceConfig::from_file(&path).ok())
+        .map(std::sync::Arc::new);
+    nestweaver_engine::resolver_generation::set_declared_link_config(config);
+}
+
 fn load_instance_config_opt(path: Option<&Path>) -> Option<nestweaver_engine::InstanceConfig> {
     let p = path?;
     match nestweaver_engine::InstanceConfig::from_file(p) {
@@ -18752,6 +18769,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             require_existing_db(&db_path)?;
+            install_declared_links_for_direct_route(&db_path, config.as_deref());
 
             let mut args = serde_json::json!({
                 "changed_files": files,
@@ -18831,6 +18849,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             require_existing_db(&db_path)?;
+            install_declared_links_for_direct_route(&db_path, config.as_deref());
             // nw-174 added a default cap to the underlying tool. Without a flag
             // here the CLI would inherit the ceiling with no way to raise it,
             // silently truncating output for scripts and CI that parse
@@ -19369,6 +19388,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
+            install_declared_links_for_direct_route(&db_path, None);
             let repo_root = detect_repo_root();
 
             // The default (neither --json nor --sarif) is the concise advisory
@@ -19582,6 +19602,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
+            install_declared_links_for_direct_route(&db_path, None);
 
             // Resolve changed files: explicit --files, else git diff against --base-ref.
             // Computed up front so the daemon path can send a proper

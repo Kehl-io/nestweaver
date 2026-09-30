@@ -14272,3 +14272,104 @@ fn enum_like_context_flags_reject_unknown_values_as_usage_errors() {
         assert_eq!(code, Some(0), "{args:?}: {stderr}");
     }
 }
+
+/// The direct `affected-tests` route reads declared `[[links]]` from the
+/// config this database's daemon last started with. It never loaded them, so
+/// a stale repository linked to the change only by a declared link was
+/// classed unrelated and the selection was trusted.
+#[test]
+fn direct_affected_tests_honours_a_declared_link_to_a_stale_repo() {
+    use nestweaver_engine::resolver_generation::{
+        RESOLVER_GENERATION, RESOLVER_GENERATION_SIDECAR, load, record,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    for (name, file) in [("mine-repo", "mine.js"), ("other-repo", "other.js")] {
+        let repo = dir.path().join(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join(file), "function f(n) { return n; }\n").unwrap();
+        nestweaver_cmd()
+            .args(["index", "--repo"])
+            .arg(&repo)
+            .arg("--db")
+            .arg(&db_path)
+            .assert()
+            .success();
+    }
+    // `other-repo` claims a resolver generation this binary does not run.
+    let other_uid = {
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        store
+            .list_repos(None)
+            .unwrap()
+            .into_iter()
+            .find(|repo| repo.url.ends_with("other-repo"))
+            .unwrap()
+            .uid
+    };
+    record(&db_path, &other_uid).unwrap();
+    let mut generations = load(&db_path);
+    generations
+        .repos
+        .insert(other_uid.clone(), RESOLVER_GENERATION + 1);
+    std::fs::write(
+        sidecar_path(&db_path, RESOLVER_GENERATION_SIDECAR),
+        serde_json::to_string(&generations).unwrap(),
+    )
+    .unwrap();
+
+    let run = || {
+        let output = nestweaver_cmd()
+            .args(["affected-tests", "--files", "mine.js", "--json", "--db"])
+            .arg(&db_path)
+            .output()
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&output.stdout)));
+        (output.status.code(), payload)
+    };
+
+    // Counterweight: with no declared link the stale repo is unrelated.
+    let (code, payload) = run();
+    assert_eq!(code, Some(0), "{payload}");
+    assert_ne!(payload["refused"], true, "{payload}");
+
+    let config = dir.path().join("instance.toml");
+    std::fs::write(
+        &config,
+        r#"instance_id = "declared-link"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp"
+
+[workspace]
+backend = "local"
+path = "/tmp"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "model"
+summary_model = "model"
+
+[git]
+credential_method = "ssh"
+
+[[links]]
+from = "mine-repo"
+to = "other-repo"
+type = "http-api"
+"#,
+    )
+    .unwrap();
+    nestweaver_daemon::lifecycle::write_last_successful_config(&db_path, &config).unwrap();
+
+    let (code, payload) = run();
+    assert_ne!(code, Some(0), "{payload}");
+    assert_eq!(payload["refused"], true, "{payload}");
+    assert_eq!(
+        payload["resolver_stale_repos"],
+        serde_json::json!([other_uid]),
+        "{payload}"
+    );
+}
