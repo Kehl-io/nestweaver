@@ -30097,6 +30097,7 @@ fn run_publication_rebuild(
                         &store,
                         &target_db,
                         &package_names,
+                        config.indexing.limits(),
                     )?;
                     eprintln!("Cross-repo links: {cross_repo} inferred over every repository.");
                     let projects = nestweaver_engine::project::materialize_projects(

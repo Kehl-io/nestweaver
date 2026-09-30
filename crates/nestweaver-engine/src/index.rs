@@ -3068,8 +3068,8 @@ fn infer_cross_repo_call_edges(
     current_repo_uid: &str,
     parsed_files: &[ParsedFileEntry],
 ) -> Result<Vec<nestweaver_schema::ResolvedEdge>, anyhow::Error> {
-    // nw-688: repo uid -> declared package name, to tell an indexed repo's
-    // package (`@org/shared`) from an npm one (`lodash`).
+    // Repo uid -> declared package name, to tell an indexed repo's package
+    // (`@org/shared`) from an npm one (`lodash`).
     let package_names = store
         .db_path()
         .map(crate::manifest::package_names_hint)
@@ -3086,41 +3086,95 @@ fn infer_cross_repo_call_edges(
 /// had into it. A caller that indexes every source first (a publication
 /// rebuild) runs this afterwards instead, with every repository present and
 /// `package_names` taken from the sources themselves, so a fresh build and a
-/// resumed one agree. Parses come from the parse cache the indexing runs
-/// just filled, keyed by each file's recorded content hash.
+/// resumed one agree.
+///
+/// The files are the graph's own File nodes, each with the content hash it
+/// was indexed from. Each file's parse is taken from the parse cache under
+/// that hash, and re-parsed from the repository's working tree when the cache
+/// lacks it (missing, corrupt or pruned). The pass never links from a partial
+/// view: a file it cannot re-read, or whose current content no longer has the
+/// indexed hash, fails it with [`CrossRepoInferenceInputsUnavailable`] before
+/// any stored link is touched.
 ///
 /// Returns the number of links written.
 pub fn reinfer_cross_repo_links(
     store: &GraphStore,
     db_path: &Path,
     package_names: &HashMap<String, String>,
+    limits: crate::index_limits::IndexLimits,
 ) -> Result<usize, anyhow::Error> {
-    let filemeta = load_filemeta_sidecar(&crate::sidecar_path(db_path, ".filemeta.json"));
     let parsed_cache =
         crate::parsed_cache::ParsedCache::load(&crate::sidecar_path(db_path, ".parsed_cache.bin"));
     let mut repos = store
         .list_repos(None)
         .map_err(|e| anyhow::anyhow!("list repositories for cross-repo inference: {e}"))?;
     repos.sort_by(|left, right| left.uid.cmp(&right.uid));
+    let unavailable = |repo: &str, detail: String| -> anyhow::Error {
+        CrossRepoInferenceInputsUnavailable {
+            repository: repo.to_string(),
+            detail,
+        }
+        .into()
+    };
     let mut edges = Vec::new();
     for repo in repos {
-        let Some(files) = filemeta.repos.get(&repo.uid) else {
-            continue;
-        };
-        let mut paths: Vec<&String> = files.keys().collect();
-        paths.sort();
-        let parsed: Vec<ParsedFileEntry> = paths
-            .into_iter()
-            .filter_map(|rel_path| {
-                let cached = parsed_cache.get(&files[rel_path].content_hash)?;
-                Some((
+        let mut files = store.list_file_hashes_by_repo(&repo.uid).map_err(|e| {
+            anyhow::anyhow!("list files of {} for cross-repo inference: {e}", repo.url)
+        })?;
+        files.sort();
+        let root = repo.local_root().map(PathBuf::from);
+        let reader = root
+            .as_deref()
+            .map(|root| crate::content_reader::FilesystemReader::with_limits(root, limits));
+        let mut parsed: Vec<ParsedFileEntry> = Vec::with_capacity(files.len());
+        for (rel_path, recorded) in &files {
+            if let Some(cached) = parsed_cache.get(recorded) {
+                parsed.push((
                     rel_path.clone(),
                     cached.symbols.clone(),
                     cached.references.clone(),
                     None,
-                ))
-            })
-            .collect();
+                ));
+                continue;
+            }
+            // Not cached: re-parse the file, but only the exact content the
+            // index recorded.
+            let (Some(root), Some(reader)) = (root.as_deref(), reader.as_ref()) else {
+                return Err(unavailable(
+                    &repo.url,
+                    format!(
+                        "{rel_path} is not in the parse cache and the repository has no working tree"
+                    ),
+                ));
+            };
+            let source =
+                crate::content_reader::ContentReader::read_file(reader, Path::new(rel_path))
+                    .map_err(|error| {
+                        unavailable(
+                            &repo.url,
+                            format!("read {rel_path} to re-parse it: {error:#}"),
+                        )
+                    })?;
+            if &content_hash_hex(&source) != recorded {
+                return Err(unavailable(
+                    &repo.url,
+                    format!("{rel_path} changed since it was indexed"),
+                ));
+            }
+            let reparsed = parse_source(&root.join(rel_path), &source).map_err(|error| {
+                unavailable(&repo.url, format!("re-parse {rel_path}: {error:#}"))
+            })?;
+            // The index published nothing for a file it could not parse.
+            if reparsed.unparsable_skip(rel_path.clone()).is_some() {
+                continue;
+            }
+            parsed.push((
+                rel_path.clone(),
+                reparsed.symbols,
+                reparsed.references,
+                None,
+            ));
+        }
         edges.extend(infer_cross_repo_call_edges_with(
             store,
             &repo.uid,
@@ -3132,6 +3186,19 @@ pub fn reinfer_cross_repo_links(
         .replace_inferred_cross_repo_links(&edges)
         .map_err(|e| anyhow::anyhow!("replace inferred cross-repo links: {e}"))?;
     Ok(edges.len())
+}
+
+/// Whole-graph cross-repo inference could not see a repository's complete
+/// parse, so it refused rather than replace the stored links with a partial
+/// set. Retryable: re-indexing the named repository (a resumed rebuild does
+/// when its sources changed) restores the inputs.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "cross-repo link inference cannot read repository {repository}: {detail}; no stored link was changed. Resume the rebuild to re-index it"
+)]
+pub struct CrossRepoInferenceInputsUnavailable {
+    pub repository: String,
+    pub detail: String,
 }
 
 fn infer_cross_repo_call_edges_with(
@@ -8059,6 +8126,137 @@ fn content_hash_hex(s: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// Two indexed repositories that call into each other, for the
+    /// whole-graph cross-repo inference pass.
+    struct CrossRepoFixture {
+        _dir: tempfile::TempDir,
+        db: PathBuf,
+        alpha: PathBuf,
+    }
+
+    fn cross_repo_fixture() -> CrossRepoFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let alpha = dir.path().join("alpha");
+        let beta = dir.path().join("beta");
+        fs::create_dir_all(alpha.join("src")).unwrap();
+        fs::create_dir_all(beta.join("src")).unwrap();
+        fs::write(
+            alpha.join("src/helper.js"),
+            "export function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            beta.join("src/caller.js"),
+            "export function betaCaller() {\n  return alphaHelper();\n}\nexport function betaUtil() { return 2; }\n",
+        )
+        .unwrap();
+        let db = dir.path().join("graph.lbug");
+        for (root, url) in [
+            (&beta, "file:///fixture/beta"),
+            (&alpha, "file:///fixture/alpha"),
+        ] {
+            index_directory_with_opts(
+                root,
+                &db,
+                &IndexOptions::new("test", url, "sha").force(true),
+            )
+            .unwrap();
+        }
+        CrossRepoFixture {
+            _dir: dir,
+            db,
+            alpha,
+        }
+    }
+
+    fn cross_repo_links(store: &GraphStore) -> Vec<(String, String, String)> {
+        let mut links: Vec<_> = store
+            .list_all_cross_repo_links(10_000)
+            .unwrap()
+            .into_iter()
+            .map(|link| (link.source_name, link.target_name, link.link_type))
+            .collect();
+        links.sort();
+        links
+    }
+
+    fn reinfer(fx: &CrossRepoFixture) -> Result<usize, anyhow::Error> {
+        let store = GraphStore::open(&fx.db).unwrap();
+        reinfer_cross_repo_links(
+            &store,
+            &fx.db,
+            &HashMap::new(),
+            crate::index_limits::IndexLimits::default(),
+        )
+    }
+
+    #[test]
+    fn whole_graph_cross_repo_inference_reparses_a_lost_or_corrupt_cache() {
+        let fx = cross_repo_fixture();
+        let cache = crate::sidecar_path(&fx.db, ".parsed_cache.bin");
+        assert!(cache.exists());
+        assert_eq!(reinfer(&fx).unwrap(), 2);
+        let with_cache = cross_repo_links(&GraphStore::open(&fx.db).unwrap());
+        assert_eq!(
+            with_cache
+                .iter()
+                .map(|(from, to, _)| (from.as_str(), to.as_str()))
+                .collect::<Vec<_>>(),
+            [("alphaUses", "betaUtil"), ("betaCaller", "alphaHelper")],
+            "both directions are linked whatever the indexing order"
+        );
+
+        std::fs::remove_file(&cache).unwrap();
+        assert_eq!(reinfer(&fx).unwrap(), 2);
+        assert_eq!(
+            cross_repo_links(&GraphStore::open(&fx.db).unwrap()),
+            with_cache
+        );
+
+        std::fs::write(&cache, b"not a parse cache").unwrap();
+        assert_eq!(reinfer(&fx).unwrap(), 2);
+        assert_eq!(
+            cross_repo_links(&GraphStore::open(&fx.db).unwrap()),
+            with_cache
+        );
+    }
+
+    #[test]
+    fn whole_graph_cross_repo_inference_refuses_before_deleting_links() {
+        let fx = cross_repo_fixture();
+        reinfer(&fx).unwrap();
+        let before = cross_repo_links(&GraphStore::open(&fx.db).unwrap());
+        assert_eq!(before.len(), 2);
+        std::fs::remove_file(crate::sidecar_path(&fx.db, ".parsed_cache.bin")).unwrap();
+
+        // The indexed content is gone from disk: nothing can re-parse it.
+        fs::write(
+            fx.alpha.join("src/helper.js"),
+            "export function somethingElse() { return 3; }\n",
+        )
+        .unwrap();
+        let error = reinfer(&fx).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<CrossRepoInferenceInputsUnavailable>()
+                .is_some()
+                && error.to_string().contains("changed since it was indexed"),
+            "{error:#}"
+        );
+        assert_eq!(cross_repo_links(&GraphStore::open(&fx.db).unwrap()), before);
+
+        fs::remove_file(fx.alpha.join("src/helper.js")).unwrap();
+        let error = reinfer(&fx).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<CrossRepoInferenceInputsUnavailable>()
+                .is_some()
+                && error.to_string().contains("read src/helper.js"),
+            "{error:#}"
+        );
+        assert_eq!(cross_repo_links(&GraphStore::open(&fx.db).unwrap()), before);
+    }
 
     /// Stand-in for a binary's response-shape version in tests that exercise
     /// the response cache's GENERATION behavior. Any stable non-zero value

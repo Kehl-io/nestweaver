@@ -67,7 +67,11 @@ What it recomputes:
 
 It then validates again. The staged graph (symbols, notes, and symbol,
 cross-repository, and note→code edges) matches what a fresh rebuild of the
-changed sources produces:
+changed sources produces. Cross-repository links are inferred from each
+file's parse at the content the graph indexed: a parse missing from the parse
+cache is re-parsed from the working tree, and a file that no longer has that
+content stops the rebuild before any link is replaced, so a lost cache never
+silently drops links. A scoped resume reports:
 
 ```text
 Resume: 1 input(s) changed since the build recorded them (repository file:///src/app); re-indexing only those, then rebuilding derived state and validating.
