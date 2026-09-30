@@ -1977,6 +1977,9 @@ struct WatchedNoteReader {
     filesystem: crate::content_reader::FilesystemReader,
     files: Vec<PathBuf>,
     changed: HashSet<PathBuf>,
+    /// Symlink events: not followed, disclosed through the same prune
+    /// channel the full walk uses.
+    symlinks: Vec<crate::content_reader::SkippedDir>,
     /// nw-668: the text of every CHANGED note exactly as this refresh read,
     /// parsed and committed it, keyed by vault-relative path. The watcher's
     /// cross-domain scan runs over this rather than re-reading the file: a
@@ -2016,6 +2019,9 @@ impl ContentReader for WatchedNoteReader {
     fn max_source_file_bytes(&self) -> u64 {
         self.filesystem.max_source_file_bytes()
     }
+    fn skipped_dirs(&self) -> Vec<crate::content_reader::SkippedDir> {
+        self.symlinks.clone()
+    }
 }
 
 /// Commit the watcher's changed `paths` through the incremental indexer.
@@ -2041,11 +2047,19 @@ pub(crate) fn refresh_watched_paths(
         .map(|n| PathBuf::from(n.file_path))
         .collect();
     let mut changed = HashSet::new();
+    let mut symlinks = Vec::new();
     for path in paths {
         let relative = path
             .strip_prefix(vault_root)
             .context("watched path outside vault")?
             .to_path_buf();
+        // Not followed, as the full walk does not follow it: a note that was
+        // at this path is gone from the graph, and the link is disclosed.
+        if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            files.remove(&relative);
+            symlinks.push(crate::content_reader::symlink_row(path, &relative));
+            continue;
+        }
         match std::fs::metadata(path) {
             Ok(metadata) if metadata.is_file() => {
                 let canonical = std::fs::canonicalize(path)?;
@@ -2068,6 +2082,7 @@ pub(crate) fn refresh_watched_paths(
         filesystem: filesystem_note_reader(vault_root, note_limits),
         files: files.into_iter().collect(),
         changed,
+        symlinks,
         captured: std::sync::Mutex::new(HashMap::new()),
     };
     index_markdown_since_with_reader_mode(
@@ -2101,9 +2116,17 @@ fn disclose_vault_prunes(reader: &dyn ContentReader, ignore_set: &GlobSet) -> Ve
     reader
         .skipped_dirs()
         .into_iter()
-        .filter(|pruned| {
-            pruned.reason != crate::content_reader::UNREADABLE_DIR_REASON
-                || !brainignore_covers_dir(&pruned.path, ignore_set)
+        .filter(|pruned| match pruned.reason.as_str() {
+            crate::content_reader::UNREADABLE_DIR_REASON => {
+                !brainignore_covers_dir(&pruned.path, ignore_set)
+            }
+            // A symlink `.brainignore` excludes would not have been indexed
+            // had it been a real file or directory, so it is not a skip.
+            crate::content_reader::SYMLINK_REASON => {
+                !crate::brainignore::is_ignored(&pruned.path, ignore_set)
+                    && !brainignore_covers_dir(&pruned.path, ignore_set)
+            }
+            _ => true,
         })
         .filter_map(|pruned| {
             crate::index::disclose_pruned_dir(pruned, crate::index::SkipDirCaller::Vault)
@@ -3475,9 +3498,9 @@ where
 
     // SECURITY: FilesystemReader::list_files() uses follow_links(false)
     // and only returns entries where file_type().is_file() == true,
-    // so symlinks (including those pointing outside the vault) are
-    // silently excluded — matching the old WalkDir + symlink-rejection
-    // behaviour.
+    // so symlinks (including those pointing outside the vault) are never
+    // read. They are not silent: the walk records each one as a
+    // `SYMLINK_REASON` row, disclosed by `disclose_vault_prunes` below.
     let all_files = reader.list_files()?;
 
     // nw-196/nw-436/nw-437: DRAIN THE SAME PRUNE RECORDER `index.rs`'s code
@@ -7610,6 +7633,70 @@ sub b body
         assert!(
             !titles.iter().any(|t| t == "SECRET"),
             "outside-vault symlink content must not be indexed"
+        );
+    }
+
+    /// Symlinks are not followed (see `symlink_escaping_vault_is_skipped`),
+    /// and they are no longer silent either: a symlinked note or directory is
+    /// listed as skipped with a `symlink` reason, on the full and `--since`
+    /// routes alike. It is a policy skip (`unsupported`), so it neither
+    /// degrades coverage nor blocks the vault's link derivation. A symlink
+    /// that could hold no note (a non-Markdown file, a dangling link) and one
+    /// `.brainignore` excludes are not listed.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_notes_and_directories_are_disclosed_as_skipped() {
+        use std::os::unix::fs::symlink;
+        let (dir, root) = make_vault(&[
+            ("real.md", "# Real\n"),
+            ("sub/inner.md", "# Inner\n"),
+            ("image.png", "png"),
+        ]);
+        let outside = dir.path().join("outside.md");
+        std::fs::write(&outside, "# Outside\n").unwrap();
+        symlink(&outside, root.join("escape.md")).unwrap();
+        symlink(root.join("real.md"), root.join("alias.md")).unwrap();
+        symlink(root.join("sub"), root.join("linked-dir")).unwrap();
+        symlink(root.join("image.png"), root.join("image-link.png")).unwrap();
+        symlink(root.join("missing.md"), root.join("dangling.md")).unwrap();
+        symlink(root.join("real.md"), root.join("ignored-link.md")).unwrap();
+        std::fs::write(root.join(".brainignore"), "ignored-link.md\n").unwrap();
+
+        let expect = |skipped: &[SkippedFile], route: &str| {
+            let mut symlinks: Vec<&str> = skipped
+                .iter()
+                .filter(|row| row.reason.contains("symlink"))
+                .map(|row| row.path.as_str())
+                .collect();
+            symlinks.sort();
+            assert_eq!(
+                symlinks,
+                vec!["alias.md", "escape.md", "linked-dir"],
+                "{route}: {skipped:?}"
+            );
+            for row in skipped.iter().filter(|row| row.reason.contains("symlink")) {
+                assert_eq!(row.reason_code, SkipReasonCode::Unsupported, "{route}");
+                assert!(
+                    !crate::markdown_derivation::is_coverage_gap(row),
+                    "{route}: a symlink is policy, not a coverage gap"
+                );
+            }
+        };
+
+        let db_path = dir.path().join("brain.lbug");
+        let full = index_markdown_directory(&root, &db_path, "default", "v").unwrap();
+        assert_eq!(full.notes_count, 2, "{:?}", full.skipped);
+        expect(&full.skipped, "full refresh");
+
+        std::fs::write(root.join("real.md"), "# Real\n\nedited\n").unwrap();
+        let since =
+            index_markdown_directory_since(&root, &db_path, "default", "v", std::time::UNIX_EPOCH)
+                .unwrap();
+        expect(&since.skipped, "--since refresh");
+        let sidecar = load_skipped_notes_sidecar(&db_path);
+        assert!(
+            sidecar.skipped.iter().any(|row| row.path == "linked-dir"),
+            "the sidecar carries the disclosure: {sidecar:?}"
         );
     }
 

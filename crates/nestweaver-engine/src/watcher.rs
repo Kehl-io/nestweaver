@@ -3013,6 +3013,55 @@ mod tests {
         );
     }
 
+    /// A symlink event is handled like the full refresh handles the link: not
+    /// followed, not indexed, disclosed as a `symlink` skip. A link pointing
+    /// outside the vault used to fail the whole batch ("watched note escapes
+    /// vault"), and one pointing inside was indexed through the link although
+    /// a refresh skips it.
+    #[cfg(unix)]
+    #[test]
+    fn watcher_skips_and_discloses_symlink_events() {
+        use std::os::unix::fs::symlink;
+        let _guard = serial_watcher_test();
+        let (dir, root) = make_vault(&[("keep.md", "# Keep\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let outside = dir.path().join("outside.md");
+        fs::write(&outside, "# Outside\n").unwrap();
+        symlink(&outside, root.join("escape.md")).unwrap();
+        symlink(root.join("keep.md"), root.join("alias.md")).unwrap();
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        watcher
+            .process_batch(
+                &store,
+                None,
+                &v_uid,
+                vec![root.join("escape.md"), root.join("alias.md")],
+                &None,
+            )
+            .unwrap();
+        let notes: Vec<String> = store
+            .list_notes(Some(&v_uid))
+            .unwrap()
+            .into_iter()
+            .map(|note| note.file_path)
+            .collect();
+        assert_eq!(notes, vec!["keep.md".to_string()]);
+        let sidecar = crate::index_md::load_skipped_notes_sidecar(&db_path);
+        for path in ["escape.md", "alias.md"] {
+            assert!(
+                sidecar
+                    .skipped
+                    .iter()
+                    .any(|row| row.path == path && row.reason.contains("symlink")),
+                "{path}: {sidecar:?}"
+            );
+        }
+    }
+
     #[test]
     fn watcher_records_new_oversized_note_as_skipped() {
         let (_dir, root) = make_vault(&[("keep.md", "# Keep\n")]);

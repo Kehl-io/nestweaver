@@ -2237,6 +2237,37 @@ pub(crate) const IGNORE_FILE_ROW_PREFIX: &str = "ignore file `";
 /// second, private copy of this match would be exactly the drifted twin nw-217
 /// describes. `caller` is what lets the two sites share the builder without
 /// sharing a remedy that is only true for one of them — see [`SkipDirCaller`].
+/// A symlink the walk did not follow. Only a VAULT discloses it, and only
+/// when it could hold a note: a link to a directory, or a Markdown-named link
+/// to a file. A code repo keeps its long-standing silent skip (links there are
+/// routine: toolchain shims, vendored aliases), and a dangling or
+/// non-Markdown link could never have been a note. `Unsupported` is a policy
+/// code, so it neither degrades coverage nor blocks link derivation.
+fn disclose_symlink(
+    pruned: &crate::content_reader::SkippedDir,
+    caller: SkipDirCaller,
+) -> Option<SkippedFile> {
+    use crate::content_reader::{SYMLINK_TARGET_DIR, SYMLINK_TARGET_FILE};
+    if matches!(caller, SkipDirCaller::Repo) {
+        return None;
+    }
+    let target = pruned.detail.as_deref()?;
+    let could_hold_a_note = target == SYMLINK_TARGET_DIR
+        || (target == SYMLINK_TARGET_FILE
+            && nestweaver_parser::is_markdown(Path::new(&pruned.path)));
+    could_hold_a_note.then(|| {
+        SkippedFile::new(
+            pruned.path.clone(),
+            SkipReasonCode::Unsupported,
+            format!(
+                "symlink to a {target} is not followed, so nothing through it is indexed; \
+                 symlinks can point outside the vault or duplicate notes under a second \
+                 path. Move or copy the {target} into the vault to index it"
+            ),
+        )
+    })
+}
+
 pub(crate) fn disclose_pruned_dir(
     pruned: crate::content_reader::SkippedDir,
     caller: SkipDirCaller,
@@ -2249,6 +2280,9 @@ pub(crate) fn disclose_pruned_dir(
         )
     {
         return None; // Reported independently by ExclusionInventory.
+    }
+    if pruned.reason == crate::content_reader::SYMLINK_REASON {
+        return disclose_symlink(&pruned, caller);
     }
     if pruned.reason == crate::content_reader::UNREADABLE_DIR_REASON {
         // nw-651: the one row here that is a FAILURE, not a policy — so it is
@@ -8283,6 +8317,34 @@ fn content_hash_hex(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A symlink row is disclosed by a vault only, and only when it could
+    /// have held a note; a code repo keeps its silent skip.
+    #[test]
+    fn symlink_rows_are_disclosed_for_vaults_that_could_hold_a_note() {
+        use crate::content_reader::{
+            SYMLINK_REASON, SYMLINK_TARGET_DIR, SYMLINK_TARGET_FILE, SYMLINK_TARGET_UNRESOLVED,
+            SkippedDir,
+        };
+        let row = |path: &str, target: &str| SkippedDir {
+            path: path.to_string(),
+            reason: SYMLINK_REASON.to_string(),
+            matched_pattern: None,
+            detail: Some(target.to_string()),
+        };
+        let vault =
+            |path: &str, target: &str| disclose_pruned_dir(row(path, target), SkipDirCaller::Vault);
+        let disclosed = vault("notes", SYMLINK_TARGET_DIR).expect("a linked directory");
+        assert_eq!(disclosed.reason_code, SkipReasonCode::Unsupported);
+        assert!(disclosed.reason.contains("symlink"), "{}", disclosed.reason);
+        assert!(vault("a.md", SYMLINK_TARGET_FILE).is_some());
+        assert!(vault("a.png", SYMLINK_TARGET_FILE).is_none());
+        assert!(vault("a.md", SYMLINK_TARGET_UNRESOLVED).is_none());
+        assert!(
+            disclose_pruned_dir(row("notes", SYMLINK_TARGET_DIR), SkipDirCaller::Repo).is_none(),
+            "code repos keep the silent skip"
+        );
+    }
     use std::fs;
 
     /// Two indexed repositories that call into each other, for the
