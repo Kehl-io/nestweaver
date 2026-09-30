@@ -2,7 +2,9 @@
 //!
 //! This version is independent of manifest snapshots, package versions and
 //! code resolver generations. Only the daemon's admitted writer may persist
-//! transitions. Loading and admission never mutate graph or sidecar state.
+//! transitions, plus a publication rebuild for the staged slot it alone
+//! writes ([`stamp_rebuilt_vault`]). Loading and admission never mutate graph
+//! or sidecar state.
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -15,7 +17,7 @@ pub const RECORD_SCHEMA_VERSION: u32 = 1;
 pub const DERIVATION_VERSION: u32 = crate::index_md::MARKDOWN_LINK_DERIVATION_VERSION;
 const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_VAULT_RECORDS: usize = 10_000;
-const RECORD_SUFFIX: &str = ".markdown-derivation.json";
+pub const RECORD_SUFFIX: &str = ".markdown-derivation.json";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -871,6 +873,110 @@ pub fn inventory_digest(notes: &[nestweaver_schema::Note]) -> String {
         .to_string()
 }
 
+/// The one completion path for a full vault refresh: reset the vault's
+/// record for `source`/`coverage`, bind the refresh's engine evidence
+/// ([`VaultDerivationRecord::record_complete_graph`], which refuses a degraded
+/// or partial publication, a coverage gap, or a refresh whose note count
+/// differs from the notes the graph holds for the vault), mark its
+/// search reconciled, and store it in `records`. Shared by the daemon's
+/// derivation writer and a publication rebuild, so both stamp by one rule.
+pub fn record_full_refresh(
+    records: &mut DerivationRecords,
+    vault: &Vault,
+    source: SourceIdentity,
+    coverage: CoverageIdentity,
+    result: &crate::index_md::MarkdownRefreshResult,
+    notes: &[nestweaver_schema::Note],
+    identity: &PublicationIdentity,
+) -> Result<(), RecordError> {
+    let mut record = records
+        .vaults
+        .remove(&vault.uid)
+        .unwrap_or_else(|| VaultDerivationRecord::pending(vault, source.clone(), coverage.clone()));
+    record.source = source;
+    record.coverage = coverage;
+    record.derivation_version = DERIVATION_VERSION;
+    record.phase = DerivationPhase::Pending;
+    record.witness = None;
+    record.pending_generation = None;
+    record.completed_generation = None;
+    record.last_error = None;
+    record.retry_after_unix_seconds = None;
+    record.attempts = 0;
+    // The expected count is what the graph now holds for the vault, so a
+    // refresh that reports a different number of notes is refused.
+    record.record_complete_graph(result, notes.len(), inventory_digest(notes), identity)?;
+    record.record_search_reconciled(identity)?;
+    records.vaults.insert(vault.uid.clone(), record);
+    Ok(())
+}
+
+/// Record a vault a publication rebuild just indexed in full into its staged
+/// slot, through [`record_full_refresh`] — the rule the daemon's derivation
+/// writer stamps a full refresh by. Without a record the published slot's
+/// first daemon start re-derives (fully refreshes) the vault, which drops and
+/// relinks every note's code links under the write lock. The slot's BM25
+/// index is built from this graph before the slot can be sealed, which is the
+/// search reconciliation the witness claims.
+///
+/// A refresh the rule refuses (a degraded publication, a coverage gap, a
+/// note-count mismatch) leaves the vault unrecorded, removing any earlier
+/// record, so the daemon derives and discloses it as after an ordinary
+/// refresh. Returns whether it was stamped Current.
+pub fn stamp_rebuilt_vault(
+    db_path: &Path,
+    result: &crate::index_md::MarkdownRefreshResult,
+    data_instance_id: &str,
+    extra_ignore_patterns: &[String],
+    max_note_bytes: u64,
+) -> anyhow::Result<bool> {
+    let store = nestweaver_store::GraphStore::open_read_only_without_migration(db_path)
+        .map_err(|error| anyhow::anyhow!("open staged graph for derivation records: {error}"))?;
+    let identity = store
+        .publication_identity()
+        .map_err(|error| anyhow::anyhow!("read staged publication identity: {error}"))?
+        .ok_or_else(|| anyhow::anyhow!("staged graph has no publication identity"))?;
+    let vault = store
+        .list_vaults(None)
+        .map_err(|error| anyhow::anyhow!("list staged vaults: {error}"))?
+        .into_iter()
+        .find(|vault| vault.uid == result.index.vault_uid)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "indexed vault {} is not in the staged graph",
+                result.index.vault_uid
+            )
+        })?;
+    let notes = store
+        .list_notes(Some(&vault.uid))
+        .map_err(|error| anyhow::anyhow!("list staged notes: {error}"))?;
+    drop(store);
+    let expected = expectation(&identity, data_instance_id);
+    let mut records = load_records(db_path, &expected)?.unwrap_or_default();
+    let source = filesystem_source(Path::new(&vault.root_path))?;
+    let coverage = coverage_identity(
+        Path::new(&source.canonical_root),
+        extra_ignore_patterns,
+        max_note_bytes,
+        CoverageScope::FullRegisteredPolicy,
+    )?;
+    let stamped = match record_full_refresh(
+        &mut records,
+        &vault,
+        source,
+        coverage,
+        result,
+        &notes,
+        &identity,
+    ) {
+        Ok(()) => true,
+        Err(RecordError::IncompletePublication) => false,
+        Err(error) => return Err(error.into()),
+    };
+    save_records(db_path, &records, &expected)?;
+    Ok(stamped)
+}
+
 pub fn expectation<'a>(
     identity: &'a PublicationIdentity,
     data_instance_id: &'a str,
@@ -937,6 +1043,58 @@ mod tests {
 
     fn identity() -> PublicationIdentity {
         PublicationIdentity::new_brain()
+    }
+
+    /// A rebuild stamps a vault Current only by the daemon's full-refresh
+    /// rule: a degraded publication or a note-count mismatch is refused and
+    /// leaves no record, while the complete refresh is stamped.
+    #[test]
+    fn a_rebuild_stamps_only_a_complete_vault_refresh_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(vault.join("a.md"), "# A\n\nbody\n").unwrap();
+        let db = dir.path().join("graph.lbug");
+        let mut result =
+            crate::index_md::index_markdown_directory_with_ignore_and_deletion_count_and_note_limits(
+                &vault,
+                &db,
+                "test",
+                "vault",
+                &[],
+                crate::index_limits::NoteLimits::default(),
+            )
+            .unwrap();
+        let max = crate::index_limits::NoteLimits::default().max_note_bytes();
+        let vault_uid = result.index.vault_uid.clone();
+        let record_of = || {
+            let store = nestweaver_store::GraphStore::open_read_only(&db).unwrap();
+            let identity = store.publication_identity().unwrap().unwrap();
+            drop(store);
+            load_records(&db, &expectation(&identity, "test"))
+                .unwrap()
+                .and_then(|records| records.vaults.get(&vault_uid).cloned())
+        };
+
+        use crate::manifest::GraphMutationPublicationDisposition as Disposition;
+        let complete = result.publication.disposition;
+        assert_eq!(complete, Disposition::CommittedComplete);
+        result.publication.disposition = Disposition::CommittedDegraded;
+        assert!(!stamp_rebuilt_vault(&db, &result, "test", &[], max).unwrap());
+        assert_eq!(record_of(), None);
+        result.publication.disposition = complete;
+
+        result.index.notes_count += 1;
+        assert!(!stamp_rebuilt_vault(&db, &result, "test", &[], max).unwrap());
+        assert_eq!(record_of(), None);
+        result.index.notes_count -= 1;
+
+        assert!(stamp_rebuilt_vault(&db, &result, "test", &[], max).unwrap());
+        assert_eq!(record_of().unwrap().phase, DerivationPhase::Current);
+        // A later refused refresh removes the earlier Current record.
+        result.publication.disposition = Disposition::CommittedDegraded;
+        assert!(!stamp_rebuilt_vault(&db, &result, "test", &[], max).unwrap());
+        assert_eq!(record_of(), None);
     }
 
     /// nw-684 review: the derivation gate reads `.brainignore` for its policy

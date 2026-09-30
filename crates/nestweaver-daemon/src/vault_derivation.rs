@@ -9,7 +9,7 @@ use nestweaver_engine::index_md::MarkdownRefreshResult;
 use nestweaver_engine::markdown_derivation::{
     self, CoverageIdentity, CoverageScope, DerivationPhase, DerivationRecords, RecordError,
     VaultDerivationRecord, admit_all_vaults, coverage_identity, expectation, filesystem_source,
-    inventory_digest, load_records, requires_current_derivation, save_records,
+    load_records, requires_current_derivation, save_records,
 };
 use nestweaver_schema::Vault;
 use std::path::Path;
@@ -198,28 +198,15 @@ fn stamp_from_refresh(
     let notes = state.store.list_notes(Some(&vault.uid))?;
     heal_ambient_default(state, &identity)?;
     let mut records = load_or_empty(state, &identity)?;
-    let mut record = records
-        .vaults
-        .remove(&vault.uid)
-        .unwrap_or_else(|| VaultDerivationRecord::pending(vault, source.clone(), coverage.clone()));
-    record.source = source;
-    record.coverage = coverage;
-    record.derivation_version = markdown_derivation::DERIVATION_VERSION;
-    record.phase = DerivationPhase::Pending;
-    record.witness = None;
-    record.pending_generation = None;
-    record.completed_generation = None;
-    record.last_error = None;
-    record.retry_after_unix_seconds = None;
-    record.attempts = 0;
-    record.record_complete_graph(
+    markdown_derivation::record_full_refresh(
+        &mut records,
+        vault,
+        source,
+        coverage,
         result,
-        result.index.notes_count,
-        inventory_digest(&notes),
+        &notes,
         &identity,
     )?;
-    record.record_search_reconciled(&identity)?;
-    records.vaults.insert(vault.uid.clone(), record);
     persist(state, &identity, &records)?;
     Ok(())
 }
