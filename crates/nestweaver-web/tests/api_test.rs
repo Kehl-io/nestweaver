@@ -1084,7 +1084,7 @@ fn insert_named_vault_notes(store: &GraphStore, vault_uid: &str, name: &str, cou
     for i in 0..count {
         store
             .insert_note(&Note {
-                uid: format!("note:{name}:{i:04}"),
+                uid: format!("note:{vault_uid}:{i:04}"),
                 vault_uid: vault_uid.to_string(),
                 file_path: format!("n{i:04}.md"),
                 title: format!("{name} {i:04}"),
@@ -1221,7 +1221,7 @@ async fn brain_notes_cursor_pages_a_vault_past_the_offset_ceiling() {
     // A cursor and an offset together are contradictory.
     let (status, _, _) = get_json_with_total(
         &app,
-        "/api/v1/brain/notes?vault=vlt:big&after=note:big:0001&offset=5",
+        "/api/v1/brain/notes?vault=vlt:big&after=note:vlt:big:0001&offset=5",
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1264,10 +1264,10 @@ async fn get_json_with_next(app: &axum::Router, uri: &str) -> (StatusCode, Value
 async fn brain_notes_next_cursor_survives_a_dropped_corrupt_row() {
     let store = setup_test_store();
     insert_named_vault_notes(&store, "vlt:big", "big", 6);
-    // uid sorts between note:big:0001 and note:big:0002; NUL title = corrupt.
+    // uid sorts between note:vlt:big:0001 and ...:0002; NUL title = corrupt.
     store
         .insert_note(&Note {
-            uid: "note:big:0001x".to_string(),
+            uid: "note:vlt:big:0001x".to_string(),
             vault_uid: "vlt:big".to_string(),
             file_path: "corrupt.md".to_string(),
             title: "Cor\u{0}rupt".to_string(),
@@ -1294,7 +1294,7 @@ async fn brain_notes_next_cursor_survives_a_dropped_corrupt_row() {
         get_json_with_next(&app, "/api/v1/brain/notes?vault=vlt:big&limit=3").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(first.as_array().map(Vec::len), Some(2));
-    assert_eq!(next.as_deref(), Some("note:big:0001x"));
+    assert_eq!(next.as_deref(), Some("note:vlt:big:0001x"));
 
     let mut seen: Vec<String> = first
         .as_array()
@@ -1323,6 +1323,50 @@ async fn brain_notes_next_cursor_survives_a_dropped_corrupt_row() {
     }
     assert_eq!(seen.len(), 6, "every clean note is reachable: {seen:?}");
     assert_eq!(last_next, None, "the end of the vault sends no cursor");
+}
+
+/// A malformed `after` used to restart silently at page 1 (a uid sorting
+/// before every note) or return an empty "end" page (one sorting after), so a
+/// pager looped or stopped early without an error. It must be a note uid of
+/// the listed vault: anything else is 400.
+#[tokio::test]
+async fn brain_notes_rejects_a_cursor_that_is_not_a_note_uid_of_the_vault() {
+    let store = setup_test_store();
+    insert_named_vault_notes(&store, "vlt:big", "big", 6);
+    insert_named_vault_notes(&store, "vlt:other", "other", 2);
+    let app = create_router(AppState::new(
+        store,
+        None,
+        std::path::PathBuf::from("/tmp/test.lbug"),
+    ));
+    for bad in [
+        "garbage",
+        "",
+        // Double-encoded: the server receives the literal `note%3Avlt...`.
+        "note%253Avlt%253Abig%253A0001",
+        "note:vlt:other:0000",
+        "note:vlt:big:",
+        "note:vlt:big:0001:extra",
+    ] {
+        let uri = format!("/api/v1/brain/notes?vault=vlt:big&limit=2&after={bad}");
+        let (status, json) = get_json(&app, &uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {json}");
+        assert!(json["error"].as_str().unwrap().contains("after"), "{json}");
+    }
+    // Without a vault filter the cursor must still be a note uid.
+    let (status, _) = get_json(&app, "/api/v1/brain/notes?after=vlt:big").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Counterweight: a real cursor pages on, with and without the filter.
+    let (status, json) = get_json(
+        &app,
+        "/api/v1/brain/notes?vault=vlt:big&limit=2&after=note:vlt:big:0001",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json[0]["uid"], "note:vlt:big:0002");
+    let (status, _) = get_json(&app, "/api/v1/brain/notes?after=note:vlt:big:0001").await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 /// Counterweight: a vault that fits in one page sends no cursor, so a caller
