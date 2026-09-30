@@ -13648,6 +13648,56 @@ fn a_resume_after_a_vault_edit_reindexes_only_that_vault() {
     );
 }
 
+/// A heading is embedded with its note's title. Changing only a note's title
+/// leaves the heading's own hash alone, yet its vector is stale: a resume
+/// re-embeds the note and its headings.
+#[test]
+fn a_resume_after_a_note_title_change_re_embeds_its_headings() {
+    let fx = LinkedRebuildFixture::new();
+    let operation = fx.build_until_validation();
+    let note = fx.vault.join("Workspaces/Alpha/design.md");
+    // Only the frontmatter title changes: every heading keeps its text, line
+    // and uid, so only the note's hash says its headings' vectors are stale.
+    let body = std::fs::read_to_string(&note).unwrap();
+    assert!(body.contains("title: Widget design"));
+    std::fs::write(
+        &note,
+        body.replace("title: Widget design", "title: Widget architecture"),
+    )
+    .unwrap();
+
+    let resumed = fx.rebuild(&["--operation", &operation]);
+    assert_exit(&resumed, 0, "scoped resume");
+    let stderr = String::from_utf8_lossy(&resumed.stderr).into_owned();
+    let selected = fx.selected();
+    let store = nestweaver_store::GraphStore::open_read_only(&selected).unwrap();
+    let design = store
+        .list_notes(None)
+        .unwrap()
+        .into_iter()
+        .find(|note| note.file_path.ends_with("design.md"))
+        .unwrap();
+    assert_eq!(design.title, "Widget architecture");
+    let vault_uid = design.vault_uid.clone();
+    let headings: Vec<_> = store
+        .list_headings_by_vault(&vault_uid)
+        .unwrap()
+        .into_iter()
+        .filter(|heading| heading.note_uid == design.uid)
+        .collect();
+    assert!(!headings.is_empty());
+    assert_eq!(embedding_count_line(&stderr, "note"), Some(1), "{stderr}");
+    assert_eq!(
+        embedding_count_line(&stderr, "heading"),
+        Some(headings.len()),
+        "the retitled note's headings are re-embedded: {stderr}"
+    );
+    assert_eq!(embedding_count_line(&stderr, "symbol"), None, "{stderr}");
+    for heading in &headings {
+        assert!(store.has_embedding(&heading.uid));
+    }
+}
+
 /// A change resume cannot scope — the configuration, or which sources exist —
 /// falls back to a full rebuild under a new operation, and says why.
 #[test]

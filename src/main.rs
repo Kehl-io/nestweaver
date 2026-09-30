@@ -30527,11 +30527,23 @@ fn staged_source_content(
         {
             return Ok(None);
         }
-        for note in store.list_notes(Some(source_uid))? {
-            content.insert(note.uid, note.content_hash);
-        }
+        let notes = store.list_notes(Some(source_uid))?;
+        // A heading is embedded with its note's title, which its own hash
+        // does not cover: key it by the whole note's content as well, so any
+        // change to the note (its title included) re-embeds its headings.
+        let note_hashes: std::collections::HashMap<&str, &str> = notes
+            .iter()
+            .map(|note| (note.uid.as_str(), note.content_hash.as_str()))
+            .collect();
         for heading in store.list_headings_by_vault(source_uid)? {
-            content.insert(heading.uid, heading.content_hash);
+            let note_hash = note_hashes
+                .get(heading.note_uid.as_str())
+                .copied()
+                .unwrap_or_default();
+            content.insert(heading.uid, format!("{note_hash}:{}", heading.content_hash));
+        }
+        for note in notes {
+            content.insert(note.uid, note.content_hash);
         }
     }
     Ok(Some(content))
