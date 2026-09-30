@@ -22,6 +22,7 @@ nestweaver daemon start --config /path/to/instance.toml
 ```
 
 The rebuild captures the exact repository and vault inputs, rebuilds the graph,
+cross-repository call links (inferred once, after every source is indexed),
 projects, note→code links, BM25, per-scope regex shards, embeddings, and
 ranking metadata, then revalidates the inputs before the atomic switch. Note→code
 links are built with the same reconciler the daemon uses (`[Graph] linking notes
@@ -51,10 +52,22 @@ nestweaver publication rebuild --config /path/to/instance.toml --operation <uuid
 A rebuild of a large brain takes long enough (about an hour for tens of
 repositories) that a source often changes before it finishes, and final
 validation then refuses the cutover. Resume the same operation: it compares the
-current inputs with the ones the operation recorded, re-indexes only the
-repositories and vaults whose content or commit changed into the staged slot,
-re-embeds only their changed nodes, rebuilds the state derived from the graph
-(projects, note→code links, BM25, regex shards, ranking), and validates again:
+current inputs with the ones the operation recorded and re-indexes only the
+repositories and vaults whose content or commit changed into the staged slot.
+What it recomputes:
+
+- **Per changed source:** the source's graph, and the embeddings of its nodes
+  whose content changed (symbols by content hash; notes by content hash; a
+  note's headings whenever the note changed at all, since a heading is embedded
+  with its note's title). Unchanged sources keep their staged graph and vectors.
+- **Over the whole graph, every time:** cross-repository call links (inferred
+  after every source is indexed, so they do not depend on indexing order),
+  project membership, note→code links, BM25, and ranking. Regex shards are
+  refreshed for the scopes whose content moved.
+
+It then validates again. The staged graph (symbols, notes, and symbol,
+cross-repository, and note→code edges) matches what a fresh rebuild of the
+changed sources produces:
 
 ```text
 Resume: 1 input(s) changed since the build recorded them (repository file:///src/app); re-indexing only those, then rebuilding derived state and validating.

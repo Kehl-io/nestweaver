@@ -3923,8 +3923,14 @@ mod tests {
             crate::publication::PUBLICATION_GRAPH_FILE,
             crate::index_md::SKIPPED_NOTES_SIDECAR_SUFFIX
         );
+        let derivation = format!(
+            "{}{}",
+            crate::publication::PUBLICATION_GRAPH_FILE,
+            crate::markdown_derivation::RECORD_SUFFIX
+        );
         std::fs::write(slot.join(&registrations), b"{}").unwrap();
         std::fs::write(slot.join(&skipped), b"{}").unwrap();
+        std::fs::write(slot.join(&derivation), b"{}").unwrap();
 
         let bundle = seal_publication_slot(&db_path, &slot)
             .expect("a slot holding vault index sidecars must seal");
@@ -3937,6 +3943,8 @@ mod tests {
                 .any(|a| a.path == skipped
                     && a.kind == crate::publication::ArtifactKind::FileMetadata)
         );
+        assert!(bundle.artifacts.iter().any(|a| a.path == derivation
+            && a.kind == crate::publication::ArtifactKind::CompatibilityStamp));
     }
 
     #[test]
