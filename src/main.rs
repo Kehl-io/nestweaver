@@ -30078,6 +30078,23 @@ fn run_publication_rebuild(
                         "materialize the staged publication graph",
                     )?;
                     let store = GraphStore::open_with_authority(&target_db, &authority)?;
+                    // Cross-repo call links are inferred once, over the whole
+                    // graph, after every source is indexed: per-repository
+                    // inference depends on indexing order, and re-indexing a
+                    // changed repository drops the links others had into it.
+                    let package_names: std::collections::HashMap<String, String> =
+                        publication_source_manifests(&sources)
+                            .into_iter()
+                            .filter_map(|(uid, manifest)| {
+                                manifest.package_name.map(|name| (uid, name))
+                            })
+                            .collect();
+                    let cross_repo = nestweaver_engine::index::reinfer_cross_repo_links(
+                        &store,
+                        &target_db,
+                        &package_names,
+                    )?;
+                    eprintln!("Cross-repo links: {cross_repo} inferred over every repository.");
                     let projects = nestweaver_engine::project::materialize_projects(
                         &store,
                         &config,
@@ -30286,13 +30303,7 @@ fn run_publication_rebuild(
                         "materialize staged publication metadata",
                     )?;
                     let store = GraphStore::open_with_authority(&target_db, &authority)?;
-                    let mut manifests = std::collections::HashMap::new();
-                    for repo in &sources.repos {
-                        let reader = nestweaver_engine::content_reader::FilesystemReader::new(
-                            Path::new(&repo.root_path),
-                        );
-                        manifests.insert(repo.uid.clone(), nestweaver_engine::parse_manifest(&reader));
-                    }
+                    let manifests = publication_source_manifests(&sources);
                     nestweaver_engine::save_manifest_cache_for_db(&manifests, &store, &target_db)?;
                     store.compute_pagerank(
                         0.85,
@@ -30692,6 +30703,22 @@ fn publication_progress(
             message,
         },
     )
+}
+
+/// Every captured repository's manifest, read from its working tree.
+fn publication_source_manifests(
+    sources: &nestweaver_engine::PublicationSourceManifest,
+) -> std::collections::HashMap<String, nestweaver_engine::manifest::ManifestInfo> {
+    sources
+        .repos
+        .iter()
+        .map(|repo| {
+            let reader = nestweaver_engine::content_reader::FilesystemReader::new(Path::new(
+                &repo.root_path,
+            ));
+            (repo.uid.clone(), nestweaver_engine::parse_manifest(&reader))
+        })
+        .collect()
 }
 
 /// Journal checkpoint: the staged slot completed one full re-embed.

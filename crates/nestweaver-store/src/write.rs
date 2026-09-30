@@ -2171,6 +2171,33 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Replace every name-inferred cross-repo link (evidence kinds
+    /// `cross_repo_name_match` / `cross_repo_name_import_corroborated`) with
+    /// `edges`, in one transaction. A whole-graph pass that infers them after
+    /// every repository is indexed uses this, so the result does not depend
+    /// on the order repositories were indexed in. Other CROSS_REPO_LINK edges
+    /// are left alone.
+    pub fn replace_inferred_cross_repo_links(
+        &self,
+        edges: &[ResolvedEdge],
+    ) -> Result<(), StoreError> {
+        let conn = self.begin_transaction()?;
+        let result = exec_params(
+            &conn,
+            "MATCH (:Symbol)-[r:CROSS_REPO_LINK]->(:Symbol) \
+             WHERE r.evidence CONTAINS 'cross_repo_name_' DELETE r",
+            vec![],
+        )
+        .and_then(|()| Self::batch_insert_edges_on(&conn, edges));
+        match result {
+            Ok(()) => self.commit_transaction(&conn),
+            Err(error) => {
+                let _ = self.rollback_transaction(&conn);
+                Err(error)
+            }
+        }
+    }
+
     pub fn batch_insert_edges(&self, edges: &[ResolvedEdge]) -> Result<(), StoreError> {
         let conn = self.begin_transaction()?;
         Self::batch_insert_edges_on(&conn, edges)?;

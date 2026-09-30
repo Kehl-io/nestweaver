@@ -13074,12 +13074,22 @@ impl LinkedRebuildFixture {
         );
         write(alpha.join("src/extra.rs"), "pub fn alpha_extra() {}\n");
         write(
+            alpha.join("src/helper.js"),
+            "export function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n",
+        );
+        // beta calls alpha: a name-inferred cross-repo call link, whose
+        // presence must not depend on which repository is indexed first.
+        write(
             beta.join("src/widget.rs"),
             "pub struct SharedWidget;\npub struct BetaGadget;\n",
         );
         write(
+            beta.join("src/caller.js"),
+            "export function betaCaller() {\n  return alphaHelper();\n}\nexport function betaUtil() { return 2; }\n",
+        );
+        write(
             vault.join("Workspaces/Alpha/design.md"),
-            "# Design\n\nThe SharedWidget wraps the AlphaGadget.\n",
+            "---\ntitle: Widget design\n---\n# Design\n\nThe SharedWidget wraps the AlphaGadget.\n",
         );
         write(
             vault.join("Notes/beta.md"),
@@ -13196,6 +13206,23 @@ fn a_rebuild_publishes_current_note_code_links_with_no_debt() {
     );
     assert_eq!(report.memberships_added, 0);
     assert_eq!(store.list_references_code_edges().unwrap(), before);
+    drop(store);
+    // beta is indexed before alpha, yet its call into alpha is linked.
+    assert!(
+        has_cross_repo_call(&selected, "betaCaller", "alphaHelper"),
+        "a fresh rebuild must link beta's call into alpha whatever the indexing order"
+    );
+    assert!(has_cross_repo_call(&selected, "alphaUses", "betaUtil"));
+    // Each link once: the whole-graph pass replaces what per-repository
+    // indexing inferred instead of adding to it.
+    let links: Vec<_> = typed_edges(&selected)
+        .into_iter()
+        .filter(|edge| edge.2 == "CROSS_REPO_LINK")
+        .collect();
+    let mut distinct = links.clone();
+    distinct.dedup();
+    assert_eq!(links, distinct, "duplicated cross-repo links");
+    assert_eq!(links.len(), 2, "{links:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("linking notes to code"),
@@ -13372,6 +13399,49 @@ fn symbol_content(
         .collect()
 }
 
+/// Every symbol-to-symbol edge, cross-repo links included, in comparable form.
+fn typed_edges(db: &std::path::Path) -> Vec<(String, String, String, i64, String)> {
+    let store = nestweaver_store::GraphStore::open_read_only(db).unwrap();
+    let scaled = |confidence: f64| (confidence * 10_000.0).round() as i64;
+    let mut edges: Vec<_> = store
+        .load_typed_edges()
+        .unwrap()
+        .into_iter()
+        .map(|(src, dst, kind, confidence, evidence)| {
+            (src, dst, kind, scaled(confidence), evidence)
+        })
+        .collect();
+    // `load_typed_edges` covers the in-repo symbol edges; the cross-repo
+    // links are listed separately.
+    edges.extend(
+        store
+            .list_all_cross_repo_links(100_000)
+            .unwrap()
+            .into_iter()
+            .map(|link| {
+                (
+                    link.source_uid,
+                    link.target_uid,
+                    "CROSS_REPO_LINK".to_string(),
+                    scaled(f64::from(link.confidence)),
+                    link.link_type,
+                )
+            }),
+    );
+    edges.sort();
+    edges
+}
+
+fn has_cross_repo_call(db: &std::path::Path, from: &str, to: &str) -> bool {
+    let names = symbol_content(db);
+    let name = |uid: &str| names.get(uid).map(|(name, _, _)| name.clone());
+    typed_edges(db).iter().any(|(src, dst, kind, _, _)| {
+        kind == "CROSS_REPO_LINK"
+            && name(src).as_deref() == Some(from)
+            && name(dst).as_deref() == Some(to)
+    })
+}
+
 fn embedding_count_line(stderr: &str, kind: &str) -> Option<usize> {
     stderr.lines().find_map(|line| {
         line.strip_prefix("Embedding ")?
@@ -13473,6 +13543,14 @@ fn a_resume_after_source_drift_reindexes_only_the_changed_repository() {
             .collect::<Vec<_>>()
     };
     assert_eq!(names(&after), names(&symbol_content(&fresh)));
+    // Cross-repo links: beta's call into alpha survives alpha's re-index,
+    // and every edge equals the fresh build's.
+    let resumed_edges = typed_edges(&selected);
+    assert!(
+        has_cross_repo_call(&selected, "betaCaller", "alphaHelper"),
+        "{resumed_edges:?}"
+    );
+    assert_eq!(resumed_edges, typed_edges(&fresh));
     let resumed_store = nestweaver_store::GraphStore::open_read_only(&selected).unwrap();
     let fresh_store = nestweaver_store::GraphStore::open_read_only(&fresh).unwrap();
     assert!(after.values().any(|(name, _, _)| name == "AlphaGizmo"));

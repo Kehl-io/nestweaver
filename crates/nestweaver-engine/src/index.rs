@@ -3068,6 +3068,78 @@ fn infer_cross_repo_call_edges(
     current_repo_uid: &str,
     parsed_files: &[ParsedFileEntry],
 ) -> Result<Vec<nestweaver_schema::ResolvedEdge>, anyhow::Error> {
+    // nw-688: repo uid -> declared package name, to tell an indexed repo's
+    // package (`@org/shared`) from an npm one (`lodash`).
+    let package_names = store
+        .db_path()
+        .map(crate::manifest::package_names_hint)
+        .unwrap_or_default();
+    infer_cross_repo_call_edges_with(store, current_repo_uid, parsed_files, &package_names)
+}
+
+/// Re-infer every name-matched cross-repo call link over the WHOLE graph and
+/// replace the stored ones with the result.
+///
+/// Per-repository indexing infers a repository's outgoing links against the
+/// repositories already in the graph, so its result depends on indexing
+/// order, and re-indexing a repository drops the links other repositories
+/// had into it. A caller that indexes every source first (a publication
+/// rebuild) runs this afterwards instead, with every repository present and
+/// `package_names` taken from the sources themselves, so a fresh build and a
+/// resumed one agree. Parses come from the parse cache the indexing runs
+/// just filled, keyed by each file's recorded content hash.
+///
+/// Returns the number of links written.
+pub fn reinfer_cross_repo_links(
+    store: &GraphStore,
+    db_path: &Path,
+    package_names: &HashMap<String, String>,
+) -> Result<usize, anyhow::Error> {
+    let filemeta = load_filemeta_sidecar(&crate::sidecar_path(db_path, ".filemeta.json"));
+    let parsed_cache =
+        crate::parsed_cache::ParsedCache::load(&crate::sidecar_path(db_path, ".parsed_cache.bin"));
+    let mut repos = store
+        .list_repos(None)
+        .map_err(|e| anyhow::anyhow!("list repositories for cross-repo inference: {e}"))?;
+    repos.sort_by(|left, right| left.uid.cmp(&right.uid));
+    let mut edges = Vec::new();
+    for repo in repos {
+        let Some(files) = filemeta.repos.get(&repo.uid) else {
+            continue;
+        };
+        let mut paths: Vec<&String> = files.keys().collect();
+        paths.sort();
+        let parsed: Vec<ParsedFileEntry> = paths
+            .into_iter()
+            .filter_map(|rel_path| {
+                let cached = parsed_cache.get(&files[rel_path].content_hash)?;
+                Some((
+                    rel_path.clone(),
+                    cached.symbols.clone(),
+                    cached.references.clone(),
+                    None,
+                ))
+            })
+            .collect();
+        edges.extend(infer_cross_repo_call_edges_with(
+            store,
+            &repo.uid,
+            &parsed,
+            package_names,
+        )?);
+    }
+    store
+        .replace_inferred_cross_repo_links(&edges)
+        .map_err(|e| anyhow::anyhow!("replace inferred cross-repo links: {e}"))?;
+    Ok(edges.len())
+}
+
+fn infer_cross_repo_call_edges_with(
+    store: &GraphStore,
+    current_repo_uid: &str,
+    parsed_files: &[ParsedFileEntry],
+    package_names: &HashMap<String, String>,
+) -> Result<Vec<nestweaver_schema::ResolvedEdge>, anyhow::Error> {
     use nestweaver_parser::ReferenceKind;
     use nestweaver_schema::{CrossRepoLinkType, EdgeEvidence, EdgeType, ResolvedEdge, Visibility};
 
@@ -3088,12 +3160,6 @@ fn infer_cross_repo_call_edges(
     const NAME_ONLY_CONFIDENCE: f32 = 0.20; // info tier (< 0.25 warning cutoff)
     const IMPORT_CORROBORATED_CONFIDENCE: f32 = 0.50; // SamePackageFallback
 
-    // nw-688: repo uid -> declared package name, to tell an indexed repo's
-    // package (`@org/shared`) from an npm one (`lodash`).
-    let package_names = store
-        .db_path()
-        .map(crate::manifest::package_names_hint)
-        .unwrap_or_default();
     let local_symbol_names: std::collections::HashSet<String> = parsed_files
         .iter()
         .flat_map(|(_, symbols, _, _)| symbols.iter().map(|s| s.name.clone()))
