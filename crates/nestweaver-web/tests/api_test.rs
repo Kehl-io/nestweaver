@@ -2671,3 +2671,108 @@ async fn context_routes_reject_blank_seeds_and_oversized_requests() {
     let (status, json) = post_json(&app, "/api/v1/context", json!({ "seeds": ["greet"] })).await;
     assert_eq!(status, StatusCode::OK, "{json}");
 }
+
+/// GET returning status, content type and raw body.
+async fn get_raw(app: &axum::Router, uri: &str) -> (StatusCode, String, String) {
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        content_type,
+        String::from_utf8_lossy(&body).into_owned(),
+    )
+}
+
+/// axum's own extractor rejections (a query parameter that does not parse,
+/// a body that is not JSON) answered `text/plain`, unlike every other API
+/// error. They are JSON `{"error": ...}` now, with the same status, and an
+/// unknown API path is a JSON 404 rather than an empty body.
+#[tokio::test]
+async fn api_errors_are_json_including_extractor_rejections() {
+    let app = make_app();
+    let (status, content_type, body) = get_raw(&app, "/api/v1/brain/notes?limit=abc").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        content_type.starts_with("application/json"),
+        "{content_type}: {body}"
+    );
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        json["error"].as_str().unwrap().contains("invalid digit"),
+        "{json}"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/context")
+                .header("content-type", "application/json")
+                .body(Body::from("{not json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.status().is_client_error(), "{}", response.status());
+    assert!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("application/json")),
+        "{:?}",
+        response.headers()
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["error"].is_string(), "{json}");
+
+    let (status, content_type, body) = get_raw(&app, "/api/v1/does-not-exist").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        content_type.starts_with("application/json"),
+        "{content_type}"
+    );
+    assert!(serde_json::from_str::<Value>(&body).unwrap()["error"].is_string());
+
+    // Counterweight: a successful response is untouched.
+    let (status, content_type, _) = get_raw(&app, "/api/v1/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(content_type.starts_with("application/json"));
+}
+
+/// Outside server mode there is no admin API; `/admin/api/*` served the
+/// SPA's HTML with 200. It is a JSON 404 now.
+#[tokio::test]
+async fn admin_api_outside_server_mode_is_a_json_404() {
+    let app = make_app();
+    for uri in ["/admin/api/status", "/admin/api", "/admin/api/repos/x"] {
+        let (status, content_type, body) = get_raw(&app, uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+        assert!(
+            content_type.starts_with("application/json"),
+            "{uri}: {content_type}"
+        );
+        let json: Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            json["error"].as_str().unwrap().contains("server mode"),
+            "{json}"
+        );
+    }
+}

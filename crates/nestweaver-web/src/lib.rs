@@ -62,8 +62,18 @@ async fn spa_fallback(request: Request) -> Response {
 
     // API typos must remain machine-readable HTTP failures. Returning the SPA
     // shell here turns an unknown endpoint into a misleading 200 response.
-    if path == "/api" || path.starts_with("/api/") {
-        return StatusCode::NOT_FOUND.into_response();
+    if is_api_path(path) {
+        return crate::error::ApiError::not_found(format!("no API route at {path}"))
+            .into_response();
+    }
+    // The admin API exists only in server mode, on the server's own listener.
+    // This UI answered it with the SPA's HTML and a 200.
+    if path == "/admin/api" || path.starts_with("/admin/api/") {
+        return crate::error::ApiError::not_found(
+            "the admin API is served only by a daemon in server mode, on its own listener, \
+             not by this UI",
+        )
+        .into_response();
     }
 
     // Paths with file extensions that weren't found should 404
@@ -81,6 +91,59 @@ async fn spa_fallback(request: Request) -> Response {
             .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+fn is_api_path(path: &str) -> bool {
+    path == "/api" || path.starts_with("/api/")
+}
+
+/// Largest error body re-encoded as JSON; axum's rejection texts are short.
+const MAX_REENCODED_ERROR_BYTES: usize = 64 * 1024;
+
+/// Every API error is a JSON `{"error": ...}` body. axum's own extractor
+/// rejections (a query string or JSON body that does not parse, a body over
+/// the limit, a method not allowed) answer `text/plain`, or nothing; this
+/// re-encodes them with their status unchanged. Responses that are already
+/// JSON, successes, and non-API paths pass through untouched.
+async fn json_api_errors(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let api = is_api_path(request.uri().path());
+    let response = next.run(request).await;
+    let status = response.status();
+    if !api || !(status.is_client_error() || status.is_server_error()) {
+        return response;
+    }
+    let is_json = response
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    if is_json {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let text = axum::body::to_bytes(body, MAX_REENCODED_ERROR_BYTES)
+        .await
+        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+        .unwrap_or_default();
+    let message = if text.is_empty() {
+        status
+            .canonical_reason()
+            .unwrap_or("request failed")
+            .to_lowercase()
+    } else {
+        text
+    };
+    let mut rebuilt = (status, axum::Json(serde_json::json!({ "error": message }))).into_response();
+    // Keep headers such as `Allow` on a 405; the body's type is ours now.
+    for (name, value) in parts.headers.iter() {
+        if name != http::header::CONTENT_TYPE && name != http::header::CONTENT_LENGTH {
+            rebuilt.headers_mut().insert(name.clone(), value.clone());
+        }
+    }
+    rebuilt
 }
 
 pub fn create_router(state: Arc<AppState>) -> Router {
@@ -205,6 +268,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Events (SSE)
         .route("/api/v1/events", get(routes::events::events))
         .fallback(get(spa_fallback))
+        .layer(axum::middleware::from_fn(json_api_errors))
         // No CORS layer: the SPA is served same-origin (serve_ui) in production
         // and via Vite's same-origin dev proxy in development, so no
         // cross-origin access is needed. Sending `Access-Control-Allow-Origin: *`

@@ -242,6 +242,7 @@ Also changing behaviour in this release, in ways a script may notice:
 
 | Change | What to do |
 | --- | --- |
+| Every web API error body is JSON `{"error": …}`: axum's own rejections (a query parameter or JSON body that does not parse, a body over the limit, a wrong method) used to answer `text/plain` (or an empty body), and an unknown `/api/…` path answered an empty 404. Statuses are unchanged. Outside server mode, `/admin/api/*` on the UI is a JSON **404**; it used to serve the SPA's HTML with 200 | Parse error bodies as JSON |
 | A declared project repo removed with `remove-repo` (or indexed since the last materialization) is now disclosed, or cleared, by the daemon's next code-link pass: `list-projects` and `project-context` print `Warning: declared repo not a member: …` without waiting for `materialize-projects` | Nothing to change |
 | `brain status` names a project whose declared repos resolve to none by its name, not its uid; `--json` `code_links` gains `unscoped_project_names` (index for index with `unscoped_projects`). `notes_changed_as_of`, printed as "as of the last pass", is now re-dated by every pass that finds changed notes; it used to keep the date of the first pass that saw them | Nothing to change |
 | `list-projects` lists each project's member repos: a `Repos:` line in text (`(none)` when it has none) and a `member_repos` object (project name to `[{uid, name}]`) in `--json`. The daemon's project listing carries them as `repos` on each project | Read `member_repos` instead of calling `project-context` per project |
