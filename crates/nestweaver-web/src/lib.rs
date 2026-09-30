@@ -62,8 +62,18 @@ async fn spa_fallback(request: Request) -> Response {
 
     // API typos must remain machine-readable HTTP failures. Returning the SPA
     // shell here turns an unknown endpoint into a misleading 200 response.
-    if path == "/api" || path.starts_with("/api/") {
-        return StatusCode::NOT_FOUND.into_response();
+    if is_api_path(path) {
+        return crate::error::ApiError::not_found(format!("no API route at {path}"))
+            .into_response();
+    }
+    // The admin API exists only in server mode, on the server's own listener.
+    // This UI answered it with the SPA's HTML and a 200.
+    if path == "/admin/api" || path.starts_with("/admin/api/") {
+        return crate::error::ApiError::not_found(
+            "the admin API is served only by a daemon in server mode, on its own listener, \
+             not by this UI",
+        )
+        .into_response();
     }
 
     // Paths with file extensions that weren't found should 404
@@ -83,6 +93,59 @@ async fn spa_fallback(request: Request) -> Response {
     }
 }
 
+fn is_api_path(path: &str) -> bool {
+    path == "/api" || path.starts_with("/api/")
+}
+
+/// Largest error body re-encoded as JSON; axum's rejection texts are short.
+const MAX_REENCODED_ERROR_BYTES: usize = 64 * 1024;
+
+/// Every API error is a JSON `{"error": ...}` body. axum's own extractor
+/// rejections (a query string or JSON body that does not parse, a body over
+/// the limit, a method not allowed) answer `text/plain`, or nothing; this
+/// re-encodes them with their status unchanged. Responses that are already
+/// JSON, successes, and non-API paths pass through untouched.
+async fn json_api_errors(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let api = is_api_path(request.uri().path());
+    let response = next.run(request).await;
+    let status = response.status();
+    if !api || !(status.is_client_error() || status.is_server_error()) {
+        return response;
+    }
+    let is_json = response
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    if is_json {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let text = axum::body::to_bytes(body, MAX_REENCODED_ERROR_BYTES)
+        .await
+        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+        .unwrap_or_default();
+    let message = if text.is_empty() {
+        status
+            .canonical_reason()
+            .unwrap_or("request failed")
+            .to_lowercase()
+    } else {
+        text
+    };
+    let mut rebuilt = (status, axum::Json(serde_json::json!({ "error": message }))).into_response();
+    // Keep headers such as `Allow` on a 405; the body's type is ours now.
+    for (name, value) in parts.headers.iter() {
+        if name != http::header::CONTENT_TYPE && name != http::header::CONTENT_LENGTH {
+            rebuilt.headers_mut().append(name.clone(), value.clone());
+        }
+    }
+    rebuilt
+}
+
 pub fn create_router(state: Arc<AppState>) -> Router {
     // Touch all lazy metric statics so the /metrics endpoint always reports
     // the full set of metric names, even before any events occur.
@@ -100,10 +163,17 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(routes::symbols::symbols_in_file),
         )
         .route("/api/v1/symbols/top", get(routes::symbols::symbols_top))
-        .route("/api/v1/context", post(routes::context::code_context))
+        .route(
+            "/api/v1/context",
+            post(routes::context::code_context).layer(axum::extract::DefaultBodyLimit::max(
+                routes::context::CONTEXT_BODY_LIMIT_BYTES,
+            )),
+        )
         .route(
             "/api/v1/brain/context",
-            post(routes::context::brain_context),
+            post(routes::context::brain_context).layer(axum::extract::DefaultBodyLimit::max(
+                routes::context::CONTEXT_BODY_LIMIT_BYTES,
+            )),
         )
         // Impact
         .route("/api/v1/impact/{uid}", get(routes::impact::impact))
@@ -198,6 +268,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Events (SSE)
         .route("/api/v1/events", get(routes::events::events))
         .fallback(get(spa_fallback))
+        .layer(axum::middleware::from_fn(json_api_errors))
         // No CORS layer: the SPA is served same-origin (serve_ui) in production
         // and via Vite's same-origin dev proxy in development, so no
         // cross-origin access is needed. Sending `Access-Control-Allow-Origin: *`
@@ -232,6 +303,16 @@ pub fn create_admin_router(state: Arc<AdminState>) -> Router {
         // network-facing MCP listener, so an unauthenticated /admin/api/metrics
         // would leak operational counters.
         .route("/metrics", get(admin::metrics))
+        // Nested under the UI router in server mode, this router would
+        // otherwise inherit the UI's fallback, which says the admin API is
+        // not served here at all.
+        .fallback(|request: Request| async move {
+            crate::error::ApiError::not_found(format!(
+                "unknown admin API route: {}",
+                request.uri().path()
+            ))
+            .into_response()
+        })
         .with_state(state)
 }
 
@@ -400,6 +481,46 @@ mod frontend_assets_tests {
         assert!(
             checked > 0,
             "expected index.html to reference at least one /assets/* file"
+        );
+    }
+
+    /// The JSON re-encoding keeps every value of a multi-valued header: an
+    /// error carrying two `Allow` (or `Vary`) lines keeps both.
+    #[tokio::test]
+    async fn json_api_errors_keeps_every_value_of_a_repeated_header() {
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route(
+                "/api/x",
+                get(|| async {
+                    let mut response =
+                        (StatusCode::METHOD_NOT_ALLOWED, "not allowed").into_response();
+                    let headers = response.headers_mut();
+                    headers.append(http::header::ALLOW, "GET".parse().unwrap());
+                    headers.append(http::header::ALLOW, "HEAD".parse().unwrap());
+                    response
+                }),
+            )
+            .layer(axum::middleware::from_fn(json_api_errors));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/x")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let allow: Vec<&str> = response
+            .headers()
+            .get_all(http::header::ALLOW)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(allow, ["GET", "HEAD"]);
+        assert_eq!(
+            response.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
         );
     }
 

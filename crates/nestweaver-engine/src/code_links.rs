@@ -81,6 +81,10 @@ pub struct CodeLinksState {
     /// declared repos resolved to none, so their notes link unscoped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unscoped_projects: Vec<String>,
+    /// The names of `unscoped_projects`, index for index (the uid where a
+    /// project could not be read), so status can name them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unscoped_project_names: Vec<String>,
     /// nw-670: the link-rules version ([`CROSS_DOMAIN_RULES_VERSION`]) the
     /// stored links were built with; 0 (absent) is the pre-nw-670
     /// match-every-word rules. A mismatch makes the next pass a migration:
@@ -251,7 +255,25 @@ pub fn code_links_status_json(db_path: Option<&Path>) -> serde_json::Value {
             .collect::<Vec<_>>(),
         // nw-670 re-review F1: projects whose declared repos resolved to none.
         "unscoped_projects": state.unscoped_projects,
+        "unscoped_project_names": state.unscoped_project_names,
     })
+}
+
+/// Project names for status, in the order of `uids`; a project that cannot be
+/// read keeps its uid.
+fn unscoped_project_names(store: &GraphStore, uids: &[String]) -> Vec<String> {
+    if uids.is_empty() {
+        return Vec::new();
+    }
+    let names: HashMap<String, String> = store
+        .list_projects()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|project| (project.uid, project.name))
+        .collect();
+    uids.iter()
+        .map(|uid| names.get(uid).cloned().unwrap_or_else(|| uid.clone()))
+        .collect()
 }
 
 /// The `code_links_pending` disclosure object (`reason`, `since`,
@@ -494,18 +516,21 @@ impl CodeLinkReconciler {
         if let Ok(report) = &outcome
             && !report.stopped
         {
+            let names = unscoped_project_names(store, &report.unscoped_projects);
             update_code_links_state(&db_path, |state| {
                 let differs = state.changed_by_vault != report.changed_by_vault
-                    || state.unscoped_projects != report.unscoped_projects;
+                    || state.unscoped_projects != report.unscoped_projects
+                    || state.unscoped_project_names != names;
                 state.changed_by_vault = report.changed_by_vault.clone();
                 state.unscoped_projects = report.unscoped_projects.clone();
-                // N6: only stamp a time when there is a count to date.
+                state.unscoped_project_names = names.clone();
+                // N6: only stamp a time when there is a count to date. The
+                // count is re-dated by EVERY pass that finds one, so "as of
+                // the last pass" is the last pass, not the first that saw it.
                 let as_of = (!report.changed_by_vault.is_empty()).then(now_iso);
-                let stamp_differs = state.changed_as_of.is_some() != as_of.is_some();
-                if differs || stamp_differs {
-                    state.changed_as_of = as_of;
-                }
-                differs || stamp_differs
+                let dated = as_of.is_some() || state.changed_as_of.is_some();
+                state.changed_as_of = as_of;
+                differs || dated
             });
         }
         match &outcome {
@@ -1973,6 +1998,12 @@ repos = [{repos}]
             serde_json::json!([project]),
             "{status}"
         );
+        // Status text names projects, not uids: the name rides along.
+        assert_eq!(
+            status["unscoped_project_names"],
+            serde_json::json!(["p"]),
+            "{status}"
+        );
     }
 
     /// Counterweight: a project that declares no repos (a notes-only
@@ -2003,6 +2034,20 @@ repos = [{repos}]
         assert_eq!(changed[0]["count"], 1, "{status}");
         // nw-670 re-review N6: the count is dated to its pass.
         assert!(status["notes_changed_as_of"].is_string(), "{status}");
+
+        // "As of the last pass" must be the LAST pass: a later pass that
+        // finds the same count re-dates it (it used to keep the first date).
+        update_code_links_state(&fx.db, |state| {
+            state.changed_as_of = Some("2000-01-01T00:00:00Z".to_string());
+            true
+        });
+        reconcile(&fx.store);
+        let again = code_links_status_json(Some(&fx.db));
+        assert_eq!(again["notes_changed_since_indexing"], *changed, "{again}");
+        assert_ne!(
+            again["notes_changed_as_of"], "2000-01-01T00:00:00Z",
+            "the date is the latest pass's: {again}"
+        );
     }
 
     /// nw-670 live eval #2: relink writes go out in groups bounded by an

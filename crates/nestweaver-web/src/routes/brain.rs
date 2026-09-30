@@ -114,6 +114,46 @@ pub struct ListNotesParams {
     pub after: Option<String>,
 }
 
+/// `after` must be a note uid (`note:<vault uid>:<hash>`) of the listed
+/// vault, or of some vault when no filter is given. A malformed cursor used
+/// to be compared as a plain string: one sorting before every note silently
+/// restarted at page 1, one sorting after every note returned an empty "end"
+/// page, and a double-encoded cursor (`note%3A...`) did one or the other.
+/// Existence is NOT required: a note deleted between two pages is still a
+/// valid position to page on from.
+fn validate_notes_cursor(after: &str, vault: Option<&str>) -> Result<(), ApiError> {
+    let hash_is_valid = |hash: &str| {
+        !hash.is_empty()
+            && hash
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    let valid = match after.strip_prefix("note:") {
+        Some(rest) => match vault {
+            Some(vault) => rest
+                .strip_prefix(vault)
+                .and_then(|tail| tail.strip_prefix(':'))
+                .is_some_and(hash_is_valid),
+            None => rest.rsplit_once(':').is_some_and(|(vault, hash)| {
+                vault.starts_with("vlt:") && vault.len() > "vlt:".len() && hash_is_valid(hash)
+            }),
+        },
+        None => false,
+    };
+    if valid {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(match vault {
+        Some(vault) => format!(
+            "`after` must be a note uid of vault '{vault}' (`note:{vault}:<hash>`), as sent \
+             in the X-Next-After header (decode it once)"
+        ),
+        None => "`after` must be a note uid (`note:<vault uid>:<hash>`), as sent in the \
+                 X-Next-After header (decode it once)"
+            .to_string(),
+    }))
+}
+
 pub async fn list_notes(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListNotesParams>,
@@ -145,6 +185,9 @@ pub async fn list_notes(
         ));
     }
     let vault = params.vault.as_deref().filter(|uid| !uid.is_empty());
+    if let Some(after) = params.after.as_deref() {
+        validate_notes_cursor(after, vault)?;
+    }
     let total = match vault {
         Some(uid) => {
             // An unknown vault is a 404, not an empty page that reads as

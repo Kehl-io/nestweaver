@@ -529,6 +529,39 @@ pub struct SkippedDir {
 /// path that vanished mid-walk is no row at all.
 pub const UNREADABLE_DIR_REASON: &str = "unreadable during enumeration";
 
+/// The `reason` a [`SkippedDir`] carries for a symlink the walk met and did
+/// not follow (`follow_links(false)`). `detail` is what the link points at:
+/// [`SYMLINK_TARGET_FILE`], [`SYMLINK_TARGET_DIR`] or
+/// [`SYMLINK_TARGET_UNRESOLVED`].
+///
+/// Following links is refused on purpose: a link can point outside the root
+/// (indexing content nobody registered) or back into it (duplicating notes
+/// under a second path, or looping). The row exists so the skip is disclosed
+/// rather than silent; only the vault indexer reports it (see
+/// `index::disclose_pruned_dir`).
+pub const SYMLINK_REASON: &str = "symlink (not followed)";
+/// [`SYMLINK_REASON`] detail: the link resolves to a regular file.
+pub const SYMLINK_TARGET_FILE: &str = "file";
+/// [`SYMLINK_REASON`] detail: the link resolves to a directory.
+pub const SYMLINK_TARGET_DIR: &str = "directory";
+/// [`SYMLINK_REASON`] detail: the link is dangling or cannot be resolved.
+pub const SYMLINK_TARGET_UNRESOLVED: &str = "unresolved";
+
+/// One [`SYMLINK_REASON`] row for the symlink at `abs` (`rel` below the root).
+pub(crate) fn symlink_row(abs: &Path, rel: &Path) -> SkippedDir {
+    let target = match std::fs::metadata(abs) {
+        Ok(meta) if meta.is_dir() => SYMLINK_TARGET_DIR,
+        Ok(_) => SYMLINK_TARGET_FILE,
+        Err(_) => SYMLINK_TARGET_UNRESOLVED,
+    };
+    SkippedDir {
+        path: rel.to_string_lossy().into_owned(),
+        reason: SYMLINK_REASON.to_string(),
+        matched_pattern: None,
+        detail: Some(target.to_string()),
+    }
+}
+
 /// The path an `ignore` walk error is about, if it names one.
 ///
 /// `WalkBuilder` wraps a failed `read_dir` as `WithDepth { WithPath { path,
@@ -1245,6 +1278,14 @@ impl ContentReader for FilesystemReader {
             if let Some(err) = entry.error() {
                 tracing::warn!("walk ignore-file error: {err}");
                 self.record_walk_rows(classify_walk_error(err, &self.repo_path));
+            }
+            if entry.file_type().is_some_and(|ft| ft.is_symlink())
+                && let Ok(rel) = entry.path().strip_prefix(&self.repo_path)
+            {
+                if let Ok(mut pruned) = self.skipped_dirs.lock() {
+                    pruned.push(symlink_row(entry.path(), rel));
+                }
+                continue;
             }
             if entry.file_type().is_some_and(|ft| ft.is_file())
                 && let Ok(rel) = entry.path().strip_prefix(&self.repo_path)
