@@ -2819,6 +2819,86 @@ fn a_vault_name_already_held_by_another_root_is_refused_by_add_and_watch() {
     assert_eq!(stdout.matches("r4-vault").count(), 1, "{stdout}");
 }
 
+/// The same guard on the RENAME route: a vault already in the graph used to
+/// skip the check entirely, so `brain add b --name other` followed by
+/// `brain add b --name notes` (or `brain refresh b --name NOTES`) left two
+/// vaults named `notes`. Refused like a new root, with the same message and
+/// exit 1. Counterweight: renaming to a free name still works.
+#[test]
+fn renaming_a_registered_vault_to_a_name_another_root_holds_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("a").join("notes");
+    let second = dir.path().join("b").join("notes");
+    for root in [&first, &second] {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join("Orphan.md"), "# Orphan\n\nbody\n").unwrap();
+    }
+    let db_path = dir.path().join("brain.lbug");
+    let brain = |args: &[&str]| {
+        nestweaver_cmd()
+            .arg("brain")
+            .args(args)
+            .arg("--db")
+            .arg(&db_path)
+            .timeout(std::time::Duration::from_secs(120))
+            .output()
+            .unwrap()
+    };
+    let path = |p: &std::path::Path| p.to_string_lossy().to_string();
+    assert!(brain(&["add", &path(&first)]).status.success());
+    assert!(
+        brain(&["add", &path(&second), "--name", "other"])
+            .status
+            .success()
+    );
+
+    for args in [
+        vec![
+            "add".to_string(),
+            path(&second),
+            "--name".into(),
+            "notes".into(),
+        ],
+        vec![
+            "refresh".to_string(),
+            path(&second),
+            "--name".into(),
+            "NOTES".into(),
+        ],
+    ] {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = brain(&args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("a vault named 'notes' is already indexed at")
+                && stderr.contains("brain remove"),
+            "{args:?}: {stderr}"
+        );
+    }
+    let list = brain(&["list", "--json"]);
+    let vaults: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let names: Vec<String> = vaults
+        .as_array()
+        .or_else(|| vaults["vaults"].as_array())
+        .unwrap()
+        .iter()
+        .map(|v| v["name"].as_str().unwrap().to_lowercase())
+        .collect();
+    assert_eq!(
+        names.iter().filter(|n| n.as_str() == "notes").count(),
+        1,
+        "{names:?}"
+    );
+
+    // Counterweight: a rename to a name no other root holds succeeds.
+    assert!(
+        brain(&["add", &path(&second), "--name", "second-notes"])
+            .status
+            .success()
+    );
+}
+
 fn index_vault_notes(vault_dir: &std::path::Path, db_path: &std::path::Path) {
     nestweaver_cmd()
         .args(["brain", "add"])
