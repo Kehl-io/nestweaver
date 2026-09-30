@@ -561,6 +561,11 @@ pub struct CrossRepoRelinkTiming {
     /// Backoff after a failed pass, doubling up to `retry_max`.
     pub retry_min: Duration,
     pub retry_max: Duration,
+    /// How long the parse cache stays in memory after the last pass. Kept
+    /// between the passes of a burst (a pass then reads only the cache's
+    /// new log records), released when idle: a large brain's cache is
+    /// hundreds of megabytes in memory.
+    pub cache_idle: Duration,
 }
 
 impl Default for CrossRepoRelinkTiming {
@@ -571,6 +576,7 @@ impl Default for CrossRepoRelinkTiming {
             max_delay: Duration::from_secs(60),
             retry_min: Duration::from_secs(30),
             retry_max: Duration::from_secs(10 * 60),
+            cache_idle: Duration::from_secs(5 * 60),
         }
     }
 }
@@ -607,6 +613,7 @@ pub async fn run_cross_repo_link_relinker(
     let mut retry: Option<(tokio::time::Instant, u64)> = None;
     let mut startup = true;
     let mut cache = Some(crate::parsed_cache::ParsedCache::empty());
+    let mut last_pass: Option<tokio::time::Instant> = None;
     loop {
         if *shutdown.borrow() {
             return;
@@ -621,6 +628,10 @@ pub async fn run_cross_repo_link_relinker(
             if state.pending.is_none() {
                 seen = None;
                 owed_since = None;
+                if last_pass.is_some_and(|at| now.duration_since(at) >= timing.cache_idle) {
+                    cache = Some(crate::parsed_cache::ParsedCache::empty());
+                    last_pass = None;
+                }
                 continue;
             }
             let owed_at = *owed_since.get_or_insert(now);
@@ -667,6 +678,7 @@ pub async fn run_cross_repo_link_relinker(
             (outcome, pass_cache)
         })
         .await;
+        last_pass = Some(tokio::time::Instant::now());
         let outcome = match outcome {
             Ok((outcome, pass_cache)) => {
                 cache = Some(pass_cache);
@@ -1030,6 +1042,7 @@ mod tests {
                 max_delay: Duration::from_secs(30),
                 retry_min: Duration::from_millis(50),
                 retry_max: Duration::from_millis(50),
+                ..Default::default()
             },
         ));
         // The unconditional startup pass links both directions first.
@@ -1254,6 +1267,7 @@ mod tests {
             max_delay: Duration::from_secs(30),
             retry_min: retry,
             retry_max: retry,
+            cache_idle: Duration::from_secs(60),
         }
     }
 }
