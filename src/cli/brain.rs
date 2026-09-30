@@ -2520,6 +2520,15 @@ pub(crate) fn run_brain(
                         return Ok((report_context_lookup_failure(&error, json, &seeds), None));
                     }
                     Err(error)
+                        if error.chain().any(|cause| {
+                            cause
+                                .to_string()
+                                .contains(nestweaver_engine::query::EMPTY_SEED_CONTAINER)
+                        }) =>
+                    {
+                        return Ok((report_brain_context_empty(&error, json, &seeds)?, None));
+                    }
+                    Err(error)
                         if error
                             .chain()
                             .any(|cause| cause.to_string().contains("No seeds resolved")) =>
@@ -2894,6 +2903,8 @@ pub(crate) fn run_brain(
                     let msg = e.to_string();
                     if msg.contains("Ambiguous") {
                         Ok((report_context_lookup_failure(&e, json, &seeds), None))
+                    } else if msg.contains(nestweaver_engine::query::EMPTY_SEED_CONTAINER) {
+                        Ok((report_brain_context_empty(&e, json, &seeds)?, None))
                     } else if msg.contains("No seeds resolved") {
                         Ok((report_brain_context_not_found(&e, json, &seeds)?, None))
                     } else {
@@ -3723,6 +3734,45 @@ pub(crate) fn brain_context_not_found_payload(
     })
 }
 
+/// A seed naming a vault with no notes (or a repo with no symbols) is not a
+/// miss: exit 1 (a valid request the graph cannot answer yet), not 2, with
+/// `status: "empty"` under `--json` rather than the not-found envelope.
+pub(crate) fn report_brain_context_empty(
+    error: &anyhow::Error,
+    json: bool,
+    seeds: &[String],
+) -> anyhow::Result<i32> {
+    let message = error
+        .chain()
+        .map(ToString::to_string)
+        .find_map(|cause| {
+            cause
+                .find(nestweaver_engine::query::EMPTY_SEED_CONTAINER)
+                .map(|start| cause[start..].to_string())
+        })
+        .unwrap_or_else(|| format!("{error:#}"));
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&brain_context_empty_payload(&message, seeds))?
+        );
+    } else {
+        eprintln!("{message}");
+    }
+    Ok(EXIT_ERROR)
+}
+
+pub(crate) fn brain_context_empty_payload(message: &str, seeds: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "error": "seed container is empty",
+        "status": "empty",
+        "message": message,
+        "seeds_expanded": 0,
+        "connected": [],
+        "empty_seeds": seeds,
+    })
+}
+
 #[cfg(test)]
 mod brain_context_not_found_tests {
     use super::*;
@@ -3750,6 +3800,20 @@ mod brain_context_not_found_tests {
         assert_eq!(payload["status"], "not_found");
         assert_eq!(payload["error"], "not found");
         assert_eq!(payload["unresolved_seeds"], serde_json::json!(seeds));
+    }
+
+    /// An empty vault is not a miss: its own status, and the engine's text
+    /// without the transport wrapper.
+    #[test]
+    fn an_empty_vault_seed_has_its_own_envelope() {
+        let engine = format!(
+            "{} vault vlt:x has no notes, so there is nothing to seed from.",
+            nestweaver_engine::query::EMPTY_SEED_CONTAINER
+        );
+        let payload = brain_context_empty_payload(&engine, &["vlt:x".to_string()]);
+        assert_eq!(payload["status"], "empty");
+        assert_ne!(payload["error"], "not found");
+        assert_eq!(payload["empty_seeds"], serde_json::json!(["vlt:x"]));
     }
 
     /// COUNTERWEIGHT: the direct route's bare engine error is used as is.

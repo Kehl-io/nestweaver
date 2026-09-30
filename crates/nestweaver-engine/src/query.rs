@@ -2308,6 +2308,8 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     // so the seed set can be cut to each container's most central members
     // once PPR has scored them.
     let mut container_expansions: Vec<ContainerMembers> = Vec::new();
+    // Container seeds that exist but hold nothing (a vault with no notes).
+    let mut empty_containers: Vec<String> = Vec::new();
 
     for raw in inputs {
         let trimmed = raw.trim();
@@ -2341,6 +2343,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             if let Some(members) = container_seed_members(store, trimmed)? {
                 if members.uids.is_empty() {
                     unresolved.push(raw.clone());
+                    empty_containers.push(trimmed.to_string());
                 } else {
                     // Joined into `seed_uids` after the loop, so the loop's
                     // own seeds can be told apart from container sweep-ins.
@@ -2528,6 +2531,13 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         store.require_verified_embedding_identity()?;
     }
     ensure_brain_context_not_cancelled(cancel)?;
+    // Every input that failed named a container that exists but is empty:
+    // that is not a miss, and saying "No seeds resolved" made an empty vault
+    // indistinguishable from a bogus uid.
+    if seed_uids.is_empty() && !unresolved.is_empty() && unresolved.len() == empty_containers.len()
+    {
+        anyhow::bail!("{}", empty_seed_container_message(&empty_containers));
+    }
     if seed_uids.is_empty() {
         anyhow::bail!(
             "No seeds resolved. Tried as UIDs, note titles, tags (with or without '#'), symbol \
@@ -3256,6 +3266,31 @@ fn container_member_limit() -> usize {
 struct ContainerMembers {
     uids: Vec<String>,
     total: usize,
+}
+
+/// Prefix of the error a brain-context call ends in when its only seeds are
+/// containers that exist but hold nothing (a `vlt:` vault with no notes, a
+/// `repo:` with no indexed symbols). Distinct from `No seeds resolved.`,
+/// which means an input matched nothing at all.
+pub const EMPTY_SEED_CONTAINER: &str = "Seed container is empty:";
+
+fn empty_seed_container_message(uids: &[String]) -> String {
+    let described: Vec<String> = uids
+        .iter()
+        .map(|uid| {
+            if uid.starts_with("repo:") {
+                format!("repository {uid} has no indexed symbols")
+            } else {
+                format!("vault {uid} has no notes")
+            }
+        })
+        .collect();
+    format!(
+        "{EMPTY_SEED_CONTAINER} {}, so there is nothing to seed from. Add notes to the vault \
+         and refresh it (`nestweaver brain refresh <vault root>`), or seed from a note, tag or \
+         symbol instead.",
+        described.join("; ")
+    )
 }
 
 /// Members of a container seed (nw-609): a vault's notes for `vlt:`, a
@@ -7207,13 +7242,37 @@ mod vault_seed_tests {
         assert_eq!(result.seed_matches_total, Some(members - 1));
     }
 
+    /// A `vlt:` seed for a vault with no notes is not a bogus uid: it is its
+    /// own error, [`EMPTY_SEED_CONTAINER`], so callers can tell "that vault
+    /// is empty" from "no such vault". A bogus uid stays "No seeds resolved".
     #[test]
-    fn a_vault_with_no_notes_is_an_error_not_an_empty_success() {
+    fn a_vault_with_no_notes_is_its_own_error_not_a_miss() {
         let store = fixture();
         let err = run(&store, "vlt:empty").expect_err("an empty vault expands to nothing");
         let msg = format!("{err:#}");
-        assert!(msg.starts_with("No seeds resolved."), "{msg}");
-        assert!(msg.contains("vlt:empty"), "{msg}");
+        assert!(msg.starts_with(super::EMPTY_SEED_CONTAINER), "{msg}");
+        assert!(msg.contains("vault vlt:empty has no notes"), "{msg}");
+        assert!(!msg.contains("No seeds resolved"), "{msg}");
+
+        let bogus = format!("{:#}", run(&store, "vlt:bogus").unwrap_err());
+        assert!(bogus.starts_with("No seeds resolved."), "{bogus}");
+        // An unresolvable input beside the empty vault is still a miss.
+        let mixed = build_brain_context_hybrid_with_aliases(
+            &store,
+            &["vlt:empty".to_string(), "vlt:bogus".to_string()],
+            None,
+            &HybridSearchConfig::default(),
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{mixed:#}").starts_with("No seeds resolved."),
+            "{mixed:#}"
+        );
     }
 
     /// The same defect on the `repo:` twin: a Repo node is in no PPR scope

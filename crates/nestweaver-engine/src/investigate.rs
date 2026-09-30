@@ -1831,9 +1831,11 @@ fn bm25_fallback(
 /// else is an operational or integrity failure and must retain its typed error
 /// instead of being mistaken for an empty semantic result.
 fn is_no_seed_resolution_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.to_string().starts_with("No seeds resolved."))
+    error.chain().any(|cause| {
+        let text = cause.to_string();
+        text.starts_with("No seeds resolved.")
+            || text.starts_with(crate::query::EMPTY_SEED_CONTAINER)
+    })
 }
 
 /// The note UID that owns a Section/Heading UID, recovered from the UID

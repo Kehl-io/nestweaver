@@ -47,6 +47,15 @@ fn reject_unresolved_http_seeds(
 /// so unresolved seeds never round-trip into the HTTP body.
 fn map_context_engine_error(err: anyhow::Error) -> ApiError {
     let message = err.to_string();
+    // The seed names a vault (or repo) that exists but holds nothing: the
+    // request is valid, the graph cannot answer it yet. Not a 404.
+    if err.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains(nestweaver_engine::query::EMPTY_SEED_CONTAINER)
+    }) {
+        return ApiError::conflict("the context seed's vault has no notes");
+    }
     if message.contains("No matching symbols")
         || message.contains("No symbols found")
         || message.contains("No seeds resolved")

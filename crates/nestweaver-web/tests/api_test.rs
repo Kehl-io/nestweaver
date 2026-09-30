@@ -2566,3 +2566,38 @@ async fn source_serves_indexed_files_under_a_symlinked_repo_root() {
     assert_eq!(s, StatusCode::OK, "{j}");
     assert_eq!(j["lines"], json!(["hello"]));
 }
+
+/// A seed naming a vault with no notes is a valid request the graph cannot
+/// answer yet: 409, not the 404 a bogus uid gets.
+#[tokio::test]
+async fn brain_context_on_an_empty_vault_is_409_not_404() {
+    let store = GraphStore::in_memory().unwrap();
+    store
+        .insert_vault(&Vault {
+            uid: "vlt:empty".into(),
+            name: "empty".into(),
+            root_path: "/v".into(),
+            instance_id: "default".into(),
+        })
+        .unwrap();
+    let app = create_router(AppState::new(
+        store,
+        None,
+        std::path::PathBuf::from("/tmp/empty-vault.lbug"),
+    ));
+    let (status, json) = post_json(
+        &app,
+        "/api/v1/brain/context",
+        json!({ "seeds": ["vlt:empty"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    assert_eq!(json["error"], "the context seed's vault has no notes");
+    let (status, json) = post_json(
+        &app,
+        "/api/v1/brain/context",
+        json!({ "seeds": ["vlt:bogus"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+}
