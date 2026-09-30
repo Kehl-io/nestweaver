@@ -4948,6 +4948,13 @@ fn format_daemon_status_response(
             {
                 lines.push(line);
             }
+            if let Some(line) = status
+                .cross_repo_links
+                .as_ref()
+                .and_then(format_cross_repo_links_status)
+            {
+                lines.push(line);
+            }
             // nw-705: repositories the manifest rebuild refused, by name.
             lines.extend(format_manifest_failures_status(&status.manifest_failures));
             // nw-585: indexed, but without their frontmatter -- not skipped.
@@ -5578,7 +5585,7 @@ enum Commands {
     /// removes the canonical sidecar or the keyed copy matching its current
     /// resolution.
     #[command(
-        after_help = "Examples:\n  nestweaver repair\n  nestweaver repair --db ~/brain/.nestweaver/brain.lbug\n  nestweaver repair --json\n  nestweaver repair --force        # marker carries no usable writer pid\n\nExits 0 when the publication is clean or was recovered, 1 when it is dirty\nand could not be recovered. Database/publication ownership is never overridden,\neven with --force; stop that process first.\n\nAlso reclaims orphaned Tantivy migration staging directories\n(.nestweaver-tantivy-reindex-*) left beside <db>.tantivy by a crashed schema\nmigration, and reports what was removed (or, under --dry-run, what would be).\nA database directory can hold thirteen sidecar artifacts in total\n(.code_links.json, .filemeta.json, .generation, .manifests.json,\n.pagerank.json, .parsed_cache.bin, .publications/, .resolution_deps.bin,\n.resolver_generation.json, .tantivy/, .wal, .write.lock, plus .regex-v3/\nunder --with-trigrams) — all safe to leave alone; only files matching the\nstaging prefix above are ever removed by this command.\n\nAlso reclaims orphaned resolution-keyed cluster sidecars\n(<db>.clusters.<resolution>.json), other than the canonical <db>.clusters.json\nand the keyed copy matching its current resolution, and reports what was\nremoved (or, under --dry-run, what would be)."
+        after_help = "Examples:\n  nestweaver repair\n  nestweaver repair --db ~/brain/.nestweaver/brain.lbug\n  nestweaver repair --json\n  nestweaver repair --force        # marker carries no usable writer pid\n\nExits 0 when the publication is clean or was recovered, 1 when it is dirty\nand could not be recovered. Database/publication ownership is never overridden,\neven with --force; stop that process first.\n\nAlso reclaims orphaned Tantivy migration staging directories\n(.nestweaver-tantivy-reindex-*) left beside <db>.tantivy by a crashed schema\nmigration, and reports what was removed (or, under --dry-run, what would be).\nA database directory can hold fourteen sidecar artifacts in total\n(.code_links.json, .cross_repo_links.json, .filemeta.json, .generation, .manifests.json,\n.pagerank.json, .parsed_cache.bin, .publications/, .resolution_deps.bin,\n.resolver_generation.json, .tantivy/, .wal, .write.lock, plus .regex-v3/\nunder --with-trigrams) — all safe to leave alone; only files matching the\nstaging prefix above are ever removed by this command.\n\nAlso reclaims orphaned resolution-keyed cluster sidecars\n(<db>.clusters.<resolution>.json), other than the canonical <db>.clusters.json\nand the keyed copy matching its current resolution, and reports what was\nremoved (or, under --dry-run, what would be)."
     )]
     Repair {
         #[arg(
@@ -10041,6 +10048,28 @@ fn format_manifest_failures_status(
         ));
     }
     lines
+}
+
+/// The one `brain status` line for owed cross-repo links, shared by the
+/// typed (daemon) and JSON (direct) renderers. `None` when nothing is owed.
+fn format_cross_repo_links_status(
+    links: &nestweaver_proto::CrossRepoLinksStatus,
+) -> Option<String> {
+    if !links.pending {
+        return None;
+    }
+    let mut line = format!("Cross-repo links: being re-inferred ({}", links.reason);
+    if !links.since.is_empty() {
+        line.push_str(&format!(", since {}", links.since));
+    }
+    line.push_str("); cross-repo impact may miss links until it finishes");
+    if !links.last_error.is_empty() {
+        line.push_str(&format!(
+            "; last attempt failed ({} time(s)): {}; retrying",
+            links.failures, links.last_error
+        ));
+    }
+    Some(line)
 }
 
 /// nw-670 review M3: the one `brain status` line for owed note->code links,
@@ -23116,6 +23145,36 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 config.as_deref(),
                 &format!("code re-index of {}", repo_path.display()),
             );
+            // Once per run: re-infer every name-matched cross-repo link over
+            // the whole graph, so the links do not depend on the order
+            // repositories were indexed in and a re-index restores the links
+            // other repositories had into this one.
+            match GraphStore::open_with_authority(&db_path, &write_lease) {
+                Ok(store) => {
+                    nestweaver_engine::cross_repo_links::mark_cross_repo_links_owed(
+                        &store,
+                        &format!("code re-index of {}", repo_path.display()),
+                    );
+                    if let Some(report) = nestweaver_engine::cross_repo_links::reconcile_after_index(
+                        &store,
+                        &db_path,
+                        index_limits,
+                        None,
+                    ) {
+                        out.status(&format!(
+                            "Cross-repo links: {} inferred over {} repositories ({} files, {} re-parsed) in {} ms.",
+                            report.links,
+                            report.repos,
+                            report.files,
+                            report.reparsed,
+                            report.elapsed_ms
+                        ));
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    "cross-repo link inference skipped — cannot open DB for writing; the links stay owed: {error:#}"
+                ),
+            }
 
             // Feature F12: mine git history and write the recency sidecar so
             // subsequent commands demote dormant code at rank-read time.

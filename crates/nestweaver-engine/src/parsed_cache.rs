@@ -60,13 +60,20 @@ impl ParsedCache {
     }
 
     /// Persist the cache to disk in MessagePack format.
+    ///
+    /// Replaced atomically (temp file + rename): the index and the
+    /// whole-graph cross-repo inference both write it, and a reader must
+    /// never load a torn file.
     pub fn save(&self, path: &Path) -> Result<(), anyhow::Error> {
         let file = ParsedCacheFile {
             version: CACHE_VERSION,
             entries: self.entries.clone(),
         };
         let data = rmp_serde::to_vec(&file).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
-        std::fs::write(path, data).map_err(|e| anyhow::anyhow!("write: {e}"))?;
+        nestweaver_store::durable_sidecar::atomic_replace_file(path, |out| {
+            std::io::Write::write_all(out, &data)
+        })
+        .map_err(|e| anyhow::anyhow!("write: {e}"))?;
         Ok(())
     }
 

@@ -438,6 +438,7 @@ pub mod contract_ref_source;
 pub mod contracts;
 pub mod cpu_throttle;
 pub mod cross_domain;
+pub mod cross_repo_links;
 pub mod dead_code;
 pub mod did_you_mean;
 pub mod diff_impact;

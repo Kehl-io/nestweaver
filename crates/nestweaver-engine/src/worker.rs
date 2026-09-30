@@ -242,6 +242,19 @@ impl WorkerPool {
             Arc::clone(&relink_wake),
             CODE_LINK_RELINK_TIMING,
         ));
+        // One debounced whole-graph cross-repo inference per pool: fetched
+        // repositories are re-read from their bare clones on a parse-cache
+        // miss.
+        let cross_repo_relinker = store.db_path().map(|db_path| {
+            tokio::spawn(crate::cross_repo_links::run_cross_repo_link_relinker(
+                Arc::clone(&store),
+                db_path.to_path_buf(),
+                self.index_limits,
+                relink_lease_factory(write_gate.clone(), shutdown.clone()),
+                shutdown.clone(),
+                crate::cross_repo_links::CrossRepoRelinkTiming::default(),
+            ))
+        });
 
         // Rehydrate the reindex tracker from the persisted store so the
         // periodic-full update counter and 7-day backstop survive a daemon
@@ -549,6 +562,9 @@ impl WorkerPool {
         // The relink task observes the same shutdown and stops between
         // chunks (its lease factory refuses too).
         let _ = relinker.await;
+        if let Some(task) = cross_repo_relinker {
+            let _ = task.await;
+        }
     }
 }
 
@@ -1157,6 +1173,12 @@ where
                 ReindexOutcome::Full
             };
             mark_code_links_owed_after_code_index(store, &prepared.repo_url);
+            // Paid by the pool's cross-repo relinker: one debounced
+            // whole-graph pass however many fetches land.
+            crate::cross_repo_links::mark_cross_repo_links_owed(
+                store,
+                &format!("code re-index of {}", prepared.repo_url),
+            );
             Ok(outcome)
         }
     }
@@ -1323,6 +1345,77 @@ mod tests {
             !should_force_full_reindex(None, "repo-a", 10_000, true),
             "spot checks only apply when server-mode tracking is enabled"
         );
+    }
+
+    /// Server mode: a fetched code repository records cross-repo link debt,
+    /// and the whole-graph pass re-reads the fetched sources from their bare
+    /// clones (the reader path writes no parse cache), links both
+    /// directions, and caches those parses for the next pass.
+    #[test]
+    fn fetched_repos_are_linked_both_ways_from_their_bare_clones() {
+        let tmp = TempDir::new().unwrap();
+        let alpha = tmp.path().join("alpha");
+        let beta = tmp.path().join("beta");
+        create_source_repo(
+            &alpha,
+            &[(
+                "src/helper.js",
+                "export function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n",
+            )],
+        );
+        create_source_repo(
+            &beta,
+            &[(
+                "src/caller.js",
+                "export function betaCaller() {\n  return alphaHelper();\n}\nexport function betaUtil() { return 2; }\n",
+            )],
+        );
+        let db = tmp.path().join("graph.lbug");
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+        for (id, source) in [(1, &alpha), (2, &beta)] {
+            let job = make_code_job(
+                id,
+                &format!("repo-{id}"),
+                &format!("file://{}", source.display()),
+            );
+            process_job(&job, &ws, &store, "test-instance").unwrap();
+        }
+        assert!(crate::cross_repo_links::cross_repo_links_pending(&db));
+        // Only the bare clones hold the sources now.
+        std::fs::remove_dir_all(&alpha).unwrap();
+        std::fs::remove_dir_all(&beta).unwrap();
+
+        let pass = || {
+            crate::cross_repo_links::reconcile_cross_repo_links(
+                &store,
+                &db,
+                crate::index_limits::IndexLimits::default(),
+                None,
+                &|| false,
+            )
+            .unwrap()
+        };
+        let first = pass();
+        assert!(first.settled && first.links == 2, "{first:?}");
+        assert_eq!(first.reparsed, first.files, "{first:?}");
+        let mut names: Vec<_> = store
+            .list_all_cross_repo_links(100)
+            .unwrap()
+            .into_iter()
+            .map(|link| (link.source_name, link.target_name))
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                ("alphaUses".to_string(), "betaUtil".to_string()),
+                ("betaCaller".to_string(), "alphaHelper".to_string()),
+            ]
+        );
+        assert!(!crate::cross_repo_links::cross_repo_links_pending(&db));
+        let second = pass();
+        assert_eq!(second.reparsed, 0, "{second:?}");
     }
 
     #[test]

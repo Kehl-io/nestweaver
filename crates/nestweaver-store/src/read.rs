@@ -571,6 +571,13 @@ fn parse_framework_hint(s: &str) -> Option<nestweaver_schema::FrameworkHint> {
     })
 }
 
+/// A symbol a called name may resolve to: (uid, repo uid, visibility).
+pub type SymbolTarget = (String, String, Visibility);
+
+/// A stored name-inferred cross-repo link: (source uid, target uid,
+/// confidence, link type, evidence JSON).
+pub type InferredCrossRepoLink = (String, String, f64, String, String);
+
 pub(crate) const SYMBOL_COLUMNS: &str = "s.uid, s.name, s.kind, s.repo_uid, s.file_path, s.start_line, s.end_line, \
      s.signature, s.summary, s.content_hash, s.pagerank_score, s.is_entry_point, s.entry_point_kind, \
      s.framework_hint, s.canonical_id, s.visibility";
@@ -815,6 +822,42 @@ impl GraphStore {
             .execute(&mut stmt, vec![("name", Value::String(name.to_string()))])
             .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
         result.map(|row| row_to_symbol(&row)).collect()
+    }
+
+    /// `(uid, repo_uid, visibility)` of every symbol whose name is in
+    /// `names`, keyed by name, from ONE scan of the Symbol table.
+    ///
+    /// `lookup_symbols_by_name` scans the table once per name (the name is
+    /// not indexed), which a whole-graph pass over tens of thousands of
+    /// called names cannot afford; this reads four columns per symbol once
+    /// and keeps only the requested names.
+    pub fn symbol_targets_by_names(
+        &self,
+        names: &HashSet<String>,
+    ) -> Result<HashMap<String, Vec<SymbolTarget>>, StoreError> {
+        let mut targets: HashMap<String, Vec<SymbolTarget>> = HashMap::new();
+        if names.is_empty() {
+            return Ok(targets);
+        }
+        let conn = self.conn()?;
+        let result = conn
+            .query("MATCH (s:Symbol) RETURN s.name, s.uid, s.repo_uid, s.visibility")
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        for row in result {
+            let name = extract_string(&row, 0)?;
+            if !names.contains(&name) {
+                continue;
+            }
+            let visibility = extract_opt_string(&row, 3)?
+                .map(|s| parse_visibility(&s))
+                .unwrap_or(Visibility::Inferred);
+            targets.entry(name).or_default().push((
+                extract_string(&row, 1)?,
+                extract_string(&row, 2)?,
+                visibility,
+            ));
+        }
+        Ok(targets)
     }
 
     pub fn list_repos(&self, instance_id: Option<&str>) -> Result<Vec<Repo>, StoreError> {
@@ -1277,6 +1320,36 @@ impl GraphStore {
                     link_type,
                     confidence,
                 })
+            })
+            .collect()
+    }
+
+    /// Every name-inferred cross-repo link (evidence kinds
+    /// `cross_repo_name_match` / `cross_repo_name_import_corroborated`) as
+    /// `(source uid, target uid, confidence, link type, evidence JSON)`, in
+    /// no particular order: the set
+    /// [`GraphStore::replace_inferred_cross_repo_links`] replaces, so a
+    /// caller can tell whether a replacement would change anything.
+    pub fn list_inferred_cross_repo_links(&self) -> Result<Vec<InferredCrossRepoLink>, StoreError> {
+        let conn = self.conn()?;
+        let q = "MATCH (s:Symbol)-[r:CROSS_REPO_LINK]->(t:Symbol) \
+                 WHERE r.evidence CONTAINS 'cross_repo_name_' \
+                 RETURN s.uid, t.uid, r.confidence, r.link_type, r.evidence";
+        let mut stmt = conn
+            .prepare(q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let result = conn
+            .execute(&mut stmt, vec![])
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        result
+            .map(|row| {
+                Ok((
+                    extract_string(&row, 0)?,
+                    extract_string(&row, 1)?,
+                    extract_f64(&row, 2)?,
+                    extract_string(&row, 3)?,
+                    extract_string(&row, 4)?,
+                ))
             })
             .collect()
     }

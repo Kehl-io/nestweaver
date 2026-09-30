@@ -498,6 +498,12 @@ pub(crate) fn run_brain(
                     {
                         println!("  {line}");
                     }
+                    if let Some(line) = nestweaver_proto::cross_repo_links_from_status_json(&value)
+                        .as_ref()
+                        .and_then(format_cross_repo_links_status)
+                    {
+                        println!("  {line}");
+                    }
                     for line in format_manifest_failures_status(
                         &nestweaver_proto::manifest_failures_from_status_json(&value),
                     ) {
@@ -832,6 +838,19 @@ pub(crate) fn run_brain(
                             "  interaction_tracking: disabled (run with --track-interactions to enable)"
                         );
                     }
+                }
+                // The same line the daemon-routed render prints.
+                if let Some(line) =
+                    nestweaver_proto::cross_repo_links_from_status_json(&serde_json::json!({
+                        "cross_repo_links":
+                            nestweaver_engine::cross_repo_links::cross_repo_links_status_json(
+                                Some(db_path),
+                            ),
+                    }))
+                    .as_ref()
+                    .and_then(format_cross_repo_links_status)
+                {
+                    println!("  {line}");
                 }
             }
 

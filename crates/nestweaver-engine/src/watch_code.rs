@@ -1075,6 +1075,13 @@ impl CodeWatcher {
             &self.db_path,
             &format!("code watcher batch in {repo_url}"),
         );
+        // The batch deleted the changed files' symbols, and the cascade took
+        // other repositories' inferred links into them; a whole-graph pass
+        // (the daemon's cross-repo relinker) restores them.
+        crate::cross_repo_links::mark_cross_repo_links_owed(
+            store,
+            &format!("code watcher batch in {repo_url}"),
+        );
         Ok(WatchBatchOutcome::Published { files_processed })
     }
 

@@ -5820,3 +5820,212 @@ fn flow_trace_repo_uniquely_pins_one_ping() {
         );
     }
 }
+
+// ─── Name-inferred cross-repo links follow the whole graph ──────────────────
+
+/// Two repositories that call into each other: `alpha` calls beta's
+/// `betaUtil`, `beta` calls alpha's `alphaHelper`.
+fn write_calling_repos(root: &Path) -> (PathBuf, PathBuf) {
+    let alpha = root.join("alpha");
+    let beta = root.join("beta");
+    write_repo_files(
+        &alpha,
+        &[(
+            "src/helper.js",
+            "export function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n",
+        )],
+    );
+    write_repo_files(
+        &beta,
+        &[(
+            "src/caller.js",
+            "export function betaCaller() {\n  return alphaHelper();\n}\nexport function betaUtil() { return 2; }\n",
+        )],
+    );
+    (alpha, beta)
+}
+
+fn index_direct(repo: &Path, db: &Path, extra: &[&str]) {
+    no_daemon_cmd()
+        .args([
+            "index",
+            "--repo",
+            &repo.display().to_string(),
+            "--db",
+            &db.display().to_string(),
+        ])
+        .args(extra)
+        .assert()
+        .success();
+}
+
+/// Every name-inferred link as (source, target, confidence, link type,
+/// evidence), sorted.
+fn inferred_links(db: &Path) -> Vec<(String, String, u64, String, String)> {
+    let store = nestweaver_store::GraphStore::open_or_create(db).unwrap();
+    let mut links: Vec<_> = store
+        .list_inferred_cross_repo_links()
+        .unwrap()
+        .into_iter()
+        .map(|(s, t, c, l, e)| (s, t, c.to_bits(), l, e))
+        .collect();
+    links.sort();
+    links
+}
+
+fn linked_names(db: &Path) -> Vec<(String, String)> {
+    let store = nestweaver_store::GraphStore::open_or_create(db).unwrap();
+    let mut names: Vec<_> = store
+        .list_all_cross_repo_links(1000)
+        .unwrap()
+        .into_iter()
+        .map(|link| (link.source_name, link.target_name))
+        .collect();
+    names.sort();
+    names
+}
+
+fn both_directions() -> Vec<(String, String)> {
+    vec![
+        ("alphaUses".to_string(), "betaUtil".to_string()),
+        ("betaCaller".to_string(), "alphaHelper".to_string()),
+    ]
+}
+
+fn cross_repo_status(db: &Path) -> serde_json::Value {
+    let output = no_daemon_cmd()
+        .args([
+            "brain",
+            "status",
+            "--json",
+            "--db",
+            &db.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    value["cross_repo_links"].clone()
+}
+
+/// Indexing alpha then beta, or beta then alpha, stores the same links —
+/// both directions, same confidence and type — and leaves nothing owed.
+#[test]
+fn index_order_does_not_change_inferred_cross_repo_links() {
+    let tmp = TempDir::new().unwrap();
+    let (alpha, beta) = write_calling_repos(tmp.path());
+    let forward = tmp.path().join("forward.lbug");
+    let backward = tmp.path().join("backward.lbug");
+    index_direct(&alpha, &forward, &[]);
+    index_direct(&beta, &forward, &[]);
+    index_direct(&beta, &backward, &[]);
+    index_direct(&alpha, &backward, &[]);
+
+    assert_eq!(linked_names(&forward), both_directions());
+    assert_eq!(inferred_links(&forward), inferred_links(&backward));
+    for db in [&forward, &backward] {
+        let status = cross_repo_status(db);
+        assert_eq!(status["pending"], false, "{status}");
+    }
+}
+
+/// Re-indexing alpha (forced, or incrementally after an edit) deletes its
+/// symbols and, with them, beta's links into it. The run restores them.
+#[test]
+fn reindexing_a_repository_restores_the_links_into_it() {
+    let tmp = TempDir::new().unwrap();
+    let (alpha, beta) = write_calling_repos(tmp.path());
+    let db = tmp.path().join("graph.lbug");
+    index_direct(&alpha, &db, &[]);
+    index_direct(&beta, &db, &[]);
+    let before = inferred_links(&db);
+    assert_eq!(linked_names(&db), both_directions());
+
+    index_direct(&alpha, &db, &["--force"]);
+    assert_eq!(inferred_links(&db), before, "a forced re-index");
+
+    // An edit that keeps every symbol where it was (same uids).
+    std::fs::write(
+        alpha.join("src/helper.js"),
+        "export function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n// edited\n",
+    )
+    .unwrap();
+    index_direct(&alpha, &db, &[]);
+    assert_eq!(inferred_links(&db), before, "an incremental re-index");
+}
+
+/// With the parse cache corrupt, the run re-parses the other repository
+/// from its working tree; when that content is gone too, the pass refuses,
+/// leaves the stored links alone, and `brain status` discloses the debt.
+#[test]
+fn a_corrupt_parse_cache_reparses_or_refuses_without_losing_links() {
+    let tmp = TempDir::new().unwrap();
+    let (alpha, beta) = write_calling_repos(tmp.path());
+    let db = tmp.path().join("graph.lbug");
+    index_direct(&alpha, &db, &[]);
+    index_direct(&beta, &db, &[]);
+    let before = inferred_links(&db);
+    let mut cache = db.as_os_str().to_owned();
+    cache.push(".parsed_cache.bin");
+    let cache = PathBuf::from(cache);
+
+    std::fs::write(&cache, b"not a parse cache").unwrap();
+    index_direct(&beta, &db, &["--force"]);
+    assert_eq!(inferred_links(&db), before, "alpha re-parsed from disk");
+    assert_eq!(cross_repo_status(&db)["pending"], false);
+
+    std::fs::write(&cache, b"not a parse cache").unwrap();
+    std::fs::write(
+        alpha.join("src/helper.js"),
+        "export function somethingElse() { return 3; }\n",
+    )
+    .unwrap();
+    // beta is unchanged, so this run writes no symbol; only the pass could
+    // touch the links, and it must refuse rather than drop alpha's.
+    index_direct(&beta, &db, &[]);
+    assert_eq!(inferred_links(&db), before);
+    let status = cross_repo_status(&db);
+    assert_eq!(status["pending"], true, "{status}");
+    assert!(
+        status["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("changed since it was indexed")),
+        "{status}"
+    );
+    let text = no_daemon_cmd()
+        .args(["brain", "status", "--db", &db.display().to_string()])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        stdout.contains("Cross-repo links: being re-inferred"),
+        "{stdout}"
+    );
+}
+
+/// Counterweight: repositories that never call each other get no links.
+#[test]
+fn repositories_without_cross_calls_get_no_inferred_links() {
+    let tmp = TempDir::new().unwrap();
+    let one = tmp.path().join("one");
+    let two = tmp.path().join("two");
+    write_repo_files(
+        &one,
+        &[(
+            "src/a.js",
+            "export function oneOnly() { return localOne(); }\nexport function localOne() { return 1; }\n",
+        )],
+    );
+    write_repo_files(
+        &two,
+        &[(
+            "src/b.js",
+            "export function twoOnly() { return localTwo(); }\nexport function localTwo() { return 2; }\n",
+        )],
+    );
+    let db = tmp.path().join("graph.lbug");
+    index_direct(&one, &db, &[]);
+    index_direct(&two, &db, &[]);
+    assert!(inferred_links(&db).is_empty());
+    assert_eq!(cross_repo_status(&db)["pending"], false);
+}
