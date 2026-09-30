@@ -5242,6 +5242,7 @@ mod daemon_status_renderer_tests {
             last_reconciled_at: String::new(),
             notes_changed_since_indexing: Vec::new(),
             unscoped_projects: Vec::new(),
+            unscoped_project_names: Vec::new(),
             notes_changed_as_of: String::new(),
         };
         let status = nestweaver_proto::BrainStatusResponse {
@@ -5268,6 +5269,26 @@ mod daemon_status_renderer_tests {
             ..owed
         };
         assert_eq!(format_code_links_status(&current), None);
+    }
+
+    /// Status names an unscoped project by its name, not its uid; an older
+    /// daemon that sends only uids still renders them.
+    #[test]
+    fn unscoped_projects_render_by_name() {
+        let links = nestweaver_proto::CodeLinksStatus {
+            unscoped_projects: vec!["proj:default:abc123".to_string()],
+            unscoped_project_names: vec!["Website".to_string()],
+            ..Default::default()
+        };
+        let line = format_code_links_status(&links).expect("a gap line");
+        assert!(line.contains("project(s) Website declare repos"), "{line}");
+        assert!(!line.contains("proj:default:abc123"), "{line}");
+        let older = nestweaver_proto::CodeLinksStatus {
+            unscoped_project_names: Vec::new(),
+            ..links
+        };
+        let line = format_code_links_status(&older).expect("a gap line");
+        assert!(line.contains("proj:default:abc123"), "{line}");
     }
 
     /// nw-705: every repo the manifest rebuild refused is named on the
@@ -10319,9 +10340,16 @@ fn format_code_links_status(links: &nestweaver_proto::CodeLinksStatus) -> Option
         ));
     }
     if !links.unscoped_projects.is_empty() {
+        // Names when the daemon sent them (index for index); an older daemon
+        // sends only uids.
+        let named = if links.unscoped_project_names.len() == links.unscoped_projects.len() {
+            &links.unscoped_project_names
+        } else {
+            &links.unscoped_projects
+        };
         gaps.push(format!(
             "project(s) {} declare repos that resolve to none, so their notes link unscoped",
-            links.unscoped_projects.join(", ")
+            named.join(", ")
         ));
     }
     if !links.pending && !migration_owed {
