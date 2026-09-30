@@ -71,6 +71,10 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - name: Check out the pinned LadybugDB source
+        # Sets LBUG_SOURCE_DIR for the lbug build. The tag and commit live
+        # in scripts/fetch-lbug-source.sh only.
+        run: scripts/fetch-lbug-source.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: backlog-performance
@@ -196,6 +200,10 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
+      - name: Check out the pinned LadybugDB source
+        # Sets LBUG_SOURCE_DIR for the lbug build. The tag and commit live
+        # in scripts/fetch-lbug-source.sh only.
+        run: scripts/fetch-lbug-source.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
@@ -653,6 +661,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
         with:
           components: clippy
+      - name: Check out the pinned LadybugDB source
+        # Sets LBUG_SOURCE_DIR for the lbug build. The tag and commit live
+        # in scripts/fetch-lbug-source.sh only.
+        run: scripts/fetch-lbug-source.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
@@ -811,6 +823,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
         with:
           components: clippy
+      - name: Check out the pinned LadybugDB source
+        # Sets LBUG_SOURCE_DIR for the lbug build. The tag and commit live
+        # in scripts/fetch-lbug-source.sh only.
+        run: scripts/fetch-lbug-source.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
@@ -873,6 +889,10 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
+      - name: Check out the pinned LadybugDB source
+        # Sets LBUG_SOURCE_DIR for the lbug build. The tag and commit live
+        # in scripts/fetch-lbug-source.sh only.
+        run: scripts/fetch-lbug-source.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
@@ -972,6 +992,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
         with:
           components: llvm-tools-preview
+      - name: Check out the pinned LadybugDB source
+        # Sets LBUG_SOURCE_DIR for the lbug build. The tag and commit live
+        # in scripts/fetch-lbug-source.sh only.
+        run: scripts/fetch-lbug-source.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
@@ -1121,6 +1145,10 @@ jobs:
           # `--in-diff` needs the base commit to diff against.
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
+      - name: Check out the pinned LadybugDB source
+        # Sets LBUG_SOURCE_DIR for the lbug build. The tag and commit live
+        # in scripts/fetch-lbug-source.sh only.
+        run: scripts/fetch-lbug-source.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
@@ -1790,6 +1818,10 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
+      - name: Check out the pinned LadybugDB source
+        # Sets LBUG_SOURCE_DIR for the lbug build. The tag and commit live
+        # in scripts/fetch-lbug-source.sh only.
+        run: scripts/fetch-lbug-source.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true

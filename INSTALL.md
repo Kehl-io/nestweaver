@@ -116,15 +116,26 @@ sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-com
 ```sh
 git clone https://github.com/Kehl-io/nestweaver.git
 cd nestweaver
+eval "$(scripts/fetch-lbug-source.sh)"
 cargo install --locked --path .
 nestweaver --version
 ```
 
 The first source build compiles LadybugDB and can take several minutes. Keep
 the checkout's `.cargo/config.toml`: it forces `LBUG_BUILD_FROM_SOURCE=1` so
-the build uses the Ladybug sources resolved by `Cargo.lock`, rather than a
-prebuilt archive whose hidden ELF symbols cause zstd link errors. Cargo
-vendors the Ladybug sources with the crate.
+the build compiles Ladybug from source, rather than linking a prebuilt archive
+whose hidden ELF symbols cause zstd link errors.
+
+**`LBUG_SOURCE_DIR` is required for now.** The published `lbug` 0.21.1 crate
+cannot build its own bundled sources (the packaging fix is merged upstream but
+not yet released), so the build reads them from a LadybugDB checkout at tag
+`v0.21.1` named by `LBUG_SOURCE_DIR`. `scripts/fetch-lbug-source.sh` makes a
+shallow clone of that tag (about 80 MB, no submodules) under `target/`,
+verifies its commit, and prints the `export` line; `eval` applies it to the
+current shell. Pass a directory to put the clone elsewhere, or point
+`LBUG_SOURCE_DIR` at your own checkout of the same tag. Set it in every shell
+that runs `cargo`. This step goes away once a published `lbug` crate builds
+from source.
 
 No extra linker flags are needed. Exactly one copy of zstd is linked: the one
 Ladybug vendors. Rust code uses it through `nestweaver_store::zstd` instead of
