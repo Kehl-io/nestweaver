@@ -499,11 +499,11 @@ pub fn rebuild_project_repo_membership(
         .map(|project| project_uid(instance_id, &project.name))
         .filter(|uid| existing.contains(uid))
         .collect();
-    let desired: Vec<(String, String)> =
-        declared_repo_edges(config, instance_id, &store.list_repos(None)?)
-            .into_iter()
-            .filter(|(project, _)| existing.contains(project))
-            .collect();
+    let all_repos = store.list_repos(None)?;
+    let desired: Vec<(String, String)> = declared_repo_edges(config, instance_id, &all_repos)
+        .into_iter()
+        .filter(|(project, _)| existing.contains(project))
+        .collect();
     // nw-670 re-review N4: diff BEFORE taking any lease or publication — a
     // no-op rebuild (every pass once membership is current) must not open a
     // publication (ranked reads would fail closed for it; a crash would leave
@@ -525,6 +525,36 @@ pub fn rebuild_project_repo_membership(
             != Some(&count)
         {
             set_property(&mut ext_store, &uid, DECLARED_REPO_COUNT_KEY, count);
+            ext_changed = true;
+        }
+        // Declared-repo issues move with the graph, not only with a
+        // materialization: a declared repo removed (`remove-repo`) or
+        // indexed since is disclosed or cleared by the next rebuild, which
+        // every code-link pass runs.
+        let issues: Vec<ProjectRepoIssue> = project_cfg
+            .repos
+            .iter()
+            .filter_map(|repo_name| {
+                ProjectRepoIssue::from_match(
+                    &project_cfg.name,
+                    repo_name,
+                    &resolve_declared_repo(repo_name, &config.repos, &all_repos),
+                )
+            })
+            .collect();
+        if recorded_repo_issues(&ext_store, &uid) != issues {
+            if issues.is_empty() {
+                if let Some(properties) = ext_store.get_mut(&uid) {
+                    properties.remove(REPO_ISSUES_KEY);
+                }
+            } else {
+                set_property(
+                    &mut ext_store,
+                    &uid,
+                    REPO_ISSUES_KEY,
+                    serde_json::json!(issues),
+                );
+            }
             ext_changed = true;
         }
     }
@@ -1371,6 +1401,42 @@ repos = [{repos}]
         let config = config_with("default", "\"alpha\", \"bravo\"");
         assert!(rebuild_project_repo_membership(&store, &config, "default", &db, None).unwrap());
         assert_eq!(store.project_member_repo_uids(&project).unwrap().len(), 2);
+    }
+
+    /// A declared repo removed from the graph (`remove-repo`) left its
+    /// project silently short a member until the next `materialize-projects`
+    /// recorded the issue. The membership rebuild every code-link pass runs
+    /// now records it too, and clears it once the repo is back.
+    #[test]
+    fn the_rebuild_discloses_a_removed_declared_repo_and_clears_it_on_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, db, repo, project, url) = one_repo_project_fixture(dir.path(), "\"alpha\"");
+        let config = config_with("default", "\"alpha\"");
+        let issues = || recorded_repo_issues(&load_extensions(&db), &project);
+        assert!(issues().is_empty(), "precondition: {:?}", issues());
+
+        store
+            .delete_repo_node(&nestweaver_schema::repo_uid("default", &url))
+            .unwrap();
+        rebuild_project_repo_membership(&store, &config, "default", &db, None).unwrap();
+        let recorded = issues();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].repo, "alpha");
+        assert!(recorded[0].attached_nothing(), "{recorded:?}");
+
+        crate::index::index_directory_with_store(
+            &store,
+            &repo,
+            &db,
+            "default",
+            &url,
+            "sha",
+            false,
+            Some("alpha"),
+        )
+        .unwrap();
+        rebuild_project_repo_membership(&store, &config, "default", &db, None).unwrap();
+        assert!(issues().is_empty(), "cleared once back: {:?}", issues());
     }
 
     /// nw-670 re-review N1: a re-identified repo (same checkout, new
