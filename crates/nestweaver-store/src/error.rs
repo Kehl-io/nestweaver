@@ -1478,7 +1478,7 @@ mod corruption_classification_tests {
     fn redact_build_paths_strips_home_and_registry_prefix() {
         let raw = "query error: Assertion failed in file \
                    \"/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/\
-lbug-0.21.0/lbug-src/src/include/common/concurrent_vector.h\" on line 76: \
+lbug-0.21.1/lbug-src/src/include/common/concurrent_vector.h\" on line 76: \
                    index != nullptr";
         let redacted = super::redact_build_paths(raw);
         assert!(
@@ -1490,7 +1490,7 @@ lbug-0.21.0/lbug-src/src/include/common/concurrent_vector.h\" on line 76: \
             "the runner home survived: {redacted}"
         );
         assert!(
-            redacted.contains("<dep>/lbug-0.21.0/"),
+            redacted.contains("<dep>/lbug-0.21.1/"),
             "the crate-relative remainder must survive: {redacted}"
         );
         assert!(

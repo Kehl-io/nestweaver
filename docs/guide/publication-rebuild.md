@@ -7,7 +7,7 @@ change `CURRENT` until every artifact validates.
 
 ## Storage-engine upgrade (LadybugDB 0.21): rebuild required
 
-This release updates LadybugDB to 0.21.0, which changes how text keys are
+This release updates LadybugDB to 0.21 (0.21.1), which changes how text keys are
 hashed. The engine's on-disk format marker did not change, so the engine
 itself would open an older database and then silently miss lookups on
 non-ASCII keys. NestWeaver therefore records the engine format itself (a

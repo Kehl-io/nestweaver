@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 nestweaver-algorithms = { workspace = true }
 nestweaver-schema = { workspace = true }
-lbug = "=0.21.0"
+lbug = "=0.21.1"
 # Only to keep the reopen hold-off off async executor threads (see
 # `ReopenableDatabase::wait_out_hold_off`); no runtime is started here.
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
