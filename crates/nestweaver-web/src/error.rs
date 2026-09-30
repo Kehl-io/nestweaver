@@ -5,6 +5,8 @@ use serde_json::json;
 pub struct ApiError {
     pub status: StatusCode,
     pub message: String,
+    /// A coded body to send instead of `{"error": message}`.
+    pub body: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -12,6 +14,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: msg.into(),
+            body: None,
         }
     }
 
@@ -19,13 +22,17 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: msg.into(),
+            body: None,
         }
     }
 
-    pub fn conflict(msg: impl Into<String>) -> Self {
+    /// 409 with a coded body (`{"error": <code>, ...}`), for a request the
+    /// graph cannot answer in its current state.
+    pub fn conflict_with_body(msg: impl Into<String>, body: serde_json::Value) -> Self {
         Self {
             status: StatusCode::CONFLICT,
             message: msg.into(),
+            body: Some(body),
         }
     }
 
@@ -33,6 +40,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: msg.into(),
+            body: None,
         }
     }
 
@@ -40,6 +48,7 @@ impl ApiError {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: msg.into(),
+            body: None,
         }
     }
 
@@ -65,7 +74,9 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = json!({ "error": self.message });
+        let body = self
+            .body
+            .unwrap_or_else(|| json!({ "error": self.message }));
         (self.status, axum::Json(body)).into_response()
     }
 }

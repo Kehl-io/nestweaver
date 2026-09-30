@@ -3285,11 +3285,20 @@ fn empty_seed_container_message(uids: &[String]) -> String {
             }
         })
         .collect();
+    let mut remedies = Vec::new();
+    if uids.iter().any(|uid| !uid.starts_with("repo:")) {
+        remedies.push(
+            "add notes to the vault and refresh it (`nestweaver brain refresh <vault root>`)",
+        );
+    }
+    if uids.iter().any(|uid| uid.starts_with("repo:")) {
+        remedies.push("re-index the repository (`nestweaver index --repo <path> --force`)");
+    }
     format!(
-        "{EMPTY_SEED_CONTAINER} {}, so there is nothing to seed from. Add notes to the vault \
-         and refresh it (`nestweaver brain refresh <vault root>`), or seed from a note, tag or \
-         symbol instead.",
-        described.join("; ")
+        "{EMPTY_SEED_CONTAINER} {}, so there is nothing to seed from. To use it, {}; or seed \
+         from a note, tag or symbol instead.",
+        described.join("; "),
+        remedies.join(", and ")
     )
 }
 
@@ -7273,6 +7282,26 @@ mod vault_seed_tests {
             format!("{mixed:#}").starts_with("No seeds resolved."),
             "{mixed:#}"
         );
+    }
+
+    /// The empty-container remedy fits the container: a repo with no
+    /// symbols is re-indexed, it does not get notes added.
+    #[test]
+    fn an_empty_repo_seed_gets_the_index_remedy() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_repo(&repo("repo:bare")).unwrap();
+        let msg = format!("{:#}", run(&store, "repo:bare").unwrap_err());
+        assert!(msg.starts_with(super::EMPTY_SEED_CONTAINER), "{msg}");
+        assert!(
+            msg.contains("repository repo:bare has no indexed symbols"),
+            "{msg}"
+        );
+        assert!(msg.contains("nestweaver index --repo"), "{msg}");
+        assert!(!msg.to_lowercase().contains("add notes"), "{msg}");
+
+        let vault = format!("{:#}", run(&fixture(), "vlt:empty").unwrap_err());
+        assert!(vault.contains("add notes"), "{vault}");
+        assert!(!vault.contains("index --repo"), "{vault}");
     }
 
     /// The same defect on the `repo:` twin: a Repo node is in no PPR scope

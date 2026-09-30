@@ -74,13 +74,31 @@ fn reject_unresolved_http_seeds(
 fn map_context_engine_error(err: anyhow::Error) -> ApiError {
     let message = err.to_string();
     // The seed names a vault (or repo) that exists but holds nothing: the
-    // request is valid, the graph cannot answer it yet. Not a 404.
-    if err.chain().any(|cause| {
-        cause
-            .to_string()
-            .contains(nestweaver_engine::query::EMPTY_SEED_CONTAINER)
-    }) {
-        return ApiError::conflict("the context seed's vault has no notes");
+    // request is valid, the graph cannot answer it yet. Not a 404. The body
+    // matches the CLI's `--json` shape; the message is generic per container
+    // kind so no seed text round-trips into the response.
+    if let Some(engine) = err
+        .chain()
+        .map(|cause| cause.to_string())
+        .find(|text| text.contains(nestweaver_engine::query::EMPTY_SEED_CONTAINER))
+    {
+        let mut remedies = Vec::new();
+        if engine.contains(" has no notes") {
+            remedies
+                .push("a seed names a vault with no notes: add notes to the vault and refresh it");
+        }
+        if engine.contains(" has no indexed symbols") {
+            remedies.push("a seed names a repository with no indexed symbols: re-index it");
+        }
+        let message = remedies.join("; ");
+        return ApiError::conflict_with_body(
+            message.clone(),
+            serde_json::json!({
+                "error": "seed container is empty",
+                "status": "empty",
+                "message": message,
+            }),
+        );
     }
     if message.contains("No matching symbols")
         || message.contains("No symbols found")

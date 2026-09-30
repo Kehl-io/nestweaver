@@ -2636,7 +2636,13 @@ async fn brain_context_on_an_empty_vault_is_409_not_404() {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{json}");
-    assert_eq!(json["error"], "the context seed's vault has no notes");
+    // The CLI's `--json` shape: a stable code plus a status.
+    assert_eq!(json["error"], "seed container is empty", "{json}");
+    assert_eq!(json["status"], "empty", "{json}");
+    assert!(
+        json["message"].as_str().unwrap().contains("add notes"),
+        "{json}"
+    );
     let (status, json) = post_json(
         &app,
         "/api/v1/brain/context",
@@ -2807,4 +2813,37 @@ async fn a_json_405_keeps_its_allow_header() {
             .get("content-type")
             .is_some_and(|v| v.to_str().unwrap().starts_with("application/json"))
     );
+}
+
+/// An empty repo seed gets the same coded 409, with the index remedy.
+#[tokio::test]
+async fn brain_context_on_an_empty_repo_is_409_with_the_index_remedy() {
+    let store = GraphStore::in_memory().unwrap();
+    store
+        .insert_repo(&Repo {
+            uid: "repo:bare".into(),
+            url: "file:///x/bare".into(),
+            indexed_sha: "sha".into(),
+            staleness_commits_behind: 0,
+            instance_id: "default".into(),
+            name: None,
+            root_path: Some("/x/bare".into()),
+        })
+        .unwrap();
+    let app = create_router(AppState::new(
+        store,
+        None,
+        std::path::PathBuf::from("/tmp/empty-repo.lbug"),
+    ));
+    let (status, json) = post_json(
+        &app,
+        "/api/v1/brain/context",
+        json!({ "seeds": ["repo:bare"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    assert_eq!(json["status"], "empty", "{json}");
+    let message = json["message"].as_str().unwrap();
+    assert!(message.contains("index"), "{json}");
+    assert!(!message.contains("add notes"), "{json}");
 }
