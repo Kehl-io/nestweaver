@@ -13840,3 +13840,154 @@ fn spawn_fake_embedding_endpoint() -> String {
     });
     format!("http://{address}")
 }
+
+// ─── Repo-filter failures keep their class on every surface ────────────────
+//
+// Every repo filter resolves through one resolver, and its failure class
+// decides the exit code: not found 2, ambiguous 3 (with the candidates),
+// malformed 64. Each surface below is checked for all three, with a
+// counterweight proving an exact selector still answers.
+
+/// Two indexed repos that share the display name `web-app`, so `web-app` is
+/// ambiguous while each repo's root path selects exactly one.
+fn two_web_apps(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let db_path = root.join("test.lbug");
+    let mut first = None;
+    for (dir, function) in [("one", "greet_one"), ("two", "greet_two")] {
+        let repo = root.join(dir).join("web-app");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join("main.js"),
+            format!("function {function}(n) {{ return helper_{dir}(n); }}\nfunction helper_{dir}(n) {{ return n; }}\n"),
+        )
+        .unwrap();
+        nestweaver_cmd()
+            .args(["index", "--repo"])
+            .arg(&repo)
+            .arg("--db")
+            .arg(&db_path)
+            .assert()
+            .success();
+        first.get_or_insert(repo);
+    }
+    (db_path, first.unwrap().canonicalize().unwrap())
+}
+
+/// Run `args(selector)` against `db` and check the three failure classes plus
+/// the exact-selector counterweight.
+fn assert_repo_filter_classes(
+    db: &std::path::Path,
+    exact: &str,
+    malformed: &str,
+    args: impl Fn(&str) -> Vec<String>,
+) {
+    let run = |selector: &str| {
+        let output = nestweaver_cmd()
+            .args(args(selector))
+            .arg("--db")
+            .arg(db)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        (output.status.code(), stdout, stderr)
+    };
+    let envelope = |stdout: &str| -> serde_json::Value {
+        serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("expected one JSON envelope ({e}): {stdout:?}"))
+    };
+
+    let (code, stdout, stderr) = run("no-such-repo");
+    assert_eq!(code, Some(2), "not found must exit 2: {stdout}\n{stderr}");
+    assert_eq!(envelope(&stdout)["status"], "not_found", "{stdout}");
+
+    let (code, stdout, stderr) = run("web-app");
+    assert_eq!(code, Some(3), "ambiguous must exit 3: {stdout}\n{stderr}");
+    let payload = envelope(&stdout);
+    assert_eq!(payload["status"], "ambiguous", "{stdout}");
+    assert_eq!(
+        payload["candidates"].as_array().map(Vec::len),
+        Some(2),
+        "an ambiguous selector must name both candidates: {stdout}"
+    );
+
+    let (code, stdout, stderr) = run(malformed);
+    assert_eq!(code, Some(64), "malformed must exit 64: {stdout}\n{stderr}");
+
+    let (code, stdout, stderr) = run(exact);
+    assert_eq!(
+        code,
+        Some(0),
+        "COUNTERWEIGHT: an exact selector still answers: {stdout}\n{stderr}"
+    );
+}
+
+fn owned(args: &[&str]) -> Vec<String> {
+    args.iter().map(|a| a.to_string()).collect()
+}
+
+#[test]
+fn clusters_repo_filter_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let long = "z".repeat(5000);
+    assert_repo_filter_classes(&db, exact.to_str().unwrap(), &long, |repo| {
+        owned(&["clusters", "--json", "--repo", repo])
+    });
+}
+
+#[test]
+fn dead_code_repo_filter_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let long = "z".repeat(5000);
+    assert_repo_filter_classes(&db, exact.to_str().unwrap(), &long, |repo| {
+        owned(&["dead-code", "--json", "--repo", repo])
+    });
+}
+
+#[test]
+fn brain_context_repo_filter_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let long = "z".repeat(5000);
+    assert_repo_filter_classes(&db, exact.to_str().unwrap(), &long, |repo| {
+        owned(&["brain", "context", "greet_one", "--json", "--repos", repo])
+    });
+}
+
+/// `repo:web-app` used to MERGE both repos (a substring match on the UID)
+/// instead of refusing the ambiguous name.
+#[test]
+fn investigate_repo_scope_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let root = dir.path().to_path_buf();
+    assert_repo_filter_classes(&db, exact.to_str().unwrap(), "", |repo| {
+        vec![
+            "investigate".to_string(),
+            "greet_one".to_string(),
+            "--json".to_string(),
+            "--root".to_string(),
+            root.to_string_lossy().to_string(),
+            "--scope".to_string(),
+            format!("repo:{repo}"),
+        ]
+    });
+}
+
+#[test]
+fn cross_repo_contracts_repo_filter_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let long = "z".repeat(5000);
+    assert_repo_filter_classes(&db, exact.to_str().unwrap(), &long, |repo| {
+        owned(&[
+            "cross-repo-contracts",
+            "greet_one",
+            "--json",
+            "--repo",
+            repo,
+        ])
+    });
+}

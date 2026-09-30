@@ -16030,6 +16030,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let payload = match routed {
                 Ok(Some(value)) => value,
                 Ok(None) => unreachable!("the direct leg always yields a payload or an error"),
+                // `--repo` is a row filter resolved like every other one.
+                Err(error) if error_is_unresolved_repo_filter(&error) => {
+                    return Ok((report_unresolved_repo_filter(&error, json), None));
+                }
                 Err(error) if format!("{error:#}").contains("Ambiguous") => {
                     if json {
                         println!(
@@ -18173,6 +18177,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             config: config_opt,
         } => {
             let db_path = resolve_db_with_config(db, config_opt.as_deref())?;
+            if let Err((code, message)) = reject_oversized_repo_selectors(&repos) {
+                eprintln!("{message}");
+                return Ok((code, None));
+            }
 
             // nw-479: a `--repo` scope takes a COMPLETELY separate path —
             // computed on the repo-induced subgraph by the `clusters` tool
@@ -18970,6 +18978,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 serialize_dead_code_page,
             };
             let db_path = db.clone().unwrap_or_else(default_db_path);
+            if let Err((code, message)) = reject_oversized_repo_selectors(&repos) {
+                eprintln!("{message}");
+                return Ok((code, None));
+            }
             let mut args =
                 serde_json::json!({ "min_confidence": min_confidence, "offset": offset });
             if let Some(n) = limit {
@@ -19002,7 +19014,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // substitute or merge an upstream population for this route.
                 require_existing_db(&db_path)?;
                 let runtime = tokio::runtime::Runtime::new()?;
-                runtime.block_on(async {
+                let answer = runtime.block_on(async {
                     let query = async {
                         let mut client =
                             nestweaver_client::DaemonClient::connect(&db_path, None).await?;
@@ -19022,7 +19034,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             .context("local daemon dead-code request timed out")?,
                         None => query.await,
                     }
-                })?
+                });
+                match answer {
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
+                    other => other?,
+                }
             } else {
                 let store = open_store(db.as_deref())?;
                 let all_repos = store.list_repos(None)?;
@@ -19043,7 +19061,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let scope = if repos.is_empty() {
                     None
                 } else {
-                    Some(resolve_repo_filter(&store, &repos)?)
+                    match resolve_repo_filter(&store, &repos) {
+                        Ok(scope) => Some(scope),
+                        Err(error) if error_is_unresolved_repo_filter(&error) => {
+                            return Ok((report_unresolved_repo_filter(&error, json), None));
+                        }
+                        Err(error) => return Err(error),
+                    }
                 };
                 let request = DeadCodePageRequest {
                     min_confidence: DeadCodeConfidence::from_str_loose(&min_confidence)
@@ -22372,8 +22396,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // makes `semantic_applied` finally answer honestly on the
                 // route where it was previously ignored.
                 args["no_embed"] = serde_json::json!(no_embed);
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "investigate", args)?
-                {
+                let answer = match try_hybrid_json_rpc(true, &db_path, None, "investigate", args) {
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
+                    other => other?,
+                };
+                if let Some(value) = answer {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -22394,7 +22423,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // "all" is the honest name for the no-restriction default and is
             // already an advertised option.
             let scope = scope.unwrap_or_else(|| "all".to_string());
-            let result = nestweaver_engine::investigate(
+            let result = match nestweaver_engine::investigate(
                 &store,
                 tantivy.as_ref(),
                 Some(&db_path),
@@ -22403,7 +22432,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 &scope,
                 Some(token_budget),
                 None,
-            )?;
+            ) {
+                Err(error) if error_is_unresolved_repo_filter(&error) => {
+                    return Ok((report_unresolved_repo_filter(&error, json), None));
+                }
+                other => other?,
+            };
             // Built unconditionally so text and JSON render from the SAME
             // payload, and so the daemon path can reuse the renderer (nw-108).
             let mut payload = serde_json::to_value(&result)?;
@@ -25828,6 +25862,42 @@ mod repo_filter_honesty_tests {
         let err = reject_oversized_repo_selectors(&[long]).expect_err("must reject");
         assert_eq!(err.0, EXIT_USAGE);
         assert!(err.1.contains("PROTOCOL_ERROR") || err.1.contains("REJECTED"));
+    }
+
+    /// The daemon route: a status whose message is only the tool's outer
+    /// context still reports the class carried in its details.
+    #[test]
+    fn a_daemon_repo_filter_status_keeps_its_exit_code() {
+        for (class, expected) in [
+            ("not_found", EXIT_NOT_FOUND),
+            ("ambiguous", EXIT_AMBIGUOUS),
+            ("malformed", EXIT_USAGE),
+        ] {
+            let envelope = serde_json::json!({
+                "status": class,
+                "error": class,
+                "repo": "web-app",
+                "message": "repo filter entry \"web-app\": failed",
+            });
+            let mut status = tonic::Status::with_details(
+                tonic::Code::InvalidArgument,
+                "tool clusters failed: compute_clusters_scoped",
+                serde_json::to_vec(&envelope).unwrap().into(),
+            );
+            status.metadata_mut().insert(
+                nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY,
+                nestweaver_engine::node_scope::REPO_FILTER_UNRESOLVED_CODE
+                    .parse()
+                    .unwrap(),
+            );
+            let error = anyhow::Error::new(status).context("clusters rpc failed");
+            assert!(error_is_unresolved_repo_filter(&error));
+            assert_eq!(
+                report_unresolved_repo_filter(&error, false),
+                expected,
+                "{class}"
+            );
+        }
     }
 
     #[test]

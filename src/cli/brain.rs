@@ -2445,6 +2445,10 @@ pub(crate) fn run_brain(
             no_embed,
         } => {
             let db_path = resolve_db_with_config(db, config_path.as_deref())?;
+            if let Err((code, message)) = reject_oversized_repo_selectors(&repos) {
+                eprintln!("{message}");
+                return Ok((code, None));
+            }
             let cfg = load_instance_config_opt(config_path.as_deref());
             let limit = resolve_limit(limit, cfg.as_ref(), 30);
 
@@ -2512,6 +2516,11 @@ pub(crate) fn run_brain(
                     "brain_context",
                     context_params,
                 ) {
+                    // First: an unresolved `--repos` entry is the caller's
+                    // selector, not a seed lookup, and keeps its own class.
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
                     Err(error)
                         if error
                             .chain()
@@ -2570,6 +2579,19 @@ pub(crate) fn run_brain(
             }
 
             let store = open_store(Some(&db_path))?;
+            // Resolved before retrieval, so an unresolvable entry is reported
+            // with its class whether or not the seeds resolve.
+            let repo_scope = if repos.is_empty() {
+                None
+            } else {
+                match resolve_repo_filter(&store, &repos) {
+                    Ok(scope) => Some(scope),
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
             if rerank {
                 store.require_verified_embedding_identity().context(
                     "verify the database embedding identity before direct context reranking",
@@ -2660,11 +2682,6 @@ pub(crate) fn run_brain(
                     // matches nothing on both lists — and it is the same
                     // resolver, so this route and the daemon route can no
                     // longer answer differently for one flag value.
-                    let repo_scope = if repos.is_empty() {
-                        None
-                    } else {
-                        Some(resolve_repo_filter(&store, &repos)?)
-                    };
                     let vault_scope = if vaults.is_empty() {
                         None
                     } else {

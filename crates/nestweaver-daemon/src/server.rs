@@ -128,6 +128,22 @@ fn dispatch_err_to_status(tool_name: &str, e: anyhow::Error) -> Status {
         );
     }
 
+    // An unresolved repo filter carries its class (not found / ambiguous /
+    // malformed) and candidates in the status details, and its message is
+    // the typed error's own text: the outermost context alone hid both, so
+    // an ambiguous selector read as not found on the daemon route.
+    if let Some(unresolved) = nestweaver_mcp::tools::repo_filter_failure(&e) {
+        let mut with_details = Status::with_details(
+            status.code(),
+            format!("tool {tool_name} failed: {unresolved}"),
+            serde_json::to_vec(&unresolved.envelope())
+                .unwrap_or_default()
+                .into(),
+        );
+        *with_details.metadata_mut() = status.metadata().clone();
+        return with_details;
+    }
+
     // nw-557: a lookup miss keeps its gRPC code and message (the CLI
     // classifies both) and carries the MCP not-found envelope in the status
     // details, so an MCP client behind the daemon proxy or the hybrid client
@@ -273,6 +289,48 @@ mod dispatch_err_to_status_tests {
         );
     }
 
+    /// An AMBIGUOUS repo filter wrapped in a tool's own `.context()` must
+    /// still reach the client as ambiguous, with its candidates: the status
+    /// message used to be only the outermost context, so `clusters --repo`
+    /// on the daemon route reported an ambiguous name as not found.
+    #[test]
+    fn a_wrapped_ambiguous_repo_filter_keeps_its_class_and_candidates() {
+        let resolver = nestweaver_engine::RepoSelectorError::error(
+            nestweaver_engine::RepoSelectorFailure::Ambiguous,
+            vec!["repo:a".to_string(), "repo:b".to_string()],
+            "repository selector 'web-app' is ambiguous; use an exact UID: \
+             web-app (repo:a), web-app (repo:b)"
+                .to_string(),
+        );
+        let error = anyhow::Error::new(nestweaver_engine::node_scope::RepoFilterUnresolved::new(
+            "web-app", &resolver,
+        ))
+        .context("compute_clusters_scoped");
+        let status = dispatch_err_to_status("clusters", error);
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("ambiguous") && status.message().contains("repo:b"),
+            "the message must be the typed error's, not the outer context: {:?}",
+            status.message()
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(status.details())
+            .expect("the class travels in the status details");
+        assert_eq!(envelope["status"], "ambiguous", "{envelope}");
+        assert_eq!(
+            envelope["candidates"],
+            serde_json::json!(["repo:a", "repo:b"])
+        );
+        assert_eq!(
+            status
+                .metadata()
+                .get(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
+                .and_then(|value| value.to_str().ok()),
+            Some(nestweaver_engine::node_scope::REPO_FILTER_UNRESOLVED_CODE),
+            "federation still keys on the unchanged code"
+        );
+    }
+
     /// COUNTERWEIGHT: an ordinary failure must carry NO code, or the client's
     /// typed check would absorb every local outage into a degraded stand-in.
     #[test]
@@ -329,8 +387,9 @@ mod dispatch_err_to_status_tests {
 
     /// nw-557 F3: `brain_diff`'s unknown `repo` is its lookup miss. The
     /// status keeps `repo-filter-unresolved` (the code the CLI's exit 2 keys
-    /// on) and carries the MCP envelope in its details. Counterweight: the
-    /// same error from a tool whose `repo` is only a filter gets no envelope.
+    /// on) and carries the MCP envelope in its details. A repo FILTER that
+    /// names no repo is a lookup miss too, with the same envelope; an
+    /// ambiguous one is not, so it yields no not-found envelope.
     #[test]
     fn brain_diff_unknown_repo_carries_the_envelope_and_keeps_its_code() {
         let unresolved = || {
@@ -354,9 +413,25 @@ mod dispatch_err_to_status_tests {
         assert!(envelope["message"].as_str().is_some());
 
         let filter = dispatch_err_to_status("hub_nodes", unresolved());
+        let envelope =
+            nestweaver_mcp::tools::envelope_from_status_details(filter.details()).unwrap();
+        assert_eq!(envelope["status"], "not_found");
+        assert_eq!(envelope["repo"], "no-such-repo");
+
+        let ambiguous = dispatch_err_to_status(
+            "hub_nodes",
+            anyhow::Error::new(nestweaver_engine::node_scope::RepoFilterUnresolved::new(
+                "web-app",
+                &nestweaver_engine::RepoSelectorError::error(
+                    nestweaver_engine::RepoSelectorFailure::Ambiguous,
+                    vec!["repo:a".to_string(), "repo:b".to_string()],
+                    "ambiguous".to_string(),
+                ),
+            )),
+        );
         assert!(
-            filter.details().is_empty(),
-            "a filter miss is not a lookup miss"
+            nestweaver_mcp::tools::envelope_from_status_details(ambiguous.details()).is_none(),
+            "an ambiguous filter is not a lookup miss"
         );
     }
 

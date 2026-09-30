@@ -250,8 +250,9 @@ pub fn compute_clusters_scoped(
         ));
     }
 
-    let resolved_repos = crate::node_scope::resolve_repo_filter(store, repo_selectors, None)
-        .context("resolving clusters --repo scope")?;
+    // No `.context()`: it would become the message a client renders and hide
+    // the typed failure's class and candidates.
+    let resolved_repos = crate::node_scope::resolve_repo_filter(store, repo_selectors, None)?;
 
     let (symbols, edges) = store
         .load_code_symbols_and_edges()

@@ -5642,36 +5642,28 @@ pub fn not_found_envelope(error: &anyhow::Error) -> Option<Value> {
     None
 }
 
-/// Tools whose identifying argument is a repo selector (`repo`), so an
-/// unresolved selector is the tool's lookup miss rather than a filter error.
-const REPO_LOOKUP_TOOLS: &[&str] = &["brain_diff"];
+/// The unresolved repo filter in `error`'s chain, if that is what failed.
+pub fn repo_filter_failure(
+    error: &anyhow::Error,
+) -> Option<&nestweaver_engine::node_scope::RepoFilterUnresolved> {
+    error.chain().find_map(|cause| {
+        cause.downcast_ref::<nestweaver_engine::node_scope::RepoFilterUnresolved>()
+    })
+}
 
 /// [`not_found_envelope`] plus the misses a tool reports through a shared
-/// typed error instead of [`ToolTargetNotFound`]: `brain_diff`'s unknown
-/// `repo` is a `RepoFilterUnresolved`, which the CLI classifies (exit 2) and
-/// the daemon stamps with its own code, so it is recognised here by tool
-/// rather than re-typed at the source. An AMBIGUOUS selector is not a miss
-/// and keeps its prose error.
-pub fn lookup_miss_envelope(tool: &str, error: &anyhow::Error) -> Option<Value> {
+/// typed error instead of [`ToolTargetNotFound`]: a repo selector that names
+/// no indexed repo is a `RepoFilterUnresolved` whose class is not found,
+/// which the CLI classifies (exit 2) and the daemon stamps with its own code,
+/// so it is recognised here rather than re-typed at every source. An
+/// AMBIGUOUS or malformed selector is not a miss and keeps its error text.
+pub fn lookup_miss_envelope(_tool: &str, error: &anyhow::Error) -> Option<Value> {
     if let Some(envelope) = not_found_envelope(error) {
         return Some(envelope);
     }
-    if !REPO_LOOKUP_TOOLS.contains(&tool) {
-        return None;
-    }
-    let unresolved = error.chain().find_map(|cause| {
-        cause.downcast_ref::<nestweaver_engine::node_scope::RepoFilterUnresolved>()
-    })?;
-    let message = unresolved.to_string();
-    if message.to_ascii_lowercase().contains("ambiguous") {
-        return None;
-    }
-    Some(json!({
-        "status": "not_found",
-        "error": "not found",
-        "repo": unresolved.selector,
-        "message": message,
-    }))
+    let unresolved = repo_filter_failure(error)?;
+    (unresolved.failure == nestweaver_engine::RepoSelectorFailure::NotFound)
+        .then(|| unresolved.envelope())
 }
 
 /// Parse a not-found envelope out of gRPC status details, if that is what
@@ -5699,7 +5691,13 @@ pub fn wrap_tool_not_found(envelope: Value) -> Value {
 pub fn wrap_tool_failure(tool: &str, error: &anyhow::Error) -> Value {
     match lookup_miss_envelope(tool, error) {
         Some(envelope) => wrap_tool_not_found(envelope),
-        None => wrap_tool_error(&error.to_string()),
+        // An unresolved repo filter renders its OWN message: an outer
+        // `.context()` would otherwise replace the candidate list a caller
+        // needs to pick one repo.
+        None => match repo_filter_failure(error) {
+            Some(unresolved) => wrap_tool_error(&unresolved.to_string()),
+            None => wrap_tool_error(&error.to_string()),
+        },
     }
 }
 
@@ -10433,18 +10431,12 @@ fn tool_cross_repo_contracts(
     // Resolved with the same
     // `resolve_repo_selector` every other `--repo` flag in this binary uses,
     // rather than a bespoke string-equality check that would drift from it.
+    // Through `resolve_repo_filter`, so an unresolved selector keeps its
+    // class (not found / ambiguous / malformed) instead of flattening to text.
     let repo_filter = match args.get("repo").and_then(|v| v.as_str()) {
-        Some(selector) => {
-            let repos = store
-                .list_repos(None)
-                .map_err(|e| anyhow!("list_repos: {e}"))?;
-            Some(
-                nestweaver_engine::resolve_repo_selector(&repos, selector)
-                    .map_err(|e| anyhow!("{e}"))?
-                    .uid
-                    .clone(),
-            )
-        }
+        Some(selector) => resolve_repo_filter(store, &[selector.to_string()], None)?
+            .into_iter()
+            .next(),
         None => None,
     };
 
@@ -12241,8 +12233,9 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
                 .collect(),
             "repos",
         )?;
-        let scoped = nestweaver_engine::compute_clusters_scoped(store, &selectors, resolution_arg)
-            .context("compute_clusters_scoped")?;
+        // No `.context()`: the outermost message is what a client renders,
+        // and wrapping here hid an unresolved repo's class and candidates.
+        let scoped = nestweaver_engine::compute_clusters_scoped(store, &selectors, resolution_arg)?;
 
         require_cluster(requested_id, &scoped.communities)?;
         let matching: Vec<&nestweaver_engine::CommunityInfo> = scoped
@@ -27452,6 +27445,50 @@ mod context_scope_filter_tests {
         // COUNTERWEIGHT: the disambiguated form the error recommends works.
         let resolved = resolve_repo_filter(&store, &[REPO_A.to_string()], None).unwrap();
         assert_eq!(resolved, HashSet::from([REPO_A.to_string()]));
+    }
+
+    /// An MCP repo-filter miss is a lookup miss: `isError: true` with the
+    /// not-found envelope. An ambiguous selector is `isError: true` whose text
+    /// names both candidates even when a tool wrapped the error in context.
+    #[test]
+    fn a_repo_filter_miss_is_the_mcp_not_found_envelope() {
+        let store = store_with_two_repos_named_website();
+        let miss = dispatch(
+            &store,
+            None,
+            "clusters",
+            json!({ "repos": ["not-a-repo"] }),
+            None,
+        )
+        .expect_err("an unknown repo must not answer");
+        let wrapped = wrap_tool_failure("clusters", &miss);
+        assert_eq!(wrapped["isError"], json!(true), "{wrapped}");
+        assert_eq!(
+            wrapped["structuredContent"]["status"], "not_found",
+            "{wrapped}"
+        );
+        assert_eq!(
+            wrapped["structuredContent"]["repo"], "not-a-repo",
+            "{wrapped}"
+        );
+
+        let ambiguous = dispatch(
+            &store,
+            None,
+            "clusters",
+            json!({ "repos": ["website"] }),
+            None,
+        )
+        .expect_err("an ambiguous repo must not answer")
+        .context("an outer layer");
+        let wrapped = wrap_tool_failure("clusters", &ambiguous);
+        assert_eq!(wrapped["isError"], json!(true), "{wrapped}");
+        assert!(wrapped.get("structuredContent").is_none(), "{wrapped}");
+        let text = wrapped["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("ambiguous") && text.contains(REPO_A) && text.contains(REPO_B),
+            "{text}"
+        );
     }
 
     /// nw-405: an entry that names no repo is an ERROR. The old predicate
