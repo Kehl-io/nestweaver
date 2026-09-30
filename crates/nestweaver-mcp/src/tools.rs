@@ -11555,7 +11555,7 @@ fn build_flow_tree(
 fn tool_schema_detect_changes() -> Value {
     json!({
         "name": "detect_changes",
-        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high, or unknown when a changed file maps to no indexed symbols — never read unknown as low)\n- `risk` and `gate_state` are the verdict `blast_radius` returns for the same files at its default depth (nw-544), so a gate built on either tool agrees; `affected_processes` is detail, not a risk input\n- Gate on `gate_state`, not `status` (nw-467): a run that merely stopped at its configured depth is `status: partial` but `gate_state: ok` — bounded, not broken, and the normal state at the default depth. `degraded-unknown` means stale/errored/refused/cancelled and requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts\n- `resolver_stale_repos`, when present, is repo UIDs with generation-mismatched edges — a different population from `stale_check`'s or `hub_nodes`'s own `stale_repos` (same key name, different tools, different meanings — nw-371)",
+        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high, or unknown when a changed file maps to no indexed symbols — never read unknown as low)\n- `risk` and `gate_state` are the verdict `blast_radius` returns for the same files at its default depth (nw-544), so a gate built on either tool agrees; `affected_processes` is detail, not a risk input\n- Gate on `gate_state`, not `status` (nw-467): a run that merely stopped at its configured depth is `status: partial` but `gate_state: ok` — bounded, not broken, and the normal state at the default depth. `degraded-unknown` means stale/errored/refused/cancelled and requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts\n- `resolver_stale_repos`, when present, is repo UIDs with generation-mismatched edges that own or are linked to a changed file (a stale repo unrelated to the change is only named in a `resolver-generation-stale-unrelated` warning) — a different population from `stale_check`'s or `hub_nodes`'s own `stale_repos` (same key name, different tools, different meanings — nw-371)",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -11673,8 +11673,16 @@ fn tool_detect_changes_scoped(
             })
             .collect();
         let symbols_omitted = total.saturating_sub(affected_symbols.len());
-        let mut resolver_stale_repos =
-            nestweaver_engine::resolver_generation::incompatible_repos_for_store(store)?;
+        // The same owning-or-linked verdict the unrestricted route
+        // reaches through `detect_changes_impact`.
+        let mut incompatibility =
+            nestweaver_engine::resolver_generation::incompatibility_for_changed_files(
+                store, &files,
+            )?;
+        incompatibility
+            .unrelated
+            .retain(|repo_uid| repo_is_visible(repo_uid, visible));
+        let mut resolver_stale_repos = incompatibility.all();
         resolver_stale_repos.retain(|repo_uid| repo_is_visible(repo_uid, visible));
         let mut notifications = vec![json!({
             "level": "warning",
@@ -11696,6 +11704,13 @@ fn tool_detect_changes_scoped(
                 "message": nestweaver_engine::resolver_generation::incompatibility_message(
                     &resolver_stale_repos,
                 ),
+            }));
+        }
+        if let Some(message) = incompatibility.unrelated_message() {
+            notifications.push(json!({
+                "level": "warning",
+                "descriptor": nestweaver_engine::resolver_generation::UNRELATED_STALE_RESOLVER_DESCRIPTOR,
+                "message": message,
             }));
         }
         return Ok(json!({
@@ -11825,7 +11840,7 @@ fn tool_detect_changes_scoped(
 fn tool_schema_affected_tests() -> Value {
     json!({
         "name": "affected_tests",
-        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (at least one must be provided).\n\nREFUSAL: on a graph whose edges predate the running resolver this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos`, a `remedies` array, `recommendation: \"run-full-suite\"`, and NO tier keys at all — a missing edge can only make the selection SMALLER, so an under-resolved graph silently drops a regression test while the gate still reports success. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required, a generation-stale repo is already at HEAD so a plain incremental index writes nothing) and call again.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n- `recommendation` is a machine-readable CI directive: 'selection-usable' requires a complete run with nonempty test files, or an explicitly documented docs-only/proven-empty exception; otherwise 'run-full-suite'. Documentation-only changes are disclosed as docs; unassessed source/config changes are disclosed and widen to the full suite\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n- `resolver_stale_repos` (repo UIDs, generation-mismatch) is NOT the same population as `_meta.stale_repos` (federation lag, present only via the hybrid client) or `stale_check`'s/`hub_nodes`'s own `stale_repos` (different tools, different populations under the same key name — nw-371)\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
+        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (at least one must be provided).\n\nREFUSAL: when a repo that owns a changed file (or shares a recorded cross-repo edge or a declared `[[links]]` entry with one) has edges that predate the running resolver, this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos`, a `remedies` array, `recommendation: \"run-full-suite\"`, and NO tier keys at all — a missing edge can only make the selection SMALLER, so an under-resolved graph silently drops a regression test while the gate still reports success. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required, a generation-stale repo is already at HEAD so a plain incremental index writes nothing) and call again. A stale repo unrelated to the change does not refuse; it is named in a `resolver-generation-stale-unrelated` warning notification.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n- `recommendation` is a machine-readable CI directive: 'selection-usable' requires a complete run with nonempty test files, or an explicitly documented docs-only/proven-empty exception; otherwise 'run-full-suite'. Documentation-only changes are disclosed as docs; unassessed source/config changes are disclosed and widen to the full suite\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n- `resolver_stale_repos` (repo UIDs, generation-mismatch) is NOT the same population as `_meta.stale_repos` (federation lag, present only via the hybrid client) or `stale_check`'s/`hub_nodes`'s own `stale_repos` (different tools, different populations under the same key name — nw-371)\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -11875,14 +11890,6 @@ fn tool_affected_tests(
     args: Value,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
-    // nw-412: REFUSE before doing any work, the way `dead_code` does. On a
-    // resolver-generation-stale graph a MISSING edge makes the affected-test
-    // set SMALLER, so the regression test that should have run is silently
-    // dropped while the gate reports success.
-    if let Some(refusal) = resolver_generation_refusal(store, visible)? {
-        return Ok(affected_tests_refusal_payload(&refusal));
-    }
-
     let owners = restricted_symbol_owners(store, visible)?;
 
     // Resolve the set of changed files: explicit list takes precedence over base_ref.
@@ -11934,6 +11941,16 @@ fn tool_affected_tests(
         return Err(anyhow!(
             "provide either 'changed_files' (non-empty) or 'base_ref'"
         ));
+    }
+
+    // nw-412: REFUSE before selecting, the way `dead_code` does. On a
+    // resolver-generation-stale graph a MISSING edge makes the affected-test
+    // set SMALLER, so the regression test that should have run is silently
+    // dropped while the gate reports success. Only a stale repository
+    // that owns or is linked to a changed file refuses; an unrelated one is
+    // disclosed in the selection's notifications instead.
+    if let Some(refusal) = resolver_generation_refusal(store, visible, Some(&changed_files))? {
+        return Ok(affected_tests_refusal_payload(&refusal));
     }
 
     // nw-037: route through the recorded wrapper so every selection feeds the
@@ -14502,7 +14519,7 @@ fn tool_bridge_nodes(
 fn tool_schema_blast_radius() -> Value {
     json!({
         "name": "blast_radius",
-        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High, or Unknown when a changed file maps to no indexed symbols — never read Unknown as Low) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\n`cochanged_files` lists historically co-changing files (git history, Jaccard confidence) with no static edge — an advisory recall supplement; absence of co-change data is disclosed via a `cochange-unavailable` note.\n\nTrust contract (read before trusting a green result):\n- status (complete/partial/degraded/failed) + gate_state (ok/degraded-unknown/risk-flagged) are TWO AXES, not one (nw-467). A run that stopped at its configured traversal budget is `status: partial` and still gates `ok` — it is BOUNDED, not degraded, and at the default depth of 3 that is the steady state, so `status == complete` is not a usable green light and `gate_state` is. A run that is stale, errored, refused or cancelled is degraded-unknown, NEVER risk-flagged — treat that one as 'unknown, review manually', not 'safe'. The bound itself is never hidden: `coverage.traversal_truncated` and the `depth-truncated` blind spot still report it\n- a graph whose edges predate the running resolver DEGRADES rather than refusing: status becomes at least 'degraded', gate_state becomes 'degraded-unknown', and a `resolver.generation-stale` notification names the repos and the `nestweaver index --repo <path> --force` remedy. On such a graph a missing edge UNDERSTATES impact, so a green result there is not a green result. (`affected_tests` refuses outright on the same condition — it is a selector, and a narrowed selection cannot be widened back by its caller.)\n- coverage (repos in scope / not indexed / stale / truncated) distinguishes 'no impact' from 'incomplete coverage'\n- blind_spots: inherent static gaps (dynamic-dispatch, reflection, config-wiring, codegen) plus run-specific ones (pruned-below-threshold, depth-truncated, not-indexed)\n- THREE fields on this response are named `stale_repos` or a variant of it, and they mean three different things (nw-371): `coverage.stale_repos` is behind-git-HEAD repos (objects with `repo_uid`+`commits_behind`); `resolver_stale_repos` (top-level) is repo UIDs whose edges predate/postdate this resolver generation; `_meta.stale_repos`, present only via the hybrid client, is FEDERATION lag (an upstream server's data being behind). None is interchangeable with `stale_check`'s or `hub_nodes`'/`bridge_nodes`'s own `stale_repos`, which are separate tools with separate populations under the same key name.\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection (declared in blind_spots, not silently)\n- Response size scales with number of changed files and graph density\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results. On an authenticated server with an [authz] policy, repository-restricted callers are refused before seed resolution or traversal: the global walk cannot yet be computed on an authorization-induced subgraph, and redacting after traversal would preserve reachability created through hidden intermediates.",
+        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High, or Unknown when a changed file maps to no indexed symbols — never read Unknown as Low) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\n`cochanged_files` lists historically co-changing files (git history, Jaccard confidence) with no static edge — an advisory recall supplement; absence of co-change data is disclosed via a `cochange-unavailable` note.\n\nTrust contract (read before trusting a green result):\n- status (complete/partial/degraded/failed) + gate_state (ok/degraded-unknown/risk-flagged) are TWO AXES, not one (nw-467). A run that stopped at its configured traversal budget is `status: partial` and still gates `ok` — it is BOUNDED, not degraded, and at the default depth of 3 that is the steady state, so `status == complete` is not a usable green light and `gate_state` is. A run that is stale, errored, refused or cancelled is degraded-unknown, NEVER risk-flagged — treat that one as 'unknown, review manually', not 'safe'. The bound itself is never hidden: `coverage.traversal_truncated` and the `depth-truncated` blind spot still report it\n- a graph whose edges predate the running resolver DEGRADES rather than refusing: status becomes at least 'degraded', gate_state becomes 'degraded-unknown', and a `resolver.generation-stale` notification names the repos and the `nestweaver index --repo <path> --force` remedy. On such a graph a missing edge UNDERSTATES impact, so a green result there is not a green result. (`affected_tests` refuses outright on the same condition — it is a selector, and a narrowed selection cannot be widened back by its caller.) Only a stale repo that owns a changed file, or shares a recorded cross-repo edge or a declared `[[links]]` entry with one that does, degrades; any other stale repo is named in a `resolver-generation-stale-unrelated` warning and does not\n- coverage (repos in scope / not indexed / stale / truncated) distinguishes 'no impact' from 'incomplete coverage'\n- blind_spots: inherent static gaps (dynamic-dispatch, reflection, config-wiring, codegen) plus run-specific ones (pruned-below-threshold, depth-truncated, not-indexed)\n- THREE fields on this response are named `stale_repos` or a variant of it, and they mean three different things (nw-371): `coverage.stale_repos` is behind-git-HEAD repos (objects with `repo_uid`+`commits_behind`); `resolver_stale_repos` (top-level) is repo UIDs whose edges predate/postdate this resolver generation; `_meta.stale_repos`, present only via the hybrid client, is FEDERATION lag (an upstream server's data being behind). None is interchangeable with `stale_check`'s or `hub_nodes`'/`bridge_nodes`'s own `stale_repos`, which are separate tools with separate populations under the same key name.\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection (declared in blind_spots, not silently)\n- Response size scales with number of changed files and graph density\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results. On an authenticated server with an [authz] policy, repository-restricted callers are refused before seed resolution or traversal: the global walk cannot yet be computed on an authorization-induced subgraph, and redacting after traversal would preserve reachability created through hidden intermediates.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -14689,7 +14706,12 @@ fn tool_blast_radius(
     // direction that made this dangerous: a stale-resolver run reported
     // `gate_state: ok` over a shrunken affected set, and can no longer report
     // `ok` at all.
-    if let Some(refusal) = resolver_generation_refusal(store, visible)? {
+    let changed_file_strings: Vec<String> = files
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    if let Some(refusal) = resolver_generation_refusal(store, visible, Some(&changed_file_strings))?
+    {
         result.status = result
             .status
             .max(nestweaver_engine::blast_radius::AnalysisStatus::Degraded);
@@ -15393,6 +15415,9 @@ pub fn set_current_db_path(path: std::path::PathBuf) {
 /// `brain_search` can apply Feature F6 `[ranking]` priors without re-parsing
 /// the file. Pass `None` to clear.
 pub fn set_current_instance_config(cfg: Option<std::sync::Arc<nestweaver_engine::InstanceConfig>>) {
+    // The same dispatch's declared `[[links]]` are reachability evidence for
+    // the resolver-generation gate, which the engine reads on this thread.
+    nestweaver_engine::resolver_generation::set_declared_link_config(cfg.clone());
     CURRENT_INSTANCE_CONFIG.with(|c| *c.borrow_mut() = cfg);
 }
 
@@ -17349,7 +17374,7 @@ fn dead_code_refusal(
     store: &GraphStore,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Option<nestweaver_engine::resolver_generation::DeadCodeRefusal>, anyhow::Error> {
-    resolver_generation_refusal(store, visible)
+    resolver_generation_refusal(store, visible, None)
 }
 
 /// The resolver-generation verdict for the repos this caller can SEE, or
@@ -17368,9 +17393,15 @@ fn dead_code_refusal(
 /// makes the verdict CORRECT for that caller: a stale repo they cannot see can
 /// contribute no edge to an answer that is already filtered to their scope, so
 /// refusing on it would be refusing on someone else's data.
+///
+/// `changed_files`, when given, narrows the verdict to the repositories that
+/// own or are linked to one of them: an unrelated stale repository is
+/// disclosed by the analysis itself and does not refuse or degrade the call.
+/// `None` keeps the whole-graph verdict `dead_code` needs.
 fn resolver_generation_refusal(
     store: &GraphStore,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+    changed_files: Option<&[String]>,
 ) -> Result<Option<nestweaver_engine::resolver_generation::DeadCodeRefusal>, anyhow::Error> {
     let db_path = match (current_db_path(store), store.db_path()) {
         (Ok(path), _) => path,
@@ -17382,11 +17413,19 @@ fn resolver_generation_refusal(
     // error (and, on the CLI, the diagnostic nw-285 built for a schema-less
     // database) rather than a binder exception quoted inside a paragraph about
     // resolver generations.
-    let repos: Vec<nestweaver_schema::Repo> = store
+    let mut repos: Vec<nestweaver_schema::Repo> = store
         .list_repos(None)?
         .into_iter()
         .filter(|repo| repo_is_visible(&repo.uid, visible))
         .collect();
+    if let Some(changed_files) = changed_files {
+        nestweaver_engine::resolver_generation::incompatibility_for_changed_files_at(
+            store,
+            Some(&db_path),
+            changed_files,
+        )?
+        .retain_degrading(&mut repos);
+    }
     Ok(nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(&db_path, &repos))
 }
 
@@ -22266,6 +22305,16 @@ mod arg_alias_tests {
                 root_path: Some("/tmp/future".to_string()),
             })
             .unwrap();
+        // The changed file belongs to the future-generation repository; a
+        // stale repository unrelated to the change only discloses.
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: "file:future:src/new.rs".to_string(),
+                path: "src/new.rs".to_string(),
+                repo_uid: repo_uid.to_string(),
+                content_hash: "h".to_string(),
+            })
+            .unwrap();
         nestweaver_engine::resolver_generation::record(&db, repo_uid).unwrap();
         let mut generations = nestweaver_engine::resolver_generation::load(&db);
         generations.repos.insert(
@@ -23484,6 +23533,16 @@ mod blast_radius_visibility_tests {
                 instance_id: "inst".to_string(),
                 name: None,
                 root_path: None,
+            })
+            .unwrap();
+        // The changed file belongs to the stale repository, so it
+        // degrades rather than being disclosed as unrelated.
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: "file:repo:visible:src/a.rs".to_string(),
+                path: "src/a.rs".to_string(),
+                repo_uid: "repo:visible".to_string(),
+                content_hash: "h".to_string(),
             })
             .unwrap();
 
@@ -27743,6 +27802,70 @@ mod resolver_stale_merge_gate_tests {
             stale.get("coverage").is_some() && stale.get("blind_spots").is_some(),
             "degrading must not strip the trust contract it degrades: {stale}"
         );
+    }
+
+    /// A stale repository that neither owns a changed file nor shares
+    /// an edge or declared link with one is DISCLOSED, and neither refuses
+    /// `affected_tests` nor degrades `blast_radius`/`detect_changes`. The
+    /// counterweight is the two tests above: the same fixture with the OWNING
+    /// repository stale still refuses and degrades.
+    #[test]
+    fn an_unrelated_stale_repo_is_disclosed_without_refusing_or_degrading() {
+        let (_dir, db_path) = super::cache_dispatch_tests::index_on_disk_for_merge_guard();
+        let store = GraphStore::open(&db_path).unwrap();
+        // A second repository with no generation record, and no link to the
+        // indexed one: incompatible, and unrelated to `main.js`.
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:default:unrelated".into(),
+                url: "file:///src/unrelated".into(),
+                indexed_sha: "deadbeef".into(),
+                staleness_commits_behind: 0,
+                instance_id: "default".into(),
+                name: None,
+                root_path: Some("/src/unrelated".into()),
+            })
+            .unwrap();
+        let args = json!({ "changed_files": ["main.js"] });
+        let discloses = |payload: &Value| {
+            payload["notifications"].as_array().is_some_and(|all| {
+                all.iter().any(|n| {
+                    n["descriptor"]
+                        == json!(
+                            nestweaver_engine::resolver_generation::UNRELATED_STALE_RESOLVER_DESCRIPTOR
+                        )
+                        && n["message"]
+                            .as_str()
+                            .is_some_and(|m| m.contains("repo:default:unrelated"))
+                })
+            })
+        };
+
+        let tests = tool_affected_tests(&store, args.clone(), None).unwrap();
+        assert!(tests.get("refused").is_none(), "{tests}");
+        assert_eq!(tests["resolver_stale_repos"], json!([]), "{tests}");
+        assert!(discloses(&tests), "{tests}");
+
+        let blast = tool_blast_radius(&store, args.clone(), None, None).unwrap();
+        assert_eq!(blast["gate_state"], json!("ok"), "{blast}");
+        assert!(
+            !blast["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["descriptor"] == json!(BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR)),
+            "{blast}"
+        );
+        assert!(discloses(&blast), "{blast}");
+
+        let changes = tool_detect_changes(&store, args).unwrap();
+        assert_eq!(changes["resolver_stale_repos"], json!([]), "{changes}");
+        assert_ne!(
+            changes["gate_state"],
+            json!("degraded-unknown"),
+            "{changes}"
+        );
+        assert!(discloses(&changes), "{changes}");
     }
 }
 

@@ -10547,9 +10547,22 @@ const BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR: &str = "resolver.generation-stale"
 fn degrade_blast_radius_if_resolver_stale(
     store: &GraphStore,
     db_path: &Path,
+    changed_files: &[PathBuf],
     result: &mut BlastRadiusResult,
 ) -> Result<(), anyhow::Error> {
-    let repos = store.list_repos(None)?;
+    let mut repos = store.list_repos(None)?;
+    // Only a stale repository that owns or is linked to a changed
+    // file degrades; the engine already disclosed any unrelated one.
+    let changed: Vec<String> = changed_files
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    nestweaver_engine::resolver_generation::incompatibility_for_changed_files_at(
+        store,
+        Some(db_path),
+        &changed,
+    )?
+    .retain_degrading(&mut repos);
     let Some(refusal) =
         nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(db_path, &repos)
     else {
@@ -19458,7 +19471,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // is the merge-gate surface most likely to be read by a machine
             // that never sees the JSON, and `--sarif` also forces this direct
             // path, so it is the leg that most needs the marker.
-            degrade_blast_radius_if_resolver_stale(&store, &db_path, &mut result)?;
+            degrade_blast_radius_if_resolver_stale(&store, &db_path, &changed_files, &mut result)?;
 
             if sarif {
                 let mut sarif_value =
@@ -19675,7 +19688,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // direction nothing downstream can detect. See
                     // `WHY_AFFECTED_TESTS_REFUSES` for why this refuses where
                     // `pr-impact` degrades.
-                    let repos = store.list_repos(None)?;
+                    // Only a stale repository that owns or is linked
+                    // to a changed file refuses; an unrelated one is disclosed
+                    // in the selection's notifications instead.
+                    let mut repos = store.list_repos(None)?;
+                    nestweaver_engine::resolver_generation::incompatibility_for_changed_files_at(
+                        &store,
+                        Some(&db_path),
+                        &changed_files,
+                    )?
+                    .retain_degrading(&mut repos);
                     if let Some(refusal) =
                         nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(
                             &db_path, &repos,
@@ -38087,7 +38109,23 @@ mod resolver_generation_gate_tests {
     fn store_with_one_repo(root: &std::path::Path) -> GraphStore {
         let store = GraphStore::in_memory().unwrap();
         store.insert_repo(&repo_row(root)).unwrap();
+        // The changed file the gate tests pass belongs to this repo (
+        // a stale repository degrades only a change it owns or reaches).
         store
+            .insert_file(&nestweaver_schema::File {
+                uid: format!("file:{REPO}:src/lib.rs"),
+                path: CHANGED.to_string(),
+                repo_uid: REPO.to_string(),
+                content_hash: "h".to_string(),
+            })
+            .unwrap();
+        store
+    }
+
+    const CHANGED: &str = "src/lib.rs";
+
+    fn changed() -> Vec<PathBuf> {
+        vec![PathBuf::from(CHANGED)]
     }
 
     /// A run that reported the clean gate this item is about: `Complete`,
@@ -38128,7 +38166,7 @@ mod resolver_generation_gate_tests {
         // is the "indexed before this record existed" case by definition.
 
         let mut result = clean_result();
-        degrade_blast_radius_if_resolver_stale(&store, &db_path, &mut result).unwrap();
+        degrade_blast_radius_if_resolver_stale(&store, &db_path, &changed(), &mut result).unwrap();
 
         assert_eq!(result.status, AnalysisStatus::Degraded);
         assert_eq!(
@@ -38158,6 +38196,39 @@ mod resolver_generation_gate_tests {
         );
     }
 
+    /// A stale repository that neither owns the changed file nor is
+    /// linked to it does not degrade the direct `pr-impact` gate. The test
+    /// above is the counterweight: the owning repository stale degrades.
+    #[test]
+    fn an_unrelated_stale_repo_does_not_degrade_the_direct_blast_radius_gate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("nestweaver.lbug");
+        let store = store_with_one_repo(tmp.path());
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:default:unrelated".to_string(),
+                url: "https://github.com/example/unrelated".to_string(),
+                indexed_sha: "deadbeef".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        resolver_generation::record(&db_path, REPO).unwrap();
+
+        let mut result = clean_result();
+        degrade_blast_radius_if_resolver_stale(&store, &db_path, &changed(), &mut result).unwrap();
+
+        assert_eq!(result.status, AnalysisStatus::Complete);
+        assert_eq!(result.gate_state, GateState::Ok);
+        assert!(
+            result.notifications.is_empty(),
+            "{:?}",
+            result.notifications
+        );
+    }
+
     /// COUNTERWEIGHT, and the assertion nw-412 explicitly requires: a
     /// generation-CURRENT graph must NOT degrade. Without this, wiring that
     /// degraded unconditionally would pass every test above while making the
@@ -38171,7 +38242,7 @@ mod resolver_generation_gate_tests {
 
         let mut result = clean_result();
         let before = result.summary.clone();
-        degrade_blast_radius_if_resolver_stale(&store, &db_path, &mut result).unwrap();
+        degrade_blast_radius_if_resolver_stale(&store, &db_path, &changed(), &mut result).unwrap();
 
         assert_eq!(result.status, AnalysisStatus::Complete);
         assert_eq!(result.gate_state, GateState::Ok);

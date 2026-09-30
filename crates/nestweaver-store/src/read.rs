@@ -2975,6 +2975,58 @@ impl GraphStore {
         result.map(|row| extract_string(&row, 0)).collect()
     }
 
+    /// Every OTHER repo that shares a recorded symbol-to-symbol edge with
+    /// `repo_uid`, in either direction, sorted and de-duplicated.
+    ///
+    /// Covers every `Symbol -> Symbol` relationship table, not only
+    /// `CROSS_REPO_LINK`: a resolver can also write a cross-repo `CALLS` or
+    /// `IMPORTS`, and any of them is a path an impact walk can take across the
+    /// repository boundary. One query per table and direction keeps each one a
+    /// plain labelled pattern.
+    pub fn repos_sharing_symbol_edges(&self, repo_uid: &str) -> Result<Vec<String>, StoreError> {
+        const SYMBOL_EDGE_TABLES: [&str; 9] = [
+            "CALLS",
+            "USES",
+            "ACCESSES",
+            "IMPORTS",
+            "EXTENDS_SYM",
+            "IMPLEMENTS_SYM",
+            "INCLUDES_SYM",
+            "MEMBER_OF",
+            "CROSS_REPO_LINK",
+        ];
+        let conn = self.conn()?;
+        let mut neighbours: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for table in SYMBOL_EDGE_TABLES {
+            // `$repo` is the named repo's side; the other endpoint is the
+            // neighbour. Both orientations, so an edge INTO the repo counts
+            // as well as one out of it.
+            for (own, other) in [("s", "t"), ("t", "s")] {
+                let q = format!(
+                    "MATCH (s:Symbol)-[:{table}]->(t:Symbol) \
+                     WHERE {own}.repo_uid = $repo AND {other}.repo_uid <> $repo \
+                     RETURN DISTINCT {other}.repo_uid"
+                );
+                let mut stmt = conn
+                    .prepare(&q)
+                    .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+                let result = conn
+                    .execute(
+                        &mut stmt,
+                        vec![("repo", Value::String(repo_uid.to_string()))],
+                    )
+                    .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+                for row in result {
+                    let uid = extract_string(&row, 0)?;
+                    if !uid.is_empty() {
+                        neighbours.insert(uid);
+                    }
+                }
+            }
+        }
+        Ok(neighbours.into_iter().collect())
+    }
+
     /// Every File node of `repo_uid` as `(file_path, content_hash)`.
     ///
     /// nw-664: the code watcher's startup reconciliation compares disk

@@ -4603,9 +4603,10 @@ fn degrade_blast_radius_if_resolver_stale(
     store: &GraphStore,
     db_path: &Path,
     visible: &nestweaver_engine::authz::VisibleRepos,
+    changed_files: &[PathBuf],
     result: &mut nestweaver_engine::blast_radius::BlastRadiusResult,
 ) -> Result<(), Status> {
-    let repos: Vec<nestweaver_schema::Repo> = store
+    let mut repos: Vec<nestweaver_schema::Repo> = store
         .list_repos(None)
         .map_err(|error| {
             // Log the chain server-side; the client gets no store internals.
@@ -4615,6 +4616,22 @@ fn degrade_blast_radius_if_resolver_stale(
         .into_iter()
         .filter(|repo| visible.allows(&repo.uid))
         .collect();
+    // Only a stale repository that owns or is linked to a changed
+    // file degrades; the engine already disclosed any unrelated one.
+    let changed: Vec<String> = changed_files
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    nestweaver_engine::resolver_generation::incompatibility_for_changed_files_at(
+        store,
+        Some(db_path),
+        &changed,
+    )
+    .map_err(|error| {
+        tracing::error!("pr_impact: resolver-generation verdict: {error:#}");
+        Status::unavailable("resolver-generation verdict unavailable")
+    })?
+    .retain_degrading(&mut repos);
     let Some(refusal) =
         nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(db_path, &repos)
     else {
@@ -10772,6 +10789,12 @@ impl NestWeaverDaemon for DaemonService {
         let cancel_for_task = cancel.clone();
         let handler = async move {
             tokio::task::spawn_blocking(move || {
+                // Declared `[[links]]` are reachability evidence for the
+                // resolver-generation gate; this worker thread is
+                // not a tool dispatch, so install them here.
+                nestweaver_engine::resolver_generation::set_declared_link_config(
+                    state.instance_cfg.clone(),
+                );
                 // TODO(nw-033): resolve target repo_uid from the working repo
                 let options = nestweaver_engine::BlastRadiusOptions {
                     target_repo: None,
@@ -10823,6 +10846,7 @@ impl NestWeaverDaemon for DaemonService {
                     &state.store,
                     &state.db_path,
                     &visible,
+                    &changed_files,
                     &mut result,
                 )?;
                 serde_json::to_string(&result)
@@ -27988,6 +28012,47 @@ external_model = "unavailable-test-model"
                 .as_str()
                 .is_some_and(|s| !s.contains("[status: ")),
             "a complete run must not be tagged with a status marker: {value}"
+        );
+    }
+
+    /// A stale repository with no link to the changed file is
+    /// disclosed, not degrading. The counterweight is the test above: the
+    /// same fixture with the OWNING repository stale degrades.
+    #[tokio::test]
+    async fn an_unrelated_stale_repo_does_not_degrade_pr_impact_through_the_daemon() {
+        let state = nw412_state();
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:nw412:unrelated",
+                "https://github.com/example/unrelated",
+                Some("/tmp/unrelated"),
+            ))
+            .unwrap();
+        nestweaver_engine::resolver_generation::record(&state.db_path, NW412_REPO)
+            .expect("recording the current generation must succeed");
+
+        let value = nw412_pr_impact(state).await;
+
+        assert_eq!(value["gate_state"], serde_json::json!("ok"), "{value}");
+        let notifications = value["notifications"].as_array().expect("notifications");
+        assert!(
+            notifications
+                .iter()
+                .all(|n| n["descriptor"] != serde_json::json!("resolver.generation-stale")),
+            "{value}"
+        );
+        assert!(
+            notifications.iter().any(|n| {
+                n["descriptor"]
+                    == serde_json::json!(
+                        nestweaver_engine::resolver_generation::UNRELATED_STALE_RESOLVER_DESCRIPTOR
+                    )
+                    && n["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains("repo:nw412:unrelated"))
+            }),
+            "the unrelated stale repository must still be disclosed: {value}"
         );
     }
 
