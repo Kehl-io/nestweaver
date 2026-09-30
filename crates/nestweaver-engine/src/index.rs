@@ -3074,7 +3074,16 @@ fn infer_cross_repo_call_edges(
         .db_path()
         .map(crate::manifest::package_names_hint)
         .unwrap_or_default();
-    infer_cross_repo_call_edges_with(store, current_repo_uid, parsed_files, &package_names)
+    let files: Vec<FileParse<'_>> = parsed_files
+        .iter()
+        .map(|(rel_path, symbols, references, _)| FileParse {
+            rel_path,
+            symbols,
+            references,
+        })
+        .collect();
+    let targets = called_name_targets(store, &files)?;
+    infer_cross_repo_call_edges_with(current_repo_uid, &files, &package_names, &targets)
 }
 
 /// Re-infer every name-matched cross-repo call link over the WHOLE graph and
@@ -3086,15 +3095,17 @@ fn infer_cross_repo_call_edges(
 /// had into it. A caller that indexes every source first (a publication
 /// rebuild) runs this afterwards instead, with every repository present and
 /// `package_names` taken from the sources themselves, so a fresh build and a
-/// resumed one agree.
+/// resumed one agree. The ordinary index routes run the same pass through
+/// [`crate::cross_repo_links::reconcile_cross_repo_links`].
 ///
 /// The files are the graph's own File nodes, each with the content hash it
 /// was indexed from. Each file's parse is taken from the parse cache under
-/// that hash, and re-parsed from the repository's working tree when the cache
-/// lacks it (missing, corrupt or pruned). The pass never links from a partial
-/// view: a file it cannot re-read, or whose current content no longer has the
-/// indexed hash, fails it with [`CrossRepoInferenceInputsUnavailable`] before
-/// any stored link is touched.
+/// that hash, and re-parsed from the repository's working tree (or, for a
+/// server-mode repository, its bare clone at the indexed revision) when the
+/// cache lacks it (missing, corrupt or pruned). The pass never links from a
+/// partial view: a file it cannot re-read, or whose current content no
+/// longer has the indexed hash, fails it with
+/// [`CrossRepoInferenceInputsUnavailable`] before any stored link is touched.
 ///
 /// Returns the number of links written.
 pub fn reinfer_cross_repo_links(
@@ -3103,12 +3114,68 @@ pub fn reinfer_cross_repo_links(
     package_names: &HashMap<String, String>,
     limits: crate::index_limits::IndexLimits,
 ) -> Result<usize, anyhow::Error> {
-    let parsed_cache =
+    let mut cache =
         crate::parsed_cache::ParsedCache::load(&crate::sidecar_path(db_path, ".parsed_cache.bin"));
+    let inference = infer_whole_graph_cross_repo_links(
+        store,
+        db_path,
+        package_names,
+        limits,
+        &|| false,
+        &mut cache,
+    )?
+    .expect("a pass that is never asked to stop completes");
+    store
+        .replace_inferred_cross_repo_links(&inference.edges)
+        .map_err(|e| anyhow::anyhow!("replace inferred cross-repo links: {e}"))?;
+    Ok(inference.edges.len())
+}
+
+/// The result of one whole-graph cross-repo inference, before it is written.
+pub(crate) struct WholeGraphCrossRepoInference {
+    pub(crate) edges: Vec<nestweaver_schema::ResolvedEdge>,
+    pub(crate) repos: usize,
+    pub(crate) files: usize,
+    /// Files whose parse came from the parse cache.
+    pub(crate) cache_hits: usize,
+    /// Files re-read and re-parsed because the cache lacked them.
+    pub(crate) reparsed: usize,
+}
+
+/// Infer every name-matched cross-repo call link over the whole graph without
+/// writing anything (see [`reinfer_cross_repo_links`] for the inputs and the
+/// refusal rule). `None` when `should_stop` asked it to stop between
+/// repositories.
+///
+/// Files re-parsed on a cache miss are added to the parse cache, so the next
+/// pass after an incremental or watcher write (neither updates the cache)
+/// re-reads only files that changed again.
+pub(crate) fn infer_whole_graph_cross_repo_links(
+    store: &GraphStore,
+    db_path: &Path,
+    package_names: &HashMap<String, String>,
+    limits: crate::index_limits::IndexLimits,
+    should_stop: &dyn Fn() -> bool,
+    parsed_cache: &mut crate::parsed_cache::ParsedCache,
+) -> Result<Option<WholeGraphCrossRepoInference>, anyhow::Error> {
+    let parsed_cache_path = crate::sidecar_path(db_path, ".parsed_cache.bin");
     let mut repos = store
         .list_repos(None)
         .map_err(|e| anyhow::anyhow!("list repositories for cross-repo inference: {e}"))?;
     repos.sort_by(|left, right| left.uid.cmp(&right.uid));
+    let mut inference = WholeGraphCrossRepoInference {
+        edges: Vec::new(),
+        repos: repos.len(),
+        files: 0,
+        cache_hits: 0,
+        reparsed: 0,
+    };
+    // One repository has nothing to link to: no pass reads its parses.
+    if repos.len() < 2 {
+        return Ok(Some(inference));
+    }
+    // A long-lived caller's cache catches up with other writers' entries.
+    parsed_cache.refresh(&parsed_cache_path);
     let unavailable = |repo: &str, detail: String| -> anyhow::Error {
         CrossRepoInferenceInputsUnavailable {
             repository: repo.to_string(),
@@ -3116,96 +3183,172 @@ pub fn reinfer_cross_repo_links(
         }
         .into()
     };
-    let mut edges = Vec::new();
-    for repo in repos {
+
+    // Phase 1: every file's parse is in the cache under the hash it was
+    // indexed from, or re-parsed into it from that exact content. Any file
+    // that cannot be refuses the whole pass before a link is touched.
+    let mut repo_files: Vec<(String, Vec<(String, String)>)> = Vec::with_capacity(repos.len());
+    let mut reparsed_hashes: Vec<String> = Vec::new();
+    for repo in &repos {
+        if should_stop() {
+            return Ok(None);
+        }
         let mut files = store.list_file_hashes_by_repo(&repo.uid).map_err(|e| {
             anyhow::anyhow!("list files of {} for cross-repo inference: {e}", repo.url)
         })?;
         files.sort();
-        let root = repo.local_root().map(PathBuf::from);
-        let reader = root
-            .as_deref()
-            .map(|root| crate::content_reader::FilesystemReader::with_limits(root, limits));
-        let mut parsed: Vec<ParsedFileEntry> = Vec::with_capacity(files.len());
+        inference.files += files.len();
+        let mut sources: Option<Vec<crate::cross_repo_links::RepoSource>> = None;
         for (rel_path, recorded) in &files {
-            if let Some(cached) = parsed_cache.get(recorded) {
-                parsed.push((
-                    rel_path.clone(),
-                    cached.symbols.clone(),
-                    cached.references.clone(),
-                    None,
-                ));
+            if parsed_cache.get(recorded).is_some() {
+                inference.cache_hits += 1;
                 continue;
             }
             // Not cached: re-parse the file, but only the exact content the
-            // index recorded.
-            let (Some(root), Some(reader)) = (root.as_deref(), reader.as_ref()) else {
-                return Err(unavailable(
-                    &repo.url,
-                    format!(
-                        "{rel_path} is not in the parse cache and the repository has no working tree"
-                    ),
-                ));
-            };
-            let source =
-                crate::content_reader::ContentReader::read_file(reader, Path::new(rel_path))
-                    .map_err(|error| {
-                        unavailable(
-                            &repo.url,
-                            format!("read {rel_path} to re-parse it: {error:#}"),
-                        )
-                    })?;
-            if &content_hash_hex(&source) != recorded {
-                return Err(unavailable(
-                    &repo.url,
-                    format!("{rel_path} changed since it was indexed"),
-                ));
+            // index recorded, from the first source that still has it.
+            let sources = sources.get_or_insert_with(|| {
+                crate::cross_repo_links::repo_sources(repo, db_path, limits)
+            });
+            let mut found = None;
+            let mut detail = format!(
+                "{rel_path} is not in the parse cache and the repository has no working tree"
+            );
+            for source in sources.iter() {
+                match source.reader.read_file(Path::new(rel_path)) {
+                    Ok(text) if &content_hash_hex(&text) == recorded => {
+                        found = Some((source, text));
+                        break;
+                    }
+                    Ok(_) => detail = format!("{rel_path} changed since it was indexed"),
+                    Err(error) => detail = format!("read {rel_path} to re-parse it: {error:#}"),
+                }
             }
-            let reparsed = parse_source(&root.join(rel_path), &source).map_err(|error| {
+            let Some((source, text)) = found else {
+                return Err(unavailable(&repo.url, detail));
+            };
+            let reparsed = parse_source(&source.parse_path(rel_path), &text).map_err(|error| {
                 unavailable(&repo.url, format!("re-parse {rel_path}: {error:#}"))
             })?;
-            // The index published nothing for a file it could not parse.
+            inference.reparsed += 1;
+            // The index published nothing for a file it could not parse; it
+            // stays out of the cache and so out of the inference.
             if reparsed.unparsable_skip(rel_path.clone()).is_some() {
                 continue;
             }
-            parsed.push((
-                rel_path.clone(),
-                reparsed.symbols,
-                reparsed.references,
-                None,
-            ));
+            parsed_cache.insert(
+                recorded.clone(),
+                crate::parsed_cache::CachedParseResult {
+                    symbols: reparsed.symbols,
+                    references: reparsed.references,
+                    type_bindings: reparsed.type_bindings,
+                },
+            );
+            reparsed_hashes.push(recorded.clone());
         }
-        edges.extend(infer_cross_repo_call_edges_with(
-            store,
-            &repo.uid,
-            &parsed,
+        repo_files.push((repo.uid.clone(), files));
+    }
+    // Appended to the cache's log, not a rewrite of the whole cache. Best
+    // effort: a lost entry only costs the next pass a re-parse.
+    crate::parsed_cache::append_entries(
+        &parsed_cache_path,
+        reparsed_hashes
+            .iter()
+            .filter_map(|hash| parsed_cache.get(hash).map(|entry| (hash.as_str(), entry))),
+    );
+
+    // Phase 2: every called name's candidates, from one scan of the symbols
+    // rather than one per name.
+    let per_repo: Vec<(&str, Vec<FileParse<'_>>)> = repo_files
+        .iter()
+        .map(|(repo_uid, files)| {
+            let parses = files
+                .iter()
+                .filter_map(|(rel_path, hash)| {
+                    parsed_cache.get(hash).map(|cached| FileParse {
+                        rel_path,
+                        symbols: &cached.symbols,
+                        references: &cached.references,
+                    })
+                })
+                .collect();
+            (repo_uid.as_str(), parses)
+        })
+        .collect();
+    if should_stop() {
+        return Ok(None);
+    }
+    let all_files: Vec<FileParse<'_>> = per_repo
+        .iter()
+        .flat_map(|(_, files)| files.iter().copied())
+        .collect();
+    let targets = called_name_targets(store, &all_files)?;
+    drop(all_files);
+
+    // Phase 3: each repository's outgoing links against every other.
+    for (repo_uid, files) in &per_repo {
+        if should_stop() {
+            return Ok(None);
+        }
+        inference.edges.extend(infer_cross_repo_call_edges_with(
+            repo_uid,
+            files,
             package_names,
+            &targets,
         )?);
     }
-    store
-        .replace_inferred_cross_repo_links(&edges)
-        .map_err(|e| anyhow::anyhow!("replace inferred cross-repo links: {e}"))?;
-    Ok(edges.len())
+    Ok(Some(inference))
 }
 
 /// Whole-graph cross-repo inference could not see a repository's complete
 /// parse, so it refused rather than replace the stored links with a partial
 /// set. Retryable: re-indexing the named repository (a resumed rebuild does
-/// when its sources changed) restores the inputs.
+/// when its sources changed, and so does the next index of it) restores the
+/// inputs.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "cross-repo link inference cannot read repository {repository}: {detail}; no stored link was changed. Resume the rebuild to re-index it"
+    "cross-repo link inference cannot read repository {repository}: {detail}; no stored link was changed. Re-index that repository (or resume the rebuild) to restore them"
 )]
 pub struct CrossRepoInferenceInputsUnavailable {
     pub repository: String,
     pub detail: String,
 }
 
-fn infer_cross_repo_call_edges_with(
+/// One file's parse, borrowed from wherever it lives (the index's own
+/// parse, or the parse cache).
+#[derive(Clone, Copy)]
+struct FileParse<'a> {
+    rel_path: &'a str,
+    symbols: &'a [RawSymbol],
+    references: &'a [RawReference],
+}
+
+/// A cross-repo candidate for a called name: (uid, repo uid, visibility).
+type NameTarget = (String, String, nestweaver_schema::Visibility);
+
+/// Every called name's candidate targets, read in ONE scan of the symbols
+/// (`lookup_symbols_by_name` scans the table per name: one scan per distinct
+/// call name made a whole-graph pass over five repositories take 40x longer).
+fn called_name_targets(
     store: &GraphStore,
+    files: &[FileParse<'_>],
+) -> Result<HashMap<String, Vec<NameTarget>>, anyhow::Error> {
+    use nestweaver_parser::ReferenceKind;
+    let called: std::collections::HashSet<String> = files
+        .iter()
+        .flat_map(|file| file.references.iter())
+        .filter(|r| r.kind == ReferenceKind::Call && r.receiver.is_none())
+        .map(|r| r.name.clone())
+        .collect();
+    store
+        .symbol_targets_by_names(&called)
+        .map_err(|e| anyhow::anyhow!("look up called names for cross-repo inference: {e}"))
+}
+
+fn infer_cross_repo_call_edges_with(
     current_repo_uid: &str,
-    parsed_files: &[ParsedFileEntry],
+    parsed_files: &[FileParse<'_>],
     package_names: &HashMap<String, String>,
+    targets: &HashMap<String, Vec<NameTarget>>,
 ) -> Result<Vec<nestweaver_schema::ResolvedEdge>, anyhow::Error> {
     use nestweaver_parser::ReferenceKind;
     use nestweaver_schema::{CrossRepoLinkType, EdgeEvidence, EdgeType, ResolvedEdge, Visibility};
@@ -3227,16 +3370,14 @@ fn infer_cross_repo_call_edges_with(
     const NAME_ONLY_CONFIDENCE: f32 = 0.20; // info tier (< 0.25 warning cutoff)
     const IMPORT_CORROBORATED_CONFIDENCE: f32 = 0.50; // SamePackageFallback
 
-    let local_symbol_names: std::collections::HashSet<String> = parsed_files
+    let local_symbol_names: std::collections::HashSet<&str> = parsed_files
         .iter()
-        .flat_map(|(_, symbols, _, _)| symbols.iter().map(|s| s.name.clone()))
+        .flat_map(|file| file.symbols.iter().map(|s| s.name.as_str()))
         .collect();
     let mut edges = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    // name -> store hits, memoised for this call (nw-127).
-    let mut name_lookup_cache: std::collections::HashMap<String, Vec<nestweaver_schema::Symbol>> =
-        std::collections::HashMap::new();
-    for (rel_path, symbols, references, _) in parsed_files {
+    for file in parsed_files {
+        let (rel_path, symbols, references) = (file.rel_path, file.symbols, file.references);
         // Names this file imports — corroborates a same-named cross-repo call.
         let imported_names: std::collections::HashSet<&str> = references
             .iter()
@@ -3258,7 +3399,7 @@ fn infer_cross_repo_call_edges_with(
             if reference.kind != ReferenceKind::Call || reference.receiver.is_some() {
                 continue;
             }
-            if local_symbol_names.contains(&reference.name) {
+            if local_symbol_names.contains(reference.name.as_str()) {
                 continue;
             }
             let bound_package = package_bound.get(reference.name.as_str()).copied();
@@ -3275,36 +3416,21 @@ fn infer_cross_repo_call_edges_with(
             );
 
             // Collect eligible cross-repo candidates, then apply the ubiquity cap.
-            //
-            // nw-127: this is one store round-trip PER CALL SITE, and call names
-            // repeat heavily across a repo, so the same name was looked up
-            // thousands of times per run. The store is not mutated inside this
-            // loop (symbol writes happen after resolution is prepared), so
-            // memoising the lookup for the duration of the call is a pure win.
-            let by_name = match name_lookup_cache.get(reference.name.as_str()) {
-                Some(hits) => hits,
-                None => {
-                    let hits = store
-                        .lookup_symbols_by_name(&reference.name)
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                    name_lookup_cache
-                        .entry(reference.name.clone())
-                        .or_insert(hits)
-                }
-            };
-            let candidates: Vec<_> = by_name
+            let candidates: Vec<&NameTarget> = targets
+                .get(&reference.name)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
                 .iter()
-                .filter(|t| {
-                    t.repo_uid != current_repo_uid
-                        && t.uid != source_uid
-                        && t.visibility != Visibility::Private
+                .filter(|(uid, repo_uid, visibility)| {
+                    repo_uid != current_repo_uid
+                        && *uid != source_uid
+                        && *visibility != Visibility::Private
                         && bound_package.is_none_or(|specifier| {
                             package_names
-                                .get(&t.repo_uid)
+                                .get(repo_uid)
                                 .is_some_and(|package| specifier_names_package(specifier, package))
                         })
                 })
-                .cloned()
                 .collect();
             if candidates.is_empty() || candidates.len() > MAX_CROSS_REPO_NAME_CANDIDATES {
                 continue;
@@ -3325,11 +3451,11 @@ fn infer_cross_repo_call_edges_with(
                 "cross_repo_name_match"
             };
 
-            for target in candidates {
-                if seen.insert((source_uid.clone(), target.uid.clone())) {
+            for (target_uid, _, _) in candidates {
+                if seen.insert((source_uid.clone(), target_uid.clone())) {
                     edges.push(ResolvedEdge {
                         source_uid: source_uid.clone(),
-                        target_uid: target.uid,
+                        target_uid: target_uid.clone(),
                         edge_type: EdgeType::CrossRepoLink,
                         confidence,
                         link_type: Some(CrossRepoLinkType::SharedImport),
@@ -6931,6 +7057,7 @@ fn incremental_index_with_name_and_io_and_authority(
         epilogue_io,
         true,
     )?;
+    append_incremental_parses(Some(db_path), &prepared_files);
 
     Ok(result)
 }
@@ -7317,8 +7444,39 @@ where
         &FileSystemIndexEpilogueIo,
         true,
     )?;
+    append_incremental_parses(store.db_path(), &prepared_files);
 
     Ok(result)
+}
+
+/// Add an incremental run's fresh parses to the parse cache (its log), so
+/// neither a later full index nor the whole-graph cross-repo pass re-reads
+/// those files. Best effort.
+fn append_incremental_parses(
+    db_path: Option<&Path>,
+    prepared: &HashMap<String, PreparedIncrementalOutcome>,
+) {
+    let Some(db_path) = db_path else {
+        return;
+    };
+    let parses: Vec<(String, crate::parsed_cache::CachedParseResult)> = prepared
+        .values()
+        .filter_map(|outcome| match outcome {
+            PreparedIncrementalOutcome::Ready(file) => Some((
+                content_hash_hex(&file.source),
+                crate::parsed_cache::CachedParseResult {
+                    symbols: file.parsed.symbols.clone(),
+                    references: file.parsed.references.clone(),
+                    type_bindings: file.parsed.type_bindings.clone(),
+                },
+            )),
+            _ => None,
+        })
+        .collect();
+    crate::parsed_cache::append_entries(
+        &crate::sidecar_path(db_path, ".parsed_cache.bin"),
+        parses.iter().map(|(hash, entry)| (hash.as_str(), entry)),
+    );
 }
 
 struct PreparedIncrementalFile {

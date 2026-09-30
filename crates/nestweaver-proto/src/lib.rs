@@ -188,6 +188,32 @@ pub fn manifest_failures_from_status_json(value: &serde_json::Value) -> Vec<Mani
         .unwrap_or_default()
 }
 
+/// Map `brain_status`'s `cross_repo_links` object onto the typed status RPC.
+/// `None` when the payload has none (an older producer).
+pub fn cross_repo_links_from_status_json(
+    value: &serde_json::Value,
+) -> Option<CrossRepoLinksStatus> {
+    let links = value.get("cross_repo_links")?;
+    let text = |key: &str| {
+        links
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    Some(CrossRepoLinksStatus {
+        pending: links
+            .get("pending")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        reason: text("reason"),
+        since: text("since"),
+        last_error: text("last_error"),
+        failures: links.get("failures").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        last_reconciled_at: text("last_reconciled_at"),
+    })
+}
+
 /// nw-670 review M3: map `brain_status`'s `code_links` object onto the typed
 /// status RPC. `None` when the payload has none (an older producer).
 pub fn code_links_from_status_json(value: &serde_json::Value) -> Option<CodeLinksStatus> {

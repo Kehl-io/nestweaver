@@ -9346,6 +9346,9 @@ pub fn brain_status_json(
         nestweaver_engine::index_md::skipped_notes_status_json(db_path.as_deref());
     // nw-670 review M3: owed note->code links, in their own object.
     let code_links = nestweaver_engine::code_links::code_links_status_json(db_path.as_deref());
+    // Name-inferred cross-repo links owed a whole-graph pass.
+    let cross_repo_links =
+        nestweaver_engine::cross_repo_links::cross_repo_links_status_json(db_path.as_deref());
     // nw-705: repositories the manifest rebuild refused, each with its remedy.
     let manifest_failures = db_path
         .as_deref()
@@ -9427,6 +9430,7 @@ pub fn brain_status_json(
         // (no vault walk). Always present so callers can key on `count: 0`.
         "skipped_notes": skipped_notes,
         "code_links": code_links,
+        "cross_repo_links": cross_repo_links,
         "notes_near_size_limit": notes_near_size_limit,
         // The `brain_search` precedent: always present, empty unless a
         // component was bypassed. The direct fallback sets

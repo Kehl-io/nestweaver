@@ -59,11 +59,15 @@ const SIDECAR_SUFFIXES: &[&str] = &[
     ".regex-v3",
     ".pagerank.json",
     ".parsed_cache.bin",
+    // Parses added since the base was last written; read with it.
+    ".parsed_cache.log",
     ".resolution_deps.bin",
     crate::resolver_generation::RESOLVER_GENERATION_SIDECAR,
     // nw-670: the link-rules version travels with the links it describes, so
     // a restored pre-upgrade graph is migrated rather than trusted.
     crate::code_links::CODE_LINKS_SIDECAR,
+    // Owed cross-repo link inference travels with the links it describes.
+    crate::cross_repo_links::CROSS_REPO_LINKS_SIDECAR,
     ".filemeta.json",
     ".manifests.json",
     ".gitactivity.json",
@@ -2000,6 +2004,11 @@ fn backup_artifact_contract(
             Some(".parsed_cache.bin") => {
                 (ArtifactKind::ParsedCache, 1, "nestweaver-parsed-cache-v1")
             }
+            Some(".parsed_cache.log") => (
+                ArtifactKind::ParsedCache,
+                1,
+                "nestweaver-parsed-cache-log-v1",
+            ),
             Some(".resolution_deps.bin") => (
                 ArtifactKind::ResolutionDependencies,
                 1,
@@ -2018,6 +2027,14 @@ fn backup_artifact_contract(
                 ArtifactKind::CompatibilityStamp,
                 1,
                 "nestweaver-code-links-v1",
+            ),
+            // Whether the name-inferred cross-repo links are owed a
+            // whole-graph pass: it describes the graph's edges, so it
+            // travels with them, like the code-links stamp.
+            Some(crate::cross_repo_links::CROSS_REPO_LINKS_SIDECAR) => (
+                ArtifactKind::CompatibilityStamp,
+                1,
+                "nestweaver-cross-repo-links-v1",
             ),
             // Every vault index writes these two beside the graph, so a
             // rebuilt slot that holds a vault carries both. Neither is on the

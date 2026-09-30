@@ -4948,6 +4948,13 @@ fn format_daemon_status_response(
             {
                 lines.push(line);
             }
+            if let Some(line) = status
+                .cross_repo_links
+                .as_ref()
+                .and_then(format_cross_repo_links_status)
+            {
+                lines.push(line);
+            }
             // nw-705: repositories the manifest rebuild refused, by name.
             lines.extend(format_manifest_failures_status(&status.manifest_failures));
             // nw-585: indexed, but without their frontmatter -- not skipped.
@@ -5578,7 +5585,7 @@ enum Commands {
     /// removes the canonical sidecar or the keyed copy matching its current
     /// resolution.
     #[command(
-        after_help = "Examples:\n  nestweaver repair\n  nestweaver repair --db ~/brain/.nestweaver/brain.lbug\n  nestweaver repair --json\n  nestweaver repair --force        # marker carries no usable writer pid\n\nExits 0 when the publication is clean or was recovered, 1 when it is dirty\nand could not be recovered. Database/publication ownership is never overridden,\neven with --force; stop that process first.\n\nAlso reclaims orphaned Tantivy migration staging directories\n(.nestweaver-tantivy-reindex-*) left beside <db>.tantivy by a crashed schema\nmigration, and reports what was removed (or, under --dry-run, what would be).\nA database directory can hold thirteen sidecar artifacts in total\n(.code_links.json, .filemeta.json, .generation, .manifests.json,\n.pagerank.json, .parsed_cache.bin, .publications/, .resolution_deps.bin,\n.resolver_generation.json, .tantivy/, .wal, .write.lock, plus .regex-v3/\nunder --with-trigrams) — all safe to leave alone; only files matching the\nstaging prefix above are ever removed by this command.\n\nAlso reclaims orphaned resolution-keyed cluster sidecars\n(<db>.clusters.<resolution>.json), other than the canonical <db>.clusters.json\nand the keyed copy matching its current resolution, and reports what was\nremoved (or, under --dry-run, what would be)."
+        after_help = "Examples:\n  nestweaver repair\n  nestweaver repair --db ~/brain/.nestweaver/brain.lbug\n  nestweaver repair --json\n  nestweaver repair --force        # marker carries no usable writer pid\n\nExits 0 when the publication is clean or was recovered, 1 when it is dirty\nand could not be recovered. Database/publication ownership is never overridden,\neven with --force; stop that process first.\n\nAlso reclaims orphaned Tantivy migration staging directories\n(.nestweaver-tantivy-reindex-*) left beside <db>.tantivy by a crashed schema\nmigration, and reports what was removed (or, under --dry-run, what would be).\nA database directory can hold fifteen sidecar artifacts in total\n(.code_links.json, .cross_repo_links.json, .filemeta.json, .generation, .manifests.json,\n.pagerank.json, .parsed_cache.bin, .parsed_cache.log, .publications/, .resolution_deps.bin,\n.resolver_generation.json, .tantivy/, .wal, .write.lock, plus .regex-v3/\nunder --with-trigrams) — all safe to leave alone; only files matching the\nstaging prefix above are ever removed by this command.\n\nAlso reclaims orphaned resolution-keyed cluster sidecars\n(<db>.clusters.<resolution>.json), other than the canonical <db>.clusters.json\nand the keyed copy matching its current resolution, and reports what was\nremoved (or, under --dry-run, what would be)."
     )]
     Repair {
         #[arg(
@@ -9989,6 +9996,50 @@ fn reconcile_code_links_direct(
     }
 }
 
+/// Record that the direct index route owes a whole-graph cross-repo pass,
+/// and return the store to run it with. When the store cannot be opened the
+/// debt is recorded anyway (the links stay owed and disclosed).
+fn record_cross_repo_debt_direct(
+    db_path: &Path,
+    write_lease: &nestweaver_daemon::lifecycle::DbWriteLease,
+    reason: &str,
+) -> Option<GraphStore> {
+    match GraphStore::open_with_authority(db_path, write_lease) {
+        Ok(store) => {
+            nestweaver_engine::cross_repo_links::mark_cross_repo_links_owed(&store, reason);
+            Some(store)
+        }
+        Err(error) => {
+            nestweaver_engine::cross_repo_links::mark_cross_repo_links_pending(db_path, reason);
+            tracing::warn!(
+                "cross-repo link inference skipped — cannot open DB for writing; the links stay owed: {error:#}"
+            );
+            None
+        }
+    }
+}
+
+/// Records the direct index's cross-repo link debt when the run returns
+/// before its whole-graph pass.
+struct CrossRepoDebtOnEarlyExit<'a> {
+    db_path: &'a Path,
+    lease: &'a nestweaver_daemon::lifecycle::DbWriteLease,
+    reason: String,
+    armed: bool,
+}
+
+impl Drop for CrossRepoDebtOnEarlyExit<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            drop(record_cross_repo_debt_direct(
+                self.db_path,
+                self.lease,
+                &self.reason,
+            ));
+        }
+    }
+}
+
 /// nw-705: `suggest-links` text names the repositories whose manifests could
 /// not be rebuilt, since their package links are missing from the answer.
 fn print_manifest_failures_note(failures: &serde_json::Value) {
@@ -10041,6 +10092,28 @@ fn format_manifest_failures_status(
         ));
     }
     lines
+}
+
+/// The one `brain status` line for owed cross-repo links, shared by the
+/// typed (daemon) and JSON (direct) renderers. `None` when nothing is owed.
+fn format_cross_repo_links_status(
+    links: &nestweaver_proto::CrossRepoLinksStatus,
+) -> Option<String> {
+    if !links.pending {
+        return None;
+    }
+    let mut line = format!("Cross-repo links: being re-inferred ({}", links.reason);
+    if !links.since.is_empty() {
+        line.push_str(&format!(", since {}", links.since));
+    }
+    line.push_str("); cross-repo impact may miss links until it finishes");
+    if !links.last_error.is_empty() {
+        line.push_str(&format!(
+            "; last attempt failed ({} time(s)): {}; retrying",
+            links.failures, links.last_error
+        ));
+    }
+    Some(line)
 }
 
 /// nw-670 review M3: the one `brain status` line for owed note->code links,
@@ -19895,6 +19968,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let watcher = CodeWatcher::new(&db_path, &repo_path, &instance_id)
                 .with_limits(index_limits)
+                // No daemon pays the cross-repo link debt this watcher's
+                // batches record; a relinker beside it does, and stops with it.
+                .with_cross_repo_relinker(
+                    nestweaver_engine::cross_repo_links::CrossRepoRelinkTiming::default(),
+                )
                 .with_instance_config(
                     config
                         .as_deref()
@@ -22971,6 +23049,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // cochange and the trigram rebuild below. Dropping it here would
             // make this a probe again.
             let write_lease = require_exclusive_store_access(&db_path, "index")?;
+            // Records the cross-repo link debt if the run ends early (an
+            // index error may still have committed), as the daemon records it
+            // whatever the index's outcome.
+            let mut cross_repo_debt = CrossRepoDebtOnEarlyExit {
+                db_path: &db_path,
+                lease: &write_lease,
+                reason: format!("code re-index of {}", repo_path.display()),
+                armed: true,
+            };
 
             let (files_count, symbols_count, edges_count);
             let skipped_files;
@@ -23116,6 +23203,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 config.as_deref(),
                 &format!("code re-index of {}", repo_path.display()),
             );
+            // Once per run: re-infer every name-matched cross-repo link over
+            // the whole graph, so the links do not depend on the order
+            // repositories were indexed in and a re-index restores the links
+            // other repositories had into this one.
+            cross_repo_debt.armed = false;
+            if let Some(store) =
+                record_cross_repo_debt_direct(&db_path, &write_lease, &cross_repo_debt.reason)
+                && let Some(report) = nestweaver_engine::cross_repo_links::reconcile_after_index(
+                    &store,
+                    &db_path,
+                    index_limits,
+                    None,
+                )
+            {
+                out.status(&format!(
+                    "Cross-repo links: {} inferred over {} repositories ({} files, {} re-parsed) in {} ms.",
+                    report.links, report.repos, report.files, report.reparsed, report.elapsed_ms
+                ));
+            }
 
             // Feature F12: mine git history and write the recency sidecar so
             // subsequent commands demote dormant code at rank-read time.
@@ -39000,5 +39106,59 @@ mod nw674_repo_issue_render_tests {
         assert!(lines[1].contains("resolved only by URL substring"));
         // Counterweight: no field, no warning.
         assert!(project_context_repo_issue_lines(&serde_json::json!({"project": "x"})).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod cross_repo_debt_on_early_exit_tests {
+    use super::*;
+
+    fn two_repo_db(dir: &Path) -> PathBuf {
+        let db = dir.join("graph.lbug");
+        for name in ["one", "two"] {
+            let root = dir.join(name);
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(
+                root.join("src/a.js"),
+                format!("export function {name}Fn() {{ return 1; }}\n"),
+            )
+            .unwrap();
+            nestweaver_engine::index::index_directory(
+                &root,
+                &db,
+                "test",
+                &format!("file:///fixture/{name}"),
+                "sha",
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    /// A direct index that returns early (an error after a commit) still
+    /// records the cross-repo link debt; one that reached its pass does not
+    /// record it again on the way out.
+    #[test]
+    fn an_early_return_records_the_cross_repo_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = two_repo_db(dir.path());
+        let lease = require_exclusive_store_access(&db, "test").unwrap();
+        let pending = || nestweaver_engine::cross_repo_links::cross_repo_links_pending(&db);
+
+        drop(CrossRepoDebtOnEarlyExit {
+            db_path: &db,
+            lease: &lease,
+            reason: "test".to_string(),
+            armed: false,
+        });
+        assert!(!pending(), "a disarmed guard records nothing");
+
+        drop(CrossRepoDebtOnEarlyExit {
+            db_path: &db,
+            lease: &lease,
+            reason: "code re-index of /fixture/one".to_string(),
+            armed: true,
+        });
+        assert!(pending(), "an early return records the debt");
     }
 }
