@@ -1083,13 +1083,41 @@ mod tests {
     #[test]
     fn an_incremental_index_leaves_nothing_to_reparse() {
         let fx = fixture();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .current_dir(&fx.alpha)
+                .output()
+                .unwrap();
+            assert!(status.status.success(), "{status:?}");
+            String::from_utf8(status.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&["commit", "-qm", "one"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        crate::index::index_directory_with_opts(
+            &fx.alpha,
+            &fx.db,
+            &crate::index::IndexOptions::new("test", "file:///fixture/alpha", &head).force(true),
+        )
+        .unwrap();
         fs::write(
             fx.alpha.join("src/helper.js"),
             "export function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n// edited\n",
         )
         .unwrap();
-        crate::index::incremental_index(&fx.alpha, &fx.db, "test", "file:///fixture/alpha")
-            .unwrap();
+        git(&["commit", "-qam", "two"]);
+        let result =
+            crate::index::incremental_index(&fx.alpha, &fx.db, "test", "file:///fixture/alpha")
+                .unwrap();
+        assert!(
+            !result.fell_back_to_full && result.files_modified == 1,
+            "an incremental run: fell back {} modified {}",
+            result.fell_back_to_full,
+            result.files_modified
+        );
         let store = GraphStore::open(&fx.db).unwrap();
         let report = reconcile(&store, &fx.db).unwrap();
         assert_eq!(report.reparsed, 0, "{report:?}");

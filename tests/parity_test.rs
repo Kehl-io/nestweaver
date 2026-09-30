@@ -5951,7 +5951,7 @@ fn reindexing_a_repository_restores_the_links_into_it() {
     )
     .unwrap();
     index_direct(&alpha, &db, &[]);
-    assert_eq!(inferred_links(&db), before, "an incremental re-index");
+    assert_eq!(inferred_links(&db), before, "a re-index after an edit");
 }
 
 /// With the parse cache corrupt, the run re-parses the other repository

@@ -556,11 +556,17 @@ mod tests {
         seed.save(&path).unwrap();
         let mut cache = ParsedCache::load(&path);
         append_entries(&path, [("other", &sample_result())]);
+        // Another writer replaces the base meanwhile, still holding "dead".
+        let mut rival = ParsedCache::load(&path);
+        rival.insert("rival".into(), sample_result());
+        rival.save(&path).unwrap();
         cache.retain_hashes(&HashSet::from(["live".to_string()]));
         cache.save(&path).unwrap();
         let saved = ParsedCache::load(&path);
-        assert!(saved.get("dead").is_none());
-        assert!(saved.get("live").is_some() && saved.get("other").is_some());
+        assert!(saved.get("dead").is_none(), "an eviction was undone");
+        for hash in ["live", "other", "rival"] {
+            assert!(saved.get(hash).is_some(), "{hash} lost");
+        }
     }
 
     /// A long-lived cache reads only what was appended since; a torn tail is

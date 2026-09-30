@@ -3733,6 +3733,75 @@ mod tests {
         )
     }
 
+    /// A watcher batch adds its fresh parses to the parse cache, so the
+    /// whole-graph pass after it re-reads no file.
+    #[cfg(unix)]
+    #[test]
+    fn a_watcher_batch_caches_its_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let alpha = dir.path().join("alpha");
+        let beta = dir.path().join("beta");
+        std::fs::create_dir_all(alpha.join("src")).unwrap();
+        std::fs::create_dir_all(beta.join("src")).unwrap();
+        std::fs::write(
+            alpha.join("src/a.js"),
+            "export function alphaFn() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            beta.join("src/b.js"),
+            "export function betaFn() { return alphaFn(); }\n",
+        )
+        .unwrap();
+        let alpha = std::fs::canonicalize(&alpha).unwrap();
+        let beta = std::fs::canonicalize(&beta).unwrap();
+        let db_path = dir.path().join("graph.lbug");
+        for root in [&alpha, &beta] {
+            crate::index::index_directory(
+                root,
+                &db_path,
+                "test",
+                &format!("file://{}", root.display()),
+                "sha",
+            )
+            .unwrap();
+        }
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let watcher = CodeWatcher::new(&db_path, &alpha, "test")
+            .with_debounce_ms(100)
+            .with_ready_callback(move || {
+                let _ = ready_tx.send(());
+            });
+        let stop = watcher.shutdown_handle();
+        let run_store = Arc::clone(&store);
+        let handle = std::thread::spawn(move || watcher.run_with_store(run_store, None));
+        ready_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        std::fs::write(
+            alpha.join("src/a.js"),
+            "export function alphaFn() { return 2; }\n",
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !crate::cross_repo_links::cross_repo_links_pending(&db_path)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(crate::cross_repo_links::cross_repo_links_pending(&db_path));
+        stop.stop();
+        handle.join().unwrap().unwrap();
+        let report = crate::cross_repo_links::reconcile_cross_repo_links(
+            &store,
+            &db_path,
+            crate::index_limits::IndexLimits::default(),
+            None,
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(report.reparsed, 0, "{report:?}");
+    }
+
     /// A direct watch (no daemon) pays the cross-repo link debt its own
     /// batches record: an edit in alpha drops beta's links into it, and the
     /// watcher's relinker restores them after its quiet period and clears
