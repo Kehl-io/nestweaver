@@ -1701,8 +1701,8 @@ const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
                   worse than none: exit 64 from an out-of-range or unknown FLAG is raised by the\n      \
                   argument parser BEFORE --json is read, so it writes to stderr and nothing to\n      \
                   stdout. Only an uncompilable --pattern reaches the JSON path. Exit 3 emits a\n      \
-                  candidate list, and `impact` keys it \"status\", not \"error\". A few commands\n      \
-                  (cross-repo-refs, rank) still write nothing on 2. Check the code, then stderr.\n\n\
+                  candidate list, and `impact` keys it \"status\", not \"error\". `read-symbols`\n      \
+                  lists misses under \"not_found\" instead. Check the code, then stderr.\n\n\
                   Shell completions:\n  \
                   nestweaver completions bash > ~/.local/share/bash-completion/completions/nestweaver\n  \
                   nestweaver completions zsh > ~/.zfunc/_nestweaver\n  \
@@ -3015,6 +3015,45 @@ fn render_investigate_text(payload: &serde_json::Value) {
         "\nDrill in: nestweaver investigate-expand {} --targets <asset_id,...>",
         text(payload, "bundle_id")
     );
+}
+
+/// The remedy `cluster <id>` prints on a miss. It used to list EVERY
+/// community (2.2 MB of stderr for `cluster 999999999` on a real graph); now
+/// it is the count, the id range, the largest few, and the command that
+/// lists them all.
+fn cluster_not_found_hint(output: &nestweaver_engine::ClusteringOutput) -> String {
+    const SHOWN: usize = 10;
+    let communities = &output.communities;
+    if communities.is_empty() {
+        return format!(
+            "There are no clusters at resolution {}; run `nestweaver clusters` to compute them.",
+            output.resolution
+        );
+    }
+    let min = communities.iter().map(|c| c.id).min().unwrap_or(0);
+    let max = communities.iter().map(|c| c.id).max().unwrap_or(0);
+    let mut largest: Vec<&nestweaver_engine::CommunityInfo> = communities.iter().collect();
+    largest.sort_by(|a, b| b.member_count.cmp(&a.member_count).then(a.id.cmp(&b.id)));
+    let shown: Vec<String> = largest
+        .iter()
+        .take(SHOWN)
+        .map(|c| {
+            let name: String = c.name.chars().take(60).collect();
+            format!("[{}] {name}", c.id)
+        })
+        .collect();
+    format!(
+        "{} clusters at resolution {} (ids {min}-{max}). Largest: {}{}. Run `nestweaver \
+         clusters` to list them all.",
+        communities.len(),
+        output.resolution,
+        shown.join(", "),
+        if communities.len() > SHOWN {
+            ", ..."
+        } else {
+            ""
+        }
+    )
 }
 
 /// `investigate-expand` text, from the result's JSON so the daemon and
@@ -18587,15 +18626,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         print_json_not_found("cluster", &id_or_name);
                     }
                     eprintln!("Cluster '{}' not found.", id_or_name);
-                    eprintln!(
-                        "Available clusters: {}",
-                        output
-                            .communities
-                            .iter()
-                            .map(|c| format!("[{}] {}", c.id, c.name))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
+                    eprintln!("{}", cluster_not_found_hint(&output));
                     Ok((EXIT_NOT_FOUND, None))
                 }
             }
@@ -38767,6 +38798,84 @@ mod cli_honesty_sweep_tests {
         );
         assert_eq!(seeds["seeds"], serde_json::json!(["a", "b"]));
         assert_eq!(seeds["message"], serde_json::json!("No matching symbols"));
+    }
+
+    /// `cluster <id>` with an id no community has printed EVERY community on
+    /// stderr (2.2 MB on a real graph). The hint is bounded: a count, the id
+    /// range, the largest few and the command that lists them all.
+    #[test]
+    fn a_cluster_miss_prints_a_bounded_hint() {
+        let communities: Vec<nestweaver_engine::CommunityInfo> = (0..70_000u32)
+            .map(|id| nestweaver_engine::CommunityInfo {
+                id,
+                name: format!("community-with-a-longish-name-{id}"),
+                cohesion: 0.5,
+                member_count: (id % 97) as usize + 1,
+                members: Vec::new(),
+                key_files: Vec::new(),
+            })
+            .collect();
+        let output = nestweaver_engine::ClusteringOutput {
+            resolution: 0.3,
+            modularity: 0.4,
+            communities,
+        };
+        let hint = cluster_not_found_hint(&output);
+        assert!(hint.len() < 2048, "bounded: {} bytes", hint.len());
+        assert!(hint.contains("70000 clusters"), "{hint}");
+        assert!(hint.contains("ids 0-69999"), "{hint}");
+        assert!(hint.contains("nestweaver clusters"), "{hint}");
+        assert!(hint.contains("[96]"), "the largest are named: {hint}");
+
+        let empty = nestweaver_engine::ClusteringOutput {
+            resolution: 0.3,
+            modularity: 0.0,
+            communities: Vec::new(),
+        };
+        assert!(cluster_not_found_hint(&empty).contains("no clusters"));
+    }
+
+    /// The exit-code paragraph named `rank`, which is not a command (it is
+    /// `ranking rank`), and listed commands as writing nothing on exit 2 that
+    /// now write the envelope. Every command it names must exist.
+    #[test]
+    fn the_exit_code_help_names_only_real_commands() {
+        let (help, root) = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let mut root = Cli::command();
+                root.build();
+                (root.render_long_help().to_string(), root)
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+        let start = help.find("Exit codes (scripting contract)").unwrap();
+        let section = &help[start..start + help[start..].find("Shell completions").unwrap()];
+        assert!(!section.contains("rank)"), "{section}");
+        let mut checked = 0;
+        for span in section.split('`').skip(1).step_by(2) {
+            let tokens: Vec<&str> = span.split_whitespace().collect();
+            if tokens.is_empty()
+                || matches!(tokens[0], "error" | "status")
+                || tokens
+                    .iter()
+                    .any(|t| !t.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+            {
+                continue;
+            }
+            let mut command = &root;
+            for token in &tokens {
+                command = command
+                    .find_subcommand(token)
+                    .unwrap_or_else(|| panic!("`{span}` is not a command: {section}"));
+            }
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "the section names at least one command: {section}"
+        );
     }
 
     /// COUNTERWEIGHT. A pattern that does not COMPILE is not an absent target,
