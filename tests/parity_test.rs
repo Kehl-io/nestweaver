@@ -5975,6 +5975,8 @@ fn a_corrupt_parse_cache_reparses_or_refuses_without_losing_links() {
     assert_eq!(cross_repo_status(&db)["pending"], false);
 
     std::fs::write(&cache, b"not a parse cache").unwrap();
+    // The first run's re-parse of alpha went to the cache's log: lose it too.
+    let _ = std::fs::remove_file(cache.with_extension("log"));
     std::fs::write(
         alpha.join("src/helper.js"),
         "export function somethingElse() { return 3; }\n",

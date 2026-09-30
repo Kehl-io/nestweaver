@@ -1164,6 +1164,26 @@ impl CodeWatcher {
             store,
             &format!("code watcher batch in {repo_url}"),
         );
+        // The batch's fresh parses join the parse cache (its log), so the
+        // whole-graph pass that follows re-reads none of these files.
+        let parses: Vec<(String, crate::parsed_cache::CachedParseResult)> = prepared_paths
+            .iter()
+            .filter_map(|path| match path {
+                PreparedPath::Replace(file) => Some((
+                    file.file.content_hash.clone(),
+                    crate::parsed_cache::CachedParseResult {
+                        symbols: file.raw_symbols.clone(),
+                        references: file.raw_references.clone(),
+                        type_bindings: file.type_bindings.clone(),
+                    },
+                )),
+                PreparedPath::Delete { .. } => None,
+            })
+            .collect();
+        crate::parsed_cache::append_entries(
+            &crate::sidecar_path(&self.db_path, ".parsed_cache.bin"),
+            parses.iter().map(|(hash, entry)| (hash.as_str(), entry)),
+        );
         Ok(WatchBatchOutcome::Published { files_processed })
     }
 
@@ -1801,6 +1821,7 @@ struct PreparedCodeFile {
     resolved_edges: Vec<nestweaver_schema::ResolvedEdge>,
     raw_symbols: Vec<nestweaver_parser::RawSymbol>,
     raw_references: Vec<nestweaver_parser::RawReference>,
+    type_bindings: Vec<nestweaver_parser::AstTypeBinding>,
 }
 
 /// Read, parse, resolve, and annotate a watched source before publication.
@@ -1952,6 +1973,7 @@ fn prepare_code_file(
         resolved_edges,
         raw_symbols: parsed.symbols,
         raw_references: parsed.references,
+        type_bindings: parsed.type_bindings,
     })
 }
 
@@ -3803,6 +3825,16 @@ mod tests {
 
         stop.stop();
         handle.join().unwrap().unwrap();
+        // The batch's parse went to the cache: nothing left to re-read.
+        let report = crate::cross_repo_links::reconcile_cross_repo_links(
+            &store,
+            &db_path,
+            crate::index_limits::IndexLimits::default(),
+            None,
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(report.reparsed, 0, "{report:?}");
     }
 
     /// Start a code watcher over `root`, stop it at readiness, and return how

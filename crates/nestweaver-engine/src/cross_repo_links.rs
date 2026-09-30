@@ -190,29 +190,43 @@ impl RepoSource {
     }
 }
 
-/// A reader over `repo`'s indexed sources: its working tree, or a
-/// server-mode repository's bare clone (`<db dir>/workspace/<name>.git`, as
-/// the worker pool lays them out) at the revision it was indexed from.
-/// `None` when neither exists.
-pub(crate) fn repo_source(
+/// Readers over `repo`'s indexed sources, in the order to try them: its
+/// working tree, and a server-mode repository's bare clone
+/// (`<db dir>/workspace/<name>.git`, as the worker pool lays them out) at the
+/// revision it was indexed from. A repository with no recorded working tree
+/// (server mode, whose `file://` URL may still name a directory that has
+/// moved on) tries its bare clone first. The caller takes the first source
+/// whose content still has the indexed hash.
+pub(crate) fn repo_sources(
     repo: &nestweaver_schema::Repo,
     db_path: &Path,
     limits: crate::index_limits::IndexLimits,
-) -> Option<RepoSource> {
-    // A working tree that is gone (a server-mode `file://` clone source)
-    // falls through to the bare clone.
-    if let Some(root) = repo
+) -> Vec<RepoSource> {
+    let working_tree = repo
         .local_root()
         .map(PathBuf::from)
         .filter(|root| root.is_dir())
-    {
-        return Some(RepoSource {
+        .map(|root| RepoSource {
             reader: Box::new(crate::content_reader::FilesystemReader::with_limits(
                 &root, limits,
             )),
             root: Some(root),
         });
-    }
+    let bare = bare_clone_source(repo, db_path, limits);
+    let server_mode = repo.root_path.as_deref().is_none_or(str::is_empty);
+    let ordered = if server_mode {
+        [bare, working_tree]
+    } else {
+        [working_tree, bare]
+    };
+    ordered.into_iter().flatten().collect()
+}
+
+fn bare_clone_source(
+    repo: &nestweaver_schema::Repo,
+    db_path: &Path,
+    limits: crate::index_limits::IndexLimits,
+) -> Option<RepoSource> {
     if repo.indexed_sha.is_empty() {
         return None;
     }
@@ -263,7 +277,9 @@ pub struct CrossRepoReconcileReport {
 ///
 /// Refuses before touching any link when a repository's parse cannot be
 /// read ([`crate::index::CrossRepoInferenceInputsUnavailable`]); the error is
-/// recorded on the debt and returned.
+/// recorded on the debt and returned. A refusal while a newer code write
+/// landed (a file saved after its batch) is not a failure: the pass is
+/// superseded, and the next one reads the newer state.
 pub fn reconcile_cross_repo_links(
     store: &GraphStore,
     db_path: &Path,
@@ -271,8 +287,33 @@ pub fn reconcile_cross_repo_links(
     lease: Option<&crate::watcher::WatchMutationLeaseFactory>,
     should_stop: &dyn Fn() -> bool,
 ) -> Result<CrossRepoReconcileReport, anyhow::Error> {
+    let mut cache = crate::parsed_cache::ParsedCache::load(&parse_cache_path(db_path));
+    reconcile_cross_repo_links_with_cache(store, db_path, limits, lease, should_stop, &mut cache)
+}
+
+fn parse_cache_path(db_path: &Path) -> PathBuf {
+    crate::sidecar_path(db_path, ".parsed_cache.bin")
+}
+
+/// [`reconcile_cross_repo_links`] with a parse cache the caller keeps
+/// between passes (refreshed from the cache's log, not reloaded).
+pub fn reconcile_cross_repo_links_with_cache(
+    store: &GraphStore,
+    db_path: &Path,
+    limits: crate::index_limits::IndexLimits,
+    lease: Option<&crate::watcher::WatchMutationLeaseFactory>,
+    should_stop: &dyn Fn() -> bool,
+    cache: &mut crate::parsed_cache::ParsedCache,
+) -> Result<CrossRepoReconcileReport, anyhow::Error> {
     let started = std::time::Instant::now();
     let marks_at_start = load_cross_repo_links_state(db_path).marks;
+    // A graph write that landed after this is read makes the result stale,
+    // whether or not its route has recorded its mark yet.
+    let generation_at_start = store.graph_generation();
+    let moved = || {
+        load_cross_repo_links_state(db_path).marks != marks_at_start
+            || store.graph_generation() != generation_at_start
+    };
     let package_names = crate::manifest::package_names_hint(db_path);
     let inference = match crate::index::infer_whole_graph_cross_repo_links(
         store,
@@ -280,11 +321,23 @@ pub fn reconcile_cross_repo_links(
         &package_names,
         limits,
         should_stop,
+        cache,
     ) {
         Ok(Some(inference)) => inference,
         Ok(None) => {
             return Ok(CrossRepoReconcileReport {
                 stopped: true,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                ..CrossRepoReconcileReport::default()
+            });
+        }
+        Err(error) if moved() => {
+            tracing::debug!(
+                error = %format!("{error:#}"),
+                "cross-repo inference read state a newer write replaced; superseded"
+            );
+            return Ok(CrossRepoReconcileReport {
+                superseded: true,
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 ..CrossRepoReconcileReport::default()
             });
@@ -307,22 +360,27 @@ pub fn reconcile_cross_repo_links(
         report.elapsed_ms = started.elapsed().as_millis() as u64;
         return Ok(report);
     }
-    let edges = &inference.edges;
+    let mut edges = inference.edges;
     loop {
         let guard = lease
             .map(|factory| factory("cross_repo_links"))
             .transpose()?;
-        if load_cross_repo_links_state(db_path).marks != marks_at_start {
+        if moved() {
             report.superseded = true;
             report.elapsed_ms = started.elapsed().as_millis() as u64;
             return Ok(report);
         }
+        // An edge whose end has no Symbol node would be skipped by the
+        // insert, so the stored set could never match and every pass would
+        // rewrite it: keep only edges between existing symbols.
+        keep_edges_between_existing_symbols(store, &mut edges)?;
+        report.links = edges.len();
         // Re-checked under the lease: an unchanged set is not rewritten, so
         // a watcher batch that changed no linked name publishes nothing.
         let stored = store
             .list_inferred_cross_repo_links()
             .map_err(|e| anyhow::anyhow!("read inferred cross-repo links: {e}"))?;
-        if same_links(stored, edges) {
+        if same_links(stored, &edges) {
             break;
         }
         // A publication brackets the write, as for every other graph
@@ -339,7 +397,7 @@ pub fn reconcile_cross_repo_links(
             continue;
         };
         let written = store
-            .replace_inferred_cross_repo_links(edges)
+            .replace_inferred_cross_repo_links(&edges)
             .map(|()| true)
             .map_err(|e| anyhow::anyhow!("replace inferred cross-repo links: {e}"));
         if let Err(error) = crate::code_links::finish_publication(publication, written) {
@@ -352,6 +410,29 @@ pub fn reconcile_cross_repo_links(
     report.settled = settle(db_path, marks_at_start);
     report.elapsed_ms = started.elapsed().as_millis() as u64;
     Ok(report)
+}
+
+fn keep_edges_between_existing_symbols(
+    store: &GraphStore,
+    edges: &mut Vec<nestweaver_schema::ResolvedEdge>,
+) -> Result<(), anyhow::Error> {
+    let mut uids: Vec<String> = edges
+        .iter()
+        .flat_map(|edge| [edge.source_uid.clone(), edge.target_uid.clone()])
+        .collect();
+    uids.sort();
+    uids.dedup();
+    if uids.is_empty() {
+        return Ok(());
+    }
+    let existing: std::collections::HashSet<String> = store
+        .lookup_symbols_by_uids(&uids)
+        .map_err(|e| anyhow::anyhow!("look up linked symbols: {e}"))?
+        .into_iter()
+        .map(|symbol| symbol.uid)
+        .collect();
+    edges.retain(|edge| existing.contains(&edge.source_uid) && existing.contains(&edge.target_uid));
+    Ok(())
 }
 
 /// Whether the stored name-inferred links are exactly `edges`, compared as
@@ -498,12 +579,16 @@ impl Default for CrossRepoRelinkTiming {
 /// watcher batches and server-mode fetches.
 ///
 /// Level-triggered on the durable debt, so it needs no wake-up from the
-/// routes and pays debt left by a restart on its first tick. It waits for
-/// `debounce` without a new mark (at most `max_delay`), then runs one pass
-/// off the async runtime: inference with no lease, the lease only for the
-/// replace transaction. It never runs two passes at once. On shutdown it
-/// stops between repositories, and the lease factory refuses (the pass
-/// returns without writing).
+/// routes. Its first pass is unconditional: it settles debt left by a
+/// restart and links a crash dropped before its route could record the debt
+/// (a pass that finds nothing to change writes nothing). After that it waits
+/// for `debounce` without a new mark (at most `max_delay`), then runs one
+/// pass off the async runtime: inference with no lease, the lease only for
+/// the replace transaction. It never runs two passes at once, keeps its
+/// parse cache between passes (reading only what other writers appended),
+/// and backs off after a failure until the backoff ends or a new mark lands.
+/// On shutdown it stops between repositories, and the lease factory refuses
+/// (the pass returns without writing).
 pub async fn run_cross_repo_link_relinker(
     store: Arc<GraphStore>,
     db_path: PathBuf,
@@ -518,7 +603,10 @@ pub async fn run_cross_repo_link_relinker(
     let mut seen: Option<(u64, tokio::time::Instant)> = None;
     let mut owed_since: Option<tokio::time::Instant> = None;
     let mut retry_after = timing.retry_min;
-    let mut retry_at: Option<tokio::time::Instant> = None;
+    // When to retry after a failure, and the marks count it failed at.
+    let mut retry: Option<(tokio::time::Instant, u64)> = None;
+    let mut startup = true;
+    let mut cache = Some(crate::parsed_cache::ParsedCache::empty());
     loop {
         if *shutdown.borrow() {
             return;
@@ -529,39 +617,63 @@ pub async fn run_cross_repo_link_relinker(
         }
         let state = load_cross_repo_links_state(&db_path);
         let now = tokio::time::Instant::now();
-        if state.pending.is_none() {
-            seen = None;
-            owed_since = None;
-            continue;
-        }
-        let owed_at = *owed_since.get_or_insert(now);
-        let quiet_since = match seen {
-            Some((marks, at)) if marks == state.marks => at,
-            _ => {
-                seen = Some((state.marks, now));
-                now
+        if !startup {
+            if state.pending.is_none() {
+                seen = None;
+                owed_since = None;
+                continue;
             }
-        };
-        if retry_at.is_some_and(|at| now < at) {
-            continue;
+            let owed_at = *owed_since.get_or_insert(now);
+            let quiet_since = match seen {
+                Some((marks, at)) if marks == state.marks => at,
+                _ => {
+                    seen = Some((state.marks, now));
+                    now
+                }
+            };
+            if let Some((at, failed_marks)) = retry {
+                // A new mark is new work, not the failure retried.
+                if state.marks != failed_marks {
+                    retry = None;
+                } else if now < at {
+                    continue;
+                }
+            }
+            if now.duration_since(quiet_since) < timing.debounce
+                && now.duration_since(owed_at) < timing.max_delay
+            {
+                continue;
+            }
         }
-        if now.duration_since(quiet_since) < timing.debounce
-            && now.duration_since(owed_at) < timing.max_delay
-        {
-            continue;
-        }
+        startup = false;
         let (pass_store, pass_db, pass_lease, stop) = (
             Arc::clone(&store),
             db_path.clone(),
             Arc::clone(&lease),
             shutdown.clone(),
         );
+        let mut pass_cache = cache
+            .take()
+            .unwrap_or_else(crate::parsed_cache::ParsedCache::empty);
         let outcome = tokio::task::spawn_blocking(move || {
-            reconcile_cross_repo_links(&pass_store, &pass_db, limits, Some(&pass_lease), &|| {
-                *stop.borrow()
-            })
+            let outcome = reconcile_cross_repo_links_with_cache(
+                &pass_store,
+                &pass_db,
+                limits,
+                Some(&pass_lease),
+                &|| *stop.borrow(),
+                &mut pass_cache,
+            );
+            (outcome, pass_cache)
         })
         .await;
+        let outcome = match outcome {
+            Ok((outcome, pass_cache)) => {
+                cache = Some(pass_cache);
+                Ok(outcome)
+            }
+            Err(join_error) => Err(join_error),
+        };
         match outcome {
             Ok(Ok(report)) => {
                 tracing::info!(
@@ -578,7 +690,7 @@ pub async fn run_cross_repo_link_relinker(
                 if report.stopped {
                     return;
                 }
-                retry_at = None;
+                retry = None;
                 retry_after = timing.retry_min;
                 if report.settled {
                     owed_since = None;
@@ -595,12 +707,12 @@ pub async fn run_cross_repo_link_relinker(
                     error = %format!("{error:#}"),
                     "cross-repo link relink failed; the debt stays disclosed and is retried"
                 );
-                retry_at = Some(tokio::time::Instant::now() + retry_after);
+                retry = Some((tokio::time::Instant::now() + retry_after, state.marks));
                 retry_after = retry_after.saturating_mul(2).min(timing.retry_max);
             }
             Err(join_error) => {
                 tracing::error!(%join_error, "cross-repo link relink task panicked");
-                retry_at = Some(tokio::time::Instant::now() + retry_after);
+                retry = Some((tokio::time::Instant::now() + retry_after, state.marks));
                 retry_after = retry_after.saturating_mul(2).min(timing.retry_max);
             }
         }
@@ -755,6 +867,15 @@ mod tests {
                 None => fs::remove_file(&cache).unwrap(),
                 Some(bytes) => fs::write(&cache, bytes).unwrap(),
             }
+            // The previous round's re-parses went to the log: lose it too
+            // (or, the second time, leave it torn).
+            let log = crate::parsed_cache::log_path(&cache);
+            match damage {
+                None => {
+                    let _ = fs::remove_file(&log);
+                }
+                Some(bytes) => fs::write(&log, bytes).unwrap(),
+            }
             // Drop the links so the pass has something to restore.
             store.replace_inferred_cross_repo_links(&[]).unwrap();
             let report = reconcile(&store, &fx.db).unwrap();
@@ -839,7 +960,7 @@ mod tests {
         fs::create_dir_all(two.join("src")).unwrap();
         fs::write(
             one.join("src/a.js"),
-            "export function oneOnly() { return localOne(); }\nexport function localOne() { return 1; }\n",
+            "export function oneOnly() { return localOne() + phantomShared(); }\nexport function localOne() { return 1; }\n",
         )
         .unwrap();
         fs::write(
@@ -852,6 +973,19 @@ mod tests {
         index(&two, &db, "file:///fixture/two");
         mark_cross_repo_links_pending(&db, "test");
         let store = GraphStore::open(&db).unwrap();
+        // A public symbol of repository one that its parse does not define
+        // (so the local-name filter cannot see it): one's call to it is a
+        // same-repository call, which only the repository filter excludes.
+        let mut phantom = store
+            .list_all_symbols()
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.name == "localOne")
+            .unwrap();
+        phantom.name = "phantomShared".to_string();
+        phantom.uid = format!("{}-phantom", phantom.uid);
+        phantom.visibility = nestweaver_schema::Visibility::Public;
+        store.insert_symbol(&phantom).unwrap();
         let report = reconcile(&store, &db).unwrap();
         assert_eq!(report.repos, 2, "{report:?}");
         assert!(report.files >= 2 && report.settled, "{report:?}");
@@ -898,12 +1032,22 @@ mod tests {
                 retry_max: Duration::from_millis(50),
             },
         ));
+        // The unconditional startup pass links both directions first.
+        for _ in 0..200 {
+            if names(&store) == both_directions() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(names(&store), both_directions());
+        store.replace_inferred_cross_repo_links(&[]).unwrap();
         mark_cross_repo_links_pending(&fx.db, "test");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             cross_repo_links_pending(&fx.db),
             "no pass inside the debounce"
         );
+        assert!(names(&store).is_empty());
         let mut settled = false;
         for _ in 0..200 {
             if !cross_repo_links_pending(&fx.db) {
@@ -919,5 +1063,197 @@ mod tests {
             .await
             .expect("the relinker stops on shutdown")
             .unwrap();
+    }
+
+    /// An incremental re-index adds its fresh parses to the cache, so the
+    /// pass that follows re-reads no file.
+    #[test]
+    fn an_incremental_index_leaves_nothing_to_reparse() {
+        let fx = fixture();
+        fs::write(
+            fx.alpha.join("src/helper.js"),
+            "export function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n// edited\n",
+        )
+        .unwrap();
+        crate::index::incremental_index(&fx.alpha, &fx.db, "test", "file:///fixture/alpha")
+            .unwrap();
+        let store = GraphStore::open(&fx.db).unwrap();
+        let report = reconcile(&store, &fx.db).unwrap();
+        assert_eq!(report.reparsed, 0, "{report:?}");
+        assert!(report.cache_hits >= 2, "{report:?}");
+    }
+
+    /// A refusal while a newer write landed is the newer state winning, not
+    /// a failure: no error, no recorded failure, the debt stands.
+    #[test]
+    fn a_refusal_after_a_newer_mark_is_superseded_not_failed() {
+        let fx = fixture();
+        let store = GraphStore::open(&fx.db).unwrap();
+        fs::remove_file(crate::sidecar_path(&fx.db, ".parsed_cache.bin")).unwrap();
+        fs::write(
+            fx.alpha.join("src/helper.js"),
+            "export function savedAfterTheBatch() { return 3; }\n",
+        )
+        .unwrap();
+        mark_cross_repo_links_pending(&fx.db, "batch");
+        let marked = std::cell::Cell::new(false);
+        let report = reconcile_cross_repo_links(
+            &store,
+            &fx.db,
+            crate::index_limits::IndexLimits::default(),
+            None,
+            &|| {
+                if !marked.replace(true) {
+                    mark_cross_repo_links_pending(&fx.db, "the next batch");
+                }
+                false
+            },
+        )
+        .unwrap();
+        assert!(report.superseded, "{report:?}");
+        let status = cross_repo_links_status_json(Some(&fx.db));
+        assert_eq!(status["pending"], true, "{status}");
+        assert_eq!(status["failures"], 0, "{status}");
+    }
+
+    /// A graph write that lands during inference supersedes the pass even
+    /// before its route records the mark.
+    #[test]
+    fn a_graph_write_during_the_pass_supersedes_it() {
+        let fx = fixture();
+        let store = GraphStore::open(&fx.db).unwrap();
+        mark_cross_repo_links_pending(&fx.db, "test");
+        let before = links(&store);
+        let bumped = std::cell::Cell::new(false);
+        let report = reconcile_cross_repo_links(
+            &store,
+            &fx.db,
+            crate::index_limits::IndexLimits::default(),
+            None,
+            &|| {
+                if !bumped.replace(true) {
+                    store.bump_graph_generation();
+                }
+                false
+            },
+        )
+        .unwrap();
+        assert!(report.superseded && !report.written, "{report:?}");
+        assert_eq!(links(&store), before);
+    }
+
+    /// An inferred edge whose source symbol is gone from the graph (the
+    /// insert would skip it) is dropped before comparing, so the next pass
+    /// finds the stored links current instead of rewriting them forever.
+    #[test]
+    fn edges_from_missing_symbols_do_not_rewrite_every_pass() {
+        let fx = fixture();
+        let store = GraphStore::open(&fx.db).unwrap();
+        let beta_uid = store
+            .list_repos(None)
+            .unwrap()
+            .into_iter()
+            .find(|repo| repo.url.ends_with("beta"))
+            .unwrap()
+            .uid;
+        store
+            .delete_symbols_in_file(&beta_uid, "src/caller.js")
+            .unwrap();
+        let first = reconcile(&store, &fx.db).unwrap();
+        assert_eq!(first.links, 0, "{first:?}");
+        let second = reconcile(&store, &fx.db).unwrap();
+        assert!(!second.written, "{second:?}");
+    }
+
+    /// The relinker's first pass is unconditional: links a crash dropped
+    /// before any debt was recorded are restored at startup.
+    #[tokio::test]
+    async fn the_relinker_repairs_unrecorded_loss_at_startup() {
+        let fx = fixture();
+        let store = Arc::new(GraphStore::open(&fx.db).unwrap());
+        assert!(!cross_repo_links_pending(&fx.db));
+        assert_eq!(names(&store).len(), 1, "only beta -> alpha before a pass");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_cross_repo_link_relinker(
+            Arc::clone(&store),
+            fx.db.clone(),
+            crate::index_limits::IndexLimits::default(),
+            no_lease(),
+            shutdown_rx,
+            fast_timing(Duration::from_secs(3600)),
+        ));
+        let mut repaired = false;
+        for _ in 0..200 {
+            if names(&store) == both_directions() {
+                repaired = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(repaired, "{:?}", names(&store));
+        let _ = shutdown_tx.send(true);
+        task.await.unwrap();
+    }
+
+    /// A failure backs off, but a new mark is new work: it runs at once
+    /// instead of waiting out the backoff.
+    #[tokio::test]
+    async fn a_new_mark_ends_a_failure_backoff() {
+        let fx = fixture();
+        let store = Arc::new(GraphStore::open(&fx.db).unwrap());
+        let helper = fx.alpha.join("src/helper.js");
+        let original = fs::read_to_string(&helper).unwrap();
+        fs::remove_file(crate::sidecar_path(&fx.db, ".parsed_cache.bin")).unwrap();
+        fs::write(&helper, "export function changed() { return 3; }\n").unwrap();
+        mark_cross_repo_links_pending(&fx.db, "first");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_cross_repo_link_relinker(
+            Arc::clone(&store),
+            fx.db.clone(),
+            crate::index_limits::IndexLimits::default(),
+            no_lease(),
+            shutdown_rx,
+            fast_timing(Duration::from_secs(3600)),
+        ));
+        let failures = || cross_repo_links_status_json(Some(&fx.db))["failures"].as_u64();
+        let mut failed = false;
+        for _ in 0..200 {
+            if failures() >= Some(1) {
+                failed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(failed, "the first pass refuses");
+        fs::write(&helper, original).unwrap();
+        mark_cross_repo_links_pending(&fx.db, "second");
+        let mut settled = false;
+        for _ in 0..200 {
+            if !cross_repo_links_pending(&fx.db) {
+                settled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            settled,
+            "the new mark ran a pass inside the one-hour backoff"
+        );
+        let _ = shutdown_tx.send(true);
+        task.await.unwrap();
+    }
+
+    fn no_lease() -> crate::watcher::WatchMutationLeaseFactory {
+        Arc::new(|_| Ok(Box::new(()) as Box<dyn crate::watcher::WatchMutationLease>))
+    }
+
+    fn fast_timing(retry: Duration) -> CrossRepoRelinkTiming {
+        CrossRepoRelinkTiming {
+            tick: Duration::from_millis(20),
+            debounce: Duration::from_millis(100),
+            max_delay: Duration::from_secs(30),
+            retry_min: retry,
+            retry_max: retry,
+        }
     }
 }

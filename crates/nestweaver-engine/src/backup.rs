@@ -59,6 +59,8 @@ const SIDECAR_SUFFIXES: &[&str] = &[
     ".regex-v3",
     ".pagerank.json",
     ".parsed_cache.bin",
+    // Parses added since the base was last written; read with it.
+    ".parsed_cache.log",
     ".resolution_deps.bin",
     crate::resolver_generation::RESOLVER_GENERATION_SIDECAR,
     // nw-670: the link-rules version travels with the links it describes, so
@@ -2002,6 +2004,11 @@ fn backup_artifact_contract(
             Some(".parsed_cache.bin") => {
                 (ArtifactKind::ParsedCache, 1, "nestweaver-parsed-cache-v1")
             }
+            Some(".parsed_cache.log") => (
+                ArtifactKind::ParsedCache,
+                1,
+                "nestweaver-parsed-cache-log-v1",
+            ),
             Some(".resolution_deps.bin") => (
                 ArtifactKind::ResolutionDependencies,
                 1,

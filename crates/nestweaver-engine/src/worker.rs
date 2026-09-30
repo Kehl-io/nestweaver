@@ -1382,9 +1382,14 @@ mod tests {
             process_job(&job, &ws, &store, "test-instance").unwrap();
         }
         assert!(crate::cross_repo_links::cross_repo_links_pending(&db));
-        // Only the bare clones hold the sources now.
-        std::fs::remove_dir_all(&alpha).unwrap();
-        std::fs::remove_dir_all(&beta).unwrap();
+        // The source working trees have moved on since the fetch (edits not
+        // fetched): the pass must read the bare clones at the indexed
+        // revision, not these directories the `file://` URLs still name.
+        for (dir, file) in [(&alpha, "src/helper.js"), (&beta, "src/caller.js")] {
+            let path = dir.join(file);
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, format!("{text}// moved on\n")).unwrap();
+        }
 
         let pass = || {
             crate::cross_repo_links::reconcile_cross_repo_links(
