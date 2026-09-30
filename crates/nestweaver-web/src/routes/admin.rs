@@ -1787,6 +1787,38 @@ mod tests {
         admin_state_with_auth(Some("test-query-token".to_string()))
     }
 
+    /// In server mode the admin router is nested in the UI router, and a
+    /// nested router without its own fallback inherits the UI's, which says
+    /// the admin API is not served here. An unknown admin route must say it
+    /// is an unknown admin route instead.
+    #[tokio::test]
+    async fn an_unknown_admin_route_in_server_mode_is_its_own_json_404() {
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let app = crate::create_router(crate::state::AppState::new(
+            store,
+            None,
+            std::path::PathBuf::from("/tmp/admin-fallback.lbug"),
+        ))
+        .nest("/admin/api", crate::create_admin_router(test_admin_state()));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/admin/api/no-such-route")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("unknown admin API route"), "{json}");
+        assert!(!error.contains("server mode"), "{json}");
+    }
+
     #[test]
     fn admin_mutation_admission_is_shutdown_visible_and_fail_closed() {
         let state = test_admin_state();

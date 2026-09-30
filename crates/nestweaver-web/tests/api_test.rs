@@ -2776,3 +2776,35 @@ async fn admin_api_outside_server_mode_is_a_json_404() {
         );
     }
 }
+
+/// Re-encoding an error as JSON keeps the response's other headers, all of
+/// their values: a 405 still says which methods the route allows.
+#[tokio::test]
+async fn a_json_405_keeps_its_allow_header() {
+    let app = make_app();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/context")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let allow: Vec<String> = response
+        .headers()
+        .get_all("allow")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect();
+    assert!(allow.iter().any(|v| v.contains("POST")), "{allow:?}");
+    assert!(
+        response
+            .headers()
+            .get("content-type")
+            .is_some_and(|v| v.to_str().unwrap().starts_with("application/json"))
+    );
+}

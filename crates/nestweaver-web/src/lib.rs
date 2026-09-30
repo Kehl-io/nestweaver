@@ -140,7 +140,7 @@ async fn json_api_errors(
     // Keep headers such as `Allow` on a 405; the body's type is ours now.
     for (name, value) in parts.headers.iter() {
         if name != http::header::CONTENT_TYPE && name != http::header::CONTENT_LENGTH {
-            rebuilt.headers_mut().insert(name.clone(), value.clone());
+            rebuilt.headers_mut().append(name.clone(), value.clone());
         }
     }
     rebuilt
@@ -303,6 +303,16 @@ pub fn create_admin_router(state: Arc<AdminState>) -> Router {
         // network-facing MCP listener, so an unauthenticated /admin/api/metrics
         // would leak operational counters.
         .route("/metrics", get(admin::metrics))
+        // Nested under the UI router in server mode, this router would
+        // otherwise inherit the UI's fallback, which says the admin API is
+        // not served here at all.
+        .fallback(|request: Request| async move {
+            crate::error::ApiError::not_found(format!(
+                "unknown admin API route: {}",
+                request.uri().path()
+            ))
+            .into_response()
+        })
         .with_state(state)
 }
 
@@ -471,6 +481,46 @@ mod frontend_assets_tests {
         assert!(
             checked > 0,
             "expected index.html to reference at least one /assets/* file"
+        );
+    }
+
+    /// The JSON re-encoding keeps every value of a multi-valued header: an
+    /// error carrying two `Allow` (or `Vary`) lines keeps both.
+    #[tokio::test]
+    async fn json_api_errors_keeps_every_value_of_a_repeated_header() {
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route(
+                "/api/x",
+                get(|| async {
+                    let mut response =
+                        (StatusCode::METHOD_NOT_ALLOWED, "not allowed").into_response();
+                    let headers = response.headers_mut();
+                    headers.append(http::header::ALLOW, "GET".parse().unwrap());
+                    headers.append(http::header::ALLOW, "HEAD".parse().unwrap());
+                    response
+                }),
+            )
+            .layer(axum::middleware::from_fn(json_api_errors));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/x")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let allow: Vec<&str> = response
+            .headers()
+            .get_all(http::header::ALLOW)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(allow, ["GET", "HEAD"]);
+        assert_eq!(
+            response.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
         );
     }
 
