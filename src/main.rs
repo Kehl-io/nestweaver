@@ -3017,6 +3017,118 @@ fn render_investigate_text(payload: &serde_json::Value) {
     );
 }
 
+/// `investigate-expand` text, from the result's JSON so the daemon and
+/// direct routes print the same thing. An entry whose body could not be read
+/// says why rather than printing an empty block.
+fn render_investigate_expand_text(payload: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+    let text = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let list = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut out = String::new();
+    let unresolved: Vec<String> = list("unresolved")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    if !unresolved.is_empty() {
+        let _ = writeln!(out, "Unresolved targets: {}", unresolved.join(", "));
+    }
+    let neighbors = list("neighbors");
+    for entry in list("expanded") {
+        let asset_id = text(&entry, "asset_id");
+        let _ = writeln!(
+            out,
+            "\n=== {asset_id}  {} ({}) ===",
+            text(&entry, "title"),
+            text(&entry, "location")
+        );
+        match entry.get("inline_body").and_then(|v| v.as_str()) {
+            Some(body) => {
+                let _ = writeln!(out, "{body}");
+            }
+            None => {
+                if let Some(reason) = entry.get("unavailable_reason").and_then(|v| v.as_str()) {
+                    let _ = writeln!(out, "(body unavailable: {reason})");
+                }
+            }
+        }
+        let own: Vec<&serde_json::Value> = neighbors
+            .iter()
+            .filter(|n| n.get("of").and_then(|v| v.as_str()) == Some(asset_id.as_str()))
+            .collect();
+        if !own.is_empty() {
+            let _ = writeln!(out, "-- neighbors --");
+            for n in own {
+                let _ = writeln!(
+                    out,
+                    "  [{}] {} ({})",
+                    text(n, "relation"),
+                    text(n, "title"),
+                    text(n, "uid")
+                );
+            }
+        }
+    }
+    out
+}
+
+/// `investigate-hydrate` text, from the result's JSON (see
+/// [`render_investigate_expand_text`]).
+fn render_investigate_hydrate_text(payload: &serde_json::Value) -> String {
+    let entries = payload
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let hydrated = payload
+        .get("hydrated")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let truncated_count = entries
+        .iter()
+        .filter(|e| {
+            e.get("inline_body").is_some_and(|v| !v.is_null())
+                && !e
+                    .get("body_complete")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true)
+        })
+        .count();
+    let mut out = format!(
+        "Hydrated {hydrated} entr{} in bundle {}{}\n",
+        if hydrated == 1 { "y" } else { "ies" },
+        payload
+            .get("bundle_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+        if truncated_count > 0 {
+            format!(" ({truncated_count} truncated — use read_symbols for full source)")
+        } else {
+            String::new()
+        }
+    );
+    if let Some(reasons) = payload.get("skipped_reasons").and_then(|v| v.as_object()) {
+        for (reason, count) in reasons {
+            out.push_str(&format!(
+                "  skipped {}: {reason}\n",
+                count.as_u64().unwrap_or(0)
+            ));
+        }
+    }
+    out
+}
+
 /// Print a change-impact payload's `notifications` as `[level] message`, the
 /// one renderer shared by `blast-radius` and `detect-changes` (nw-544).
 ///
@@ -9758,12 +9870,24 @@ fn wholly_inferred_write_refusal(
 ) -> Option<String> {
     wholly_inferred_write_message(
         &format!("Error: refusing to {action}"),
+        WRITE_REFUSAL_REMEDY,
         repo_stated,
         db_source,
         repo_path,
         db_path,
     )
 }
+
+/// The remedy the refusing commands (`index`, `watch`) print: both accept
+/// `--repo`, `--db` and `--config`.
+const WRITE_REFUSAL_REMEDY: &str = "State either end: `--repo <path>` to confirm the source, \
+     or `--db <path>` / `--config <file>` to confirm the target.";
+
+/// The remedy the `investigate*` commands print. They take neither `--repo`
+/// nor `--config` (the source is `--root`), so the refusal's remedy named two
+/// flags these commands reject.
+const INVESTIGATE_WRITE_REMEDY: &str = "State either end: `--root <path>` to confirm the \
+     source, or `--db <path>` to confirm the target.";
 
 /// The same property as [`wholly_inferred_write_refusal`], reported rather
 /// than enforced.
@@ -9783,6 +9907,7 @@ fn wholly_inferred_write_warning(
 ) -> Option<String> {
     wholly_inferred_write_message(
         &format!("Warning: {action}"),
+        INVESTIGATE_WRITE_REMEDY,
         repo_stated,
         db_source,
         repo_path,
@@ -9792,6 +9917,7 @@ fn wholly_inferred_write_warning(
 
 fn wholly_inferred_write_message(
     lead: &str,
+    remedy: &str,
     repo_stated: bool,
     db_source: DbSource,
     repo_path: &Path,
@@ -9804,8 +9930,7 @@ fn wholly_inferred_write_message(
         "{lead}: neither the source nor the target was stated.\n  \
          source: {} (detected from the current directory)\n  \
          target: {} (from the NESTWEAVER_DB environment variable)\n\
-         State either end: `--repo <path>` to confirm the source, \
-         or `--db <path>` / `--config <file>` to confirm the target.",
+         {remedy}",
         repo_path.display(),
         db_path.display(),
     ))
@@ -22435,7 +22560,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, None, "investigate_expand", args)?
                 {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    // `--json` used to be a no-op here: the daemon route
+                    // printed JSON either way.
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        print!("{}", render_investigate_expand_text(&value));
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -22457,26 +22588,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                if !result.unresolved.is_empty() {
-                    println!("Unresolved targets: {}", result.unresolved.join(", "));
-                }
-                for e in &result.expanded {
-                    println!("\n=== {}  {} ({}) ===", e.asset_id, e.title, e.location);
-                    if let Some(body) = &e.inline_body {
-                        println!("{body}");
-                    }
-                    let neighbors: Vec<&nestweaver_engine::NeighborRef> = result
-                        .neighbors
-                        .iter()
-                        .filter(|n| n.of == e.asset_id)
-                        .collect();
-                    if !neighbors.is_empty() {
-                        println!("-- neighbors --");
-                        for n in neighbors {
-                            println!("  [{}] {} ({})", n.relation, n.title, n.uid);
-                        }
-                    }
-                }
+                print!(
+                    "{}",
+                    render_investigate_expand_text(&serde_json::to_value(&result)?)
+                );
             }
             Ok((EXIT_SUCCESS, None))
         }
@@ -22515,7 +22630,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) =
                     try_hybrid_json_rpc(true, &db_path, None, "investigate_hydrate", args)?
                 {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        print!("{}", render_investigate_hydrate_text(&value));
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -22533,21 +22652,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                let truncated_count = result
-                    .entries
-                    .iter()
-                    .filter(|e| e.inline_body.is_some() && !e.body_complete)
-                    .count();
-                println!(
-                    "Hydrated {} entr{} in bundle {}{}",
-                    result.hydrated,
-                    if result.hydrated == 1 { "y" } else { "ies" },
-                    result.bundle_id,
-                    if truncated_count > 0 {
-                        format!(" ({truncated_count} truncated — use read_symbols for full source)")
-                    } else {
-                        String::new()
-                    }
+                print!(
+                    "{}",
+                    render_investigate_hydrate_text(&serde_json::to_value(&result)?)
                 );
             }
             Ok((EXIT_SUCCESS, None))
@@ -28356,6 +28463,93 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
     /// invocation already passed (nw-328/nw-329's actual shape) cannot be
     /// expressed as a static per-string check. Both stay covered only by the
     /// one-row-per-bug table in `tests/error_remedy_test.rs`.
+    /// Both investigate drill-in commands print text from the same JSON on
+    /// either route, and an entry with no body says why.
+    #[test]
+    fn investigate_drill_in_text_renders_from_json() {
+        let expand = serde_json::json!({
+            "bundle_id": "bndl_x",
+            "unresolved": ["zzz"],
+            "expanded": [
+                { "asset_id": "a1", "title": "greet", "location": "a.ts:1",
+                  "inline_body": "function greet() {}" },
+                { "asset_id": "a2", "title": "gone", "location": "b.ts:1",
+                  "unavailable_reason": "source changed since indexing" }
+            ],
+            "neighbors": [
+                { "of": "a1", "uid": "sym:x", "kind": "Symbol", "title": "hello",
+                  "relation": "callee" }
+            ]
+        });
+        let text = render_investigate_expand_text(&expand);
+        assert!(text.contains("Unresolved targets: zzz"), "{text}");
+        assert!(text.contains("=== a1  greet (a.ts:1) ==="), "{text}");
+        assert!(text.contains("function greet() {}"), "{text}");
+        assert!(text.contains("[callee] hello (sym:x)"), "{text}");
+        assert!(
+            text.contains("(body unavailable: source changed since indexing)"),
+            "{text}"
+        );
+        assert!(
+            !text.trim_start().starts_with('{'),
+            "text, not JSON: {text}"
+        );
+
+        let hydrate = serde_json::json!({
+            "bundle_id": "bndl_x",
+            "hydrated": 1,
+            "entries": [ { "asset_id": "a1", "inline_body": "x", "body_complete": false } ],
+            "skipped_reasons": { "no longer exists": 2 }
+        });
+        let text = render_investigate_hydrate_text(&hydrate);
+        assert!(
+            text.starts_with("Hydrated 1 entry in bundle bndl_x (1 truncated"),
+            "{text}"
+        );
+        assert!(text.contains("skipped 2: no longer exists"), "{text}");
+    }
+
+    /// The `investigate*` bundle-cache warning is assembled at run time, so
+    /// the literal-remedy sweep below never sees it. It told the reader to
+    /// pass `--repo` or `--config`, which none of the three commands accept;
+    /// every flag it names must be one the command parses.
+    #[test]
+    fn investigate_cache_warning_names_only_flags_the_command_accepts() {
+        let root = on_big_stack(|| {
+            let mut root = Cli::command();
+            root.build();
+            root
+        });
+        for command in ["investigate", "investigate-expand", "investigate-hydrate"] {
+            let message = wholly_inferred_write_warning(
+                &format!("{command} is writing its bundle cache beside a database nobody named"),
+                false,
+                DbSource::Env,
+                std::path::Path::new("/tmp/checkout"),
+                std::path::Path::new("/tmp/ambient.lbug"),
+            )
+            .expect("neither end stated warns");
+            let flags = command_flag_names(root.find_subcommand(command).expect(command));
+            let named: Vec<&str> = message
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .filter_map(|span| span.split_whitespace().next())
+                .filter(|token| token.starts_with("--"))
+                .collect();
+            assert!(
+                !named.is_empty(),
+                "{command}: the warning names a remedy: {message}"
+            );
+            for flag in named {
+                assert!(
+                    flags.contains(flag.trim_start_matches('-')) || flags.contains(flag),
+                    "{command} does not accept {flag}: {message}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn backtick_quoted_remedies_name_real_flags_on_real_command_paths() {
         let root = on_big_stack(|| {

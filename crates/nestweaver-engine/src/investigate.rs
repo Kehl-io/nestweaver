@@ -2084,6 +2084,12 @@ pub enum BodyUnavailable {
     /// (explicit or a genuinely recorded repo `local_root`) was tried and
     /// still didn't contain the file.
     NoRecordedLocalRoot { path: String },
+    /// `root` was omitted and the symbol's repo HAS a recorded `local_root`,
+    /// but that directory no longer exists (the checkout moved or was
+    /// deleted), so the read fell back to the server's working directory.
+    /// Saying "no recorded local_root" here sent the reader looking for a
+    /// missing record instead of a moved checkout.
+    RecordedLocalRootMissing { path: String, root: String },
     /// nw-689: the file WAS read, but it changed since indexing and the stored
     /// span no longer holds the symbol (and it could not be re-located).
     /// Distinct from `SourceUnreadable`: a different `root` will not help;
@@ -2106,6 +2112,14 @@ impl BodyUnavailable {
             }
             BodyUnavailable::SourceUnreadable { path } => {
                 format!("source not readable from the supplied root: {path}")
+            }
+            BodyUnavailable::RecordedLocalRootMissing { path, root } => {
+                format!(
+                    "this symbol's repo was indexed at {root}, which no longer exists (moved or \
+                     deleted); tried the server's working directory and could not read: {path}. \
+                     Re-index the repo from its current location, or supply its checkout as the \
+                     root"
+                )
             }
             BodyUnavailable::NoRecordedLocalRoot { path } => {
                 format!(
@@ -2139,6 +2153,9 @@ enum SymbolRootSource {
     /// repo, no recorded root, or a root that no longer exists on disk), so
     /// this fell back to the server's own working directory.
     FallbackCwd(std::path::PathBuf),
+    /// As [`Self::FallbackCwd`], but the repo DOES record a `local_root`: it
+    /// is gone from disk. Carries that recorded root for the reason text.
+    FallbackCwdRecordedRootMissing(std::path::PathBuf, String),
 }
 
 impl SymbolRootSource {
@@ -2146,7 +2163,8 @@ impl SymbolRootSource {
         match self {
             SymbolRootSource::Explicit(p)
             | SymbolRootSource::RepoLocalRoot(p)
-            | SymbolRootSource::FallbackCwd(p) => p,
+            | SymbolRootSource::FallbackCwd(p)
+            | SymbolRootSource::FallbackCwdRecordedRootMissing(p, _) => p,
         }
     }
 }
@@ -2173,13 +2191,23 @@ fn resolve_symbol_body_root(
     if let Some(explicit) = root {
         return SymbolRootSource::Explicit(explicit.to_path_buf());
     }
-    match store
-        .lookup_symbol(uid)
-        .ok()
-        .and_then(|symbol| crate::read_symbols::repo_local_root(store, &symbol.repo_uid))
+    let repo_uid = store.lookup_symbol(uid).ok().map(|symbol| symbol.repo_uid);
+    if let Some(local_root) = repo_uid
+        .as_deref()
+        .and_then(|repo_uid| crate::read_symbols::repo_local_root(store, repo_uid))
     {
-        Some(local_root) => SymbolRootSource::RepoLocalRoot(local_root),
-        None => SymbolRootSource::FallbackCwd(std::env::current_dir().unwrap_or_default()),
+        return SymbolRootSource::RepoLocalRoot(local_root);
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    // A recorded root that is no longer a directory is a moved checkout, not
+    // a missing record: say which.
+    let recorded = repo_uid
+        .as_deref()
+        .and_then(|repo_uid| store.lookup_repo(repo_uid).ok().flatten())
+        .and_then(|repo| repo.local_root().map(str::to_string));
+    match recorded {
+        Some(root) => SymbolRootSource::FallbackCwdRecordedRootMissing(cwd, root),
+        None => SymbolRootSource::FallbackCwd(cwd),
     }
 }
 
@@ -2246,6 +2274,12 @@ fn fetch_full_body(
                 Some(window) if !window.body_available => Err(match resolved_root {
                     SymbolRootSource::FallbackCwd(_) => {
                         BodyUnavailable::NoRecordedLocalRoot { path: window.path }
+                    }
+                    SymbolRootSource::FallbackCwdRecordedRootMissing(_, root) => {
+                        BodyUnavailable::RecordedLocalRootMissing {
+                            path: window.path,
+                            root,
+                        }
                     }
                     SymbolRootSource::Explicit(_) | SymbolRootSource::RepoLocalRoot(_) => {
                         BodyUnavailable::SourceUnreadable { path: window.path }
@@ -3378,6 +3412,49 @@ mod tests {
             "no unavailable_reason expected once local_root resolution \
              succeeds: {e:?}"
         );
+    }
+
+    /// A repo whose recorded `local_root` was moved away is not a repo with
+    /// no recorded root: the reason names the recorded path and says it no
+    /// longer exists, instead of "no recorded local_root".
+    #[test]
+    fn investigate_expand_says_when_the_recorded_root_moved() {
+        let (dir, src, store) = make_store();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let result = investigate(
+            &store,
+            None,
+            Some(&db_path),
+            &src,
+            "greet",
+            "vault",
+            None,
+            None,
+        )
+        .unwrap();
+        let target = result
+            .entries
+            .iter()
+            .find(|e| e.uid.starts_with("sym:"))
+            .map(|e| e.asset_id.clone())
+            .expect("at least one symbol entry");
+        std::fs::rename(&src, dir.path().join("moved")).unwrap();
+
+        let expanded = investigate_expand(
+            &store,
+            &db_path,
+            None,
+            &result.bundle_id,
+            std::slice::from_ref(&target),
+        )
+        .unwrap();
+        let reason = expanded.expanded[0]
+            .unavailable_reason
+            .clone()
+            .expect("the body cannot be read from a moved checkout");
+        assert!(!reason.contains("no recorded local_root"), "{reason}");
+        assert!(reason.contains("no longer exists"), "{reason}");
+        assert!(reason.contains(&src.display().to_string()), "{reason}");
     }
 
     /// Counterweight to the test above: an EXPLICIT `root` must still win
