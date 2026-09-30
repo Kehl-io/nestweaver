@@ -6029,3 +6029,86 @@ fn repositories_without_cross_calls_get_no_inferred_links() {
     assert!(inferred_links(&db).is_empty());
     assert_eq!(cross_repo_status(&db)["pending"], false);
 }
+
+/// A direct `nestweaver watch` has no daemon to pay the cross-repo link debt
+/// its batches record, so it runs the relinker itself: an edit in alpha
+/// drops beta's links into it, and they are back, with the debt cleared,
+/// after the quiet period. The watch then exits cleanly on SIGINT.
+#[test]
+fn a_direct_watch_restores_cross_repo_links_and_clears_the_debt() {
+    let tmp = TempDir::new().unwrap();
+    let (alpha, beta) = write_calling_repos(tmp.path());
+    let db = tmp.path().join("graph.lbug");
+    index_direct(&alpha, &db, &[]);
+    index_direct(&beta, &db, &[]);
+    drop(beta);
+    let before = inferred_links(&db);
+    assert_eq!(before.len(), 2);
+
+    let mut sidecar = db.as_os_str().to_owned();
+    sidecar.push(".cross_repo_links.json");
+    let sidecar = PathBuf::from(sidecar);
+    let pending = || {
+        std::fs::read_to_string(&sidecar)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .is_some_and(|state| state.get("pending").is_some_and(|p| !p.is_null()))
+    };
+    assert!(!pending());
+
+    let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("nestweaver"))
+        .args([
+            "watch",
+            &alpha.display().to_string(),
+            "--db",
+            &db.display().to_string(),
+        ])
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    struct Kill(u32);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = StdCommand::new("kill")
+                .args(["-9", &self.0.to_string()])
+                .status();
+        }
+    }
+    let _guard = Kill(child.id());
+    let wait = |done: &dyn Fn() -> bool, secs: u64| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        while !done() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        done()
+    };
+    // Give the watcher time to subscribe, then edit until a batch records
+    // the debt (an edit before the subscription is not seen).
+    let helper = alpha.join("src/helper.js");
+    let original = std::fs::read_to_string(&helper).unwrap();
+    let mut saw_debt = false;
+    for attempt in 0..6 {
+        std::thread::sleep(Duration::from_secs(2));
+        std::fs::write(&helper, format!("{original}// edit {attempt}\n")).unwrap();
+        if wait(&pending, 6) {
+            saw_debt = true;
+            break;
+        }
+    }
+    assert!(saw_debt, "a watch batch records the cross-repo link debt");
+    assert!(
+        wait(&|| !pending(), 30),
+        "the watch's relinker clears the debt"
+    );
+
+    StdCommand::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "watch exits cleanly: {status:?}");
+    assert_eq!(inferred_links(&db), before, "the links are restored");
+}

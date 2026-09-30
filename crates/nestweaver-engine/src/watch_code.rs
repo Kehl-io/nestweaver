@@ -49,11 +49,31 @@ pub struct CodeWatcher {
     /// nw-651 on Linux: directories the filesystem subscription could not
     /// cover (`watch_tree`), disclosed with the rest of this repo's debt.
     unwatched_dirs: Vec<(PathBuf, String)>,
+    /// Run a debounced whole-graph cross-repo relinker beside the watcher
+    /// (a direct `nestweaver watch`, which has no daemon to pay the debt its
+    /// batches record).
+    cross_repo_relink: Option<crate::cross_repo_links::CrossRepoRelinkTiming>,
     #[cfg(test)]
     ready_signal: Option<std::sync::mpsc::Sender<()>>,
     /// Test seam: subscribe as inotify would fail on an unreadable subtree.
     #[cfg(test)]
     emulate_inotify_watch: bool,
+}
+
+/// The watcher's cross-repo relinker thread: signalled and joined on drop,
+/// so it never outlives the watcher (nor writes after it returns).
+struct RelinkerThread {
+    shutdown: tokio::sync::watch::Sender<bool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for RelinkerThread {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -120,6 +140,7 @@ impl CodeWatcher {
             ready_callback: None,
             reconcile_retry_base: crate::watcher::RECONCILE_RETRY_BASE,
             unwatched_dirs: Vec::new(),
+            cross_repo_relink: None,
             #[cfg(test)]
             ready_signal: None,
             #[cfg(test)]
@@ -161,6 +182,18 @@ impl CodeWatcher {
 
     pub fn with_instance_config(mut self, config: Option<Arc<crate::InstanceConfig>>) -> Self {
         self.instance_config = config;
+        self
+    }
+
+    /// Pay the cross-repo link debt this watcher's batches record with a
+    /// debounced whole-graph relinker that lives as long as the watcher.
+    /// Batches and the relinker's replace share one write gate (the
+    /// installed mutation lease factory, or a process-local gate).
+    pub fn with_cross_repo_relinker(
+        mut self,
+        timing: crate::cross_repo_links::CrossRepoRelinkTiming,
+    ) -> Self {
+        self.cross_repo_relink = Some(timing);
         self
     }
 
@@ -265,12 +298,61 @@ impl CodeWatcher {
         self.run_inner(store, on_change)
     }
 
+    fn start_cross_repo_relinker(&mut self, store: &Arc<GraphStore>) -> Option<RelinkerThread> {
+        let timing = self.cross_repo_relink?;
+        let db_path = store.db_path()?.to_path_buf();
+        let lease = match &self.mutation_lease_factory {
+            Some(factory) => Arc::clone(factory),
+            None => {
+                let gate = crate::write_gate::WriteGate::new();
+                let factory: WatchMutationLeaseFactory = Arc::new(move |what: &'static str| {
+                    Ok(Box::new(gate.blocking_lock(what)) as Box<dyn WatchMutationLease>)
+                });
+                self.mutation_lease_factory = Some(Arc::clone(&factory));
+                factory
+            }
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let store = Arc::clone(store);
+        let limits = self.limits;
+        let thread = std::thread::Builder::new()
+            .name("cross-repo-relinker".to_string())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        tracing::warn!(%error, "cross-repo relinker: cannot start a runtime");
+                        return;
+                    }
+                };
+                runtime.block_on(crate::cross_repo_links::run_cross_repo_link_relinker(
+                    store,
+                    db_path,
+                    limits,
+                    lease,
+                    shutdown_rx,
+                    timing,
+                ));
+            })
+            .map_err(|error| tracing::warn!(%error, "cross-repo relinker: cannot spawn"))
+            .ok()?;
+        Some(RelinkerThread {
+            shutdown: shutdown_tx,
+            thread: Some(thread),
+        })
+    }
+
     /// Shared implementation used by both `run` and `run_with_store`.
     fn run_inner(
         mut self,
         store: Arc<GraphStore>,
         on_change: Option<Box<dyn Fn() + Send>>,
     ) -> Result<(), anyhow::Error> {
+        // Stopped and joined when this function returns, however it returns.
+        let _relinker = self.start_cross_repo_relinker(&store);
         // Register before inspecting or cold-indexing the tree. Events that
         // race the initial snapshot are queued by the debouncer and replayed
         // below, closing the former scan-then-watch lost-event window.
@@ -3627,6 +3709,100 @@ mod tests {
             root,
             nestweaver_schema::repo_uid("test", &repo_url),
         )
+    }
+
+    /// A direct watch (no daemon) pays the cross-repo link debt its own
+    /// batches record: an edit in alpha drops beta's links into it, and the
+    /// watcher's relinker restores them after its quiet period and clears
+    /// the debt. The relinker stops with the watcher.
+    #[cfg(unix)]
+    #[test]
+    fn a_direct_watch_restores_cross_repo_links_after_the_debounce() {
+        let dir = tempfile::tempdir().unwrap();
+        let alpha = dir.path().join("alpha");
+        let beta = dir.path().join("beta");
+        std::fs::create_dir_all(alpha.join("src")).unwrap();
+        std::fs::create_dir_all(beta.join("src")).unwrap();
+        let helper = "export function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n";
+        std::fs::write(alpha.join("src/helper.js"), helper).unwrap();
+        std::fs::write(
+            beta.join("src/caller.js"),
+            "export function betaCaller() {\n  return alphaHelper();\n}\nexport function betaUtil() { return 2; }\n",
+        )
+        .unwrap();
+        let alpha = std::fs::canonicalize(&alpha).unwrap();
+        let beta = std::fs::canonicalize(&beta).unwrap();
+        let db_path = dir.path().join("graph.lbug");
+        for root in [&alpha, &beta] {
+            crate::index::index_directory(
+                root,
+                &db_path,
+                "test",
+                &format!("file://{}", root.display()),
+                "sha",
+            )
+            .unwrap();
+        }
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        crate::cross_repo_links::mark_cross_repo_links_pending(&db_path, "fixture");
+        crate::cross_repo_links::reconcile_cross_repo_links(
+            &store,
+            &db_path,
+            crate::index_limits::IndexLimits::default(),
+            None,
+            &|| false,
+        )
+        .unwrap();
+        let links = || {
+            let mut links: Vec<_> = store
+                .list_inferred_cross_repo_links()
+                .unwrap()
+                .into_iter()
+                .map(|(s, t, c, l, e)| (s, t, c.to_bits(), l, e))
+                .collect();
+            links.sort();
+            links
+        };
+        let before = links();
+        assert_eq!(before.len(), 2);
+        let owed = || crate::cross_repo_links::cross_repo_links_pending(&db_path);
+        assert!(!owed());
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let watcher = CodeWatcher::new(&db_path, &alpha, "test")
+            .with_debounce_ms(100)
+            .with_cross_repo_relinker(crate::cross_repo_links::CrossRepoRelinkTiming {
+                tick: Duration::from_millis(20),
+                debounce: Duration::from_millis(1500),
+                ..Default::default()
+            })
+            .with_ready_callback(move || {
+                let _ = ready_tx.send(());
+            });
+        let stop = watcher.shutdown_handle();
+        let run_store = Arc::clone(&store);
+        let handle = std::thread::spawn(move || watcher.run_with_store(run_store, None));
+        ready_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+
+        std::fs::write(alpha.join("src/helper.js"), format!("{helper}// edited\n")).unwrap();
+        let wait = |done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !done() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            done()
+        };
+        assert!(
+            wait(&|| owed() && links().is_empty()),
+            "the batch drops the links and records the debt"
+        );
+        assert!(
+            wait(&|| !owed() && links() == before),
+            "the relinker restores the links and clears the debt"
+        );
+
+        stop.stop();
+        handle.join().unwrap().unwrap();
     }
 
     /// Start a code watcher over `root`, stop it at readiness, and return how

@@ -19924,6 +19924,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let watcher = CodeWatcher::new(&db_path, &repo_path, &instance_id)
                 .with_limits(index_limits)
+                // No daemon pays the cross-repo link debt this watcher's
+                // batches record; a relinker beside it does, and stops with it.
+                .with_cross_repo_relinker(
+                    nestweaver_engine::cross_repo_links::CrossRepoRelinkTiming::default(),
+                )
                 .with_instance_config(
                     config
                         .as_deref()
