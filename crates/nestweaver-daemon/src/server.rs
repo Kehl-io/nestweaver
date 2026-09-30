@@ -2001,6 +2001,33 @@ fn current_repo_eligibility_config(
     }
 }
 
+/// The daemon's additions to a dispatched `brain_status` (both JSON routes).
+///
+/// Status is what a user runs to see what the daemon is doing, so nothing
+/// here may fail it: an eligibility reload that fails (an unreadable or
+/// invalid config file) keeps the shared builder's rows and is disclosed as a
+/// warning instead of turning the whole answer into an error.
+fn annotate_brain_status(state: &DaemonState, value: &mut serde_json::Value) {
+    if let Err(error) = refresh_status_eligibility(state, value) {
+        let message = format!("{error:#}");
+        tracing::warn!(error = %message, "brain_status: repository eligibility not refreshed");
+        if let Some(object) = value.as_object_mut() {
+            let warnings = object
+                .entry("warnings")
+                .or_insert_with(|| serde_json::json!([]));
+            if let Some(warnings) = warnings.as_array_mut() {
+                warnings.push(serde_json::json!({
+                    "kind": "repo_eligibility_unrefreshed",
+                    "warning": format!(
+                        "repository eligibility shown as of daemon start: {message}"
+                    ),
+                }));
+            }
+        }
+    }
+    vault_derivation::status_overlay(state, value);
+}
+
 /// Refresh only eligibility disclosure after tool dispatch (including any
 /// cache hit). All other status fields retain the daemon's startup settings.
 fn refresh_status_eligibility(
@@ -2195,6 +2222,9 @@ pub struct DaemonState {
     /// nw-675: the code-link reconcile loop, awaited on teardown like the two
     /// loops above.
     pub code_link_reconciler_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The debounced whole-graph cross-repo link relinker, awaited on
+    /// teardown like the reconcile loops above.
+    pub cross_repo_relinker_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Join handles for every watcher task this daemon has spawned.
     ///
     /// Same invariant as the two reconcile loops above, and it was missing for
@@ -3924,9 +3954,7 @@ impl DaemonService {
                 &mut value,
             );
             if tool_name == "brain_status" {
-                refresh_status_eligibility(&state, &mut value)
-                    .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
-                vault_derivation::status_overlay(&state, &mut value);
+                annotate_brain_status(&state, &mut value);
             }
             tracing::debug!(
                 tool = %tool_name,
@@ -4103,9 +4131,7 @@ impl DaemonService {
                 &mut value,
             );
             if tool_name == "brain_status" {
-                refresh_status_eligibility(&state, &mut value)
-                    .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
-                vault_derivation::status_overlay(&state, &mut value);
+                annotate_brain_status(&state, &mut value);
             }
             tracing::debug!(
                 tool = %tool_name,
@@ -7780,6 +7806,14 @@ impl NestWeaverDaemon for DaemonService {
                 &state.db_path,
                 &format!("code re-index of {}", repo_path.display()),
             );
+            // The index inferred this repository's outgoing cross-repo links
+            // only against the repositories already present, and dropped
+            // other repositories' links into its re-indexed files. Recorded
+            // after the write, like the code-link debt.
+            nestweaver_engine::cross_repo_links::mark_cross_repo_links_owed(
+                &state.store,
+                &format!("code re-index of {}", repo_path.display()),
+            );
             #[cfg(feature = "release-fixture-hooks")]
             if let Some(scope) = &fixture_scope {
                 let error = index_result
@@ -7794,6 +7828,20 @@ impl NestWeaverDaemon for DaemonService {
                     }));
                     return;
                 }
+            }
+            // Once per run, before the terminal event: re-infer every
+            // name-matched cross-repo link over the whole graph, so the links
+            // do not depend on indexing order. Inference runs with no write
+            // gate held; the gate is taken only for the replace transaction.
+            // A refusal (a repository's parse unreadable) leaves the stored
+            // links and the disclosed debt in place.
+            if index_result.is_ok() {
+                nestweaver_engine::cross_repo_links::reconcile_after_index(
+                    &state.store,
+                    &state.db_path,
+                    index_limits,
+                    Some(&daemon_mutation_lease_factory(Arc::clone(&state))),
+                );
             }
             match index_result {
                 Ok(result) => {
@@ -8682,6 +8730,12 @@ impl NestWeaverDaemon for DaemonService {
                 &state.db_path,
                 &format!("repo {} removed", req.repo_uid),
             );
+            // Removed symbols change which names are unambiguous across the
+            // remaining repositories.
+            nestweaver_engine::cross_repo_links::mark_cross_repo_links_owed(
+                &state.store,
+                &format!("repo {} removed", req.repo_uid),
+            );
             removed
         })
         .await
@@ -8746,6 +8800,12 @@ impl NestWeaverDaemon for DaemonService {
             // nw-670 review M4: see remove_repo.
             nestweaver_engine::code_links::mark_code_links_pending(
                 &state.db_path,
+                "stale repos or vaults pruned",
+            );
+            // Removed symbols change which names are unambiguous across the
+            // remaining repositories.
+            nestweaver_engine::cross_repo_links::mark_cross_repo_links_owed(
+                &state.store,
                 "stale repos or vaults pruned",
             );
             pruned
@@ -8877,6 +8937,12 @@ impl NestWeaverDaemon for DaemonService {
                 &state.db_path,
                 &format!("instance {from_id} merged into {to_id}"),
             );
+            // Removed symbols change which names are unambiguous across the
+            // remaining repositories.
+            nestweaver_engine::cross_repo_links::mark_cross_repo_links_owed(
+                &state.store,
+                &format!("instance {from_id} merged into {to_id}"),
+            );
             let result = result?;
 
             let discarded_vaults = result
@@ -8951,6 +9017,12 @@ impl NestWeaverDaemon for DaemonService {
                     // what the remaining notes' mentions resolve to.
                     nestweaver_engine::code_links::mark_code_links_pending(
                         &state.db_path,
+                        &format!("instance {instance_id} purged"),
+                    );
+                    // Removed symbols change which names are unambiguous across the
+                    // remaining repositories.
+                    nestweaver_engine::cross_repo_links::mark_cross_repo_links_owed(
+                        &state.store,
                         &format!("instance {instance_id} purged"),
                     );
                     let _ = tx.blocking_send(Ok(IndexProgress {
@@ -9503,6 +9575,7 @@ impl NestWeaverDaemon for DaemonService {
             notes_near_size_limit,
             code_links: nestweaver_proto::code_links_from_status_json(&value),
             manifest_failures: nestweaver_proto::manifest_failures_from_status_json(&value),
+            cross_repo_links: nestweaver_proto::cross_repo_links_from_status_json(&value),
         }))
     }
 
@@ -10351,7 +10424,21 @@ impl NestWeaverDaemon for DaemonService {
                 .store
                 .list_projects()
                 .map_err(|e| Status::internal(format!("list_projects failed: {e:#}")))?;
-            serde_json::to_string(&projects)
+            // Each project carries its member repos (`repos`), which the CLI
+            // cannot read itself while this daemon holds the store.
+            let rows = projects
+                .iter()
+                .map(|project| {
+                    let mut row = serde_json::to_value(project)?;
+                    let members =
+                        nestweaver_engine::project_member_repos(&state.store, &project.uid)
+                            .unwrap_or_default();
+                    row["repos"] = serde_json::to_value(members)?;
+                    Ok(row)
+                })
+                .collect::<Result<Vec<_>, serde_json::Error>>()
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))?;
+            serde_json::to_string(&rows)
                 .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
         })
         .await
@@ -14339,6 +14426,7 @@ pub async fn run_server(
         trigram_reconciler_handle: std::sync::Mutex::new(None),
         embedding_reconciler_handle: std::sync::Mutex::new(None),
         code_link_reconciler_handle: std::sync::Mutex::new(None),
+        cross_repo_relinker_handle: std::sync::Mutex::new(None),
         manifest_recovery: Arc::new(Default::default()),
         manifest_recovery_handle: std::sync::Mutex::new(None),
         watcher_tasks: std::sync::Mutex::new(Vec::new()),
@@ -14649,6 +14737,31 @@ pub async fn run_server(
             .code_link_reconciler_handle
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(code_link_handle);
+    }
+
+    // Name-inferred cross-repo links follow the whole graph: watcher batches
+    // record the debt, and one debounced pass re-infers them. Server mode
+    // runs its own in the worker pool, beside the fetches that record it.
+    if !read_only && !state.server_mode {
+        let limits = state
+            .instance_cfg
+            .as_ref()
+            .map(|config| config.indexing.limits())
+            .unwrap_or_default();
+        let relinker_handle = tokio::spawn(
+            nestweaver_engine::cross_repo_links::run_cross_repo_link_relinker(
+                Arc::clone(&state.store),
+                state.db_path.clone(),
+                limits,
+                daemon_mutation_lease_factory(Arc::clone(&state)),
+                state.shutdown_tx.subscribe(),
+                nestweaver_engine::cross_repo_links::CrossRepoRelinkTiming::default(),
+            ),
+        );
+        *state
+            .cross_repo_relinker_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(relinker_handle);
     }
 
     let uds = tokio::net::UnixListener::bind(&sock_path)
@@ -16083,6 +16196,15 @@ pub async fn run_server(
         tracing::info!("draining code link reconcile loop before exit");
         let _ = handle.await;
     }
+    let cross_repo_handle = state
+        .cross_repo_relinker_handle
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
+    if let Some(handle) = cross_repo_handle {
+        tracing::info!("draining cross-repo link relinker before exit");
+        let _ = handle.await;
+    }
 
     let manifest_handle = state
         .manifest_recovery_handle
@@ -17034,6 +17156,208 @@ credential_method = "gh"
         done()
     }
 
+    async fn index_repo_via_rpc(state: &Arc<DaemonState>, root: &Path, force: bool) {
+        let service = DaemonService::new(state.clone());
+        let mut request = Request::new(IndexRepoRequest {
+            repo_path: root.display().to_string(),
+            force,
+            ..Default::default()
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let mut rx = service
+            .index_repo(request)
+            .await
+            .unwrap()
+            .into_inner()
+            .into_inner();
+        let mut done = false;
+        while let Some(event) = rx.recv().await {
+            let event = event.unwrap();
+            assert_ne!(event.phase, Phase::Error as i32, "{}", event.message);
+            done |= event.phase == Phase::Done as i32;
+        }
+        assert!(done, "index of {} completed", root.display());
+    }
+
+    /// Two repositories that call into each other.
+    fn calling_repos(root: &Path) -> (PathBuf, PathBuf) {
+        let alpha = root.join("alpha");
+        let beta = root.join("beta");
+        std::fs::create_dir_all(alpha.join("src")).unwrap();
+        std::fs::create_dir_all(beta.join("src")).unwrap();
+        std::fs::write(
+            alpha.join("src/helper.js"),
+            "export function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            beta.join("src/caller.js"),
+            "export function betaCaller() {\n  return alphaHelper();\n}\nexport function betaUtil() { return 2; }\n",
+        )
+        .unwrap();
+        (alpha.canonicalize().unwrap(), beta.canonicalize().unwrap())
+    }
+
+    /// (source, target, confidence, link type) of every cross-repo link.
+    fn cross_repo_link_rows(state: &DaemonState) -> Vec<(String, String, u32, String)> {
+        let mut rows: Vec<_> = state
+            .store
+            .list_all_cross_repo_links(1000)
+            .unwrap()
+            .into_iter()
+            .map(|link| {
+                (
+                    link.source_name,
+                    link.target_name,
+                    link.confidence.to_bits(),
+                    link.link_type,
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    fn linked_names(state: &DaemonState) -> Vec<(String, String)> {
+        cross_repo_link_rows(state)
+            .into_iter()
+            .map(|(source, target, _, _)| (source, target))
+            .collect()
+    }
+
+    fn both_directions() -> Vec<(String, String)> {
+        vec![
+            ("alphaUses".to_string(), "betaUtil".to_string()),
+            ("betaCaller".to_string(), "alphaHelper".to_string()),
+        ]
+    }
+
+    async fn cross_repo_links_owed(state: &Arc<DaemonState>) -> bool {
+        DaemonService::new(state.clone())
+            .brain_status(Request::new(BrainStatusRequest {}))
+            .await
+            .unwrap()
+            .into_inner()
+            .cross_repo_links
+            .expect("a live daemon reports cross_repo_links")
+            .pending
+    }
+
+    /// IndexRepo re-infers cross-repo links over the whole graph once per
+    /// run: the order repositories are indexed in does not change them, and
+    /// a forced re-index restores the links other repositories had into it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_repo_links_both_directions_whatever_the_order() {
+        let repos = tempfile::tempdir().unwrap();
+        let (alpha, beta) = calling_repos(repos.path());
+        let forward = test_state_with_writer();
+        index_repo_via_rpc(&forward, &alpha, false).await;
+        index_repo_via_rpc(&forward, &beta, false).await;
+        let backward = test_state_with_writer();
+        index_repo_via_rpc(&backward, &beta, false).await;
+        index_repo_via_rpc(&backward, &alpha, false).await;
+
+        assert_eq!(linked_names(&forward), both_directions());
+        let links = cross_repo_link_rows(&forward);
+        assert_eq!(cross_repo_link_rows(&backward), links);
+        assert!(!cross_repo_links_owed(&forward).await);
+
+        index_repo_via_rpc(&forward, &alpha, true).await;
+        assert_eq!(
+            cross_repo_link_rows(&forward),
+            links,
+            "restored after --force"
+        );
+        assert!(!cross_repo_links_owed(&forward).await);
+    }
+
+    /// A code watcher batch replaces the changed file's symbols, and the
+    /// cascade takes the other repository's links into them. The batch
+    /// records the debt (shown by `brain status`), and the relinker restores
+    /// the links after its debounce and settles it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_watcher_batch_owes_cross_repo_links_and_the_relinker_restores_them() {
+        let state = test_state_with_writer();
+        let repos = tempfile::tempdir().unwrap();
+        let (alpha, beta) = calling_repos(repos.path());
+        index_repo_via_rpc(&state, &alpha, false).await;
+        index_repo_via_rpc(&state, &beta, false).await;
+        let links = cross_repo_link_rows(&state);
+        assert_eq!(linked_names(&state), both_directions());
+        assert!(!cross_repo_links_owed(&state).await);
+
+        let service = DaemonService::new(state.clone());
+        let started = service
+            .watch_code(Request::new(WatchCodeRequest {
+                repo_path: alpha.display().to_string(),
+                instance_id: String::new(),
+                force: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(started.ok, "{}", started.message);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        std::fs::write(
+            alpha.join("src/helper.js"),
+            "export function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n// edited\n",
+        )
+        .unwrap();
+        assert!(
+            eventually(|| linked_names(&state).is_empty()).await,
+            "the batch dropped the links: {:?}",
+            linked_names(&state)
+        );
+        // Recorded right after the batch commits.
+        assert!(
+            eventually(
+                || nestweaver_engine::cross_repo_links::cross_repo_links_pending(&state.db_path)
+            )
+            .await
+        );
+        assert!(
+            cross_repo_links_owed(&state).await,
+            "the debt is disclosed in status while owed"
+        );
+
+        let relinker = tokio::spawn(
+            nestweaver_engine::cross_repo_links::run_cross_repo_link_relinker(
+                Arc::clone(&state.store),
+                state.db_path.clone(),
+                nestweaver_engine::index_limits::IndexLimits::default(),
+                daemon_mutation_lease_factory(Arc::clone(&state)),
+                state.shutdown_tx.subscribe(),
+                nestweaver_engine::cross_repo_links::CrossRepoRelinkTiming {
+                    tick: Duration::from_millis(20),
+                    debounce: Duration::from_millis(200),
+                    ..Default::default()
+                },
+            ),
+        );
+        assert!(
+            eventually(|| cross_repo_link_rows(&state) == links).await,
+            "the relinker restored the links: {:?}",
+            linked_names(&state)
+        );
+        let mut settled = false;
+        for _ in 0..200 {
+            if !cross_repo_links_owed(&state).await {
+                settled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(settled, "the debt clears once the links are restored");
+
+        let mut stop = Request::new(StopWatchRequest {
+            watcher_id: started.watcher_id,
+        });
+        stop.extensions_mut().insert(crate::auth::IsAdmin(true));
+        assert!(service.stop_watch(stop).await.unwrap().into_inner().ok);
+        let _ = state.shutdown_tx.send(true);
+        relinker.await.unwrap();
+    }
+
     /// nw-675: IndexVault — the daemon route of `brain add` and of a full
     /// `brain refresh` — recreates every note, and the cascade took their
     /// code links. Nothing rebuilt them; they stayed gone until each note was
@@ -17378,6 +17702,119 @@ repos = ["alpha"]
             DerivationPhase::Current
         );
         vault_derivation::admit_tool(&state, "backlinks").unwrap();
+    }
+
+    /// `brain status` must answer while the daemon re-derives a vault (the
+    /// derivation holds the write gate for its whole run), on both status
+    /// routes, and the JSON must name the vault and phase being derived.
+    /// Driven through a real migration: the record sidecar is deleted, as a
+    /// lost sidecar or a version bump leaves it, and the background loop's
+    /// own `inspect_next` / `migrate_named` pair re-derives the vault.
+    #[tokio::test]
+    async fn brain_status_answers_and_discloses_a_running_vault_derivation() {
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\nsee [[B]]\n").unwrap();
+        std::fs::write(root.join("B.md"), "# B\n").unwrap();
+        let progress = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(
+            progress.last().expect("IndexVault streamed").phase,
+            Phase::Done as i32
+        );
+        std::fs::remove_file(nestweaver_engine::markdown_derivation::record_path(
+            &state.db_path,
+        ))
+        .unwrap();
+        let vault_uid = vault_derivation::inspect_next(&state)
+            .unwrap()
+            .expect("a vault with no record is due for derivation");
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let worker_state = Arc::clone(&state);
+        let worker = tokio::task::spawn_blocking(move || {
+            let _lease = worker_state.write_gate.blocking_lock("vault_derivation");
+            let reached = std::sync::Mutex::new(Some((reached_tx, release_rx)));
+            vault_derivation::tests::set_phase_hook(Some(Box::new(move |phase| {
+                if phase == "refreshing notes"
+                    && let Some((reached, release)) = reached.lock().unwrap().take()
+                {
+                    reached.send(()).unwrap();
+                    release.recv().unwrap();
+                }
+            })));
+            let result = vault_derivation::migrate_named(&worker_state, &vault_uid);
+            vault_derivation::tests::set_phase_hook(None);
+            result
+        });
+        tokio::task::spawn_blocking(move || reached_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        let service = DaemonService::new(Arc::clone(&state));
+        let json = tokio::time::timeout(
+            Duration::from_secs(30),
+            service.brain_status_json(Request::new(JsonRequest {
+                args_json: "{}".into(),
+            })),
+        )
+        .await
+        .expect("status must not wait for the derivation")
+        .expect("status must answer during a derivation")
+        .into_inner();
+        let value: serde_json::Value = serde_json::from_str(&json.result_json).unwrap();
+        let running = &value["vault_derivation"]["in_progress"];
+        assert_eq!(running["root_path"], root.display().to_string(), "{value}");
+        assert_eq!(running["phase"], "refreshing notes", "{running}");
+        assert_eq!(running["indexed_notes"], 2, "{running}");
+        assert_eq!(value["write_holder"], "vault_derivation");
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            service.brain_status(Request::new(BrainStatusRequest {})),
+        )
+        .await
+        .expect("typed status must not wait for the derivation")
+        .expect("typed status must answer during a derivation");
+
+        release_tx.send(()).unwrap();
+        worker.await.unwrap().unwrap();
+        let after = service
+            .brain_status_json(Request::new(JsonRequest {
+                args_json: "{}".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let after: serde_json::Value = serde_json::from_str(&after.result_json).unwrap();
+        assert!(
+            after["vault_derivation"]["in_progress"].is_null(),
+            "a finished derivation is no longer in progress: {after}"
+        );
+        assert_eq!(after["vault_derivation"]["pending_or_blocked_vaults"], 0);
+    }
+
+    /// Status must not fail outright because its eligibility refresh cannot
+    /// reload the config file: the rows it already has are kept and the
+    /// failure is a warning.
+    #[tokio::test]
+    async fn brain_status_answers_when_the_eligibility_reload_fails() {
+        let Ok(mut state) = Arc::try_unwrap(test_state_with_writer()) else {
+            panic!("the test state has one owner");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        state.effective_config =
+            EffectiveConfigProvenance::Configured(dir.path().join("gone.toml"));
+        let mut value = serde_json::json!({ "repos": [ { "uid": "repo:x" } ] });
+        annotate_brain_status(&state, &mut value);
+        assert_eq!(value["repos"][0]["uid"], "repo:x", "{value}");
+        let warnings = value["warnings"].as_array().expect("a warning");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w["kind"] == "repo_eligibility_unrefreshed"),
+            "{value}"
+        );
     }
 
     /// Counterweight to the policy-skip test: a note the reader cannot read is
@@ -18956,6 +19393,63 @@ repos = ["alpha"]
         assert!(!merge_called.get());
         assert!(state.store.project_exists("proj:old:prepare").unwrap());
         assert_eq!(state.store.graph_generation(), generation_before);
+    }
+
+    /// `list-projects` cannot read membership itself while the daemon holds
+    /// the store, so the daemon's project listing carries each project's
+    /// member repos.
+    #[tokio::test]
+    async fn list_projects_json_carries_member_repos() {
+        let state = test_state_with_writer();
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: "proj:default:web".to_string(),
+                name: "web".to_string(),
+                summary: None,
+                instance_id: "default".to_string(),
+            })
+            .unwrap();
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: "proj:default:empty".to_string(),
+                name: "empty".to_string(),
+                summary: None,
+                instance_id: "default".to_string(),
+            })
+            .unwrap();
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:default:site",
+                "file:///x/site",
+                Some("/x/site"),
+            ))
+            .unwrap();
+        state
+            .store
+            .replace_project_repo_edges(
+                &["proj:default:web".to_string()],
+                &[(
+                    "proj:default:web".to_string(),
+                    "repo:default:site".to_string(),
+                )],
+            )
+            .unwrap();
+        let service = DaemonService::new(Arc::clone(&state));
+        let response = service
+            .list_projects_json(Request::new(JsonRequest {
+                args_json: "{}".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&response.result_json).unwrap();
+        let by_name = |name: &str| rows.iter().find(|row| row["name"] == name).unwrap().clone();
+        assert_eq!(by_name("web")["repos"][0]["uid"], "repo:default:site");
+        assert_eq!(by_name("web")["repos"][0]["name"], "site");
+        assert_eq!(by_name("empty")["repos"], serde_json::json!([]));
     }
 
     #[test]
@@ -23937,6 +24431,7 @@ repos = ["alpha"]
             trigram_reconciler_handle: std::sync::Mutex::new(None),
             embedding_reconciler_handle: std::sync::Mutex::new(None),
             code_link_reconciler_handle: std::sync::Mutex::new(None),
+            cross_repo_relinker_handle: std::sync::Mutex::new(None),
             manifest_recovery: Arc::new(Default::default()),
             manifest_recovery_handle: std::sync::Mutex::new(None),
             watcher_tasks: std::sync::Mutex::new(Vec::new()),
@@ -24393,6 +24888,7 @@ credential_method = "gh"
             trigram_reconciler_handle: std::sync::Mutex::new(None),
             embedding_reconciler_handle: std::sync::Mutex::new(None),
             code_link_reconciler_handle: std::sync::Mutex::new(None),
+            cross_repo_relinker_handle: std::sync::Mutex::new(None),
             manifest_recovery: Arc::new(Default::default()),
             manifest_recovery_handle: std::sync::Mutex::new(None),
             watcher_tasks: std::sync::Mutex::new(Vec::new()),

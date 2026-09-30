@@ -111,7 +111,6 @@ use nestweaver_engine::{
     get_last_indexed_at,
     index_markdown_directory_since_with_ignore_and_write_lease_and_note_limits,
     index_markdown_directory_with_ignore_and_deletion_count_and_write_lease_and_note_limits,
-    index_markdown_directory_with_ignore_and_note_limits,
     index_markdown_directory_with_ignore_and_write_lease_and_note_limits, list_repos,
     list_services, load_alias_sidecar, load_clusters, load_clusters_with_generation, lookup_symbol,
     record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
@@ -1748,6 +1747,10 @@ const ENV_REGISTRY: &[EnvVar] = &[
         role: EnvRole::Internal,
     },
     EnvVar {
+        name: "NESTWEAVER_TEST_STOP_BEFORE_PHASE",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
         name: "NESTWEAVER_TEST_XDG_DEFAULT_CHILD",
         role: EnvRole::Internal,
     },
@@ -1860,8 +1863,8 @@ const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
                   worse than none: exit 64 from an out-of-range or unknown FLAG is raised by the\n      \
                   argument parser BEFORE --json is read, so it writes to stderr and nothing to\n      \
                   stdout. Only an uncompilable --pattern reaches the JSON path. Exit 3 emits a\n      \
-                  candidate list, and `impact` keys it \"status\", not \"error\". A few commands\n      \
-                  (cross-repo-refs, rank) still write nothing on 2. Check the code, then stderr.\n\n\
+                  candidate list, and `impact` keys it \"status\", not \"error\". `read-symbols`\n      \
+                  lists misses under \"not_found\" instead. Check the code, then stderr.\n\n\
                   Shell completions:\n  \
                   nestweaver completions bash > ~/.local/share/bash-completion/completions/nestweaver\n  \
                   nestweaver completions zsh > ~/.zfunc/_nestweaver\n  \
@@ -3174,6 +3177,200 @@ fn render_investigate_text(payload: &serde_json::Value) {
         "\nDrill in: nestweaver investigate-expand {} --targets <asset_id,...>",
         text(payload, "bundle_id")
     );
+}
+
+/// `list-projects` on the direct route: the projects, with each one's member
+/// repos recorded into `members`.
+fn direct_projects_with_members(
+    store: &nestweaver_store::GraphStore,
+    members: &mut ProjectMemberRepos,
+) -> anyhow::Result<Vec<nestweaver_schema::Project>> {
+    let projects = store.list_projects().map_err(|e| anyhow::anyhow!(e))?;
+    for project in &projects {
+        members.insert(
+            project.name.clone(),
+            nestweaver_engine::project_member_repos(store, &project.uid)?,
+        );
+    }
+    Ok(projects)
+}
+
+/// The remedy `cluster <id>` prints on a miss. It used to list EVERY
+/// community (2.2 MB of stderr for `cluster 999999999` on a real graph); now
+/// it is the count, the id range, the largest few, and the command that
+/// lists them all.
+fn cluster_not_found_hint(output: &nestweaver_engine::ClusteringOutput) -> String {
+    const SHOWN: usize = 10;
+    let communities = &output.communities;
+    if communities.is_empty() {
+        return format!(
+            "There are no clusters at resolution {}; run `nestweaver clusters` to compute them.",
+            output.resolution
+        );
+    }
+    let min = communities.iter().map(|c| c.id).min().unwrap_or(0);
+    let max = communities.iter().map(|c| c.id).max().unwrap_or(0);
+    let mut largest: Vec<&nestweaver_engine::CommunityInfo> = communities.iter().collect();
+    largest.sort_by(|a, b| b.member_count.cmp(&a.member_count).then(a.id.cmp(&b.id)));
+    let shown: Vec<String> = largest
+        .iter()
+        .take(SHOWN)
+        .map(|c| {
+            let name: String = c.name.chars().take(60).collect();
+            format!("[{}] {name}", c.id)
+        })
+        .collect();
+    format!(
+        "{} clusters at resolution {} (ids {min}-{max}). Largest: {}{}. Run `nestweaver \
+         clusters` to list them all.",
+        communities.len(),
+        output.resolution,
+        shown.join(", "),
+        if communities.len() > SHOWN {
+            ", ..."
+        } else {
+            ""
+        }
+    )
+}
+
+/// The engine's miss for a bundle id no live bundle has, found anywhere in
+/// `error`'s chain (the daemon route wraps it).
+fn bundle_miss_message(error: &anyhow::Error, bundle_id: &str) -> Option<String> {
+    let expected = format!("bundle '{bundle_id}' not found or expired");
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains(&expected))
+        .then(|| {
+            format!(
+                "{expected}; bundles expire after 24 hours, so run `nestweaver investigate` \
+                 again for a new one"
+            )
+        })
+}
+
+/// `investigate-expand` / `investigate-hydrate` on an unknown or expired
+/// bundle: exit 2 with the not-found envelope under `--json`, like every
+/// other read command's miss. It used to be exit 1 with the RPC wrapper.
+fn report_bundle_miss(error: &anyhow::Error, bundle_id: &str, json: bool) -> Option<i32> {
+    let message = bundle_miss_message(error, bundle_id)?;
+    if json {
+        print_json_not_found_detail("bundle_id", &serde_json::json!(bundle_id), Some(&message));
+    }
+    eprintln!("{message}");
+    Some(EXIT_NOT_FOUND)
+}
+
+/// `investigate-expand` text, from the result's JSON so the daemon and
+/// direct routes print the same thing. An entry whose body could not be read
+/// says why rather than printing an empty block.
+fn render_investigate_expand_text(payload: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+    let text = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let list = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut out = String::new();
+    let unresolved: Vec<String> = list("unresolved")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    if !unresolved.is_empty() {
+        let _ = writeln!(out, "Unresolved targets: {}", unresolved.join(", "));
+    }
+    let neighbors = list("neighbors");
+    for entry in list("expanded") {
+        let asset_id = text(&entry, "asset_id");
+        let _ = writeln!(
+            out,
+            "\n=== {asset_id}  {} ({}) ===",
+            text(&entry, "title"),
+            text(&entry, "location")
+        );
+        match entry.get("inline_body").and_then(|v| v.as_str()) {
+            Some(body) => {
+                let _ = writeln!(out, "{body}");
+            }
+            None => {
+                if let Some(reason) = entry.get("unavailable_reason").and_then(|v| v.as_str()) {
+                    let _ = writeln!(out, "(body unavailable: {reason})");
+                }
+            }
+        }
+        let own: Vec<&serde_json::Value> = neighbors
+            .iter()
+            .filter(|n| n.get("of").and_then(|v| v.as_str()) == Some(asset_id.as_str()))
+            .collect();
+        if !own.is_empty() {
+            let _ = writeln!(out, "-- neighbors --");
+            for n in own {
+                let _ = writeln!(
+                    out,
+                    "  [{}] {} ({})",
+                    text(n, "relation"),
+                    text(n, "title"),
+                    text(n, "uid")
+                );
+            }
+        }
+    }
+    out
+}
+
+/// `investigate-hydrate` text, from the result's JSON (see
+/// [`render_investigate_expand_text`]).
+fn render_investigate_hydrate_text(payload: &serde_json::Value) -> String {
+    let entries = payload
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let hydrated = payload
+        .get("hydrated")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let truncated_count = entries
+        .iter()
+        .filter(|e| {
+            e.get("inline_body").is_some_and(|v| !v.is_null())
+                && !e
+                    .get("body_complete")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true)
+        })
+        .count();
+    let mut out = format!(
+        "Hydrated {hydrated} entr{} in bundle {}{}\n",
+        if hydrated == 1 { "y" } else { "ies" },
+        payload
+            .get("bundle_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+        if truncated_count > 0 {
+            format!(" ({truncated_count} truncated — use read_symbols for full source)")
+        } else {
+            String::new()
+        }
+    );
+    if let Some(reasons) = payload.get("skipped_reasons").and_then(|v| v.as_object()) {
+        for (reason, count) in reasons {
+            out.push_str(&format!(
+                "  skipped {}: {reason}\n",
+                count.as_u64().unwrap_or(0)
+            ));
+        }
+    }
+    out
 }
 
 /// Print a change-impact payload's `notifications` as `[level] message`, the
@@ -5107,6 +5304,13 @@ fn format_daemon_status_response(
             {
                 lines.push(line);
             }
+            if let Some(line) = status
+                .cross_repo_links
+                .as_ref()
+                .and_then(format_cross_repo_links_status)
+            {
+                lines.push(line);
+            }
             // nw-705: repositories the manifest rebuild refused, by name.
             lines.extend(format_manifest_failures_status(&status.manifest_failures));
             // nw-585: indexed, but without their frontmatter -- not skipped.
@@ -5227,6 +5431,7 @@ mod daemon_status_renderer_tests {
             last_reconciled_at: String::new(),
             notes_changed_since_indexing: Vec::new(),
             unscoped_projects: Vec::new(),
+            unscoped_project_names: Vec::new(),
             notes_changed_as_of: String::new(),
         };
         let status = nestweaver_proto::BrainStatusResponse {
@@ -5253,6 +5458,26 @@ mod daemon_status_renderer_tests {
             ..owed
         };
         assert_eq!(format_code_links_status(&current), None);
+    }
+
+    /// Status names an unscoped project by its name, not its uid; an older
+    /// daemon that sends only uids still renders them.
+    #[test]
+    fn unscoped_projects_render_by_name() {
+        let links = nestweaver_proto::CodeLinksStatus {
+            unscoped_projects: vec!["proj:default:abc123".to_string()],
+            unscoped_project_names: vec!["Website".to_string()],
+            ..Default::default()
+        };
+        let line = format_code_links_status(&links).expect("a gap line");
+        assert!(line.contains("project(s) Website declare repos"), "{line}");
+        assert!(!line.contains("proj:default:abc123"), "{line}");
+        let older = nestweaver_proto::CodeLinksStatus {
+            unscoped_project_names: Vec::new(),
+            ..links
+        };
+        let line = format_code_links_status(&older).expect("a gap line");
+        assert!(line.contains("proj:default:abc123"), "{line}");
     }
 
     /// nw-705: every repo the manifest rebuild refused is named on the
@@ -5737,7 +5962,7 @@ enum Commands {
     /// removes the canonical sidecar or the keyed copy matching its current
     /// resolution.
     #[command(
-        after_help = "Examples:\n  nestweaver repair\n  nestweaver repair --db ~/brain/.nestweaver/brain.lbug\n  nestweaver repair --json\n  nestweaver repair --force        # marker carries no usable writer pid\n\nExits 0 when the publication is clean or was recovered, 1 when it is dirty\nand could not be recovered. Database/publication ownership is never overridden,\neven with --force; stop that process first.\n\nAlso reclaims orphaned Tantivy migration staging directories\n(.nestweaver-tantivy-reindex-*) left beside <db>.tantivy by a crashed schema\nmigration, and reports what was removed (or, under --dry-run, what would be).\nA database directory can hold thirteen sidecar artifacts in total\n(.code_links.json, .filemeta.json, .generation, .manifests.json,\n.pagerank.json, .parsed_cache.bin, .publications/, .resolution_deps.bin,\n.resolver_generation.json, .tantivy/, .wal, .write.lock, plus .regex-v3/\nunder --with-trigrams) — all safe to leave alone; only files matching the\nstaging prefix above are ever removed by this command.\n\nAlso reclaims orphaned resolution-keyed cluster sidecars\n(<db>.clusters.<resolution>.json), other than the canonical <db>.clusters.json\nand the keyed copy matching its current resolution, and reports what was\nremoved (or, under --dry-run, what would be)."
+        after_help = "Examples:\n  nestweaver repair\n  nestweaver repair --db ~/brain/.nestweaver/brain.lbug\n  nestweaver repair --json\n  nestweaver repair --force        # marker carries no usable writer pid\n\nExits 0 when the publication is clean or was recovered, 1 when it is dirty\nand could not be recovered. Database/publication ownership is never overridden,\neven with --force; stop that process first.\n\nAlso reclaims orphaned Tantivy migration staging directories\n(.nestweaver-tantivy-reindex-*) left beside <db>.tantivy by a crashed schema\nmigration, and reports what was removed (or, under --dry-run, what would be).\nA database directory can hold fifteen sidecar artifacts in total\n(.code_links.json, .cross_repo_links.json, .filemeta.json, .generation, .manifests.json,\n.pagerank.json, .parsed_cache.bin, .parsed_cache.log, .publications/, .resolution_deps.bin,\n.resolver_generation.json, .tantivy/, .wal, .write.lock, plus .regex-v3/\nunder --with-trigrams) — all safe to leave alone; only files matching the\nstaging prefix above are ever removed by this command.\n\nAlso reclaims orphaned resolution-keyed cluster sidecars\n(<db>.clusters.<resolution>.json), other than the canonical <db>.clusters.json\nand the keyed copy matching its current resolution, and reports what was\nremoved (or, under --dry-run, what would be)."
     )]
     Repair {
         #[arg(
@@ -9910,12 +10135,24 @@ fn wholly_inferred_write_refusal(
 ) -> Option<String> {
     wholly_inferred_write_message(
         &format!("Error: refusing to {action}"),
+        WRITE_REFUSAL_REMEDY,
         repo_stated,
         db_source,
         repo_path,
         db_path,
     )
 }
+
+/// The remedy the refusing commands (`index`, `watch`) print: both accept
+/// `--repo`, `--db` and `--config`.
+const WRITE_REFUSAL_REMEDY: &str = "State either end: `--repo <path>` to confirm the source, \
+     or `--db <path>` / `--config <file>` to confirm the target.";
+
+/// The remedy the `investigate*` commands print. They take neither `--repo`
+/// nor `--config` (the source is `--root`), so the refusal's remedy named two
+/// flags these commands reject.
+const INVESTIGATE_WRITE_REMEDY: &str = "State either end: `--root <path>` to confirm the \
+     source, or `--db <path>` to confirm the target.";
 
 /// The same property as [`wholly_inferred_write_refusal`], reported rather
 /// than enforced.
@@ -9935,6 +10172,7 @@ fn wholly_inferred_write_warning(
 ) -> Option<String> {
     wholly_inferred_write_message(
         &format!("Warning: {action}"),
+        INVESTIGATE_WRITE_REMEDY,
         repo_stated,
         db_source,
         repo_path,
@@ -9944,6 +10182,7 @@ fn wholly_inferred_write_warning(
 
 fn wholly_inferred_write_message(
     lead: &str,
+    remedy: &str,
     repo_stated: bool,
     db_source: DbSource,
     repo_path: &Path,
@@ -9956,8 +10195,7 @@ fn wholly_inferred_write_message(
         "{lead}: neither the source nor the target was stated.\n  \
          source: {} (detected from the current directory)\n  \
          target: {} (from the NESTWEAVER_DB environment variable)\n\
-         State either end: `--repo <path>` to confirm the source, \
-         or `--db <path>` / `--config <file>` to confirm the target.",
+         {remedy}",
         repo_path.display(),
         db_path.display(),
     ))
@@ -10185,6 +10423,50 @@ fn reconcile_code_links_direct(
     }
 }
 
+/// Record that the direct index route owes a whole-graph cross-repo pass,
+/// and return the store to run it with. When the store cannot be opened the
+/// debt is recorded anyway (the links stay owed and disclosed).
+fn record_cross_repo_debt_direct(
+    db_path: &Path,
+    write_lease: &nestweaver_daemon::lifecycle::DbWriteLease,
+    reason: &str,
+) -> Option<GraphStore> {
+    match GraphStore::open_with_authority(db_path, write_lease) {
+        Ok(store) => {
+            nestweaver_engine::cross_repo_links::mark_cross_repo_links_owed(&store, reason);
+            Some(store)
+        }
+        Err(error) => {
+            nestweaver_engine::cross_repo_links::mark_cross_repo_links_pending(db_path, reason);
+            tracing::warn!(
+                "cross-repo link inference skipped — cannot open DB for writing; the links stay owed: {error:#}"
+            );
+            None
+        }
+    }
+}
+
+/// Records the direct index's cross-repo link debt when the run returns
+/// before its whole-graph pass.
+struct CrossRepoDebtOnEarlyExit<'a> {
+    db_path: &'a Path,
+    lease: &'a nestweaver_daemon::lifecycle::DbWriteLease,
+    reason: String,
+    armed: bool,
+}
+
+impl Drop for CrossRepoDebtOnEarlyExit<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            drop(record_cross_repo_debt_direct(
+                self.db_path,
+                self.lease,
+                &self.reason,
+            ));
+        }
+    }
+}
+
 /// nw-705: `suggest-links` text names the repositories whose manifests could
 /// not be rebuilt, since their package links are missing from the answer.
 fn print_manifest_failures_note(failures: &serde_json::Value) {
@@ -10239,6 +10521,28 @@ fn format_manifest_failures_status(
     lines
 }
 
+/// The one `brain status` line for owed cross-repo links, shared by the
+/// typed (daemon) and JSON (direct) renderers. `None` when nothing is owed.
+fn format_cross_repo_links_status(
+    links: &nestweaver_proto::CrossRepoLinksStatus,
+) -> Option<String> {
+    if !links.pending {
+        return None;
+    }
+    let mut line = format!("Cross-repo links: being re-inferred ({}", links.reason);
+    if !links.since.is_empty() {
+        line.push_str(&format!(", since {}", links.since));
+    }
+    line.push_str("); cross-repo impact may miss links until it finishes");
+    if !links.last_error.is_empty() {
+        line.push_str(&format!(
+            "; last attempt failed ({} time(s)): {}; retrying",
+            links.failures, links.last_error
+        ));
+    }
+    Some(line)
+}
+
 /// nw-670 review M3: the one `brain status` line for owed note->code links,
 /// shared by the typed (daemon) and JSON (direct) renderers. `None` when
 /// nothing is owed and the stored links match this binary's rules.
@@ -10262,9 +10566,16 @@ fn format_code_links_status(links: &nestweaver_proto::CodeLinksStatus) -> Option
         ));
     }
     if !links.unscoped_projects.is_empty() {
+        // Names when the daemon sent them (index for index); an older daemon
+        // sends only uids.
+        let named = if links.unscoped_project_names.len() == links.unscoped_projects.len() {
+            &links.unscoped_project_names
+        } else {
+            &links.unscoped_projects
+        };
         gaps.push(format!(
             "project(s) {} declare repos that resolve to none, so their notes link unscoped",
-            links.unscoped_projects.join(", ")
+            named.join(", ")
         ));
     }
     if !links.pending && !migration_owed {
@@ -18595,15 +18906,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         print_json_not_found("cluster", &id_or_name);
                     }
                     eprintln!("Cluster '{}' not found.", id_or_name);
-                    eprintln!(
-                        "Available clusters: {}",
-                        output
-                            .communities
-                            .iter()
-                            .map(|c| format!("[{}] {}", c.id, c.name))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
+                    eprintln!("{}", cluster_not_found_hint(&output));
                     Ok((EXIT_NOT_FOUND, None))
                 }
             }
@@ -20107,6 +20410,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             let watcher = CodeWatcher::new(&db_path, &repo_path, &instance_id)
                 .with_limits(index_limits)
+                // No daemon pays the cross-repo link debt this watcher's
+                // batches record; a relinker beside it does, and stops with it.
+                .with_cross_repo_relinker(
+                    nestweaver_engine::cross_repo_links::CrossRepoRelinkTiming::default(),
+                )
                 .with_instance_config(
                     config
                         .as_deref()
@@ -22192,6 +22500,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             require_existing_db(&resolved_db)?;
 
             // ── daemon guard ──────────────────────────────────────
+            let mut member_repos = ProjectMemberRepos::new();
             let materialized: Vec<nestweaver_schema::Project> = if use_daemon {
                 let db_path = resolved_db.clone();
                 let args = serde_json::json!({});
@@ -22213,20 +22522,40 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "list_projects",
                     args,
                 )? {
-                    Some(value) => serde_json::from_value(unwrap_hybrid_payload(value))
-                        .context("decode projects from the daemon")?,
+                    Some(value) => {
+                        let rows: Vec<serde_json::Value> =
+                            serde_json::from_value(unwrap_hybrid_payload(value))
+                                .context("decode projects from the daemon")?;
+                        let mut projects = Vec::with_capacity(rows.len());
+                        for row in rows {
+                            let project: nestweaver_schema::Project =
+                                serde_json::from_value(row.clone())
+                                    .context("decode projects from the daemon")?;
+                            // Absent from an older daemon: then nothing is
+                            // claimed about membership.
+                            if let Some(repos) = row.get("repos") {
+                                member_repos.insert(
+                                    project.name.clone(),
+                                    serde_json::from_value(repos.clone())
+                                        .context("decode project member repos")?,
+                                );
+                            }
+                            projects.push(project);
+                        }
+                        projects
+                    }
                     None => {
                         // The direct store cannot honour a pinned config, so
                         // falling back would silently target a different
                         // instance than the caller named.
                         ensure_direct_store_fallback_allowed(&resolved_db, config.as_deref())?;
                         let store = open_store(Some(&resolved_db))?;
-                        store.list_projects().map_err(|e| anyhow::anyhow!(e))?
+                        direct_projects_with_members(&store, &mut member_repos)?
                     }
                 }
             } else {
                 let store = open_store(Some(&resolved_db))?;
-                store.list_projects().map_err(|e| anyhow::anyhow!(e))?
+                direct_projects_with_members(&store, &mut member_repos)?
             };
 
             // When --config is provided, also surface declared projects from
@@ -22260,7 +22589,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             print!(
                 "{}",
-                render_list_projects(&materialized, &declared_only, &repo_issues, json)?
+                render_list_projects(
+                    &materialized,
+                    &declared_only,
+                    &repo_issues,
+                    &member_repos,
+                    json
+                )?
             );
             Ok((EXIT_SUCCESS, None))
         }
@@ -22566,10 +22901,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // repo got empty bodies again regardless of the daemon-side
                 // fix.
                 let args = investigate_rpc_args(&bundle_id, Some(&targets), None, root.as_deref());
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "investigate_expand", args)?
+                let routed = try_hybrid_json_rpc(true, &db_path, None, "investigate_expand", args);
+                if let Err(error) = &routed
+                    && let Some(code) = report_bundle_miss(error, &bundle_id, json)
                 {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((code, None));
+                }
+                if let Some(value) = routed? {
+                    // `--json` used to be a no-op here: the daemon route
+                    // printed JSON either way.
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        print!("{}", render_investigate_expand_text(&value));
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -22581,36 +22926,26 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // `detect_repo_root()` here — a single directory-walk guess is
             // no better than the daemon's old cwd default when the caller's
             // cwd is outside every indexed repo.
-            let result = nestweaver_engine::investigate_expand(
+            let result = match nestweaver_engine::investigate_expand(
                 &store,
                 &db_path,
                 root.as_deref(),
                 &bundle_id,
                 &targets,
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(error) => match report_bundle_miss(&error, &bundle_id, json) {
+                    Some(code) => return Ok((code, None)),
+                    None => return Err(error),
+                },
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                if !result.unresolved.is_empty() {
-                    println!("Unresolved targets: {}", result.unresolved.join(", "));
-                }
-                for e in &result.expanded {
-                    println!("\n=== {}  {} ({}) ===", e.asset_id, e.title, e.location);
-                    if let Some(body) = &e.inline_body {
-                        println!("{body}");
-                    }
-                    let neighbors: Vec<&nestweaver_engine::NeighborRef> = result
-                        .neighbors
-                        .iter()
-                        .filter(|n| n.of == e.asset_id)
-                        .collect();
-                    if !neighbors.is_empty() {
-                        println!("-- neighbors --");
-                        for n in neighbors {
-                            println!("  [{}] {} ({})", n.relation, n.title, n.uid);
-                        }
-                    }
-                }
+                print!(
+                    "{}",
+                    render_investigate_expand_text(&serde_json::to_value(&result)?)
+                );
             }
             Ok((EXIT_SUCCESS, None))
         }
@@ -22646,10 +22981,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // overridden by the client's cwd.
                 let args =
                     investigate_rpc_args(&bundle_id, None, Some(token_budget), root.as_deref());
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "investigate_hydrate", args)?
+                let routed = try_hybrid_json_rpc(true, &db_path, None, "investigate_hydrate", args);
+                if let Err(error) = &routed
+                    && let Some(code) = report_bundle_miss(error, &bundle_id, json)
                 {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((code, None));
+                }
+                if let Some(value) = routed? {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        print!("{}", render_investigate_hydrate_text(&value));
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -22657,31 +23000,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let store = open_store(Some(&db_path))?;
             // nw-560: pass an omitted `--root` through as `None` — see the
             // matching comment in `investigate-expand` above.
-            let result = nestweaver_engine::investigate_hydrate(
+            let result = match nestweaver_engine::investigate_hydrate(
                 &store,
                 &db_path,
                 root.as_deref(),
                 &bundle_id,
                 Some(token_budget),
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(error) => match report_bundle_miss(&error, &bundle_id, json) {
+                    Some(code) => return Ok((code, None)),
+                    None => return Err(error),
+                },
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                let truncated_count = result
-                    .entries
-                    .iter()
-                    .filter(|e| e.inline_body.is_some() && !e.body_complete)
-                    .count();
-                println!(
-                    "Hydrated {} entr{} in bundle {}{}",
-                    result.hydrated,
-                    if result.hydrated == 1 { "y" } else { "ies" },
-                    result.bundle_id,
-                    if truncated_count > 0 {
-                        format!(" ({truncated_count} truncated — use read_symbols for full source)")
-                    } else {
-                        String::new()
-                    }
+                print!(
+                    "{}",
+                    render_investigate_hydrate_text(&serde_json::to_value(&result)?)
                 );
             }
             Ok((EXIT_SUCCESS, None))
@@ -23183,6 +23520,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // cochange and the trigram rebuild below. Dropping it here would
             // make this a probe again.
             let write_lease = require_exclusive_store_access(&db_path, "index")?;
+            // Records the cross-repo link debt if the run ends early (an
+            // index error may still have committed), as the daemon records it
+            // whatever the index's outcome.
+            let mut cross_repo_debt = CrossRepoDebtOnEarlyExit {
+                db_path: &db_path,
+                lease: &write_lease,
+                reason: format!("code re-index of {}", repo_path.display()),
+                armed: true,
+            };
 
             let (files_count, symbols_count, edges_count);
             let skipped_files;
@@ -23328,6 +23674,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 config.as_deref(),
                 &format!("code re-index of {}", repo_path.display()),
             );
+            // Once per run: re-infer every name-matched cross-repo link over
+            // the whole graph, so the links do not depend on the order
+            // repositories were indexed in and a re-index restores the links
+            // other repositories had into this one.
+            cross_repo_debt.armed = false;
+            if let Some(store) =
+                record_cross_repo_debt_direct(&db_path, &write_lease, &cross_repo_debt.reason)
+                && let Some(report) = nestweaver_engine::cross_repo_links::reconcile_after_index(
+                    &store,
+                    &db_path,
+                    index_limits,
+                    None,
+                )
+            {
+                out.status(&format!(
+                    "Cross-repo links: {} inferred over {} repositories ({} files, {} re-parsed) in {} ms.",
+                    report.links, report.repos, report.files, report.reparsed, report.elapsed_ms
+                ));
+            }
 
             // Feature F12: mine git history and write the recency sidecar so
             // subsequent commands demote dormant code at rank-read time.
@@ -28499,6 +28864,121 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
     /// invocation already passed (nw-328/nw-329's actual shape) cannot be
     /// expressed as a static per-string check. Both stay covered only by the
     /// one-row-per-bug table in `tests/error_remedy_test.rs`.
+    /// An unknown bundle is a miss (exit 2, not-found envelope) whether the
+    /// engine's error arrives bare (direct route) or wrapped (daemon route);
+    /// any other failure is not.
+    #[test]
+    fn an_unknown_bundle_is_a_not_found_miss_on_both_routes() {
+        let bare = anyhow::anyhow!("bundle 'bndl_x' not found or expired");
+        let wrapped =
+            anyhow::anyhow!("tool investigate_expand failed: bundle 'bndl_x' not found or expired")
+                .context("investigate_expand RPC failed");
+        for error in [&bare, &wrapped] {
+            let message = bundle_miss_message(error, "bndl_x").expect("a miss");
+            assert!(message.starts_with("bundle 'bndl_x' not found or expired"));
+            let payload =
+                json_not_found_payload("bundle_id", &serde_json::json!("bndl_x"), Some(&message));
+            assert_eq!(payload["error"], "not found");
+            assert_eq!(payload["bundle_id"], "bndl_x");
+        }
+        assert_eq!(
+            report_bundle_miss(&bare, "bndl_x", false),
+            Some(EXIT_NOT_FOUND)
+        );
+        let other = anyhow::anyhow!("cannot read the bundle store at /x: denied");
+        assert!(bundle_miss_message(&other, "bndl_x").is_none());
+        assert!(report_bundle_miss(&other, "bndl_x", false).is_none());
+        // Another bundle's miss is not this one's.
+        assert!(bundle_miss_message(&bare, "bndl_y").is_none());
+    }
+
+    /// Both investigate drill-in commands print text from the same JSON on
+    /// either route, and an entry with no body says why.
+    #[test]
+    fn investigate_drill_in_text_renders_from_json() {
+        let expand = serde_json::json!({
+            "bundle_id": "bndl_x",
+            "unresolved": ["zzz"],
+            "expanded": [
+                { "asset_id": "a1", "title": "greet", "location": "a.ts:1",
+                  "inline_body": "function greet() {}" },
+                { "asset_id": "a2", "title": "gone", "location": "b.ts:1",
+                  "unavailable_reason": "source changed since indexing" }
+            ],
+            "neighbors": [
+                { "of": "a1", "uid": "sym:x", "kind": "Symbol", "title": "hello",
+                  "relation": "callee" }
+            ]
+        });
+        let text = render_investigate_expand_text(&expand);
+        assert!(text.contains("Unresolved targets: zzz"), "{text}");
+        assert!(text.contains("=== a1  greet (a.ts:1) ==="), "{text}");
+        assert!(text.contains("function greet() {}"), "{text}");
+        assert!(text.contains("[callee] hello (sym:x)"), "{text}");
+        assert!(
+            text.contains("(body unavailable: source changed since indexing)"),
+            "{text}"
+        );
+        assert!(
+            !text.trim_start().starts_with('{'),
+            "text, not JSON: {text}"
+        );
+
+        let hydrate = serde_json::json!({
+            "bundle_id": "bndl_x",
+            "hydrated": 1,
+            "entries": [ { "asset_id": "a1", "inline_body": "x", "body_complete": false } ],
+            "skipped_reasons": { "no longer exists": 2 }
+        });
+        let text = render_investigate_hydrate_text(&hydrate);
+        assert!(
+            text.starts_with("Hydrated 1 entry in bundle bndl_x (1 truncated"),
+            "{text}"
+        );
+        assert!(text.contains("skipped 2: no longer exists"), "{text}");
+    }
+
+    /// The `investigate*` bundle-cache warning is assembled at run time, so
+    /// the literal-remedy sweep below never sees it. It told the reader to
+    /// pass `--repo` or `--config`, which none of the three commands accept;
+    /// every flag it names must be one the command parses.
+    #[test]
+    fn investigate_cache_warning_names_only_flags_the_command_accepts() {
+        let root = on_big_stack(|| {
+            let mut root = Cli::command();
+            root.build();
+            root
+        });
+        for command in ["investigate", "investigate-expand", "investigate-hydrate"] {
+            let message = wholly_inferred_write_warning(
+                &format!("{command} is writing its bundle cache beside a database nobody named"),
+                false,
+                DbSource::Env,
+                std::path::Path::new("/tmp/checkout"),
+                std::path::Path::new("/tmp/ambient.lbug"),
+            )
+            .expect("neither end stated warns");
+            let flags = command_flag_names(root.find_subcommand(command).expect(command));
+            let named: Vec<&str> = message
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .filter_map(|span| span.split_whitespace().next())
+                .filter(|token| token.starts_with("--"))
+                .collect();
+            assert!(
+                !named.is_empty(),
+                "{command}: the warning names a remedy: {message}"
+            );
+            for flag in named {
+                assert!(
+                    flags.contains(flag.trim_start_matches('-')) || flags.contains(flag),
+                    "{command} does not accept {flag}: {message}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn backtick_quoted_remedies_name_real_flags_on_real_command_paths() {
         let root = on_big_stack(|| {
@@ -29925,12 +30405,36 @@ fn run_publication_rebuild(
     let incumbent_identity = incumbent_store
         .publication_identity()?
         .ok_or_else(|| anyhow::anyhow!("incumbent database has no publication identity"))?;
-    let sources = nestweaver_engine::PublicationSourceManifest::capture(&incumbent_store)?;
+    // A resume reuses the recorded per-file digests wherever a strong change
+    // token proves the file is unchanged, so only changed files are reread.
+    let recorded_inputs = operation_uuid.and_then(|operation_uuid| {
+        nestweaver_engine::publication_operation::load_operation_inputs(
+            &publication_root,
+            operation_uuid,
+        )
+    });
+    let sources = match recorded_inputs.as_ref() {
+        Some(recorded) => recorded
+            .sources
+            .recapture_for_validation(&incumbent_store)?,
+        None => nestweaver_engine::PublicationSourceManifest::capture(&incumbent_store)?,
+    };
     let preserved_state =
         nestweaver_engine::publication_state::PreservedStateSnapshot::capture(&incumbent_db)?;
     let preserved_state_fingerprint = preserved_state.fingerprint()?;
     let input_fingerprint =
         publication_input_fingerprint(&sources, config_path, &preserved_state_fingerprint)?;
+    let config_blake3 = nestweaver_engine::hash::blake3_hex_bytes(
+        &std::fs::read(config_path)
+            .with_context(|| format!("read publication config {}", config_path.display()))?,
+    );
+    let current_inputs = nestweaver_engine::publication_operation::PublicationOperationInputs {
+        version: nestweaver_engine::publication_operation::OPERATION_INPUTS_VERSION,
+        input_fingerprint: input_fingerprint.clone(),
+        config_blake3,
+        preserved_state_fingerprint: preserved_state_fingerprint.clone(),
+        sources: sources.clone(),
+    };
     drop(incumbent_store);
     let current = nestweaver_engine::publication::read_current(&publication_root)?;
     if let Some(current) = current.as_ref()
@@ -29944,6 +30448,35 @@ fn run_publication_rebuild(
         );
     }
 
+    let create_operation = || -> anyhow::Result<
+        nestweaver_engine::publication_operation::PublicationOperationState,
+    > {
+        let target = incumbent_identity.next_publication()?;
+        let plan = nestweaver_engine::publication_operation::PublicationOperationPlan {
+            operation_uuid: uuid::Uuid::new_v4().to_string(),
+            brain_uuid: incumbent_identity.brain_uuid.clone(),
+            target_publication_uuid: target.publication_uuid,
+            expected_current_publication_uuid: current
+                .as_ref()
+                .map(|pointer| pointer.publication_uuid.clone()),
+            input_fingerprint: input_fingerprint.clone(),
+            producer_version: env!("CARGO_PKG_VERSION").to_string(),
+            publication_format_version: nestweaver_engine::snapshot::SNAPSHOT_FORMAT_VERSION,
+            created_unix_millis: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis()
+                .try_into()?,
+        };
+        let created =
+            nestweaver_engine::publication_operation::create_operation(&publication_root, plan)?;
+        eprintln!("Publication operation: {}", created.plan.operation_uuid);
+        nestweaver_engine::publication_operation::write_operation_inputs(
+            &publication_root,
+            &created.plan.operation_uuid,
+            &current_inputs,
+        )?;
+        Ok(created)
+    };
     let mut state = if let Some(operation_uuid) = operation_uuid {
         let loaded = nestweaver_engine::publication_operation::load_operation(
             &publication_root,
@@ -29953,6 +30486,11 @@ fn run_publication_rebuild(
         requested.input_fingerprint = input_fingerprint.clone();
         requested.producer_version = env!("CARGO_PKG_VERSION").to_string();
         requested.publication_format_version = nestweaver_engine::snapshot::SNAPSHOT_FORMAT_VERSION;
+        let inputs_drifted = loaded.plan.input_fingerprint != input_fingerprint
+            && loaded.plan.producer_version == requested.producer_version
+            && loaded.plan.publication_format_version == requested.publication_format_version
+            && !loaded.cancel_requested
+            && nestweaver_engine::publication_operation::phase_accepts_rescope(loaded.phase);
         if loaded.cancel_requested {
             let cancelled = nestweaver_engine::publication_operation::acknowledge_cancel(
                 &publication_root,
@@ -29968,6 +30506,111 @@ fn run_publication_rebuild(
                 );
             }
             return Ok(EXIT_ERROR);
+        } else if inputs_drifted {
+            let slot = nestweaver_engine::publication::slot_path(
+                &publication_root,
+                &loaded.plan.target_publication_uuid,
+            )?;
+            let scope = match recorded_inputs.as_ref() {
+                _ if slot
+                    .join(nestweaver_engine::publication::PUBLICATION_MANIFEST_FILE)
+                    .exists() =>
+                {
+                    nestweaver_engine::publication_operation::ResumeScope::Restart(
+                        "its staged publication is already sealed".to_string(),
+                    )
+                }
+                Some(recorded) if recorded.input_fingerprint == loaded.plan.input_fingerprint => {
+                    nestweaver_engine::publication_operation::plan_resume_scope(
+                        recorded,
+                        &sources,
+                        &current_inputs.config_blake3,
+                        &preserved_state_fingerprint,
+                    )
+                }
+                _ => nestweaver_engine::publication_operation::ResumeScope::Restart(
+                    "it has no record of the inputs it was built from".to_string(),
+                ),
+            };
+            match scope {
+                nestweaver_engine::publication_operation::ResumeScope::Restart(reason) => {
+                    eprintln!(
+                        "Resume cannot re-index only what changed: {reason}. Discarding operation {} and starting a full rebuild.",
+                        loaded.plan.operation_uuid
+                    );
+                    let latest = if loaded.failure.is_none() {
+                        nestweaver_engine::publication_operation::record_failure(
+                            &publication_root,
+                            &loaded.plan.operation_uuid,
+                            loaded.revision,
+                            "publication_inputs_changed",
+                            format!("resume could not be scoped: {reason}"),
+                            false,
+                        )?
+                    } else {
+                        loaded
+                    };
+                    nestweaver_engine::publication_operation::discard_operation(
+                        &publication_root,
+                        &latest.plan.operation_uuid,
+                        latest.revision,
+                        &root_lock,
+                    )?;
+                    create_operation()?
+                }
+                nestweaver_engine::publication_operation::ResumeScope::Unchanged => {
+                    anyhow::bail!(
+                        "publication inputs changed in a way resume cannot attribute to a source; discard operation {} and rebuild",
+                        loaded.plan.operation_uuid
+                    );
+                }
+                nestweaver_engine::publication_operation::ResumeScope::Rescope {
+                    repos,
+                    vaults,
+                    preserved_state_changed,
+                } => {
+                    let mut invalidated = Vec::new();
+                    let mut names = Vec::new();
+                    for repo in sources
+                        .repos
+                        .iter()
+                        .filter(|repo| repos.contains(&repo.uid))
+                    {
+                        invalidated.push(publication_graph_checkpoint("repo", &repo.uid));
+                        names.push(format!("repository {}", repo.url));
+                    }
+                    for vault in sources
+                        .vaults
+                        .iter()
+                        .filter(|vault| vaults.contains(&vault.uid))
+                    {
+                        invalidated.push(publication_graph_checkpoint("vault", &vault.uid));
+                        names.push(format!("vault {}", vault.name));
+                    }
+                    if preserved_state_changed {
+                        names.push("preserved interaction history".to_string());
+                    }
+                    eprintln!(
+                        "Resume: {} input(s) changed since the build recorded them ({}); re-indexing only those, then rebuilding derived state and validating.",
+                        names.len(),
+                        names.join(", ")
+                    );
+                    // Record the new inputs first: a crash before the journal
+                    // update leaves a record the journal does not match, which
+                    // a later resume treats as unscoped (full rebuild).
+                    nestweaver_engine::publication_operation::write_operation_inputs(
+                        &publication_root,
+                        &loaded.plan.operation_uuid,
+                        &current_inputs,
+                    )?;
+                    nestweaver_engine::publication_operation::rescope_operation(
+                        &publication_root,
+                        &requested,
+                        loaded.revision,
+                        &invalidated,
+                    )?
+                }
+            }
         } else if loaded.failure.is_some() {
             nestweaver_engine::publication_operation::resume_operation(
                 &publication_root,
@@ -29979,26 +30622,7 @@ fn run_publication_rebuild(
             loaded
         }
     } else {
-        let target = incumbent_identity.next_publication()?;
-        let plan = nestweaver_engine::publication_operation::PublicationOperationPlan {
-            operation_uuid: uuid::Uuid::new_v4().to_string(),
-            brain_uuid: incumbent_identity.brain_uuid.clone(),
-            target_publication_uuid: target.publication_uuid,
-            expected_current_publication_uuid: current
-                .as_ref()
-                .map(|pointer| pointer.publication_uuid.clone()),
-            input_fingerprint,
-            producer_version: env!("CARGO_PKG_VERSION").to_string(),
-            publication_format_version: nestweaver_engine::snapshot::SNAPSHOT_FORMAT_VERSION,
-            created_unix_millis: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_millis()
-                .try_into()?,
-        };
-        let created =
-            nestweaver_engine::publication_operation::create_operation(&publication_root, plan)?;
-        eprintln!("Publication operation: {}", created.plan.operation_uuid);
-        created
+        create_operation()?
     };
     let operation_uuid = state.plan.operation_uuid.clone();
     let slot = nestweaver_engine::publication::slot_path(
@@ -30032,6 +30656,14 @@ fn run_publication_rebuild(
                 );
             }
             use nestweaver_engine::publication_operation::PublicationPhase;
+            // Test seam: stop the worker, as an interruption would, before it
+            // starts the named phase (e.g. `validating`).
+            #[cfg(debug_assertions)]
+            if std::env::var("NESTWEAVER_TEST_STOP_BEFORE_PHASE").is_ok_and(|phase| {
+                phase.eq_ignore_ascii_case(&format!("{:?}", state.phase))
+            }) {
+                std::process::exit(88);
+            }
             match state.phase {
                 PublicationPhase::Planned => {
                     nestweaver_engine::publication_operation::ensure_planned_database(
@@ -30074,12 +30706,21 @@ fn run_publication_rebuild(
                             }
                             continue;
                         }
+                        // A source the slot already holds is being
+                        // re-indexed (a scoped resume, or a retry after an
+                        // interruption): remember its nodes' content so the
+                        // ones whose content changed are re-embedded.
+                        let staged_before = staged_source_content(&target_db, "repo", &repo.uid)?;
                         state = publication_progress(
                             &publication_root,
                             &state,
                             completed,
                             total,
-                            format!("indexing repository {}", repo.url),
+                            if staged_before.is_some() {
+                                format!("re-indexing changed repository {}", repo.url)
+                            } else {
+                                format!("indexing repository {}", repo.url)
+                            },
                         )?;
                         let indexed_sha = repo.observed_head.as_deref().unwrap_or("local");
                         // The same per-repository directory policy an
@@ -30106,6 +30747,9 @@ fn run_publication_rebuild(
                             &target_db,
                             &opts,
                         )?;
+                        if let Some(before) = staged_before {
+                            invalidate_changed_embeddings(&target_db, "repo", &repo.uid, &before)?;
+                        }
                         state = nestweaver_engine::publication_operation::record_artifact(
                             &publication_root,
                             &operation_uuid,
@@ -30142,14 +30786,20 @@ fn run_publication_rebuild(
                             }
                             continue;
                         }
+                        let staged_before =
+                            staged_source_content(&target_db, "vault", &vault.uid)?;
                         state = publication_progress(
                             &publication_root,
                             &state,
                             completed,
                             total,
-                            format!("indexing vault {}", vault.name),
+                            if staged_before.is_some() {
+                                format!("re-indexing changed vault {}", vault.name)
+                            } else {
+                                format!("indexing vault {}", vault.name)
+                            },
                         )?;
-                        index_markdown_directory_with_ignore_and_note_limits(
+                        let refreshed = nestweaver_engine::index_md::index_markdown_directory_with_ignore_and_deletion_count_and_note_limits(
                             Path::new(&vault.root_path),
                             &target_db,
                             &vault.instance_id,
@@ -30157,6 +30807,24 @@ fn run_publication_rebuild(
                             &[],
                             config.indexing.note_limits(),
                         )?;
+                        // The daemon admits a vault's Markdown links only
+                        // with a current derivation record; without one its
+                        // first start re-derives (fully refreshes) the vault.
+                        if !nestweaver_engine::markdown_derivation::stamp_rebuilt_vault(
+                            &target_db,
+                            &refreshed,
+                            &config.instance_id,
+                            &[],
+                            config.indexing.note_limits().max_note_bytes(),
+                        )? {
+                            eprintln!(
+                                "Vault {} was not indexed completely; the daemon re-derives it after the switch.",
+                                vault.name
+                            );
+                        }
+                        if let Some(before) = staged_before {
+                            invalidate_changed_embeddings(&target_db, "vault", &vault.uid, &before)?;
+                        }
                         state = nestweaver_engine::publication_operation::record_artifact(
                             &publication_root,
                             &operation_uuid,
@@ -30179,6 +30847,24 @@ fn run_publication_rebuild(
                         "materialize the staged publication graph",
                     )?;
                     let store = GraphStore::open_with_authority(&target_db, &authority)?;
+                    // Cross-repo call links are inferred once, over the whole
+                    // graph, after every source is indexed: per-repository
+                    // inference depends on indexing order, and re-indexing a
+                    // changed repository drops the links others had into it.
+                    let package_names: std::collections::HashMap<String, String> =
+                        publication_source_manifests(&sources)
+                            .into_iter()
+                            .filter_map(|(uid, manifest)| {
+                                manifest.package_name.map(|name| (uid, name))
+                            })
+                            .collect();
+                    let cross_repo = nestweaver_engine::index::reinfer_cross_repo_links(
+                        &store,
+                        &target_db,
+                        &package_names,
+                        config.indexing.limits(),
+                    )?;
+                    eprintln!("Cross-repo links: {cross_repo} inferred over every repository.");
                     let projects = nestweaver_engine::project::materialize_projects(
                         &store,
                         &config,
@@ -30216,13 +30902,14 @@ fn run_publication_rebuild(
                             eprintln!("{summary}");
                         }
                     }
-                    nestweaver_engine::discover_cross_domain_links_with_config(
-                        &store,
-                        &config.cross_domain,
+                    state = publication_progress(
+                        &publication_root,
+                        &state,
+                        total,
+                        total,
+                        "linking notes to code".to_string(),
                     )?;
-                    // nw-670 review L7: every note of this fresh graph was
-                    // just linked by the current rules.
-                    nestweaver_engine::code_links::record_rules_version(&target_db);
+                    link_staged_notes_to_code(&store, &config, &target_db)?;
                     drop(store);
                     let receipt = preserved_state.clone().import_into(&target_db)?;
                     receipt.write_bound(&target_db)?;
@@ -30270,8 +30957,22 @@ fn run_publication_rebuild(
                         "build the staged regex index",
                     )?;
                     let store = GraphStore::open_with_authority(&target_db, &authority)?;
-                    store.rebuild_trigram_index()?;
+                    // After one complete build, a resume over changed sources
+                    // refreshes only the scopes whose candidate digest moved.
+                    let complete_regex = !state
+                        .completed_artifacts
+                        .contains_key(PUBLICATION_REGEX_CHECKPOINT);
+                    store.refresh_trigram_index(complete_regex)?;
                     drop(store);
+                    if complete_regex {
+                        state = nestweaver_engine::publication_operation::record_artifact(
+                            &publication_root,
+                            &operation_uuid,
+                            state.revision,
+                            PUBLICATION_REGEX_CHECKPOINT.to_string(),
+                            nestweaver_engine::hash::blake3_hex(&state.plan.target_publication_uuid),
+                        )?;
+                    }
                     state = nestweaver_engine::publication_operation::advance_phase(
                         &publication_root,
                         &operation_uuid,
@@ -30280,12 +30981,22 @@ fn run_publication_rebuild(
                     )?;
                 }
                 PublicationPhase::Embeddings => {
+                    // After one complete re-embed, a resume over changed
+                    // sources embeds only nodes without a vector: the changed
+                    // ones, whose vectors the graph phase invalidated.
+                    let complete_embed = !state
+                        .completed_artifacts
+                        .contains_key(PUBLICATION_EMBEDDINGS_CHECKPOINT);
                     state = publication_progress(
                         &publication_root,
                         &state,
                         0,
                         0,
-                        "re-embedding the complete staged corpus".to_string(),
+                        if complete_embed {
+                            "re-embedding the complete staged corpus".to_string()
+                        } else {
+                            "embedding changed nodes".to_string()
+                        },
                     )?;
                     let accelerator = Some(match config.embedding.accelerator {
                         nestweaver_engine::config::EmbeddingAccelerator::Auto => CliEmbeddingAccelerator::Auto,
@@ -30311,7 +31022,7 @@ fn run_publication_rebuild(
                         if external.is_none() { accelerator } else { None },
                         batch_size,
                         "all",
-                        true,
+                        complete_embed,
                         false,
                         true,
                         false,
@@ -30320,6 +31031,27 @@ fn run_publication_rebuild(
                     )?;
                     if exit != EXIT_SUCCESS {
                         anyhow::bail!("complete publication re-embed reported failures");
+                    }
+                    // A pass over an existing base (an incremental resume,
+                    // or a retry after an interrupted embed) journals its
+                    // vectors over that base; the slot seals one
+                    // self-contained base bound to the current generation.
+                    {
+                        let authority = acquire_publication_write_authority(
+                            &target_db,
+                            "compact the staged embeddings",
+                        )?;
+                        GraphStore::open_with_authority(&target_db, &authority)?
+                            .compact_embedding_index()?;
+                    }
+                    if complete_embed {
+                        state = nestweaver_engine::publication_operation::record_artifact(
+                            &publication_root,
+                            &operation_uuid,
+                            state.revision,
+                            PUBLICATION_EMBEDDINGS_CHECKPOINT.to_string(),
+                            nestweaver_engine::hash::blake3_hex(&state.plan.target_publication_uuid),
+                        )?;
                     }
                     state = nestweaver_engine::publication_operation::advance_phase(
                         &publication_root,
@@ -30341,13 +31073,7 @@ fn run_publication_rebuild(
                         "materialize staged publication metadata",
                     )?;
                     let store = GraphStore::open_with_authority(&target_db, &authority)?;
-                    let mut manifests = std::collections::HashMap::new();
-                    for repo in &sources.repos {
-                        let reader = nestweaver_engine::content_reader::FilesystemReader::new(
-                            Path::new(&repo.root_path),
-                        );
-                        manifests.insert(repo.uid.clone(), nestweaver_engine::parse_manifest(&reader));
-                    }
+                    let manifests = publication_source_manifests(&sources);
                     nestweaver_engine::save_manifest_cache_for_db(&manifests, &store, &target_db)?;
                     store.compute_pagerank(
                         0.85,
@@ -30383,6 +31109,14 @@ fn run_publication_rebuild(
                             "publication sources, configuration, or preserved user state changed during rebuild; resume starts only after the inputs are stable"
                         );
                     }
+                    // Links are built in the graph phase, before the
+                    // topology and ranking that depend on them; a slot whose
+                    // links are not current cannot be repaired here.
+                    staged_code_links_current(&target_db).map_err(|error| {
+                        nestweaver_engine::publication_operation::PermanentPublicationFailure(
+                            format!("validate the staged note→code links: {error:#}"),
+                        )
+                    })?;
                     let _authority = acquire_publication_write_authority(
                         &target_db,
                         "seal the staged publication",
@@ -30543,6 +31277,156 @@ fn run_publication_rebuild(
     )
 }
 
+/// Content hash of every embeddable node of one source in the staged graph —
+/// a repository's symbols, or a vault's notes and headings — or `None` when
+/// the slot does not hold that source yet.
+fn staged_source_content(
+    target_db: &Path,
+    kind: &str,
+    source_uid: &str,
+) -> anyhow::Result<Option<std::collections::HashMap<String, String>>> {
+    if !target_db.exists() {
+        return Ok(None);
+    }
+    let store = GraphStore::open_read_only(target_db)
+        .map_err(|error| anyhow::anyhow!("open staged graph: {error}"))?;
+    let mut content = std::collections::HashMap::new();
+    if kind == "repo" {
+        if store.lookup_repo(source_uid)?.is_none() {
+            return Ok(None);
+        }
+        for symbol in store.list_all_symbols()? {
+            if symbol.repo_uid == source_uid {
+                content.insert(symbol.uid, symbol.content_hash);
+            }
+        }
+    } else {
+        if !store
+            .list_vaults(None)?
+            .iter()
+            .any(|vault| vault.uid == source_uid)
+        {
+            return Ok(None);
+        }
+        let notes = store.list_notes(Some(source_uid))?;
+        // A heading is embedded with its note's title, which its own hash
+        // does not cover: key it by the whole note's content as well, so any
+        // change to the note (its title included) re-embeds its headings.
+        let note_hashes: std::collections::HashMap<&str, &str> = notes
+            .iter()
+            .map(|note| (note.uid.as_str(), note.content_hash.as_str()))
+            .collect();
+        for heading in store.list_headings_by_vault(source_uid)? {
+            let note_hash = note_hashes
+                .get(heading.note_uid.as_str())
+                .copied()
+                .unwrap_or_default();
+            content.insert(heading.uid, format!("{note_hash}:{}", heading.content_hash));
+        }
+        for note in notes {
+            content.insert(note.uid, note.content_hash);
+        }
+    }
+    Ok(Some(content))
+}
+
+/// After re-indexing a source into the staged slot, tombstone the embeddings
+/// of its nodes whose content changed (or that disappeared), so the resumed
+/// embedding phase — which only fills missing vectors — re-embeds exactly the
+/// changed nodes. Unchanged nodes keep their vectors.
+fn invalidate_changed_embeddings(
+    target_db: &Path,
+    kind: &str,
+    source_uid: &str,
+    before: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<()> {
+    let after = staged_source_content(target_db, kind, source_uid)?.unwrap_or_default();
+    let changed: Vec<String> = before
+        .iter()
+        .filter(|(uid, hash)| after.get(*uid) != Some(*hash))
+        .map(|(uid, _)| uid.clone())
+        .collect();
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let authority =
+        acquire_publication_write_authority(target_db, "invalidate changed embeddings")?;
+    let store = GraphStore::open_with_authority(target_db, &authority)?;
+    let removed = store.tombstone_embeddings(&changed)?;
+    if removed > 0 {
+        eprintln!("Invalidated {removed} embedding(s) of changed or removed nodes.");
+    }
+    Ok(())
+}
+
+/// Build every note's code links in the staged graph with the machinery the
+/// daemon settles code-link debt with: the same project repo membership
+/// rebuild, then the same reconciler with the same project folders. The
+/// published slot then starts with links the daemon's first pass agrees with
+/// and no owed code-link debt, instead of the daemon relinking the whole
+/// brain under its write lock after the cutover.
+fn link_staged_notes_to_code(
+    store: &GraphStore,
+    config: &nestweaver_engine::config::InstanceConfig,
+    target_db: &Path,
+) -> anyhow::Result<()> {
+    // A fresh graph holds no links built by other rules, so this pass builds
+    // every note's links rather than migrating (purging) first.
+    nestweaver_engine::code_links::record_rules_version(target_db);
+    if config
+        .projects
+        .iter()
+        .any(|project| !project.repos.is_empty())
+    {
+        nestweaver_engine::project::rebuild_project_repo_membership(
+            store,
+            config,
+            &config.instance_id,
+            target_db,
+            None,
+        )?;
+    }
+    let report = nestweaver_engine::code_links::reconcile_code_links_with_folders(
+        store,
+        &config.cross_domain,
+        nestweaver_engine::project::project_folders(config, &config.instance_id),
+    )?;
+    if !report.unreadable.is_empty() {
+        anyhow::bail!(
+            "{} note(s) could not be read while linking notes to code, e.g. {}",
+            report.unreadable.len(),
+            report.unreadable.join("; ")
+        );
+    }
+    eprintln!(
+        "Code links: {} note(s) checked, {} linked ({} edge(s)).",
+        report.notes_checked,
+        report.rewritten.len(),
+        report.edges_written
+    );
+    staged_code_links_current(target_db)
+}
+
+/// The cutover gate for note→code links: the staged graph's links were built
+/// by the current rules and nothing is owed.
+fn staged_code_links_current(target_db: &Path) -> anyhow::Result<()> {
+    let links = nestweaver_engine::code_links::load_code_links_state(target_db);
+    if links.rules_version != nestweaver_engine::code_links::CROSS_DOMAIN_RULES_VERSION {
+        anyhow::bail!(
+            "staged note→code links were built by link rules v{}, not v{}; discard this operation and rebuild",
+            links.rules_version,
+            nestweaver_engine::code_links::CROSS_DOMAIN_RULES_VERSION
+        );
+    }
+    if let Some(pending) = links.pending {
+        anyhow::bail!(
+            "staged note→code links are owed ({}); discard this operation and rebuild",
+            pending.reason
+        );
+    }
+    Ok(())
+}
+
 fn acquire_publication_write_authority(
     db_path: &Path,
     operation: &str,
@@ -30613,6 +31497,27 @@ fn publication_progress(
         },
     )
 }
+
+/// Every captured repository's manifest, read from its working tree.
+fn publication_source_manifests(
+    sources: &nestweaver_engine::PublicationSourceManifest,
+) -> std::collections::HashMap<String, nestweaver_engine::manifest::ManifestInfo> {
+    sources
+        .repos
+        .iter()
+        .map(|repo| {
+            let reader = nestweaver_engine::content_reader::FilesystemReader::new(Path::new(
+                &repo.root_path,
+            ));
+            (repo.uid.clone(), nestweaver_engine::parse_manifest(&reader))
+        })
+        .collect()
+}
+
+/// Journal checkpoint: the staged slot completed one full re-embed.
+const PUBLICATION_EMBEDDINGS_CHECKPOINT: &str = "embeddings/complete.done";
+/// Journal checkpoint: the staged slot completed one full regex build.
+const PUBLICATION_REGEX_CHECKPOINT: &str = "regex/complete.done";
 
 fn publication_graph_checkpoint(kind: &str, source_uid: &str) -> String {
     format!(
@@ -38340,6 +39245,84 @@ mod cli_honesty_sweep_tests {
         assert_eq!(seeds["message"], serde_json::json!("No matching symbols"));
     }
 
+    /// `cluster <id>` with an id no community has printed EVERY community on
+    /// stderr (2.2 MB on a real graph). The hint is bounded: a count, the id
+    /// range, the largest few and the command that lists them all.
+    #[test]
+    fn a_cluster_miss_prints_a_bounded_hint() {
+        let communities: Vec<nestweaver_engine::CommunityInfo> = (0..70_000u32)
+            .map(|id| nestweaver_engine::CommunityInfo {
+                id,
+                name: format!("community-with-a-longish-name-{id}"),
+                cohesion: 0.5,
+                member_count: (id % 97) as usize + 1,
+                members: Vec::new(),
+                key_files: Vec::new(),
+            })
+            .collect();
+        let output = nestweaver_engine::ClusteringOutput {
+            resolution: 0.3,
+            modularity: 0.4,
+            communities,
+        };
+        let hint = cluster_not_found_hint(&output);
+        assert!(hint.len() < 2048, "bounded: {} bytes", hint.len());
+        assert!(hint.contains("70000 clusters"), "{hint}");
+        assert!(hint.contains("ids 0-69999"), "{hint}");
+        assert!(hint.contains("nestweaver clusters"), "{hint}");
+        assert!(hint.contains("[96]"), "the largest are named: {hint}");
+
+        let empty = nestweaver_engine::ClusteringOutput {
+            resolution: 0.3,
+            modularity: 0.0,
+            communities: Vec::new(),
+        };
+        assert!(cluster_not_found_hint(&empty).contains("no clusters"));
+    }
+
+    /// The exit-code paragraph named `rank`, which is not a command (it is
+    /// `ranking rank`), and listed commands as writing nothing on exit 2 that
+    /// now write the envelope. Every command it names must exist.
+    #[test]
+    fn the_exit_code_help_names_only_real_commands() {
+        let (help, root) = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let mut root = Cli::command();
+                root.build();
+                (root.render_long_help().to_string(), root)
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+        let start = help.find("Exit codes (scripting contract)").unwrap();
+        let section = &help[start..start + help[start..].find("Shell completions").unwrap()];
+        assert!(!section.contains("rank)"), "{section}");
+        let mut checked = 0;
+        for span in section.split('`').skip(1).step_by(2) {
+            let tokens: Vec<&str> = span.split_whitespace().collect();
+            if tokens.is_empty()
+                || matches!(tokens[0], "error" | "status")
+                || tokens
+                    .iter()
+                    .any(|t| !t.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+            {
+                continue;
+            }
+            let mut command = &root;
+            for token in &tokens {
+                command = command
+                    .find_subcommand(token)
+                    .unwrap_or_else(|| panic!("`{span}` is not a command: {section}"));
+            }
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "the section names at least one command: {section}"
+        );
+    }
+
     /// COUNTERWEIGHT. A pattern that does not COMPILE is not an absent target,
     /// and the two must not share an envelope: one means "fix your regex" and
     /// the other means "nothing matched", and a consumer that cannot tell them
@@ -38820,9 +39803,17 @@ mod nw674_repo_issue_render_tests {
         .into_iter()
         .collect();
 
-        let json: serde_json::Value =
-            serde_json::from_str(&render_list_projects(&materialized, &[], &issues, true).unwrap())
-                .unwrap();
+        let json: serde_json::Value = serde_json::from_str(
+            &render_list_projects(
+                &materialized,
+                &[],
+                &issues,
+                &ProjectMemberRepos::new(),
+                true,
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             json["repo_issues"]["wavelength-wireless"][0]["repo"],
             "wavelength-wireless-site"
@@ -38833,24 +39824,73 @@ mod nw674_repo_issue_render_tests {
         );
         assert!(json["repo_issues"].get("siteloom").is_none());
 
-        let text = render_list_projects(&materialized, &[], &issues, false).unwrap();
+        let text = render_list_projects(
+            &materialized,
+            &[],
+            &issues,
+            &ProjectMemberRepos::new(),
+            false,
+        )
+        .unwrap();
         let expected = "  Warning: declared repo not a member: \
                         wavelength-wireless/wavelength-wireless-site (matches no indexed repo)";
         assert!(text.contains(expected), "{text}");
         // The warning sits under ITS project, not the next one.
-        let siteloom = text.split("siteloom\n").nth(1).unwrap();
+        let siteloom = text.split("\nsiteloom\n").nth(1).unwrap();
         assert!(!siteloom.contains("Warning"), "{text}");
+    }
+
+    /// `list-projects` lists each project's member repos, in text and JSON;
+    /// a project with none says so rather than printing nothing.
+    #[test]
+    fn list_projects_lists_member_repos() {
+        let materialized = projects();
+        let members: ProjectMemberRepos = [(
+            "wavelength-wireless".to_string(),
+            vec![nestweaver_engine::ProjectMemberRepo {
+                uid: "repo:ww".to_string(),
+                name: "wavelength-wireless-site".to_string(),
+            }],
+        )]
+        .into_iter()
+        .collect();
+        let issues = ProjectRepoIssues::new();
+        let text = render_list_projects(&materialized, &[], &issues, &members, false).unwrap();
+        assert!(
+            text.contains("  Repos:    wavelength-wireless-site\n"),
+            "{text}"
+        );
+        let siteloom = text.split("\nsiteloom\n").nth(1).unwrap();
+        assert!(siteloom.contains("  Repos:    (none)"), "{text}");
+        let json: serde_json::Value = serde_json::from_str(
+            &render_list_projects(&materialized, &[], &issues, &members, true).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            json["member_repos"]["wavelength-wireless"][0]["name"],
+            "wavelength-wireless-site"
+        );
+        assert_eq!(json["member_repos"]["siteloom"], serde_json::json!([]));
     }
 
     #[test]
     fn list_projects_without_issues_is_unchanged() {
         let materialized = projects();
         let clean = ProjectRepoIssues::new();
-        let json: serde_json::Value =
-            serde_json::from_str(&render_list_projects(&materialized, &[], &clean, true).unwrap())
-                .unwrap();
+        let json: serde_json::Value = serde_json::from_str(
+            &render_list_projects(&materialized, &[], &clean, &ProjectMemberRepos::new(), true)
+                .unwrap(),
+        )
+        .unwrap();
         assert!(json.get("repo_issues").is_none(), "{json}");
-        let text = render_list_projects(&materialized, &[], &clean, false).unwrap();
+        let text = render_list_projects(
+            &materialized,
+            &[],
+            &clean,
+            &ProjectMemberRepos::new(),
+            false,
+        )
+        .unwrap();
         assert!(!text.contains("Warning"), "{text}");
         assert!(text.starts_with("wavelength-wireless\n  UID:      proj:wavelength-wireless\n"));
     }
@@ -38871,5 +39911,59 @@ mod nw674_repo_issue_render_tests {
         assert!(lines[1].contains("resolved only by URL substring"));
         // Counterweight: no field, no warning.
         assert!(project_context_repo_issue_lines(&serde_json::json!({"project": "x"})).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod cross_repo_debt_on_early_exit_tests {
+    use super::*;
+
+    fn two_repo_db(dir: &Path) -> PathBuf {
+        let db = dir.join("graph.lbug");
+        for name in ["one", "two"] {
+            let root = dir.join(name);
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(
+                root.join("src/a.js"),
+                format!("export function {name}Fn() {{ return 1; }}\n"),
+            )
+            .unwrap();
+            nestweaver_engine::index::index_directory(
+                &root,
+                &db,
+                "test",
+                &format!("file:///fixture/{name}"),
+                "sha",
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    /// A direct index that returns early (an error after a commit) still
+    /// records the cross-repo link debt; one that reached its pass does not
+    /// record it again on the way out.
+    #[test]
+    fn an_early_return_records_the_cross_repo_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = two_repo_db(dir.path());
+        let lease = require_exclusive_store_access(&db, "test").unwrap();
+        let pending = || nestweaver_engine::cross_repo_links::cross_repo_links_pending(&db);
+
+        drop(CrossRepoDebtOnEarlyExit {
+            db_path: &db,
+            lease: &lease,
+            reason: "test".to_string(),
+            armed: false,
+        });
+        assert!(!pending(), "a disarmed guard records nothing");
+
+        drop(CrossRepoDebtOnEarlyExit {
+            db_path: &db,
+            lease: &lease,
+            reason: "code re-index of /fixture/one".to_string(),
+            armed: true,
+        });
+        assert!(pending(), "an early return records the debt");
     }
 }

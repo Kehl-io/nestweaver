@@ -281,6 +281,10 @@ pub(crate) fn run_ranking(
             let resolved = match resolve_uid(&store, &uid)? {
                 ResolveResult::Found(u) => u,
                 ResolveResult::NotFound => {
+                    // The exit-2 envelope every read command writes.
+                    if json {
+                        print_json_not_found("symbol", &uid);
+                    }
                     eprintln!("Symbol not found: {uid}");
                     return Ok((EXIT_NOT_FOUND, None));
                 }

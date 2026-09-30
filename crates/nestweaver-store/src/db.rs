@@ -3751,6 +3751,29 @@ impl GraphStore {
         Ok(removed)
     }
 
+    /// Tombstone the embeddings of exactly `uids`, live or not, so the next
+    /// non-forced embed pass re-embeds them. For a caller that knows these
+    /// nodes' text changed under an unchanged UID (a publication rebuild
+    /// re-indexing a changed source into its staged slot); the deletion paths
+    /// above must keep using their liveness difference instead.
+    pub fn tombstone_embeddings(&self, uids: &[String]) -> Result<usize, StoreError> {
+        if uids.is_empty() {
+            return Ok(0);
+        }
+        let removed = {
+            let mut idx = self
+                .embedding_index
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            idx.tombstone_uids(uids)
+        };
+        if removed == 0 {
+            return Ok(0);
+        }
+        self.flush_embedding_index()?;
+        Ok(removed)
+    }
+
     pub fn tombstone_deleted_symbol_embeddings(
         &self,
         repo_uid: &str,

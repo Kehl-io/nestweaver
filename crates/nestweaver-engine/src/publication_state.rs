@@ -76,6 +76,12 @@ impl PreservedStateSnapshot {
         if let Some(store) = interactions.as_mut() {
             store.node_scores.retain(|uid, _| live.contains(uid));
             crate::interactions::save_interaction_store(db_path, store)?;
+        } else {
+            // A resumed rebuild imports again into a slot that may hold an
+            // earlier import; no captured history means none in the slot.
+            nestweaver_store::durable_sidecar::remove_file_durable_if_exists(
+                &crate::interactions::interaction_sidecar_path(db_path),
+            )?;
         }
         let imported_count = interactions
             .as_ref()

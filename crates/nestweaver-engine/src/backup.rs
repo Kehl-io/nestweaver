@@ -59,11 +59,15 @@ const SIDECAR_SUFFIXES: &[&str] = &[
     ".regex-v3",
     ".pagerank.json",
     ".parsed_cache.bin",
+    // Parses added since the base was last written; read with it.
+    ".parsed_cache.log",
     ".resolution_deps.bin",
     crate::resolver_generation::RESOLVER_GENERATION_SIDECAR,
     // nw-670: the link-rules version travels with the links it describes, so
     // a restored pre-upgrade graph is migrated rather than trusted.
     crate::code_links::CODE_LINKS_SIDECAR,
+    // Owed cross-repo link inference travels with the links it describes.
+    crate::cross_repo_links::CROSS_REPO_LINKS_SIDECAR,
     ".filemeta.json",
     ".manifests.json",
     ".gitactivity.json",
@@ -2079,6 +2083,11 @@ fn backup_artifact_contract(
             Some(".parsed_cache.bin") => {
                 (ArtifactKind::ParsedCache, 1, "nestweaver-parsed-cache-v1")
             }
+            Some(".parsed_cache.log") => (
+                ArtifactKind::ParsedCache,
+                1,
+                "nestweaver-parsed-cache-log-v1",
+            ),
             Some(".resolution_deps.bin") => (
                 ArtifactKind::ResolutionDependencies,
                 1,
@@ -2098,6 +2107,36 @@ fn backup_artifact_contract(
                 1,
                 "nestweaver-code-links-v1",
             ),
+            // Whether the name-inferred cross-repo links are owed a
+            // whole-graph pass: it describes the graph's edges, so it
+            // travels with them, like the code-links stamp.
+            Some(crate::cross_repo_links::CROSS_REPO_LINKS_SIDECAR) => (
+                ArtifactKind::CompatibilityStamp,
+                1,
+                "nestweaver-cross-repo-links-v1",
+            ),
+            // Every vault index writes these two beside the graph, so a
+            // rebuilt slot that holds a vault carries both. Neither is on the
+            // backup list (a restored registration record would claim vaults
+            // the restored file never published), but a publication slot IS
+            // the graph that indexed its vaults: they describe it exactly and
+            // are sealed with it. Unclassified, they refused every rebuild of
+            // a brain with a vault.
+            Some(crate::vault_registration::VAULT_REGISTRATIONS_SUFFIX) => (
+                ArtifactKind::CompatibilityStamp,
+                1,
+                "nestweaver-vault-registrations-v1",
+            ),
+            // A rebuild stamps each vault it indexed in full as derived by
+            // the current Markdown link rules, bound to the slot's identity.
+            Some(crate::markdown_derivation::RECORD_SUFFIX) => (
+                ArtifactKind::CompatibilityStamp,
+                1,
+                "nestweaver-markdown-derivation-v1",
+            ),
+            Some(crate::index_md::SKIPPED_NOTES_SIDECAR_SUFFIX) => {
+                (ArtifactKind::FileMetadata, 1, "nestweaver-skipped-notes-v1")
+            }
             Some(".filemeta.json") => {
                 (ArtifactKind::FileMetadata, 1, "nestweaver-file-metadata-v1")
             }
@@ -4164,6 +4203,50 @@ mod tests {
             "{:?}",
             backup.manifest.checksums.keys().collect::<Vec<_>>()
         );
+    }
+
+    /// A rebuilt slot that indexed a vault holds the vault-registration
+    /// record and the skipped-notes disclosure; the seal must describe both
+    /// instead of refusing them as unclassified.
+    #[test]
+    fn a_slot_holding_vault_index_sidecars_seals() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = dir.path().join("slot");
+        std::fs::create_dir(&slot).unwrap();
+        let db_path = slot.join(crate::publication::PUBLICATION_GRAPH_FILE);
+        drop(nestweaver_store::GraphStore::create(&db_path).unwrap());
+        let registrations = format!(
+            "{}{}",
+            crate::publication::PUBLICATION_GRAPH_FILE,
+            crate::vault_registration::VAULT_REGISTRATIONS_SUFFIX
+        );
+        let skipped = format!(
+            "{}{}",
+            crate::publication::PUBLICATION_GRAPH_FILE,
+            crate::index_md::SKIPPED_NOTES_SIDECAR_SUFFIX
+        );
+        let derivation = format!(
+            "{}{}",
+            crate::publication::PUBLICATION_GRAPH_FILE,
+            crate::markdown_derivation::RECORD_SUFFIX
+        );
+        std::fs::write(slot.join(&registrations), b"{}").unwrap();
+        std::fs::write(slot.join(&skipped), b"{}").unwrap();
+        std::fs::write(slot.join(&derivation), b"{}").unwrap();
+
+        let bundle = seal_publication_slot(&db_path, &slot)
+            .expect("a slot holding vault index sidecars must seal");
+        assert!(bundle.artifacts.iter().any(|a| a.path == registrations
+            && a.kind == crate::publication::ArtifactKind::CompatibilityStamp));
+        assert!(
+            bundle
+                .artifacts
+                .iter()
+                .any(|a| a.path == skipped
+                    && a.kind == crate::publication::ArtifactKind::FileMetadata)
+        );
+        assert!(bundle.artifacts.iter().any(|a| a.path == derivation
+            && a.kind == crate::publication::ArtifactKind::CompatibilityStamp));
     }
 
     #[test]

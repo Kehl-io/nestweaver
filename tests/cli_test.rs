@@ -13948,3 +13948,707 @@ fn backup_save_of_an_old_engine_database_with_a_pending_log_names_the_way_out() 
         "the database and its old-engine log must be untouched"
     );
 }
+
+/// Two repositories that both define `SharedWidget`, and a vault whose
+/// project note mentions it, so a correct link must be project-scoped. The
+/// incumbent is indexed the ordinary way; `rebuild` runs the upgrade.
+struct LinkedRebuildFixture {
+    _dir: tempfile::TempDir,
+    db: std::path::PathBuf,
+    config: std::path::PathBuf,
+    alpha: std::path::PathBuf,
+    vault: std::path::PathBuf,
+}
+
+impl LinkedRebuildFixture {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |path: std::path::PathBuf, body: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        let alpha = dir.path().join("alpha");
+        let beta = dir.path().join("beta");
+        let vault = dir.path().join("vault");
+        write(
+            alpha.join("src/widget.rs"),
+            "pub struct SharedWidget;\npub struct AlphaGadget;\n",
+        );
+        write(alpha.join("src/extra.rs"), "pub fn alpha_extra() {}\n");
+        write(
+            alpha.join("src/helper.js"),
+            "export function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n",
+        );
+        // beta calls alpha: a name-inferred cross-repo call link, whose
+        // presence must not depend on which repository is indexed first.
+        write(
+            beta.join("src/widget.rs"),
+            "pub struct SharedWidget;\npub struct BetaGadget;\n",
+        );
+        write(
+            beta.join("src/caller.js"),
+            "export function betaCaller() {\n  return alphaHelper();\n}\nexport function betaUtil() { return 2; }\n",
+        );
+        write(
+            vault.join("Workspaces/Alpha/design.md"),
+            "---\ntitle: Widget design\n---\n# Design\n\nThe SharedWidget wraps the AlphaGadget.\n",
+        );
+        write(
+            vault.join("Notes/beta.md"),
+            "# Beta\n\nThe BetaGadget ships next.\n",
+        );
+        let db = dir.path().join("brain.lbug");
+        let endpoint = spawn_fake_embedding_endpoint();
+        let config = dir.path().join("instance.toml");
+        let quote =
+            |path: &std::path::Path| serde_json::to_string(&path.to_string_lossy()).unwrap();
+        std::fs::write(
+            &config,
+            format!(
+                "instance_id = \"linked\"\ndb = {}\n[snapshot_storage]\nbackend = \"local\"\npath = {}\n[workspace]\nbackend = \"local\"\npath = {}\n[inference]\nendpoint = \"http://localhost:11434\"\nembedding_model = \"unused\"\nsummary_model = \"unused\"\n[embedding]\nexternal_endpoint = \"{endpoint}\"\nexternal_model = \"fake\"\n[git]\ncredential_method = \"gh\"\n[[repos]]\nurl = {}\nname = \"alpha\"\n[[repos]]\nurl = {}\nname = \"beta\"\n[[projects]]\nname = \"alpha-project\"\nvault_folder = \"Workspaces/Alpha\"\nrepos = [\"alpha\"]\n",
+                quote(&db),
+                quote(&dir.path().join("snapshots")),
+                quote(&dir.path().join("workspace")),
+                quote(&alpha.canonicalize().unwrap()),
+                quote(&beta.canonicalize().unwrap()),
+            ),
+        )
+        .unwrap();
+        for repo in [&alpha, &beta] {
+            nestweaver_cmd()
+                .args(["index", "--config"])
+                .arg(&config)
+                .arg("--repo")
+                .arg(repo)
+                .assert()
+                .success();
+        }
+        nestweaver_cmd()
+            .args(["brain", "add"])
+            .arg(&vault)
+            .arg("--config")
+            .arg(&config)
+            .assert()
+            .success();
+        Self {
+            _dir: dir,
+            db,
+            config,
+            alpha,
+            vault,
+        }
+    }
+
+    fn rebuild(&self, extra: &[&str]) -> std::process::Output {
+        nestweaver_cmd()
+            .timeout(std::time::Duration::from_secs(300))
+            .args(["publication", "rebuild", "--config"])
+            .arg(&self.config)
+            .args(extra)
+            .output()
+            .unwrap()
+    }
+
+    fn selected(&self) -> std::path::PathBuf {
+        nestweaver_engine::publication::resolve_selected_database(&self.db).unwrap()
+    }
+}
+
+fn assert_exit(output: &std::process::Output, code: i32, what: &str) {
+    assert_eq!(
+        output.status.code(),
+        Some(code),
+        "{what}: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The first daemon start after an upgrade used to rebuild every note's code
+/// links under the write lock: the staged graph was published with links that
+/// disagreed with what the reconciler derives (project scoping) and with
+/// owed code-link debt. A rebuild must publish links that are already current,
+/// so the daemon's first pass has nothing to write.
+#[test]
+fn a_rebuild_publishes_current_note_code_links_with_no_debt() {
+    let fx = LinkedRebuildFixture::new();
+    let output = fx.rebuild(&[]);
+    assert_exit(&output, 0, "rebuild");
+    let selected = fx.selected();
+    assert_ne!(selected, fx.db, "CURRENT must point at the rebuilt slot");
+
+    let state = nestweaver_engine::code_links::load_code_links_state(&selected);
+    assert_eq!(state.pending, None, "a published slot owes no code links");
+    assert_eq!(
+        state.rules_version,
+        nestweaver_engine::code_links::CROSS_DOMAIN_RULES_VERSION
+    );
+
+    // Counterweight: the slot really holds links, including the scoped one.
+    let store = nestweaver_store::GraphStore::open(&selected).unwrap();
+    let before = store.list_references_code_edges().unwrap();
+    assert!(
+        before.len() >= 3,
+        "the fixture's notes must link to code: {before:?}"
+    );
+
+    // What the daemon's first pass would do: the same reconciler, the same
+    // cross-domain config and project folders. It must find nothing to write.
+    let config = nestweaver_engine::config::InstanceConfig::from_file(&fx.config).unwrap();
+    let report = nestweaver_engine::code_links::reconcile_code_links_with_folders(
+        &store,
+        &config.cross_domain,
+        nestweaver_engine::project::project_folders(&config, &config.instance_id),
+    )
+    .unwrap();
+    assert!(
+        report.rewritten.is_empty(),
+        "the daemon's first pass would rewrite {:?}",
+        report.rewritten
+    );
+    assert_eq!(report.memberships_added, 0);
+    assert_eq!(store.list_references_code_edges().unwrap(), before);
+    drop(store);
+    // beta is indexed before alpha, yet its call into alpha is linked.
+    assert!(
+        has_cross_repo_call(&selected, "betaCaller", "alphaHelper"),
+        "a fresh rebuild must link beta's call into alpha whatever the indexing order"
+    );
+    assert!(has_cross_repo_call(&selected, "alphaUses", "betaUtil"));
+    // Each link once: the whole-graph pass replaces what per-repository
+    // indexing inferred instead of adding to it.
+    let links: Vec<_> = typed_edges(&selected)
+        .into_iter()
+        .filter(|edge| edge.2 == "CROSS_REPO_LINK")
+        .collect();
+    let mut distinct = links.clone();
+    distinct.dedup();
+    assert_eq!(links, distinct, "duplicated cross-repo links");
+    assert_eq!(links.len(), 2, "{links:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("linking notes to code"),
+        "the rebuild must report its code-link phase: {stderr}"
+    );
+}
+
+fn operation_uuid_of(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("Publication operation: "))
+        .unwrap_or_else(|| panic!("no operation uuid in: {stderr}"))
+        .trim()
+        .to_string()
+}
+
+fn staged_graph_of(db: &std::path::Path, operation: &str) -> std::path::PathBuf {
+    let root = nestweaver_engine::publication::default_publication_root(db);
+    let state = nestweaver_engine::publication_operation::load_operation(&root, operation).unwrap();
+    nestweaver_engine::publication::slot_path(&root, &state.plan.target_publication_uuid)
+        .unwrap()
+        .join(nestweaver_engine::publication::PUBLICATION_GRAPH_FILE)
+}
+
+/// The cutover gate refuses a staged graph that owes code links, so a slot
+/// can never be published into a daemon's first-pass relink.
+#[test]
+fn a_rebuild_refuses_to_seal_a_slot_that_owes_code_links() {
+    let fx = LinkedRebuildFixture::new();
+    let mut stop = nestweaver_cmd();
+    let stopped = stop
+        .timeout(std::time::Duration::from_secs(300))
+        .env("NESTWEAVER_TEST_STOP_BEFORE_PHASE", "validating")
+        .args(["publication", "rebuild", "--config"])
+        .arg(&fx.config)
+        .output()
+        .unwrap();
+    assert_exit(&stopped, 88, "rebuild stopped before validation");
+    let operation = operation_uuid_of(&stopped);
+    let staged = staged_graph_of(&fx.db, &operation);
+    nestweaver_engine::code_links::mark_code_links_pending(&staged, "injected debt");
+
+    let resumed = fx.rebuild(&["--operation", &operation]);
+    assert_exit(&resumed, 1, "resume over owed links");
+    let stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert!(
+        stderr.contains("validate the staged note→code links") && stderr.contains("injected debt"),
+        "{stderr}"
+    );
+    assert_eq!(fx.selected(), fx.db, "the incumbent stays selected");
+}
+
+/// Everything a daemon started right after an upgrade would owe the links is
+/// already settled: its first status and ranked read carry no code-link debt
+/// or open publication, and its unconditional first pass writes nothing (the
+/// graph generation it would advance stays put).
+#[test]
+fn a_daemon_started_on_a_rebuilt_brain_serves_without_a_code_link_pass() {
+    let fx = LinkedRebuildFixture::new();
+    assert_exit(&fx.rebuild(&[]), 0, "rebuild");
+    let selected = fx.selected();
+    let generation_path = nestweaver_engine::sidecar_path(&selected, ".generation");
+    let generation_before = std::fs::read(&generation_path).unwrap();
+    let reconciled_before =
+        nestweaver_engine::code_links::load_code_links_state(&selected).last_reconciled_at;
+    assert!(reconciled_before.is_some(), "the rebuild settled the links");
+
+    let daemon_cmd = || {
+        let mut cmd = Command::cargo_bin("nestweaver").unwrap();
+        cmd.env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON");
+        cmd
+    };
+    struct StopDaemon<'a>(&'a std::path::Path, Box<dyn Fn() -> Command + 'a>);
+    impl Drop for StopDaemon<'_> {
+        fn drop(&mut self) {
+            let _ = (self.1)()
+                .args(["daemon", "--db"])
+                .arg(self.0)
+                .arg("stop")
+                .output();
+        }
+    }
+    let _stop = StopDaemon(&fx.db, Box::new(daemon_cmd));
+    daemon_cmd()
+        .args(["daemon", "--db"])
+        .arg(&fx.db)
+        .args(["start", "--config"])
+        .arg(&fx.config)
+        .assert()
+        .success();
+
+    let status = || -> serde_json::Value {
+        let output = daemon_cmd()
+            .args(["brain", "status", "--json", "--db"])
+            .arg(&fx.db)
+            .output()
+            .unwrap();
+        assert_exit(&output, 0, "brain status");
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let first = status();
+    assert_eq!(first["code_links"]["pending"], false, "{first}");
+    assert_ne!(first["index_publication"]["dirty"], true, "{first}");
+    assert_eq!(
+        first["vault_derivation"]["pending_or_blocked_vaults"], 0,
+        "every rebuilt vault is admitted without a re-derivation: {first}"
+    );
+
+    let context = daemon_cmd()
+        .args(["brain", "context", "SharedWidget", "--json", "--db"])
+        .arg(&fx.db)
+        .output()
+        .unwrap();
+    assert_exit(&context, 0, "brain context");
+    let body: serde_json::Value = serde_json::from_slice(&context.stdout).unwrap();
+    assert_ne!(body["publication_in_progress"], true, "{body}");
+    assert_ne!(body["code_links_incomplete"], true, "{body}");
+
+    // The daemon's first reconcile pass is unconditional; wait for it to
+    // complete, then prove it rewrote nothing.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let now = status();
+        if now["code_links"]["last_reconciled_at"].as_str() != reconciled_before.as_deref() {
+            assert_eq!(now["code_links"]["pending"], false, "{now}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon's first code-link pass never completed: {now}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    assert_eq!(
+        std::fs::read(&generation_path).unwrap(),
+        generation_before,
+        "the daemon's first pass rewrote links (the graph generation moved)"
+    );
+}
+
+impl LinkedRebuildFixture {
+    /// Start a rebuild and stop it right before validation, as an
+    /// interruption would; returns the operation uuid.
+    fn build_until_validation(&self) -> String {
+        let stopped = nestweaver_cmd()
+            .timeout(std::time::Duration::from_secs(300))
+            .env("NESTWEAVER_TEST_STOP_BEFORE_PHASE", "validating")
+            .args(["publication", "rebuild", "--config"])
+            .arg(&self.config)
+            .output()
+            .unwrap();
+        assert_exit(&stopped, 88, "rebuild stopped before validation");
+        operation_uuid_of(&stopped)
+    }
+}
+
+fn symbol_content(
+    db: &std::path::Path,
+) -> std::collections::BTreeMap<String, (String, String, String)> {
+    nestweaver_store::GraphStore::open_read_only(db)
+        .unwrap()
+        .list_all_symbols()
+        .unwrap()
+        .into_iter()
+        .map(|symbol| {
+            (
+                symbol.uid,
+                (symbol.name, symbol.repo_uid, symbol.content_hash),
+            )
+        })
+        .collect()
+}
+
+/// Every symbol-to-symbol edge, cross-repo links included, in comparable form.
+fn typed_edges(db: &std::path::Path) -> Vec<(String, String, String, i64, String)> {
+    let store = nestweaver_store::GraphStore::open_read_only(db).unwrap();
+    let scaled = |confidence: f64| (confidence * 10_000.0).round() as i64;
+    let mut edges: Vec<_> = store
+        .load_typed_edges()
+        .unwrap()
+        .into_iter()
+        .map(|(src, dst, kind, confidence, evidence)| {
+            (src, dst, kind, scaled(confidence), evidence)
+        })
+        .collect();
+    // `load_typed_edges` covers the in-repo symbol edges; the cross-repo
+    // links are listed separately.
+    edges.extend(
+        store
+            .list_all_cross_repo_links(100_000)
+            .unwrap()
+            .into_iter()
+            .map(|link| {
+                (
+                    link.source_uid,
+                    link.target_uid,
+                    "CROSS_REPO_LINK".to_string(),
+                    scaled(f64::from(link.confidence)),
+                    link.link_type,
+                )
+            }),
+    );
+    edges.sort();
+    edges
+}
+
+fn has_cross_repo_call(db: &std::path::Path, from: &str, to: &str) -> bool {
+    let names = symbol_content(db);
+    let name = |uid: &str| names.get(uid).map(|(name, _, _)| name.clone());
+    typed_edges(db).iter().any(|(src, dst, kind, _, _)| {
+        kind == "CROSS_REPO_LINK"
+            && name(src).as_deref() == Some(from)
+            && name(dst).as_deref() == Some(to)
+    })
+}
+
+fn embedding_count_line(stderr: &str, kind: &str) -> Option<usize> {
+    stderr.lines().find_map(|line| {
+        line.strip_prefix("Embedding ")?
+            .strip_suffix(&format!(" {kind}(s) via API (batch size 32)…"))?
+            .parse()
+            .ok()
+    })
+}
+
+/// Sources changed while a rebuild ran (its validation refuses the cutover).
+/// A resume re-indexes only the changed repository into the staged slot,
+/// re-embeds only its changed nodes, rebuilds what derives from the graph,
+/// validates, and publishes a graph equal to a fresh full rebuild.
+#[test]
+fn a_resume_after_source_drift_reindexes_only_the_changed_repository() {
+    let fx = LinkedRebuildFixture::new();
+    let operation = fx.build_until_validation();
+    let root = nestweaver_engine::publication::default_publication_root(&fx.db);
+    let staged = staged_graph_of(&fx.db, &operation);
+    let before = symbol_content(&staged);
+    // The validation refusal a drifted source produces, recorded as the
+    // rebuild records it.
+    let latest =
+        nestweaver_engine::publication_operation::load_operation(&root, &operation).unwrap();
+    nestweaver_engine::publication_operation::record_failure(
+        &root,
+        &operation,
+        latest.revision,
+        "publication_rebuild_failed",
+        "publication sources, configuration, or preserved user state changed during rebuild",
+        true,
+    )
+    .unwrap();
+    let kept_checkpoints = latest.completed_artifacts.len();
+
+    // Edit one symbol in place (same uid, new content), rename one, delete a
+    // file and add one — all in alpha.
+    std::fs::write(
+        fx.alpha.join("src/widget.rs"),
+        "pub struct SharedWidget(u8);\npub struct AlphaGizmo;\n",
+    )
+    .unwrap();
+    std::fs::remove_file(fx.alpha.join("src/extra.rs")).unwrap();
+    std::fs::write(fx.alpha.join("src/added.rs"), "pub fn alpha_added() {}\n").unwrap();
+
+    let resumed = fx.rebuild(&["--operation", &operation]);
+    assert_exit(&resumed, 0, "scoped resume");
+    let stderr = String::from_utf8_lossy(&resumed.stderr).into_owned();
+    let alpha_url = format!("file://{}", fx.alpha.canonicalize().unwrap().display());
+    assert!(
+        stderr.contains("Resume: 1 input(s) changed")
+            && stderr.contains(&format!("re-indexing changed repository {alpha_url}")),
+        "{stderr}"
+    );
+    let indexed: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("[Graph]") && line.contains("indexing"))
+        .collect();
+    assert_eq!(indexed.len(), 1, "only alpha is re-indexed: {indexed:?}");
+    assert!(
+        stderr.contains("[Embeddings] embedding changed nodes"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Publication operation:"),
+        "no new operation: {stderr}"
+    );
+
+    let selected = fx.selected();
+    assert_eq!(selected, staged, "the resumed slot is published");
+    let after = symbol_content(&selected);
+    let changed = after
+        .iter()
+        .filter(|(uid, (_, _, hash))| before.get(*uid).is_none_or(|(_, _, old)| old != hash))
+        .count();
+    assert!(changed >= 3, "the edit changed alpha's symbols: {after:?}");
+    assert!(changed < after.len());
+    assert_eq!(
+        embedding_count_line(&stderr, "symbol"),
+        Some(changed),
+        "exactly the changed symbols are re-embedded: {stderr}"
+    );
+    assert_eq!(embedding_count_line(&stderr, "note"), None, "{stderr}");
+    let state =
+        nestweaver_engine::publication_operation::load_operation(&root, &operation).unwrap();
+    assert!(state.completed_artifacts.len() >= kept_checkpoints);
+
+    // Equal to a fresh full rebuild of the changed sources.
+    let fresh_output = fx.rebuild(&[]);
+    assert_exit(&fresh_output, 0, "fresh rebuild");
+    let fresh = fx.selected();
+    assert_ne!(fresh, selected);
+    let names = |content: &std::collections::BTreeMap<String, (String, String, String)>| {
+        content
+            .iter()
+            .map(|(uid, (name, repo, hash))| {
+                (uid.clone(), name.clone(), repo.clone(), hash.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(&after), names(&symbol_content(&fresh)));
+    // Cross-repo links: beta's call into alpha survives alpha's re-index,
+    // and every edge equals the fresh build's.
+    let resumed_edges = typed_edges(&selected);
+    assert!(
+        has_cross_repo_call(&selected, "betaCaller", "alphaHelper"),
+        "{resumed_edges:?}"
+    );
+    assert_eq!(resumed_edges, typed_edges(&fresh));
+    let resumed_store = nestweaver_store::GraphStore::open_read_only(&selected).unwrap();
+    let fresh_store = nestweaver_store::GraphStore::open_read_only(&fresh).unwrap();
+    assert!(after.values().any(|(name, _, _)| name == "AlphaGizmo"));
+    assert!(
+        !after
+            .values()
+            .any(|(name, _, _)| name == "alpha_extra" || name == "AlphaGadget")
+    );
+    assert_eq!(
+        resumed_store.count_notes().unwrap(),
+        fresh_store.count_notes().unwrap()
+    );
+    assert_eq!(
+        resumed_store.list_references_code_edges().unwrap(),
+        fresh_store.list_references_code_edges().unwrap()
+    );
+    for uid in after.keys() {
+        assert!(resumed_store.has_embedding(uid), "{uid} has no vector");
+    }
+    assert_eq!(
+        resumed_store.embedding_index_dimension(),
+        fresh_store.embedding_index_dimension()
+    );
+}
+
+/// The vault twin: an edited note re-indexes only its vault, re-embeds only
+/// the changed note, re-stamps the vault's derivation record, and relinks.
+#[test]
+fn a_resume_after_a_vault_edit_reindexes_only_that_vault() {
+    let fx = LinkedRebuildFixture::new();
+    let operation = fx.build_until_validation();
+    std::fs::write(
+        fx.vault.join("Notes/beta.md"),
+        "# Beta\n\nThe BetaGadget ships next, beside the SharedWidget.\n",
+    )
+    .unwrap();
+    let resumed = fx.rebuild(&["--operation", &operation]);
+    assert_exit(&resumed, 0, "scoped resume");
+    let stderr = String::from_utf8_lossy(&resumed.stderr).into_owned();
+    let indexed: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("[Graph]") && line.contains("indexing"))
+        .collect();
+    assert_eq!(
+        indexed,
+        ["[Graph] re-indexing changed vault vault"],
+        "{stderr}"
+    );
+    assert_eq!(embedding_count_line(&stderr, "symbol"), None, "{stderr}");
+    assert_eq!(embedding_count_line(&stderr, "note"), Some(1), "{stderr}");
+
+    let selected = fx.selected();
+    let fresh_output = fx.rebuild(&[]);
+    assert_exit(&fresh_output, 0, "fresh rebuild");
+    let fresh = fx.selected();
+    let resumed_store = nestweaver_store::GraphStore::open_read_only(&selected).unwrap();
+    let fresh_store = nestweaver_store::GraphStore::open_read_only(&fresh).unwrap();
+    assert_eq!(
+        resumed_store.list_references_code_edges().unwrap(),
+        fresh_store.list_references_code_edges().unwrap()
+    );
+    let hashes = |store: &nestweaver_store::GraphStore| {
+        store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .map(|note| (note.uid, note.content_hash))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    assert_eq!(hashes(&resumed_store), hashes(&fresh_store));
+    for note in resumed_store.list_notes(None).unwrap() {
+        assert!(
+            resumed_store.has_embedding(&note.uid),
+            "{} has no vector",
+            note.uid
+        );
+    }
+    let identity = resumed_store.publication_identity().unwrap().unwrap();
+    let records = nestweaver_engine::markdown_derivation::load_records(
+        &selected,
+        &nestweaver_engine::markdown_derivation::expectation(&identity, "linked"),
+    )
+    .unwrap()
+    .unwrap();
+    let record = records.vaults.values().next().unwrap();
+    assert_eq!(
+        record.phase,
+        nestweaver_engine::markdown_derivation::DerivationPhase::Current
+    );
+    assert_eq!(
+        record.witness.as_ref().unwrap().source_inventory_digest,
+        nestweaver_engine::markdown_derivation::inventory_digest(
+            &resumed_store.list_notes(None).unwrap()
+        )
+    );
+}
+
+/// A heading is embedded with its note's title. Changing only a note's title
+/// leaves the heading's own hash alone, yet its vector is stale: a resume
+/// re-embeds the note and its headings.
+#[test]
+fn a_resume_after_a_note_title_change_re_embeds_its_headings() {
+    let fx = LinkedRebuildFixture::new();
+    let operation = fx.build_until_validation();
+    let note = fx.vault.join("Workspaces/Alpha/design.md");
+    // Only the frontmatter title changes: every heading keeps its text, line
+    // and uid, so only the note's hash says its headings' vectors are stale.
+    let body = std::fs::read_to_string(&note).unwrap();
+    assert!(body.contains("title: Widget design"));
+    std::fs::write(
+        &note,
+        body.replace("title: Widget design", "title: Widget architecture"),
+    )
+    .unwrap();
+
+    let resumed = fx.rebuild(&["--operation", &operation]);
+    assert_exit(&resumed, 0, "scoped resume");
+    let stderr = String::from_utf8_lossy(&resumed.stderr).into_owned();
+    let selected = fx.selected();
+    let store = nestweaver_store::GraphStore::open_read_only(&selected).unwrap();
+    let design = store
+        .list_notes(None)
+        .unwrap()
+        .into_iter()
+        .find(|note| note.file_path.ends_with("design.md"))
+        .unwrap();
+    assert_eq!(design.title, "Widget architecture");
+    let vault_uid = design.vault_uid.clone();
+    let headings: Vec<_> = store
+        .list_headings_by_vault(&vault_uid)
+        .unwrap()
+        .into_iter()
+        .filter(|heading| heading.note_uid == design.uid)
+        .collect();
+    assert!(!headings.is_empty());
+    assert_eq!(embedding_count_line(&stderr, "note"), Some(1), "{stderr}");
+    assert_eq!(
+        embedding_count_line(&stderr, "heading"),
+        Some(headings.len()),
+        "the retitled note's headings are re-embedded: {stderr}"
+    );
+    assert_eq!(embedding_count_line(&stderr, "symbol"), None, "{stderr}");
+    for heading in &headings {
+        assert!(store.has_embedding(&heading.uid));
+    }
+}
+
+/// A change resume cannot scope — the configuration, or which sources exist —
+/// falls back to a full rebuild under a new operation, and says why.
+#[test]
+fn a_resume_restarts_in_full_when_the_change_cannot_be_scoped() {
+    let fx = LinkedRebuildFixture::new();
+    let root = nestweaver_engine::publication::default_publication_root(&fx.db);
+
+    let operation = fx.build_until_validation();
+    let mut config = std::fs::read_to_string(&fx.config).unwrap();
+    config.push_str("# edited while the rebuild ran\n");
+    std::fs::write(&fx.config, config).unwrap();
+    let resumed = fx.rebuild(&["--operation", &operation]);
+    assert_exit(&resumed, 0, "resume after a configuration change");
+    let stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert!(
+        stderr.contains(
+            "Resume cannot re-index only what changed: the instance configuration changed"
+        ) && stderr.contains(&format!("Discarding operation {operation}")),
+        "{stderr}"
+    );
+    let restarted = operation_uuid_of(&resumed);
+    assert_ne!(restarted, operation);
+    assert!(nestweaver_engine::publication_operation::load_operation(&root, &operation).is_err());
+    assert!(!stderr.contains("re-indexing changed"), "{stderr}");
+    assert_eq!(fx.selected(), staged_graph_of(&fx.db, &restarted));
+
+    // A repository added to the incumbent while the next rebuild ran.
+    let operation = fx.build_until_validation();
+    let gamma = fx.alpha.parent().unwrap().join("gamma");
+    std::fs::create_dir_all(gamma.join("src")).unwrap();
+    std::fs::write(gamma.join("src/lib.rs"), "pub fn gamma_signal() {}\n").unwrap();
+    nestweaver_cmd()
+        .args(["index", "--config"])
+        .arg(&fx.config)
+        .arg("--repo")
+        .arg(&gamma)
+        .assert()
+        .success();
+    let resumed = fx.rebuild(&["--operation", &operation]);
+    assert_exit(&resumed, 0, "resume after a repository was added");
+    let stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert!(
+        stderr.contains("Resume cannot re-index only what changed: repository")
+            && stderr.contains("gamma was added"),
+        "{stderr}"
+    );
+    let names: Vec<String> = symbol_content(&fx.selected())
+        .into_values()
+        .map(|(name, _, _)| name)
+        .collect();
+    assert!(names.contains(&"gamma_signal".to_string()), "{names:?}");
+}

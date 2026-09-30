@@ -933,6 +933,258 @@ pub fn resume_operation(
     )
 }
 
+/// `operations/<uuid>/inputs.json`: the exact inputs the operation's staged
+/// graph was built from, kept beside the journal so a resume can tell WHICH
+/// sources drifted instead of only that the combined fingerprint changed.
+pub const OPERATION_INPUTS_FILE: &str = "inputs.json";
+pub const OPERATION_INPUTS_VERSION: u32 = 1;
+
+/// The recorded inputs of one operation. `input_fingerprint` binds the record
+/// to the plan it was written for: a record whose fingerprint differs from the
+/// journal's is stale (a crash between the two writes) and is not trusted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationOperationInputs {
+    pub version: u32,
+    pub input_fingerprint: String,
+    pub config_blake3: String,
+    pub preserved_state_fingerprint: String,
+    pub sources: crate::PublicationSourceManifest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChecksummedOperationInputs {
+    checksum_blake3: String,
+    inputs: PublicationOperationInputs,
+}
+
+pub fn write_operation_inputs(
+    publication_root: &Path,
+    operation_uuid: &str,
+    inputs: &PublicationOperationInputs,
+) -> anyhow::Result<()> {
+    parse_non_nil_uuid("operation_uuid", operation_uuid)?;
+    let path = crate::publication::operation_path(publication_root, operation_uuid)?
+        .join(OPERATION_INPUTS_FILE);
+    let envelope = ChecksummedOperationInputs {
+        checksum_blake3: blake3::hash(&serde_json::to_vec(inputs)?)
+            .to_hex()
+            .to_string(),
+        inputs: inputs.clone(),
+    };
+    let bytes = serde_json::to_vec(&envelope)?;
+    nestweaver_store::durable_sidecar::atomic_replace_file(&path, |file| file.write_all(&bytes))?;
+    Ok(())
+}
+
+/// The recorded inputs, or `None` when there is no usable record (absent,
+/// unreadable, corrupt, or another version): the caller then cannot scope a
+/// resume and must rebuild in full.
+pub fn load_operation_inputs(
+    publication_root: &Path,
+    operation_uuid: &str,
+) -> Option<PublicationOperationInputs> {
+    let path = crate::publication::operation_path(publication_root, operation_uuid)
+        .ok()?
+        .join(OPERATION_INPUTS_FILE);
+    let envelope: ChecksummedOperationInputs =
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let checksum = blake3::hash(&serde_json::to_vec(&envelope.inputs).ok()?)
+        .to_hex()
+        .to_string();
+    (checksum == envelope.checksum_blake3 && envelope.inputs.version == OPERATION_INPUTS_VERSION)
+        .then_some(envelope.inputs)
+}
+
+/// What a resume must do about inputs that changed since the operation
+/// recorded them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeScope {
+    /// Nothing the staged graph was built from changed.
+    Unchanged,
+    /// Re-index exactly these sources (repository and vault uids) into the
+    /// staged slot, then redo everything derived from the graph.
+    Rescope {
+        repos: Vec<String>,
+        vaults: Vec<String>,
+        preserved_state_changed: bool,
+    },
+    /// The change cannot be scoped safely; the reason is shown to the user.
+    Restart(String),
+}
+
+/// Compare the operation's recorded inputs with the current ones. Content or
+/// commit changes inside a known source are scoped to that source; anything
+/// that changes WHICH sources exist, where they live, or how they are indexed
+/// (the instance configuration) is not.
+pub fn plan_resume_scope(
+    recorded: &PublicationOperationInputs,
+    current: &crate::PublicationSourceManifest,
+    config_blake3: &str,
+    preserved_state_fingerprint: &str,
+) -> ResumeScope {
+    if recorded.config_blake3 != config_blake3 {
+        return ResumeScope::Restart("the instance configuration changed".to_string());
+    }
+    if recorded.sources.version != current.version {
+        return ResumeScope::Restart("the source manifest format changed".to_string());
+    }
+    let mut repos = Vec::new();
+    let recorded_repos: BTreeMap<&str, &crate::publication_source::PublicationRepoSource> =
+        recorded
+            .sources
+            .repos
+            .iter()
+            .map(|repo| (repo.uid.as_str(), repo))
+            .collect();
+    for repo in &current.repos {
+        let Some(before) = recorded_repos.get(repo.uid.as_str()) else {
+            return ResumeScope::Restart(format!("repository {} was added", repo.url));
+        };
+        if before.url != repo.url
+            || before.name != repo.name
+            || before.instance_id != repo.instance_id
+            || before.root_path != repo.root_path
+        {
+            return ResumeScope::Restart(format!("repository {} was moved or renamed", repo.url));
+        }
+        if before.content_blake3 != repo.content_blake3
+            || before.observed_head != repo.observed_head
+        {
+            repos.push(repo.uid.clone());
+        }
+    }
+    if let Some(removed) = recorded
+        .sources
+        .repos
+        .iter()
+        .find(|before| !current.repos.iter().any(|repo| repo.uid == before.uid))
+    {
+        return ResumeScope::Restart(format!("repository {} was removed", removed.url));
+    }
+    let mut vaults = Vec::new();
+    for vault in &current.vaults {
+        let Some(before) = recorded
+            .sources
+            .vaults
+            .iter()
+            .find(|before| before.uid == vault.uid)
+        else {
+            return ResumeScope::Restart(format!("vault {} was added", vault.root_path));
+        };
+        if before.name != vault.name
+            || before.instance_id != vault.instance_id
+            || before.root_path != vault.root_path
+        {
+            return ResumeScope::Restart(format!("vault {} was moved or renamed", vault.root_path));
+        }
+        if before.content_blake3 != vault.content_blake3 {
+            vaults.push(vault.uid.clone());
+        }
+    }
+    if let Some(removed) = recorded
+        .sources
+        .vaults
+        .iter()
+        .find(|before| !current.vaults.iter().any(|vault| vault.uid == before.uid))
+    {
+        return ResumeScope::Restart(format!("vault {} was removed", removed.root_path));
+    }
+    let preserved_state_changed =
+        recorded.preserved_state_fingerprint != preserved_state_fingerprint;
+    if repos.is_empty() && vaults.is_empty() && !preserved_state_changed {
+        ResumeScope::Unchanged
+    } else {
+        ResumeScope::Rescope {
+            repos,
+            vaults,
+            preserved_state_changed,
+        }
+    }
+}
+
+/// Whether a resume may rescope an operation in `phase`: only while the slot
+/// is still being staged. A Ready or Activating slot is sealed.
+pub fn phase_accepts_rescope(phase: PublicationPhase) -> bool {
+    matches!(
+        phase,
+        PublicationPhase::Planned
+            | PublicationPhase::Graph
+            | PublicationPhase::TextSearch
+            | PublicationPhase::Regex
+            | PublicationPhase::Embeddings
+            | PublicationPhase::Metadata
+            | PublicationPhase::Validating
+    )
+}
+
+/// Rewind an unsealed operation for a resume over changed inputs: adopt the
+/// new input fingerprint, drop the graph checkpoints of `invalidated` sources
+/// so the graph phase re-indexes exactly those, and return to the graph phase
+/// so every artifact derived from the graph is rebuilt before validation. A
+/// retryable failure is cleared; a permanent one still refuses. Every other
+/// plan field must match, and every other checkpoint is kept.
+pub fn rescope_operation(
+    publication_root: &Path,
+    requested: &PublicationOperationPlan,
+    expected_revision: u64,
+    invalidated: &[String],
+) -> anyhow::Result<PublicationOperationState> {
+    requested.validate()?;
+    let journal_lock = lock_operation_journal(publication_root, &requested.operation_uuid)?;
+    let incumbent = load_operation(publication_root, &requested.operation_uuid)?;
+    if incumbent.revision != expected_revision {
+        anyhow::bail!(
+            "stale publication-operation writer: expected revision {expected_revision}, current revision {}",
+            incumbent.revision
+        );
+    }
+    if !phase_accepts_rescope(incumbent.phase) || incumbent.cancel_requested {
+        anyhow::bail!(
+            "publication operation in phase {:?} cannot be rescoped",
+            incumbent.phase
+        );
+    }
+    if incumbent
+        .failure
+        .as_ref()
+        .is_some_and(|failure| !failure.retryable)
+    {
+        anyhow::bail!("publication failure is not retryable; discard explicitly");
+    }
+    let mut same_plan = requested.clone();
+    same_plan.input_fingerprint = incumbent.plan.input_fingerprint.clone();
+    if same_plan != incumbent.plan {
+        anyhow::bail!(
+            "publication operation is incompatible with the requested resume beyond its source inputs"
+        );
+    }
+    let mut next = incumbent.clone();
+    next.plan.input_fingerprint = requested.input_fingerprint.clone();
+    if next.phase != PublicationPhase::Planned {
+        next.phase = PublicationPhase::Graph;
+    }
+    for checkpoint in invalidated {
+        next.completed_artifacts.remove(checkpoint);
+    }
+    next.failure = None;
+    next.progress = None;
+    next.validated_manifest_blake3 = None;
+    next.plan.validate()?;
+    next.revision = incumbent
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("publication operation revision exhausted"))?;
+    next.updated_unix_millis = unix_millis().max(incumbent.updated_unix_millis);
+    if !journal_lock.is_current() {
+        anyhow::bail!("publication journal authority was replaced before checkpoint");
+    }
+    persist_state(
+        &operation_state_path(publication_root, &requested.operation_uuid)?,
+        &next,
+    )?;
+    Ok(next)
+}
+
 /// Explicitly discard a cancelled or failed staging operation. The target slot
 /// is first moved under the operation directory, then the complete operation is
 /// renamed out of the active UUID namespace before recursive deletion. A crash
@@ -1635,6 +1887,269 @@ mod tests {
         let resumed = resume_operation(dir.path(), &plan, failed.revision).unwrap();
         assert_eq!(resumed.completed_artifacts.get(&checkpoint), Some(&digest));
         assert_eq!(resumed.phase, PublicationPhase::Graph);
+    }
+
+    fn repo_source(uid: &str, digest: char) -> crate::PublicationRepoSource {
+        crate::PublicationRepoSource {
+            uid: uid.to_string(),
+            url: format!("file:///src/{uid}"),
+            instance_id: "test".to_string(),
+            name: Some(uid.to_string()),
+            root_path: format!("/src/{uid}"),
+            observed_head: Some("head".to_string()),
+            content_blake3: digest.to_string().repeat(64),
+            file_count: 1,
+            files: Vec::new(),
+        }
+    }
+
+    fn vault_source(uid: &str, digest: char) -> crate::PublicationVaultSource {
+        crate::PublicationVaultSource {
+            uid: uid.to_string(),
+            name: uid.to_string(),
+            instance_id: "test".to_string(),
+            root_path: format!("/notes/{uid}"),
+            content_blake3: digest.to_string().repeat(64),
+            file_count: 1,
+            files: Vec::new(),
+        }
+    }
+
+    fn recorded_inputs() -> PublicationOperationInputs {
+        PublicationOperationInputs {
+            version: OPERATION_INPUTS_VERSION,
+            input_fingerprint: "inputs-v1:abc".to_string(),
+            config_blake3: "c".repeat(64),
+            preserved_state_fingerprint: "p".to_string(),
+            sources: crate::PublicationSourceManifest {
+                version: crate::publication_source::PUBLICATION_SOURCE_MANIFEST_VERSION,
+                repos: vec![repo_source("alpha", 'a'), repo_source("beta", 'b')],
+                vaults: vec![vault_source("notes", 'n')],
+            },
+        }
+    }
+
+    #[test]
+    fn resume_scope_names_exactly_the_changed_sources() {
+        let recorded = recorded_inputs();
+        let config = recorded.config_blake3.clone();
+        assert_eq!(
+            plan_resume_scope(&recorded, &recorded.sources, &config, "p"),
+            ResumeScope::Unchanged
+        );
+
+        let mut current = recorded.sources.clone();
+        current.repos[1].content_blake3 = "e".repeat(64);
+        assert_eq!(
+            plan_resume_scope(&recorded, &current, &config, "p"),
+            ResumeScope::Rescope {
+                repos: vec!["beta".to_string()],
+                vaults: Vec::new(),
+                preserved_state_changed: false,
+            }
+        );
+
+        // A new commit alone is a change even when the tree hashes equal.
+        let mut current = recorded.sources.clone();
+        current.repos[0].observed_head = Some("next".to_string());
+        current.vaults[0].content_blake3 = "f".repeat(64);
+        assert_eq!(
+            plan_resume_scope(&recorded, &current, &config, "q"),
+            ResumeScope::Rescope {
+                repos: vec!["alpha".to_string()],
+                vaults: vec!["notes".to_string()],
+                preserved_state_changed: true,
+            }
+        );
+    }
+
+    #[test]
+    fn resume_scope_restarts_when_the_change_cannot_be_scoped() {
+        let recorded = recorded_inputs();
+        let config = recorded.config_blake3.clone();
+        let restart =
+            |current: &crate::PublicationSourceManifest, config: &str| match plan_resume_scope(
+                &recorded, current, config, "p",
+            ) {
+                ResumeScope::Restart(reason) => reason,
+                other => panic!("expected a restart, got {other:?}"),
+            };
+        assert!(restart(&recorded.sources, &"d".repeat(64)).contains("configuration changed"));
+
+        let mut added = recorded.sources.clone();
+        added.repos.push(repo_source("gamma", 'g'));
+        assert!(restart(&added, &config).contains("gamma was added"));
+
+        let mut removed = recorded.sources.clone();
+        removed.repos.remove(0);
+        assert!(restart(&removed, &config).contains("alpha was removed"));
+
+        let mut moved = recorded.sources.clone();
+        moved.repos[0].root_path = "/elsewhere".to_string();
+        assert!(restart(&moved, &config).contains("moved or renamed"));
+
+        let mut vault_added = recorded.sources.clone();
+        vault_added.vaults.push(vault_source("more", 'm'));
+        assert!(restart(&vault_added, &config).contains("vault /notes/more was added"));
+
+        let mut vault_removed = recorded.sources.clone();
+        vault_removed.vaults.clear();
+        assert!(restart(&vault_removed, &config).contains("vault /notes/notes was removed"));
+    }
+
+    #[test]
+    fn operation_inputs_round_trip_and_reject_tampering() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = plan();
+        create_operation(dir.path(), plan.clone()).unwrap();
+        assert_eq!(
+            load_operation_inputs(dir.path(), &plan.operation_uuid),
+            None
+        );
+        let inputs = recorded_inputs();
+        write_operation_inputs(dir.path(), &plan.operation_uuid, &inputs).unwrap();
+        assert_eq!(
+            load_operation_inputs(dir.path(), &plan.operation_uuid),
+            Some(inputs)
+        );
+        let path = crate::publication::operation_path(dir.path(), &plan.operation_uuid)
+            .unwrap()
+            .join(OPERATION_INPUTS_FILE);
+        let tampered = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("file:///src/alpha", "file:///src/other");
+        std::fs::write(&path, tampered).unwrap();
+        assert_eq!(
+            load_operation_inputs(dir.path(), &plan.operation_uuid),
+            None
+        );
+    }
+
+    #[test]
+    fn rescope_rewinds_to_the_graph_dropping_only_invalidated_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = plan();
+        let created = create_operation(dir.path(), plan.clone()).unwrap();
+        let graph = advance_phase(
+            dir.path(),
+            &plan.operation_uuid,
+            created.revision,
+            PublicationPhase::Graph,
+        )
+        .unwrap();
+        let changed = "graph/repo/changed.done".to_string();
+        let kept = "graph/repo/kept.done".to_string();
+        let mut state = graph;
+        for checkpoint in [&changed, &kept] {
+            state = record_artifact(
+                dir.path(),
+                &plan.operation_uuid,
+                state.revision,
+                checkpoint.clone(),
+                "a".repeat(64),
+            )
+            .unwrap();
+        }
+        state = advance_to_validating_from_graph(dir.path(), &plan, state);
+        let failed = record_failure(
+            dir.path(),
+            &plan.operation_uuid,
+            state.revision,
+            "publication_rebuild_failed",
+            "sources changed during rebuild",
+            true,
+        )
+        .unwrap();
+
+        let mut requested = plan.clone();
+        requested.input_fingerprint = "inputs-v1:changed".to_string();
+        // Stale revision and a foreign plan are refused.
+        assert!(
+            rescope_operation(
+                dir.path(),
+                &requested,
+                failed.revision - 1,
+                std::slice::from_ref(&changed)
+            )
+            .is_err()
+        );
+        let mut foreign = requested.clone();
+        foreign.target_publication_uuid = uuid::Uuid::new_v4().to_string();
+        assert!(
+            rescope_operation(
+                dir.path(),
+                &foreign,
+                failed.revision,
+                std::slice::from_ref(&changed)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("beyond its source inputs")
+        );
+
+        let rescoped = rescope_operation(
+            dir.path(),
+            &requested,
+            failed.revision,
+            std::slice::from_ref(&changed),
+        )
+        .unwrap();
+        assert_eq!(rescoped.phase, PublicationPhase::Graph);
+        assert_eq!(rescoped.plan.input_fingerprint, requested.input_fingerprint);
+        assert_eq!(rescoped.failure, None);
+        assert!(!rescoped.completed_artifacts.contains_key(&changed));
+        assert!(rescoped.completed_artifacts.contains_key(&kept));
+        assert_eq!(rescoped.revision, failed.revision + 1);
+        assert_eq!(
+            load_operation(dir.path(), &plan.operation_uuid).unwrap(),
+            rescoped
+        );
+        // The rewound journal resumes ordinarily with the new inputs.
+        rescoped.resumable_with(&requested).unwrap();
+    }
+
+    #[test]
+    fn rescope_refuses_a_sealed_or_permanently_failed_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = plan();
+        let created = create_operation(dir.path(), plan.clone()).unwrap();
+        let failed = record_failure(
+            dir.path(),
+            &plan.operation_uuid,
+            created.revision,
+            "permanent",
+            "cannot be retried",
+            false,
+        )
+        .unwrap();
+        let mut requested = plan.clone();
+        requested.input_fingerprint = "inputs-v1:changed".to_string();
+        assert!(
+            rescope_operation(dir.path(), &requested, failed.revision, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("not retryable")
+        );
+        assert!(!phase_accepts_rescope(PublicationPhase::Ready));
+        assert!(!phase_accepts_rescope(PublicationPhase::Activating));
+        assert!(phase_accepts_rescope(PublicationPhase::Validating));
+    }
+
+    fn advance_to_validating_from_graph(
+        root: &Path,
+        plan: &PublicationOperationPlan,
+        mut state: PublicationOperationState,
+    ) -> PublicationOperationState {
+        for phase in [
+            PublicationPhase::TextSearch,
+            PublicationPhase::Regex,
+            PublicationPhase::Embeddings,
+            PublicationPhase::Metadata,
+            PublicationPhase::Validating,
+        ] {
+            state = advance_phase(root, &plan.operation_uuid, state.revision, phase).unwrap();
+        }
+        state
     }
 
     #[test]

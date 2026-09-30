@@ -9361,6 +9361,9 @@ pub fn brain_status_json(
         nestweaver_engine::index_md::skipped_notes_status_json(db_path.as_deref());
     // nw-670 review M3: owed note->code links, in their own object.
     let code_links = nestweaver_engine::code_links::code_links_status_json(db_path.as_deref());
+    // Name-inferred cross-repo links owed a whole-graph pass.
+    let cross_repo_links =
+        nestweaver_engine::cross_repo_links::cross_repo_links_status_json(db_path.as_deref());
     // nw-705: repositories the manifest rebuild refused, each with its remedy.
     let manifest_failures = db_path
         .as_deref()
@@ -9442,6 +9445,7 @@ pub fn brain_status_json(
         // (no vault walk). Always present so callers can key on `count: 0`.
         "skipped_notes": skipped_notes,
         "code_links": code_links,
+        "cross_repo_links": cross_repo_links,
         "notes_near_size_limit": notes_near_size_limit,
         // The `brain_search` precedent: always present, empty unless a
         // component was bypassed. The direct fallback sets
@@ -17667,6 +17671,44 @@ mod project_context_bug12_tests {
             ));
         }
         assert!(!project_member_uid("tag:shared", &members));
+    }
+
+    /// A `vlt:` seed for a vault with no notes is a business error
+    /// (`isError: true` with the engine's "Seed container is empty" text),
+    /// not the not-found envelope a bogus uid gets.
+    #[test]
+    fn brain_context_on_an_empty_vault_is_not_the_not_found_envelope() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:empty".into(),
+                name: "empty".into(),
+                root_path: "/v".into(),
+                instance_id: "default".into(),
+            })
+            .unwrap();
+        let empty = dispatch(
+            &store,
+            None,
+            "brain_context",
+            json!({ "seeds": ["vlt:empty"] }),
+            None,
+        )
+        .unwrap_err();
+        assert!(not_found_envelope(&empty).is_none(), "{empty:#}");
+        assert!(
+            format!("{empty:#}").contains(nestweaver_engine::query::EMPTY_SEED_CONTAINER),
+            "{empty:#}"
+        );
+        let bogus = dispatch(
+            &store,
+            None,
+            "brain_context",
+            json!({ "seeds": ["vlt:bogus"] }),
+            None,
+        )
+        .unwrap_err();
+        assert!(not_found_envelope(&bogus).is_some(), "{bogus:#}");
     }
 
     #[test]

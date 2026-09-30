@@ -498,6 +498,12 @@ pub(crate) fn run_brain(
                     {
                         println!("  {line}");
                     }
+                    if let Some(line) = nestweaver_proto::cross_repo_links_from_status_json(&value)
+                        .as_ref()
+                        .and_then(format_cross_repo_links_status)
+                    {
+                        println!("  {line}");
+                    }
                     for line in format_manifest_failures_status(
                         &nestweaver_proto::manifest_failures_from_status_json(&value),
                     ) {
@@ -832,6 +838,19 @@ pub(crate) fn run_brain(
                             "  interaction_tracking: disabled (run with --track-interactions to enable)"
                         );
                     }
+                }
+                // The same line the daemon-routed render prints.
+                if let Some(line) =
+                    nestweaver_proto::cross_repo_links_from_status_json(&serde_json::json!({
+                        "cross_repo_links":
+                            nestweaver_engine::cross_repo_links::cross_repo_links_status_json(
+                                Some(db_path),
+                            ),
+                    }))
+                    .as_ref()
+                    .and_then(format_cross_repo_links_status)
+                {
+                    println!("  {line}");
                 }
             }
 
@@ -2503,6 +2522,15 @@ pub(crate) fn run_brain(
                         return Ok((report_context_lookup_failure(&error, json, &seeds), None));
                     }
                     Err(error)
+                        if error.chain().any(|cause| {
+                            cause
+                                .to_string()
+                                .contains(nestweaver_engine::query::EMPTY_SEED_CONTAINER)
+                        }) =>
+                    {
+                        return Ok((report_brain_context_empty(&error, json, &seeds)?, None));
+                    }
+                    Err(error)
                         if error
                             .chain()
                             .any(|cause| cause.to_string().contains("No seeds resolved")) =>
@@ -2877,6 +2905,8 @@ pub(crate) fn run_brain(
                     let msg = e.to_string();
                     if msg.contains("Ambiguous") {
                         Ok((report_context_lookup_failure(&e, json, &seeds), None))
+                    } else if msg.contains(nestweaver_engine::query::EMPTY_SEED_CONTAINER) {
+                        Ok((report_brain_context_empty(&e, json, &seeds)?, None))
                     } else if msg.contains("No seeds resolved") {
                         Ok((report_brain_context_not_found(&e, json, &seeds)?, None))
                     } else {
@@ -3542,32 +3572,52 @@ pub(crate) fn finish_vault_refresh(
 /// nw-694: `brain status` text says a vault is BLOCKED. The count lived only
 /// in `--json` (`vault_derivation`), so a human saw a healthy status while
 /// every link-graph tool refused that vault.
+///
+/// A derivation the daemon is running now is said too, with its vault, phase
+/// and how long it has run, so status explains why link-graph tools wait.
 pub(crate) fn vault_derivation_status_lines(status: &serde_json::Value) -> Vec<String> {
-    let Some(blocked) = status
-        .get("vault_derivation")
+    let derivation = status.get("vault_derivation");
+    let mut lines = Vec::new();
+    if let Some(running) = derivation
+        .and_then(|derivation| derivation.get("in_progress"))
+        .filter(|running| running.is_object())
+    {
+        let text = |key: &str| running.get(key).and_then(|v| v.as_str()).unwrap_or("?");
+        let mut detail = format!("phase: {}", text("phase"));
+        if let Some(notes) = running.get("indexed_notes").and_then(|v| v.as_u64()) {
+            detail.push_str(&format!(", {notes} note(s) indexed"));
+        }
+        if let Some(elapsed) = running.get("elapsed_seconds").and_then(|v| v.as_u64()) {
+            detail.push_str(&format!(", running {elapsed}s"));
+        }
+        lines.push(format!(
+            "Vault derivation in progress: {} ({detail}) -- link-graph tools refuse this vault \
+             until it finishes",
+            text("root_path")
+        ));
+    }
+    let Some(blocked) = derivation
         .and_then(|derivation| derivation.get("blocked_vaults"))
         .and_then(|blocked| blocked.as_array())
     else {
-        return Vec::new();
+        return lines;
     };
-    blocked
-        .iter()
-        .map(|vault| {
-            let root = vault
-                .get("root_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("<unknown vault>");
-            let reason = vault
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            format!(
-                "Vault BLOCKED: {root} ({reason}) -- Markdown link derivation is not current, so \
+    lines.extend(blocked.iter().map(|vault| {
+        let root = vault
+            .get("root_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown vault>");
+        let reason = vault
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        format!(
+            "Vault BLOCKED: {root} ({reason}) -- Markdown link derivation is not current, so \
                  link-graph tools refuse it. Fix the unreadable path and run a full \
                  `nestweaver brain refresh {root}`."
-            )
-        })
-        .collect()
+        )
+    }));
+    lines
 }
 
 #[cfg(test)]
@@ -3591,11 +3641,43 @@ mod vault_derivation_status_tests {
         assert!(lines[0].contains("brain refresh /v/brain"), "{}", lines[0]);
     }
 
+    /// A derivation running now is said with its vault, phase and progress.
+    #[test]
+    fn a_running_derivation_gets_a_status_line_naming_it() {
+        let status = serde_json::json!({
+            "vault_derivation": {
+                "pending_or_blocked_vaults": 1,
+                "blocked_vaults": [],
+                "in_progress": {
+                    "vault_uid": "vlt:default:abc",
+                    "root_path": "/v/brain",
+                    "phase": "refreshing notes",
+                    "indexed_notes": 4000,
+                    "elapsed_seconds": 12
+                }
+            }
+        });
+        let lines = vault_derivation_status_lines(&status);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("Vault derivation in progress: /v/brain"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains("phase: refreshing notes"), "{}", lines[0]);
+        assert!(lines[0].contains("4000 note(s)"), "{}", lines[0]);
+        assert!(lines[0].contains("running 12s"), "{}", lines[0]);
+    }
+
     /// Counterweight: no Blocked vault, no line.
     #[test]
     fn no_blocked_vault_means_no_line() {
         let status = serde_json::json!({
-            "vault_derivation": { "pending_or_blocked_vaults": 0, "blocked_vaults": [] }
+            "vault_derivation": {
+                "pending_or_blocked_vaults": 0,
+                "blocked_vaults": [],
+                "in_progress": null
+            }
         });
         assert!(vault_derivation_status_lines(&status).is_empty());
         assert!(vault_derivation_status_lines(&serde_json::json!({})).is_empty());
@@ -3654,6 +3736,45 @@ pub(crate) fn brain_context_not_found_payload(
     })
 }
 
+/// A seed naming a vault with no notes (or a repo with no symbols) is not a
+/// miss: exit 1 (a valid request the graph cannot answer yet), not 2, with
+/// `status: "empty"` under `--json` rather than the not-found envelope.
+pub(crate) fn report_brain_context_empty(
+    error: &anyhow::Error,
+    json: bool,
+    seeds: &[String],
+) -> anyhow::Result<i32> {
+    let message = error
+        .chain()
+        .map(ToString::to_string)
+        .find_map(|cause| {
+            cause
+                .find(nestweaver_engine::query::EMPTY_SEED_CONTAINER)
+                .map(|start| cause[start..].to_string())
+        })
+        .unwrap_or_else(|| format!("{error:#}"));
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&brain_context_empty_payload(&message, seeds))?
+        );
+    } else {
+        eprintln!("{message}");
+    }
+    Ok(EXIT_ERROR)
+}
+
+pub(crate) fn brain_context_empty_payload(message: &str, seeds: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "error": "seed container is empty",
+        "status": "empty",
+        "message": message,
+        "seeds_expanded": 0,
+        "connected": [],
+        "empty_seeds": seeds,
+    })
+}
+
 #[cfg(test)]
 mod brain_context_not_found_tests {
     use super::*;
@@ -3681,6 +3802,20 @@ mod brain_context_not_found_tests {
         assert_eq!(payload["status"], "not_found");
         assert_eq!(payload["error"], "not found");
         assert_eq!(payload["unresolved_seeds"], serde_json::json!(seeds));
+    }
+
+    /// An empty vault is not a miss: its own status, and the engine's text
+    /// without the transport wrapper.
+    #[test]
+    fn an_empty_vault_seed_has_its_own_envelope() {
+        let engine = format!(
+            "{} vault vlt:x has no notes, so there is nothing to seed from.",
+            nestweaver_engine::query::EMPTY_SEED_CONTAINER
+        );
+        let payload = brain_context_empty_payload(&engine, &["vlt:x".to_string()]);
+        assert_eq!(payload["status"], "empty");
+        assert_ne!(payload["error"], "not found");
+        assert_eq!(payload["empty_seeds"], serde_json::json!(["vlt:x"]));
     }
 
     /// COUNTERWEIGHT: the direct route's bare engine error is used as is.
