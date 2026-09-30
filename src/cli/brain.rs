@@ -2929,106 +2929,25 @@ pub(crate) fn run_brain(
             )? {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&value)?);
-                } else if let Some(arr) = value.get("broken_links") {
-                    let links: Vec<nestweaver_engine::BrokenLink> =
-                        serde_json::from_value(arr.clone())?;
-                    if links.is_empty() {
-                        println!("No broken or ambiguous wikilinks found.");
-                    } else {
-                        // nw-097 class: the daemon reports `total`; this path
-                        // printed only how many it chose to show, so 50 of 778
-                        // read as "778 does not exist". The direct path below
-                        // already renders "N of total" — match it.
-                        let total = value.get("total").and_then(|v| v.as_u64());
-                        match total {
-                            Some(tot) if tot > links.len() as u64 => {
-                                println!("Broken / ambiguous wikilinks ({} of {tot}):", links.len())
-                            }
-                            _ => println!("Broken / ambiguous wikilinks ({}):", links.len()),
-                        }
-                        // Population counts from the envelope; the page is a
-                        // sample and cannot answer the question (nw-297). A
-                        // pre-nw-297 daemon omits the fields — fall back to the
-                        // page rather than printing nothing.
-                        let page_unresolved = links.iter().filter(|l| l.is_unresolved()).count();
-                        let unresolved = value
-                            .get("unresolved")
-                            .and_then(|v| v.as_u64())
-                            .map(|n| n as usize)
-                            .unwrap_or(page_unresolved);
-                        let low_confidence = value
-                            .get("low_confidence")
-                            .and_then(|v| v.as_u64())
-                            .map(|n| n as usize)
-                            .unwrap_or(links.len() - page_unresolved);
-                        print_link_classification(unresolved, low_confidence);
-                        for l in &links {
-                            println!(
-                                "  [[{}]] in {} (confidence {:.2}) — {}",
-                                l.wikilink_text,
-                                l.source_path,
-                                l.confidence,
-                                describe_link_resolution(l)
-                            );
-                            if !l.suggested_target_uids.is_empty() {
-                                print_link_suggestions(l);
-                            }
-                        }
-                    }
+                } else {
+                    render_broken_links_payload(&value, offset)?;
                 }
                 return Ok((EXIT_SUCCESS, None));
             }
 
             let store = open_store(Some(&db_path))?;
-            let all_links = nestweaver_engine::broken_links(&store, max_suggestions)?;
-            let total = all_links.len();
-            // Classify BEFORE truncating — the page is a sample of a list that
-            // is grouped by category, not ranked by severity (nw-297).
-            let unresolved = all_links.iter().filter(|l| l.is_unresolved()).count();
-            let low_confidence = total - unresolved;
-            // nw-341: `total` stays the PRE-offset population on both routes.
-            let links: Vec<_> = all_links.into_iter().skip(offset).take(limit).collect();
+            // The same payload builder the MCP tool uses, so the two routes
+            // cannot disagree about which links are broken.
+            let value =
+                nestweaver_engine::broken_links_payload(&store, max_suggestions, offset, limit)?;
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "broken_links": links,
-                        "total": total,
-                        "returned": links.len(),
-                        "truncated": links.len() < total,
-                        "offset": offset,
-                        "unresolved": unresolved,
-                        "low_confidence": low_confidence,
-                    }))?
-                );
-            } else if links.is_empty() {
-                println!("No broken or ambiguous wikilinks found.");
+                println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
-                if offset > 0 {
-                    println!(
-                        "Broken / ambiguous wikilinks ({} of {total}, from offset {offset}):",
-                        links.len()
-                    );
-                } else {
-                    println!("Broken / ambiguous wikilinks ({} of {total}):", links.len());
-                }
-                print_link_classification(unresolved, low_confidence);
-                for l in &links {
-                    println!(
-                        "  [[{}]] in {} (confidence {:.2}) — {}",
-                        l.wikilink_text,
-                        l.source_path,
-                        l.confidence,
-                        describe_link_resolution(l)
-                    );
-                    if !l.suggested_target_uids.is_empty() {
-                        print_link_suggestions(l);
-                    }
-                }
+                render_broken_links_payload(&value, offset)?;
             }
             let stats = format!(
                 "{} link(s) in {}",
-                links.len(),
+                value["returned"].as_u64().unwrap_or(0),
                 format_elapsed(t0.elapsed())
             );
             Ok((EXIT_SUCCESS, Some(stats)))
@@ -3708,4 +3627,64 @@ mod brain_context_not_found_tests {
             ENGINE
         );
     }
+}
+
+/// Text rendering of the `broken-links` payload, for both routes.
+///
+/// Population counts come from the envelope: the page is a sample of the
+/// population and cannot answer "does this vault have broken links".
+fn render_broken_links_payload(value: &serde_json::Value, offset: usize) -> anyhow::Result<()> {
+    let count = |key: &str| value.get(key).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let links: Vec<nestweaver_engine::BrokenLink> = value
+        .get("broken_links")
+        .map(|rows| serde_json::from_value(rows.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    let low: Vec<nestweaver_engine::BrokenLink> = value
+        .get("low_confidence")
+        .filter(|rows| rows.is_array())
+        .map(|rows| serde_json::from_value(rows.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    let total = count("total");
+    let low_total = count("low_confidence_total");
+    if links.is_empty() {
+        println!("No broken or ambiguous wikilinks found.");
+    } else {
+        let range = if offset > 0 {
+            format!("{} of {total}, from offset {offset}", links.len())
+        } else {
+            format!("{} of {total}", links.len())
+        };
+        println!("Broken / ambiguous wikilinks ({range}):");
+    }
+    print_link_classification(count("unresolved"), count("ambiguous"), low_total);
+    for l in &links {
+        println!(
+            "  [[{}]] in {} (confidence {:.2}) — {}",
+            l.wikilink_text,
+            l.source_path,
+            l.confidence,
+            describe_link_resolution(l)
+        );
+        if !l.suggested_target_uids.is_empty() {
+            print_link_suggestions(l);
+        }
+    }
+    if !low.is_empty() {
+        println!(
+            "Low-confidence wikilinks — resolved, not broken ({} of {low_total}):",
+            low.len()
+        );
+        for l in &low {
+            println!(
+                "  [[{}]] in {} (confidence {:.2}) — {}",
+                l.wikilink_text,
+                l.source_path,
+                l.confidence,
+                describe_link_resolution(l)
+            );
+        }
+    }
+    Ok(())
 }

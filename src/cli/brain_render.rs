@@ -1366,6 +1366,10 @@ pub(crate) fn doc_stats_text_lines(stats: &nestweaver_engine::DocStats) -> Vec<S
             stats.unresolved_link_targets, stats.unresolved_link_section_targets
         ),
         format!(
+            "  ambiguous links (several notes match): {}",
+            stats.ambiguous_link_targets
+        ),
+        format!(
             "  low-confidence (resolved, not broken): {}",
             stats.low_confidence_link_targets
         ),

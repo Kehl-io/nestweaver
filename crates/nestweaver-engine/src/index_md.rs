@@ -4596,13 +4596,15 @@ impl<'a> WikilinkLookup<'a> {
         // runs ABOVE the title tiers — a filename is a stronger claim on a bare
         // `[[Name]]` than a heading is (nw-290).
         //
-        // It must stay at 0.95, not 1.0: `broken_wikilinks` selects
-        // `confidence < 1.0`, and `a_lower_tier_resolution_is_not_broken`
-        // depends on a same-folder match remaining visible there as a
-        // resolved-but-lower-tier row.
+        // An EXACT, UNIQUE name scores 1.0 whichever tier finds it: when the
+        // key is the filename stem of exactly one note and no other note
+        // carries it as a title, there is nothing to be unsure about, and
+        // Obsidian resolves it the same way. The 0.95 / 0.92 / 0.90 tiers
+        // remain for a stem shared by several notes and narrowed by
+        // proximity, which is a lower-confidence resolution.
         // Priorities 2-4 are one ladder over a BARE stem, extracted so the
         // path-qualified fallback below can RE-ENTER it (nw-343).
-        if let Some(candidate) = self.resolve_bare_stem(&key, source_folder) {
+        if let Some(candidate) = self.resolve_bare_stem(&key, source_folder, true) {
             return ResolveOutcome::Resolved(vec![candidate]);
         }
 
@@ -4660,7 +4662,9 @@ impl<'a> WikilinkLookup<'a> {
             && let Some(base) = key.rsplit('/').find(|segment| !segment.is_empty())
             && base != key
         {
-            if let Some(candidate) = self.resolve_bare_stem(base, source_folder) {
+            // `exact: false`: only the basename matched, not the path the
+            // author wrote, so this stays a lower-confidence resolution.
+            if let Some(candidate) = self.resolve_bare_stem(base, source_folder, false) {
                 return ResolveOutcome::Resolved(vec![candidate]);
             }
             // Below the exact-path tiers: only the filename was corroborated,
@@ -4722,7 +4726,29 @@ impl<'a> WikilinkLookup<'a> {
     /// tolerate global ambiguity (they narrow by directory first), 0.90 does
     /// not. Jumping straight to 0.90's global-uniqueness test threw away the
     /// two tiers that could still have answered.
-    fn resolve_bare_stem(&self, key: &str, source_folder: &str) -> Option<ResolveCandidate> {
+    ///
+    /// With `exact`, a key that names exactly one note — its filename stem is
+    /// unique in the vault and no OTHER note has it as a title — resolves at
+    /// 1.0: an exact, unique match is a resolved link, not a lower tier.
+    fn resolve_bare_stem(
+        &self,
+        key: &str,
+        source_folder: &str,
+        exact: bool,
+    ) -> Option<ResolveCandidate> {
+        if exact
+            && let Some(uids) = self.by_stem.get(key)
+            && let [uid] = uids.as_slice()
+            && self
+                .by_title
+                .get(key)
+                .is_none_or(|titled| titled.iter().all(|other| other == uid))
+        {
+            return Some(ResolveCandidate {
+                note_uid: uid.to_string(),
+                confidence: 1.0,
+            });
+        }
         // Priority 2: same-folder filename stem.
         if let Some(uids) = self
             .by_folder_stem
@@ -5601,6 +5627,9 @@ mod tests {
                 "# X\n\n| col |\n| --- |\n| [[Backlog\\|the backlog]] |\n",
             ),
             ("f/Backlog.md", "# Not The Same Title\n"),
+            // A second `Backlog` elsewhere, so the same-folder tier (not an
+            // exact unique match at 1.0) is what resolves it.
+            ("g/Backlog.md", "# Another Backlog\n"),
         ]);
         let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
         assert_eq!(result.unresolved_link_occurrences, 0);

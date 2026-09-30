@@ -7339,28 +7339,30 @@ fn a_missing_db_still_reports_db_not_found() {
 // POPULATION, not the page.
 // ---------------------------------------------------------------------------
 
-/// Build a vault with a known, unequal split: six links that resolve at a lower
-/// confidence tier (unique global filename-stem match, 0.90) and three that
-/// resolve to nothing at all.
+/// Build a vault with a known, unequal split of BROKEN links: six ambiguous
+/// ones (a title two notes share) and three that resolve to nothing at all,
+/// plus two low-confidence links (a stem two notes share, narrowed by the
+/// source's folder) that are listed separately and are not broken.
 ///
-/// The store emits the low-confidence group first, so any page shorter than six
-/// is a pure sample of the benign category — which is exactly the shape that
-/// made a 226-unresolved vault print `0 unresolved (genuinely broken)`.
+/// Any page shorter than the broken population is a sample, which is exactly
+/// the shape that made a 226-unresolved vault print `0 unresolved`.
 fn broken_links_vault(root: &std::path::Path) -> std::path::PathBuf {
     let vault = root.join("vault");
-    std::fs::create_dir_all(vault.join("targets")).unwrap();
-    std::fs::create_dir_all(vault.join("sources")).unwrap();
+    for dir in ["one", "two", "sources", "elsewhere"] {
+        std::fs::create_dir_all(vault.join(dir)).unwrap();
+    }
     for i in 1..=6 {
-        // Title deliberately unlike the stem, so the link misses the 1.0
-        // unique-title tier and lands on the 0.90 global-stem tier.
-        std::fs::write(
-            vault.join(format!("targets/stemkey-{i}.md")),
-            format!("---\ntitle: Utterly Different Title {i}\n---\n\nbody\n"),
-        )
-        .unwrap();
+        // Two notes share the title, so `[[Dup Title i]]` is ambiguous.
+        for (dir, stem) in [("one", "first"), ("two", "second")] {
+            std::fs::write(
+                vault.join(format!("{dir}/{stem}-{i}.md")),
+                format!("---\ntitle: Dup Title {i}\n---\n\nbody\n"),
+            )
+            .unwrap();
+        }
         std::fs::write(
             vault.join(format!("sources/src{i}.md")),
-            format!("---\ntitle: Source {i}\n---\n\nSee [[stemkey-{i}]]\n"),
+            format!("---\ntitle: Source {i}\n---\n\nSee [[Dup Title {i}]]\n"),
         )
         .unwrap();
     }
@@ -7368,6 +7370,20 @@ fn broken_links_vault(root: &std::path::Path) -> std::path::PathBuf {
         std::fs::write(
             vault.join(format!("sources/miss{i}.md")),
             format!("---\ntitle: Miss {i}\n---\n\nSee [[Nonexistent Note {i}]]\n"),
+        )
+        .unwrap();
+    }
+    for i in 1..=2 {
+        for dir in ["sources", "elsewhere"] {
+            std::fs::write(
+                vault.join(format!("{dir}/shared-{i}.md")),
+                format!("---\ntitle: Shared {dir} {i}\n---\n\nbody\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            vault.join(format!("sources/near{i}.md")),
+            format!("---\ntitle: Near {i}\n---\n\nSee [[shared-{i}]]\n"),
         )
         .unwrap();
     }
@@ -7401,8 +7417,8 @@ fn broken_links_classification_counts_the_population_not_the_page() {
         .success();
     let full = String::from_utf8(full.get_output().stdout.clone()).unwrap();
     assert!(
-        full.contains("3 unresolved (genuinely broken), 6 resolved"),
-        "the whole population is 3 unresolved / 6 lower-tier: {full}"
+        full.contains("3 unresolved and 6 ambiguous (broken); 2 more resolved"),
+        "the whole population is 3 unresolved / 6 ambiguous / 2 low-confidence: {full}"
     );
 
     let page = nestweaver_cmd()
@@ -7416,7 +7432,7 @@ fn broken_links_classification_counts_the_population_not_the_page() {
         "the page itself is still bounded by --limit: {page}"
     );
     assert!(
-        page.contains("3 unresolved (genuinely broken), 6 resolved"),
+        page.contains("3 unresolved and 6 ambiguous (broken); 2 more resolved"),
         "the classification describes the population, not the page: {page}"
     );
 }
@@ -7442,10 +7458,12 @@ fn broken_links_json_carries_the_population_split() {
         value["unresolved"], 3,
         "the genuinely-broken count is a property of the vault: {out}"
     );
+    assert_eq!(value["ambiguous"], 6, "payload: {out}");
     assert_eq!(
-        value["low_confidence"], 6,
-        "and so is the benign count: {out}"
+        value["low_confidence_total"], 2,
+        "and so is the benign count, which is not in `total`: {out}"
     );
+    assert_eq!(value["low_confidence"].as_array().unwrap().len(), 2);
 }
 
 /// `memory lint` is the second surface onto the same `broken_links` call, so it
@@ -7462,7 +7480,10 @@ fn memory_lint_splits_the_broken_wikilink_count() {
         .success();
     let out = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(
-        out.contains("broken wikilinks:      9 (3 genuinely broken, 6 lower-tier resolutions)"),
+        out.contains(
+            "broken wikilinks:      9 (3 unresolved, 6 ambiguous on this page; \
+             2 low-confidence resolutions listed separately, not broken)"
+        ),
         "the bare length conflates two categories: {out}"
     );
 }

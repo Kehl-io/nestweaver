@@ -221,7 +221,12 @@ pub struct MemoryLintReport {
     pub stale: Vec<StaleNote>,
     pub contradictions: Vec<Contradiction>,
     pub orphans: Vec<OrphanDocument>,
+    /// Unresolved or ambiguous wikilinks only.
     pub broken_wikilinks: Vec<BrokenLink>,
+    /// Wikilinks that resolved to one note below full confidence. Listed for
+    /// review, not a health problem, and not counted as broken.
+    #[serde(default)]
+    pub low_confidence_wikilinks: Vec<BrokenLink>,
     pub supersession_chains: Vec<SupersessionChain>,
     pub schema_drift: Vec<SchemaDrift>,
     pub dangling_relationships: Vec<DanglingRelationship>,
@@ -240,6 +245,7 @@ pub fn memory_lint(store: &GraphStore, now_epoch: f64) -> Result<MemoryLintRepor
             contradictions: vec![],
             orphans: vec![],
             broken_wikilinks: vec![],
+            low_confidence_wikilinks: vec![],
             supersession_chains: vec![],
             schema_drift: vec![],
             dangling_relationships: vec![],
@@ -287,7 +293,8 @@ pub fn memory_lint(store: &GraphStore, now_epoch: f64) -> Result<MemoryLintRepor
     let orphans = orphan_documents(store, None, None, &[])?;
 
     // 4. broken_wikilinks — reuse F9.
-    let broken_wikilinks = broken_links(store, 5)?;
+    let (broken_wikilinks, low_confidence_wikilinks) =
+        crate::brain_docgraph::split_broken_links(broken_links(store, 5)?);
 
     // 5. supersession_chains — A supersedes B where B is still wikilinked
     //    from notes.
@@ -425,6 +432,7 @@ pub fn memory_lint(store: &GraphStore, now_epoch: f64) -> Result<MemoryLintRepor
         contradictions,
         orphans,
         broken_wikilinks,
+        low_confidence_wikilinks,
         supersession_chains,
         schema_drift,
         dangling_relationships,

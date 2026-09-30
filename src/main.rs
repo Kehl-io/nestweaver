@@ -2162,14 +2162,17 @@ fn print_link_suggestions(l: &nestweaver_engine::BrokenLink) {
 
 fn describe_link_resolution(link: &nestweaver_engine::BrokenLink) -> String {
     match &link.resolved_target_uid {
+        _ if link.is_ambiguous() => {
+            format!("AMBIGUOUS — {} notes match", link.candidate_count)
+        }
         Some(uid) => format!("resolves to {uid}"),
         None => "UNRESOLVED — no such note".to_string(),
     }
 }
 
-/// Summarise how many entries are genuinely broken versus merely resolved at a
-/// lower tier, so the headline count cannot be read as "all of these are
-/// broken".
+/// Summarise how many links are broken (unresolved or ambiguous) and how many
+/// more merely resolved to one note at a lower tier, so the headline count
+/// cannot be read as "all of these are broken".
 ///
 /// The counts are over the whole POPULATION, never the returned page. Computing
 /// them from the page printed "0 unresolved (genuinely broken)" on a vault with
@@ -2178,10 +2181,15 @@ fn describe_link_resolution(link: &nestweaver_engine::BrokenLink) -> String {
 /// the benign category. Ordering is being fixed in `broken_wikilinks`, but a
 /// page is still a sample — only the population can answer "does this vault
 /// have broken links".
-fn print_link_classification(total_unresolved: usize, total_low_confidence: usize) {
+fn print_link_classification(
+    total_unresolved: usize,
+    total_ambiguous: usize,
+    total_low_confidence: usize,
+) {
     println!(
-        "  {total_unresolved} unresolved (genuinely broken), {total_low_confidence} resolved at a lower \
-         confidence tier (same-folder or filename-stem match — not broken)"
+        "  {total_unresolved} unresolved and {total_ambiguous} ambiguous (broken); \
+         {total_low_confidence} more resolved to one note at a lower confidence tier \
+         (listed separately, not broken)"
     );
 }
 

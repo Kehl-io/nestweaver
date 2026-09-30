@@ -198,6 +198,9 @@ pub struct BrokenWikilinkRow {
     pub confidence: f32,
     /// The note UID this edge currently points at (the low-confidence target).
     pub current_target_uid: String,
+    /// How many distinct notes this link resolved to: 0 when unresolved, 1
+    /// for a single (lower-confidence) target, more than 1 when ambiguous.
+    pub candidate_count: usize,
 }
 
 /// A lightweight note row used by orphan detection and topic clustering.
@@ -4121,8 +4124,9 @@ impl GraphStore {
     /// Wikilink edges whose resolution is suspect — confidence below 1.0.
     ///
     /// These are ambiguous or low-priority resolutions (the indexer splits
-    /// confidence 1/N across ambiguous title matches and assigns < 1.0 to
-    /// alias/same-folder matches). Unresolved links are not stored as edges,
+    /// confidence 1/N across ambiguous matches and assigns < 1.0 to alias,
+    /// path-basename and proximity-narrowed matches); `candidate_count` tells
+    /// an ambiguous link from a single lower-tier target. Unresolved links are not stored as edges,
     /// so this surfaces the recoverable "broken-ish" links. Each row carries
     /// the source note, the `display` link text, and the current target.
     /// Empty DB → empty vec.
@@ -4144,10 +4148,20 @@ impl GraphStore {
                  r.confidence, dst.uid";
         match conn.query(q) {
             Ok(result) => {
+                // Distinct targets per (source note, text): more than one is
+                // an AMBIGUOUS link, which the dedup below would otherwise
+                // make indistinguishable from a single lower-tier target.
+                let mut targets: std::collections::HashMap<(String, String), HashSet<String>> =
+                    std::collections::HashMap::new();
                 for row in result {
                     let source_uid = extract_string(&row, 0)?;
                     let wikilink_text = extract_string(&row, 3)?;
+                    let target_uid = extract_string(&row, 5)?;
                     let key = (source_uid.clone(), wikilink_text.clone());
+                    targets
+                        .entry(key.clone())
+                        .or_default()
+                        .insert(target_uid.clone());
                     if let std::collections::hash_map::Entry::Vacant(slot) = seen.entry(key.clone())
                     {
                         order.push(key);
@@ -4157,8 +4171,14 @@ impl GraphStore {
                             source_title: extract_string(&row, 2)?,
                             wikilink_text,
                             confidence: extract_f64(&row, 4)? as f32,
-                            current_target_uid: extract_string(&row, 5)?,
+                            current_target_uid: target_uid,
+                            candidate_count: 1,
                         });
+                    }
+                }
+                for (key, distinct) in targets {
+                    if let Some(row) = seen.get_mut(&key) {
+                        row.candidate_count = distinct.len();
                     }
                 }
             }
@@ -4189,6 +4209,7 @@ impl GraphStore {
                             wikilink_text,
                             confidence: 0.0,
                             current_target_uid: String::new(),
+                            candidate_count: 0,
                         });
                     }
                 }

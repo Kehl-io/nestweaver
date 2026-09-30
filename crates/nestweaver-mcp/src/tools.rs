@@ -16,8 +16,8 @@ use nestweaver_engine::query::search_symbols_page;
 use nestweaver_engine::{
     BlastRadiusOptions, BrainContextResult, DeadCodeConfidence, EmbedQueryFn, HybridSearchConfig,
     SummaryLevel, ToolDocEntry, analyze_blast_radius, attach_cluster_ids, attach_communities,
-    broken_links, build_brain_context_hybrid_with_aliases, compute_clusters, detect_changes_impact,
-    doc_stats, expand_query_with_aliases, filter_by_target, generate_agents_md_with_rules,
+    build_brain_context_hybrid_with_aliases, compute_clusters, detect_changes_impact, doc_stats,
+    expand_query_with_aliases, filter_by_target, generate_agents_md_with_rules,
     generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_tools,
     generate_skill_with_tools, generate_summaries, get_all_properties, get_last_indexed_at,
     investigate, investigate_expand, investigate_hydrate, load_alias_sidecar, load_clusters,
@@ -4992,34 +4992,15 @@ fn tool_brain_broken_links(store: &GraphStore, args: Value) -> Result<Value, any
     // Reversing the sort is not an option: it would regress nw-297's
     // `genuinely_broken_links_sort_before_lower_tier_resolutions`.
     let offset = read_limit(&args, "offset", 0, 0, RESULT_LIMIT_MAX)?;
-    let all_links = broken_links(store, max_suggestions)?;
-    // nw-297: classify over the POPULATION, before the window. The page is
-    // a sample, and a caller that reads the page's own composition as the
-    // vault's composition gets the wrong answer at every limit — which is
-    // exactly what the CLI's summary line did.
-    let unresolved = all_links.iter().filter(|l| l.is_unresolved()).count();
-    let low_confidence = all_links.len() - unresolved;
-    let rows: Vec<Value> = all_links
-        .iter()
-        .map(serde_json::to_value)
-        .collect::<Result<_, serde_json::Error>>()?;
-    // nw-341: through `Bounded`, not hand-rolled. This was the last bounded
-    // list in the catalogue still building its own (total, returned) pair, so
-    // it was also the only one that never emitted `truncated` -- a caller could
-    // not tell a complete page from a cut one without comparing two numbers.
-    let mut out = json!({
-        "unresolved": unresolved,
-        "low_confidence": low_confidence,
-        "offset": offset,
-    });
-    Bounded::window(rows, offset, limit).merge_into(&mut out, "broken_links");
-    Ok(out)
+    // Classified over the POPULATION, before the window. One payload builder
+    // serves this tool and the CLI's direct route.
+    nestweaver_engine::broken_links_payload(store, max_suggestions, offset, limit)
 }
 
 fn tool_schema_brain_broken_links() -> Value {
     json!({
         "name": "brain_broken_links",
-        "description": "Find wikilinks in the vault that did not resolve cleanly. TWO POPULATIONS are returned together: links that resolved at a lower tier (confidence < 1.0 — same-folder or filename-stem matches, which are NOT broken) and links that resolved to nothing (`resolved_target_uid` absent — the only genuinely broken ones).\n\nGuidelines:\n- `unresolved` and `low_confidence` count the WHOLE population, not the returned page; `returned` and `truncated` describe the page and `total` is the pre-offset population. Read the population counts, never the page composition\n- Results are ordered unresolved-first, then by ascending confidence, so the first page is the most severe — and the HIGHEST-confidence tiers are the tail, reachable only via `offset`\n- Each result includes fuzzy-matched suggested target UIDs for repair\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only detects wikilink resolution issues, not broken external URLs\n- Suggestions are fuzzy title matches, not guaranteed correct targets",
+        "description": "Find wikilinks in the vault that did not resolve cleanly. `broken_links` holds only BROKEN links: unresolved ones (`resolved_target_uid` absent, confidence 0.0) and ambiguous ones (`candidate_count` > 1, several notes match). A link that exactly and uniquely names a note (case-insensitive, any folder) is resolved at confidence 1.0 and is not listed. `low_confidence` is a SEPARATE list of links that resolved to one note by a fuzzier tier (a stem shared by several notes and narrowed by folder proximity, a path whose basename alone matched, or an alias); they are NOT broken and are not counted in `total`.\n\nGuidelines:\n- `unresolved`, `ambiguous` and `low_confidence_total` count the WHOLE population, not the returned page; `returned` and `truncated` describe the `broken_links` page and `total` is its pre-offset population (`low_confidence_truncated` describes the `low_confidence` page). Read the population counts, never the page composition\n- `offset` and `limit` window both lists. Results are ordered unresolved-first, then by ascending confidence\n- Each result includes fuzzy-matched suggested target UIDs for repair\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only detects wikilink resolution issues, not broken external URLs\n- Suggestions are fuzzy title matches, not guaranteed correct targets",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -5177,7 +5158,7 @@ fn tool_brain_doc_stats(store: &GraphStore, args: Value) -> Result<Value, anyhow
 fn tool_schema_brain_doc_stats() -> Value {
     json!({
         "name": "brain_doc_stats",
-        "description": "Get a one-shot health summary of a vault's document graph — note counts, broken links, orphans, tag distribution, and notes-by-year.\n\nGuidelines:\n- Call once for a quick vault health overview before deeper analysis\n- All keys are always returned, even on an empty vault (zeros/empty collections)\n- Output: {total_notes, wikilink_edges, unresolved_link_targets, unresolved_link_section_targets, low_confidence_link_targets, orphans, avg_outdegree, top_tags, notes_by_year}\n- Every link count NAMES ITS POPULATION and they legitimately disagree: `wikilink_edges` counts edges (one ambiguous link contributes N), `unresolved_link_targets` counts distinct (note, link text), `unresolved_link_section_targets` counts distinct (section, link text). Link OCCURRENCES are not stored in the graph — `brain_add` reports those\n\nLimitations:\n- Aggregates other brain document tools; for detailed broken links use brain_broken_links directly",
+        "description": "Get a one-shot health summary of a vault's document graph — note counts, broken links, orphans, tag distribution, and notes-by-year.\n\nGuidelines:\n- Call once for a quick vault health overview before deeper analysis\n- All keys are always returned, even on an empty vault (zeros/empty collections)\n- Output: {total_notes, wikilink_edges, unresolved_link_targets, unresolved_link_section_targets, ambiguous_link_targets, low_confidence_link_targets, orphans, avg_outdegree, top_tags, notes_by_year}\n- Broken links are `unresolved_link_targets` (no target) plus `ambiguous_link_targets` (several notes match). `low_confidence_link_targets` resolved to ONE note by a fuzzier tier and is not broken; an exact, unique name match is fully resolved and in none of these counts\n- Every link count NAMES ITS POPULATION and they legitimately disagree: `wikilink_edges` counts edges (one ambiguous link contributes N), `unresolved_link_targets` counts distinct (note, link text), `unresolved_link_section_targets` counts distinct (section, link text). Link OCCURRENCES are not stored in the graph — `brain_add` reports those\n\nLimitations:\n- Aggregates other brain document tools; for detailed broken links use brain_broken_links directly",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -5230,7 +5211,7 @@ fn tool_brain_memory_lint(store: &GraphStore, args: Value) -> Result<Value, anyh
 fn tool_schema_brain_memory_lint() -> Value {
     json!({
         "name": "brain_memory_lint",
-        "description": "Audit a memory-bank vault for health problems across seven categories: stale notes, contradictions, orphans, broken wikilinks, supersession chains, schema drift, and dangling relationships.\n\nGuidelines:\n- All seven keys always present in output; empty on a no-vault database\n- Use limit to cap results per category; totals are always reported\n- Schema drift checks against _templates/<kind>.md templates\n\nLimitations:\n- Stale detection uses a fixed 90-day threshold for status:active notes\n- Schema drift requires template files to exist in _templates/",
+        "description": "Audit a memory-bank vault for health problems across seven categories: stale notes, contradictions, orphans, broken wikilinks, supersession chains, schema drift, and dangling relationships.\n\nGuidelines:\n- All seven keys always present in output; empty on a no-vault database\n- `broken_wikilinks` holds only unresolved or ambiguous links; links that resolved to one note below full confidence are listed separately in `low_confidence_wikilinks` and are not a health problem\n- Use limit to cap results per category; totals are always reported\n- Schema drift checks against _templates/<kind>.md templates\n\nLimitations:\n- Stale detection uses a fixed 90-day threshold for status:active notes\n- Schema drift requires template files to exist in _templates/",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -25656,13 +25637,15 @@ mod broken_links_window_tests {
     /// hand-rolls its disclosure instead of using the `Bounded` seam.
     #[test]
     fn the_high_confidence_tail_is_reachable_by_offset() {
-        // Three 0.70 alias rows sort ahead of one 0.95 same-folder row.
+        // Three 0.70 alias rows sort ahead of one 0.95 same-folder row, and
+        // all four resolved to ONE note each: the low-confidence list.
         let (_dir, root) = make_vault(&[
             (
                 "f/a.md",
                 "# A\n\nSee [[Sibling]], [[al-one]], [[al-two]], [[al-three]].\n",
             ),
             ("f/Sibling.md", "# Different Title Entirely\n"),
+            ("h/Sibling.md", "# Another Sibling\n"),
             ("g/one.md", "---\naliases: [al-one]\n---\n# One\n"),
             ("g/two.md", "---\naliases: [al-two]\n---\n# Two\n"),
             ("g/three.md", "---\naliases: [al-three]\n---\n# Three\n"),
@@ -25670,54 +25653,46 @@ mod broken_links_window_tests {
         let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
 
         let page = tool_brain_broken_links(&store, json!({ "limit": 3 })).unwrap();
-        assert_eq!(page["total"], 4, "envelope: {page}");
+        assert_eq!(page["total"], 0, "none of these is broken: {page}");
+        assert_eq!(page["low_confidence_total"], 4, "envelope: {page}");
         assert_eq!(
-            page["truncated"],
+            page["low_confidence_truncated"],
             json!(true),
-            "nw-341: a truncated page must SAY it is truncated, through the same \
-             (returned, total, truncated) seam every other bounded list uses: {page}"
+            "a truncated page must SAY it is truncated: {page}"
         );
-        let head: Vec<&str> = page["broken_links"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|l| l["wikilink_text"].as_str().unwrap())
-            .collect();
+        let texts = |value: &Value| -> Vec<String> {
+            value["low_confidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| l["wikilink_text"].as_str().unwrap().to_string())
+                .collect()
+        };
         assert!(
-            !head.contains(&"Sibling"),
-            "precondition: the 0.95 row must be the one the cap removes, got {head:?}"
+            !texts(&page).contains(&"Sibling".to_string()),
+            "precondition: the 0.95 row must be the one the cap removes: {page}"
         );
 
         let tail = tool_brain_broken_links(&store, json!({ "limit": 3, "offset": 3 })).unwrap();
-        let tail_texts: Vec<&str> = tail["broken_links"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|l| l["wikilink_text"].as_str().unwrap())
-            .collect();
         assert!(
-            tail_texts.contains(&"Sibling"),
-            "nw-341: the 0.95 same-folder tier must be REACHABLE -- it is precisely \
-             what a reviewer of the wikilink tier ladder has to inspect, got {tail_texts:?}"
+            texts(&tail).contains(&"Sibling".to_string()),
+            "the 0.95 same-folder tier must be REACHABLE by offset: {tail}"
         );
         assert_eq!(
-            tail["total"], 4,
-            "total must stay the PRE-offset population: {tail}"
+            tail["low_confidence_total"], 4,
+            "the total must stay the PRE-offset population: {tail}"
         );
-        assert_eq!(
-            tail["offset"], 3,
-            "the window's origin must be echoed, or a caller paging through \
-             cannot tell which page it is holding: {tail}"
-        );
+        assert_eq!(tail["offset"], 3, "{tail}");
     }
 
-    /// nw-341: an offset past the end is an empty page, not an error and not a
+    /// An offset past the end is an empty page, not an error and not a
     /// wrapped-around page. It must still report the true population.
     #[test]
     fn an_offset_past_the_population_is_an_honest_empty_page() {
         let (_dir, root) = make_vault(&[
-            ("f/a.md", "# A\n\nSee [[Sibling]].\n"),
+            ("f/a.md", "# A\n\nSee [[Sibling]] and [[Missing]].\n"),
             ("f/Sibling.md", "# Different Title Entirely\n"),
+            ("g/Sibling.md", "# Another Sibling\n"),
         ]);
         let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
 
@@ -25725,11 +25700,11 @@ mod broken_links_window_tests {
         assert_eq!(page["returned"], json!(0));
         assert_eq!(page["total"], json!(1), "population, not remainder: {page}");
         assert_eq!(page["truncated"], json!(true));
+        assert_eq!(page["unresolved"], json!(1), "{page}");
         assert_eq!(
-            page["unresolved"].as_u64().unwrap() + page["low_confidence"].as_u64().unwrap(),
-            1,
-            "nw-297: classification is over the POPULATION, so it survives any \
-             window: {page}"
+            page["low_confidence_total"],
+            json!(1),
+            "classification is over the POPULATION, so it survives any window: {page}"
         );
     }
 }

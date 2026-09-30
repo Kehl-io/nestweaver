@@ -533,7 +533,8 @@ pub use blast_radius::{
 pub use blast_radius_sarif::{append_contract_breaks_to_sarif, blast_radius_to_sarif};
 pub use brain_docgraph::{
     BrokenLink, CoOccurringTag, DocStats, OrphanDocument, TagCount, TagGraph, TopicCluster,
-    broken_links, doc_stats, orphan_documents, tag_graph, tag_graph_all, topic_clusters,
+    broken_links, broken_links_payload, doc_stats, orphan_documents, split_broken_links, tag_graph,
+    tag_graph_all, topic_clusters,
 };
 pub use brain_memory::{
     ConsolidationManifest, ConsolidationProposal, Contradiction, DanglingRelationship,
