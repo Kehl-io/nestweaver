@@ -650,10 +650,10 @@ pub use process::{
 };
 pub use project::{
     DeclaredRepoMatch, ImplicitProjectDetectionResult, ProjectMaterializationResult,
-    ProjectRepoIssue, REPO_ISSUES_KEY, RepoIssueKind, detect_implicit_projects,
+    ProjectMemberRepo, ProjectRepoIssue, REPO_ISSUES_KEY, RepoIssueKind, detect_implicit_projects,
     detect_implicit_projects_with_mode, detect_implicit_projects_with_publication,
-    materialize_projects, materialize_projects_with_lease, recorded_repo_issues,
-    repo_issue_warning_lines, repo_issues_summary, resolve_declared_repo,
+    materialize_projects, materialize_projects_with_lease, project_member_repos,
+    recorded_repo_issues, repo_issue_warning_lines, repo_issues_summary, resolve_declared_repo,
 };
 pub use publication::*;
 pub use publication_source::*;

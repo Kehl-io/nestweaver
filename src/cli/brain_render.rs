@@ -988,12 +988,17 @@ pub(crate) fn render_brain_search_json(result: &serde_json::Value) -> anyhow::Re
 pub(crate) type ProjectRepoIssues =
     std::collections::BTreeMap<String, Vec<nestweaver_engine::ProjectRepoIssue>>;
 
+/// Member repos per materialized project name.
+pub(crate) type ProjectMemberRepos =
+    std::collections::BTreeMap<String, Vec<nestweaver_engine::ProjectMemberRepo>>;
+
 /// The whole `list-projects` stdout, JSON or text. Extracted from the command
 /// arm so the nw-674 disclosure in both formats is unit-testable.
 pub(crate) fn render_list_projects(
     materialized: &[nestweaver_schema::Project],
     declared_only: &[nestweaver_engine::ProjectConfig],
     repo_issues: &ProjectRepoIssues,
+    member_repos: &ProjectMemberRepos,
     json: bool,
 ) -> anyhow::Result<String> {
     use std::fmt::Write as _;
@@ -1001,15 +1006,23 @@ pub(crate) fn render_list_projects(
         #[derive(serde::Serialize)]
         struct ListProjectsJson<'a> {
             materialized: &'a [nestweaver_schema::Project],
+            /// Every materialized project, keyed by name: its member repos
+            /// (`[]` when it has none).
+            member_repos: &'a ProjectMemberRepos,
             #[serde(skip_serializing_if = "<[nestweaver_engine::ProjectConfig]>::is_empty")]
             declared: &'a [nestweaver_engine::ProjectConfig],
             #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
             repo_issues: &'a ProjectRepoIssues,
         }
+        let mut members = member_repos.clone();
+        for project in materialized {
+            members.entry(project.name.clone()).or_default();
+        }
         return Ok(format!(
             "{}\n",
             serde_json::to_string_pretty(&ListProjectsJson {
                 materialized,
+                member_repos: &members,
                 declared: declared_only,
                 repo_issues,
             })?
@@ -1029,6 +1042,13 @@ pub(crate) fn render_list_projects(
         writeln!(out, "  Instance: {}", p.instance_id)?;
         if let Some(ref summary) = p.summary {
             writeln!(out, "  Summary:  {summary}")?;
+        }
+        let members = member_repos.get(&p.name).map_or(&[][..], Vec::as_slice);
+        if members.is_empty() {
+            writeln!(out, "  Repos:    (none)")?;
+        } else {
+            let names: Vec<&str> = members.iter().map(|repo| repo.name.as_str()).collect();
+            writeln!(out, "  Repos:    {}", names.join(", "))?;
         }
         let issues = repo_issues.get(&p.name).map_or(&[][..], Vec::as_slice);
         for line in nestweaver_engine::repo_issue_warning_lines(issues) {

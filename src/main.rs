@@ -3017,6 +3017,22 @@ fn render_investigate_text(payload: &serde_json::Value) {
     );
 }
 
+/// `list-projects` on the direct route: the projects, with each one's member
+/// repos recorded into `members`.
+fn direct_projects_with_members(
+    store: &nestweaver_store::GraphStore,
+    members: &mut ProjectMemberRepos,
+) -> anyhow::Result<Vec<nestweaver_schema::Project>> {
+    let projects = store.list_projects().map_err(|e| anyhow::anyhow!(e))?;
+    for project in &projects {
+        members.insert(
+            project.name.clone(),
+            nestweaver_engine::project_member_repos(store, &project.uid)?,
+        );
+    }
+    Ok(projects)
+}
+
 /// The remedy `cluster <id>` prints on a miss. It used to list EVERY
 /// community (2.2 MB of stderr for `cluster 999999999` on a real graph); now
 /// it is the count, the id range, the largest few, and the command that
@@ -22214,6 +22230,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             require_existing_db(&resolved_db)?;
 
             // ── daemon guard ──────────────────────────────────────
+            let mut member_repos = ProjectMemberRepos::new();
             let materialized: Vec<nestweaver_schema::Project> = if use_daemon {
                 let db_path = resolved_db.clone();
                 let args = serde_json::json!({});
@@ -22235,20 +22252,40 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "list_projects",
                     args,
                 )? {
-                    Some(value) => serde_json::from_value(unwrap_hybrid_payload(value))
-                        .context("decode projects from the daemon")?,
+                    Some(value) => {
+                        let rows: Vec<serde_json::Value> =
+                            serde_json::from_value(unwrap_hybrid_payload(value))
+                                .context("decode projects from the daemon")?;
+                        let mut projects = Vec::with_capacity(rows.len());
+                        for row in rows {
+                            let project: nestweaver_schema::Project =
+                                serde_json::from_value(row.clone())
+                                    .context("decode projects from the daemon")?;
+                            // Absent from an older daemon: then nothing is
+                            // claimed about membership.
+                            if let Some(repos) = row.get("repos") {
+                                member_repos.insert(
+                                    project.name.clone(),
+                                    serde_json::from_value(repos.clone())
+                                        .context("decode project member repos")?,
+                                );
+                            }
+                            projects.push(project);
+                        }
+                        projects
+                    }
                     None => {
                         // The direct store cannot honour a pinned config, so
                         // falling back would silently target a different
                         // instance than the caller named.
                         ensure_direct_store_fallback_allowed(&resolved_db, config.as_deref())?;
                         let store = open_store(Some(&resolved_db))?;
-                        store.list_projects().map_err(|e| anyhow::anyhow!(e))?
+                        direct_projects_with_members(&store, &mut member_repos)?
                     }
                 }
             } else {
                 let store = open_store(Some(&resolved_db))?;
-                store.list_projects().map_err(|e| anyhow::anyhow!(e))?
+                direct_projects_with_members(&store, &mut member_repos)?
             };
 
             // When --config is provided, also surface declared projects from
@@ -22282,7 +22319,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             print!(
                 "{}",
-                render_list_projects(&materialized, &declared_only, &repo_issues, json)?
+                render_list_projects(
+                    &materialized,
+                    &declared_only,
+                    &repo_issues,
+                    &member_repos,
+                    json
+                )?
             );
             Ok((EXIT_SUCCESS, None))
         }
@@ -39358,9 +39401,17 @@ mod nw674_repo_issue_render_tests {
         .into_iter()
         .collect();
 
-        let json: serde_json::Value =
-            serde_json::from_str(&render_list_projects(&materialized, &[], &issues, true).unwrap())
-                .unwrap();
+        let json: serde_json::Value = serde_json::from_str(
+            &render_list_projects(
+                &materialized,
+                &[],
+                &issues,
+                &ProjectMemberRepos::new(),
+                true,
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             json["repo_issues"]["wavelength-wireless"][0]["repo"],
             "wavelength-wireless-site"
@@ -39371,24 +39422,73 @@ mod nw674_repo_issue_render_tests {
         );
         assert!(json["repo_issues"].get("siteloom").is_none());
 
-        let text = render_list_projects(&materialized, &[], &issues, false).unwrap();
+        let text = render_list_projects(
+            &materialized,
+            &[],
+            &issues,
+            &ProjectMemberRepos::new(),
+            false,
+        )
+        .unwrap();
         let expected = "  Warning: declared repo not a member: \
                         wavelength-wireless/wavelength-wireless-site (matches no indexed repo)";
         assert!(text.contains(expected), "{text}");
         // The warning sits under ITS project, not the next one.
-        let siteloom = text.split("siteloom\n").nth(1).unwrap();
+        let siteloom = text.split("\nsiteloom\n").nth(1).unwrap();
         assert!(!siteloom.contains("Warning"), "{text}");
+    }
+
+    /// `list-projects` lists each project's member repos, in text and JSON;
+    /// a project with none says so rather than printing nothing.
+    #[test]
+    fn list_projects_lists_member_repos() {
+        let materialized = projects();
+        let members: ProjectMemberRepos = [(
+            "wavelength-wireless".to_string(),
+            vec![nestweaver_engine::ProjectMemberRepo {
+                uid: "repo:ww".to_string(),
+                name: "wavelength-wireless-site".to_string(),
+            }],
+        )]
+        .into_iter()
+        .collect();
+        let issues = ProjectRepoIssues::new();
+        let text = render_list_projects(&materialized, &[], &issues, &members, false).unwrap();
+        assert!(
+            text.contains("  Repos:    wavelength-wireless-site\n"),
+            "{text}"
+        );
+        let siteloom = text.split("\nsiteloom\n").nth(1).unwrap();
+        assert!(siteloom.contains("  Repos:    (none)"), "{text}");
+        let json: serde_json::Value = serde_json::from_str(
+            &render_list_projects(&materialized, &[], &issues, &members, true).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            json["member_repos"]["wavelength-wireless"][0]["name"],
+            "wavelength-wireless-site"
+        );
+        assert_eq!(json["member_repos"]["siteloom"], serde_json::json!([]));
     }
 
     #[test]
     fn list_projects_without_issues_is_unchanged() {
         let materialized = projects();
         let clean = ProjectRepoIssues::new();
-        let json: serde_json::Value =
-            serde_json::from_str(&render_list_projects(&materialized, &[], &clean, true).unwrap())
-                .unwrap();
+        let json: serde_json::Value = serde_json::from_str(
+            &render_list_projects(&materialized, &[], &clean, &ProjectMemberRepos::new(), true)
+                .unwrap(),
+        )
+        .unwrap();
         assert!(json.get("repo_issues").is_none(), "{json}");
-        let text = render_list_projects(&materialized, &[], &clean, false).unwrap();
+        let text = render_list_projects(
+            &materialized,
+            &[],
+            &clean,
+            &ProjectMemberRepos::new(),
+            false,
+        )
+        .unwrap();
         assert!(!text.contains("Warning"), "{text}");
         assert!(text.starts_with("wavelength-wireless\n  UID:      proj:wavelength-wireless\n"));
     }

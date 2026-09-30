@@ -10399,7 +10399,21 @@ impl NestWeaverDaemon for DaemonService {
                 .store
                 .list_projects()
                 .map_err(|e| Status::internal(format!("list_projects failed: {e:#}")))?;
-            serde_json::to_string(&projects)
+            // Each project carries its member repos (`repos`), which the CLI
+            // cannot read itself while this daemon holds the store.
+            let rows = projects
+                .iter()
+                .map(|project| {
+                    let mut row = serde_json::to_value(project)?;
+                    let members =
+                        nestweaver_engine::project_member_repos(&state.store, &project.uid)
+                            .unwrap_or_default();
+                    row["repos"] = serde_json::to_value(members)?;
+                    Ok(row)
+                })
+                .collect::<Result<Vec<_>, serde_json::Error>>()
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))?;
+            serde_json::to_string(&rows)
                 .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
         })
         .await
@@ -19282,6 +19296,63 @@ repos = ["alpha"]
         assert!(!merge_called.get());
         assert!(state.store.project_exists("proj:old:prepare").unwrap());
         assert_eq!(state.store.graph_generation(), generation_before);
+    }
+
+    /// `list-projects` cannot read membership itself while the daemon holds
+    /// the store, so the daemon's project listing carries each project's
+    /// member repos.
+    #[tokio::test]
+    async fn list_projects_json_carries_member_repos() {
+        let state = test_state_with_writer();
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: "proj:default:web".to_string(),
+                name: "web".to_string(),
+                summary: None,
+                instance_id: "default".to_string(),
+            })
+            .unwrap();
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: "proj:default:empty".to_string(),
+                name: "empty".to_string(),
+                summary: None,
+                instance_id: "default".to_string(),
+            })
+            .unwrap();
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:default:site",
+                "file:///x/site",
+                Some("/x/site"),
+            ))
+            .unwrap();
+        state
+            .store
+            .replace_project_repo_edges(
+                &["proj:default:web".to_string()],
+                &[(
+                    "proj:default:web".to_string(),
+                    "repo:default:site".to_string(),
+                )],
+            )
+            .unwrap();
+        let service = DaemonService::new(Arc::clone(&state));
+        let response = service
+            .list_projects_json(Request::new(JsonRequest {
+                args_json: "{}".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&response.result_json).unwrap();
+        let by_name = |name: &str| rows.iter().find(|row| row["name"] == name).unwrap().clone();
+        assert_eq!(by_name("web")["repos"][0]["uid"], "repo:default:site");
+        assert_eq!(by_name("web")["repos"][0]["name"], "site");
+        assert_eq!(by_name("empty")["repos"], serde_json::json!([]));
     }
 
     #[test]

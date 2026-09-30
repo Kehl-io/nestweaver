@@ -227,6 +227,38 @@ pub fn recorded_repo_issues(
         .unwrap_or_default()
 }
 
+/// One member repo of a project, as `list-projects` shows it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProjectMemberRepo {
+    pub uid: String,
+    pub name: String,
+}
+
+/// A project's member repos (its PROJECT_INCLUDES_REPO targets), named the
+/// way the `--repo` selector names them, sorted by name. A member whose Repo
+/// node cannot be read is listed by uid rather than dropped.
+pub fn project_member_repos(
+    store: &GraphStore,
+    project_uid: &str,
+) -> Result<Vec<ProjectMemberRepo>, anyhow::Error> {
+    let mut members: Vec<ProjectMemberRepo> = store
+        .project_member_repo_uids(project_uid)
+        .map_err(|e| anyhow::anyhow!("read members of {project_uid}: {e}"))?
+        .into_iter()
+        .map(|uid| {
+            let name = store
+                .lookup_repo(&uid)
+                .ok()
+                .flatten()
+                .map(|repo| crate::repo_display_name(&repo))
+                .unwrap_or_else(|| uid.clone());
+            ProjectMemberRepo { uid, name }
+        })
+        .collect();
+    members.sort_by(|a, b| a.name.cmp(&b.name).then(a.uid.cmp(&b.uid)));
+    Ok(members)
+}
+
 /// Outcome of resolving one declared repo reference against indexed repos.
 #[derive(Debug)]
 pub enum DeclaredRepoMatch<'a> {
