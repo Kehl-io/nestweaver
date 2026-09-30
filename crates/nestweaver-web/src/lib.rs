@@ -100,10 +100,17 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(routes::symbols::symbols_in_file),
         )
         .route("/api/v1/symbols/top", get(routes::symbols::symbols_top))
-        .route("/api/v1/context", post(routes::context::code_context))
+        .route(
+            "/api/v1/context",
+            post(routes::context::code_context).layer(axum::extract::DefaultBodyLimit::max(
+                routes::context::CONTEXT_BODY_LIMIT_BYTES,
+            )),
+        )
         .route(
             "/api/v1/brain/context",
-            post(routes::context::brain_context),
+            post(routes::context::brain_context).layer(axum::extract::DefaultBodyLimit::max(
+                routes::context::CONTEXT_BODY_LIMIT_BYTES,
+            )),
         )
         // Impact
         .route("/api/v1/impact/{uid}", get(routes::impact::impact))

@@ -20,6 +20,32 @@ fn default_limit() -> usize {
     50
 }
 
+/// Most seeds one context request may carry (both routes).
+pub const MAX_CONTEXT_SEEDS: usize = 100;
+
+/// Request-body ceiling for the context routes: generous for
+/// [`MAX_CONTEXT_SEEDS`] names, far below axum's 2 MiB default.
+pub const CONTEXT_BODY_LIMIT_BYTES: usize = 64 * 1024;
+
+/// The request-shape checks both context routes share, before any lookup.
+/// A blank seed is refused as the CLI and the MCP schema refuse it: the
+/// engine skips it, and a request of only blank seeds then ranked the whole
+/// graph and answered 200 with arbitrary results.
+fn validate_context_seeds(seeds: &[String]) -> Result<(), ApiError> {
+    if seeds.is_empty() {
+        return Err(ApiError::bad_request("seeds must not be empty"));
+    }
+    if seeds.len() > MAX_CONTEXT_SEEDS {
+        return Err(ApiError::bad_request(format!(
+            "at most {MAX_CONTEXT_SEEDS} context seeds are supported"
+        )));
+    }
+    if seeds.iter().any(|seed| seed.trim().is_empty()) {
+        return Err(ApiError::bad_request("seeds must not contain a blank seed"));
+    }
+    Ok(())
+}
+
 /// Graph-missing `note:` UIDs are client errors. Brain-context otherwise
 /// accepts the UID as a seed and drops it at render time, which would 200
 /// an empty body instead of 4xx. Name/path misses still go through the
@@ -72,9 +98,7 @@ pub async fn code_context(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ContextRequest>,
 ) -> Result<Response, ApiError> {
-    if body.seeds.is_empty() {
-        return Err(ApiError::bad_request("seeds must not be empty"));
-    }
+    validate_context_seeds(&body.seeds)?;
     reject_unresolved_http_seeds(&state.store, &body.seeds)?;
     state.admit_vault_derivation()?;
     let result = nestweaver_engine::build_context(&state.store, &body.seeds)
@@ -100,14 +124,7 @@ pub async fn brain_context(
     State(state): State<Arc<AppState>>,
     Json(body): Json<BrainContextRequest>,
 ) -> Result<Response, ApiError> {
-    if body.seeds.is_empty() {
-        return Err(ApiError::bad_request("seeds must not be empty"));
-    }
-    if body.seeds.len() > 100 {
-        return Err(ApiError::bad_request(
-            "at most 100 context seeds are supported",
-        ));
-    }
+    validate_context_seeds(&body.seeds)?;
     let generation = state.store.graph_generation();
     nestweaver_engine::context_graph::ensure_context_generation(&state.store, generation)
         .map_err(ApiError::from_ranking)?;

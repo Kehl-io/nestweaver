@@ -2645,3 +2645,29 @@ async fn brain_context_on_an_empty_vault_is_409_not_404() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
 }
+
+/// `seeds: [""]` answered 200 with arbitrary results on the code route (the
+/// engine skips a blank seed and then ranked everything). A blank seed is a
+/// malformed request on both context routes, as it is for the CLI and MCP,
+/// and so is a seed list or body past the routes' limits.
+#[tokio::test]
+async fn context_routes_reject_blank_seeds_and_oversized_requests() {
+    let app = make_app();
+    for uri in ["/api/v1/context", "/api/v1/brain/context"] {
+        for seeds in [json!([""]), json!(["   "]), json!(["greet", ""])] {
+            let (status, json) = post_json(&app, uri, json!({ "seeds": seeds })).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {seeds}: {json}");
+            assert!(json["error"].as_str().unwrap().contains("blank"), "{json}");
+        }
+        let many: Vec<String> = (0..101).map(|i| format!("s{i}")).collect();
+        let (status, json) = post_json(&app, uri, json!({ "seeds": many })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {json}");
+
+        let huge = "x".repeat(nestweaver_web::routes::context::CONTEXT_BODY_LIMIT_BYTES + 1);
+        let (status, _) = post_json(&app, uri, json!({ "seeds": [huge] })).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{uri}");
+    }
+    // Counterweight: a real seed still answers.
+    let (status, json) = post_json(&app, "/api/v1/context", json!({ "seeds": ["greet"] })).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+}
