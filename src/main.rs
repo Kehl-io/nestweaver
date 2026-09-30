@@ -3072,6 +3072,33 @@ fn cluster_not_found_hint(output: &nestweaver_engine::ClusteringOutput) -> Strin
     )
 }
 
+/// The engine's miss for a bundle id no live bundle has, found anywhere in
+/// `error`'s chain (the daemon route wraps it).
+fn bundle_miss_message(error: &anyhow::Error, bundle_id: &str) -> Option<String> {
+    let expected = format!("bundle '{bundle_id}' not found or expired");
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains(&expected))
+        .then(|| {
+            format!(
+                "{expected}; bundles expire after 24 hours, so run `nestweaver investigate` \
+                 again for a new one"
+            )
+        })
+}
+
+/// `investigate-expand` / `investigate-hydrate` on an unknown or expired
+/// bundle: exit 2 with the not-found envelope under `--json`, like every
+/// other read command's miss. It used to be exit 1 with the RPC wrapper.
+fn report_bundle_miss(error: &anyhow::Error, bundle_id: &str, json: bool) -> Option<i32> {
+    let message = bundle_miss_message(error, bundle_id)?;
+    if json {
+        print_json_not_found_detail("bundle_id", &serde_json::json!(bundle_id), Some(&message));
+    }
+    eprintln!("{message}");
+    Some(EXIT_NOT_FOUND)
+}
+
 /// `investigate-expand` text, from the result's JSON so the daemon and
 /// direct routes print the same thing. An entry whose body could not be read
 /// says why rather than printing an empty block.
@@ -22659,9 +22686,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // repo got empty bodies again regardless of the daemon-side
                 // fix.
                 let args = investigate_rpc_args(&bundle_id, Some(&targets), None, root.as_deref());
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "investigate_expand", args)?
+                let routed = try_hybrid_json_rpc(true, &db_path, None, "investigate_expand", args);
+                if let Err(error) = &routed
+                    && let Some(code) = report_bundle_miss(error, &bundle_id, json)
                 {
+                    return Ok((code, None));
+                }
+                if let Some(value) = routed? {
                     // `--json` used to be a no-op here: the daemon route
                     // printed JSON either way.
                     if json {
@@ -22680,13 +22711,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // `detect_repo_root()` here — a single directory-walk guess is
             // no better than the daemon's old cwd default when the caller's
             // cwd is outside every indexed repo.
-            let result = nestweaver_engine::investigate_expand(
+            let result = match nestweaver_engine::investigate_expand(
                 &store,
                 &db_path,
                 root.as_deref(),
                 &bundle_id,
                 &targets,
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(error) => match report_bundle_miss(&error, &bundle_id, json) {
+                    Some(code) => return Ok((code, None)),
+                    None => return Err(error),
+                },
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
@@ -22729,9 +22766,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // overridden by the client's cwd.
                 let args =
                     investigate_rpc_args(&bundle_id, None, Some(token_budget), root.as_deref());
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "investigate_hydrate", args)?
+                let routed = try_hybrid_json_rpc(true, &db_path, None, "investigate_hydrate", args);
+                if let Err(error) = &routed
+                    && let Some(code) = report_bundle_miss(error, &bundle_id, json)
                 {
+                    return Ok((code, None));
+                }
+                if let Some(value) = routed? {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -22744,13 +22785,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let store = open_store(Some(&db_path))?;
             // nw-560: pass an omitted `--root` through as `None` — see the
             // matching comment in `investigate-expand` above.
-            let result = nestweaver_engine::investigate_hydrate(
+            let result = match nestweaver_engine::investigate_hydrate(
                 &store,
                 &db_path,
                 root.as_deref(),
                 &bundle_id,
                 Some(token_budget),
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(error) => match report_bundle_miss(&error, &bundle_id, json) {
+                    Some(code) => return Ok((code, None)),
+                    None => return Err(error),
+                },
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
@@ -28565,6 +28612,34 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
     /// invocation already passed (nw-328/nw-329's actual shape) cannot be
     /// expressed as a static per-string check. Both stay covered only by the
     /// one-row-per-bug table in `tests/error_remedy_test.rs`.
+    /// An unknown bundle is a miss (exit 2, not-found envelope) whether the
+    /// engine's error arrives bare (direct route) or wrapped (daemon route);
+    /// any other failure is not.
+    #[test]
+    fn an_unknown_bundle_is_a_not_found_miss_on_both_routes() {
+        let bare = anyhow::anyhow!("bundle 'bndl_x' not found or expired");
+        let wrapped =
+            anyhow::anyhow!("tool investigate_expand failed: bundle 'bndl_x' not found or expired")
+                .context("investigate_expand RPC failed");
+        for error in [&bare, &wrapped] {
+            let message = bundle_miss_message(error, "bndl_x").expect("a miss");
+            assert!(message.starts_with("bundle 'bndl_x' not found or expired"));
+            let payload =
+                json_not_found_payload("bundle_id", &serde_json::json!("bndl_x"), Some(&message));
+            assert_eq!(payload["error"], "not found");
+            assert_eq!(payload["bundle_id"], "bndl_x");
+        }
+        assert_eq!(
+            report_bundle_miss(&bare, "bndl_x", false),
+            Some(EXIT_NOT_FOUND)
+        );
+        let other = anyhow::anyhow!("cannot read the bundle store at /x: denied");
+        assert!(bundle_miss_message(&other, "bndl_x").is_none());
+        assert!(report_bundle_miss(&other, "bndl_x", false).is_none());
+        // Another bundle's miss is not this one's.
+        assert!(bundle_miss_message(&bare, "bndl_y").is_none());
+    }
+
     /// Both investigate drill-in commands print text from the same JSON on
     /// either route, and an entry with no body says why.
     #[test]

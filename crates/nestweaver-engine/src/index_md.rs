@@ -2279,8 +2279,7 @@ fn index_markdown_since_with_reader_mode(
                     }
                 }
                 if file_size > note_limit_bytes {
-                    // nw-469: skip and disclose, and do not fail the watcher
-                    // batch. An already-indexed note is DROPPED, as a full
+                    // Skip and disclose, and do not fail the watcher batch. An already-indexed note is DROPPED, as a full
                     // refresh drops it: its stored text is not what the file
                     // says any more, so keeping it left stale text searchable
                     // and, with the file's mtime changed, replayed the note

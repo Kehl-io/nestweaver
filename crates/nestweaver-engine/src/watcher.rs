@@ -157,12 +157,6 @@ struct BatchPhaseTimings {
     /// Write transactions and statements the cross-domain flush cost.
     sidecar_transactions: usize,
     sidecar_statements: usize,
-    /// Changed notes still in the graph whose text this batch did not read.
-    /// Reachable only for an edit that pushed a note over the size limit
-    /// (nw-469): the refresh skips it without replacing its nodes, so it
-    /// keeps its stored body AND the code links that body produced. (A read
-    /// or parse failure of an indexed note fails the refresh instead.)
-    sidecar_scan_skipped: usize,
     /// Flush attempts that failed and rolled back (non-fatal; logged). A
     /// chunk is retried once; one that fails twice is owed (`SidecarDebt`).
     sidecar_flush_failures: usize,
@@ -1149,7 +1143,6 @@ impl BrainWatcher {
             sidecar_edges = phase_timings.sidecar_edges,
             sidecar_transactions = phase_timings.sidecar_transactions,
             sidecar_statements = phase_timings.sidecar_statements,
-            sidecar_scan_skipped = phase_timings.sidecar_scan_skipped,
             sidecar_flush_failures = phase_timings.sidecar_flush_failures,
             tombstones_ms = phase_timings.tombstones_ms,
             non_graph_events_ms = phase_timings.non_graph_events_ms,
@@ -1517,16 +1510,16 @@ impl BrainWatcher {
             if let Some(probe) = &self.sidecar_scan_probe {
                 probe(chunk.len());
             }
-            if let Some(index) = index {
-                match sources.get(relative) {
-                    Some(source) => {
-                        chunk.push(crate::cross_domain::scan_note_source(
-                            uid, source, &sections, index,
-                        ));
-                        chunk_paths.push((*path).clone());
-                    }
-                    None => timings.sidecar_scan_skipped += 1,
-                }
+            // Every note still in the graph was read by this refresh (an
+            // oversized one is dropped, a read failure fails the refresh), so
+            // its committed source is here.
+            if let Some(index) = index
+                && let Some(source) = sources.get(relative)
+            {
+                chunk.push(crate::cross_domain::scan_note_source(
+                    uid, source, &sections, index,
+                ));
+                chunk_paths.push((*path).clone());
             }
             if tantivy.is_some() {
                 let section_docs: Vec<_> = sections
@@ -4816,10 +4809,9 @@ mod tests {
     /// An edit that pushes a note over the size limit drops the note, and
     /// with it the code links its old body produced: they described text the
     /// file no longer holds. (This used to keep the stored body and its
-    /// links, which also kept stale text searchable.) Nothing is left for the
-    /// link scan to skip.
+    /// links, which also kept stale text searchable.)
     #[test]
-    fn nw_668_an_oversized_edit_drops_the_note_and_its_code_links() {
+    fn an_oversized_edit_drops_the_note_and_its_code_links() {
         let _guard = serial_watcher_test();
         let fx = nw_668_fixture(&[], 2, &["AlphaWidget", "BravoWidget"]);
         let path = fx.root.join("n000.md");
@@ -4849,13 +4841,6 @@ mod tests {
         assert!(
             fx.store.lookup_note(&dropped).is_err(),
             "the oversized note leaves the graph"
-        );
-        assert_eq!(
-            watcher
-                .last_batch_phase_timings()
-                .unwrap()
-                .sidecar_scan_skipped,
-            0
         );
         let edges = fx.store.list_references_code_edges().unwrap();
         assert!(
