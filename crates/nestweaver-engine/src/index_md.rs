@@ -2217,6 +2217,9 @@ fn index_markdown_since_with_reader_mode(
     let mut candidates = Vec::new();
     let mut indexed_paths: HashMap<String, (String, PathBuf)> = HashMap::new();
     let mut eligible_note_uids = HashSet::new();
+    // Eligible notes over the size limit: observed (so they never trip the
+    // empty-scan guard below) but not kept.
+    let mut oversized_note_uids = HashSet::new();
     // nw-651: the same drain the full index runs, so an unreadable (or
     // pruned) directory is disclosed on this route too.
     let mut skipped: Vec<SkippedFile> = disclose_vault_prunes(reader, ignore_set);
@@ -2253,9 +2256,13 @@ fn index_markdown_since_with_reader_mode(
                     }
                 }
                 if file_size > note_limit_bytes {
-                    // nw-469: skip and disclose. Keep any already-indexed
-                    // body so wikilinks are not rebuilt from a truncated
-                    // read, and do not fail the watcher batch.
+                    // nw-469: skip and disclose, and do not fail the watcher
+                    // batch. An already-indexed note is DROPPED, as a full
+                    // refresh drops it: its stored text is not what the file
+                    // says any more, so keeping it left stale text searchable
+                    // and, with the file's mtime changed, replayed the note
+                    // on every watcher start.
+                    oversized_note_uids.insert(n_uid.clone());
                     skipped.push(oversized_skip(
                         rel_path_str.clone(),
                         file_size,
@@ -2358,7 +2365,9 @@ fn index_markdown_since_with_reader_mode(
         .collect();
     let removed_uids: std::collections::HashSet<String> = existing_notes
         .iter()
-        .filter(|note| !eligible_note_uids.contains(&note.uid))
+        .filter(|note| {
+            !eligible_note_uids.contains(&note.uid) || oversized_note_uids.contains(&note.uid)
+        })
         .filter(|note| !unread_note_uids.contains(&note.uid))
         .map(|note| note.uid.clone())
         .collect();
