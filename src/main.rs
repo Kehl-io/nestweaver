@@ -16384,6 +16384,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let payload = match routed {
                 Ok(Some(value)) => value,
                 Ok(None) => unreachable!("the direct leg always yields a payload or an error"),
+                // `--repo` disambiguates the name through the repo resolver.
+                Err(error) if error_is_unresolved_repo_filter(&error) => {
+                    return Ok((report_unresolved_repo_filter(&error, json), None));
+                }
                 Err(error) if format!("{error:#}").contains("no symbol found") => {
                     if json {
                         print_json_not_found("symbol", &name_or_uid);

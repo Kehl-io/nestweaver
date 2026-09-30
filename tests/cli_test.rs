@@ -14004,7 +14004,11 @@ fn two_web_apps(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathB
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::write(
             repo.join("main.js"),
-            format!("function {function}(n) {{ return helper_{dir}(n); }}\nfunction helper_{dir}(n) {{ return n; }}\n"),
+            format!(
+                "function {function}(n) {{ return helper_{dir}(n); }}\n\
+                 function helper_{dir}(n) {{ return n; }}\n\
+                 function shared_fn(n) {{ return n; }}\n"
+            ),
         )
         .unwrap();
         nestweaver_cmd()
@@ -14372,4 +14376,17 @@ type = "http-api"
         serde_json::json!([other_uid]),
         "{payload}"
     );
+}
+
+/// `cross-repo-refs --repo` disambiguates an AMBIGUOUS symbol name (it
+/// deliberately never scopes a unique one) through the repo resolver, and
+/// reports its failure class like every repo filter.
+#[test]
+fn cross_repo_refs_repo_filter_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let long = "z".repeat(5000);
+    assert_repo_filter_classes(&db, exact.to_str().unwrap(), &long, |repo| {
+        owned(&["cross-repo-refs", "shared_fn", "--json", "--repo", repo])
+    });
 }
