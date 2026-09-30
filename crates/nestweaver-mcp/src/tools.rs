@@ -161,6 +161,12 @@ fn notes_ambiguous_payload(title: &str, notes: &[nestweaver_schema::Note]) -> Va
     payload
 }
 
+/// Keep the name matches that live in the repo `repo_filter` selects.
+///
+/// Resolved by `resolve_repo_filter`, the one resolver every repo filter
+/// uses: a selector that names no repo, several repos, or is malformed is a
+/// typed error with that class, never a substring guess over file paths and
+/// UIDs that could silently pick symbols from the wrong repo.
 fn filter_name_matches_by_repo(
     store: &GraphStore,
     matches: Vec<nestweaver_schema::Symbol>,
@@ -170,34 +176,11 @@ fn filter_name_matches_by_repo(
     let Some(selector) = repo_filter.filter(|s| !s.is_empty()) else {
         return Ok(matches);
     };
-    let mut repos = store
-        .list_repos(None)
-        .map_err(|e| anyhow!("list_repos: {e}"))?;
-    repos.retain(|repo| repo_is_visible(&repo.uid, visible));
-    match nestweaver_engine::resolve_repo_selector(&repos, selector) {
-        Ok(repo) => Ok(matches
-            .into_iter()
-            .filter(|s| s.repo_uid == repo.uid)
-            .collect()),
-        Err(_) => {
-            let filter_lower = selector.to_lowercase();
-            let repo_names: HashMap<String, String> = repos
-                .iter()
-                .map(|r| (r.uid.clone(), nestweaver_engine::repo_display_name(r)))
-                .collect();
-            Ok(matches
-                .into_iter()
-                .filter(|s| {
-                    repo_names
-                        .get(&s.repo_uid)
-                        .is_some_and(|name| name.to_lowercase().contains(&filter_lower))
-                        || s.file_path.to_lowercase().starts_with(&filter_lower)
-                        || s.uid.to_lowercase().contains(&filter_lower)
-                        || s.repo_uid.to_lowercase().contains(&filter_lower)
-                })
-                .collect())
-        }
-    }
+    let repos = resolve_repo_filter(store, &[selector.to_string()], visible)?;
+    Ok(matches
+        .into_iter()
+        .filter(|symbol| repos.contains(&symbol.repo_uid))
+        .collect())
 }
 
 fn classify_name_matches(matches: Vec<nestweaver_schema::Symbol>) -> StrictNameResolve {
@@ -4819,10 +4802,16 @@ fn validate_regex_kinds(kinds: Option<&[String]>) -> Result<(), anyhow::Error> {
                 .iter()
                 .any(|known| known.eq_ignore_ascii_case(kind))
             {
-                return Err(anyhow!(
-                    "unknown kind '{kind}'; expected one of: {}",
-                    REGEX_SEARCH_KINDS.join(", ")
-                ));
+                // Typed as an argument error: the caller's input is invalid
+                // whatever the graph holds, so it is a usage error, not a
+                // failure of the tool.
+                return Err(ToolArgumentsInvalid {
+                    message: format!(
+                        "unknown kind '{kind}'; expected one of: {}",
+                        REGEX_SEARCH_KINDS.join(", ")
+                    ),
+                }
+                .into());
             }
         }
     }
@@ -5727,7 +5716,10 @@ fn is_concise(args: &Value) -> bool {
 /// case-insensitive kind-PREFIX match.
 const BRAIN_CONTEXT_KINDS: &[&str] = &["Symbol", "Note", "Section", "Tag", "Heading"];
 
-fn validate_brain_context_kinds(kinds: &[String]) -> Result<(), anyhow::Error> {
+/// Public so the CLI can refuse a bad `--kinds` value at parse time with
+/// the same rule and message. The error is a [`ToolArgumentsInvalid`]: the
+/// input is invalid whatever the graph holds.
+pub fn validate_brain_context_kinds(kinds: &[String]) -> Result<(), anyhow::Error> {
     for kind in kinds {
         let is_base = BRAIN_CONTEXT_KINDS
             .iter()
@@ -5737,10 +5729,13 @@ fn validate_brain_context_kinds(kinds: &[String]) -> Result<(), anyhow::Error> {
             .is_some_and(|p| p.eq_ignore_ascii_case("symbol/"))
             && kind.len() > "symbol/".len();
         if !is_base && !is_symbol_subkind {
-            return Err(anyhow!(
-                "unknown kind '{kind}'; expected one of: {} (or a 'Symbol/<sub-kind>' prefix)",
-                BRAIN_CONTEXT_KINDS.join(", ")
-            ));
+            return Err(ToolArgumentsInvalid {
+                message: format!(
+                    "unknown kind '{kind}'; expected one of: {} (or a 'Symbol/<sub-kind>' prefix)",
+                    BRAIN_CONTEXT_KINDS.join(", ")
+                ),
+            }
+            .into());
         }
     }
     Ok(())
@@ -27447,6 +27442,56 @@ mod context_scope_filter_tests {
         assert_eq!(resolved, HashSet::from([REPO_A.to_string()]));
     }
 
+    /// A symbol lookup's `repo` disambiguation resolves like every repo
+    /// filter: it used to fall back to substring matching over file paths and
+    /// UIDs, so an unknown or ambiguous selector quietly picked symbols.
+    #[test]
+    fn a_symbol_lookups_repo_filter_keeps_its_failure_class() {
+        let store = store_with_two_repos_named_website();
+        for (selector, failure) in [
+            (
+                "not-a-repo",
+                nestweaver_engine::RepoSelectorFailure::NotFound,
+            ),
+            ("website", nestweaver_engine::RepoSelectorFailure::Ambiguous),
+            ("", nestweaver_engine::RepoSelectorFailure::Malformed),
+        ] {
+            let error = filter_name_matches_by_repo(&store, Vec::new(), Some(selector), None);
+            if selector.is_empty() {
+                // An empty selector means "no filter", as it always has.
+                assert!(error.is_ok());
+                continue;
+            }
+            let error = error.expect_err(selector);
+            let unresolved = repo_filter_failure(&error)
+                .unwrap_or_else(|| panic!("{selector}: untyped {error:#}"));
+            assert_eq!(unresolved.failure, failure, "{selector}");
+        }
+        let error = filter_name_matches_by_repo(&store, Vec::new(), Some(&"z".repeat(600)), None)
+            .expect_err("an over-long selector is malformed");
+        assert_eq!(
+            repo_filter_failure(&error).unwrap().failure,
+            nestweaver_engine::RepoSelectorFailure::Malformed
+        );
+        // Counterweight: the exact UID still selects its repo.
+        assert!(filter_name_matches_by_repo(&store, Vec::new(), Some(REPO_A), None).is_ok());
+    }
+
+    /// Kind filters outside the advertised vocabulary are argument errors,
+    /// which the daemon reports as invalid arguments (a usage error).
+    #[test]
+    fn unknown_kinds_are_typed_argument_errors() {
+        for error in [
+            validate_brain_context_kinds(&["bogus".to_string()]).unwrap_err(),
+            validate_regex_kinds(Some(&["bogus".to_string()])).unwrap_err(),
+        ] {
+            assert!(error.is::<ToolArgumentsInvalid>(), "{error:#}");
+            assert!(error.to_string().contains("bogus"), "{error:#}");
+        }
+        validate_brain_context_kinds(&["Symbol/Function".to_string()]).unwrap();
+        validate_regex_kinds(Some(&["note".to_string()])).unwrap();
+    }
+
     /// An MCP repo-filter miss is a lookup miss: `isError: true` with the
     /// not-found envelope. An ambiguous selector is `isError: true` whose text
     /// names both candidates even when a tool wrapped the error in context.
@@ -28538,6 +28583,8 @@ mod ambiguous_name_contract_tests {
             "must trace the Python ping, not another language: {payload}"
         );
 
+        // `ping` names four repos, so the REPO selector itself is ambiguous:
+        // the typed repo-filter error every surface reports, with candidates.
         let still = dispatch(
             &store,
             None,
@@ -28545,8 +28592,14 @@ mod ambiguous_name_contract_tests {
             json!({ "symbol": "ping", "repo": "ping" }),
             None,
         )
-        .expect("still-ambiguous selector is a structured refusal");
-        assert_ambiguous_tool_payload("flow_trace -- repo=ping", &still);
+        .expect_err("an ambiguous repo selector must not pick a repo");
+        let unresolved = repo_filter_failure(&still).expect("typed repo-filter error");
+        assert_eq!(
+            unresolved.failure,
+            nestweaver_engine::RepoSelectorFailure::Ambiguous,
+            "{still:#}"
+        );
+        assert_eq!(unresolved.candidates.len(), 4, "{still:#}");
     }
 }
 

@@ -13961,6 +13961,18 @@ fn assert_repo_filter_classes(
     malformed: &str,
     args: impl Fn(&str) -> Vec<String>,
 ) {
+    assert_repo_filter_classes_with(db, exact, malformed, Some(0), args);
+}
+
+/// [`assert_repo_filter_classes`] where the exact selector's own exit code
+/// differs (a lookup that then misses on its target, not on the repo).
+fn assert_repo_filter_classes_with(
+    db: &std::path::Path,
+    exact: &str,
+    malformed: &str,
+    exact_code: Option<i32>,
+    args: impl Fn(&str) -> Vec<String>,
+) {
     let run = |selector: &str| {
         let output = nestweaver_cmd()
             .args(args(selector))
@@ -13996,9 +14008,12 @@ fn assert_repo_filter_classes(
 
     let (code, stdout, stderr) = run(exact);
     assert_eq!(
-        code,
-        Some(0),
+        code, exact_code,
         "COUNTERWEIGHT: an exact selector still answers: {stdout}\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("repo filter entry") && !stderr.contains("repo filter entry"),
+        "an exact selector must resolve: {stdout}\n{stderr}"
     );
 }
 
@@ -14070,4 +14085,124 @@ fn cross_repo_contracts_repo_filter_keeps_its_failure_class() {
             repo,
         ])
     });
+}
+
+/// `impact --repo` used to fall back to substring matching over file paths
+/// and UIDs when the selector did not resolve.
+#[test]
+fn impact_repo_filter_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let long = "z".repeat(5000);
+    assert_repo_filter_classes(&db, exact.to_str().unwrap(), &long, |repo| {
+        owned(&["impact", "greet_one", "--json", "--repo", repo])
+    });
+}
+
+#[test]
+fn flow_trace_repo_filter_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let long = "z".repeat(5000);
+    assert_repo_filter_classes(&db, exact.to_str().unwrap(), &long, |repo| {
+        owned(&["flow-trace", "greet_one", "--json", "--repo", repo])
+    });
+}
+
+#[test]
+fn contracts_list_repo_filter_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let long = "z".repeat(5000);
+    assert_repo_filter_classes(&db, exact.to_str().unwrap(), &long, |repo| {
+        owned(&["contracts", "list", "--json", "--repo", repo])
+    });
+}
+
+#[test]
+fn contracts_drift_repo_filter_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let long = "z".repeat(5000);
+    assert_repo_filter_classes(&db, exact.to_str().unwrap(), &long, |repo| {
+        owned(&["contracts", "drift", "--json", "--repo", repo])
+    });
+}
+
+/// The fixture has no services, so an exact repo resolves and the SERVICE
+/// then misses: still exit 2, but not a repo-filter failure.
+#[test]
+fn service_summary_repo_filter_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let long = "z".repeat(5000);
+    assert_repo_filter_classes_with(&db, exact.to_str().unwrap(), &long, Some(2), |repo| {
+        owned(&["service-summary", "web-app", "--json", "--repo", repo])
+    });
+}
+
+/// A value outside a flag's fixed vocabulary is invalid argv: exit 64 with
+/// the valid values named, not exit 1 with "Internal error".
+#[test]
+fn enum_like_context_flags_reject_unknown_values_as_usage_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = two_web_apps(dir.path());
+    let run = |args: &[&str]| {
+        let output = nestweaver_cmd()
+            .args(args)
+            .arg("--db")
+            .arg(&db)
+            .output()
+            .unwrap();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    };
+    for (args, names) in [
+        (
+            vec!["brain", "context", "greet_one", "--kinds", "bogus"],
+            "Symbol, Note, Section, Tag, Heading",
+        ),
+        (
+            vec!["brain", "context", "greet_one", "--kinds", "Symbol,bogus"],
+            "Symbol, Note, Section, Tag, Heading",
+        ),
+        (
+            vec!["brain", "context", "greet_one", "--intent", "bogus"],
+            "find-definition",
+        ),
+        (
+            vec!["context", "greet_one", "--intent", "bogus"],
+            "find-definition",
+        ),
+    ] {
+        let (code, stderr) = run(&args);
+        assert_eq!(code, Some(64), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("bogus") && stderr.contains(names),
+            "{args:?} must name the valid values: {stderr}"
+        );
+    }
+    // Counterweight: valid values are accepted.
+    for args in [
+        vec![
+            "brain",
+            "context",
+            "greet_one",
+            "--kinds",
+            "Symbol,Symbol/Function",
+        ],
+        vec![
+            "brain",
+            "context",
+            "greet_one",
+            "--intent",
+            "find-definition",
+        ],
+        vec!["context", "greet_one", "--intent", "find-definition"],
+    ] {
+        let (code, stderr) = run(&args);
+        assert_eq!(code, Some(0), "{args:?}: {stderr}");
+    }
 }

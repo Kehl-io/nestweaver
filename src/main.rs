@@ -2102,6 +2102,21 @@ fn parse_unit_interval_f32(value: &str) -> Result<f32, String> {
 /// tools cannot re-diverge one at a time the way they arrived here, and
 /// rejects at PARSE TIME so all four affected CLI/MCP surfaces settle on one
 /// exit code (64) instead of `regex-search`'s prior 1.
+/// A `brain context --kinds` value, checked at parse time with the MCP
+/// tool's own rule and message, so a bad kind is a usage error (exit 64)
+/// that lists the valid kinds on both routes.
+fn parse_brain_context_kind(value: &str) -> Result<String, String> {
+    nestweaver_mcp::tools::validate_brain_context_kinds(&[value.to_string()])
+        .map(|()| value.to_string())
+        .map_err(|error| error.to_string())
+}
+
+/// A `--intent` value, checked at parse time so a bad one is a usage error
+/// (exit 64) naming the valid intents rather than an internal error.
+fn parse_query_intent(value: &str) -> Result<String, String> {
+    value.parse::<QueryIntent>().map(|_| value.to_string())
+}
+
 fn parse_non_blank_query(value: &str) -> Result<String, String> {
     if nestweaver_mcp::tools::is_blank_query(value) {
         Err("empty query strings are not allowed".to_string())
@@ -6310,6 +6325,7 @@ enum Commands {
         config: Option<PathBuf>,
         #[arg(
             long,
+            value_parser = parse_query_intent,
             help = "Query intent override: find-definition, understand-architecture, analyze-impact, general-context"
         )]
         intent: Option<String>,
@@ -8495,6 +8511,7 @@ enum BrainCommands {
         #[arg(
             long = "kinds",
             value_delimiter = ',',
+            value_parser = parse_brain_context_kind,
             help = "Keep only nodes with these kind prefixes (e.g. Symbol,Note)"
         )]
         kinds: Vec<String>,
@@ -8641,6 +8658,7 @@ enum BrainCommands {
         /// can force a specific traversal profile against the unified brain.
         #[arg(
             long = "intent",
+            value_parser = parse_query_intent,
             help = "Query intent override: find-definition, understand-architecture, analyze-impact, blast-radius, general-context"
         )]
         intent: Option<String>,
@@ -15800,6 +15818,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["repo"] = serde_json::json!(r);
                 }
                 match try_hybrid_json_rpc(use_daemon, &db_path, None, "service_summary", args) {
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
                     Err(error)
                         if error.chain().any(|cause| {
                             cause
@@ -15817,12 +15838,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok(Some(value)) => serde_json::from_value(strip_hybrid_meta(value)).ok(),
                     Ok(None) => {
                         let store = open_store(db.as_deref())?;
-                        nestweaver_engine::query::service_summary(
+                        match nestweaver_engine::query::service_summary(
                             &store,
                             &name,
                             instance.as_deref(),
                             repo.as_deref(),
-                        )?
+                        ) {
+                            Err(error) if error_is_unresolved_repo_filter(&error) => {
+                                return Ok((report_unresolved_repo_filter(&error, json), None));
+                            }
+                            other => other?,
+                        }
                     }
                 }
             };
@@ -18914,6 +18940,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let payload = match routed {
                 Ok(Some(value)) => value,
                 Ok(None) => unreachable!("the direct leg always yields a payload or an error"),
+                Err(error) if error_is_unresolved_repo_filter(&error) => {
+                    return Ok((report_unresolved_repo_filter(&error, json), None));
+                }
                 Err(error)
                     if {
                         let rendered = format!("{error:#}");
@@ -21695,13 +21724,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
             #[allow(clippy::collapsible_if)]
             if use_daemon {
-                if let Some(value) = try_hybrid_json_rpc_checked(
+                let answer = match try_hybrid_json_rpc_checked(
                     true,
                     &db_path,
                     config_opt.as_deref(),
                     "brain_impact",
                     impact_args,
-                )? {
+                ) {
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
+                    other => other?,
+                };
+                if let Some(value) = answer {
                     // nw-451: unwrap a two-tier envelope BEFORE anything reads
                     // this payload. `brain_impact` is TwoTier-routed, so with a
                     // healthy upstream `status` and `impact_nodes` live inside
@@ -21864,7 +21899,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let store = open_store(Some(&db_path))?;
 
             // Resolve the symbol UID first (may be a name).
-            match resolve_uid_with_repo_filter(&store, &name_or_uid, repo_filter.as_deref())? {
+            let resolved =
+                match resolve_uid_with_repo_filter(&store, &name_or_uid, repo_filter.as_deref()) {
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
+                    other => other?,
+                };
+            match resolved {
                 ResolveResult::Found(uid) => {
                     let threshold = min_score.unwrap_or(nestweaver_store::DEFAULT_IMPACT_THRESHOLD);
                     let result = store.impact_with_flags_and_threshold(
@@ -25427,37 +25469,20 @@ fn resolve_uid(store: &GraphStore, name_or_uid: &str) -> anyhow::Result<ResolveR
 }
 
 /// Like [`resolve_uid`] but applies an optional repo filter to narrow ambiguous
-/// matches. When `repo_filter` is `Some`, only symbols belonging to a repo
-/// whose display name matches the filter are kept. Also matches against
-/// file_path prefix and UID substring as fallbacks.
+/// matches. The filter is resolved by `resolve_repo_filter`, the one resolver
+/// every repo filter uses, so a selector naming no repo, several repos, or a
+/// malformed one fails with its class instead of a substring guess.
 fn resolve_uid_with_repo_filter(
     store: &GraphStore,
     name_or_uid: &str,
     repo_filter: Option<&str>,
 ) -> anyhow::Result<ResolveResult> {
-    let result = resolve_uid(store, name_or_uid)?;
     let Some(filter) = repo_filter else {
-        return Ok(result);
+        return resolve_uid(store, name_or_uid);
     };
-
-    let filter_lower = filter.to_lowercase();
-    // Build a repo_uid → display_name map for matching
-    let repos = list_repos(store, None)?;
-    let repo_names: std::collections::HashMap<String, String> = repos
-        .iter()
-        .map(|r| (r.uid.clone(), nestweaver_engine::repo_display_name(r)))
-        .collect();
-    let matches_filter = |s: &Symbol| -> bool {
-        // Match by repo display name (primary — supports --name overrides)
-        if let Some(name) = repo_names.get(&s.repo_uid)
-            && name.to_lowercase().contains(&filter_lower)
-        {
-            return true;
-        }
-        // Fallback: file_path prefix or UID substring
-        s.file_path.to_lowercase().starts_with(&filter_lower)
-            || s.uid.to_lowercase().contains(&filter_lower)
-    };
+    let repos = resolve_repo_filter(store, &[filter.to_string()])?;
+    let result = resolve_uid(store, name_or_uid)?;
+    let matches_filter = |s: &Symbol| -> bool { repos.contains(&s.repo_uid) };
 
     match &result {
         ResolveResult::Ambiguous(candidates) => {

@@ -215,11 +215,16 @@ fn list_contracts_impl(
             .into_iter()
             .filter(|repo| repo_is_visible(&repo.uid))
             .collect();
+        // Mapped like every repo filter: the typed error carries its class
+        // (not found / ambiguous / malformed) to the client in the details.
         let repo =
             nestweaver_engine::resolve_repo_selector(&visible_repos, filter).map_err(|error| {
-                Status::invalid_argument(format!(
-                    "no indexed repo matches --repo '{filter}': {error}"
-                ))
+                dispatch_err_to_status(
+                    "list_contracts",
+                    anyhow::Error::new(nestweaver_engine::node_scope::RepoFilterUnresolved::new(
+                        filter, &error,
+                    )),
+                )
             })?;
         Some(repo.uid.clone())
     } else {
@@ -534,8 +539,12 @@ mod list_contracts_tests {
         assert!(
             empty
                 .message()
-                .contains("no indexed repo matches --repo ''")
+                .contains("repository selector cannot be empty"),
+            "{}",
+            empty.message()
         );
+        let envelope: serde_json::Value = serde_json::from_slice(empty.details()).unwrap();
+        assert_eq!(envelope["status"], "malformed", "{envelope}");
 
         let visible = VisibleRepos::Only(HashSet::from(["target".to_string()]));
         let unfiltered = list_contracts_impl(&store, None, &visible).unwrap();
@@ -545,7 +554,16 @@ mod list_contracts_tests {
         for filter in ["repo:display", "does-not-exist"] {
             let error = list_contracts_impl(&store, Some(filter), &visible).unwrap_err();
             assert_eq!(error.code(), tonic::Code::InvalidArgument);
-            assert!(error.message().contains("no indexed repo matches --repo"));
+            // A hidden repo is indistinguishable from a missing one.
+            assert!(
+                error
+                    .message()
+                    .contains(&format!("repo '{filter}' not found")),
+                "{}",
+                error.message()
+            );
+            let envelope: serde_json::Value = serde_json::from_slice(error.details()).unwrap();
+            assert_eq!(envelope["status"], "not_found", "{envelope}");
         }
     }
 }
@@ -18456,6 +18474,85 @@ repos = ["alpha"]
             (55..=60).contains(&delay),
             "second failure backs off ~60s: {delay}"
         );
+    }
+
+    /// Links are stored with the confidence the resolver gave them at index
+    /// time, so a vault derived before exact unique names resolved at 1.0
+    /// still holds their old 0.95 rows. Its record at derivation version 1
+    /// must be re-derived, which rewrites them at 1.0; a record already at
+    /// the current version must be left alone. Reverting the version bump
+    /// makes version 1 current again and fails the first half.
+    #[tokio::test]
+    async fn a_vault_derived_before_exact_unique_links_is_re_derived() {
+        use nestweaver_engine::markdown_derivation::{DERIVATION_VERSION, DerivationPhase};
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\nsee [[B]]\n").unwrap();
+        std::fs::write(root.join("B.md"), "# B\n").unwrap();
+        let progress = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(progress.last().unwrap().phase, Phase::Done as i32);
+
+        // What a version-1 derivation stored for `[[B]]`: a 0.95 row.
+        let plant_old_row = || {
+            let vault_uid = state.store.list_vaults(None).unwrap()[0].uid.clone();
+            let edges = state
+                .store
+                .wikilink_edges_for_vault(&vault_uid, "WIKILINK_TO_NOTE", "dst:Note")
+                .unwrap();
+            let (section, note, _, display, target) = edges
+                .iter()
+                .find(|edge| edge.3.eq_ignore_ascii_case("B"))
+                .expect("[[B]] resolved")
+                .clone();
+            state
+                .store
+                .batch_insert_wikilink_to_note_edges(&[(&section, &note, 0.95, &display, &target)])
+                .unwrap();
+        };
+        let low_rows = || {
+            nestweaver_engine::broken_links(&state.store, 0)
+                .unwrap()
+                .into_iter()
+                .filter(|link| link.confidence < 1.0)
+                .count()
+        };
+
+        // Counterweight: at the CURRENT version nothing is due, and the old
+        // row stays exactly where it is.
+        plant_old_row();
+        assert_eq!(
+            low_rows(),
+            1,
+            "precondition: the planted 0.95 row is visible"
+        );
+        assert_eq!(
+            vault_derivation_record(&state).derivation_version,
+            DERIVATION_VERSION
+        );
+        assert_eq!(vault_derivation::inspect_next(&state).unwrap(), None);
+        assert_eq!(low_rows(), 1);
+
+        // A COMPLETED version-1 record, exactly as a version-1 binary left
+        // it: Current, with its witness. Only the version makes it due, so
+        // this half fails if version 1 is ever current again.
+        let mut record = vault_derivation_record(&state);
+        assert_eq!(record.phase, DerivationPhase::Current);
+        record.derivation_version = 1;
+        record
+            .witness
+            .as_mut()
+            .expect("a Current record has a witness")
+            .derivation_version = 1;
+        save_vault_derivation_record(&state, record);
+        let due = vault_derivation::inspect_next(&state)
+            .unwrap()
+            .expect("a version-1 vault must be re-derived");
+        vault_derivation::migrate_named(&state, &due).unwrap();
+        assert_eq!(low_rows(), 0, "re-derivation rewrites the old 0.95 row");
+        let current = vault_derivation_record(&state);
+        assert_eq!(current.derivation_version, DERIVATION_VERSION);
+        assert_eq!(current.phase, DerivationPhase::Current);
     }
 
     /// A NUL byte in a note's leading 8 KiB is the same policy skip the code
