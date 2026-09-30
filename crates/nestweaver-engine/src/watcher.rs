@@ -3055,6 +3055,53 @@ mod tests {
         }
     }
 
+    /// A symlink row outlives a watcher batch that does not touch it (the
+    /// batch does not re-walk the vault, and a linked directory resolves as a
+    /// directory, which made it look like a stale walk row), and leaves once
+    /// an event shows the link is gone.
+    #[cfg(unix)]
+    #[test]
+    fn watcher_keeps_symlink_rows_until_the_link_is_gone() {
+        use std::os::unix::fs::symlink;
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[("keep.md", "# Keep\n"), ("sub/inner.md", "# Inner\n")]);
+        symlink(root.join("sub"), root.join("linked-dir")).unwrap();
+        symlink(root.join("keep.md"), root.join("alias.md")).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let rows = || -> Vec<String> {
+            let mut rows: Vec<String> = crate::index_md::load_skipped_notes_sidecar(&db_path)
+                .skipped
+                .into_iter()
+                .filter(|row| row.reason.contains("symlink"))
+                .map(|row| row.path)
+                .collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(rows(), vec!["alias.md", "linked-dir"], "precondition");
+
+        fs::write(root.join("keep.md"), "# Keep\n\nedited\n").unwrap();
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        watcher
+            .process_batch(&store, None, &v_uid, vec![root.join("keep.md")], &None)
+            .unwrap();
+        assert_eq!(
+            rows(),
+            vec!["alias.md", "linked-dir"],
+            "an unrelated batch keeps them"
+        );
+
+        fs::remove_file(root.join("alias.md")).unwrap();
+        watcher
+            .process_batch(&store, None, &v_uid, vec![root.join("alias.md")], &None)
+            .unwrap();
+        assert_eq!(rows(), vec!["linked-dir"], "a deleted link's row leaves");
+    }
+
     #[test]
     fn watcher_records_new_oversized_note_as_skipped() {
         let (_dir, root) = make_vault(&[("keep.md", "# Keep\n")]);

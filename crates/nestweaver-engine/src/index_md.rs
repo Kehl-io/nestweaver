@@ -809,9 +809,11 @@ fn persist_skipped_notes_merge(
         // could not apply) is in `skipped` again when it still holds. Keeping the
         // old ones kept a directory "unreadable" in `brain status` after its
         // permissions were fixed, until the next full index.
-        sidecar
-            .skipped
-            .retain(|file| !touched.contains(file.path.as_str()) && !is_walk_row(vault_root, file));
+        sidecar.skipped.retain(|file| {
+            !touched.contains(file.path.as_str())
+                && !is_walk_row(vault_root, file)
+                && !is_replaced_symlink_row(vault_root, file)
+        });
         sidecar
             .notes_near_size_limit
             .retain(|note| !touched.contains(note.path.as_str()));
@@ -844,11 +846,55 @@ fn persist_skipped_notes_merge(
 /// at the same path. (A directory that has since been DELETED is not
 /// recognised and keeps its row until the next full index.)
 fn is_walk_row(vault_root: &Path, file: &SkippedFile) -> bool {
+    // A symlink row is not a walk row even when the link resolves to a
+    // directory: an incremental watcher batch does not re-walk, so dropping
+    // it here erased the disclosure until the next full refresh.
+    if is_symlink_row(file) {
+        return false;
+    }
     file.path == "."
         || file
             .reason
             .starts_with(crate::index::IGNORE_FILE_ROW_PREFIX)
         || vault_root.join(&file.path).is_dir()
+}
+
+fn is_symlink_row(file: &SkippedFile) -> bool {
+    file.reason.starts_with(crate::index::SYMLINK_ROW_PREFIX)
+}
+
+/// A symlink row whose path in THIS vault now holds something that is not a
+/// symlink (the link was replaced by a real note or directory). A path that
+/// holds nothing here keeps its row: rows are vault-relative and may belong
+/// to another vault; a deleted link's row is dropped by the watcher event
+/// that saw it go ([`forget_symlink_rows`]) or by the next full refresh.
+fn is_replaced_symlink_row(vault_root: &Path, file: &SkippedFile) -> bool {
+    is_symlink_row(file)
+        && std::fs::symlink_metadata(vault_root.join(&file.path))
+            .is_ok_and(|meta| !meta.file_type().is_symlink())
+}
+
+/// Drop the symlink rows at `paths` (vault-relative): watcher events showed
+/// no symlink there any more.
+fn forget_symlink_rows(db_path: Option<&Path>, paths: &[String]) {
+    let Some(db_path) = db_path.filter(|_| !paths.is_empty()) else {
+        return;
+    };
+    update_skipped_notes_sidecar(db_path, |mut sidecar| {
+        let before = sidecar.skipped.len();
+        sidecar
+            .skipped
+            .retain(|file| !(is_symlink_row(file) && paths.contains(&file.path)));
+        (sidecar.skipped.len() != before).then(|| {
+            build_skipped_notes_sidecar(
+                &sidecar.skipped,
+                &sidecar.notes_near_size_limit,
+                sidecar.unindexable_mtimes,
+                sidecar.reconciliation_pending,
+                sidecar.frontmatter_unparsed,
+            )
+        })
+    });
 }
 
 /// nw-653: reason prefix of the entries that disclose a watcher startup
@@ -2048,6 +2094,7 @@ pub(crate) fn refresh_watched_paths(
         .collect();
     let mut changed = HashSet::new();
     let mut symlinks = Vec::new();
+    let mut not_symlinks = Vec::new();
     for path in paths {
         let relative = path
             .strip_prefix(vault_root)
@@ -2060,6 +2107,7 @@ pub(crate) fn refresh_watched_paths(
             symlinks.push(crate::content_reader::symlink_row(path, &relative));
             continue;
         }
+        not_symlinks.push(relative.to_string_lossy().into_owned());
         match std::fs::metadata(path) {
             Ok(metadata) if metadata.is_file() => {
                 let canonical = std::fs::canonicalize(path)?;
@@ -2094,6 +2142,7 @@ pub(crate) fn refresh_watched_paths(
         ignore_set,
         Some(lease),
     )?;
+    forget_symlink_rows(store.db_path(), &not_symlinks);
     Ok(reader
         .captured
         .into_inner()

@@ -2209,6 +2209,41 @@ pub(crate) enum SkipDirCaller {
 /// `path` is a file (nw-651 review).
 pub(crate) const IGNORE_FILE_ROW_PREFIX: &str = "ignore file `";
 
+/// Start of every symlink skip row's reason, so the sidecar merge can tell a
+/// symlink row from a walk row (a linked directory resolves as a directory).
+pub(crate) const SYMLINK_ROW_PREFIX: &str = "symlink to a ";
+
+/// A symlink the walk did not follow. Only a VAULT discloses it, and only
+/// when it could hold a note: a link to a directory, or a Markdown-named link
+/// to a file. A code repo keeps its long-standing silent skip (links there are
+/// routine: toolchain shims, vendored aliases), and a dangling or
+/// non-Markdown link could never have been a note. `Unsupported` is a policy
+/// code, so it neither degrades coverage nor blocks link derivation.
+fn disclose_symlink(
+    pruned: &crate::content_reader::SkippedDir,
+    caller: SkipDirCaller,
+) -> Option<SkippedFile> {
+    use crate::content_reader::{SYMLINK_TARGET_DIR, SYMLINK_TARGET_FILE};
+    if matches!(caller, SkipDirCaller::Repo) {
+        return None;
+    }
+    let target = pruned.detail.as_deref()?;
+    let could_hold_a_note = target == SYMLINK_TARGET_DIR
+        || (target == SYMLINK_TARGET_FILE
+            && nestweaver_parser::is_markdown(Path::new(&pruned.path)));
+    could_hold_a_note.then(|| {
+        SkippedFile::new(
+            pruned.path.clone(),
+            SkipReasonCode::Unsupported,
+            format!(
+                "{SYMLINK_ROW_PREFIX}{target} is not followed, so nothing through it is indexed; \
+                 symlinks can point outside the vault or duplicate notes under a second \
+                 path. Move or copy the {target} into the vault to index it"
+            ),
+        )
+    })
+}
+
 /// Turn one recorded prune into the `SkippedFile` row the coverage gate reads,
 /// or `None` when that prune is deliberately not disclosed.
 ///
@@ -2237,37 +2272,6 @@ pub(crate) const IGNORE_FILE_ROW_PREFIX: &str = "ignore file `";
 /// second, private copy of this match would be exactly the drifted twin nw-217
 /// describes. `caller` is what lets the two sites share the builder without
 /// sharing a remedy that is only true for one of them — see [`SkipDirCaller`].
-/// A symlink the walk did not follow. Only a VAULT discloses it, and only
-/// when it could hold a note: a link to a directory, or a Markdown-named link
-/// to a file. A code repo keeps its long-standing silent skip (links there are
-/// routine: toolchain shims, vendored aliases), and a dangling or
-/// non-Markdown link could never have been a note. `Unsupported` is a policy
-/// code, so it neither degrades coverage nor blocks link derivation.
-fn disclose_symlink(
-    pruned: &crate::content_reader::SkippedDir,
-    caller: SkipDirCaller,
-) -> Option<SkippedFile> {
-    use crate::content_reader::{SYMLINK_TARGET_DIR, SYMLINK_TARGET_FILE};
-    if matches!(caller, SkipDirCaller::Repo) {
-        return None;
-    }
-    let target = pruned.detail.as_deref()?;
-    let could_hold_a_note = target == SYMLINK_TARGET_DIR
-        || (target == SYMLINK_TARGET_FILE
-            && nestweaver_parser::is_markdown(Path::new(&pruned.path)));
-    could_hold_a_note.then(|| {
-        SkippedFile::new(
-            pruned.path.clone(),
-            SkipReasonCode::Unsupported,
-            format!(
-                "symlink to a {target} is not followed, so nothing through it is indexed; \
-                 symlinks can point outside the vault or duplicate notes under a second \
-                 path. Move or copy the {target} into the vault to index it"
-            ),
-        )
-    })
-}
-
 pub(crate) fn disclose_pruned_dir(
     pruned: crate::content_reader::SkippedDir,
     caller: SkipDirCaller,
