@@ -2899,6 +2899,72 @@ fn renaming_a_registered_vault_to_a_name_another_root_holds_is_refused() {
     );
 }
 
+/// Without `--name`, `brain refresh` and `brain watch` keep a vault's
+/// registered name. They used to default it to the directory name, which for
+/// `b/notes` registered as `other` collided with `a/notes` and was refused.
+#[test]
+fn refresh_and_watch_without_a_name_keep_the_registered_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("a").join("notes");
+    let second = dir.path().join("b").join("notes");
+    for root in [&first, &second] {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join("Orphan.md"), "# Orphan\n\nbody\n").unwrap();
+    }
+    let db_path = dir.path().join("brain.lbug");
+    let brain = |args: &[&str], timeout: u64| {
+        nestweaver_cmd()
+            .arg("brain")
+            .args(args)
+            .arg("--db")
+            .arg(&db_path)
+            .timeout(std::time::Duration::from_secs(timeout))
+            .output()
+            .unwrap()
+    };
+    let path = |p: &std::path::Path| p.to_string_lossy().to_string();
+    assert!(brain(&["add", &path(&first)], 120).status.success());
+    assert!(
+        brain(&["add", &path(&second), "--name", "other"], 120)
+            .status
+            .success()
+    );
+    let names = || {
+        let list = brain(&["list", "--json"], 120);
+        let vaults: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+        let mut names: Vec<String> = vaults
+            .as_array()
+            .or_else(|| vaults["vaults"].as_array())
+            .unwrap()
+            .iter()
+            .map(|v| v["name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        names
+    };
+
+    let refresh = brain(&["refresh", &path(&second)], 120);
+    assert_eq!(
+        refresh.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&refresh.stderr)
+    );
+    assert_eq!(names(), vec!["notes".to_string(), "other".to_string()]);
+
+    // `brain watch` runs until stopped: it must still be running when the
+    // timeout kills it, rather than exit refused.
+    let watch = brain(&["watch", &path(&second)], 8);
+    let stderr = String::from_utf8_lossy(&watch.stderr);
+    assert!(
+        watch.status.code().is_none_or(|code| code == 0),
+        "watch must not be refused: {:?} {stderr}",
+        watch.status
+    );
+    assert!(!stderr.contains("already indexed"), "{stderr}");
+    assert_eq!(names(), vec!["notes".to_string(), "other".to_string()]);
+}
+
 fn index_vault_notes(vault_dir: &std::path::Path, db_path: &std::path::Path) {
     nestweaver_cmd()
         .args(["brain", "add"])

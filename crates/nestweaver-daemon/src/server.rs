@@ -6850,7 +6850,13 @@ impl NestWeaverDaemon for DaemonService {
         let owner_pid = peer_owner_pid(&request);
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
-        let vault_name = req.vault_name.clone();
+        // A defaulted name is resolved by the engine: a registered vault
+        // keeps its stored name, a new one takes its directory's.
+        let vault_name = if req.vault_name_defaulted {
+            String::new()
+        } else {
+            req.vault_name.clone()
+        };
         let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         let extra_patterns = req.extra_ignore_patterns.clone();
         let force = req.force;
@@ -8155,7 +8161,13 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
-        let vault_name = req.vault_name.clone();
+        // A defaulted name is resolved by the engine: a registered vault
+        // keeps its stored name, a new one takes its directory's.
+        let vault_name = if req.vault_name_defaulted {
+            String::new()
+        } else {
+            req.vault_name.clone()
+        };
         let extra_patterns = req.extra_ignore_patterns.clone();
         let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         let note_limits = resolve_request_note_limits(req.max_note_bytes, &self.state)?;
@@ -8396,7 +8408,13 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
-        let vault_name = req.vault_name.clone();
+        // A defaulted name is resolved by the engine: a registered vault
+        // keeps its stored name, a new one takes its directory's.
+        let vault_name = if req.vault_name_defaulted {
+            String::new()
+        } else {
+            req.vault_name.clone()
+        };
         let extra_patterns = req.extra_ignore_patterns.clone();
         let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         let note_limits = resolve_request_note_limits(req.max_note_bytes, &self.state)?;
@@ -18474,6 +18492,46 @@ repos = ["alpha"]
             (55..=60).contains(&delay),
             "second failure backs off ~60s: {delay}"
         );
+    }
+
+    /// A request whose name is only the directory default keeps a registered
+    /// vault's stored name; an explicit name still renames it.
+    #[tokio::test]
+    async fn a_defaulted_vault_name_keeps_the_registered_name() {
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\n").unwrap();
+        let index = |name: &str, defaulted: bool| {
+            let service = DaemonService::new(state.clone());
+            let mut request = Request::new(IndexVaultRequest {
+                vault_path: root.display().to_string(),
+                vault_name: name.to_string(),
+                vault_name_defaulted: defaulted,
+                ..Default::default()
+            });
+            request.extensions_mut().insert(crate::auth::IsAdmin(true));
+            async move {
+                let mut rx = service
+                    .index_vault(request)
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .into_inner();
+                let mut last = None;
+                while let Some(event) = rx.recv().await {
+                    last = Some(event.unwrap());
+                }
+                assert_eq!(last.unwrap().phase, Phase::Done as i32);
+            }
+        };
+        let name = || state.store.list_vaults(None).unwrap()[0].name.clone();
+        index("other", false).await;
+        assert_eq!(name(), "other");
+        index("dirname", true).await;
+        assert_eq!(name(), "other", "a defaulted name is not a rename");
+        index("renamed", false).await;
+        assert_eq!(name(), "renamed", "an explicit name still renames");
     }
 
     /// Links are stored with the confidence the resolver gave them at index
@@ -29237,6 +29295,7 @@ external_model = "unavailable-test-model"
                 extra_ignore_patterns: Vec::new(),
                 force: false,
                 max_note_bytes: 0,
+                vault_name_defaulted: false,
             }))
             .await
             .expect("WatchVault RPC")
@@ -31509,6 +31568,7 @@ mod watcher_e2e_tests {
             extra_ignore_patterns: Vec::new(),
             force,
             max_note_bytes: 0,
+            vault_name_defaulted: false,
         };
 
         let v1 = client

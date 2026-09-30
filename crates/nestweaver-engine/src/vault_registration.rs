@@ -156,6 +156,36 @@ pub(crate) fn record_for_store(
     }
 }
 
+/// The name a vault publication uses when the caller passed `requested`.
+///
+/// An EMPTY `requested` means the caller gave no `--name`: a vault already
+/// registered at this uid keeps its stored name, and a new one is named after
+/// its directory. Only an explicit name is a rename. Defaulting to the
+/// directory name on every refresh used to rename a vault registered with a
+/// custom `--name`, and so trip the duplicate-name guard below.
+pub fn effective_vault_name(
+    store: &nestweaver_store::GraphStore,
+    uid: &str,
+    requested: &str,
+    root: &Path,
+) -> String {
+    if !requested.is_empty() {
+        return requested.to_string();
+    }
+    if let Ok(vault) = store.lookup_vault(uid) {
+        return vault.name;
+    }
+    default_vault_name(root)
+}
+
+/// The name a new vault takes when none is given: its directory's name.
+pub fn default_vault_name(root: &Path) -> String {
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("vault")
+        .to_string()
+}
+
 /// nw-608: refuse to register a NEW vault under a name another vault at a
 /// different root already holds.
 ///

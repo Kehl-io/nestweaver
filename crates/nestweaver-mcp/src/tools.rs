@@ -9768,16 +9768,13 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
         // Detection priority: Obsidian vault > markdown folder > git repo.
         if has_obsidian || has_any_md {
             let kind = if has_obsidian { "obsidian" } else { "markdown" };
+            // Empty when `name` is absent: the indexer then keeps a registered
+            // vault's stored name, and names a new one after its directory.
             let name = args
                 .get("name")
                 .and_then(|v| v.as_str())
                 .map(String::from)
-                .unwrap_or_else(|| {
-                    path.file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("vault")
-                        .to_string()
-                });
+                .unwrap_or_default();
             // We need a db_path for index_markdown_directory; but the server
             // already opened one. Reuse it indirectly: call the in-memory
             // primitive? No — that doesn't persist. Reopen the same DB by
@@ -16681,6 +16678,8 @@ fn dispatch_add_source_via_daemon(
             let req = tonic::Request::new(nestweaver_proto::IndexVaultRequest {
                 vault_path: path.clone(),
                 vault_name: vault_name.unwrap_or_default(),
+                // Without `name`, a registered vault keeps its stored name.
+                vault_name_defaulted: name_arg.is_none(),
                 extra_ignore_patterns: vec![],
                 instance_id: instance_id.clone(),
                 max_note_bytes: current_instance_config()

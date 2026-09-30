@@ -2172,6 +2172,8 @@ fn index_markdown_since_with_reader_mode(
     let vault_root = reader.root();
     let root_str = vault_root.to_string_lossy().into_owned();
     let v_uid = vault_uid(instance_id, &root_str);
+    let vault_name =
+        &crate::vault_registration::effective_vault_name(store, &v_uid, vault_name, vault_root);
     crate::vault_registration::refuse_duplicate_vault_name(store, &v_uid, vault_name, vault_root)?;
 
     let existing_notes = store
@@ -3434,6 +3436,8 @@ where
     let vault_root = reader.root();
     let root_str = vault_root.to_string_lossy().into_owned();
     let v_uid = vault_uid(instance_id, &root_str);
+    let vault_name =
+        &crate::vault_registration::effective_vault_name(store, &v_uid, vault_name, vault_root);
     // nw-608: before any scan work. The server-mode route names a vault by its
     // repo URL and roots it at a bare clone, so it is not a local registration.
     if record_repo_sha.is_none() {
@@ -9594,5 +9598,51 @@ mod duplicate_vault_name_tests {
         .unwrap();
         let unique = index_markdown_directory(&copy, &db, "default", "r4-copy").unwrap();
         assert_eq!(unique.notes_count, 1);
+    }
+
+    /// No name (an empty one) is not a rename. Both roots here are named
+    /// `vault`, so defaulting a refresh of the `other`-named copy to its
+    /// directory name collided with the original and the refresh was refused.
+    /// Without a name a registered vault keeps its own; a new one takes its
+    /// directory's.
+    #[test]
+    fn a_refresh_without_a_name_keeps_the_registered_name_on_both_routes() {
+        let original_dir = tempfile::tempdir().unwrap();
+        let copy_dir = tempfile::tempdir().unwrap();
+        let original = vault_at(original_dir.path(), "original");
+        let copy = vault_at(copy_dir.path(), "copy");
+        let db = original_dir.path().join("brain.lbug");
+        let first = index_markdown_directory(&original, &db, "default", "").unwrap();
+        assert_eq!(
+            first.vault_name, "vault",
+            "a new vault takes its directory's name"
+        );
+        index_markdown_directory(&copy, &db, "default", "other").unwrap();
+
+        let full = index_markdown_directory(&copy, &db, "default", "").unwrap();
+        assert_eq!(full.vault_name, "other");
+        index_markdown_directory_since(&copy, &db, "default", "", std::time::UNIX_EPOCH).unwrap();
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let mut names: Vec<String> = store
+            .list_vaults(None)
+            .unwrap()
+            .into_iter()
+            .map(|vault| vault.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["other".to_string(), "vault".to_string()]);
+        drop(store);
+
+        // Counterweight: an EXPLICIT name equal to the directory's is still a
+        // rename onto the original's name, and is refused.
+        let error = index_markdown_directory(&copy, &db, "default", "vault")
+            .err()
+            .expect("an explicit rename onto another root's name is refused");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<crate::vault_registration::DuplicateVaultName>()),
+            "{error:#}"
+        );
     }
 }

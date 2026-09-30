@@ -54,12 +54,21 @@ pub(crate) fn run_brain(
             let instance_id_owned =
                 resolve_instance_id_for_db(instance, config.as_deref(), &db_path)?;
             let instance_id = instance_id_owned.as_str();
+            // Only an explicit `--name` renames: without one a registered vault
+            // keeps its stored name, so the engine is asked with an empty name
+            // and the daemon is told the name was defaulted.
+            let name_given = name.is_some();
             let vault_name = name.unwrap_or_else(|| {
                 path.file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("vault")
                     .to_string()
             });
+            let requested_name = if name_given {
+                vault_name.clone()
+            } else {
+                String::new()
+            };
 
             if !path.exists() {
                 eprintln!("Error: path does not exist: {}", path.display());
@@ -99,6 +108,7 @@ pub(crate) fn run_brain(
                 let req = nestweaver_proto::IndexVaultRequest {
                     vault_path: vault_abs.to_string_lossy().to_string(),
                     vault_name: vault_name.clone(),
+                    vault_name_defaulted: !name_given,
                     extra_ignore_patterns: extra_patterns.clone(),
                     instance_id: instance_id.to_string(),
                     max_note_bytes: rpc_max_note_bytes(config.as_deref(), note_limits),
@@ -159,7 +169,7 @@ pub(crate) fn run_brain(
                 &path,
                 &db_path,
                 instance_id,
-                &vault_name,
+                &requested_name,
                 &extra_patterns,
                 note_limits,
                 &write_lease,
@@ -1277,12 +1287,21 @@ pub(crate) fn run_brain(
                 );
                 return Ok((EXIT_ERROR, None));
             }
+            // Only an explicit `--name` renames: without one a registered vault
+            // keeps its stored name, so the engine is asked with an empty name
+            // and the daemon is told the name was defaulted.
+            let name_given = name.is_some();
             let vault_name = name.unwrap_or_else(|| {
                 path.file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("vault")
                     .to_string()
             });
+            let requested_name = if name_given {
+                vault_name.clone()
+            } else {
+                String::new()
+            };
             // Resolve and validate the same instance precedence as brain add,
             // brain refresh, top-level index, and top-level watch.
             let instance_id = resolve_instance_id_for_db(instance, config.as_deref(), &db_path)?;
@@ -1334,6 +1353,7 @@ pub(crate) fn run_brain(
                     force,
                     vault_path: vault_abs.to_string_lossy().to_string(),
                     vault_name: vault_name.clone(),
+                    vault_name_defaulted: !name_given,
                     instance_id: instance_id.clone(),
                     extra_ignore_patterns: extra_patterns.clone(),
                     max_note_bytes: rpc_max_note_bytes(config.as_deref(), note_limits),
@@ -1381,7 +1401,7 @@ pub(crate) fn run_brain(
             let tantivy_sidecar = tantivy_sidecar_path_for(&db_path);
             let manifests_path = nestweaver_engine::manifest_cache_path(&db_path);
             let wiki_instance_id = instance_id.clone();
-            let watcher = BrainWatcher::new(&db_path, &path, instance_id, vault_name)
+            let watcher = BrainWatcher::new(&db_path, &path, instance_id, requested_name)
                 .with_tantivy_index(&tantivy_sidecar)
                 .with_manifests_path(&manifests_path)
                 .with_extra_ignore_patterns(&extra_patterns)
@@ -1524,12 +1544,21 @@ pub(crate) fn run_brain(
                 );
                 return Ok((EXIT_ERROR, None));
             }
+            // Only an explicit `--name` renames: without one a registered vault
+            // keeps its stored name, so the engine is asked with an empty name
+            // and the daemon is told the name was defaulted.
+            let name_given = name.is_some();
             let vault_name = name.unwrap_or_else(|| {
                 path.file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("vault")
                     .to_string()
             });
+            let requested_name = if name_given {
+                vault_name.clone()
+            } else {
+                String::new()
+            };
             let extra_patterns = parse_ignore_flag(&ignore);
             let canonical = abs_for_daemon(&path);
             let note_limits = note_limits_from_config(config.as_deref())?;
@@ -1646,6 +1675,7 @@ pub(crate) fn run_brain(
                     let req = nestweaver_proto::RefreshVaultSinceRequest {
                         vault_path: canonical.to_string_lossy().to_string(),
                         vault_name: vault_name.clone(),
+                        vault_name_defaulted: !name_given,
                         extra_ignore_patterns: extra_patterns.clone(),
                         instance_id: instance_id.to_string(),
                         since_unix_seconds,
@@ -1688,6 +1718,7 @@ pub(crate) fn run_brain(
                         // resolve a client-relative vault path against the wrong directory.
                         vault_path: canonical.to_string_lossy().to_string(),
                         vault_name: vault_name.clone(),
+                        vault_name_defaulted: !name_given,
                         extra_ignore_patterns: extra_patterns.clone(),
                         instance_id: instance_id.to_string(),
                         max_note_bytes: rpc_max_note_bytes(config.as_deref(), note_limits),
@@ -1749,7 +1780,7 @@ pub(crate) fn run_brain(
                         &path,
                         &db_path,
                         &instance_id,
-                        &vault_name,
+                        &requested_name,
                         since_time,
                         &extra_patterns,
                         note_limits,
@@ -1820,7 +1851,7 @@ pub(crate) fn run_brain(
                         &path,
                         &db_path,
                         &instance_id,
-                        &vault_name,
+                        &requested_name,
                         &extra_patterns,
                         note_limits,
                         &write_lease,
