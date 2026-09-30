@@ -111,7 +111,6 @@ use nestweaver_engine::{
     get_last_indexed_at,
     index_markdown_directory_since_with_ignore_and_write_lease_and_note_limits,
     index_markdown_directory_with_ignore_and_deletion_count_and_write_lease_and_note_limits,
-    index_markdown_directory_with_ignore_and_note_limits,
     index_markdown_directory_with_ignore_and_write_lease_and_note_limits, list_repos,
     list_services, load_alias_sidecar, load_clusters, load_clusters_with_generation, lookup_symbol,
     record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
@@ -30035,7 +30034,7 @@ fn run_publication_rebuild(
                                 format!("indexing vault {}", vault.name)
                             },
                         )?;
-                        let indexed = index_markdown_directory_with_ignore_and_note_limits(
+                        let refreshed = nestweaver_engine::index_md::index_markdown_directory_with_ignore_and_deletion_count_and_note_limits(
                             Path::new(&vault.root_path),
                             &target_db,
                             &vault.instance_id,
@@ -30046,13 +30045,18 @@ fn run_publication_rebuild(
                         // The daemon admits a vault's Markdown links only
                         // with a current derivation record; without one its
                         // first start re-derives (fully refreshes) the vault.
-                        nestweaver_engine::markdown_derivation::stamp_rebuilt_vault(
+                        if !nestweaver_engine::markdown_derivation::stamp_rebuilt_vault(
                             &target_db,
-                            &indexed,
+                            &refreshed,
                             &config.instance_id,
                             &[],
                             config.indexing.note_limits().max_note_bytes(),
-                        )?;
+                        )? {
+                            eprintln!(
+                                "Vault {} was not indexed completely; the daemon re-derives it after the switch.",
+                                vault.name
+                            );
+                        }
                         if let Some(before) = staged_before {
                             invalidate_changed_embeddings(&target_db, "vault", &vault.uid, &before)?;
                         }
