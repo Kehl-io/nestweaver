@@ -5,7 +5,7 @@
 
 ### ⚠ BREAKING CHANGES
 
-* **store:** Rebuild required. This release updates LadybugDB to 0.21.0, which changes how text keys are hashed. The on-disk format marker did not change, so NestWeaver now refuses to open databases built by earlier versions and prints `nestweaver::db_rebuild_required` with the exact command. Stop the daemon, run `nestweaver backup save <file>`, then `nestweaver publication rebuild --config <instance.toml>`. The old database stays in place until the new one validates. To roll back, reinstall the previous version and restore your backup. Do not open a rebuilt database with an older NestWeaver.
+* **store:** Rebuild required. This release updates LadybugDB to 0.21.1, which changes how text keys are hashed. The on-disk format marker did not change, so NestWeaver now refuses to open databases built by earlier versions and prints `nestweaver::db_rebuild_required` with the exact command. Stop the daemon, run `nestweaver backup save <file>`, then `nestweaver publication rebuild --config <instance.toml>`. The old database stays in place until the new one validates. To roll back, reinstall the previous version and restore your backup. Do not open a rebuilt database with an older NestWeaver.
 
 ### Features
 
