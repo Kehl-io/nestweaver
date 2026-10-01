@@ -555,7 +555,7 @@ fn default_embedding_cache_dir() -> String {
             .ok()
     };
     dirs::cache_dir()
-        .and_then(&utf8_model_dir)
+        .and_then(utf8_model_dir)
         .or_else(|| dirs::home_dir().and_then(|home| utf8_model_dir(home.join(".cache"))))
         .unwrap_or_else(|| FALLBACK_EMBEDDING_CACHE_DIR.to_string())
 }

@@ -2534,10 +2534,15 @@ impl GraphStore {
                 }
             }
         }
-        self.graph_generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(1)
-            })
+        // `fetch_update` is deprecated in favour of `try_update` from Rust
+        // 1.99, which older supported toolchains do not have.
+        #[allow(deprecated)]
+        let previous =
+            self.graph_generation
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current.checked_add(1)
+                });
+        previous
             .map(|previous| previous + 1)
             .map_err(|_| StoreError::Query("graph generation exhausted".to_string()))
     }

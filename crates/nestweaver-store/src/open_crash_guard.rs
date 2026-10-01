@@ -68,6 +68,9 @@ mod imp {
     const GUARDED_SIGNALS: [libc::c_int; 2] = [libc::SIGSEGV, libc::SIGBUS];
 
     extern "C" fn handler(signal: libc::c_int) {
+        // A daemon that armed crash recording keeps its record whichever
+        // handler happens to be installed when the fault arrives.
+        crate::daemon_exit::record_fatal_signal(signal);
         if IN_FLIGHT.load(Ordering::SeqCst) == 0 {
             // Not ours. Restore the default disposition and re-raise, so a
             // segfault anywhere else still produces the crash report it would
@@ -140,10 +143,10 @@ mod imp {
                 // the open would swallow the attribution of unrelated crashes
                 // — the handler's own zero-in-flight arm covers the race, but
                 // restoring is cheaper and clearer than relying on it.
+                // "Back" is the daemon's crash recorder when one is armed,
+                // and the default action otherwise.
                 for signal in GUARDED_SIGNALS {
-                    unsafe {
-                        libc::signal(signal, libc::SIG_DFL);
-                    }
+                    crate::daemon_exit::restore_signal(signal);
                 }
             }
         }
