@@ -1237,6 +1237,47 @@ A restore legitimately holds the lease for its whole duration. Killing the
 holder in that case is the corruption the message is warning about, not the fix
 for it.
 
+### The daemon crashed while answering
+
+A command that ends with `nestweaver::daemon_engine_crashed` means the daemon
+was killed by a fatal signal (SIGSEGV, SIGBUS, SIGABRT or SIGILL) while serving
+that request. The usual cause is a corrupt database: under LadybugDB 0.21 a file
+with damaged index pages still opens, and the engine faults when a later lookup
+reads them. `status`, `search` and `context` can keep working on the same
+database while `impact <uid>` crashes it every time.
+
+```bash
+nestweaver brain status          # Warning: the previous daemon (pid …) was killed by SIGSEGV …
+nestweaver brain status --json   # warnings[]: kind "daemon_unclean_exit", exit, signal, at_unix, pid, count
+```
+
+Recover the database; do not retry the request, which will crash the daemon
+again:
+
+```bash
+nestweaver backup restore <archive>
+# or, with an instance config, rebuild into a new database beside this one:
+nestweaver publication rebuild --config <instance.toml>
+```
+
+How to read the warning:
+
+- `exit: "engine_crashed"` with a `signal` means the daemon's own fatal-signal
+  handler recorded the crash. Treat the database as corrupt.
+- `exit: "exited_unexpectedly"` with `signal: null` means the daemon vanished
+  without shutting down and without a recorded signal: `kill -9`,
+  `daemon stop --force`, the out-of-memory killer or a power loss. Nothing is
+  claimed about the storage engine.
+- `count` is the number of unclean exits since the last clean shutdown.
+- `daemon stop`, SIGTERM and an idle exit are clean and leave no warning.
+- The warning clears when a daemon next shuts down cleanly. A restore or rebuild
+  does not clear it by itself; `nestweaver daemon stop` afterwards does.
+
+The record is two small files beside the daemon log
+(`~/.local/state/nestweaver/<instance>/daemon.running` and `daemon.crash`).
+Recording never touches the database and never restarts the daemon. The
+operating system's own crash report is still written.
+
 ### Client can't connect
 
 ```bash
