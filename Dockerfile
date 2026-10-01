@@ -2,11 +2,14 @@
 FROM rust:1.96-trixie AS builder
 WORKDIR /build
 RUN apt-get update && apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler && rm -rf /var/lib/apt/lists/*
-COPY . .
 # The lbug crate builds from a LadybugDB checkout until a published crate can
-# build its own sources; the script pins and verifies the tag.
+# build its own sources; the script pins and verifies the tag. Only its inputs
+# are copied first, so a source change does not re-clone LadybugDB.
+COPY scripts/fetch-lbug-source.sh scripts/fetch-lbug-source.sh
+COPY Cargo.lock Cargo.lock
 RUN scripts/fetch-lbug-source.sh /opt/ladybug
 ENV LBUG_SOURCE_DIR=/opt/ladybug
+COPY . .
 RUN cargo build --locked --release --bin nestweaver
 
 # Runtime stage
