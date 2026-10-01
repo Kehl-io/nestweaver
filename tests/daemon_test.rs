@@ -7847,3 +7847,459 @@ fn generate_guide_with_config_never_reaches_a_configured_upstream() {
         );
     }
 }
+
+// ── Disclosure of an unclean daemon exit ─────────────────────────────────────
+//
+// A daemon killed by a fatal signal used to leave the client with a bare
+// transport error and the respawned daemon reporting a healthy status. These
+// tests drive the debug-only `NESTWEAVER_TEST_SEGV_ON_TOOL` seam, which raises
+// SIGSEGV inside the daemon while it serves the named tool, so nothing here
+// depends on a real storage-engine fault.
+
+/// A scratch home, an indexed database and the commands to drive its daemon
+/// in isolation from every other daemon on the machine.
+struct CrashScratch {
+    _dir: tempfile::TempDir,
+    home: std::path::PathBuf,
+    db: std::path::PathBuf,
+}
+
+impl CrashScratch {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db = dir.path().join("db").join("test.lbug");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        write_test_repo(&repo);
+        create_db(&repo, &db);
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        Self {
+            _dir: dir,
+            home,
+            db,
+        }
+    }
+
+    /// A daemon-routed command. The idle timeout is long, so a daemon these
+    /// tests respawn cannot idle out (a clean exit, which clears the record)
+    /// between two assertions.
+    fn cmd(&self, args: &[&str]) -> Command {
+        let mut cmd = daemon_cmd();
+        isolate_nestweaver_cmd(&mut cmd, &self.home);
+        cmd.env("NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS", "300");
+        cmd.env_remove("NESTWEAVER_TEST_SEGV_ON_TOOL");
+        cmd.args(args).arg("--db").arg(&self.db);
+        cmd
+    }
+
+    fn daemon(&self, action: &str) -> Command {
+        let mut cmd = daemon_action_cmd(&self.db, action);
+        isolate_nestweaver_cmd(&mut cmd, &self.home);
+        cmd.env("NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS", "300");
+        cmd.env_remove("NESTWEAVER_TEST_SEGV_ON_TOOL");
+        cmd
+    }
+
+    fn guard(&self) -> IsolatedDaemonGuard {
+        IsolatedDaemonGuard::new(&self.db, &self.home)
+    }
+
+    fn daemon_pid(&self) -> Option<i32> {
+        std::fs::read_to_string(isolated_pidfile(&self.home, &self.db))
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+    }
+
+    /// The `daemon_unclean_exit` entry of `brain status --json`, if present.
+    fn unclean_exit_warning(&self) -> Option<serde_json::Value> {
+        let output = self.cmd(&["brain", "status", "--json"]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "brain status must stay exit 0: {output:?}"
+        );
+        let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        status["warnings"]
+            .as_array()
+            .expect("brain status --json always carries `warnings`")
+            .iter()
+            .find(|warning| warning["kind"] == "daemon_unclean_exit")
+            .cloned()
+    }
+
+    fn status_text_stderr(&self) -> String {
+        let output = self.cmd(&["brain", "status"]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "brain status must stay exit 0: {output:?}"
+        );
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    /// Start a daemon that will die on SIGSEGV the moment it serves `impact`,
+    /// then run `impact` against it and return that command's output.
+    #[cfg(debug_assertions)]
+    fn crash_daemon_with_impact(&self) -> std::process::Output {
+        self.daemon("start")
+            .env("NESTWEAVER_TEST_SEGV_ON_TOOL", "brain_impact")
+            .assert()
+            .success();
+        let pid = self.daemon_pid().expect("the daemon wrote its pidfile");
+        let output = self.cmd(&["impact", "greet"]).output().unwrap();
+        assert!(
+            wait_until(Duration::from_secs(10), || unsafe { libc::kill(pid, 0) }
+                != 0),
+            "the seam must have killed daemon {pid}"
+        );
+        output
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_daemon_killed_by_a_signal_mid_request_is_named_not_reported_as_transport() {
+    let scratch = CrashScratch::new();
+    let _guard = scratch.guard();
+
+    let output = scratch.crash_daemon_with_impact();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("nestweaver::daemon_engine_crashed"),
+        "the crash must be a named diagnostic: {stderr}"
+    );
+    assert!(
+        stderr.contains("storage engine crashed while answering") && stderr.contains("SIGSEGV"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("nestweaver backup restore") && stderr.contains("nestweaver index --repo"),
+        "the diagnostic must carry both ways out: {stderr}"
+    );
+    assert!(
+        !stderr.contains("transport error") && !stderr.contains("broken pipe"),
+        "the bare transport error must not reach the user: {stderr}"
+    );
+
+    // The respawned daemon says what it replaced, in text and in JSON.
+    let text = scratch.status_text_stderr();
+    assert!(
+        text.contains("was killed by SIGSEGV") && text.contains("storage engine crashed"),
+        "{text}"
+    );
+    assert!(text.contains("nestweaver backup restore"), "{text}");
+    assert!(
+        text.contains("nestweaver publication rebuild"),
+        "the warning must name the rebuild too: {text}"
+    );
+    let warning = scratch
+        .unclean_exit_warning()
+        .expect("brain status --json must carry the unclean-exit warning");
+    assert_eq!(warning["exit"], "engine_crashed", "{warning}");
+    assert_eq!(warning["signal"], "SIGSEGV", "{warning}");
+    assert_eq!(warning["count"], 1, "{warning}");
+    assert!(warning["at_unix"].as_u64().unwrap() > 1_600_000_000);
+    assert!(warning["pid"].as_u64().unwrap() > 0);
+}
+
+/// The clearing rule: the record is kept until a daemon shuts down cleanly.
+/// `daemon restart` is a clean shutdown whose state directory survives (the
+/// client holds the spawnlock across it), so the successor reporting nothing
+/// proves the shutdown cleared the record rather than a directory sweep.
+#[cfg(debug_assertions)]
+#[test]
+fn a_clean_daemon_cycle_clears_the_crash_warning() {
+    let scratch = CrashScratch::new();
+    let _guard = scratch.guard();
+
+    scratch.crash_daemon_with_impact();
+    assert!(
+        scratch.unclean_exit_warning().is_some(),
+        "precondition: the crash is being reported"
+    );
+    // Still reported on a second look: one status read does not consume it.
+    assert!(scratch.unclean_exit_warning().is_some());
+
+    scratch.daemon("restart").assert().success();
+    assert_eq!(
+        scratch.unclean_exit_warning(),
+        None,
+        "a daemon that shut down cleanly must take the warning with it"
+    );
+    assert!(
+        !scratch.status_text_stderr().contains("previous daemon"),
+        "and the text status must be quiet too"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_second_crash_is_counted() {
+    let scratch = CrashScratch::new();
+    let _guard = scratch.guard();
+
+    scratch.crash_daemon_with_impact();
+    // No clean shutdown in between: nothing is running, so `start` arms a
+    // fresh daemon over the first crash's record.
+    scratch.crash_daemon_with_impact();
+    let warning = scratch.unclean_exit_warning().expect("still reported");
+    assert_eq!(warning["count"], 2, "{warning}");
+    assert_eq!(warning["exit"], "engine_crashed", "{warning}");
+}
+
+#[test]
+fn a_deliberate_stop_and_an_idle_exit_leave_no_warning() {
+    let scratch = CrashScratch::new();
+    let _guard = scratch.guard();
+
+    scratch.daemon("start").assert().success();
+    // A restart keeps the state directory (the client holds the spawnlock
+    // across it), so the successor would find a sentinel the outgoing daemon
+    // failed to remove.
+    scratch.daemon("restart").assert().success();
+    assert_eq!(
+        scratch.unclean_exit_warning(),
+        None,
+        "`daemon restart` is a clean shutdown"
+    );
+    scratch.daemon("stop").assert().success();
+    assert_eq!(
+        scratch.unclean_exit_warning(),
+        None,
+        "`daemon stop` is a clean shutdown"
+    );
+    scratch.daemon("stop").assert().success();
+
+    // An idle exit: autostart with a short idle window and wait it out.
+    scratch
+        .cmd(&["brain", "status"])
+        .env("NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS", "2")
+        .assert()
+        .success();
+    let pid = scratch.daemon_pid().expect("autostart wrote a pidfile");
+    assert!(
+        wait_until(Duration::from_secs(30), || unsafe { libc::kill(pid, 0) }
+            != 0),
+        "the daemon must idle out"
+    );
+    assert_eq!(
+        scratch.unclean_exit_warning(),
+        None,
+        "an idle exit is a clean shutdown"
+    );
+}
+
+#[test]
+fn a_sigkilled_daemon_is_reported_as_an_unexpected_exit_not_an_engine_crash() {
+    let scratch = CrashScratch::new();
+    let _guard = scratch.guard();
+
+    scratch.daemon("start").assert().success();
+    let pid = scratch.daemon_pid().expect("the daemon wrote its pidfile");
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    assert!(
+        wait_until(Duration::from_secs(10), || unsafe { libc::kill(pid, 0) }
+            != 0),
+        "SIGKILL must end daemon {pid}"
+    );
+
+    let warning = scratch
+        .unclean_exit_warning()
+        .expect("a killed daemon must be disclosed");
+    assert_eq!(warning["exit"], "exited_unexpectedly", "{warning}");
+    assert_eq!(warning["signal"], serde_json::Value::Null, "{warning}");
+    assert_eq!(warning["pid"], pid, "{warning}");
+    let text = scratch.status_text_stderr();
+    assert!(text.contains("exited unexpectedly"), "{text}");
+    assert!(
+        !text.contains("engine crashed"),
+        "an outside kill must not be blamed on the storage engine: {text}"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn an_mcp_tool_call_that_crashes_the_daemon_returns_an_error_result() {
+    let scratch = CrashScratch::new();
+    let _guard = scratch.guard();
+    // The MCP session autostarts the daemon, which inherits the seam.
+    let mut command = StdCommand::new(bin_path());
+    command
+        .args(["mcp", "--db"])
+        .arg(&scratch.db)
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .env_remove("NESTWEAVER_UPSTREAM")
+        .env("HOME", &scratch.home)
+        .env("XDG_CONFIG_HOME", scratch.home.join("config"))
+        .env("XDG_CACHE_HOME", scratch.home.join("cache"))
+        .env("XDG_DATA_HOME", scratch.home.join("data"))
+        .env("XDG_STATE_HOME", scratch.home.join("state"))
+        .env("XDG_RUNTIME_DIR", scratch.home.join("runtime"))
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", scratch.home.join("sock"))
+        .env("NESTWEAVER_TEST_SEGV_ON_TOOL", "brain_impact");
+    #[cfg(not(target_os = "macos"))]
+    command.env("NESTWEAVER_DAEMON_FORK", "1");
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn nestweaver mcp");
+    let input = [
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05"}}),
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "brain_impact", "arguments": {"symbol": "greet"}}}),
+        // Answered only if the session survived the daemon's death.
+        serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}),
+    ]
+    .iter()
+    .map(|request| format!("{request}\n"))
+    .collect::<String>();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("read mcp output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let frames: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let frame = |id: u64| {
+        frames
+            .iter()
+            .find(|frame| frame["id"] == id)
+            .unwrap_or_else(|| panic!("no response for request {id}: {stdout}"))
+    };
+
+    let result = &frame(2)["result"];
+    assert_eq!(result["isError"], true, "{stdout}");
+    let text = result["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("storage engine crashed while answering") && text.contains("SIGSEGV"),
+        "{text}"
+    );
+    assert!(
+        text.contains("nestweaver backup restore") && text.contains("publication rebuild"),
+        "the result must carry the remedy: {text}"
+    );
+    assert!(
+        !text.contains("transport error") && !text.contains("broken pipe"),
+        "{text}"
+    );
+    assert!(
+        frame(3).get("result").is_some(),
+        "the session must keep answering after the daemon died: {stdout}"
+    );
+}
+
+/// `daemon stop --force` kills on purpose, so the kill is not an unexpected
+/// exit. The daemon is SIGSTOPped first so it cannot drain on SIGTERM and the
+/// SIGKILL escalation is really taken.
+#[test]
+fn a_forced_stop_leaves_no_warning() {
+    let scratch = CrashScratch::new();
+    let _guard = scratch.guard();
+
+    scratch.daemon("start").assert().success();
+    let pid = scratch.daemon_pid().expect("the daemon wrote its pidfile");
+    unsafe {
+        libc::kill(pid, libc::SIGSTOP);
+    }
+    let output = scratch
+        .daemon("stop")
+        .arg("--force")
+        .env("NESTWEAVER_STOP_GRACE_SECS", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("sending SIGKILL"),
+        "the escalation must have been taken: {stderr}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || unsafe { libc::kill(pid, 0) }
+            != 0),
+        "the forced stop must end daemon {pid}"
+    );
+    assert_eq!(
+        scratch.unclean_exit_warning(),
+        None,
+        "a kill the operator asked for is not an unexpected exit"
+    );
+}
+
+/// Ctrl-C on a foreground `daemon run` drains and returns like SIGTERM does,
+/// instead of dying on the signal.
+#[test]
+fn sigint_on_a_foreground_daemon_is_a_clean_shutdown() {
+    let scratch = CrashScratch::new();
+    let _guard = scratch.guard();
+
+    let mut command = StdCommand::new(bin_path());
+    command
+        .args(["daemon", "--db"])
+        .arg(&scratch.db)
+        .arg("run")
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .env_remove("NESTWEAVER_UPSTREAM")
+        .env("HOME", &scratch.home)
+        .env("XDG_CONFIG_HOME", scratch.home.join("config"))
+        .env("XDG_CACHE_HOME", scratch.home.join("cache"))
+        .env("XDG_DATA_HOME", scratch.home.join("data"))
+        .env("XDG_STATE_HOME", scratch.home.join("state"))
+        .env("XDG_RUNTIME_DIR", scratch.home.join("runtime"))
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", scratch.home.join("sock"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().expect("spawn foreground daemon");
+    let pid = child.id() as i32;
+    let ready = wait_until(Duration::from_secs(30), || {
+        // An answered RPC, not just a pidfile: the signal handlers are
+        // registered before the listener serves, and well after the pidfile.
+        scratch.daemon_pid() == Some(pid)
+            && scratch
+                .cmd(&["brain", "status"])
+                .output()
+                .is_ok_and(|output| output.status.success())
+    });
+    assert_eq!(
+        scratch.daemon_pid(),
+        Some(pid),
+        "the status probe must have reached this daemon, not started another"
+    );
+    if !ready {
+        let _ = child.kill();
+        panic!("the foreground daemon never became ready");
+    }
+
+    unsafe {
+        libc::kill(pid, libc::SIGINT);
+    }
+    let mut status = None;
+    let exited = wait_until(Duration::from_secs(30), || {
+        status = child.try_wait().unwrap();
+        status.is_some()
+    });
+    if !exited {
+        let _ = child.kill();
+        panic!("the daemon did not exit after SIGINT");
+    }
+    let status = status.unwrap();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "SIGINT must drain and return, not kill the process: {status:?}"
+    );
+    assert_eq!(scratch.unclean_exit_warning(), None);
+}

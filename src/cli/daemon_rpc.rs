@@ -857,6 +857,8 @@ pub(crate) fn dispatch_hybrid_mcp_request(
                     "result": nestweaver_mcp::tools::wrap_tool_error(&error.to_string()),
                 })
             } else {
+                // A session outlives many requests: restart the crash-attribution clock.
+                nestweaver_store::daemon_exit::note_request_start();
                 let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     if write_tools.contains(name) {
                         nestweaver_mcp::tools::dispatch_via_daemon(

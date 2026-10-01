@@ -5678,6 +5678,17 @@ pub fn wrap_tool_not_found(envelope: Value) -> Value {
 /// Wrap a failed dispatch: a lookup miss becomes the not-found envelope,
 /// anything else the plain error text.
 pub fn wrap_tool_failure(tool: &str, error: &anyhow::Error) -> Value {
+    // The daemon died on a fatal signal while answering: say that, with the
+    // way out, instead of the broken pipe the client was left holding.
+    if let Some(crash) =
+        nestweaver_store::daemon_exit::crash_behind_broken_connection(&format!("{error:#}"))
+    {
+        return wrap_tool_error(
+            &crash
+                .exit
+                .client_message(&crash.db_path, crash.during_request),
+        );
+    }
     match lookup_miss_envelope(tool, error) {
         Some(envelope) => wrap_tool_not_found(envelope),
         // An unresolved repo filter renders its OWN message: an outer
@@ -9508,6 +9519,48 @@ pub fn brain_status_warnings(store: &GraphStore, db_path: Option<&std::path::Pat
     brain_status_warnings_for(store, db_path, publication.as_ref())
 }
 
+/// The `brain status` warning for a daemon that did not shut down. `signal`
+/// is null when no fatal signal was caught, which is the difference between
+/// "the storage engine crashed" and "the daemon was killed from outside".
+fn daemon_unclean_exit_warning(exit: &nestweaver_store::daemon_exit::UncleanExit) -> Value {
+    let crashed = exit.signal.is_some();
+    json!({
+        "kind": "daemon_unclean_exit",
+        "warning": if exit.is_abort() {
+            format!(
+                "{}. Check the daemon log. Recovery is only needed if it repeats: {}.",
+                exit.summary(),
+                nestweaver_store::daemon_exit::RECOVERY
+            )
+        } else if crashed {
+            format!(
+                "{}. Recover it: {}.",
+                exit.summary(),
+                nestweaver_store::daemon_exit::RECOVERY
+            )
+        } else {
+            format!(
+                "{}. If it happens again without an operator killing the daemon, treat \
+                 the database as suspect: {}.",
+                exit.summary(),
+                nestweaver_store::daemon_exit::RECOVERY
+            )
+        },
+        "exit": if exit.is_abort() {
+            "aborted"
+        } else if crashed {
+            "engine_crashed"
+        } else {
+            "exited_unexpectedly"
+        },
+        "signal": exit.signal_name(),
+        "at_unix": exit.at,
+        "pid": exit.pid,
+        "count": exit.count,
+        "clears": "at the next clean daemon shutdown",
+    })
+}
+
 /// Core of [`brain_status_warnings`] with the index-publication status
 /// already read, so `tool_brain_status` can share ONE marker read — against
 /// ONE db path — between the wedge warning and its `index_publication`
@@ -9620,6 +9673,12 @@ fn brain_status_warnings_for(
             },
             "action": status.repair_command_for(p),
         }));
+    }
+
+    // The previous daemon for this database did not shut down. Present only
+    // when a daemon is serving this call; cleared by its clean shutdown.
+    if let Some(exit) = nestweaver_store::daemon_exit::armed_report() {
+        warnings.push(daemon_unclean_exit_warning(&exit));
     }
 
     if store.reopen_required() {

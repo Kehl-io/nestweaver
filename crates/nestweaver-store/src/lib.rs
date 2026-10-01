@@ -1,6 +1,7 @@
 pub mod artifact_envelope;
 pub mod cache;
 pub mod context_graph;
+pub mod daemon_exit;
 pub mod db;
 pub mod durable_sidecar;
 pub mod engine_format;
