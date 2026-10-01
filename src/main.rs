@@ -24764,6 +24764,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // lock, with the loser dying with "Could not set lock on
                         // file ... another process may hold the write lock".
                         use std::os::unix::io::AsRawFd;
+                        // Whether this invocation creates the pidfile: a start
+                        // the guard below refuses must not leave behind a
+                        // pidfile it created, or a refusal reads as "a daemon
+                        // was here".
+                        let pidfile_preexisted = pidfile.exists();
                         let pid_lock = std::fs::OpenOptions::new()
                             .create(true)
                             .read(true)
@@ -24863,7 +24868,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // no daemon holds this pidfile, so this is a cold
                         // start and the double-fork below is the last step
                         // before a process exists.
-                        refuse_if_wal_unreadable()?;
+                        if let Err(refusal) = refuse_if_wal_unreadable() {
+                            // Still holding the flock, so no daemon owns the
+                            // file: remove it only if this start created it.
+                            if !pidfile_preexisted {
+                                let _ = std::fs::remove_file(&pidfile);
+                            }
+                            return Err(refusal);
+                        }
 
                         let stdout_file = std::fs::OpenOptions::new()
                             .create(true)
