@@ -1701,8 +1701,8 @@ const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
                   worse than none: exit 64 from an out-of-range or unknown FLAG is raised by the\n      \
                   argument parser BEFORE --json is read, so it writes to stderr and nothing to\n      \
                   stdout. Only an uncompilable --pattern reaches the JSON path. Exit 3 emits a\n      \
-                  candidate list, and `impact` keys it \"status\", not \"error\". A few commands\n      \
-                  (cross-repo-refs, rank) still write nothing on 2. Check the code, then stderr.\n\n\
+                  candidate list, and `impact` keys it \"status\", not \"error\". `read-symbols`\n      \
+                  lists misses under \"not_found\" instead. Check the code, then stderr.\n\n\
                   Shell completions:\n  \
                   nestweaver completions bash > ~/.local/share/bash-completion/completions/nestweaver\n  \
                   nestweaver completions zsh > ~/.zfunc/_nestweaver\n  \
@@ -3038,6 +3038,200 @@ fn render_investigate_text(payload: &serde_json::Value) {
         "\nDrill in: nestweaver investigate-expand {} --targets <asset_id,...>",
         text(payload, "bundle_id")
     );
+}
+
+/// `list-projects` on the direct route: the projects, with each one's member
+/// repos recorded into `members`.
+fn direct_projects_with_members(
+    store: &nestweaver_store::GraphStore,
+    members: &mut ProjectMemberRepos,
+) -> anyhow::Result<Vec<nestweaver_schema::Project>> {
+    let projects = store.list_projects().map_err(|e| anyhow::anyhow!(e))?;
+    for project in &projects {
+        members.insert(
+            project.name.clone(),
+            nestweaver_engine::project_member_repos(store, &project.uid)?,
+        );
+    }
+    Ok(projects)
+}
+
+/// The remedy `cluster <id>` prints on a miss. It used to list EVERY
+/// community (2.2 MB of stderr for `cluster 999999999` on a real graph); now
+/// it is the count, the id range, the largest few, and the command that
+/// lists them all.
+fn cluster_not_found_hint(output: &nestweaver_engine::ClusteringOutput) -> String {
+    const SHOWN: usize = 10;
+    let communities = &output.communities;
+    if communities.is_empty() {
+        return format!(
+            "There are no clusters at resolution {}; run `nestweaver clusters` to compute them.",
+            output.resolution
+        );
+    }
+    let min = communities.iter().map(|c| c.id).min().unwrap_or(0);
+    let max = communities.iter().map(|c| c.id).max().unwrap_or(0);
+    let mut largest: Vec<&nestweaver_engine::CommunityInfo> = communities.iter().collect();
+    largest.sort_by(|a, b| b.member_count.cmp(&a.member_count).then(a.id.cmp(&b.id)));
+    let shown: Vec<String> = largest
+        .iter()
+        .take(SHOWN)
+        .map(|c| {
+            let name: String = c.name.chars().take(60).collect();
+            format!("[{}] {name}", c.id)
+        })
+        .collect();
+    format!(
+        "{} clusters at resolution {} (ids {min}-{max}). Largest: {}{}. Run `nestweaver \
+         clusters` to list them all.",
+        communities.len(),
+        output.resolution,
+        shown.join(", "),
+        if communities.len() > SHOWN {
+            ", ..."
+        } else {
+            ""
+        }
+    )
+}
+
+/// The engine's miss for a bundle id no live bundle has, found anywhere in
+/// `error`'s chain (the daemon route wraps it).
+fn bundle_miss_message(error: &anyhow::Error, bundle_id: &str) -> Option<String> {
+    let expected = format!("bundle '{bundle_id}' not found or expired");
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains(&expected))
+        .then(|| {
+            format!(
+                "{expected}; bundles expire after 24 hours, so run `nestweaver investigate` \
+                 again for a new one"
+            )
+        })
+}
+
+/// `investigate-expand` / `investigate-hydrate` on an unknown or expired
+/// bundle: exit 2 with the not-found envelope under `--json`, like every
+/// other read command's miss. It used to be exit 1 with the RPC wrapper.
+fn report_bundle_miss(error: &anyhow::Error, bundle_id: &str, json: bool) -> Option<i32> {
+    let message = bundle_miss_message(error, bundle_id)?;
+    if json {
+        print_json_not_found_detail("bundle_id", &serde_json::json!(bundle_id), Some(&message));
+    }
+    eprintln!("{message}");
+    Some(EXIT_NOT_FOUND)
+}
+
+/// `investigate-expand` text, from the result's JSON so the daemon and
+/// direct routes print the same thing. An entry whose body could not be read
+/// says why rather than printing an empty block.
+fn render_investigate_expand_text(payload: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+    let text = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let list = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut out = String::new();
+    let unresolved: Vec<String> = list("unresolved")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    if !unresolved.is_empty() {
+        let _ = writeln!(out, "Unresolved targets: {}", unresolved.join(", "));
+    }
+    let neighbors = list("neighbors");
+    for entry in list("expanded") {
+        let asset_id = text(&entry, "asset_id");
+        let _ = writeln!(
+            out,
+            "\n=== {asset_id}  {} ({}) ===",
+            text(&entry, "title"),
+            text(&entry, "location")
+        );
+        match entry.get("inline_body").and_then(|v| v.as_str()) {
+            Some(body) => {
+                let _ = writeln!(out, "{body}");
+            }
+            None => {
+                if let Some(reason) = entry.get("unavailable_reason").and_then(|v| v.as_str()) {
+                    let _ = writeln!(out, "(body unavailable: {reason})");
+                }
+            }
+        }
+        let own: Vec<&serde_json::Value> = neighbors
+            .iter()
+            .filter(|n| n.get("of").and_then(|v| v.as_str()) == Some(asset_id.as_str()))
+            .collect();
+        if !own.is_empty() {
+            let _ = writeln!(out, "-- neighbors --");
+            for n in own {
+                let _ = writeln!(
+                    out,
+                    "  [{}] {} ({})",
+                    text(n, "relation"),
+                    text(n, "title"),
+                    text(n, "uid")
+                );
+            }
+        }
+    }
+    out
+}
+
+/// `investigate-hydrate` text, from the result's JSON (see
+/// [`render_investigate_expand_text`]).
+fn render_investigate_hydrate_text(payload: &serde_json::Value) -> String {
+    let entries = payload
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let hydrated = payload
+        .get("hydrated")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let truncated_count = entries
+        .iter()
+        .filter(|e| {
+            e.get("inline_body").is_some_and(|v| !v.is_null())
+                && !e
+                    .get("body_complete")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true)
+        })
+        .count();
+    let mut out = format!(
+        "Hydrated {hydrated} entr{} in bundle {}{}\n",
+        if hydrated == 1 { "y" } else { "ies" },
+        payload
+            .get("bundle_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+        if truncated_count > 0 {
+            format!(" ({truncated_count} truncated — use read_symbols for full source)")
+        } else {
+            String::new()
+        }
+    );
+    if let Some(reasons) = payload.get("skipped_reasons").and_then(|v| v.as_object()) {
+        for (reason, count) in reasons {
+            out.push_str(&format!(
+                "  skipped {}: {reason}\n",
+                count.as_u64().unwrap_or(0)
+            ));
+        }
+    }
+    out
 }
 
 /// Print a change-impact payload's `notifications` as `[level] message`, the
@@ -5098,6 +5292,7 @@ mod daemon_status_renderer_tests {
             last_reconciled_at: String::new(),
             notes_changed_since_indexing: Vec::new(),
             unscoped_projects: Vec::new(),
+            unscoped_project_names: Vec::new(),
             notes_changed_as_of: String::new(),
         };
         let status = nestweaver_proto::BrainStatusResponse {
@@ -5124,6 +5319,26 @@ mod daemon_status_renderer_tests {
             ..owed
         };
         assert_eq!(format_code_links_status(&current), None);
+    }
+
+    /// Status names an unscoped project by its name, not its uid; an older
+    /// daemon that sends only uids still renders them.
+    #[test]
+    fn unscoped_projects_render_by_name() {
+        let links = nestweaver_proto::CodeLinksStatus {
+            unscoped_projects: vec!["proj:default:abc123".to_string()],
+            unscoped_project_names: vec!["Website".to_string()],
+            ..Default::default()
+        };
+        let line = format_code_links_status(&links).expect("a gap line");
+        assert!(line.contains("project(s) Website declare repos"), "{line}");
+        assert!(!line.contains("proj:default:abc123"), "{line}");
+        let older = nestweaver_proto::CodeLinksStatus {
+            unscoped_project_names: Vec::new(),
+            ..links
+        };
+        let line = format_code_links_status(&older).expect("a gap line");
+        assert!(line.contains("proj:default:abc123"), "{line}");
     }
 
     /// nw-705: every repo the manifest rebuild refused is named on the
@@ -9784,12 +9999,24 @@ fn wholly_inferred_write_refusal(
 ) -> Option<String> {
     wholly_inferred_write_message(
         &format!("Error: refusing to {action}"),
+        WRITE_REFUSAL_REMEDY,
         repo_stated,
         db_source,
         repo_path,
         db_path,
     )
 }
+
+/// The remedy the refusing commands (`index`, `watch`) print: both accept
+/// `--repo`, `--db` and `--config`.
+const WRITE_REFUSAL_REMEDY: &str = "State either end: `--repo <path>` to confirm the source, \
+     or `--db <path>` / `--config <file>` to confirm the target.";
+
+/// The remedy the `investigate*` commands print. They take neither `--repo`
+/// nor `--config` (the source is `--root`), so the refusal's remedy named two
+/// flags these commands reject.
+const INVESTIGATE_WRITE_REMEDY: &str = "State either end: `--root <path>` to confirm the \
+     source, or `--db <path>` to confirm the target.";
 
 /// The same property as [`wholly_inferred_write_refusal`], reported rather
 /// than enforced.
@@ -9809,6 +10036,7 @@ fn wholly_inferred_write_warning(
 ) -> Option<String> {
     wholly_inferred_write_message(
         &format!("Warning: {action}"),
+        INVESTIGATE_WRITE_REMEDY,
         repo_stated,
         db_source,
         repo_path,
@@ -9818,6 +10046,7 @@ fn wholly_inferred_write_warning(
 
 fn wholly_inferred_write_message(
     lead: &str,
+    remedy: &str,
     repo_stated: bool,
     db_source: DbSource,
     repo_path: &Path,
@@ -9830,8 +10059,7 @@ fn wholly_inferred_write_message(
         "{lead}: neither the source nor the target was stated.\n  \
          source: {} (detected from the current directory)\n  \
          target: {} (from the NESTWEAVER_DB environment variable)\n\
-         State either end: `--repo <path>` to confirm the source, \
-         or `--db <path>` / `--config <file>` to confirm the target.",
+         {remedy}",
         repo_path.display(),
         db_path.display(),
     ))
@@ -10165,9 +10393,16 @@ fn format_code_links_status(links: &nestweaver_proto::CodeLinksStatus) -> Option
         ));
     }
     if !links.unscoped_projects.is_empty() {
+        // Names when the daemon sent them (index for index); an older daemon
+        // sends only uids.
+        let named = if links.unscoped_project_names.len() == links.unscoped_projects.len() {
+            &links.unscoped_project_names
+        } else {
+            &links.unscoped_projects
+        };
         gaps.push(format!(
             "project(s) {} declare repos that resolve to none, so their notes link unscoped",
-            links.unscoped_projects.join(", ")
+            named.join(", ")
         ));
     }
     if !links.pending && !migration_owed {
@@ -18538,15 +18773,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         print_json_not_found("cluster", &id_or_name);
                     }
                     eprintln!("Cluster '{}' not found.", id_or_name);
-                    eprintln!(
-                        "Available clusters: {}",
-                        output
-                            .communities
-                            .iter()
-                            .map(|c| format!("[{}] {}", c.id, c.name))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
+                    eprintln!("{}", cluster_not_found_hint(&output));
                     Ok((EXIT_NOT_FOUND, None))
                 }
             }
@@ -22179,6 +22406,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             require_existing_db(&resolved_db)?;
 
             // ── daemon guard ──────────────────────────────────────
+            let mut member_repos = ProjectMemberRepos::new();
             let materialized: Vec<nestweaver_schema::Project> = if use_daemon {
                 let db_path = resolved_db.clone();
                 let args = serde_json::json!({});
@@ -22200,20 +22428,40 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "list_projects",
                     args,
                 )? {
-                    Some(value) => serde_json::from_value(unwrap_hybrid_payload(value))
-                        .context("decode projects from the daemon")?,
+                    Some(value) => {
+                        let rows: Vec<serde_json::Value> =
+                            serde_json::from_value(unwrap_hybrid_payload(value))
+                                .context("decode projects from the daemon")?;
+                        let mut projects = Vec::with_capacity(rows.len());
+                        for row in rows {
+                            let project: nestweaver_schema::Project =
+                                serde_json::from_value(row.clone())
+                                    .context("decode projects from the daemon")?;
+                            // Absent from an older daemon: then nothing is
+                            // claimed about membership.
+                            if let Some(repos) = row.get("repos") {
+                                member_repos.insert(
+                                    project.name.clone(),
+                                    serde_json::from_value(repos.clone())
+                                        .context("decode project member repos")?,
+                                );
+                            }
+                            projects.push(project);
+                        }
+                        projects
+                    }
                     None => {
                         // The direct store cannot honour a pinned config, so
                         // falling back would silently target a different
                         // instance than the caller named.
                         ensure_direct_store_fallback_allowed(&resolved_db, config.as_deref())?;
                         let store = open_store(Some(&resolved_db))?;
-                        store.list_projects().map_err(|e| anyhow::anyhow!(e))?
+                        direct_projects_with_members(&store, &mut member_repos)?
                     }
                 }
             } else {
                 let store = open_store(Some(&resolved_db))?;
-                store.list_projects().map_err(|e| anyhow::anyhow!(e))?
+                direct_projects_with_members(&store, &mut member_repos)?
             };
 
             // When --config is provided, also surface declared projects from
@@ -22247,7 +22495,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             print!(
                 "{}",
-                render_list_projects(&materialized, &declared_only, &repo_issues, json)?
+                render_list_projects(
+                    &materialized,
+                    &declared_only,
+                    &repo_issues,
+                    &member_repos,
+                    json
+                )?
             );
             Ok((EXIT_SUCCESS, None))
         }
@@ -22563,10 +22817,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // repo got empty bodies again regardless of the daemon-side
                 // fix.
                 let args = investigate_rpc_args(&bundle_id, Some(&targets), None, root.as_deref());
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "investigate_expand", args)?
+                let routed = try_hybrid_json_rpc(true, &db_path, None, "investigate_expand", args);
+                if let Err(error) = &routed
+                    && let Some(code) = report_bundle_miss(error, &bundle_id, json)
                 {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((code, None));
+                }
+                if let Some(value) = routed? {
+                    // `--json` used to be a no-op here: the daemon route
+                    // printed JSON either way.
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        print!("{}", render_investigate_expand_text(&value));
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -22578,36 +22842,26 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // `detect_repo_root()` here — a single directory-walk guess is
             // no better than the daemon's old cwd default when the caller's
             // cwd is outside every indexed repo.
-            let result = nestweaver_engine::investigate_expand(
+            let result = match nestweaver_engine::investigate_expand(
                 &store,
                 &db_path,
                 root.as_deref(),
                 &bundle_id,
                 &targets,
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(error) => match report_bundle_miss(&error, &bundle_id, json) {
+                    Some(code) => return Ok((code, None)),
+                    None => return Err(error),
+                },
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                if !result.unresolved.is_empty() {
-                    println!("Unresolved targets: {}", result.unresolved.join(", "));
-                }
-                for e in &result.expanded {
-                    println!("\n=== {}  {} ({}) ===", e.asset_id, e.title, e.location);
-                    if let Some(body) = &e.inline_body {
-                        println!("{body}");
-                    }
-                    let neighbors: Vec<&nestweaver_engine::NeighborRef> = result
-                        .neighbors
-                        .iter()
-                        .filter(|n| n.of == e.asset_id)
-                        .collect();
-                    if !neighbors.is_empty() {
-                        println!("-- neighbors --");
-                        for n in neighbors {
-                            println!("  [{}] {} ({})", n.relation, n.title, n.uid);
-                        }
-                    }
-                }
+                print!(
+                    "{}",
+                    render_investigate_expand_text(&serde_json::to_value(&result)?)
+                );
             }
             Ok((EXIT_SUCCESS, None))
         }
@@ -22643,10 +22897,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // overridden by the client's cwd.
                 let args =
                     investigate_rpc_args(&bundle_id, None, Some(token_budget), root.as_deref());
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "investigate_hydrate", args)?
+                let routed = try_hybrid_json_rpc(true, &db_path, None, "investigate_hydrate", args);
+                if let Err(error) = &routed
+                    && let Some(code) = report_bundle_miss(error, &bundle_id, json)
                 {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok((code, None));
+                }
+                if let Some(value) = routed? {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        print!("{}", render_investigate_hydrate_text(&value));
+                    }
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
@@ -22654,31 +22916,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let store = open_store(Some(&db_path))?;
             // nw-560: pass an omitted `--root` through as `None` — see the
             // matching comment in `investigate-expand` above.
-            let result = nestweaver_engine::investigate_hydrate(
+            let result = match nestweaver_engine::investigate_hydrate(
                 &store,
                 &db_path,
                 root.as_deref(),
                 &bundle_id,
                 Some(token_budget),
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(error) => match report_bundle_miss(&error, &bundle_id, json) {
+                    Some(code) => return Ok((code, None)),
+                    None => return Err(error),
+                },
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                let truncated_count = result
-                    .entries
-                    .iter()
-                    .filter(|e| e.inline_body.is_some() && !e.body_complete)
-                    .count();
-                println!(
-                    "Hydrated {} entr{} in bundle {}{}",
-                    result.hydrated,
-                    if result.hydrated == 1 { "y" } else { "ies" },
-                    result.bundle_id,
-                    if truncated_count > 0 {
-                        format!(" ({truncated_count} truncated — use read_symbols for full source)")
-                    } else {
-                        String::new()
-                    }
+                print!(
+                    "{}",
+                    render_investigate_hydrate_text(&serde_json::to_value(&result)?)
                 );
             }
             Ok((EXIT_SUCCESS, None))
@@ -28506,6 +28762,121 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
     /// invocation already passed (nw-328/nw-329's actual shape) cannot be
     /// expressed as a static per-string check. Both stay covered only by the
     /// one-row-per-bug table in `tests/error_remedy_test.rs`.
+    /// An unknown bundle is a miss (exit 2, not-found envelope) whether the
+    /// engine's error arrives bare (direct route) or wrapped (daemon route);
+    /// any other failure is not.
+    #[test]
+    fn an_unknown_bundle_is_a_not_found_miss_on_both_routes() {
+        let bare = anyhow::anyhow!("bundle 'bndl_x' not found or expired");
+        let wrapped =
+            anyhow::anyhow!("tool investigate_expand failed: bundle 'bndl_x' not found or expired")
+                .context("investigate_expand RPC failed");
+        for error in [&bare, &wrapped] {
+            let message = bundle_miss_message(error, "bndl_x").expect("a miss");
+            assert!(message.starts_with("bundle 'bndl_x' not found or expired"));
+            let payload =
+                json_not_found_payload("bundle_id", &serde_json::json!("bndl_x"), Some(&message));
+            assert_eq!(payload["error"], "not found");
+            assert_eq!(payload["bundle_id"], "bndl_x");
+        }
+        assert_eq!(
+            report_bundle_miss(&bare, "bndl_x", false),
+            Some(EXIT_NOT_FOUND)
+        );
+        let other = anyhow::anyhow!("cannot read the bundle store at /x: denied");
+        assert!(bundle_miss_message(&other, "bndl_x").is_none());
+        assert!(report_bundle_miss(&other, "bndl_x", false).is_none());
+        // Another bundle's miss is not this one's.
+        assert!(bundle_miss_message(&bare, "bndl_y").is_none());
+    }
+
+    /// Both investigate drill-in commands print text from the same JSON on
+    /// either route, and an entry with no body says why.
+    #[test]
+    fn investigate_drill_in_text_renders_from_json() {
+        let expand = serde_json::json!({
+            "bundle_id": "bndl_x",
+            "unresolved": ["zzz"],
+            "expanded": [
+                { "asset_id": "a1", "title": "greet", "location": "a.ts:1",
+                  "inline_body": "function greet() {}" },
+                { "asset_id": "a2", "title": "gone", "location": "b.ts:1",
+                  "unavailable_reason": "source changed since indexing" }
+            ],
+            "neighbors": [
+                { "of": "a1", "uid": "sym:x", "kind": "Symbol", "title": "hello",
+                  "relation": "callee" }
+            ]
+        });
+        let text = render_investigate_expand_text(&expand);
+        assert!(text.contains("Unresolved targets: zzz"), "{text}");
+        assert!(text.contains("=== a1  greet (a.ts:1) ==="), "{text}");
+        assert!(text.contains("function greet() {}"), "{text}");
+        assert!(text.contains("[callee] hello (sym:x)"), "{text}");
+        assert!(
+            text.contains("(body unavailable: source changed since indexing)"),
+            "{text}"
+        );
+        assert!(
+            !text.trim_start().starts_with('{'),
+            "text, not JSON: {text}"
+        );
+
+        let hydrate = serde_json::json!({
+            "bundle_id": "bndl_x",
+            "hydrated": 1,
+            "entries": [ { "asset_id": "a1", "inline_body": "x", "body_complete": false } ],
+            "skipped_reasons": { "no longer exists": 2 }
+        });
+        let text = render_investigate_hydrate_text(&hydrate);
+        assert!(
+            text.starts_with("Hydrated 1 entry in bundle bndl_x (1 truncated"),
+            "{text}"
+        );
+        assert!(text.contains("skipped 2: no longer exists"), "{text}");
+    }
+
+    /// The `investigate*` bundle-cache warning is assembled at run time, so
+    /// the literal-remedy sweep below never sees it. It told the reader to
+    /// pass `--repo` or `--config`, which none of the three commands accept;
+    /// every flag it names must be one the command parses.
+    #[test]
+    fn investigate_cache_warning_names_only_flags_the_command_accepts() {
+        let root = on_big_stack(|| {
+            let mut root = Cli::command();
+            root.build();
+            root
+        });
+        for command in ["investigate", "investigate-expand", "investigate-hydrate"] {
+            let message = wholly_inferred_write_warning(
+                &format!("{command} is writing its bundle cache beside a database nobody named"),
+                false,
+                DbSource::Env,
+                std::path::Path::new("/tmp/checkout"),
+                std::path::Path::new("/tmp/ambient.lbug"),
+            )
+            .expect("neither end stated warns");
+            let flags = command_flag_names(root.find_subcommand(command).expect(command));
+            let named: Vec<&str> = message
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .filter_map(|span| span.split_whitespace().next())
+                .filter(|token| token.starts_with("--"))
+                .collect();
+            assert!(
+                !named.is_empty(),
+                "{command}: the warning names a remedy: {message}"
+            );
+            for flag in named {
+                assert!(
+                    flags.contains(flag.trim_start_matches('-')) || flags.contains(flag),
+                    "{command} does not accept {flag}: {message}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn backtick_quoted_remedies_name_real_flags_on_real_command_paths() {
         let root = on_big_stack(|| {
@@ -38774,6 +39145,84 @@ mod cli_honesty_sweep_tests {
         assert_eq!(seeds["message"], serde_json::json!("No matching symbols"));
     }
 
+    /// `cluster <id>` with an id no community has printed EVERY community on
+    /// stderr (2.2 MB on a real graph). The hint is bounded: a count, the id
+    /// range, the largest few and the command that lists them all.
+    #[test]
+    fn a_cluster_miss_prints_a_bounded_hint() {
+        let communities: Vec<nestweaver_engine::CommunityInfo> = (0..70_000u32)
+            .map(|id| nestweaver_engine::CommunityInfo {
+                id,
+                name: format!("community-with-a-longish-name-{id}"),
+                cohesion: 0.5,
+                member_count: (id % 97) as usize + 1,
+                members: Vec::new(),
+                key_files: Vec::new(),
+            })
+            .collect();
+        let output = nestweaver_engine::ClusteringOutput {
+            resolution: 0.3,
+            modularity: 0.4,
+            communities,
+        };
+        let hint = cluster_not_found_hint(&output);
+        assert!(hint.len() < 2048, "bounded: {} bytes", hint.len());
+        assert!(hint.contains("70000 clusters"), "{hint}");
+        assert!(hint.contains("ids 0-69999"), "{hint}");
+        assert!(hint.contains("nestweaver clusters"), "{hint}");
+        assert!(hint.contains("[96]"), "the largest are named: {hint}");
+
+        let empty = nestweaver_engine::ClusteringOutput {
+            resolution: 0.3,
+            modularity: 0.0,
+            communities: Vec::new(),
+        };
+        assert!(cluster_not_found_hint(&empty).contains("no clusters"));
+    }
+
+    /// The exit-code paragraph named `rank`, which is not a command (it is
+    /// `ranking rank`), and listed commands as writing nothing on exit 2 that
+    /// now write the envelope. Every command it names must exist.
+    #[test]
+    fn the_exit_code_help_names_only_real_commands() {
+        let (help, root) = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let mut root = Cli::command();
+                root.build();
+                (root.render_long_help().to_string(), root)
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+        let start = help.find("Exit codes (scripting contract)").unwrap();
+        let section = &help[start..start + help[start..].find("Shell completions").unwrap()];
+        assert!(!section.contains("rank)"), "{section}");
+        let mut checked = 0;
+        for span in section.split('`').skip(1).step_by(2) {
+            let tokens: Vec<&str> = span.split_whitespace().collect();
+            if tokens.is_empty()
+                || matches!(tokens[0], "error" | "status")
+                || tokens
+                    .iter()
+                    .any(|t| !t.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+            {
+                continue;
+            }
+            let mut command = &root;
+            for token in &tokens {
+                command = command
+                    .find_subcommand(token)
+                    .unwrap_or_else(|| panic!("`{span}` is not a command: {section}"));
+            }
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "the section names at least one command: {section}"
+        );
+    }
+
     /// COUNTERWEIGHT. A pattern that does not COMPILE is not an absent target,
     /// and the two must not share an envelope: one means "fix your regex" and
     /// the other means "nothing matched", and a consumer that cannot tell them
@@ -39254,9 +39703,17 @@ mod nw674_repo_issue_render_tests {
         .into_iter()
         .collect();
 
-        let json: serde_json::Value =
-            serde_json::from_str(&render_list_projects(&materialized, &[], &issues, true).unwrap())
-                .unwrap();
+        let json: serde_json::Value = serde_json::from_str(
+            &render_list_projects(
+                &materialized,
+                &[],
+                &issues,
+                &ProjectMemberRepos::new(),
+                true,
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             json["repo_issues"]["wavelength-wireless"][0]["repo"],
             "wavelength-wireless-site"
@@ -39267,24 +39724,73 @@ mod nw674_repo_issue_render_tests {
         );
         assert!(json["repo_issues"].get("siteloom").is_none());
 
-        let text = render_list_projects(&materialized, &[], &issues, false).unwrap();
+        let text = render_list_projects(
+            &materialized,
+            &[],
+            &issues,
+            &ProjectMemberRepos::new(),
+            false,
+        )
+        .unwrap();
         let expected = "  Warning: declared repo not a member: \
                         wavelength-wireless/wavelength-wireless-site (matches no indexed repo)";
         assert!(text.contains(expected), "{text}");
         // The warning sits under ITS project, not the next one.
-        let siteloom = text.split("siteloom\n").nth(1).unwrap();
+        let siteloom = text.split("\nsiteloom\n").nth(1).unwrap();
         assert!(!siteloom.contains("Warning"), "{text}");
+    }
+
+    /// `list-projects` lists each project's member repos, in text and JSON;
+    /// a project with none says so rather than printing nothing.
+    #[test]
+    fn list_projects_lists_member_repos() {
+        let materialized = projects();
+        let members: ProjectMemberRepos = [(
+            "wavelength-wireless".to_string(),
+            vec![nestweaver_engine::ProjectMemberRepo {
+                uid: "repo:ww".to_string(),
+                name: "wavelength-wireless-site".to_string(),
+            }],
+        )]
+        .into_iter()
+        .collect();
+        let issues = ProjectRepoIssues::new();
+        let text = render_list_projects(&materialized, &[], &issues, &members, false).unwrap();
+        assert!(
+            text.contains("  Repos:    wavelength-wireless-site\n"),
+            "{text}"
+        );
+        let siteloom = text.split("\nsiteloom\n").nth(1).unwrap();
+        assert!(siteloom.contains("  Repos:    (none)"), "{text}");
+        let json: serde_json::Value = serde_json::from_str(
+            &render_list_projects(&materialized, &[], &issues, &members, true).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            json["member_repos"]["wavelength-wireless"][0]["name"],
+            "wavelength-wireless-site"
+        );
+        assert_eq!(json["member_repos"]["siteloom"], serde_json::json!([]));
     }
 
     #[test]
     fn list_projects_without_issues_is_unchanged() {
         let materialized = projects();
         let clean = ProjectRepoIssues::new();
-        let json: serde_json::Value =
-            serde_json::from_str(&render_list_projects(&materialized, &[], &clean, true).unwrap())
-                .unwrap();
+        let json: serde_json::Value = serde_json::from_str(
+            &render_list_projects(&materialized, &[], &clean, &ProjectMemberRepos::new(), true)
+                .unwrap(),
+        )
+        .unwrap();
         assert!(json.get("repo_issues").is_none(), "{json}");
-        let text = render_list_projects(&materialized, &[], &clean, false).unwrap();
+        let text = render_list_projects(
+            &materialized,
+            &[],
+            &clean,
+            &ProjectMemberRepos::new(),
+            false,
+        )
+        .unwrap();
         assert!(!text.contains("Warning"), "{text}");
         assert!(text.starts_with("wavelength-wireless\n  UID:      proj:wavelength-wireless\n"));
     }

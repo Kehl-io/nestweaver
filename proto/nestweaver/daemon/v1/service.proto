@@ -672,6 +672,8 @@ message CodeLinksStatus {
   // nw-670 re-review N6: when the pass that counted
   // `notes_changed_since_indexing` ran (the count is as of then).
   string notes_changed_as_of = 12;
+  // The names of `unscoped_projects`, index for index, for status text.
+  repeated string unscoped_project_names = 13;
 }
 
 message StaleNotesInVault {

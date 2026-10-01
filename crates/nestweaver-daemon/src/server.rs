@@ -2094,6 +2094,33 @@ fn current_repo_eligibility_config(
     }
 }
 
+/// The daemon's additions to a dispatched `brain_status` (both JSON routes).
+///
+/// Status is what a user runs to see what the daemon is doing, so nothing
+/// here may fail it: an eligibility reload that fails (an unreadable or
+/// invalid config file) keeps the shared builder's rows and is disclosed as a
+/// warning instead of turning the whole answer into an error.
+fn annotate_brain_status(state: &DaemonState, value: &mut serde_json::Value) {
+    if let Err(error) = refresh_status_eligibility(state, value) {
+        let message = format!("{error:#}");
+        tracing::warn!(error = %message, "brain_status: repository eligibility not refreshed");
+        if let Some(object) = value.as_object_mut() {
+            let warnings = object
+                .entry("warnings")
+                .or_insert_with(|| serde_json::json!([]));
+            if let Some(warnings) = warnings.as_array_mut() {
+                warnings.push(serde_json::json!({
+                    "kind": "repo_eligibility_unrefreshed",
+                    "warning": format!(
+                        "repository eligibility shown as of daemon start: {message}"
+                    ),
+                }));
+            }
+        }
+    }
+    vault_derivation::status_overlay(state, value);
+}
+
 /// Refresh only eligibility disclosure after tool dispatch (including any
 /// cache hit). All other status fields retain the daemon's startup settings.
 fn refresh_status_eligibility(
@@ -3995,9 +4022,7 @@ impl DaemonService {
                 &mut value,
             );
             if tool_name == "brain_status" {
-                refresh_status_eligibility(&state, &mut value)
-                    .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
-                vault_derivation::status_overlay(&state, &mut value);
+                annotate_brain_status(&state, &mut value);
             }
             tracing::debug!(
                 tool = %tool_name,
@@ -4174,9 +4199,7 @@ impl DaemonService {
                 &mut value,
             );
             if tool_name == "brain_status" {
-                refresh_status_eligibility(&state, &mut value)
-                    .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
-                vault_derivation::status_overlay(&state, &mut value);
+                annotate_brain_status(&state, &mut value);
             }
             tracing::debug!(
                 tool = %tool_name,
@@ -10504,7 +10527,21 @@ impl NestWeaverDaemon for DaemonService {
                 .store
                 .list_projects()
                 .map_err(|e| Status::internal(format!("list_projects failed: {e:#}")))?;
-            serde_json::to_string(&projects)
+            // Each project carries its member repos (`repos`), which the CLI
+            // cannot read itself while this daemon holds the store.
+            let rows = projects
+                .iter()
+                .map(|project| {
+                    let mut row = serde_json::to_value(project)?;
+                    let members =
+                        nestweaver_engine::project_member_repos(&state.store, &project.uid)
+                            .unwrap_or_default();
+                    row["repos"] = serde_json::to_value(members)?;
+                    Ok(row)
+                })
+                .collect::<Result<Vec<_>, serde_json::Error>>()
+                .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))?;
+            serde_json::to_string(&rows)
                 .map_err(|e| Status::internal(format!("serialization failed: {e:#}")))
         })
         .await
@@ -17705,6 +17742,119 @@ repos = ["alpha"]
         vault_derivation::admit_tool(&state, "backlinks").unwrap();
     }
 
+    /// `brain status` must answer while the daemon re-derives a vault (the
+    /// derivation holds the write gate for its whole run), on both status
+    /// routes, and the JSON must name the vault and phase being derived.
+    /// Driven through a real migration: the record sidecar is deleted, as a
+    /// lost sidecar or a version bump leaves it, and the background loop's
+    /// own `inspect_next` / `migrate_named` pair re-derives the vault.
+    #[tokio::test]
+    async fn brain_status_answers_and_discloses_a_running_vault_derivation() {
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\nsee [[B]]\n").unwrap();
+        std::fs::write(root.join("B.md"), "# B\n").unwrap();
+        let progress = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(
+            progress.last().expect("IndexVault streamed").phase,
+            Phase::Done as i32
+        );
+        std::fs::remove_file(nestweaver_engine::markdown_derivation::record_path(
+            &state.db_path,
+        ))
+        .unwrap();
+        let vault_uid = vault_derivation::inspect_next(&state)
+            .unwrap()
+            .expect("a vault with no record is due for derivation");
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let worker_state = Arc::clone(&state);
+        let worker = tokio::task::spawn_blocking(move || {
+            let _lease = worker_state.write_gate.blocking_lock("vault_derivation");
+            let reached = std::sync::Mutex::new(Some((reached_tx, release_rx)));
+            vault_derivation::tests::set_phase_hook(Some(Box::new(move |phase| {
+                if phase == "refreshing notes"
+                    && let Some((reached, release)) = reached.lock().unwrap().take()
+                {
+                    reached.send(()).unwrap();
+                    release.recv().unwrap();
+                }
+            })));
+            let result = vault_derivation::migrate_named(&worker_state, &vault_uid);
+            vault_derivation::tests::set_phase_hook(None);
+            result
+        });
+        tokio::task::spawn_blocking(move || reached_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        let service = DaemonService::new(Arc::clone(&state));
+        let json = tokio::time::timeout(
+            Duration::from_secs(30),
+            service.brain_status_json(Request::new(JsonRequest {
+                args_json: "{}".into(),
+            })),
+        )
+        .await
+        .expect("status must not wait for the derivation")
+        .expect("status must answer during a derivation")
+        .into_inner();
+        let value: serde_json::Value = serde_json::from_str(&json.result_json).unwrap();
+        let running = &value["vault_derivation"]["in_progress"];
+        assert_eq!(running["root_path"], root.display().to_string(), "{value}");
+        assert_eq!(running["phase"], "refreshing notes", "{running}");
+        assert_eq!(running["indexed_notes"], 2, "{running}");
+        assert_eq!(value["write_holder"], "vault_derivation");
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            service.brain_status(Request::new(BrainStatusRequest {})),
+        )
+        .await
+        .expect("typed status must not wait for the derivation")
+        .expect("typed status must answer during a derivation");
+
+        release_tx.send(()).unwrap();
+        worker.await.unwrap().unwrap();
+        let after = service
+            .brain_status_json(Request::new(JsonRequest {
+                args_json: "{}".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let after: serde_json::Value = serde_json::from_str(&after.result_json).unwrap();
+        assert!(
+            after["vault_derivation"]["in_progress"].is_null(),
+            "a finished derivation is no longer in progress: {after}"
+        );
+        assert_eq!(after["vault_derivation"]["pending_or_blocked_vaults"], 0);
+    }
+
+    /// Status must not fail outright because its eligibility refresh cannot
+    /// reload the config file: the rows it already has are kept and the
+    /// failure is a warning.
+    #[tokio::test]
+    async fn brain_status_answers_when_the_eligibility_reload_fails() {
+        let Ok(mut state) = Arc::try_unwrap(test_state_with_writer()) else {
+            panic!("the test state has one owner");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        state.effective_config =
+            EffectiveConfigProvenance::Configured(dir.path().join("gone.toml"));
+        let mut value = serde_json::json!({ "repos": [ { "uid": "repo:x" } ] });
+        annotate_brain_status(&state, &mut value);
+        assert_eq!(value["repos"][0]["uid"], "repo:x", "{value}");
+        let warnings = value["warnings"].as_array().expect("a warning");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w["kind"] == "repo_eligibility_unrefreshed"),
+            "{value}"
+        );
+    }
+
     /// Counterweight to the policy-skip test: a note the reader cannot read is
     /// a genuine coverage gap and must still keep derivation from stamping.
     ///
@@ -19400,6 +19550,63 @@ repos = ["alpha"]
         assert!(!merge_called.get());
         assert!(state.store.project_exists("proj:old:prepare").unwrap());
         assert_eq!(state.store.graph_generation(), generation_before);
+    }
+
+    /// `list-projects` cannot read membership itself while the daemon holds
+    /// the store, so the daemon's project listing carries each project's
+    /// member repos.
+    #[tokio::test]
+    async fn list_projects_json_carries_member_repos() {
+        let state = test_state_with_writer();
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: "proj:default:web".to_string(),
+                name: "web".to_string(),
+                summary: None,
+                instance_id: "default".to_string(),
+            })
+            .unwrap();
+        state
+            .store
+            .insert_project(&nestweaver_schema::Project {
+                uid: "proj:default:empty".to_string(),
+                name: "empty".to_string(),
+                summary: None,
+                instance_id: "default".to_string(),
+            })
+            .unwrap();
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:default:site",
+                "file:///x/site",
+                Some("/x/site"),
+            ))
+            .unwrap();
+        state
+            .store
+            .replace_project_repo_edges(
+                &["proj:default:web".to_string()],
+                &[(
+                    "proj:default:web".to_string(),
+                    "repo:default:site".to_string(),
+                )],
+            )
+            .unwrap();
+        let service = DaemonService::new(Arc::clone(&state));
+        let response = service
+            .list_projects_json(Request::new(JsonRequest {
+                args_json: "{}".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&response.result_json).unwrap();
+        let by_name = |name: &str| rows.iter().find(|row| row["name"] == name).unwrap().clone();
+        assert_eq!(by_name("web")["repos"][0]["uid"], "repo:default:site");
+        assert_eq!(by_name("web")["repos"][0]["name"], "site");
+        assert_eq!(by_name("empty")["repos"], serde_json::json!([]));
     }
 
     #[test]

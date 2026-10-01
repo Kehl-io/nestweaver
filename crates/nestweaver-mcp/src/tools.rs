@@ -17657,6 +17657,44 @@ mod project_context_bug12_tests {
         assert!(!project_member_uid("tag:shared", &members));
     }
 
+    /// A `vlt:` seed for a vault with no notes is a business error
+    /// (`isError: true` with the engine's "Seed container is empty" text),
+    /// not the not-found envelope a bogus uid gets.
+    #[test]
+    fn brain_context_on_an_empty_vault_is_not_the_not_found_envelope() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:empty".into(),
+                name: "empty".into(),
+                root_path: "/v".into(),
+                instance_id: "default".into(),
+            })
+            .unwrap();
+        let empty = dispatch(
+            &store,
+            None,
+            "brain_context",
+            json!({ "seeds": ["vlt:empty"] }),
+            None,
+        )
+        .unwrap_err();
+        assert!(not_found_envelope(&empty).is_none(), "{empty:#}");
+        assert!(
+            format!("{empty:#}").contains(nestweaver_engine::query::EMPTY_SEED_CONTAINER),
+            "{empty:#}"
+        );
+        let bogus = dispatch(
+            &store,
+            None,
+            "brain_context",
+            json!({ "seeds": ["vlt:bogus"] }),
+            None,
+        )
+        .unwrap_err();
+        assert!(not_found_envelope(&bogus).is_some(), "{bogus:#}");
+    }
+
     #[test]
     fn project_context_never_fills_budget_from_outside_membership() {
         let store = GraphStore::in_memory().unwrap();

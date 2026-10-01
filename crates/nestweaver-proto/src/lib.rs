@@ -261,6 +261,13 @@ pub fn code_links_from_status_json(value: &serde_json::Value) -> Option<CodeLink
             .flatten()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect(),
+        unscoped_project_names: links
+            .get("unscoped_project_names")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
     })
 }
 

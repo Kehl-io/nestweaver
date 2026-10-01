@@ -122,6 +122,92 @@ fn lookup_vault(state: &DaemonState, vault_path: &Path) -> anyhow::Result<Vault>
         .ok_or_else(|| anyhow::anyhow!("indexed vault is not present in the graph"))
 }
 
+/// The vault derivation this daemon is running right now, keyed by database
+/// path so in-process test daemons over different databases stay apart.
+///
+/// `brain status` reads it without the write gate, so a derivation (which
+/// holds that gate for its whole run) is disclosed while it runs instead of
+/// status having nothing to say about the one thing the daemon is doing.
+#[derive(Clone, Debug)]
+struct DerivationInProgress {
+    vault_uid: String,
+    root_path: String,
+    phase: &'static str,
+    started_at_unix_seconds: u64,
+    /// Notes the graph held for the vault when the run started; `None` when
+    /// the count could not be read.
+    indexed_notes: Option<usize>,
+}
+
+static IN_PROGRESS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, DerivationInProgress>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Clears the in-progress entry when the run ends, however it ends.
+struct InProgressGuard {
+    db_path: std::path::PathBuf,
+}
+
+impl InProgressGuard {
+    fn begin(state: &DaemonState, vault: &Vault) -> Self {
+        let entry = DerivationInProgress {
+            vault_uid: vault.uid.clone(),
+            root_path: vault.root_path.clone(),
+            phase: "recording",
+            started_at_unix_seconds: now_unix_seconds(),
+            indexed_notes: state.store.count_notes_in_vault(&vault.uid).ok(),
+        };
+        IN_PROGRESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(state.db_path.clone(), entry);
+        Self {
+            db_path: state.db_path.clone(),
+        }
+    }
+
+    fn phase(&self, phase: &'static str) {
+        if let Some(entry) = IN_PROGRESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&self.db_path)
+        {
+            entry.phase = phase;
+        }
+        #[cfg(test)]
+        tests::observe_phase(&self.db_path, phase);
+    }
+}
+
+impl Drop for InProgressGuard {
+    fn drop(&mut self) {
+        IN_PROGRESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.db_path);
+    }
+}
+
+/// The `vault_derivation.in_progress` object, or null when nothing runs.
+fn in_progress_json(state: &DaemonState) -> serde_json::Value {
+    let entry = IN_PROGRESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&state.db_path)
+        .cloned();
+    match entry {
+        Some(entry) => serde_json::json!({
+            "vault_uid": entry.vault_uid,
+            "root_path": entry.root_path,
+            "phase": entry.phase,
+            "started_at_unix_seconds": entry.started_at_unix_seconds,
+            "elapsed_seconds": now_unix_seconds().saturating_sub(entry.started_at_unix_seconds),
+            "indexed_notes": entry.indexed_notes,
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
 const BLOCKED_RETRY_BASE_SECS: u64 = 30;
 const BLOCKED_RETRY_MAX_SECS: u64 = 60 * 60;
 
@@ -338,6 +424,7 @@ fn migrate_vault(
     if cancelled(state) {
         anyhow::bail!("vault derivation cancelled");
     }
+    let progress = InProgressGuard::begin(state, vault);
     let identity = state
         .store
         .publication_identity()?
@@ -373,6 +460,7 @@ fn migrate_vault(
     records.vaults.insert(vault.uid.clone(), record.clone());
     persist(state, &identity, &records)?;
 
+    progress.phase("refreshing notes");
     let admission = establish_search_reconciliation_debt(state, "vault_derivation")?;
     let indexed_before = indexed_search_rows_before(state);
     let reader = nestweaver_engine::index_md::filesystem_vault_reader(
@@ -400,12 +488,14 @@ fn migrate_vault(
             return Err(error);
         }
     };
+    progress.phase("reconciling search");
     let mutation = indexed_search_mutation(
         indexed_before,
         &state.store,
         IndexedSearchMutationScope::MayIncludeVaultFiles,
     );
     finish_search_reconciliation(state, mutation, "vault_derivation", admission)?;
+    progress.phase("stamping");
     if let Err(error) =
         stamp_from_refresh(state, vault, extra, max_note_bytes, coverage.scope, &result)
     {
@@ -569,14 +659,20 @@ pub(super) fn status_overlay(state: &DaemonState, value: &mut serde_json::Value)
     let records = load_records(&state.db_path, &expectation(&identity, &instance))
         .ok()
         .flatten();
-    let Some(records) = records else {
+    let in_progress = in_progress_json(state);
+    // A derivation that runs before any record exists (the sidecar was lost)
+    // is still disclosed.
+    let Some(records) =
+        records.or_else(|| (!in_progress.is_null()).then(DerivationRecords::default))
+    else {
         return;
     };
     let pending = records
         .vaults
         .values()
         .filter(|record| record.phase != DerivationPhase::Current)
-        .count();
+        .count()
+        .max(usize::from(!in_progress.is_null()));
     // nw-694: name the Blocked vaults, so the text render can say a vault is
     // blocked rather than leaving it to a JSON-only count.
     let blocked: Vec<serde_json::Value> = records
@@ -599,6 +695,7 @@ pub(super) fn status_overlay(state: &DaemonState, value: &mut serde_json::Value)
                 "expected_version": markdown_derivation::DERIVATION_VERSION,
                 "pending_or_blocked_vaults": pending,
                 "blocked_vaults": blocked,
+                "in_progress": in_progress,
                 "read_only": state.read_only,
             }),
         );
@@ -756,10 +853,31 @@ pub(super) fn http_max_note_bytes(state: &DaemonState) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use nestweaver_schema::vault_uid;
     use std::collections::BTreeMap;
+
+    type PhaseHook = Box<dyn Fn(&'static str)>;
+
+    thread_local! {
+        static PHASE_HOOK: std::cell::RefCell<Option<PhaseHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Run `hook` on this thread at every derivation phase change, so a test
+    /// can observe status from inside a real migration.
+    pub(in super::super) fn set_phase_hook(hook: Option<PhaseHook>) {
+        PHASE_HOOK.with(|slot| *slot.borrow_mut() = hook);
+    }
+
+    pub(super) fn observe_phase(_db_path: &Path, phase: &'static str) {
+        PHASE_HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow().as_ref() {
+                hook(phase);
+            }
+        });
+    }
 
     #[test]
     fn coverage_for_vault_does_not_downgrade_recorded_full_to_legacy() {

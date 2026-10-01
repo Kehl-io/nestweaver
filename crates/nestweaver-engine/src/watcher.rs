@@ -157,12 +157,6 @@ struct BatchPhaseTimings {
     /// Write transactions and statements the cross-domain flush cost.
     sidecar_transactions: usize,
     sidecar_statements: usize,
-    /// Changed notes still in the graph whose text this batch did not read.
-    /// Reachable only for an edit that pushed a note over the size limit
-    /// (nw-469): the refresh skips it without replacing its nodes, so it
-    /// keeps its stored body AND the code links that body produced. (A read
-    /// or parse failure of an indexed note fails the refresh instead.)
-    sidecar_scan_skipped: usize,
     /// Flush attempts that failed and rolled back (non-fatal; logged). A
     /// chunk is retried once; one that fails twice is owed (`SidecarDebt`).
     sidecar_flush_failures: usize,
@@ -1157,7 +1151,6 @@ impl BrainWatcher {
             sidecar_edges = phase_timings.sidecar_edges,
             sidecar_transactions = phase_timings.sidecar_transactions,
             sidecar_statements = phase_timings.sidecar_statements,
-            sidecar_scan_skipped = phase_timings.sidecar_scan_skipped,
             sidecar_flush_failures = phase_timings.sidecar_flush_failures,
             tombstones_ms = phase_timings.tombstones_ms,
             non_graph_events_ms = phase_timings.non_graph_events_ms,
@@ -1525,16 +1518,16 @@ impl BrainWatcher {
             if let Some(probe) = &self.sidecar_scan_probe {
                 probe(chunk.len());
             }
-            if let Some(index) = index {
-                match sources.get(relative) {
-                    Some(source) => {
-                        chunk.push(crate::cross_domain::scan_note_source(
-                            uid, source, &sections, index,
-                        ));
-                        chunk_paths.push((*path).clone());
-                    }
-                    None => timings.sidecar_scan_skipped += 1,
-                }
+            // Every note still in the graph was read by this refresh (an
+            // oversized one is dropped, a read failure fails the refresh), so
+            // its committed source is here.
+            if let Some(index) = index
+                && let Some(source) = sources.get(relative)
+            {
+                chunk.push(crate::cross_domain::scan_note_source(
+                    uid, source, &sections, index,
+                ));
+                chunk_paths.push((*path).clone());
             }
             if tantivy.is_some() {
                 let section_docs: Vec<_> = sections
@@ -3050,6 +3043,102 @@ mod tests {
         );
     }
 
+    /// A symlink event is handled like the full refresh handles the link: not
+    /// followed, not indexed, disclosed as a `symlink` skip. A link pointing
+    /// outside the vault used to fail the whole batch ("watched note escapes
+    /// vault"), and one pointing inside was indexed through the link although
+    /// a refresh skips it.
+    #[cfg(unix)]
+    #[test]
+    fn watcher_skips_and_discloses_symlink_events() {
+        use std::os::unix::fs::symlink;
+        let _guard = serial_watcher_test();
+        let (dir, root) = make_vault(&[("keep.md", "# Keep\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let outside = dir.path().join("outside.md");
+        fs::write(&outside, "# Outside\n").unwrap();
+        symlink(&outside, root.join("escape.md")).unwrap();
+        symlink(root.join("keep.md"), root.join("alias.md")).unwrap();
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        watcher
+            .process_batch(
+                &store,
+                None,
+                &v_uid,
+                vec![root.join("escape.md"), root.join("alias.md")],
+                &None,
+            )
+            .unwrap();
+        let notes: Vec<String> = store
+            .list_notes(Some(&v_uid))
+            .unwrap()
+            .into_iter()
+            .map(|note| note.file_path)
+            .collect();
+        assert_eq!(notes, vec!["keep.md".to_string()]);
+        let sidecar = crate::index_md::load_skipped_notes_sidecar(&db_path);
+        for path in ["escape.md", "alias.md"] {
+            assert!(
+                sidecar
+                    .skipped
+                    .iter()
+                    .any(|row| row.path == path && row.reason.contains("symlink")),
+                "{path}: {sidecar:?}"
+            );
+        }
+    }
+
+    /// A symlink row outlives a watcher batch that does not touch it (the
+    /// batch does not re-walk the vault, and a linked directory resolves as a
+    /// directory, which made it look like a stale walk row), and leaves once
+    /// an event shows the link is gone.
+    #[cfg(unix)]
+    #[test]
+    fn watcher_keeps_symlink_rows_until_the_link_is_gone() {
+        use std::os::unix::fs::symlink;
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[("keep.md", "# Keep\n"), ("sub/inner.md", "# Inner\n")]);
+        symlink(root.join("sub"), root.join("linked-dir")).unwrap();
+        symlink(root.join("keep.md"), root.join("alias.md")).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let rows = || -> Vec<String> {
+            let mut rows: Vec<String> = crate::index_md::load_skipped_notes_sidecar(&db_path)
+                .skipped
+                .into_iter()
+                .filter(|row| row.reason.contains("symlink"))
+                .map(|row| row.path)
+                .collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(rows(), vec!["alias.md", "linked-dir"], "precondition");
+
+        fs::write(root.join("keep.md"), "# Keep\n\nedited\n").unwrap();
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        watcher
+            .process_batch(&store, None, &v_uid, vec![root.join("keep.md")], &None)
+            .unwrap();
+        assert_eq!(
+            rows(),
+            vec!["alias.md", "linked-dir"],
+            "an unrelated batch keeps them"
+        );
+
+        fs::remove_file(root.join("alias.md")).unwrap();
+        watcher
+            .process_batch(&store, None, &v_uid, vec![root.join("alias.md")], &None)
+            .unwrap();
+        assert_eq!(rows(), vec!["linked-dir"], "a deleted link's row leaves");
+    }
+
     #[test]
     fn watcher_records_new_oversized_note_as_skipped() {
         let (_dir, root) = make_vault(&[("keep.md", "# Keep\n")]);
@@ -3084,31 +3173,85 @@ mod tests {
         );
     }
 
+    /// A note that grows past `max_note_bytes` while no watcher runs is
+    /// replayed ONCE at startup: it leaves the graph and search (a full
+    /// refresh drops it the same way; its old text is not what the file says
+    /// any more), is disclosed as one `oversized` skip row, and a later
+    /// startup finds no drift, so it is not replayed on every start.
     #[test]
-    fn watcher_discloses_note_grown_past_limit_without_failing_the_batch() {
-        let (_dir, root) = make_vault(&[("Beta.md", "# Beta\n\nold\n")]);
+    fn a_note_grown_past_the_limit_while_unwatched_is_dropped_disclosed_and_not_replayed() {
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[
+            ("Alpha.md", "# Alpha\n\n[[Beta]]\n"),
+            ("Beta.md", "# Beta\n\nquokkaword\n"),
+        ]);
         let db_dir = tempfile::tempdir().unwrap();
         let db_path = db_dir.path().join("brain.lbug");
         crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
         let store = GraphStore::open_or_create(&db_path).unwrap();
+        let tantivy = TantivyIndex::open_or_create(&db_dir.path().join("tantivy")).unwrap();
         let v_uid = vault_uid("default", &root.to_string_lossy());
         let beta = note_uid(&v_uid, "Beta.md");
-        let before = store.lookup_note(&beta).unwrap().content_hash;
-        fs::write(
-            root.join("Beta.md"),
-            vec![b'x'; crate::index_md::MAX_NOTE_SIZE_BYTES as usize + 1],
-        )
-        .unwrap();
         let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
         watcher
-            .process_batch(&store, None, &v_uid, vec![root.join("Beta.md")], &None)
+            .process_batch(
+                &store,
+                Some(&tantivy),
+                &v_uid,
+                vec![root.join("Beta.md")],
+                &None,
+            )
             .unwrap();
-        assert_eq!(store.lookup_note(&beta).unwrap().content_hash, before);
-        let sidecar = crate::index_md::load_skipped_notes_sidecar(&db_path);
         assert!(
-            sidecar.skipped.iter().any(|file| file.path == "Beta.md"),
-            "grown-past-limit note must be disclosed: {sidecar:?}"
+            !tantivy.search("quokkaword", 10).unwrap().is_empty(),
+            "precondition: the note's text is searchable"
         );
+
+        let mut grown = b"# Beta\n\n".to_vec();
+        grown.resize(crate::index_md::MAX_NOTE_SIZE_BYTES as usize + 1, b'x');
+        fs::write(root.join("Beta.md"), grown).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("Beta.md"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
+        let drift = || {
+            crate::index_md::vault_startup_drift(
+                &store,
+                &root,
+                "default",
+                &GlobSet::empty(),
+                crate::index_limits::NoteLimits::default(),
+            )
+            .unwrap()
+        };
+        let first = drift();
+        assert_eq!(first, vec![root.join("Beta.md")], "replayed once");
+        watcher
+            .process_batch(&store, Some(&tantivy), &v_uid, first, &None)
+            .unwrap();
+
+        assert!(
+            store.lookup_note(&beta).is_err(),
+            "an oversized note leaves the graph"
+        );
+        assert!(
+            tantivy.search("quokkaword", 10).unwrap().is_empty(),
+            "its old text is no longer searchable"
+        );
+        let sidecar = crate::index_md::load_skipped_notes_sidecar(&db_path);
+        let rows: Vec<_> = sidecar
+            .skipped
+            .iter()
+            .filter(|file| file.path == "Beta.md")
+            .collect();
+        assert_eq!(rows.len(), 1, "disclosed once: {sidecar:?}");
+        assert_eq!(
+            rows[0].reason_code,
+            nestweaver_parser::SkipReasonCode::Oversized
+        );
+        assert!(drift().is_empty(), "a later start must not replay it again");
         assert!(
             !crate::sidecar_path(&db_path, ".index-dirty").exists(),
             "publication marker must stay clean"
@@ -4747,11 +4890,12 @@ mod tests {
         );
     }
 
-    /// nw-668 review (M5): `sidecar_scan_skipped` is reachable — an edit that
-    /// pushes a note over the size limit is not read (nw-469), the note keeps
-    /// its stored body, and so it keeps the code links that body produced.
+    /// An edit that pushes a note over the size limit drops the note, and
+    /// with it the code links its old body produced: they described text the
+    /// file no longer holds. (This used to keep the stored body and its
+    /// links, which also kept stale text searchable.)
     #[test]
-    fn nw_668_an_oversized_edit_keeps_its_previous_code_links() {
+    fn an_oversized_edit_drops_the_note_and_its_code_links() {
         let _guard = serial_watcher_test();
         let fx = nw_668_fixture(&[], 2, &["AlphaWidget", "BravoWidget"]);
         let path = fx.root.join("n000.md");
@@ -4760,8 +4904,15 @@ mod tests {
         watcher
             .process_batch(&fx.store, None, &fx.v_uid, vec![path.clone()], &None)
             .unwrap();
-        let before = nw_668_targets(&fx.store);
-        assert_eq!(before.len(), 2);
+        let dropped = note_uid(&fx.v_uid, "n000.md");
+        assert!(
+            fx.store
+                .list_references_code_edges()
+                .unwrap()
+                .iter()
+                .any(|(from, _, _, _)| *from == dropped),
+            "precondition: the note links to code"
+        );
 
         let huge = format!(
             "# A\n\nuses BravoWidget\n{}",
@@ -4771,14 +4922,15 @@ mod tests {
         watcher
             .process_batch(&fx.store, None, &fx.v_uid, vec![path.clone()], &None)
             .unwrap();
-        assert_eq!(
-            watcher
-                .last_batch_phase_timings()
-                .unwrap()
-                .sidecar_scan_skipped,
-            1
+        assert!(
+            fx.store.lookup_note(&dropped).is_err(),
+            "the oversized note leaves the graph"
         );
-        assert_eq!(nw_668_targets(&fx.store), before);
+        let edges = fx.store.list_references_code_edges().unwrap();
+        assert!(
+            edges.iter().all(|(from, _, _, _)| *from != dropped),
+            "the dropped note's links go with it: {edges:?}"
+        );
     }
 
     /// nw-668 re-review (N1): owed link debt lives in the skipped-notes

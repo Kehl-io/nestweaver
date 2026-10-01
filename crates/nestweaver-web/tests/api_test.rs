@@ -1084,7 +1084,7 @@ fn insert_named_vault_notes(store: &GraphStore, vault_uid: &str, name: &str, cou
     for i in 0..count {
         store
             .insert_note(&Note {
-                uid: format!("note:{name}:{i:04}"),
+                uid: format!("note:{vault_uid}:{i:04}"),
                 vault_uid: vault_uid.to_string(),
                 file_path: format!("n{i:04}.md"),
                 title: format!("{name} {i:04}"),
@@ -1221,7 +1221,7 @@ async fn brain_notes_cursor_pages_a_vault_past_the_offset_ceiling() {
     // A cursor and an offset together are contradictory.
     let (status, _, _) = get_json_with_total(
         &app,
-        "/api/v1/brain/notes?vault=vlt:big&after=note:big:0001&offset=5",
+        "/api/v1/brain/notes?vault=vlt:big&after=note:vlt:big:0001&offset=5",
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1264,10 +1264,10 @@ async fn get_json_with_next(app: &axum::Router, uri: &str) -> (StatusCode, Value
 async fn brain_notes_next_cursor_survives_a_dropped_corrupt_row() {
     let store = setup_test_store();
     insert_named_vault_notes(&store, "vlt:big", "big", 6);
-    // uid sorts between note:big:0001 and note:big:0002; NUL title = corrupt.
+    // uid sorts between note:vlt:big:0001 and ...:0002; NUL title = corrupt.
     store
         .insert_note(&Note {
-            uid: "note:big:0001x".to_string(),
+            uid: "note:vlt:big:0001x".to_string(),
             vault_uid: "vlt:big".to_string(),
             file_path: "corrupt.md".to_string(),
             title: "Cor\u{0}rupt".to_string(),
@@ -1294,7 +1294,7 @@ async fn brain_notes_next_cursor_survives_a_dropped_corrupt_row() {
         get_json_with_next(&app, "/api/v1/brain/notes?vault=vlt:big&limit=3").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(first.as_array().map(Vec::len), Some(2));
-    assert_eq!(next.as_deref(), Some("note:big:0001x"));
+    assert_eq!(next.as_deref(), Some("note:vlt:big:0001x"));
 
     let mut seen: Vec<String> = first
         .as_array()
@@ -1323,6 +1323,50 @@ async fn brain_notes_next_cursor_survives_a_dropped_corrupt_row() {
     }
     assert_eq!(seen.len(), 6, "every clean note is reachable: {seen:?}");
     assert_eq!(last_next, None, "the end of the vault sends no cursor");
+}
+
+/// A malformed `after` used to restart silently at page 1 (a uid sorting
+/// before every note) or return an empty "end" page (one sorting after), so a
+/// pager looped or stopped early without an error. It must be a note uid of
+/// the listed vault: anything else is 400.
+#[tokio::test]
+async fn brain_notes_rejects_a_cursor_that_is_not_a_note_uid_of_the_vault() {
+    let store = setup_test_store();
+    insert_named_vault_notes(&store, "vlt:big", "big", 6);
+    insert_named_vault_notes(&store, "vlt:other", "other", 2);
+    let app = create_router(AppState::new(
+        store,
+        None,
+        std::path::PathBuf::from("/tmp/test.lbug"),
+    ));
+    for bad in [
+        "garbage",
+        "",
+        // Double-encoded: the server receives the literal `note%3Avlt...`.
+        "note%253Avlt%253Abig%253A0001",
+        "note:vlt:other:0000",
+        "note:vlt:big:",
+        "note:vlt:big:0001:extra",
+    ] {
+        let uri = format!("/api/v1/brain/notes?vault=vlt:big&limit=2&after={bad}");
+        let (status, json) = get_json(&app, &uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {json}");
+        assert!(json["error"].as_str().unwrap().contains("after"), "{json}");
+    }
+    // Without a vault filter the cursor must still be a note uid.
+    let (status, _) = get_json(&app, "/api/v1/brain/notes?after=vlt:big").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Counterweight: a real cursor pages on, with and without the filter.
+    let (status, json) = get_json(
+        &app,
+        "/api/v1/brain/notes?vault=vlt:big&limit=2&after=note:vlt:big:0001",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json[0]["uid"], "note:vlt:big:0002");
+    let (status, _) = get_json(&app, "/api/v1/brain/notes?after=note:vlt:big:0001").await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 /// Counterweight: a vault that fits in one page sends no cursor, so a caller
@@ -2565,4 +2609,241 @@ async fn source_serves_indexed_files_under_a_symlinked_repo_root() {
     let (s, j) = get_json(&app, "/api/v1/source?file=src/main.ts&repo=repo:linked").await;
     assert_eq!(s, StatusCode::OK, "{j}");
     assert_eq!(j["lines"], json!(["hello"]));
+}
+
+/// A seed naming a vault with no notes is a valid request the graph cannot
+/// answer yet: 409, not the 404 a bogus uid gets.
+#[tokio::test]
+async fn brain_context_on_an_empty_vault_is_409_not_404() {
+    let store = GraphStore::in_memory().unwrap();
+    store
+        .insert_vault(&Vault {
+            uid: "vlt:empty".into(),
+            name: "empty".into(),
+            root_path: "/v".into(),
+            instance_id: "default".into(),
+        })
+        .unwrap();
+    let app = create_router(AppState::new(
+        store,
+        None,
+        std::path::PathBuf::from("/tmp/empty-vault.lbug"),
+    ));
+    let (status, json) = post_json(
+        &app,
+        "/api/v1/brain/context",
+        json!({ "seeds": ["vlt:empty"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    // The CLI's `--json` shape: a stable code plus a status.
+    assert_eq!(json["error"], "seed container is empty", "{json}");
+    assert_eq!(json["status"], "empty", "{json}");
+    assert!(
+        json["message"].as_str().unwrap().contains("add notes"),
+        "{json}"
+    );
+    let (status, json) = post_json(
+        &app,
+        "/api/v1/brain/context",
+        json!({ "seeds": ["vlt:bogus"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+}
+
+/// `seeds: [""]` answered 200 with arbitrary results on the code route (the
+/// engine skips a blank seed and then ranked everything). A blank seed is a
+/// malformed request on both context routes, as it is for the CLI and MCP,
+/// and so is a seed list or body past the routes' limits.
+#[tokio::test]
+async fn context_routes_reject_blank_seeds_and_oversized_requests() {
+    let app = make_app();
+    for uri in ["/api/v1/context", "/api/v1/brain/context"] {
+        for seeds in [json!([""]), json!(["   "]), json!(["greet", ""])] {
+            let (status, json) = post_json(&app, uri, json!({ "seeds": seeds })).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {seeds}: {json}");
+            assert!(json["error"].as_str().unwrap().contains("blank"), "{json}");
+        }
+        let many: Vec<String> = (0..101).map(|i| format!("s{i}")).collect();
+        let (status, json) = post_json(&app, uri, json!({ "seeds": many })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {json}");
+
+        let huge = "x".repeat(nestweaver_web::routes::context::CONTEXT_BODY_LIMIT_BYTES + 1);
+        let (status, _) = post_json(&app, uri, json!({ "seeds": [huge] })).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{uri}");
+    }
+    // Counterweight: a real seed still answers.
+    let (status, json) = post_json(&app, "/api/v1/context", json!({ "seeds": ["greet"] })).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+}
+
+/// GET returning status, content type and raw body.
+async fn get_raw(app: &axum::Router, uri: &str) -> (StatusCode, String, String) {
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        content_type,
+        String::from_utf8_lossy(&body).into_owned(),
+    )
+}
+
+/// axum's own extractor rejections (a query parameter that does not parse,
+/// a body that is not JSON) answered `text/plain`, unlike every other API
+/// error. They are JSON `{"error": ...}` now, with the same status, and an
+/// unknown API path is a JSON 404 rather than an empty body.
+#[tokio::test]
+async fn api_errors_are_json_including_extractor_rejections() {
+    let app = make_app();
+    let (status, content_type, body) = get_raw(&app, "/api/v1/brain/notes?limit=abc").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        content_type.starts_with("application/json"),
+        "{content_type}: {body}"
+    );
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        json["error"].as_str().unwrap().contains("invalid digit"),
+        "{json}"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/context")
+                .header("content-type", "application/json")
+                .body(Body::from("{not json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.status().is_client_error(), "{}", response.status());
+    assert!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("application/json")),
+        "{:?}",
+        response.headers()
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["error"].is_string(), "{json}");
+
+    let (status, content_type, body) = get_raw(&app, "/api/v1/does-not-exist").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        content_type.starts_with("application/json"),
+        "{content_type}"
+    );
+    assert!(serde_json::from_str::<Value>(&body).unwrap()["error"].is_string());
+
+    // Counterweight: a successful response is untouched.
+    let (status, content_type, _) = get_raw(&app, "/api/v1/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(content_type.starts_with("application/json"));
+}
+
+/// Outside server mode there is no admin API; `/admin/api/*` served the
+/// SPA's HTML with 200. It is a JSON 404 now.
+#[tokio::test]
+async fn admin_api_outside_server_mode_is_a_json_404() {
+    let app = make_app();
+    for uri in ["/admin/api/status", "/admin/api", "/admin/api/repos/x"] {
+        let (status, content_type, body) = get_raw(&app, uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+        assert!(
+            content_type.starts_with("application/json"),
+            "{uri}: {content_type}"
+        );
+        let json: Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            json["error"].as_str().unwrap().contains("server mode"),
+            "{json}"
+        );
+    }
+}
+
+/// Re-encoding an error as JSON keeps the response's other headers, all of
+/// their values: a 405 still says which methods the route allows.
+#[tokio::test]
+async fn a_json_405_keeps_its_allow_header() {
+    let app = make_app();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/context")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let allow: Vec<String> = response
+        .headers()
+        .get_all("allow")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect();
+    assert!(allow.iter().any(|v| v.contains("POST")), "{allow:?}");
+    assert!(
+        response
+            .headers()
+            .get("content-type")
+            .is_some_and(|v| v.to_str().unwrap().starts_with("application/json"))
+    );
+}
+
+/// An empty repo seed gets the same coded 409, with the index remedy.
+#[tokio::test]
+async fn brain_context_on_an_empty_repo_is_409_with_the_index_remedy() {
+    let store = GraphStore::in_memory().unwrap();
+    store
+        .insert_repo(&Repo {
+            uid: "repo:bare".into(),
+            url: "file:///x/bare".into(),
+            indexed_sha: "sha".into(),
+            staleness_commits_behind: 0,
+            instance_id: "default".into(),
+            name: None,
+            root_path: Some("/x/bare".into()),
+        })
+        .unwrap();
+    let app = create_router(AppState::new(
+        store,
+        None,
+        std::path::PathBuf::from("/tmp/empty-repo.lbug"),
+    ));
+    let (status, json) = post_json(
+        &app,
+        "/api/v1/brain/context",
+        json!({ "seeds": ["repo:bare"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    assert_eq!(json["status"], "empty", "{json}");
+    let message = json["message"].as_str().unwrap();
+    assert!(message.contains("index"), "{json}");
+    assert!(!message.contains("add notes"), "{json}");
 }
