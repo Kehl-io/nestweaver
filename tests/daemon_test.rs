@@ -7938,6 +7938,7 @@ impl CrashScratch {
 
     /// Start a daemon that will die on SIGSEGV the moment it serves `impact`,
     /// then run `impact` against it and return that command's output.
+    #[cfg(debug_assertions)]
     fn crash_daemon_with_impact(&self) -> std::process::Output {
         self.daemon("start")
             .env("NESTWEAVER_TEST_SEGV_ON_TOOL", "brain_impact")
@@ -7954,6 +7955,7 @@ impl CrashScratch {
     }
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn a_daemon_killed_by_a_signal_mid_request_is_named_not_reported_as_transport() {
     let scratch = CrashScratch::new();
@@ -8004,6 +8006,7 @@ fn a_daemon_killed_by_a_signal_mid_request_is_named_not_reported_as_transport() 
 /// `daemon restart` is a clean shutdown whose state directory survives (the
 /// client holds the spawnlock across it), so the successor reporting nothing
 /// proves the shutdown cleared the record rather than a directory sweep.
+#[cfg(debug_assertions)]
 #[test]
 fn a_clean_daemon_cycle_clears_the_crash_warning() {
     let scratch = CrashScratch::new();
@@ -8029,6 +8032,7 @@ fn a_clean_daemon_cycle_clears_the_crash_warning() {
     );
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn a_second_crash_is_counted() {
     let scratch = CrashScratch::new();
@@ -8115,6 +8119,7 @@ fn a_sigkilled_daemon_is_reported_as_an_unexpected_exit_not_an_engine_crash() {
     );
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn an_mcp_tool_call_that_crashes_the_daemon_returns_an_error_result() {
     let scratch = CrashScratch::new();
