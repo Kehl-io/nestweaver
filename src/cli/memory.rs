@@ -263,9 +263,10 @@ pub(crate) fn print_memory_lint_text(payload: &serde_json::Value) {
         broken.len().to_string()
     };
     println!(
-        "  broken wikilinks:      {broken_count} ({} genuinely broken, {} lower-tier resolutions)",
+        "  broken wikilinks:      {broken_count} ({} unresolved, {} ambiguous on this page; {} low-confidence resolutions listed separately, not broken)",
         lint_unresolved,
-        broken.len().saturating_sub(lint_unresolved)
+        broken.len().saturating_sub(lint_unresolved),
+        json_total(payload, "low_confidence_wikilinks")
     );
     println!(
         "  supersession chains:   {}",

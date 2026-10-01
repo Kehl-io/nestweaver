@@ -29,13 +29,16 @@ pub const DEFAULT_ORPHAN_ALLOWLIST: &[&str] = &[
 
 /// A wikilink that resolved at less than full confidence, or not at all.
 ///
-/// `resolved_target_uid` is the difference between the two, and it matters:
-/// confidence encodes WHICH RESOLVER TIER matched, not how likely the link is
-/// to be wrong. A same-folder match scores 0.95 and a unique global
-/// filename-stem match scores 0.90 — both are unique, unambiguous resolutions,
-/// and the latter is exactly how Obsidian resolves a bare `[[Note]]`. Reporting
-/// those as "broken" alongside links that point at nothing told callers that
-/// three quarters of a healthy vault was broken (nw-100).
+/// Three kinds share this row, told apart by [`BrokenLink::is_unresolved`]
+/// and [`BrokenLink::is_ambiguous`]: a link that points at nothing and one
+/// that names several notes are BROKEN; a link that resolved to ONE note by a
+/// fuzzier tier (a stem shared by several notes and narrowed by folder
+/// proximity, a path whose basename alone matched, an alias) is low
+/// confidence and not broken. Confidence encodes WHICH RESOLVER TIER matched,
+/// not how likely the link is to be wrong, and an exact, unique name match
+/// resolves at 1.0 and never appears here. Reporting lower-tier resolutions
+/// as "broken" alongside links that point at nothing told callers that three
+/// quarters of a healthy vault was broken.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrokenLink {
     pub source_uid: String,
@@ -62,8 +65,15 @@ pub struct BrokenLink {
     #[serde(default)]
     pub suggested_total: usize,
     /// The note this link actually points at, when it resolved. `None` means
-    /// no target exists — the only case that is genuinely broken.
+    /// no target exists.
     pub resolved_target_uid: Option<String>,
+    /// How many notes the link resolved to: 0 when unresolved, 1 for a
+    /// single lower-confidence target, more than 1 when ambiguous.
+    ///
+    /// `#[serde(default)]` for a reply from a daemon older than this field;
+    /// it then reads 0, and [`BrokenLink::is_ambiguous`] stays false.
+    #[serde(default)]
+    pub candidate_count: usize,
 }
 
 impl BrokenLink {
@@ -71,6 +81,65 @@ impl BrokenLink {
     pub fn is_unresolved(&self) -> bool {
         self.resolved_target_uid.is_none()
     }
+
+    /// True when the link names several notes and none was chosen.
+    pub fn is_ambiguous(&self) -> bool {
+        self.candidate_count > 1
+    }
+
+    /// True when the link is broken: unresolved or ambiguous. A link that
+    /// resolved to ONE note at a lower tier is low confidence, not broken.
+    pub fn is_broken(&self) -> bool {
+        self.is_unresolved() || self.is_ambiguous()
+    }
+}
+
+/// [`broken_links`] split into the broken links (unresolved or ambiguous)
+/// and the low-confidence ones (one target, found by a fuzzier tier), each in
+/// the store's severity order.
+pub fn split_broken_links(links: Vec<BrokenLink>) -> (Vec<BrokenLink>, Vec<BrokenLink>) {
+    links.into_iter().partition(BrokenLink::is_broken)
+}
+
+/// The `broken-links` payload, shared by the CLI's direct route and the MCP
+/// `brain_broken_links` tool so the two cannot drift.
+///
+/// `broken_links` holds only broken links (unresolved or ambiguous) and
+/// `total` counts them; `low_confidence` is a separate list of links that
+/// resolved to one note below full confidence, counted by
+/// `low_confidence_total` and not broken. `offset`/`limit` window both lists.
+pub fn broken_links_payload(
+    store: &GraphStore,
+    max_suggestions: usize,
+    offset: usize,
+    limit: usize,
+) -> Result<serde_json::Value> {
+    let (broken, low) = split_broken_links(broken_links(store, max_suggestions)?);
+    let unresolved = broken.iter().filter(|l| l.is_unresolved()).count();
+    let ambiguous = broken.len() - unresolved;
+    let window = |rows: Vec<BrokenLink>| -> (Vec<BrokenLink>, usize) {
+        let total = rows.len();
+        let page = if limit == 0 {
+            rows.into_iter().skip(offset).collect()
+        } else {
+            rows.into_iter().skip(offset).take(limit).collect()
+        };
+        (page, total)
+    };
+    let (broken_page, total) = window(broken);
+    let (low_page, low_total) = window(low);
+    Ok(serde_json::json!({
+        "unresolved": unresolved,
+        "ambiguous": ambiguous,
+        "offset": offset,
+        "returned": broken_page.len(),
+        "total": total,
+        "truncated": broken_page.len() < total,
+        "broken_links": broken_page,
+        "low_confidence_total": low_total,
+        "low_confidence_truncated": low_page.len() < low_total,
+        "low_confidence": low_page,
+    }))
 }
 
 /// Find wikilinks that resolved below full confidence OR not at all, pairing
@@ -108,6 +177,7 @@ pub fn broken_links(store: &GraphStore, max_suggestions: usize) -> Result<Vec<Br
             } else {
                 Some(r.current_target_uid)
             },
+            candidate_count: r.candidate_count,
         });
     }
     Ok(out)
@@ -570,11 +640,17 @@ pub struct DocStats {
     /// inventing a proxy for them here would recreate exactly the defect this
     /// field exists to close. `brain add` reports them.
     pub unresolved_link_section_targets: usize,
-    /// Links that DID resolve, but below full confidence — a same-folder or
-    /// unique filename-stem match rather than a path or unique-title match.
-    /// Counted separately because folding them into the unresolved count
-    /// reported 75% of a healthy vault as broken when the real figure was 11%
-    /// (nw-100). Same (source note, target text) dedup.
+    /// Links that name several notes (ambiguous). Broken, like unresolved
+    /// ones. Same (source note, target text) dedup. `#[serde(default)]` for
+    /// a reply from a daemon older than this field.
+    #[serde(default)]
+    pub ambiguous_link_targets: usize,
+    /// Links that resolved to ONE note, but below full confidence — a
+    /// proximity-narrowed, path-basename or alias match rather than an exact
+    /// path or exact unique name. Not broken. Counted separately because
+    /// folding them into the unresolved count reported 75% of a healthy vault
+    /// as broken when the real figure was 11%. Same (source note,
+    /// target text) dedup.
     pub low_confidence_link_targets: usize,
     pub orphans: usize,
     pub avg_outdegree: f64,
@@ -592,9 +668,10 @@ pub fn doc_stats(store: &GraphStore, top_tags_limit: usize) -> Result<DocStats> 
     let unresolved_link_section_targets = store
         .count_unresolved_wikilink_nodes()
         .map_err(|e| anyhow::anyhow!(e))?;
-    let suspect = broken_links(store, 0)?;
-    let broken = suspect.iter().filter(|l| l.is_unresolved()).count();
-    let low_confidence = suspect.len() - broken;
+    let (broken_links, low_confidence_links) = split_broken_links(broken_links(store, 0)?);
+    let broken = broken_links.iter().filter(|l| l.is_unresolved()).count();
+    let ambiguous = broken_links.len() - broken;
+    let low_confidence = low_confidence_links.len();
     let orphans = orphan_documents(store, None, None, &[])?.len();
 
     // avg_outdegree: note-level wikilink edges / total notes.
@@ -636,6 +713,7 @@ pub fn doc_stats(store: &GraphStore, top_tags_limit: usize) -> Result<DocStats> 
         wikilink_edges,
         unresolved_link_targets: broken,
         unresolved_link_section_targets,
+        ambiguous_link_targets: ambiguous,
         low_confidence_link_targets: low_confidence,
         orphans,
         avg_outdegree,
@@ -731,6 +809,11 @@ mod tests {
             ("folder/Sibling.md", "# Different Title Entirely\n"),
             ("folder/Second.md", "# Another Title\n"),
             ("folder/Third.md", "# Yet Another Title\n"),
+            // Same stems elsewhere, so the sibling links are proximity-narrowed
+            // lower-tier resolutions rather than exact unique matches.
+            ("other/Sibling.md", "# Elsewhere One\n"),
+            ("other/Second.md", "# Elsewhere Two\n"),
+            ("other/Third.md", "# Elsewhere Three\n"),
         ]);
         let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
 
@@ -783,8 +866,8 @@ mod tests {
     /// nw-100: a link that resolved at a lower tier is NOT broken.
     ///
     /// `[[Sibling]]` in `folder/a.md` resolves to `folder/Sibling.md` by
-    /// same-folder match at confidence 0.95 — a unique, unambiguous target, and
-    /// how Obsidian itself resolves a bare link. It must carry a
+    /// same-folder match at confidence 0.95 — `other/Sibling.md` shares the
+    /// stem, so proximity picked ONE target. It must carry a
     /// `resolved_target_uid`, and `doc_stats` must not count it as broken.
     #[test]
     fn a_lower_tier_resolution_is_not_broken() {
@@ -794,6 +877,7 @@ mod tests {
                 "# A\n\nSee [[Sibling]] and [[Nowhere At All]].\n",
             ),
             ("folder/Sibling.md", "# Different Title Entirely\n\nhi\n"),
+            ("other/Sibling.md", "# Another Sibling\n\nhi\n"),
         ]);
         let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
 
@@ -1253,5 +1337,100 @@ mod tests {
         assert_eq!(stats.total_notes, 0);
         assert_eq!(stats.orphans, 0);
         assert_eq!(stats.avg_outdegree, 0.0);
+    }
+
+    /// A three-note vault whose links name their targets exactly must lint
+    /// clean: `[[Hub]]` and `[[Spoke]]` are exact, unique title matches, so
+    /// they are resolved links (confidence 1.0) and appear on no broken or
+    /// low-confidence list. COUNTERWEIGHT: `[[Missing]]` points at nothing,
+    /// stays at 0.0 and is the one broken link.
+    #[test]
+    fn an_exact_unique_title_link_is_resolved_and_a_missing_one_stays_broken() {
+        let (_dir, root) = make_vault(&[
+            ("Hub.md", "# Hub\n\nSee [[Spoke]].\n"),
+            ("Spoke.md", "# Spoke\n\nBack to [[hub]].\n"),
+            ("Broken.md", "# Broken\n\nSee [[Missing]].\n"),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let links = broken_links(&store, 5).unwrap();
+        assert_eq!(
+            links.len(),
+            1,
+            "only [[Missing]] may be reported; exact unique titles are resolved: {links:?}"
+        );
+        let missing = &links[0];
+        assert!(missing.wikilink_text.eq_ignore_ascii_case("Missing"));
+        assert_eq!(missing.confidence, 0.0);
+        assert!(missing.is_broken() && missing.is_unresolved());
+
+        let stats = doc_stats(&store, 5).unwrap();
+        assert_eq!(stats.unresolved_link_targets, 1);
+        assert_eq!(stats.ambiguous_link_targets, 0);
+        assert_eq!(stats.low_confidence_link_targets, 0);
+
+        let lint = crate::brain_memory::memory_lint(&store, 0.0).unwrap();
+        assert_eq!(
+            lint.broken_wikilinks.len(),
+            1,
+            "{:?}",
+            lint.broken_wikilinks
+        );
+        assert!(lint.low_confidence_wikilinks.is_empty());
+    }
+
+    /// Ambiguous links (several candidates) are broken; a proximity-narrowed
+    /// or otherwise lower-tier resolution to ONE note is low confidence and
+    /// is not broken.
+    #[test]
+    fn ambiguous_links_are_broken_and_lower_tier_links_are_low_confidence() {
+        let (_dir, store) = f9_vault();
+        let links = broken_links(&store, 5).unwrap();
+        let dup = links
+            .iter()
+            .find(|b| b.wikilink_text.eq_ignore_ascii_case("Dup"))
+            .expect("[[Dup]] names two notes");
+        assert!(dup.is_ambiguous() && dup.is_broken(), "{dup:?}");
+        assert_eq!(dup.candidate_count, 2);
+
+        let (_dir, root) = make_vault(&[
+            ("folder/a.md", "# A\n\nSee [[Sibling]].\n"),
+            ("folder/Sibling.md", "# One\n"),
+            ("other/Sibling.md", "# Two\n"),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        let links = broken_links(&store, 5).unwrap();
+        let sibling = links
+            .iter()
+            .find(|b| b.wikilink_text.eq_ignore_ascii_case("Sibling"))
+            .expect("the same-folder pick among two files is a lower-tier resolution");
+        assert!(sibling.confidence < 1.0);
+        assert!(
+            !sibling.is_broken() && !sibling.is_ambiguous(),
+            "{sibling:?}"
+        );
+        let stats = doc_stats(&store, 5).unwrap();
+        assert_eq!(stats.unresolved_link_targets, 0);
+        assert_eq!(stats.ambiguous_link_targets, 0);
+        assert_eq!(stats.low_confidence_link_targets, 1);
+    }
+
+    /// A unique filename stem is NOT an exact unique match when a different
+    /// note carries the same name as its title: two notes answer to the name,
+    /// so the filename pick stays below 1.0 and visible for review.
+    #[test]
+    fn a_unique_stem_that_another_note_uses_as_a_title_stays_low_confidence() {
+        let (_dir, root) = make_vault(&[
+            ("a.md", "# A\n\nSee [[Plan]].\n"),
+            ("Plan.md", "# The Plan File\n"),
+            ("notes/other.md", "# Plan\n"),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        let links = broken_links(&store, 5).unwrap();
+        let plan = links
+            .iter()
+            .find(|b| b.wikilink_text.eq_ignore_ascii_case("Plan"))
+            .expect("a filename pick contested by a title must stay reviewable");
+        assert!(plan.confidence < 1.0 && !plan.is_broken(), "{plan:?}");
     }
 }

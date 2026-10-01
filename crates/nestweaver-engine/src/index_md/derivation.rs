@@ -5,7 +5,14 @@ use std::collections::BTreeMap;
 use std::path::Component;
 use std::time::Duration;
 
-pub const MARKDOWN_LINK_DERIVATION_VERSION: u32 = 1;
+/// Bump whenever the wikilink resolver would store a different edge or
+/// confidence for the same notes: the daemon then re-derives every vault
+/// recorded at an older version, so no brain keeps links scored by the old
+/// rules until someone happens to refresh it.
+///
+/// 2: an exact, unique name match resolves at 1.0 instead of a 0.90-0.95
+/// filename tier.
+pub const MARKDOWN_LINK_DERIVATION_VERSION: u32 = 2;
 const MAX_CAPTURE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_CAPTURE_NOTES: usize = 100_000;
 const PREPARATION_BUDGET: Duration = Duration::from_secs(60);

@@ -2264,6 +2264,21 @@ fn parse_unit_interval_f32(value: &str) -> Result<f32, String> {
 /// tools cannot re-diverge one at a time the way they arrived here, and
 /// rejects at PARSE TIME so all four affected CLI/MCP surfaces settle on one
 /// exit code (64) instead of `regex-search`'s prior 1.
+/// A `brain context --kinds` value, checked at parse time with the MCP
+/// tool's own rule and message, so a bad kind is a usage error (exit 64)
+/// that lists the valid kinds on both routes.
+fn parse_brain_context_kind(value: &str) -> Result<String, String> {
+    nestweaver_mcp::tools::validate_brain_context_kinds(&[value.to_string()])
+        .map(|()| value.to_string())
+        .map_err(|error| error.to_string())
+}
+
+/// A `--intent` value, checked at parse time so a bad one is a usage error
+/// (exit 64) naming the valid intents rather than an internal error.
+fn parse_query_intent(value: &str) -> Result<String, String> {
+    value.parse::<QueryIntent>().map(|_| value.to_string())
+}
+
 fn parse_non_blank_query(value: &str) -> Result<String, String> {
     if nestweaver_mcp::tools::is_blank_query(value) {
         Err("empty query strings are not allowed".to_string())
@@ -2324,14 +2339,17 @@ fn print_link_suggestions(l: &nestweaver_engine::BrokenLink) {
 
 fn describe_link_resolution(link: &nestweaver_engine::BrokenLink) -> String {
     match &link.resolved_target_uid {
+        _ if link.is_ambiguous() => {
+            format!("AMBIGUOUS — {} notes match", link.candidate_count)
+        }
         Some(uid) => format!("resolves to {uid}"),
         None => "UNRESOLVED — no such note".to_string(),
     }
 }
 
-/// Summarise how many entries are genuinely broken versus merely resolved at a
-/// lower tier, so the headline count cannot be read as "all of these are
-/// broken".
+/// Summarise how many links are broken (unresolved or ambiguous) and how many
+/// more merely resolved to one note at a lower tier, so the headline count
+/// cannot be read as "all of these are broken".
 ///
 /// The counts are over the whole POPULATION, never the returned page. Computing
 /// them from the page printed "0 unresolved (genuinely broken)" on a vault with
@@ -2340,10 +2358,15 @@ fn describe_link_resolution(link: &nestweaver_engine::BrokenLink) -> String {
 /// the benign category. Ordering is being fixed in `broken_wikilinks`, but a
 /// page is still a sample — only the population can answer "does this vault
 /// have broken links".
-fn print_link_classification(total_unresolved: usize, total_low_confidence: usize) {
+fn print_link_classification(
+    total_unresolved: usize,
+    total_ambiguous: usize,
+    total_low_confidence: usize,
+) {
     println!(
-        "  {total_unresolved} unresolved (genuinely broken), {total_low_confidence} resolved at a lower \
-         confidence tier (same-folder or filename-stem match — not broken)"
+        "  {total_unresolved} unresolved and {total_ambiguous} ambiguous (broken); \
+         {total_low_confidence} more resolved to one note at a lower confidence tier \
+         (listed separately, not broken)"
     );
 }
 
@@ -6679,6 +6702,7 @@ enum Commands {
         config: Option<PathBuf>,
         #[arg(
             long,
+            value_parser = parse_query_intent,
             help = "Query intent override: find-definition, understand-architecture, analyze-impact, general-context"
         )]
         intent: Option<String>,
@@ -8864,6 +8888,7 @@ enum BrainCommands {
         #[arg(
             long = "kinds",
             value_delimiter = ',',
+            value_parser = parse_brain_context_kind,
             help = "Keep only nodes with these kind prefixes (e.g. Symbol,Note)"
         )]
         kinds: Vec<String>,
@@ -9010,6 +9035,7 @@ enum BrainCommands {
         /// can force a specific traversal profile against the unified brain.
         #[arg(
             long = "intent",
+            value_parser = parse_query_intent,
             help = "Query intent override: find-definition, understand-architecture, analyze-impact, blast-radius, general-context"
         )]
         intent: Option<String>,
@@ -10610,6 +10636,23 @@ fn format_code_links_status(links: &nestweaver_proto::CodeLinksStatus) -> Option
     Some(line)
 }
 
+/// Install the declared `[[links]]` the resolver-generation gate reads, for
+/// a route that answers without the daemon: the explicit `--config`, else the
+/// config this database's daemon last started with. The daemon and MCP server
+/// install their own; without this the direct route never saw a declared
+/// link, so a stale repository linked only by one read as unrelated.
+fn install_declared_links_for_direct_route(db_path: &Path, explicit: Option<&Path>) {
+    let path = explicit.map(Path::to_path_buf).or_else(|| {
+        nestweaver_daemon::lifecycle::read_last_successful_config(db_path)
+            .ok()
+            .map(|record| PathBuf::from(record.config_path))
+    });
+    let config = path
+        .and_then(|path| nestweaver_engine::InstanceConfig::from_file(&path).ok())
+        .map(std::sync::Arc::new);
+    nestweaver_engine::resolver_generation::set_declared_link_config(config);
+}
+
 fn load_instance_config_opt(path: Option<&Path>) -> Option<nestweaver_engine::InstanceConfig> {
     let p = path?;
     match nestweaver_engine::InstanceConfig::from_file(p) {
@@ -10984,9 +11027,22 @@ const BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR: &str = "resolver.generation-stale"
 fn degrade_blast_radius_if_resolver_stale(
     store: &GraphStore,
     db_path: &Path,
+    changed_files: &[PathBuf],
     result: &mut BlastRadiusResult,
 ) -> Result<(), anyhow::Error> {
-    let repos = store.list_repos(None)?;
+    let mut repos = store.list_repos(None)?;
+    // Only a stale repository that owns or is linked to a changed
+    // file degrades; the engine already disclosed any unrelated one.
+    let changed: Vec<String> = changed_files
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    nestweaver_engine::resolver_generation::incompatibility_for_changed_files_at(
+        store,
+        Some(db_path),
+        &changed,
+    )?
+    .retain_degrading(&mut repos);
     let Some(refusal) =
         nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(db_path, &repos)
     else {
@@ -16226,6 +16282,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     args["repo"] = serde_json::json!(r);
                 }
                 match try_hybrid_json_rpc(use_daemon, &db_path, None, "service_summary", args) {
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
                     Err(error)
                         if error.chain().any(|cause| {
                             cause
@@ -16243,12 +16302,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok(Some(value)) => serde_json::from_value(strip_hybrid_meta(value)).ok(),
                     Ok(None) => {
                         let store = open_store(db.as_deref())?;
-                        nestweaver_engine::query::service_summary(
+                        match nestweaver_engine::query::service_summary(
                             &store,
                             &name,
                             instance.as_deref(),
                             repo.as_deref(),
-                        )?
+                        ) {
+                            Err(error) if error_is_unresolved_repo_filter(&error) => {
+                                return Ok((report_unresolved_repo_filter(&error, json), None));
+                            }
+                            other => other?,
+                        }
                     }
                 }
             };
@@ -16456,6 +16520,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let payload = match routed {
                 Ok(Some(value)) => value,
                 Ok(None) => unreachable!("the direct leg always yields a payload or an error"),
+                // `--repo` is a row filter resolved like every other one.
+                Err(error) if error_is_unresolved_repo_filter(&error) => {
+                    return Ok((report_unresolved_repo_filter(&error, json), None));
+                }
                 Err(error) if format!("{error:#}").contains("Ambiguous") => {
                     if json {
                         println!(
@@ -16763,6 +16831,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let payload = match routed {
                 Ok(Some(value)) => value,
                 Ok(None) => unreachable!("the direct leg always yields a payload or an error"),
+                // `--repo` disambiguates the name through the repo resolver.
+                Err(error) if error_is_unresolved_repo_filter(&error) => {
+                    return Ok((report_unresolved_repo_filter(&error, json), None));
+                }
                 Err(error) if format!("{error:#}").contains("no symbol found") => {
                     if json {
                         print_json_not_found("symbol", &name_or_uid);
@@ -18599,6 +18671,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             config: config_opt,
         } => {
             let db_path = resolve_db_with_config(db, config_opt.as_deref())?;
+            if let Err((code, message)) = reject_oversized_repo_selectors(&repos) {
+                eprintln!("{message}");
+                return Ok((code, None));
+            }
 
             // nw-479: a `--repo` scope takes a COMPLETELY separate path —
             // computed on the repo-induced subgraph by the `clusters` tool
@@ -19142,6 +19218,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             require_existing_db(&db_path)?;
+            install_declared_links_for_direct_route(&db_path, config.as_deref());
 
             let mut args = serde_json::json!({
                 "changed_files": files,
@@ -19221,6 +19298,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             require_existing_db(&db_path)?;
+            install_declared_links_for_direct_route(&db_path, config.as_deref());
             // nw-174 added a default cap to the underlying tool. Without a flag
             // here the CLI would inherit the ceiling with no way to raise it,
             // silently truncating output for scripts and CI that parse
@@ -19330,6 +19408,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let payload = match routed {
                 Ok(Some(value)) => value,
                 Ok(None) => unreachable!("the direct leg always yields a payload or an error"),
+                Err(error) if error_is_unresolved_repo_filter(&error) => {
+                    return Ok((report_unresolved_repo_filter(&error, json), None));
+                }
                 Err(error)
                     if {
                         let rendered = format!("{error:#}");
@@ -19394,6 +19475,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 serialize_dead_code_page,
             };
             let db_path = db.clone().unwrap_or_else(default_db_path);
+            if let Err((code, message)) = reject_oversized_repo_selectors(&repos) {
+                eprintln!("{message}");
+                return Ok((code, None));
+            }
             let mut args =
                 serde_json::json!({ "min_confidence": min_confidence, "offset": offset });
             if let Some(n) = limit {
@@ -19426,7 +19511,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // substitute or merge an upstream population for this route.
                 require_existing_db(&db_path)?;
                 let runtime = tokio::runtime::Runtime::new()?;
-                runtime.block_on(async {
+                let answer = runtime.block_on(async {
                     let query = async {
                         let mut client =
                             nestweaver_client::DaemonClient::connect(&db_path, None).await?;
@@ -19446,7 +19531,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             .context("local daemon dead-code request timed out")?,
                         None => query.await,
                     }
-                })?
+                });
+                match answer {
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
+                    other => other?,
+                }
             } else {
                 let store = open_store(db.as_deref())?;
                 let all_repos = store.list_repos(None)?;
@@ -19467,7 +19558,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let scope = if repos.is_empty() {
                     None
                 } else {
-                    Some(resolve_repo_filter(&store, &repos)?)
+                    match resolve_repo_filter(&store, &repos) {
+                        Ok(scope) => Some(scope),
+                        Err(error) if error_is_unresolved_repo_filter(&error) => {
+                            return Ok((report_unresolved_repo_filter(&error, json), None));
+                        }
+                        Err(error) => return Err(error),
+                    }
                 };
                 let request = DeadCodePageRequest {
                     min_confidence: DeadCodeConfidence::from_str_loose(&min_confidence)
@@ -19740,6 +19837,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
+            install_declared_links_for_direct_route(&db_path, None);
             let repo_root = detect_repo_root();
 
             // The default (neither --json nor --sarif) is the concise advisory
@@ -19903,7 +20001,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // is the merge-gate surface most likely to be read by a machine
             // that never sees the JSON, and `--sarif` also forces this direct
             // path, so it is the leg that most needs the marker.
-            degrade_blast_radius_if_resolver_stale(&store, &db_path, &mut result)?;
+            degrade_blast_radius_if_resolver_stale(&store, &db_path, &changed_files, &mut result)?;
 
             if sarif {
                 let mut sarif_value =
@@ -19953,6 +20051,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
+            install_declared_links_for_direct_route(&db_path, None);
 
             // Resolve changed files: explicit --files, else git diff against --base-ref.
             // Computed up front so the daemon path can send a proper
@@ -20120,7 +20219,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // direction nothing downstream can detect. See
                     // `WHY_AFFECTED_TESTS_REFUSES` for why this refuses where
                     // `pr-impact` degrades.
-                    let repos = store.list_repos(None)?;
+                    // Only a stale repository that owns or is linked
+                    // to a changed file refuses; an unrelated one is disclosed
+                    // in the selection's notifications instead.
+                    let mut repos = store.list_repos(None)?;
+                    nestweaver_engine::resolver_generation::incompatibility_for_changed_files_at(
+                        &store,
+                        Some(&db_path),
+                        &changed_files,
+                    )?
+                    .retain_degrading(&mut repos);
                     if let Some(refusal) =
                         nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(
                             &db_path, &repos,
@@ -22086,13 +22194,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
             #[allow(clippy::collapsible_if)]
             if use_daemon {
-                if let Some(value) = try_hybrid_json_rpc_checked(
+                let answer = match try_hybrid_json_rpc_checked(
                     true,
                     &db_path,
                     config_opt.as_deref(),
                     "brain_impact",
                     impact_args,
-                )? {
+                ) {
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
+                    other => other?,
+                };
+                if let Some(value) = answer {
                     // nw-451: unwrap a two-tier envelope BEFORE anything reads
                     // this payload. `brain_impact` is TwoTier-routed, so with a
                     // healthy upstream `status` and `impact_nodes` live inside
@@ -22255,7 +22369,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let store = open_store(Some(&db_path))?;
 
             // Resolve the symbol UID first (may be a name).
-            match resolve_uid_with_repo_filter(&store, &name_or_uid, repo_filter.as_deref())? {
+            let resolved =
+                match resolve_uid_with_repo_filter(&store, &name_or_uid, repo_filter.as_deref()) {
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
+                    other => other?,
+                };
+            match resolved {
                 ResolveResult::Found(uid) => {
                     let threshold = min_score.unwrap_or(nestweaver_store::DEFAULT_IMPACT_THRESHOLD);
                     let result = store.impact_with_flags_and_threshold(
@@ -22814,8 +22935,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // makes `semantic_applied` finally answer honestly on the
                 // route where it was previously ignored.
                 args["no_embed"] = serde_json::json!(no_embed);
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "investigate", args)?
-                {
+                let answer = match try_hybrid_json_rpc(true, &db_path, None, "investigate", args) {
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
+                    other => other?,
+                };
+                if let Some(value) = answer {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -22836,7 +22962,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // "all" is the honest name for the no-restriction default and is
             // already an advertised option.
             let scope = scope.unwrap_or_else(|| "all".to_string());
-            let result = nestweaver_engine::investigate(
+            let result = match nestweaver_engine::investigate(
                 &store,
                 tantivy.as_ref(),
                 Some(&db_path),
@@ -22845,7 +22971,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 &scope,
                 Some(token_budget),
                 None,
-            )?;
+            ) {
+                Err(error) if error_is_unresolved_repo_filter(&error) => {
+                    return Ok((report_unresolved_repo_filter(&error, json), None));
+                }
+                other => other?,
+            };
             // Built unconditionally so text and JSON render from the SAME
             // payload, and so the daemon path can reuse the renderer (nw-108).
             let mut payload = serde_json::to_value(&result)?;
@@ -25856,37 +25987,20 @@ fn resolve_uid(store: &GraphStore, name_or_uid: &str) -> anyhow::Result<ResolveR
 }
 
 /// Like [`resolve_uid`] but applies an optional repo filter to narrow ambiguous
-/// matches. When `repo_filter` is `Some`, only symbols belonging to a repo
-/// whose display name matches the filter are kept. Also matches against
-/// file_path prefix and UID substring as fallbacks.
+/// matches. The filter is resolved by `resolve_repo_filter`, the one resolver
+/// every repo filter uses, so a selector naming no repo, several repos, or a
+/// malformed one fails with its class instead of a substring guess.
 fn resolve_uid_with_repo_filter(
     store: &GraphStore,
     name_or_uid: &str,
     repo_filter: Option<&str>,
 ) -> anyhow::Result<ResolveResult> {
-    let result = resolve_uid(store, name_or_uid)?;
     let Some(filter) = repo_filter else {
-        return Ok(result);
+        return resolve_uid(store, name_or_uid);
     };
-
-    let filter_lower = filter.to_lowercase();
-    // Build a repo_uid → display_name map for matching
-    let repos = list_repos(store, None)?;
-    let repo_names: std::collections::HashMap<String, String> = repos
-        .iter()
-        .map(|r| (r.uid.clone(), nestweaver_engine::repo_display_name(r)))
-        .collect();
-    let matches_filter = |s: &Symbol| -> bool {
-        // Match by repo display name (primary — supports --name overrides)
-        if let Some(name) = repo_names.get(&s.repo_uid)
-            && name.to_lowercase().contains(&filter_lower)
-        {
-            return true;
-        }
-        // Fallback: file_path prefix or UID substring
-        s.file_path.to_lowercase().starts_with(&filter_lower)
-            || s.uid.to_lowercase().contains(&filter_lower)
-    };
+    let repos = resolve_repo_filter(store, &[filter.to_string()])?;
+    let result = resolve_uid(store, name_or_uid)?;
+    let matches_filter = |s: &Symbol| -> bool { repos.contains(&s.repo_uid) };
 
     match &result {
         ResolveResult::Ambiguous(candidates) => {
@@ -26291,6 +26405,42 @@ mod repo_filter_honesty_tests {
         let err = reject_oversized_repo_selectors(&[long]).expect_err("must reject");
         assert_eq!(err.0, EXIT_USAGE);
         assert!(err.1.contains("PROTOCOL_ERROR") || err.1.contains("REJECTED"));
+    }
+
+    /// The daemon route: a status whose message is only the tool's outer
+    /// context still reports the class carried in its details.
+    #[test]
+    fn a_daemon_repo_filter_status_keeps_its_exit_code() {
+        for (class, expected) in [
+            ("not_found", EXIT_NOT_FOUND),
+            ("ambiguous", EXIT_AMBIGUOUS),
+            ("malformed", EXIT_USAGE),
+        ] {
+            let envelope = serde_json::json!({
+                "status": class,
+                "error": class,
+                "repo": "web-app",
+                "message": "repo filter entry \"web-app\": failed",
+            });
+            let mut status = tonic::Status::with_details(
+                tonic::Code::InvalidArgument,
+                "tool clusters failed: compute_clusters_scoped",
+                serde_json::to_vec(&envelope).unwrap().into(),
+            );
+            status.metadata_mut().insert(
+                nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY,
+                nestweaver_engine::node_scope::REPO_FILTER_UNRESOLVED_CODE
+                    .parse()
+                    .unwrap(),
+            );
+            let error = anyhow::Error::new(status).context("clusters rpc failed");
+            assert!(error_is_unresolved_repo_filter(&error));
+            assert_eq!(
+                report_unresolved_repo_filter(&error, false),
+                expected,
+                "{class}"
+            );
+        }
     }
 
     #[test]
@@ -38760,7 +38910,23 @@ mod resolver_generation_gate_tests {
     fn store_with_one_repo(root: &std::path::Path) -> GraphStore {
         let store = GraphStore::in_memory().unwrap();
         store.insert_repo(&repo_row(root)).unwrap();
+        // The changed file the gate tests pass belongs to this repo (
+        // a stale repository degrades only a change it owns or reaches).
         store
+            .insert_file(&nestweaver_schema::File {
+                uid: format!("file:{REPO}:src/lib.rs"),
+                path: CHANGED.to_string(),
+                repo_uid: REPO.to_string(),
+                content_hash: "h".to_string(),
+            })
+            .unwrap();
+        store
+    }
+
+    const CHANGED: &str = "src/lib.rs";
+
+    fn changed() -> Vec<PathBuf> {
+        vec![PathBuf::from(CHANGED)]
     }
 
     /// A run that reported the clean gate this item is about: `Complete`,
@@ -38801,7 +38967,7 @@ mod resolver_generation_gate_tests {
         // is the "indexed before this record existed" case by definition.
 
         let mut result = clean_result();
-        degrade_blast_radius_if_resolver_stale(&store, &db_path, &mut result).unwrap();
+        degrade_blast_radius_if_resolver_stale(&store, &db_path, &changed(), &mut result).unwrap();
 
         assert_eq!(result.status, AnalysisStatus::Degraded);
         assert_eq!(
@@ -38831,6 +38997,39 @@ mod resolver_generation_gate_tests {
         );
     }
 
+    /// A stale repository that neither owns the changed file nor is
+    /// linked to it does not degrade the direct `pr-impact` gate. The test
+    /// above is the counterweight: the owning repository stale degrades.
+    #[test]
+    fn an_unrelated_stale_repo_does_not_degrade_the_direct_blast_radius_gate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("nestweaver.lbug");
+        let store = store_with_one_repo(tmp.path());
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:default:unrelated".to_string(),
+                url: "https://github.com/example/unrelated".to_string(),
+                indexed_sha: "deadbeef".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        resolver_generation::record(&db_path, REPO).unwrap();
+
+        let mut result = clean_result();
+        degrade_blast_radius_if_resolver_stale(&store, &db_path, &changed(), &mut result).unwrap();
+
+        assert_eq!(result.status, AnalysisStatus::Complete);
+        assert_eq!(result.gate_state, GateState::Ok);
+        assert!(
+            result.notifications.is_empty(),
+            "{:?}",
+            result.notifications
+        );
+    }
+
     /// COUNTERWEIGHT, and the assertion nw-412 explicitly requires: a
     /// generation-CURRENT graph must NOT degrade. Without this, wiring that
     /// degraded unconditionally would pass every test above while making the
@@ -38844,7 +39043,7 @@ mod resolver_generation_gate_tests {
 
         let mut result = clean_result();
         let before = result.summary.clone();
-        degrade_blast_radius_if_resolver_stale(&store, &db_path, &mut result).unwrap();
+        degrade_blast_radius_if_resolver_stale(&store, &db_path, &changed(), &mut result).unwrap();
 
         assert_eq!(result.status, AnalysisStatus::Complete);
         assert_eq!(result.gate_state, GateState::Ok);

@@ -54,12 +54,21 @@ pub(crate) fn run_brain(
             let instance_id_owned =
                 resolve_instance_id_for_db(instance, config.as_deref(), &db_path)?;
             let instance_id = instance_id_owned.as_str();
+            // Only an explicit `--name` renames: without one a registered vault
+            // keeps its stored name, so the engine is asked with an empty name
+            // and the daemon is told the name was defaulted.
+            let name_given = name.is_some();
             let vault_name = name.unwrap_or_else(|| {
                 path.file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("vault")
                     .to_string()
             });
+            let requested_name = if name_given {
+                vault_name.clone()
+            } else {
+                String::new()
+            };
 
             if !path.exists() {
                 eprintln!("Error: path does not exist: {}", path.display());
@@ -99,6 +108,7 @@ pub(crate) fn run_brain(
                 let req = nestweaver_proto::IndexVaultRequest {
                     vault_path: vault_abs.to_string_lossy().to_string(),
                     vault_name: vault_name.clone(),
+                    vault_name_defaulted: !name_given,
                     extra_ignore_patterns: extra_patterns.clone(),
                     instance_id: instance_id.to_string(),
                     max_note_bytes: rpc_max_note_bytes(config.as_deref(), note_limits),
@@ -159,7 +169,7 @@ pub(crate) fn run_brain(
                 &path,
                 &db_path,
                 instance_id,
-                &vault_name,
+                &requested_name,
                 &extra_patterns,
                 note_limits,
                 &write_lease,
@@ -1277,12 +1287,21 @@ pub(crate) fn run_brain(
                 );
                 return Ok((EXIT_ERROR, None));
             }
+            // Only an explicit `--name` renames: without one a registered vault
+            // keeps its stored name, so the engine is asked with an empty name
+            // and the daemon is told the name was defaulted.
+            let name_given = name.is_some();
             let vault_name = name.unwrap_or_else(|| {
                 path.file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("vault")
                     .to_string()
             });
+            let requested_name = if name_given {
+                vault_name.clone()
+            } else {
+                String::new()
+            };
             // Resolve and validate the same instance precedence as brain add,
             // brain refresh, top-level index, and top-level watch.
             let instance_id = resolve_instance_id_for_db(instance, config.as_deref(), &db_path)?;
@@ -1334,6 +1353,7 @@ pub(crate) fn run_brain(
                     force,
                     vault_path: vault_abs.to_string_lossy().to_string(),
                     vault_name: vault_name.clone(),
+                    vault_name_defaulted: !name_given,
                     instance_id: instance_id.clone(),
                     extra_ignore_patterns: extra_patterns.clone(),
                     max_note_bytes: rpc_max_note_bytes(config.as_deref(), note_limits),
@@ -1381,7 +1401,7 @@ pub(crate) fn run_brain(
             let tantivy_sidecar = tantivy_sidecar_path_for(&db_path);
             let manifests_path = nestweaver_engine::manifest_cache_path(&db_path);
             let wiki_instance_id = instance_id.clone();
-            let watcher = BrainWatcher::new(&db_path, &path, instance_id, vault_name)
+            let watcher = BrainWatcher::new(&db_path, &path, instance_id, requested_name)
                 .with_tantivy_index(&tantivy_sidecar)
                 .with_manifests_path(&manifests_path)
                 .with_extra_ignore_patterns(&extra_patterns)
@@ -1524,12 +1544,21 @@ pub(crate) fn run_brain(
                 );
                 return Ok((EXIT_ERROR, None));
             }
+            // Only an explicit `--name` renames: without one a registered vault
+            // keeps its stored name, so the engine is asked with an empty name
+            // and the daemon is told the name was defaulted.
+            let name_given = name.is_some();
             let vault_name = name.unwrap_or_else(|| {
                 path.file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("vault")
                     .to_string()
             });
+            let requested_name = if name_given {
+                vault_name.clone()
+            } else {
+                String::new()
+            };
             let extra_patterns = parse_ignore_flag(&ignore);
             let canonical = abs_for_daemon(&path);
             let note_limits = note_limits_from_config(config.as_deref())?;
@@ -1646,6 +1675,7 @@ pub(crate) fn run_brain(
                     let req = nestweaver_proto::RefreshVaultSinceRequest {
                         vault_path: canonical.to_string_lossy().to_string(),
                         vault_name: vault_name.clone(),
+                        vault_name_defaulted: !name_given,
                         extra_ignore_patterns: extra_patterns.clone(),
                         instance_id: instance_id.to_string(),
                         since_unix_seconds,
@@ -1688,6 +1718,7 @@ pub(crate) fn run_brain(
                         // resolve a client-relative vault path against the wrong directory.
                         vault_path: canonical.to_string_lossy().to_string(),
                         vault_name: vault_name.clone(),
+                        vault_name_defaulted: !name_given,
                         extra_ignore_patterns: extra_patterns.clone(),
                         instance_id: instance_id.to_string(),
                         max_note_bytes: rpc_max_note_bytes(config.as_deref(), note_limits),
@@ -1749,7 +1780,7 @@ pub(crate) fn run_brain(
                         &path,
                         &db_path,
                         &instance_id,
-                        &vault_name,
+                        &requested_name,
                         since_time,
                         &extra_patterns,
                         note_limits,
@@ -1820,7 +1851,7 @@ pub(crate) fn run_brain(
                         &path,
                         &db_path,
                         &instance_id,
-                        &vault_name,
+                        &requested_name,
                         &extra_patterns,
                         note_limits,
                         &write_lease,
@@ -2447,6 +2478,10 @@ pub(crate) fn run_brain(
             no_embed,
         } => {
             let db_path = resolve_db_with_config(db, config_path.as_deref())?;
+            if let Err((code, message)) = reject_oversized_repo_selectors(&repos) {
+                eprintln!("{message}");
+                return Ok((code, None));
+            }
             let cfg = load_instance_config_opt(config_path.as_deref());
             let limit = resolve_limit(limit, cfg.as_ref(), 30);
 
@@ -2514,6 +2549,11 @@ pub(crate) fn run_brain(
                     "brain_context",
                     context_params,
                 ) {
+                    // First: an unresolved `--repos` entry is the caller's
+                    // selector, not a seed lookup, and keeps its own class.
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
                     Err(error)
                         if error
                             .chain()
@@ -2581,6 +2621,19 @@ pub(crate) fn run_brain(
             }
 
             let store = open_store(Some(&db_path))?;
+            // Resolved before retrieval, so an unresolvable entry is reported
+            // with its class whether or not the seeds resolve.
+            let repo_scope = if repos.is_empty() {
+                None
+            } else {
+                match resolve_repo_filter(&store, &repos) {
+                    Ok(scope) => Some(scope),
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
             if rerank {
                 store.require_verified_embedding_identity().context(
                     "verify the database embedding identity before direct context reranking",
@@ -2671,11 +2724,6 @@ pub(crate) fn run_brain(
                     // matches nothing on both lists — and it is the same
                     // resolver, so this route and the daemon route can no
                     // longer answer differently for one flag value.
-                    let repo_scope = if repos.is_empty() {
-                        None
-                    } else {
-                        Some(resolve_repo_filter(&store, &repos)?)
-                    };
                     let vault_scope = if vaults.is_empty() {
                         None
                     } else {
@@ -2942,106 +2990,25 @@ pub(crate) fn run_brain(
             )? {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&value)?);
-                } else if let Some(arr) = value.get("broken_links") {
-                    let links: Vec<nestweaver_engine::BrokenLink> =
-                        serde_json::from_value(arr.clone())?;
-                    if links.is_empty() {
-                        println!("No broken or ambiguous wikilinks found.");
-                    } else {
-                        // nw-097 class: the daemon reports `total`; this path
-                        // printed only how many it chose to show, so 50 of 778
-                        // read as "778 does not exist". The direct path below
-                        // already renders "N of total" — match it.
-                        let total = value.get("total").and_then(|v| v.as_u64());
-                        match total {
-                            Some(tot) if tot > links.len() as u64 => {
-                                println!("Broken / ambiguous wikilinks ({} of {tot}):", links.len())
-                            }
-                            _ => println!("Broken / ambiguous wikilinks ({}):", links.len()),
-                        }
-                        // Population counts from the envelope; the page is a
-                        // sample and cannot answer the question (nw-297). A
-                        // pre-nw-297 daemon omits the fields — fall back to the
-                        // page rather than printing nothing.
-                        let page_unresolved = links.iter().filter(|l| l.is_unresolved()).count();
-                        let unresolved = value
-                            .get("unresolved")
-                            .and_then(|v| v.as_u64())
-                            .map(|n| n as usize)
-                            .unwrap_or(page_unresolved);
-                        let low_confidence = value
-                            .get("low_confidence")
-                            .and_then(|v| v.as_u64())
-                            .map(|n| n as usize)
-                            .unwrap_or(links.len() - page_unresolved);
-                        print_link_classification(unresolved, low_confidence);
-                        for l in &links {
-                            println!(
-                                "  [[{}]] in {} (confidence {:.2}) — {}",
-                                l.wikilink_text,
-                                l.source_path,
-                                l.confidence,
-                                describe_link_resolution(l)
-                            );
-                            if !l.suggested_target_uids.is_empty() {
-                                print_link_suggestions(l);
-                            }
-                        }
-                    }
+                } else {
+                    render_broken_links_payload(&value, offset)?;
                 }
                 return Ok((EXIT_SUCCESS, None));
             }
 
             let store = open_store(Some(&db_path))?;
-            let all_links = nestweaver_engine::broken_links(&store, max_suggestions)?;
-            let total = all_links.len();
-            // Classify BEFORE truncating — the page is a sample of a list that
-            // is grouped by category, not ranked by severity (nw-297).
-            let unresolved = all_links.iter().filter(|l| l.is_unresolved()).count();
-            let low_confidence = total - unresolved;
-            // nw-341: `total` stays the PRE-offset population on both routes.
-            let links: Vec<_> = all_links.into_iter().skip(offset).take(limit).collect();
+            // The same payload builder the MCP tool uses, so the two routes
+            // cannot disagree about which links are broken.
+            let value =
+                nestweaver_engine::broken_links_payload(&store, max_suggestions, offset, limit)?;
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "broken_links": links,
-                        "total": total,
-                        "returned": links.len(),
-                        "truncated": links.len() < total,
-                        "offset": offset,
-                        "unresolved": unresolved,
-                        "low_confidence": low_confidence,
-                    }))?
-                );
-            } else if links.is_empty() {
-                println!("No broken or ambiguous wikilinks found.");
+                println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
-                if offset > 0 {
-                    println!(
-                        "Broken / ambiguous wikilinks ({} of {total}, from offset {offset}):",
-                        links.len()
-                    );
-                } else {
-                    println!("Broken / ambiguous wikilinks ({} of {total}):", links.len());
-                }
-                print_link_classification(unresolved, low_confidence);
-                for l in &links {
-                    println!(
-                        "  [[{}]] in {} (confidence {:.2}) — {}",
-                        l.wikilink_text,
-                        l.source_path,
-                        l.confidence,
-                        describe_link_resolution(l)
-                    );
-                    if !l.suggested_target_uids.is_empty() {
-                        print_link_suggestions(l);
-                    }
-                }
+                render_broken_links_payload(&value, offset)?;
             }
             let stats = format!(
                 "{} link(s) in {}",
-                links.len(),
+                value["returned"].as_u64().unwrap_or(0),
                 format_elapsed(t0.elapsed())
             );
             Ok((EXIT_SUCCESS, Some(stats)))
@@ -3826,4 +3793,64 @@ mod brain_context_not_found_tests {
             ENGINE
         );
     }
+}
+
+/// Text rendering of the `broken-links` payload, for both routes.
+///
+/// Population counts come from the envelope: the page is a sample of the
+/// population and cannot answer "does this vault have broken links".
+fn render_broken_links_payload(value: &serde_json::Value, offset: usize) -> anyhow::Result<()> {
+    let count = |key: &str| value.get(key).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let links: Vec<nestweaver_engine::BrokenLink> = value
+        .get("broken_links")
+        .map(|rows| serde_json::from_value(rows.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    let low: Vec<nestweaver_engine::BrokenLink> = value
+        .get("low_confidence")
+        .filter(|rows| rows.is_array())
+        .map(|rows| serde_json::from_value(rows.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    let total = count("total");
+    let low_total = count("low_confidence_total");
+    if links.is_empty() {
+        println!("No broken or ambiguous wikilinks found.");
+    } else {
+        let range = if offset > 0 {
+            format!("{} of {total}, from offset {offset}", links.len())
+        } else {
+            format!("{} of {total}", links.len())
+        };
+        println!("Broken / ambiguous wikilinks ({range}):");
+    }
+    print_link_classification(count("unresolved"), count("ambiguous"), low_total);
+    for l in &links {
+        println!(
+            "  [[{}]] in {} (confidence {:.2}) — {}",
+            l.wikilink_text,
+            l.source_path,
+            l.confidence,
+            describe_link_resolution(l)
+        );
+        if !l.suggested_target_uids.is_empty() {
+            print_link_suggestions(l);
+        }
+    }
+    if !low.is_empty() {
+        println!(
+            "Low-confidence wikilinks — resolved, not broken ({} of {low_total}):",
+            low.len()
+        );
+        for l in &low {
+            println!(
+                "  [[{}]] in {} (confidence {:.2}) — {}",
+                l.wikilink_text,
+                l.source_path,
+                l.confidence,
+                describe_link_resolution(l)
+            );
+        }
+    }
+    Ok(())
 }

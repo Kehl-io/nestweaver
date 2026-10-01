@@ -156,6 +156,36 @@ pub(crate) fn record_for_store(
     }
 }
 
+/// The name a vault publication uses when the caller passed `requested`.
+///
+/// An EMPTY `requested` means the caller gave no `--name`: a vault already
+/// registered at this uid keeps its stored name, and a new one is named after
+/// its directory. Only an explicit name is a rename. Defaulting to the
+/// directory name on every refresh used to rename a vault registered with a
+/// custom `--name`, and so trip the duplicate-name guard below.
+pub fn effective_vault_name(
+    store: &nestweaver_store::GraphStore,
+    uid: &str,
+    requested: &str,
+    root: &Path,
+) -> String {
+    if !requested.is_empty() {
+        return requested.to_string();
+    }
+    if let Ok(vault) = store.lookup_vault(uid) {
+        return vault.name;
+    }
+    default_vault_name(root)
+}
+
+/// The name a new vault takes when none is given: its directory's name.
+pub fn default_vault_name(root: &Path) -> String {
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("vault")
+        .to_string()
+}
+
 /// nw-608: refuse to register a NEW vault under a name another vault at a
 /// different root already holds.
 ///
@@ -171,8 +201,11 @@ pub(crate) fn record_for_store(
 /// write the operator should choose, not one a watch should perform.
 ///
 /// Scope, deliberately narrow so existing states keep working:
-///   * a vault whose uid is already in the graph refreshes in place, even in a
-///     database that was forked before this guard existed;
+///   * a vault whose uid is already in the graph refreshes in place UNDER ITS
+///     CURRENT NAME, even in a database that was forked before this guard
+///     existed. Renaming it (`--name`) is checked like a new registration:
+///     skipping the check for every known uid let a rename take a name
+///     another root already held;
 ///   * another vault at the SAME root (a different instance) is nw-098's case,
 ///     guarded by the CLI and repaired by `instance merge`, not this one.
 ///
@@ -186,35 +219,54 @@ pub fn refuse_duplicate_vault_name(
     root: &Path,
 ) -> anyhow::Result<()> {
     let vaults = store.list_vaults(None)?;
-    if vaults.iter().any(|vault| vault.uid == uid) {
-        return Ok(());
-    }
     // Compared the way vault SELECTORS compare names (case-insensitively), so
     // `Brain` beside `brain` is refused too: a selector could not tell them
     // apart either.
-    let wanted = canonical(root);
     let key = crate::node_scope::vault_name_key(name);
+    if vaults
+        .iter()
+        .any(|vault| vault.uid == uid && crate::node_scope::vault_name_key(&vault.name) == key)
+    {
+        return Ok(());
+    }
+    let wanted = canonical(root);
     let Some(existing) = vaults.iter().find(|vault| {
         crate::node_scope::vault_name_key(&vault.name) == key
             && canonical(Path::new(&vault.root_path)) != wanted
     }) else {
         return Ok(());
     };
-    // The remedy pins the EXISTING vault's instance: `list_vaults(None)` spans
-    // instances, and an unpinned `brain remove` resolves the caller's.
-    anyhow::bail!(
-        "a vault named '{}' is already indexed at {} ({}); refusing to register a \
-         second vault named '{name}' at {} — both would answer searches and \
-         selecting the vault by name would be ambiguous.\n\
-         help: pass a different --name, or if the vault moved, remove the old one first \
-         (`nestweaver brain remove {} --instance {}`) and add it at the new path.",
-        existing.name,
-        existing.root_path,
-        existing.uid,
-        root.display(),
-        crate::shell_quote(&existing.root_path),
-        crate::shell_quote(&existing.instance_id),
-    )
+    Err(anyhow::Error::new(DuplicateVaultName {
+        name: name.to_string(),
+        root: root.display().to_string(),
+        existing_name: existing.name.clone(),
+        existing_root: existing.root_path.clone(),
+        existing_uid: existing.uid.clone(),
+        existing_instance: existing.instance_id.clone(),
+    }))
+}
+
+/// A vault registration (new, or a rename) refused because another root
+/// already holds the name. Typed so every route reports it the same way.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error(
+    "a vault named '{existing_name}' is already indexed at {existing_root} ({existing_uid}); \
+     refusing to register a second vault named '{name}' at {root} — both would answer \
+     searches and selecting the vault by name would be ambiguous.\n\
+     help: pass a different --name, or if the vault moved, remove the old one first \
+     (`nestweaver brain remove {} --instance {}`) and add it at the new path.",
+    crate::shell_quote(.existing_root),
+    // The remedy pins the EXISTING vault's instance: `list_vaults(None)`
+    // spans instances, and an unpinned `brain remove` resolves the caller's.
+    crate::shell_quote(.existing_instance)
+)]
+pub struct DuplicateVaultName {
+    pub name: String,
+    pub root: String,
+    pub existing_name: String,
+    pub existing_root: String,
+    pub existing_uid: String,
+    pub existing_instance: String,
 }
 
 /// Forget registrations matching `predicate`. Returns how many were dropped.
@@ -455,6 +507,57 @@ mod tests {
 
         // Counterweight: a genuinely different name passes.
         refuse_duplicate_vault_name(&store, "vlt:default:b", "brain-copy", &copy).unwrap();
+    }
+
+    /// A vault already in the graph is checked when it is RENAMED: the
+    /// early return for a known uid let `--name` take a name another root
+    /// holds. Counterweight: keeping (or re-casing) its own name passes.
+    #[test]
+    fn renaming_a_registered_vault_onto_another_roots_name_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("a");
+        let second = dir.path().join("b");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        for (uid, name, root) in [
+            ("vlt:default:a", "notes", &first),
+            ("vlt:default:b", "other", &second),
+        ] {
+            store
+                .insert_vault(&nestweaver_schema::Vault {
+                    uid: uid.into(),
+                    name: name.into(),
+                    root_path: root.to_string_lossy().into_owned(),
+                    instance_id: "default".into(),
+                })
+                .unwrap();
+        }
+
+        let error = refuse_duplicate_vault_name(&store, "vlt:default:b", "NOTES", &second)
+            .expect_err("a rename onto another root's name must be refused");
+        let refused = error
+            .downcast_ref::<DuplicateVaultName>()
+            .expect("the refusal is typed");
+        assert_eq!(refused.existing_uid, "vlt:default:a");
+
+        refuse_duplicate_vault_name(&store, "vlt:default:b", "other", &second).unwrap();
+        refuse_duplicate_vault_name(&store, "vlt:default:b", "Other", &second).unwrap();
+        refuse_duplicate_vault_name(&store, "vlt:default:b", "renamed", &second).unwrap();
+
+        // A database forked before the guard existed already holds a second
+        // `notes`; that vault still refreshes in place under its own name.
+        let forked = dir.path().join("c");
+        std::fs::create_dir_all(&forked).unwrap();
+        store
+            .insert_vault(&nestweaver_schema::Vault {
+                uid: "vlt:default:c".into(),
+                name: "notes".into(),
+                root_path: forked.to_string_lossy().into_owned(),
+                instance_id: "default".into(),
+            })
+            .unwrap();
+        refuse_duplicate_vault_name(&store, "vlt:default:c", "notes", &forked).unwrap();
     }
 
     #[test]

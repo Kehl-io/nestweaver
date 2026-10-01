@@ -340,11 +340,16 @@ def selectors_cases(fixture):
     fixture.case("selectors", "visible-uid-with-repo-pin", uid_pin)
     for repo in ("hidden_repo", "absentRouteRepo"):
         def wrong_repo(selector=repo):
+            # A repo selector the caller cannot see is the repo filter's own
+            # miss, identical for a hidden and an absent repo; the known-repo
+            # list names only visible repos.
             payload = fixture.call_not_found("query", "brain_impact",
                                              {"symbol": "visibleTarget", "repo": selector},
-                                             key="symbol", message="no symbol found")
-            assert payload["status"] == "not_found" and payload["impact_nodes"] == [], payload
-            fixture.no_hidden(payload)
+                                             key="repo", message=f"repo '{selector}' not found")
+            assert payload["status"] == "not_found" and payload["repo"] == selector, payload
+            fixture.no_hidden({"message": payload["message"].replace(f'"{selector}"', "")
+                               .replace(f"'{selector}'", ""),
+                               **{k: v for k, v in payload.items() if k not in ("repo", "message")}})
             assert not payload.get("candidates"), payload
         fixture.case("selectors", "wrong-repo-" + repo, wrong_repo)
     for repo, confidence, score in itertools.product((None, "visible_repo"), (None, 0.1), (None, 0)):

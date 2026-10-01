@@ -1333,15 +1333,18 @@ fn parity_contracts_list_uses_daemon_without_direct_store_fallback() {
     );
     assert_eq!(daemon_without_disk_access.stdout, direct_json.stdout);
     assert!(daemon_without_disk_access.stderr.is_empty());
-    assert!(!daemon_error_without_fallback.status.success());
+    // The daemon's typed repo-filter miss is reported as not found (exit
+    // 2): answered by the daemon, not retried against the store.
+    assert_eq!(
+        daemon_error_without_fallback.status.code(),
+        Some(2),
+        "{:?}",
+        daemon_error_without_fallback
+    );
     let error = flatten_diagnostic(&daemon_error_without_fallback.stderr);
     assert!(
-        error.contains("no indexed repo matches --repo 'definitely-unknown'"),
+        error.contains("repo filter entry \"definitely-unknown\"") && error.contains("not found"),
         "daemon error must name the unmatched repo; got: {error}"
-    );
-    assert!(
-        error.contains("refusing direct-store fallback"),
-        "daemon error must refuse the fallback; got: {error}"
     );
     assert!(!error.contains("cross_repo_contracts"));
 
@@ -1349,15 +1352,12 @@ fn parity_contracts_list_uses_daemon_without_direct_store_fallback() {
         &fixture.db_path,
         &["contracts", "list", "--repo", "", "--json"],
     );
-    assert!(!explicit_empty.status.success());
+    // An empty selector is malformed argv: usage exit 64.
+    assert_eq!(explicit_empty.status.code(), Some(64), "{explicit_empty:?}");
     let empty_error = flatten_diagnostic(&explicit_empty.stderr);
     assert!(
-        empty_error.contains("no indexed repo matches --repo ''"),
+        empty_error.contains("repository selector cannot be empty"),
         "explicit-empty error must name the empty repo; got: {empty_error}"
-    );
-    assert!(
-        empty_error.contains("refusing direct-store fallback"),
-        "explicit-empty error must refuse the fallback; got: {empty_error}"
     );
 }
 

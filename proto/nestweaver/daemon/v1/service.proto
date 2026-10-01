@@ -72,6 +72,10 @@ message IndexVaultRequest {
   // compiled default). Non-zero must remain within the daemon's hard safety
   // bounds — same contract as `IndexRepoRequest.max_source_file_bytes`.
   uint64 max_note_bytes = 5;
+  // True when the caller gave no name and `vault_name` is only the directory
+  // default: a vault already registered keeps its stored name. An older
+  // daemon ignores this and uses `vault_name` as before.
+  bool vault_name_defaulted = 6;
 }
 
 // Incremental vault refresh is a distinct method so an older daemon cannot
@@ -85,6 +89,8 @@ message RefreshVaultSinceRequest {
   // Zero inherits the daemon's `[indexing].max_note_bytes`. See
   // `IndexVaultRequest.max_note_bytes`.
   uint64 max_note_bytes = 6;
+  // See `IndexVaultRequest.vault_name_defaulted`.
+  bool vault_name_defaulted = 7;
 }
 
 message RefreshBrainRequest {}
@@ -119,6 +125,8 @@ message WatchVaultRequest {
   // Zero inherits the daemon's `[indexing].max_note_bytes`. See
   // `IndexVaultRequest.max_note_bytes`.
   uint64 max_note_bytes = 6;
+  // See `IndexVaultRequest.vault_name_defaulted`.
+  bool vault_name_defaulted = 7;
 }
 
 message WatchVaultResponse {

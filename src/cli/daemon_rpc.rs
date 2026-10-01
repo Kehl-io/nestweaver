@@ -221,23 +221,59 @@ pub(crate) fn error_is_invalid_tool_arguments(error: &anyhow::Error) -> bool {
     })
 }
 
+/// The `{status, error, repo, message[, candidates]}` envelope of an
+/// unresolved repo filter: from the typed error on the direct route, or from
+/// the status details the daemon attaches to it.
+pub(crate) fn unresolved_repo_filter_envelope(error: &anyhow::Error) -> Option<serde_json::Value> {
+    if let Some(unresolved) = error.chain().find_map(|cause| {
+        cause.downcast_ref::<nestweaver_engine::node_scope::RepoFilterUnresolved>()
+    }) {
+        return Some(unresolved.envelope());
+    }
+    error.chain().find_map(|cause| {
+        let status = cause.downcast_ref::<tonic::Status>()?;
+        let envelope: serde_json::Value = serde_json::from_slice(status.details()).ok()?;
+        envelope
+            .get("status")
+            .and_then(|v| v.as_str())
+            .and_then(nestweaver_engine::RepoSelectorFailure::from_status)
+            .map(|_| envelope)
+    })
+}
+
+/// Report an unresolved repo filter and return its exit code: not found 2,
+/// ambiguous 3 (the envelope lists the candidates), malformed 64.
 pub(crate) fn report_unresolved_repo_filter(error: &anyhow::Error, json: bool) -> i32 {
-    let message = format!("{error:#}");
-    let ambiguous = message.to_ascii_lowercase().contains("ambiguous");
-    let (status, code) = if ambiguous {
-        ("ambiguous", EXIT_AMBIGUOUS)
-    } else {
-        ("not_found", EXIT_NOT_FOUND)
+    let mut envelope = unresolved_repo_filter_envelope(error).unwrap_or_else(|| {
+        // An older daemon sends neither the type nor the details; its
+        // message still names an ambiguous selector.
+        let message = format!("{error:#}");
+        let status = if message.to_ascii_lowercase().contains("ambiguous") {
+            "ambiguous"
+        } else {
+            "not_found"
+        };
+        serde_json::json!({ "status": status, "message": message })
+    });
+    let failure = envelope
+        .get("status")
+        .and_then(|v| v.as_str())
+        .and_then(nestweaver_engine::RepoSelectorFailure::from_status)
+        .unwrap_or(nestweaver_engine::RepoSelectorFailure::NotFound);
+    let code = match failure {
+        nestweaver_engine::RepoSelectorFailure::NotFound => EXIT_NOT_FOUND,
+        nestweaver_engine::RepoSelectorFailure::Ambiguous => EXIT_AMBIGUOUS,
+        nestweaver_engine::RepoSelectorFailure::Malformed => EXIT_USAGE,
     };
+    // `error` is the machine word on the CLI, as it always was.
+    envelope["error"] = serde_json::json!(failure.status());
+    let message = envelope
+        .get("message")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{error:#}"));
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "error": status,
-                "status": status,
-                "message": message,
-            })
-        );
+        println!("{envelope}");
     }
     eprintln!("{message}");
     code

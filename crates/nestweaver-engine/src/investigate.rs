@@ -769,8 +769,9 @@ fn is_index_publication_failure(error: &anyhow::Error) -> bool {
 /// `scope` accepts:
 /// - `project:<slug>` — seed the project's members and post-filter results to
 ///   the project's member symbols (errors when the project does not exist),
-/// - `repo:<name>` — restrict results to symbols in a named repo (errors when
-///   no repo matches),
+/// - `repo:<name>` — restrict results to symbols in a named repo, resolved
+///   like every `--repo` filter (errors when no repo matches, or when
+///   several do),
 /// - `vault` / `all` / empty — no restriction (default).
 ///
 /// Any other scope string is rejected with an error instead of being
@@ -1552,23 +1553,14 @@ fn resolve_scope(
     }
 
     if let Some(name) = strip_scope_prefix(scope, "repo:") {
-        let name = name.trim();
-        if name.is_empty() {
-            anyhow::bail!("invalid scope 'repo:': 'repo:' requires a repo name");
-        }
-        let repos = store
-            .list_repos(None)
-            .map_err(|e| anyhow::anyhow!("list_repos: {e}"))?;
-        let matches: Vec<String> = repos
-            .into_iter()
-            .filter(|r| {
-                crate::repo_display_name(r).eq_ignore_ascii_case(name) || r.uid.contains(name)
-            })
-            .map(|r| r.uid)
-            .collect();
-        if matches.is_empty() {
-            anyhow::bail!("unknown scope '{scope}': no repo matching '{name}'");
-        }
+        // The one repo resolver every `--repo` filter uses: exact UID, name,
+        // root or URL, then an UNAMBIGUOUS substring. A name two repos share
+        // is an ambiguous error naming both, never a merge of the two, and an
+        // empty name is a malformed selector.
+        let matches: Vec<String> =
+            crate::node_scope::resolve_repo_filter(store, &[name.trim().to_string()], None)?
+                .into_iter()
+                .collect();
         return Ok((seeds, Some(ScopeFilter::Repos(matches))));
     }
 
@@ -5543,7 +5535,7 @@ mod tests {
         let (dir, src, store) = make_store();
         let db_path = dir.path().join("nestweaver.lbug");
 
-        for scope in ["vault", "repo:test"] {
+        for scope in ["vault", "repo:repo"] {
             let result = investigate(
                 &store,
                 None,
@@ -5621,7 +5613,7 @@ mod tests {
         let (_repo, store) =
             index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
         let db_path = dir.path().join("nestweaver.lbug");
-        for scope in ["all", "repo:test"] {
+        for scope in ["all", "repo:repo"] {
             let result = investigate(
                 &store,
                 None,
@@ -6008,14 +6000,34 @@ mod tests {
         let (dir, src, store) = make_store();
         let db_path = dir.path().join("nestweaver.lbug");
 
-        for scope in [
-            "bogus",
-            "vaults",
-            "repo:",
-            "project:",
-            "repo:no-such-repo-zzz",
-            "project:No Such Project ZZZ",
+        // `repo:` goes through the shared repo resolver, so its failures are
+        // the typed repo-filter error with a class, not scope prose.
+        for (scope, failure) in [
+            ("repo:", crate::RepoSelectorFailure::Malformed),
+            (
+                "repo:no-such-repo-zzz",
+                crate::RepoSelectorFailure::NotFound,
+            ),
         ] {
+            let err = investigate(
+                &store,
+                None,
+                Some(&db_path),
+                &src,
+                "greet",
+                scope,
+                None,
+                None,
+            )
+            .unwrap_err();
+            let unresolved = err
+                .chain()
+                .find_map(|c| c.downcast_ref::<crate::node_scope::RepoFilterUnresolved>())
+                .unwrap_or_else(|| panic!("{scope}: expected a repo-filter error, got {err:#}"));
+            assert_eq!(unresolved.failure, failure, "{scope}: {err:#}");
+        }
+
+        for scope in ["bogus", "vaults", "project:", "project:No Such Project ZZZ"] {
             let err = investigate(
                 &store,
                 None,
@@ -6054,7 +6066,7 @@ mod tests {
             Some(&db_path),
             &src,
             "greet",
-            "repo:test",
+            "repo:repo",
             None,
             None,
         )
@@ -6067,7 +6079,7 @@ mod tests {
         let db_path = dir.path().join("nestweaver.lbug");
 
         // REPO: / Repo: / mixed-case prefixes must resolve like `repo:`.
-        for scope in ["REPO:test", "Repo:test", "rEpO:test"] {
+        for scope in ["REPO:repo", "Repo:repo", "rEpO:repo"] {
             investigate(
                 &store,
                 None,

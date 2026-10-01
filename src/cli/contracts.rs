@@ -14,10 +14,9 @@ pub(crate) fn resolve_contract_repo_filter(
     let Some(filter) = filter else {
         return Ok(None);
     };
-    let repos = list_repos(store, None)?;
-    let repo = nestweaver_engine::resolve_repo_selector(&repos, filter)
-        .map_err(|error| anyhow::anyhow!("no indexed repo matches --repo '{filter}': {error}"))?;
-    Ok(Some(repo.uid.clone()))
+    // The shared typed resolver: its failure class decides the exit code.
+    let resolved = resolve_repo_filter(store, &[filter.to_string()])?;
+    Ok(resolved.into_iter().next())
 }
 
 pub(crate) fn render_contract_list(
@@ -138,16 +137,23 @@ pub(crate) fn run_contracts(
             // Read-only query: reject a typo'd path before daemon autostart can
             // create an empty database and false-green with an empty list.
             require_existing_db(&db_path)?;
-            let contracts = if use_daemon {
-                list_contracts_via_daemon(&db_path, repo.as_deref())?
+            let listed = if use_daemon {
+                list_contracts_via_daemon(&db_path, repo.as_deref())
             } else {
                 let store = open_store(Some(&db_path))?;
-                let repo_uid = resolve_contract_repo_filter(&store, repo.as_deref())?;
-                let mut contracts = store
-                    .list_contracts(repo_uid.as_deref())
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                contracts.sort_by(|left, right| left.uid.cmp(&right.uid));
-                contracts
+                resolve_contract_repo_filter(&store, repo.as_deref()).and_then(|repo_uid| {
+                    let mut contracts = store
+                        .list_contracts(repo_uid.as_deref())
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    contracts.sort_by(|left, right| left.uid.cmp(&right.uid));
+                    Ok(contracts)
+                })
+            };
+            let contracts = match listed {
+                Err(error) if error_is_unresolved_repo_filter(&error) => {
+                    return Ok((report_unresolved_repo_filter(&error, json), None));
+                }
+                other => other?,
             };
             render_contract_list(&contracts, json)?;
             Ok((EXIT_SUCCESS, None))
@@ -160,9 +166,14 @@ pub(crate) fn run_contracts(
                 if let Some(ref r) = repo {
                     args["repo"] = serde_json::json!(r);
                 }
-                if let Some(value) =
-                    try_hybrid_json_rpc(true, &db_path, None, "contract_drift", args)?
+                let answer = match try_hybrid_json_rpc(true, &db_path, None, "contract_drift", args)
                 {
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
+                    other => other?,
+                };
+                if let Some(value) = answer {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
@@ -172,7 +183,12 @@ pub(crate) fn run_contracts(
                 }
             }
             let store = open_store(db.as_deref())?;
-            let repo_uid = resolve_contract_repo_filter(&store, repo.as_deref())?;
+            let repo_uid = match resolve_contract_repo_filter(&store, repo.as_deref()) {
+                Err(error) if error_is_unresolved_repo_filter(&error) => {
+                    return Ok((report_unresolved_repo_filter(&error, json), None));
+                }
+                other => other?,
+            };
             let report = nestweaver_engine::contracts::drift_for_store(&store, repo_uid.as_deref())
                 .map_err(|e| anyhow::anyhow!(e))?;
 

@@ -457,8 +457,8 @@ pub fn analyze_blast_radius(
     // not. A failed/partial query must NOT be reported as "nothing affected".
     let mut status = AnalysisStatus::Complete;
     let mut notifications: Vec<Notification> = Vec::new();
-    // nw-424: the SET is unchanged (every incompatible repository still
-    // degrades), but the message now says whether the caller owns the problem.
+    // A stale repository degrades only when it owns or is linked to
+    // a changed file; an unrelated one is disclosed without degrading.
     let changed_file_strings: Vec<String> = changed_files
         .iter()
         .map(|path| path.to_string_lossy().into_owned())
@@ -468,14 +468,7 @@ pub fn analyze_blast_radius(
         &changed_file_strings,
     )?;
     let resolver_stale_repos = incompatibility.all();
-    if incompatibility.is_incompatible() {
-        status = status.max(AnalysisStatus::Degraded);
-        notifications.push(Notification {
-            level: NotificationLevel::Error,
-            message: incompatibility.message(),
-            descriptor: crate::resolver_generation::INCOMPATIBLE_RESOLVER_DESCRIPTOR.to_string(),
-        });
-    }
+    incompatibility.apply(&mut status, &mut notifications);
 
     // Resolve repo_uid -> display name (repo URL when available, else the uid)
     // for org-wide impact reporting. Fetched up front so the changed-file loop

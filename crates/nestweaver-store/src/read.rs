@@ -198,6 +198,9 @@ pub struct BrokenWikilinkRow {
     pub confidence: f32,
     /// The note UID this edge currently points at (the low-confidence target).
     pub current_target_uid: String,
+    /// How many distinct notes this link resolved to: 0 when unresolved, 1
+    /// for a single (lower-confidence) target, more than 1 when ambiguous.
+    pub candidate_count: usize,
 }
 
 /// A lightweight note row used by orphan detection and topic clustering.
@@ -2975,6 +2978,58 @@ impl GraphStore {
         result.map(|row| extract_string(&row, 0)).collect()
     }
 
+    /// Every OTHER repo that shares a recorded symbol-to-symbol edge with
+    /// `repo_uid`, in either direction, sorted and de-duplicated.
+    ///
+    /// Covers every `Symbol -> Symbol` relationship table, not only
+    /// `CROSS_REPO_LINK`: a resolver can also write a cross-repo `CALLS` or
+    /// `IMPORTS`, and any of them is a path an impact walk can take across the
+    /// repository boundary. One query per table and direction keeps each one a
+    /// plain labelled pattern.
+    pub fn repos_sharing_symbol_edges(&self, repo_uid: &str) -> Result<Vec<String>, StoreError> {
+        const SYMBOL_EDGE_TABLES: [&str; 9] = [
+            "CALLS",
+            "USES",
+            "ACCESSES",
+            "IMPORTS",
+            "EXTENDS_SYM",
+            "IMPLEMENTS_SYM",
+            "INCLUDES_SYM",
+            "MEMBER_OF",
+            "CROSS_REPO_LINK",
+        ];
+        let conn = self.conn()?;
+        let mut neighbours: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for table in SYMBOL_EDGE_TABLES {
+            // `$repo` is the named repo's side; the other endpoint is the
+            // neighbour. Both orientations, so an edge INTO the repo counts
+            // as well as one out of it.
+            for (own, other) in [("s", "t"), ("t", "s")] {
+                let q = format!(
+                    "MATCH (s:Symbol)-[:{table}]->(t:Symbol) \
+                     WHERE {own}.repo_uid = $repo AND {other}.repo_uid <> $repo \
+                     RETURN DISTINCT {other}.repo_uid"
+                );
+                let mut stmt = conn
+                    .prepare(&q)
+                    .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+                let result = conn
+                    .execute(
+                        &mut stmt,
+                        vec![("repo", Value::String(repo_uid.to_string()))],
+                    )
+                    .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+                for row in result {
+                    let uid = extract_string(&row, 0)?;
+                    if !uid.is_empty() {
+                        neighbours.insert(uid);
+                    }
+                }
+            }
+        }
+        Ok(neighbours.into_iter().collect())
+    }
+
     /// Every File node of `repo_uid` as `(file_path, content_hash)`.
     ///
     /// nw-664: the code watcher's startup reconciliation compares disk
@@ -4069,8 +4124,9 @@ impl GraphStore {
     /// Wikilink edges whose resolution is suspect — confidence below 1.0.
     ///
     /// These are ambiguous or low-priority resolutions (the indexer splits
-    /// confidence 1/N across ambiguous title matches and assigns < 1.0 to
-    /// alias/same-folder matches). Unresolved links are not stored as edges,
+    /// confidence 1/N across ambiguous matches and assigns < 1.0 to alias,
+    /// path-basename and proximity-narrowed matches); `candidate_count` tells
+    /// an ambiguous link from a single lower-tier target. Unresolved links are not stored as edges,
     /// so this surfaces the recoverable "broken-ish" links. Each row carries
     /// the source note, the `display` link text, and the current target.
     /// Empty DB → empty vec.
@@ -4092,10 +4148,20 @@ impl GraphStore {
                  r.confidence, dst.uid";
         match conn.query(q) {
             Ok(result) => {
+                // Distinct targets per (source note, text): more than one is
+                // an AMBIGUOUS link, which the dedup below would otherwise
+                // make indistinguishable from a single lower-tier target.
+                let mut targets: std::collections::HashMap<(String, String), HashSet<String>> =
+                    std::collections::HashMap::new();
                 for row in result {
                     let source_uid = extract_string(&row, 0)?;
                     let wikilink_text = extract_string(&row, 3)?;
+                    let target_uid = extract_string(&row, 5)?;
                     let key = (source_uid.clone(), wikilink_text.clone());
+                    targets
+                        .entry(key.clone())
+                        .or_default()
+                        .insert(target_uid.clone());
                     if let std::collections::hash_map::Entry::Vacant(slot) = seen.entry(key.clone())
                     {
                         order.push(key);
@@ -4105,8 +4171,14 @@ impl GraphStore {
                             source_title: extract_string(&row, 2)?,
                             wikilink_text,
                             confidence: extract_f64(&row, 4)? as f32,
-                            current_target_uid: extract_string(&row, 5)?,
+                            current_target_uid: target_uid,
+                            candidate_count: 1,
                         });
+                    }
+                }
+                for (key, distinct) in targets {
+                    if let Some(row) = seen.get_mut(&key) {
+                        row.candidate_count = distinct.len();
                     }
                 }
             }
@@ -4137,6 +4209,7 @@ impl GraphStore {
                             wikilink_text,
                             confidence: 0.0,
                             current_target_uid: String::new(),
+                            candidate_count: 0,
                         });
                     }
                 }

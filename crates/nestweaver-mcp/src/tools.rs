@@ -16,8 +16,8 @@ use nestweaver_engine::query::search_symbols_page;
 use nestweaver_engine::{
     BlastRadiusOptions, BrainContextResult, DeadCodeConfidence, EmbedQueryFn, HybridSearchConfig,
     SummaryLevel, ToolDocEntry, analyze_blast_radius, attach_cluster_ids, attach_communities,
-    broken_links, build_brain_context_hybrid_with_aliases, compute_clusters, detect_changes_impact,
-    doc_stats, expand_query_with_aliases, filter_by_target, generate_agents_md_with_rules,
+    build_brain_context_hybrid_with_aliases, compute_clusters, detect_changes_impact, doc_stats,
+    expand_query_with_aliases, filter_by_target, generate_agents_md_with_rules,
     generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_tools,
     generate_skill_with_tools, generate_summaries, get_all_properties, get_last_indexed_at,
     investigate, investigate_expand, investigate_hydrate, load_alias_sidecar, load_clusters,
@@ -161,6 +161,12 @@ fn notes_ambiguous_payload(title: &str, notes: &[nestweaver_schema::Note]) -> Va
     payload
 }
 
+/// Keep the name matches that live in the repo `repo_filter` selects.
+///
+/// Resolved by `resolve_repo_filter`, the one resolver every repo filter
+/// uses: a selector that names no repo, several repos, or is malformed is a
+/// typed error with that class, never a substring guess over file paths and
+/// UIDs that could silently pick symbols from the wrong repo.
 fn filter_name_matches_by_repo(
     store: &GraphStore,
     matches: Vec<nestweaver_schema::Symbol>,
@@ -170,34 +176,11 @@ fn filter_name_matches_by_repo(
     let Some(selector) = repo_filter.filter(|s| !s.is_empty()) else {
         return Ok(matches);
     };
-    let mut repos = store
-        .list_repos(None)
-        .map_err(|e| anyhow!("list_repos: {e}"))?;
-    repos.retain(|repo| repo_is_visible(&repo.uid, visible));
-    match nestweaver_engine::resolve_repo_selector(&repos, selector) {
-        Ok(repo) => Ok(matches
-            .into_iter()
-            .filter(|s| s.repo_uid == repo.uid)
-            .collect()),
-        Err(_) => {
-            let filter_lower = selector.to_lowercase();
-            let repo_names: HashMap<String, String> = repos
-                .iter()
-                .map(|r| (r.uid.clone(), nestweaver_engine::repo_display_name(r)))
-                .collect();
-            Ok(matches
-                .into_iter()
-                .filter(|s| {
-                    repo_names
-                        .get(&s.repo_uid)
-                        .is_some_and(|name| name.to_lowercase().contains(&filter_lower))
-                        || s.file_path.to_lowercase().starts_with(&filter_lower)
-                        || s.uid.to_lowercase().contains(&filter_lower)
-                        || s.repo_uid.to_lowercase().contains(&filter_lower)
-                })
-                .collect())
-        }
-    }
+    let repos = resolve_repo_filter(store, &[selector.to_string()], visible)?;
+    Ok(matches
+        .into_iter()
+        .filter(|symbol| repos.contains(&symbol.repo_uid))
+        .collect())
 }
 
 fn classify_name_matches(matches: Vec<nestweaver_schema::Symbol>) -> StrictNameResolve {
@@ -4819,10 +4802,16 @@ fn validate_regex_kinds(kinds: Option<&[String]>) -> Result<(), anyhow::Error> {
                 .iter()
                 .any(|known| known.eq_ignore_ascii_case(kind))
             {
-                return Err(anyhow!(
-                    "unknown kind '{kind}'; expected one of: {}",
-                    REGEX_SEARCH_KINDS.join(", ")
-                ));
+                // Typed as an argument error: the caller's input is invalid
+                // whatever the graph holds, so it is a usage error, not a
+                // failure of the tool.
+                return Err(ToolArgumentsInvalid {
+                    message: format!(
+                        "unknown kind '{kind}'; expected one of: {}",
+                        REGEX_SEARCH_KINDS.join(", ")
+                    ),
+                }
+                .into());
             }
         }
     }
@@ -4992,34 +4981,15 @@ fn tool_brain_broken_links(store: &GraphStore, args: Value) -> Result<Value, any
     // Reversing the sort is not an option: it would regress nw-297's
     // `genuinely_broken_links_sort_before_lower_tier_resolutions`.
     let offset = read_limit(&args, "offset", 0, 0, RESULT_LIMIT_MAX)?;
-    let all_links = broken_links(store, max_suggestions)?;
-    // nw-297: classify over the POPULATION, before the window. The page is
-    // a sample, and a caller that reads the page's own composition as the
-    // vault's composition gets the wrong answer at every limit — which is
-    // exactly what the CLI's summary line did.
-    let unresolved = all_links.iter().filter(|l| l.is_unresolved()).count();
-    let low_confidence = all_links.len() - unresolved;
-    let rows: Vec<Value> = all_links
-        .iter()
-        .map(serde_json::to_value)
-        .collect::<Result<_, serde_json::Error>>()?;
-    // nw-341: through `Bounded`, not hand-rolled. This was the last bounded
-    // list in the catalogue still building its own (total, returned) pair, so
-    // it was also the only one that never emitted `truncated` -- a caller could
-    // not tell a complete page from a cut one without comparing two numbers.
-    let mut out = json!({
-        "unresolved": unresolved,
-        "low_confidence": low_confidence,
-        "offset": offset,
-    });
-    Bounded::window(rows, offset, limit).merge_into(&mut out, "broken_links");
-    Ok(out)
+    // Classified over the POPULATION, before the window. One payload builder
+    // serves this tool and the CLI's direct route.
+    nestweaver_engine::broken_links_payload(store, max_suggestions, offset, limit)
 }
 
 fn tool_schema_brain_broken_links() -> Value {
     json!({
         "name": "brain_broken_links",
-        "description": "Find wikilinks in the vault that did not resolve cleanly. TWO POPULATIONS are returned together: links that resolved at a lower tier (confidence < 1.0 — same-folder or filename-stem matches, which are NOT broken) and links that resolved to nothing (`resolved_target_uid` absent — the only genuinely broken ones).\n\nGuidelines:\n- `unresolved` and `low_confidence` count the WHOLE population, not the returned page; `returned` and `truncated` describe the page and `total` is the pre-offset population. Read the population counts, never the page composition\n- Results are ordered unresolved-first, then by ascending confidence, so the first page is the most severe — and the HIGHEST-confidence tiers are the tail, reachable only via `offset`\n- Each result includes fuzzy-matched suggested target UIDs for repair\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only detects wikilink resolution issues, not broken external URLs\n- Suggestions are fuzzy title matches, not guaranteed correct targets",
+        "description": "Find wikilinks in the vault that did not resolve cleanly. `broken_links` holds only BROKEN links: unresolved ones (`resolved_target_uid` absent, confidence 0.0) and ambiguous ones (`candidate_count` > 1, several notes match). A link that exactly and uniquely names a note (case-insensitive, any folder) is resolved at confidence 1.0 and is not listed. `low_confidence` is a SEPARATE list of links that resolved to one note by a fuzzier tier (a stem shared by several notes and narrowed by folder proximity, a path whose basename alone matched, or an alias); they are NOT broken and are not counted in `total`.\n\nGuidelines:\n- `unresolved`, `ambiguous` and `low_confidence_total` count the WHOLE population, not the returned page; `returned` and `truncated` describe the `broken_links` page and `total` is its pre-offset population (`low_confidence_truncated` describes the `low_confidence` page). Read the population counts, never the page composition\n- `offset` and `limit` window both lists. Results are ordered unresolved-first, then by ascending confidence\n- Each result includes fuzzy-matched suggested target UIDs for repair\n- Returns empty when no vault is indexed\n\nLimitations:\n- Only detects wikilink resolution issues, not broken external URLs\n- Suggestions are fuzzy title matches, not guaranteed correct targets",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -5177,7 +5147,7 @@ fn tool_brain_doc_stats(store: &GraphStore, args: Value) -> Result<Value, anyhow
 fn tool_schema_brain_doc_stats() -> Value {
     json!({
         "name": "brain_doc_stats",
-        "description": "Get a one-shot health summary of a vault's document graph — note counts, broken links, orphans, tag distribution, and notes-by-year.\n\nGuidelines:\n- Call once for a quick vault health overview before deeper analysis\n- All keys are always returned, even on an empty vault (zeros/empty collections)\n- Output: {total_notes, wikilink_edges, unresolved_link_targets, unresolved_link_section_targets, low_confidence_link_targets, orphans, avg_outdegree, top_tags, notes_by_year}\n- Every link count NAMES ITS POPULATION and they legitimately disagree: `wikilink_edges` counts edges (one ambiguous link contributes N), `unresolved_link_targets` counts distinct (note, link text), `unresolved_link_section_targets` counts distinct (section, link text). Link OCCURRENCES are not stored in the graph — `brain_add` reports those\n\nLimitations:\n- Aggregates other brain document tools; for detailed broken links use brain_broken_links directly",
+        "description": "Get a one-shot health summary of a vault's document graph — note counts, broken links, orphans, tag distribution, and notes-by-year.\n\nGuidelines:\n- Call once for a quick vault health overview before deeper analysis\n- All keys are always returned, even on an empty vault (zeros/empty collections)\n- Output: {total_notes, wikilink_edges, unresolved_link_targets, unresolved_link_section_targets, ambiguous_link_targets, low_confidence_link_targets, orphans, avg_outdegree, top_tags, notes_by_year}\n- Broken links are `unresolved_link_targets` (no target) plus `ambiguous_link_targets` (several notes match). `low_confidence_link_targets` resolved to ONE note by a fuzzier tier and is not broken; an exact, unique name match is fully resolved and in none of these counts\n- Every link count NAMES ITS POPULATION and they legitimately disagree: `wikilink_edges` counts edges (one ambiguous link contributes N), `unresolved_link_targets` counts distinct (note, link text), `unresolved_link_section_targets` counts distinct (section, link text). Link OCCURRENCES are not stored in the graph — `brain_add` reports those\n\nLimitations:\n- Aggregates other brain document tools; for detailed broken links use brain_broken_links directly",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -5230,7 +5200,7 @@ fn tool_brain_memory_lint(store: &GraphStore, args: Value) -> Result<Value, anyh
 fn tool_schema_brain_memory_lint() -> Value {
     json!({
         "name": "brain_memory_lint",
-        "description": "Audit a memory-bank vault for health problems across seven categories: stale notes, contradictions, orphans, broken wikilinks, supersession chains, schema drift, and dangling relationships.\n\nGuidelines:\n- All seven keys always present in output; empty on a no-vault database\n- Use limit to cap results per category; totals are always reported\n- Schema drift checks against _templates/<kind>.md templates\n\nLimitations:\n- Stale detection uses a fixed 90-day threshold for status:active notes\n- Schema drift requires template files to exist in _templates/",
+        "description": "Audit a memory-bank vault for health problems across seven categories: stale notes, contradictions, orphans, broken wikilinks, supersession chains, schema drift, and dangling relationships.\n\nGuidelines:\n- All seven keys always present in output; empty on a no-vault database\n- `broken_wikilinks` holds only unresolved or ambiguous links; links that resolved to one note below full confidence are listed separately in `low_confidence_wikilinks` and are not a health problem\n- Use limit to cap results per category; totals are always reported\n- Schema drift checks against _templates/<kind>.md templates\n\nLimitations:\n- Stale detection uses a fixed 90-day threshold for status:active notes\n- Schema drift requires template files to exist in _templates/",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -5661,36 +5631,28 @@ pub fn not_found_envelope(error: &anyhow::Error) -> Option<Value> {
     None
 }
 
-/// Tools whose identifying argument is a repo selector (`repo`), so an
-/// unresolved selector is the tool's lookup miss rather than a filter error.
-const REPO_LOOKUP_TOOLS: &[&str] = &["brain_diff"];
+/// The unresolved repo filter in `error`'s chain, if that is what failed.
+pub fn repo_filter_failure(
+    error: &anyhow::Error,
+) -> Option<&nestweaver_engine::node_scope::RepoFilterUnresolved> {
+    error.chain().find_map(|cause| {
+        cause.downcast_ref::<nestweaver_engine::node_scope::RepoFilterUnresolved>()
+    })
+}
 
 /// [`not_found_envelope`] plus the misses a tool reports through a shared
-/// typed error instead of [`ToolTargetNotFound`]: `brain_diff`'s unknown
-/// `repo` is a `RepoFilterUnresolved`, which the CLI classifies (exit 2) and
-/// the daemon stamps with its own code, so it is recognised here by tool
-/// rather than re-typed at the source. An AMBIGUOUS selector is not a miss
-/// and keeps its prose error.
-pub fn lookup_miss_envelope(tool: &str, error: &anyhow::Error) -> Option<Value> {
+/// typed error instead of [`ToolTargetNotFound`]: a repo selector that names
+/// no indexed repo is a `RepoFilterUnresolved` whose class is not found,
+/// which the CLI classifies (exit 2) and the daemon stamps with its own code,
+/// so it is recognised here rather than re-typed at every source. An
+/// AMBIGUOUS or malformed selector is not a miss and keeps its error text.
+pub fn lookup_miss_envelope(_tool: &str, error: &anyhow::Error) -> Option<Value> {
     if let Some(envelope) = not_found_envelope(error) {
         return Some(envelope);
     }
-    if !REPO_LOOKUP_TOOLS.contains(&tool) {
-        return None;
-    }
-    let unresolved = error.chain().find_map(|cause| {
-        cause.downcast_ref::<nestweaver_engine::node_scope::RepoFilterUnresolved>()
-    })?;
-    let message = unresolved.to_string();
-    if message.to_ascii_lowercase().contains("ambiguous") {
-        return None;
-    }
-    Some(json!({
-        "status": "not_found",
-        "error": "not found",
-        "repo": unresolved.selector,
-        "message": message,
-    }))
+    let unresolved = repo_filter_failure(error)?;
+    (unresolved.failure == nestweaver_engine::RepoSelectorFailure::NotFound)
+        .then(|| unresolved.envelope())
 }
 
 /// Parse a not-found envelope out of gRPC status details, if that is what
@@ -5718,7 +5680,13 @@ pub fn wrap_tool_not_found(envelope: Value) -> Value {
 pub fn wrap_tool_failure(tool: &str, error: &anyhow::Error) -> Value {
     match lookup_miss_envelope(tool, error) {
         Some(envelope) => wrap_tool_not_found(envelope),
-        None => wrap_tool_error(&error.to_string()),
+        // An unresolved repo filter renders its OWN message: an outer
+        // `.context()` would otherwise replace the candidate list a caller
+        // needs to pick one repo.
+        None => match repo_filter_failure(error) {
+            Some(unresolved) => wrap_tool_error(&unresolved.to_string()),
+            None => wrap_tool_error(&error.to_string()),
+        },
     }
 }
 
@@ -5748,7 +5716,10 @@ fn is_concise(args: &Value) -> bool {
 /// case-insensitive kind-PREFIX match.
 const BRAIN_CONTEXT_KINDS: &[&str] = &["Symbol", "Note", "Section", "Tag", "Heading"];
 
-fn validate_brain_context_kinds(kinds: &[String]) -> Result<(), anyhow::Error> {
+/// Public so the CLI can refuse a bad `--kinds` value at parse time with
+/// the same rule and message. The error is a [`ToolArgumentsInvalid`]: the
+/// input is invalid whatever the graph holds.
+pub fn validate_brain_context_kinds(kinds: &[String]) -> Result<(), anyhow::Error> {
     for kind in kinds {
         let is_base = BRAIN_CONTEXT_KINDS
             .iter()
@@ -5758,10 +5729,13 @@ fn validate_brain_context_kinds(kinds: &[String]) -> Result<(), anyhow::Error> {
             .is_some_and(|p| p.eq_ignore_ascii_case("symbol/"))
             && kind.len() > "symbol/".len();
         if !is_base && !is_symbol_subkind {
-            return Err(anyhow!(
-                "unknown kind '{kind}'; expected one of: {} (or a 'Symbol/<sub-kind>' prefix)",
-                BRAIN_CONTEXT_KINDS.join(", ")
-            ));
+            return Err(ToolArgumentsInvalid {
+                message: format!(
+                    "unknown kind '{kind}'; expected one of: {} (or a 'Symbol/<sub-kind>' prefix)",
+                    BRAIN_CONTEXT_KINDS.join(", ")
+                ),
+            }
+            .into());
         }
     }
     Ok(())
@@ -9817,16 +9791,13 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
         // Detection priority: Obsidian vault > markdown folder > git repo.
         if has_obsidian || has_any_md {
             let kind = if has_obsidian { "obsidian" } else { "markdown" };
+            // Empty when `name` is absent: the indexer then keeps a registered
+            // vault's stored name, and names a new one after its directory.
             let name = args
                 .get("name")
                 .and_then(|v| v.as_str())
                 .map(String::from)
-                .unwrap_or_else(|| {
-                    path.file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("vault")
-                        .to_string()
-                });
+                .unwrap_or_default();
             // We need a db_path for index_markdown_directory; but the server
             // already opened one. Reuse it indirectly: call the in-memory
             // primitive? No — that doesn't persist. Reopen the same DB by
@@ -10475,18 +10446,12 @@ fn tool_cross_repo_contracts(
     // Resolved with the same
     // `resolve_repo_selector` every other `--repo` flag in this binary uses,
     // rather than a bespoke string-equality check that would drift from it.
+    // Through `resolve_repo_filter`, so an unresolved selector keeps its
+    // class (not found / ambiguous / malformed) instead of flattening to text.
     let repo_filter = match args.get("repo").and_then(|v| v.as_str()) {
-        Some(selector) => {
-            let repos = store
-                .list_repos(None)
-                .map_err(|e| anyhow!("list_repos: {e}"))?;
-            Some(
-                nestweaver_engine::resolve_repo_selector(&repos, selector)
-                    .map_err(|e| anyhow!("{e}"))?
-                    .uid
-                    .clone(),
-            )
-        }
+        Some(selector) => resolve_repo_filter(store, &[selector.to_string()], None)?
+            .into_iter()
+            .next(),
         None => None,
     };
 
@@ -11578,7 +11543,7 @@ fn build_flow_tree(
 fn tool_schema_detect_changes() -> Value {
     json!({
         "name": "detect_changes",
-        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high, or unknown when a changed file maps to no indexed symbols — never read unknown as low)\n- `risk` and `gate_state` are the verdict `blast_radius` returns for the same files at its default depth (nw-544), so a gate built on either tool agrees; `affected_processes` is detail, not a risk input\n- Gate on `gate_state`, not `status` (nw-467): a run that merely stopped at its configured depth is `status: partial` but `gate_state: ok` — bounded, not broken, and the normal state at the default depth. `degraded-unknown` means stale/errored/refused/cancelled and requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts\n- `resolver_stale_repos`, when present, is repo UIDs with generation-mismatched edges — a different population from `stale_check`'s or `hub_nodes`'s own `stale_repos` (same key name, different tools, different meanings — nw-371)",
+        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high, or unknown when a changed file maps to no indexed symbols — never read unknown as low)\n- `risk` and `gate_state` are the verdict `blast_radius` returns for the same files at its default depth (nw-544), so a gate built on either tool agrees; `affected_processes` is detail, not a risk input\n- Gate on `gate_state`, not `status` (nw-467): a run that merely stopped at its configured depth is `status: partial` but `gate_state: ok` — bounded, not broken, and the normal state at the default depth. `degraded-unknown` means stale/errored/refused/cancelled and requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts\n- `resolver_stale_repos`, when present, is repo UIDs with generation-mismatched edges that own or are linked to a changed file (a stale repo unrelated to the change is only named in a `resolver-generation-stale-unrelated` warning) — a different population from `stale_check`'s or `hub_nodes`'s own `stale_repos` (same key name, different tools, different meanings — nw-371)",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -11696,8 +11661,16 @@ fn tool_detect_changes_scoped(
             })
             .collect();
         let symbols_omitted = total.saturating_sub(affected_symbols.len());
-        let mut resolver_stale_repos =
-            nestweaver_engine::resolver_generation::incompatible_repos_for_store(store)?;
+        // The same owning-or-linked verdict the unrestricted route
+        // reaches through `detect_changes_impact`.
+        let mut incompatibility =
+            nestweaver_engine::resolver_generation::incompatibility_for_changed_files(
+                store, &files,
+            )?;
+        incompatibility
+            .unrelated
+            .retain(|repo_uid| repo_is_visible(repo_uid, visible));
+        let mut resolver_stale_repos = incompatibility.all();
         resolver_stale_repos.retain(|repo_uid| repo_is_visible(repo_uid, visible));
         let mut notifications = vec![json!({
             "level": "warning",
@@ -11719,6 +11692,13 @@ fn tool_detect_changes_scoped(
                 "message": nestweaver_engine::resolver_generation::incompatibility_message(
                     &resolver_stale_repos,
                 ),
+            }));
+        }
+        if let Some(message) = incompatibility.unrelated_message() {
+            notifications.push(json!({
+                "level": "warning",
+                "descriptor": nestweaver_engine::resolver_generation::UNRELATED_STALE_RESOLVER_DESCRIPTOR,
+                "message": message,
             }));
         }
         return Ok(json!({
@@ -11848,7 +11828,7 @@ fn tool_detect_changes_scoped(
 fn tool_schema_affected_tests() -> Value {
     json!({
         "name": "affected_tests",
-        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (at least one must be provided).\n\nREFUSAL: on a graph whose edges predate the running resolver this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos`, a `remedies` array, `recommendation: \"run-full-suite\"`, and NO tier keys at all — a missing edge can only make the selection SMALLER, so an under-resolved graph silently drops a regression test while the gate still reports success. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required, a generation-stale repo is already at HEAD so a plain incremental index writes nothing) and call again.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n- `recommendation` is a machine-readable CI directive: 'selection-usable' requires a complete run with nonempty test files, or an explicitly documented docs-only/proven-empty exception; otherwise 'run-full-suite'. Documentation-only changes are disclosed as docs; unassessed source/config changes are disclosed and widen to the full suite\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n- `resolver_stale_repos` (repo UIDs, generation-mismatch) is NOT the same population as `_meta.stale_repos` (federation lag, present only via the hybrid client) or `stale_check`'s/`hub_nodes`'s own `stale_repos` (different tools, different populations under the same key name — nw-371)\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
+        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (at least one must be provided).\n\nREFUSAL: when a repo that owns a changed file (or shares a recorded cross-repo edge or a declared `[[links]]` entry with one) has edges that predate the running resolver, this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos`, a `remedies` array, `recommendation: \"run-full-suite\"`, and NO tier keys at all — a missing edge can only make the selection SMALLER, so an under-resolved graph silently drops a regression test while the gate still reports success. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required, a generation-stale repo is already at HEAD so a plain incremental index writes nothing) and call again. A stale repo unrelated to the change does not refuse; it is named in a `resolver-generation-stale-unrelated` warning notification.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n- `recommendation` is a machine-readable CI directive: 'selection-usable' requires a complete run with nonempty test files, or an explicitly documented docs-only/proven-empty exception; otherwise 'run-full-suite'. Documentation-only changes are disclosed as docs; unassessed source/config changes are disclosed and widen to the full suite\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n- `resolver_stale_repos` (repo UIDs, generation-mismatch) is NOT the same population as `_meta.stale_repos` (federation lag, present only via the hybrid client) or `stale_check`'s/`hub_nodes`'s own `stale_repos` (different tools, different populations under the same key name — nw-371)\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -11898,14 +11878,6 @@ fn tool_affected_tests(
     args: Value,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
-    // nw-412: REFUSE before doing any work, the way `dead_code` does. On a
-    // resolver-generation-stale graph a MISSING edge makes the affected-test
-    // set SMALLER, so the regression test that should have run is silently
-    // dropped while the gate reports success.
-    if let Some(refusal) = resolver_generation_refusal(store, visible)? {
-        return Ok(affected_tests_refusal_payload(&refusal));
-    }
-
     let owners = restricted_symbol_owners(store, visible)?;
 
     // Resolve the set of changed files: explicit list takes precedence over base_ref.
@@ -11957,6 +11929,16 @@ fn tool_affected_tests(
         return Err(anyhow!(
             "provide either 'changed_files' (non-empty) or 'base_ref'"
         ));
+    }
+
+    // nw-412: REFUSE before selecting, the way `dead_code` does. On a
+    // resolver-generation-stale graph a MISSING edge makes the affected-test
+    // set SMALLER, so the regression test that should have run is silently
+    // dropped while the gate reports success. Only a stale repository
+    // that owns or is linked to a changed file refuses; an unrelated one is
+    // disclosed in the selection's notifications instead.
+    if let Some(refusal) = resolver_generation_refusal(store, visible, Some(&changed_files))? {
+        return Ok(affected_tests_refusal_payload(&refusal));
     }
 
     // nw-037: route through the recorded wrapper so every selection feeds the
@@ -12266,8 +12248,9 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
                 .collect(),
             "repos",
         )?;
-        let scoped = nestweaver_engine::compute_clusters_scoped(store, &selectors, resolution_arg)
-            .context("compute_clusters_scoped")?;
+        // No `.context()`: the outermost message is what a client renders,
+        // and wrapping here hid an unresolved repo's class and candidates.
+        let scoped = nestweaver_engine::compute_clusters_scoped(store, &selectors, resolution_arg)?;
 
         require_cluster(requested_id, &scoped.communities)?;
         let matching: Vec<&nestweaver_engine::CommunityInfo> = scoped
@@ -14525,7 +14508,7 @@ fn tool_bridge_nodes(
 fn tool_schema_blast_radius() -> Value {
     json!({
         "name": "blast_radius",
-        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High, or Unknown when a changed file maps to no indexed symbols — never read Unknown as Low) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\n`cochanged_files` lists historically co-changing files (git history, Jaccard confidence) with no static edge — an advisory recall supplement; absence of co-change data is disclosed via a `cochange-unavailable` note.\n\nTrust contract (read before trusting a green result):\n- status (complete/partial/degraded/failed) + gate_state (ok/degraded-unknown/risk-flagged) are TWO AXES, not one (nw-467). A run that stopped at its configured traversal budget is `status: partial` and still gates `ok` — it is BOUNDED, not degraded, and at the default depth of 3 that is the steady state, so `status == complete` is not a usable green light and `gate_state` is. A run that is stale, errored, refused or cancelled is degraded-unknown, NEVER risk-flagged — treat that one as 'unknown, review manually', not 'safe'. The bound itself is never hidden: `coverage.traversal_truncated` and the `depth-truncated` blind spot still report it\n- a graph whose edges predate the running resolver DEGRADES rather than refusing: status becomes at least 'degraded', gate_state becomes 'degraded-unknown', and a `resolver.generation-stale` notification names the repos and the `nestweaver index --repo <path> --force` remedy. On such a graph a missing edge UNDERSTATES impact, so a green result there is not a green result. (`affected_tests` refuses outright on the same condition — it is a selector, and a narrowed selection cannot be widened back by its caller.)\n- coverage (repos in scope / not indexed / stale / truncated) distinguishes 'no impact' from 'incomplete coverage'\n- blind_spots: inherent static gaps (dynamic-dispatch, reflection, config-wiring, codegen) plus run-specific ones (pruned-below-threshold, depth-truncated, not-indexed)\n- THREE fields on this response are named `stale_repos` or a variant of it, and they mean three different things (nw-371): `coverage.stale_repos` is behind-git-HEAD repos (objects with `repo_uid`+`commits_behind`); `resolver_stale_repos` (top-level) is repo UIDs whose edges predate/postdate this resolver generation; `_meta.stale_repos`, present only via the hybrid client, is FEDERATION lag (an upstream server's data being behind). None is interchangeable with `stale_check`'s or `hub_nodes`'/`bridge_nodes`'s own `stale_repos`, which are separate tools with separate populations under the same key name.\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection (declared in blind_spots, not silently)\n- Response size scales with number of changed files and graph density\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results. On an authenticated server with an [authz] policy, repository-restricted callers are refused before seed resolution or traversal: the global walk cannot yet be computed on an authorization-induced subgraph, and redacting after traversal would preserve reachability created through hidden intermediates.",
+        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High, or Unknown when a changed file maps to no indexed symbols — never read Unknown as Low) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\n`cochanged_files` lists historically co-changing files (git history, Jaccard confidence) with no static edge — an advisory recall supplement; absence of co-change data is disclosed via a `cochange-unavailable` note.\n\nTrust contract (read before trusting a green result):\n- status (complete/partial/degraded/failed) + gate_state (ok/degraded-unknown/risk-flagged) are TWO AXES, not one (nw-467). A run that stopped at its configured traversal budget is `status: partial` and still gates `ok` — it is BOUNDED, not degraded, and at the default depth of 3 that is the steady state, so `status == complete` is not a usable green light and `gate_state` is. A run that is stale, errored, refused or cancelled is degraded-unknown, NEVER risk-flagged — treat that one as 'unknown, review manually', not 'safe'. The bound itself is never hidden: `coverage.traversal_truncated` and the `depth-truncated` blind spot still report it\n- a graph whose edges predate the running resolver DEGRADES rather than refusing: status becomes at least 'degraded', gate_state becomes 'degraded-unknown', and a `resolver.generation-stale` notification names the repos and the `nestweaver index --repo <path> --force` remedy. On such a graph a missing edge UNDERSTATES impact, so a green result there is not a green result. (`affected_tests` refuses outright on the same condition — it is a selector, and a narrowed selection cannot be widened back by its caller.) Only a stale repo that owns a changed file, or shares a recorded cross-repo edge or a declared `[[links]]` entry with one that does, degrades; any other stale repo is named in a `resolver-generation-stale-unrelated` warning and does not\n- coverage (repos in scope / not indexed / stale / truncated) distinguishes 'no impact' from 'incomplete coverage'\n- blind_spots: inherent static gaps (dynamic-dispatch, reflection, config-wiring, codegen) plus run-specific ones (pruned-below-threshold, depth-truncated, not-indexed)\n- THREE fields on this response are named `stale_repos` or a variant of it, and they mean three different things (nw-371): `coverage.stale_repos` is behind-git-HEAD repos (objects with `repo_uid`+`commits_behind`); `resolver_stale_repos` (top-level) is repo UIDs whose edges predate/postdate this resolver generation; `_meta.stale_repos`, present only via the hybrid client, is FEDERATION lag (an upstream server's data being behind). None is interchangeable with `stale_check`'s or `hub_nodes`'/`bridge_nodes`'s own `stale_repos`, which are separate tools with separate populations under the same key name.\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection (declared in blind_spots, not silently)\n- Response size scales with number of changed files and graph density\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results. On an authenticated server with an [authz] policy, repository-restricted callers are refused before seed resolution or traversal: the global walk cannot yet be computed on an authorization-induced subgraph, and redacting after traversal would preserve reachability created through hidden intermediates.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -14712,7 +14695,12 @@ fn tool_blast_radius(
     // direction that made this dangerous: a stale-resolver run reported
     // `gate_state: ok` over a shrunken affected set, and can no longer report
     // `ok` at all.
-    if let Some(refusal) = resolver_generation_refusal(store, visible)? {
+    let changed_file_strings: Vec<String> = files
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    if let Some(refusal) = resolver_generation_refusal(store, visible, Some(&changed_file_strings))?
+    {
         result.status = result
             .status
             .max(nestweaver_engine::blast_radius::AnalysisStatus::Degraded);
@@ -15416,6 +15404,9 @@ pub fn set_current_db_path(path: std::path::PathBuf) {
 /// `brain_search` can apply Feature F6 `[ranking]` priors without re-parsing
 /// the file. Pass `None` to clear.
 pub fn set_current_instance_config(cfg: Option<std::sync::Arc<nestweaver_engine::InstanceConfig>>) {
+    // The same dispatch's declared `[[links]]` are reachability evidence for
+    // the resolver-generation gate, which the engine reads on this thread.
+    nestweaver_engine::resolver_generation::set_declared_link_config(cfg.clone());
     CURRENT_INSTANCE_CONFIG.with(|c| *c.borrow_mut() = cfg);
 }
 
@@ -16710,6 +16701,8 @@ fn dispatch_add_source_via_daemon(
             let req = tonic::Request::new(nestweaver_proto::IndexVaultRequest {
                 vault_path: path.clone(),
                 vault_name: vault_name.unwrap_or_default(),
+                // Without `name`, a registered vault keeps its stored name.
+                vault_name_defaulted: name_arg.is_none(),
                 extra_ignore_patterns: vec![],
                 instance_id: instance_id.clone(),
                 max_note_bytes: current_instance_config()
@@ -17372,7 +17365,7 @@ fn dead_code_refusal(
     store: &GraphStore,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Option<nestweaver_engine::resolver_generation::DeadCodeRefusal>, anyhow::Error> {
-    resolver_generation_refusal(store, visible)
+    resolver_generation_refusal(store, visible, None)
 }
 
 /// The resolver-generation verdict for the repos this caller can SEE, or
@@ -17391,9 +17384,15 @@ fn dead_code_refusal(
 /// makes the verdict CORRECT for that caller: a stale repo they cannot see can
 /// contribute no edge to an answer that is already filtered to their scope, so
 /// refusing on it would be refusing on someone else's data.
+///
+/// `changed_files`, when given, narrows the verdict to the repositories that
+/// own or are linked to one of them: an unrelated stale repository is
+/// disclosed by the analysis itself and does not refuse or degrade the call.
+/// `None` keeps the whole-graph verdict `dead_code` needs.
 fn resolver_generation_refusal(
     store: &GraphStore,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+    changed_files: Option<&[String]>,
 ) -> Result<Option<nestweaver_engine::resolver_generation::DeadCodeRefusal>, anyhow::Error> {
     let db_path = match (current_db_path(store), store.db_path()) {
         (Ok(path), _) => path,
@@ -17405,11 +17404,19 @@ fn resolver_generation_refusal(
     // error (and, on the CLI, the diagnostic nw-285 built for a schema-less
     // database) rather than a binder exception quoted inside a paragraph about
     // resolver generations.
-    let repos: Vec<nestweaver_schema::Repo> = store
+    let mut repos: Vec<nestweaver_schema::Repo> = store
         .list_repos(None)?
         .into_iter()
         .filter(|repo| repo_is_visible(&repo.uid, visible))
         .collect();
+    if let Some(changed_files) = changed_files {
+        nestweaver_engine::resolver_generation::incompatibility_for_changed_files_at(
+            store,
+            Some(&db_path),
+            changed_files,
+        )?
+        .retain_degrading(&mut repos);
+    }
     Ok(nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(&db_path, &repos))
 }
 
@@ -22327,6 +22334,16 @@ mod arg_alias_tests {
                 root_path: Some("/tmp/future".to_string()),
             })
             .unwrap();
+        // The changed file belongs to the future-generation repository; a
+        // stale repository unrelated to the change only discloses.
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: "file:future:src/new.rs".to_string(),
+                path: "src/new.rs".to_string(),
+                repo_uid: repo_uid.to_string(),
+                content_hash: "h".to_string(),
+            })
+            .unwrap();
         nestweaver_engine::resolver_generation::record(&db, repo_uid).unwrap();
         let mut generations = nestweaver_engine::resolver_generation::load(&db);
         generations.repos.insert(
@@ -23545,6 +23562,16 @@ mod blast_radius_visibility_tests {
                 instance_id: "inst".to_string(),
                 name: None,
                 root_path: None,
+            })
+            .unwrap();
+        // The changed file belongs to the stale repository, so it
+        // degrades rather than being disclosed as unrelated.
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: "file:repo:visible:src/a.rs".to_string(),
+                path: "src/a.rs".to_string(),
+                repo_uid: "repo:visible".to_string(),
+                content_hash: "h".to_string(),
             })
             .unwrap();
 
@@ -25658,13 +25685,15 @@ mod broken_links_window_tests {
     /// hand-rolls its disclosure instead of using the `Bounded` seam.
     #[test]
     fn the_high_confidence_tail_is_reachable_by_offset() {
-        // Three 0.70 alias rows sort ahead of one 0.95 same-folder row.
+        // Three 0.70 alias rows sort ahead of one 0.95 same-folder row, and
+        // all four resolved to ONE note each: the low-confidence list.
         let (_dir, root) = make_vault(&[
             (
                 "f/a.md",
                 "# A\n\nSee [[Sibling]], [[al-one]], [[al-two]], [[al-three]].\n",
             ),
             ("f/Sibling.md", "# Different Title Entirely\n"),
+            ("h/Sibling.md", "# Another Sibling\n"),
             ("g/one.md", "---\naliases: [al-one]\n---\n# One\n"),
             ("g/two.md", "---\naliases: [al-two]\n---\n# Two\n"),
             ("g/three.md", "---\naliases: [al-three]\n---\n# Three\n"),
@@ -25672,54 +25701,46 @@ mod broken_links_window_tests {
         let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
 
         let page = tool_brain_broken_links(&store, json!({ "limit": 3 })).unwrap();
-        assert_eq!(page["total"], 4, "envelope: {page}");
+        assert_eq!(page["total"], 0, "none of these is broken: {page}");
+        assert_eq!(page["low_confidence_total"], 4, "envelope: {page}");
         assert_eq!(
-            page["truncated"],
+            page["low_confidence_truncated"],
             json!(true),
-            "nw-341: a truncated page must SAY it is truncated, through the same \
-             (returned, total, truncated) seam every other bounded list uses: {page}"
+            "a truncated page must SAY it is truncated: {page}"
         );
-        let head: Vec<&str> = page["broken_links"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|l| l["wikilink_text"].as_str().unwrap())
-            .collect();
+        let texts = |value: &Value| -> Vec<String> {
+            value["low_confidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| l["wikilink_text"].as_str().unwrap().to_string())
+                .collect()
+        };
         assert!(
-            !head.contains(&"Sibling"),
-            "precondition: the 0.95 row must be the one the cap removes, got {head:?}"
+            !texts(&page).contains(&"Sibling".to_string()),
+            "precondition: the 0.95 row must be the one the cap removes: {page}"
         );
 
         let tail = tool_brain_broken_links(&store, json!({ "limit": 3, "offset": 3 })).unwrap();
-        let tail_texts: Vec<&str> = tail["broken_links"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|l| l["wikilink_text"].as_str().unwrap())
-            .collect();
         assert!(
-            tail_texts.contains(&"Sibling"),
-            "nw-341: the 0.95 same-folder tier must be REACHABLE -- it is precisely \
-             what a reviewer of the wikilink tier ladder has to inspect, got {tail_texts:?}"
+            texts(&tail).contains(&"Sibling".to_string()),
+            "the 0.95 same-folder tier must be REACHABLE by offset: {tail}"
         );
         assert_eq!(
-            tail["total"], 4,
-            "total must stay the PRE-offset population: {tail}"
+            tail["low_confidence_total"], 4,
+            "the total must stay the PRE-offset population: {tail}"
         );
-        assert_eq!(
-            tail["offset"], 3,
-            "the window's origin must be echoed, or a caller paging through \
-             cannot tell which page it is holding: {tail}"
-        );
+        assert_eq!(tail["offset"], 3, "{tail}");
     }
 
-    /// nw-341: an offset past the end is an empty page, not an error and not a
+    /// An offset past the end is an empty page, not an error and not a
     /// wrapped-around page. It must still report the true population.
     #[test]
     fn an_offset_past_the_population_is_an_honest_empty_page() {
         let (_dir, root) = make_vault(&[
-            ("f/a.md", "# A\n\nSee [[Sibling]].\n"),
+            ("f/a.md", "# A\n\nSee [[Sibling]] and [[Missing]].\n"),
             ("f/Sibling.md", "# Different Title Entirely\n"),
+            ("g/Sibling.md", "# Another Sibling\n"),
         ]);
         let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
 
@@ -25727,11 +25748,11 @@ mod broken_links_window_tests {
         assert_eq!(page["returned"], json!(0));
         assert_eq!(page["total"], json!(1), "population, not remainder: {page}");
         assert_eq!(page["truncated"], json!(true));
+        assert_eq!(page["unresolved"], json!(1), "{page}");
         assert_eq!(
-            page["unresolved"].as_u64().unwrap() + page["low_confidence"].as_u64().unwrap(),
-            1,
-            "nw-297: classification is over the POPULATION, so it survives any \
-             window: {page}"
+            page["low_confidence_total"],
+            json!(1),
+            "classification is over the POPULATION, so it survives any window: {page}"
         );
     }
 }
@@ -27481,6 +27502,100 @@ mod context_scope_filter_tests {
         assert_eq!(resolved, HashSet::from([REPO_A.to_string()]));
     }
 
+    /// A symbol lookup's `repo` disambiguation resolves like every repo
+    /// filter: it used to fall back to substring matching over file paths and
+    /// UIDs, so an unknown or ambiguous selector quietly picked symbols.
+    #[test]
+    fn a_symbol_lookups_repo_filter_keeps_its_failure_class() {
+        let store = store_with_two_repos_named_website();
+        for (selector, failure) in [
+            (
+                "not-a-repo",
+                nestweaver_engine::RepoSelectorFailure::NotFound,
+            ),
+            ("website", nestweaver_engine::RepoSelectorFailure::Ambiguous),
+            ("", nestweaver_engine::RepoSelectorFailure::Malformed),
+        ] {
+            let error = filter_name_matches_by_repo(&store, Vec::new(), Some(selector), None);
+            if selector.is_empty() {
+                // An empty selector means "no filter", as it always has.
+                assert!(error.is_ok());
+                continue;
+            }
+            let error = error.expect_err(selector);
+            let unresolved = repo_filter_failure(&error)
+                .unwrap_or_else(|| panic!("{selector}: untyped {error:#}"));
+            assert_eq!(unresolved.failure, failure, "{selector}");
+        }
+        let error = filter_name_matches_by_repo(&store, Vec::new(), Some(&"z".repeat(600)), None)
+            .expect_err("an over-long selector is malformed");
+        assert_eq!(
+            repo_filter_failure(&error).unwrap().failure,
+            nestweaver_engine::RepoSelectorFailure::Malformed
+        );
+        // Counterweight: the exact UID still selects its repo.
+        assert!(filter_name_matches_by_repo(&store, Vec::new(), Some(REPO_A), None).is_ok());
+    }
+
+    /// Kind filters outside the advertised vocabulary are argument errors,
+    /// which the daemon reports as invalid arguments (a usage error).
+    #[test]
+    fn unknown_kinds_are_typed_argument_errors() {
+        for error in [
+            validate_brain_context_kinds(&["bogus".to_string()]).unwrap_err(),
+            validate_regex_kinds(Some(&["bogus".to_string()])).unwrap_err(),
+        ] {
+            assert!(error.is::<ToolArgumentsInvalid>(), "{error:#}");
+            assert!(error.to_string().contains("bogus"), "{error:#}");
+        }
+        validate_brain_context_kinds(&["Symbol/Function".to_string()]).unwrap();
+        validate_regex_kinds(Some(&["note".to_string()])).unwrap();
+    }
+
+    /// An MCP repo-filter miss is a lookup miss: `isError: true` with the
+    /// not-found envelope. An ambiguous selector is `isError: true` whose text
+    /// names both candidates even when a tool wrapped the error in context.
+    #[test]
+    fn a_repo_filter_miss_is_the_mcp_not_found_envelope() {
+        let store = store_with_two_repos_named_website();
+        let miss = dispatch(
+            &store,
+            None,
+            "clusters",
+            json!({ "repos": ["not-a-repo"] }),
+            None,
+        )
+        .expect_err("an unknown repo must not answer");
+        let wrapped = wrap_tool_failure("clusters", &miss);
+        assert_eq!(wrapped["isError"], json!(true), "{wrapped}");
+        assert_eq!(
+            wrapped["structuredContent"]["status"], "not_found",
+            "{wrapped}"
+        );
+        assert_eq!(
+            wrapped["structuredContent"]["repo"], "not-a-repo",
+            "{wrapped}"
+        );
+
+        let ambiguous = dispatch(
+            &store,
+            None,
+            "clusters",
+            json!({ "repos": ["website"] }),
+            None,
+        )
+        .expect_err("an ambiguous repo must not answer")
+        .context("an outer layer");
+        let wrapped = wrap_tool_failure("clusters", &ambiguous);
+        assert_eq!(wrapped["isError"], json!(true), "{wrapped}");
+        assert!(wrapped.get("structuredContent").is_none(), "{wrapped}");
+        let text = wrapped["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("ambiguous") && text.contains(REPO_A) && text.contains(REPO_B),
+            "{text}"
+        );
+    }
+
     /// nw-405: an entry that names no repo is an ERROR. The old predicate
     /// matched nothing and returned a confident empty result, which a caller
     /// reads as "this repo has no relevant content" rather than "you named a
@@ -27804,6 +27919,70 @@ mod resolver_stale_merge_gate_tests {
             stale.get("coverage").is_some() && stale.get("blind_spots").is_some(),
             "degrading must not strip the trust contract it degrades: {stale}"
         );
+    }
+
+    /// A stale repository that neither owns a changed file nor shares
+    /// an edge or declared link with one is DISCLOSED, and neither refuses
+    /// `affected_tests` nor degrades `blast_radius`/`detect_changes`. The
+    /// counterweight is the two tests above: the same fixture with the OWNING
+    /// repository stale still refuses and degrades.
+    #[test]
+    fn an_unrelated_stale_repo_is_disclosed_without_refusing_or_degrading() {
+        let (_dir, db_path) = super::cache_dispatch_tests::index_on_disk_for_merge_guard();
+        let store = GraphStore::open(&db_path).unwrap();
+        // A second repository with no generation record, and no link to the
+        // indexed one: incompatible, and unrelated to `main.js`.
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:default:unrelated".into(),
+                url: "file:///src/unrelated".into(),
+                indexed_sha: "deadbeef".into(),
+                staleness_commits_behind: 0,
+                instance_id: "default".into(),
+                name: None,
+                root_path: Some("/src/unrelated".into()),
+            })
+            .unwrap();
+        let args = json!({ "changed_files": ["main.js"] });
+        let discloses = |payload: &Value| {
+            payload["notifications"].as_array().is_some_and(|all| {
+                all.iter().any(|n| {
+                    n["descriptor"]
+                        == json!(
+                            nestweaver_engine::resolver_generation::UNRELATED_STALE_RESOLVER_DESCRIPTOR
+                        )
+                        && n["message"]
+                            .as_str()
+                            .is_some_and(|m| m.contains("repo:default:unrelated"))
+                })
+            })
+        };
+
+        let tests = tool_affected_tests(&store, args.clone(), None).unwrap();
+        assert!(tests.get("refused").is_none(), "{tests}");
+        assert_eq!(tests["resolver_stale_repos"], json!([]), "{tests}");
+        assert!(discloses(&tests), "{tests}");
+
+        let blast = tool_blast_radius(&store, args.clone(), None, None).unwrap();
+        assert_eq!(blast["gate_state"], json!("ok"), "{blast}");
+        assert!(
+            !blast["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["descriptor"] == json!(BLAST_RADIUS_RESOLVER_STALE_DESCRIPTOR)),
+            "{blast}"
+        );
+        assert!(discloses(&blast), "{blast}");
+
+        let changes = tool_detect_changes(&store, args).unwrap();
+        assert_eq!(changes["resolver_stale_repos"], json!([]), "{changes}");
+        assert_ne!(
+            changes["gate_state"],
+            json!("degraded-unknown"),
+            "{changes}"
+        );
+        assert!(discloses(&changes), "{changes}");
     }
 }
 
@@ -28464,6 +28643,8 @@ mod ambiguous_name_contract_tests {
             "must trace the Python ping, not another language: {payload}"
         );
 
+        // `ping` names four repos, so the REPO selector itself is ambiguous:
+        // the typed repo-filter error every surface reports, with candidates.
         let still = dispatch(
             &store,
             None,
@@ -28471,8 +28652,14 @@ mod ambiguous_name_contract_tests {
             json!({ "symbol": "ping", "repo": "ping" }),
             None,
         )
-        .expect("still-ambiguous selector is a structured refusal");
-        assert_ambiguous_tool_payload("flow_trace -- repo=ping", &still);
+        .expect_err("an ambiguous repo selector must not pick a repo");
+        let unresolved = repo_filter_failure(&still).expect("typed repo-filter error");
+        assert_eq!(
+            unresolved.failure,
+            nestweaver_engine::RepoSelectorFailure::Ambiguous,
+            "{still:#}"
+        );
+        assert_eq!(unresolved.candidates.len(), 4, "{still:#}");
     }
 }
 
