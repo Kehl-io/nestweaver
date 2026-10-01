@@ -3922,6 +3922,7 @@ impl DaemonService {
 
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || -> Result<String, Status> {
+            crash_if_test_seam_names(&tool_name);
             let has_authoritative_writer = mutation.is_some();
             let _mutation_scope = mutation.map(|(guard, label)| MutationWorkerOwnership {
                 _write_lease: state.write_gate.blocking_lock(label),
@@ -4180,6 +4181,7 @@ impl DaemonService {
 
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, Status> {
+            crash_if_test_seam_names(&tool_name);
             nestweaver_mcp::tools::set_current_db_path(state.db_path.clone());
             nestweaver_mcp::tools::set_lite_mode(false);
             nestweaver_mcp::tools::set_current_instance_config(state.instance_cfg.clone());
@@ -14078,6 +14080,27 @@ pub async fn run_server(
     // launcher's lock instead of trying to acquire a conflicting second flock.
     let _pid_guard = claim_instance_lock(&instance_id)?;
 
+    // Record how this daemon ends, and read how the previous one did. Armed
+    // under the instance lock, which is what makes a leftover sentinel mean
+    // "the previous daemon was killed". Disclosure only: a daemon that cannot
+    // arm still serves.
+    let crash_record = match nestweaver_store::daemon_exit::arm(&log_dir_path) {
+        Ok(armed) => Some(armed),
+        Err(error) => {
+            tracing::warn!(%error, "could not arm daemon crash recording");
+            None
+        }
+    };
+    if let Some(previous) = nestweaver_store::daemon_exit::armed_report() {
+        tracing::error!(
+            signal = previous.signal_name().unwrap_or("none"),
+            pid = previous.pid,
+            count = previous.count,
+            "{}",
+            previous.summary()
+        );
+    }
+
     // The WRITE LEASE, held for a read-write daemon's whole life. This is what makes a
     // direct CLI write safe to refuse: without the daemon participating, a
     // CLI-side lease would only exclude other CLI writers and the daemon —
@@ -16394,10 +16417,34 @@ pub async fn run_server(
     // (test daemons), where an unreachable-daemon recovery path exists. A
     // real database's daemon keeps its logs and runtime records — the gate
     // is inside.
+    // The clearing rule for the unclean-exit record: a daemon that got here
+    // started and stopped without incident, so what it was warning about is
+    // forgotten. An error return keeps the record (the guard's drop removes
+    // only the running sentinel).
+    if uds_result.is_ok()
+        && let Some(armed) = crash_record
+    {
+        armed.clean_shutdown();
+    }
     lifecycle::remove_instance_dirs_for_temp_db(&db_path, &instance_id);
 
     uds_result
 }
+
+/// Test seam: die on SIGSEGV while serving `tool_name`, the way a storage
+/// engine fault does, so crash disclosure can be tested without a corrupt
+/// database. Compiled out of release builds.
+#[cfg(debug_assertions)]
+fn crash_if_test_seam_names(tool_name: &str) {
+    if std::env::var("NESTWEAVER_TEST_SEGV_ON_TOOL").is_ok_and(|tool| tool == tool_name) {
+        unsafe {
+            libc::raise(libc::SIGSEGV);
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn crash_if_test_seam_names(_tool_name: &str) {}
 
 // ── FlowTraceContinue implementation ────────────────────────────────────
 

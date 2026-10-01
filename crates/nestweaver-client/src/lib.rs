@@ -919,6 +919,7 @@ impl DaemonClient {
         config_path: Option<&Path>,
         usage: autostart::DaemonUsage,
     ) -> Result<Self> {
+        nestweaver_daemon::lifecycle::watch_daemon_exit_as_client(db_path);
         let sock_path =
             autostart::ensure_daemon_for_client_async(db_path, config_path, usage).await?;
         let mut client = Self::connect_to_socket(&sock_path).await?;
@@ -1049,6 +1050,7 @@ impl DaemonClient {
         if !sock_path.exists() {
             anyhow::bail!("daemon socket not found at {}", sock_path.display());
         }
+        nestweaver_daemon::lifecycle::watch_daemon_exit_as_client(db_path);
         Self::connect_to_socket(&sock_path).await
     }
 

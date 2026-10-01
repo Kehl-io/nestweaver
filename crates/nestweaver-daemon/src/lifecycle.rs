@@ -1869,6 +1869,15 @@ pub fn log_path(instance_id: &str) -> PathBuf {
     log_dir(instance_id).join("daemon.log")
 }
 
+/// Tell the crash-disclosure funnel which daemon this CLIENT process talks to,
+/// so a connection that breaks mid-request can be checked against that daemon's
+/// crash record instead of being reported as a bare transport error. The record
+/// lives beside the daemon log; see `nestweaver_store::daemon_exit`.
+pub fn watch_daemon_exit_as_client(db_path: &Path) {
+    let instance_id = instance_id_from_db_path(db_path);
+    nestweaver_store::daemon_exit::watch_as_client(db_path, &log_dir(&instance_id));
+}
+
 /// Operator-facing pointer to where daemon diagnostics actually live.
 ///
 /// Two writers put daemon output in [`log_dir`], and they do NOT overlap:
