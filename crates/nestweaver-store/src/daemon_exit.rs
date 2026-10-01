@@ -381,6 +381,12 @@ mod imp {
                 *slot = None;
             }
             let _ = std::fs::remove_file(self.dir.join(RUNNING_FILE));
+            // A start that was refused after arming recorded nothing: leave no
+            // empty record behind. A record with lines in it is kept.
+            let crash = self.dir.join(CRASH_FILE);
+            if std::fs::metadata(&crash).is_ok_and(|meta| meta.len() == 0) {
+                let _ = std::fs::remove_file(&crash);
+            }
         }
     }
 
@@ -520,6 +526,20 @@ mod tests {
             None,
             "a client must not attribute its broken pipe to an engine crash"
         );
+        armed.clean_shutdown();
+    }
+
+    #[test]
+    fn a_refused_start_leaves_neither_file_behind() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        // `run_server` returning an error after arming drops the guard.
+        drop(arm(dir.path()).unwrap());
+        assert!(!dir.path().join(RUNNING_FILE).exists());
+        assert!(!dir.path().join(CRASH_FILE).exists());
+        // So the next daemon has nothing to report.
+        let armed = arm(dir.path()).unwrap();
+        assert_eq!(armed_report(), None);
         armed.clean_shutdown();
     }
 
