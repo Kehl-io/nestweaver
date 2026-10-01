@@ -10768,11 +10768,11 @@ impl NestWeaverDaemon for DaemonService {
                     &state.store,
                     &state.db_path,
                 )
-                .map_err(&unavailable)?;
+                .map_err(unavailable)?;
                 let suggestions = nestweaver_engine::suggest_links(&state.store, &manifests)
                     .map_err(|e| Status::internal(format!("suggest_links failed: {e:#}")))?;
                 nestweaver_engine::manifest::ensure_manifest_generation(&state.store, generation)
-                    .map_err(&unavailable)?;
+                    .map_err(unavailable)?;
                 if nestweaver_engine::manifest::manifest_debt_revision(&state.db_path)
                     .map_err(|e| Status::unavailable(e.to_string()))?
                     .is_some()

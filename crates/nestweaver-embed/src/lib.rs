@@ -120,7 +120,7 @@ fn default_cache_dir() -> PathBuf {
         path.to_str().is_some().then_some(path)
     };
     dirs::cache_dir()
-        .and_then(&utf8_model_dir)
+        .and_then(utf8_model_dir)
         .or_else(|| dirs::home_dir().and_then(|home| utf8_model_dir(home.join(".cache"))))
         .unwrap_or_else(|| PathBuf::from(FALLBACK))
 }
