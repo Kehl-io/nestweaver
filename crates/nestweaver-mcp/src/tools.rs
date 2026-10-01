@@ -8830,6 +8830,21 @@ fn tool_brain_status(
     tantivy: Option<&TantivyIndex>,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
+    // A store closed mid-reopen cannot answer the queries below; say what is
+    // happening instead of failing the status call with a query error.
+    if let Some(failure) = store.reopen_failure() {
+        return Ok(json!({
+            "status": "reopening",
+            "warnings": [{
+                "kind": "store_reopen_pending",
+                "warning": format!(
+                    "the store is closed while it reopens after an interrupted checkpoint; the last attempt failed: {failure}"
+                ),
+                "action": "the daemon retries the reopen automatically; resolve the cause above (for example free disk space) if it keeps failing",
+            }],
+            "degraded_components": ["graph"],
+        }));
+    }
     let mut value = brain_status_json(store, tantivy)?;
     scope_brain_status_to_visible_repos(store, &mut value, visible)?;
     Ok(value)
@@ -9604,6 +9619,14 @@ fn brain_status_warnings_for(
                  I/O error on the sidecar directory); ranked queries fail closed."
             },
             "action": status.repair_command_for(p),
+        }));
+    }
+
+    if store.reopen_required() {
+        warnings.push(json!({
+            "kind": "store_reopen_pending",
+            "warning": "a write committed, but the storage engine deferred its checkpoint until the database is reopened (an earlier checkpoint was interrupted); nothing was lost, and the write was not retried",
+            "action": "the daemon reopens the store automatically at the next point with no write in flight; if reads keep it busy, it briefly holds off new reads after about a minute",
         }));
     }
 

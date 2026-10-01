@@ -27,6 +27,15 @@ def step(source, name):
     return match[1]
 
 
+def first_cargo_command(section):
+    """Offset of the first cargo invocation in a job, ignoring comments."""
+    match = re.search(r'^(?!\s*#)[^\n]*?\bcargo (?:build|test|bench|check|clippy|run|llvm-cov|mutants)\b',
+                      section, re.M)
+    if match is None:
+        raise AssertionError('job runs no cargo command')
+    return match.start()
+
+
 class RuntimeContracts(unittest.TestCase):
     def test_standard_artifact_staged_before_internal_compile(self):
         build = job(CI, 'build-and-check')
@@ -156,6 +165,23 @@ class RuntimeContracts(unittest.TestCase):
                     self.assertNotIn('staged/ci-direct', section)
         self.assertNotIn('ci-standard-linux', RELEASE)
         self.assertNotIn('staged/ci-direct', RELEASE)
+
+    def test_lbug_source_inputs_trigger_every_compiling_lane(self):
+        # A change to the pinned LadybugDB source (or a build entry point that
+        # fetches it) must re-run the jobs that compile it, not skip them.
+        filters = CI.split('filters: |', 1)[1].split('\n  metal-smoke:', 1)[0]
+        rust = filters.split('rust:', 1)[1].split('metal:', 1)[0]
+        metal = filters.split('metal:', 1)[1].split('frontend:', 1)[0]
+        for path in ("'scripts/fetch-lbug-source.sh'", "'Dockerfile'", "'.devcontainer/**'"):
+            self.assertIn(path, rust)
+        self.assertIn("'scripts/fetch-lbug-source.sh'", metal)
+        for name in ('backlog-performance', 'metal-smoke', 'build-and-check', 'clippy',
+                     'daemon-tests', 'coverage', 'mutants', 'e2e'):
+            section = job(CI, name)
+            self.assertLess(section.index('scripts/fetch-lbug-source.sh'),
+                            first_cargo_command(section), name)
+        build = job(RELEASE, 'build')
+        self.assertLess(build.index('scripts/fetch-lbug-source.sh'), first_cargo_command(build))
 
     def test_python_only_checks_are_unconditionally_required(self):
         required = job(CI, 'required-ci')

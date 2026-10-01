@@ -108,7 +108,7 @@ pub(crate) fn warn_daemon_route_unavoidable(operation: &str, db_path: &Path, use
 pub(crate) fn run_instance(command: InstanceCommands, use_daemon: bool) -> anyhow::Result<i32> {
     match command {
         InstanceCommands::Identity { db, json } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = selected_db_path(&db.unwrap_or_else(default_db_path))?;
             require_existing_db(&db_path)?;
             let store = nestweaver_store::GraphStore::open_read_only_without_migration(&db_path)
                 .map_err(|error| anyhow::anyhow!("open {}: {error}", db_path.display()))?;
@@ -145,9 +145,10 @@ pub(crate) fn run_instance(command: InstanceCommands, use_daemon: bool) -> anyho
         } => {
             let config = nestweaver_engine::InstanceConfig::from_file(&config_path)
                 .with_context(|| format!("load config {}", config_path.display()))?;
-            let db_path = db
-                .or_else(|| config.db_path())
-                .unwrap_or_else(default_db_path);
+            let db_path = selected_db_path(
+                &db.or_else(|| config.db_path())
+                    .unwrap_or_else(default_db_path),
+            )?;
             require_existing_db(&db_path)?;
             let store = nestweaver_store::GraphStore::open_read_only_without_migration(&db_path)
                 .map_err(|error| anyhow::anyhow!("open {}: {error}", db_path.display()))?;
@@ -363,7 +364,7 @@ pub(crate) fn run_instance(command: InstanceCommands, use_daemon: bool) -> anyho
         InstanceCommands::AbortMigration { db, force } => {
             // Offline recovery: operate on the sidecar journals directly (the
             // daemon is wedged and won't boot). nw-091 / Bug 3B.
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = selected_db_path(&db.unwrap_or_else(default_db_path))?;
             match abort_instance_migration_offline(&db_path, force)? {
                 nestweaver_engine::AbortMigrationOutcome::NothingToAbort => {
                     println!("No pending instance-migration journal — nothing to abort.");

@@ -1856,7 +1856,7 @@ mod pagerank_sidecar_disclosure_tests {
         let error = nestweaver_store::StoreError::Query(
             "read publication identity: Query execution failed: Assertion failed in file \
              \"/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/\
-lbug-0.20.4/lbug-src/src/include/common/concurrent_vector.h\" on line 76: \
+lbug-0.21.1/lbug-src/src/include/common/concurrent_vector.h\" on line 76: \
              index != nullptr"
                 .to_string(),
         );
@@ -1875,7 +1875,7 @@ lbug-0.20.4/lbug-src/src/include/common/concurrent_vector.h\" on line 76: \
             "a raw C++ assertion with an absolute path reached the user: {disclosure}"
         );
         assert!(
-            disclosure.contains("<dep>/lbug-0.20.4/"),
+            disclosure.contains("<dep>/lbug-0.21.1/"),
             "the crate-relative remainder must survive: {disclosure}"
         );
     }

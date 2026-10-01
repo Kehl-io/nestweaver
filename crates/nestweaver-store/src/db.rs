@@ -274,12 +274,277 @@ impl Drop for IndexPublicationLease<'_> {
     }
 }
 
+/// The engine handle behind a [`GraphStore`], replaceable in place.
+///
+/// LadybugDB 0.21 can finish a write and then refuse every later checkpoint
+/// until the database is reopened (see
+/// [`crate::error::CheckpointFailure::CommittedCheckpointDeferred`]). The
+/// daemon shares one `Arc<GraphStore>` everywhere, so the reopen happens
+/// here, behind the one door every connection goes through
+/// ([`GraphStore::conn`]): each [`StoreConnection`] holds a read guard for its
+/// whole life, and [`GraphStore::reopen_after_deferred_checkpoint`] swaps the
+/// handle only when it can take the write guard WITHOUT waiting. It never
+/// blocks, so a thread that already holds a connection and opens a second one
+/// can never deadlock behind a pending reopen.
+pub(crate) struct ReopenableDatabase {
+    gate: std::sync::RwLock<()>,
+    cell: std::cell::UnsafeCell<Option<lbug::Database>>,
+    /// Set while an escalated reopen waits for open connections to finish:
+    /// new connections wait for it to clear (see `wait_out_hold_off`).
+    holding_off: std::sync::atomic::AtomicBool,
+    /// Why the last reopen attempt failed, while the handle stays closed and
+    /// the reopen keeps being retried.
+    last_reopen_error: std::sync::Mutex<Option<String>>,
+}
+
+// SAFETY: `cell` is only written under the exclusive `gate` guard (in
+// `GraphStore::reopen_after_deferred_checkpoint`), and only read through a
+// shared `gate` guard that outlives every reference handed out
+// (`StoreConnection` owns the guard). `lbug::Database` itself is Send + Sync.
+unsafe impl Sync for ReopenableDatabase {}
+unsafe impl Send for ReopenableDatabase {}
+
+impl ReopenableDatabase {
+    fn new(db: lbug::Database) -> Self {
+        Self {
+            gate: std::sync::RwLock::new(()),
+            cell: std::cell::UnsafeCell::new(Some(db)),
+            holding_off: std::sync::atomic::AtomicBool::new(false),
+            last_reopen_error: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Hold off new connections until the returned guard drops. Always
+    /// released, including on an early return or a panic.
+    fn hold_off_new_connections(&self) -> HoldOff<'_> {
+        self.holding_off
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        HoldOff(&self.holding_off)
+    }
+
+    /// Wait while an escalated reopen holds off new connections. The hold-off
+    /// is bounded by the reopen's own deadline, so this wait is too.
+    ///
+    /// Never parks an async executor thread: on a multi-threaded tokio worker
+    /// the wait runs inside `block_in_place` (the worker's other tasks move to
+    /// another thread; on a blocking-pool thread it is a plain call), and on a
+    /// current-thread runtime, whose one thread IS the executor, it does not
+    /// wait at all. That reader then simply takes its connection and the
+    /// reopen waits for it, within its own bounded window.
+    fn wait_out_hold_off(&self) {
+        if !self.holding_off.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let wait = || {
+            while self.holding_off.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+            Err(_) => wait(),
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(wait),
+            Ok(_) => {}
+        }
+    }
+}
+
+struct HoldOff<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for HoldOff<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A connection to a [`GraphStore`], holding the engine handle open for its
+/// whole lifetime.
+///
+/// Deliberately NOT a `Deref` to [`lbug::Connection`]. The engine's own types
+/// are tied to the DATABASE's lifetime, not the connection's: `query` returns
+/// `QueryResult<'db>` and `PreparedStatement` has no lifetime at all, so either
+/// could outlive the read guard that keeps the handle from being swapped by a
+/// reopen, and then point into a closed database. Every result and statement
+/// handed out here borrows THIS connection ([`StoreRows`], [`StoreStatement`]),
+/// so the compiler refuses any use after the guard is gone.
+///
+/// It also owns one engine behaviour every writer needs: LadybugDB 0.21 can
+/// fail a statement AFTER its transaction committed ("Transaction committed
+/// successfully, but the post-commit checkpoint failed"). That is reported as
+/// success with no rows, and the store is flagged for a reopen (see
+/// [`GraphStore::reopen_required`]). Reporting it as a failure would invite a
+/// retry that applies the write twice.
+pub struct StoreConnection<'a> {
+    // Declared first so it drops BEFORE the guard below.
+    conn: lbug::Connection<'a>,
+    _open: Option<std::sync::RwLockReadGuard<'a, ()>>,
+    deferred: Option<&'a std::sync::atomic::AtomicBool>,
+}
+
+/// Rows of one statement, borrowing the [`StoreConnection`] that ran it.
+pub struct StoreRows<'c, 'a> {
+    inner: Option<lbug::QueryResult<'a>>,
+    _connection: std::marker::PhantomData<&'c StoreConnection<'a>>,
+}
+
+impl Iterator for StoreRows<'_, '_> {
+    type Item = Vec<lbug::Value>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.as_mut()?.next()
+    }
+}
+
+impl std::fmt::Debug for StoreRows<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.inner {
+            Some(rows) => write!(f, "StoreRows({rows})"),
+            None => f.write_str("StoreRows(committed, no rows)"),
+        }
+    }
+}
+
+impl std::fmt::Display for StoreRows<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.inner {
+            Some(rows) => write!(f, "{rows}"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// True when `query` has a `RETURN` clause: its rows are part of its answer.
+fn statement_returns_rows(query: &str) -> bool {
+    query
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|word| word.eq_ignore_ascii_case("RETURN"))
+}
+
+/// A prepared statement, borrowing the [`StoreConnection`] that prepared it.
+pub struct StoreStatement<'c> {
+    inner: lbug::PreparedStatement,
+    returns_rows: bool,
+    _connection: std::marker::PhantomData<&'c ()>,
+}
+
+impl StoreStatement<'_> {
+    /// True if the statement only reads.
+    pub fn is_read_only(&self) -> bool {
+        self.inner.is_read_only()
+    }
+}
+
+impl<'a> StoreConnection<'a> {
+    /// Wrap a connection to a database this code opened itself (a probe, a
+    /// migration). Such a handle is never swapped, so no guard is needed.
+    pub(crate) fn unguarded(conn: lbug::Connection<'a>) -> Self {
+        Self {
+            conn,
+            _open: None,
+            deferred: None,
+        }
+    }
+
+    /// Run one statement.
+    pub fn query(&self, query: &str) -> Result<StoreRows<'_, 'a>, lbug::Error> {
+        let result = self.conn.query(query);
+        self.settle(result, statement_returns_rows(query))
+    }
+
+    /// Prepare one statement.
+    pub fn prepare(&self, query: &str) -> Result<StoreStatement<'_>, lbug::Error> {
+        Ok(StoreStatement {
+            inner: self.conn.prepare(query)?,
+            returns_rows: statement_returns_rows(query),
+            _connection: std::marker::PhantomData,
+        })
+    }
+
+    /// Execute a prepared statement.
+    pub fn execute(
+        &self,
+        statement: &mut StoreStatement<'_>,
+        params: Vec<(&str, lbug::Value)>,
+    ) -> Result<StoreRows<'_, 'a>, lbug::Error> {
+        let result = self.conn.execute(&mut statement.inner, params);
+        self.settle(result, statement.returns_rows)
+    }
+
+    /// Bound every later statement on this connection.
+    pub fn set_query_timeout(&self, timeout_ms: u64) {
+        self.conn.set_query_timeout(timeout_ms);
+    }
+
+    fn settle(
+        &self,
+        result: Result<lbug::QueryResult<'a>, lbug::Error>,
+        returns_rows: bool,
+    ) -> Result<StoreRows<'_, 'a>, lbug::Error> {
+        match result {
+            Ok(rows) => Ok(StoreRows {
+                inner: Some(rows),
+                _connection: std::marker::PhantomData,
+            }),
+            Err(error) => {
+                let message = error.to_string();
+                if crate::error::classify_checkpoint_failure(&message)
+                    != Some(crate::error::CheckpointFailure::CommittedCheckpointDeferred)
+                {
+                    return Err(error);
+                }
+                if let Some(deferred) = self.deferred {
+                    deferred.store(true, std::sync::atomic::Ordering::Release);
+                }
+                if message
+                    .to_lowercase()
+                    .contains(crate::error::POST_COMMIT_CHECKPOINT_FAILED)
+                {
+                    tracing::warn!(
+                        "a write COMMITTED and is durable, but the storage engine deferred its \
+                         checkpoint; the store reopens to finish it. The write was NOT \
+                         retried. Engine: {message}"
+                    );
+                    if returns_rows {
+                        // The engine returned no rows for a statement that
+                        // RETURNs some: never hand back an empty result that
+                        // reads as "nothing matched". An error that still says
+                        // committed (`StoreError::is_committed_despite_error`).
+                        return Err(lbug::Error::FailedQuery(format!(
+                            "the statement COMMITTED but its rows are unavailable, because \
+                             the storage engine deferred its checkpoint; do NOT retry it. \
+                             {message}"
+                        )));
+                    }
+                    // Committed: success, with no rows to read.
+                    Ok(StoreRows {
+                        inner: None,
+                        _connection: std::marker::PhantomData,
+                    })
+                } else {
+                    // A bare "frozen WAL still pending" from an explicit
+                    // CHECKPOINT: nothing new committed, the log is not merged.
+                    Err(error)
+                }
+            }
+        }
+    }
+}
+
+/// What [`GraphStore::reopen_after_deferred_checkpoint`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReopenOutcome {
+    /// No deferred checkpoint is pending on this handle.
+    NotNeeded,
+    /// A connection is still open; try again at the next safe point.
+    Busy,
+    /// The handle was closed and reopened; recovery finished the checkpoint.
+    Reopened,
+}
+
 /// GraphStore wraps a LadybugDB database for storing and querying the code knowledge graph.
 ///
 /// Each method creates a fresh Connection internally, which is the simplest safe pattern
 /// given that Connection<'a> borrows &'a Database.
 pub struct GraphStore {
-    pub(crate) db: lbug::Database,
+    pub(crate) db: ReopenableDatabase,
     access_mode: GraphStoreAccessMode,
     pub(crate) pagerank_cache: Mutex<Option<HashMap<String, f64>>>,
     /// Algorithm and scope fingerprint for the scores currently held in
@@ -380,6 +645,11 @@ pub struct GraphStore {
     /// `(sorted seed_uids, damping, max_iterations, scope_hash, intent, graph_generation)`.
     /// Repeated queries with the same seeds skip the iterative PPR computation entirely.
     pub(crate) ppr_result_cache: Mutex<lru::LruCache<u64, Vec<(String, f64)>>>,
+    /// Set when the engine reported a COMMITTED write whose checkpoint it had
+    /// to defer (see [`crate::error::CheckpointFailure::CommittedCheckpointDeferred`]).
+    /// The data is durable; the handle needs a reopen so recovery can finish
+    /// the pending checkpoint. See [`GraphStore::reopen_required`].
+    checkpoint_deferred: std::sync::atomic::AtomicBool,
 }
 
 /// Capability fixed by the constructor that opened a [`GraphStore`].
@@ -387,6 +657,11 @@ pub struct GraphStore {
 pub enum GraphStoreAccessMode {
     ReadWrite,
     ReadOnly,
+    /// Read-only access to a database an OLDER storage engine built, admitted
+    /// only by [`GraphStore::open_legacy_engine_read_only`] so a rebuild or a
+    /// restore can read what it needs to replace it. Every identity read on
+    /// such a handle scans instead of using a primary-key lookup.
+    LegacyEngineReadOnly,
 }
 
 /// Persistent identity of one NestWeaver brain and its current publication
@@ -502,42 +777,58 @@ fn is_stale_checkpoint_error(msg: &str) -> bool {
     msg.contains("wal.checkpoint") && msg.contains("does not match")
 }
 
-/// Remove the stale checkpoint sidecars lbug's error tells us to delete — but ONLY
-/// when the shadow file is absent or empty (0 bytes), the exact signature of an
-/// aborted checkpoint. A non-empty shadow could belong to a live mid-checkpoint
-/// writer; never touch that. Returns true if the checkpoint file was removed
-/// (worth a retry).
+/// Move the stale checkpoint log aside, never delete it, and only in the exact
+/// signature of an aborted checkpoint: `.shadow` absent or empty. A non-empty
+/// shadow could belong to a live mid-checkpoint writer; never touch that.
+/// Returns where the log went (worth a retry).
 ///
-/// nw-373. THE SENTENCE THAT USED TO BE HERE IS DELETED, not softened, because
-/// it was the reasoning that produced the bug: *"Reaching the stale-checkpoint
-/// error already implies no other process holds the write lock — that would
-/// surface as a lock error instead."* That is FALSE on the path that reached it
-/// most often. A READ-ONLY open never contends for the write lock at all, so it
-/// can never surface a lock error, so the implication has no antecedent — and
-/// this function was deleting `<db>.wal.checkpoint` and `<db>.shadow` of a
-/// database another process was writing, on the strength of it. An inference
-/// about what a caller did NOT observe is not a proof of exclusivity.
+/// WHY A RENAME. The ID-mismatch error this keys on comes from LadybugDB 0.21's
+/// frozen-log branch for a log WITHOUT a CHECKPOINT record
+/// (`WALReplayer::replayFrozenWAL` in `src/storage/wal/wal_replayer.cpp`), and
+/// that branch holds committed-but-unapplied records. The engine removes
+/// `.shadow` itself on that branch BEFORE comparing IDs, so "shadow absent or
+/// empty" proves nothing about whether the log is worthless; only the engine's
+/// ID comparison does. If that comparison were ever wrong, a delete would
+/// destroy committed data. A timestamped rename keeps every byte.
+///
+/// DECLINES ON DOUBT. A `.shadow` whose size or existence cannot be determined
+/// (permissions, a symlink loop) is treated as possibly live, not as empty.
 ///
 /// nw-373: mutation requires a matching borrowed [`DbWriteLease`]. The lease is
-/// held across the failed open, artifact inspection/removal, and retry; missing
+/// held across the failed open, artifact inspection/rename, and retry; missing
 /// or sibling authority leaves every byte untouched.
-fn remove_stale_checkpoint_sidecars(path: &Path, authority: Option<&DbWriteLease>) -> bool {
+fn quarantine_stale_checkpoint(path: &Path, authority: Option<&DbWriteLease>) -> Option<PathBuf> {
     if !authority.is_some_and(|authority| authority.authorizes(path)) {
-        return false;
+        return None;
     }
     let shadow = PathBuf::from(format!("{}.shadow", path.display()));
     let checkpoint = PathBuf::from(format!("{}.wal.checkpoint", path.display()));
-    let shadow_empty = std::fs::metadata(&shadow)
-        .map(|m| m.len() == 0)
-        .unwrap_or(true);
-    if !shadow_empty {
-        return false;
+    let shadow_empty = match std::fs::metadata(&shadow) {
+        Ok(metadata) => metadata.len() == 0,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // `metadata` follows symlinks: a dangling or looping link reads as
+            // NotFound or an error; only a plain absence counts as absent.
+            match std::fs::symlink_metadata(&shadow) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                _ => return None,
+            }
+        }
+        Err(_) => return None,
+    };
+    if !shadow_empty || !matches!(checkpoint.try_exists(), Ok(true)) {
+        return None;
     }
-    let removed = std::fs::remove_file(&checkpoint).is_ok();
-    if shadow.exists() {
-        let _ = std::fs::remove_file(&shadow);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let aside = PathBuf::from(format!("{}.wal.checkpoint.stale-{stamp}", path.display()));
+    std::fs::rename(&checkpoint, &aside).ok()?;
+    // An empty shadow holds no pages; keep it beside the log it came with.
+    if matches!(shadow.try_exists(), Ok(true)) {
+        let _ = std::fs::rename(&shadow, format!("{}.shadow.stale-{stamp}", path.display()));
     }
-    removed
+    Some(aside)
 }
 
 /// Open an lbug database, auto-recovering once from a stale WAL checkpoint left by
@@ -717,7 +1008,18 @@ fn hardened_system_config() -> lbug::SystemConfig {
         let on = !matches!(v.trim(), "0" | "false" | "off");
         cfg = cfg.auto_checkpoint(on);
     }
+    #[cfg(test)]
+    if CHECKPOINT_EVERY_COMMIT.with(std::cell::Cell::get) {
+        cfg = cfg.auto_checkpoint(true).checkpoint_threshold(0);
+    }
     cfg
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: make every commit auto-checkpoint, so a pending frozen log
+    /// surfaces the engine's post-commit refusal on an ordinary write.
+    static CHECKPOINT_EVERY_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A `SIGKILL`ed daemon can leave `<db>.wal` behind with NO `<db>.shadow`
@@ -755,7 +1057,15 @@ fn quarantine_orphaned_wal(path: &Path, authority: Option<&DbWriteLease>) -> Opt
     let wal = PathBuf::from(format!("{}.wal", path.display()));
     let shadow = PathBuf::from(format!("{}.shadow", path.display()));
     let frozen = PathBuf::from(format!("{}.wal.checkpoint", path.display()));
-    if !wal.exists() || shadow.exists() || frozen.exists() {
+    // `try_exists` separates "absent" from "could not tell"; anything but a
+    // definite answer for all three declines, because moving a log on a guess
+    // is how committed writes are lost. (LadybugDB 0.21 no longer fails an
+    // open on a log with no `.shadow`, so this arm rarely fires; it stays for
+    // the engine versions and shapes that still do.)
+    if !matches!(
+        (wal.try_exists(), shadow.try_exists(), frozen.try_exists()),
+        (Ok(true), Ok(false), Ok(false))
+    ) {
         return None;
     }
     let stamp = std::time::SystemTime::now()
@@ -766,6 +1076,62 @@ fn quarantine_orphaned_wal(path: &Path, authority: Option<&DbWriteLease>) -> Opt
     std::fs::rename(&wal, &quarantined)
         .ok()
         .map(|()| quarantined)
+}
+
+/// The frozen-log state whose pages the data file already holds.
+///
+/// LadybugDB 0.21 checkpoints in this order (`logCheckpointAndApplyShadowPagesForStorage`
+/// in `src/storage/checkpointer.cpp`, `ShadowFile::clear` in
+/// `src/storage/shadow_file.cpp`): write a CHECKPOINT record to the frozen log
+/// `<db>.wal.checkpoint`, apply the shadow pages to the data file, truncate and
+/// unlink `<db>.shadow`, and only then remove the frozen log. A crash between
+/// the unlink and the removal leaves a frozen log ending in CHECKPOINT with no
+/// `.shadow`. On the next open `WALReplayer::replayFrozenWAL` sees the
+/// CHECKPOINT record and calls `ShadowFile::replayShadowPageRecords`, which
+/// fails to open the missing `.shadow` ("Cannot open file <db>.shadow: No such
+/// file or directory"). Frozen-log replay runs BEFORE the active log, so that
+/// error with the frozen log present can only come from this branch.
+///
+/// The pages were applied before the shadow was unlinked, so moving ONLY the
+/// frozen log aside loses nothing, while the active `<db>.wal` holds writes
+/// committed after the checkpoint began and must stay. Shipped as a targeted
+/// diagnostic naming that one move, not as an automatic arm. Returns the
+/// frozen log's path when the state matches exactly; declines on any doubt.
+///
+/// THE ZERO-LENGTH `.shadow` VARIANT is the same state, and the upstream code
+/// proves it. `ShadowFile::clear` truncates the shadow to zero bytes
+/// (`resetToZeroPagesAndPageCapacity`, `src/storage/file_handle.cpp`) and only
+/// then unlinks it, so a crash between the two leaves a zero-byte `.shadow`.
+/// `clear` runs only after `ShadowFile::applyShadowPages` has written every
+/// page AND `syncFile`d the data file (`src/storage/shadow_file.cpp`), and the
+/// CHECKPOINT record is logged only after `shadowFile.flushAll`, so a frozen log
+/// that ends in CHECKPOINT never sits beside a shadow that was merely created
+/// and not yet written. The only other truncation, `ShadowFile::reset`, runs
+/// after `clearFrozenWAL` (`src/storage/checkpointer.cpp`), when no frozen log
+/// remains. On open, the replay reads the header page of the empty file: POSIX
+/// `readFromFile` accepts a short read that ends at end-of-file
+/// (`src/common/file_system/local_file_system.cpp`), the zero-initialised
+/// header carries a zero database id, and `FileDBIDUtils::verifyDatabaseID`
+/// fails with "Database ID for temporary file '<db>.shadow' does not match the
+/// current database". With a frozen log present and that exact message, moving
+/// the frozen log aside is again the one safe remedy; the engine then removes
+/// the empty shadow itself (`WALReplayer::replay`).
+fn frozen_checkpoint_already_applied(path: &Path, msg: &str) -> Option<PathBuf> {
+    let frozen = PathBuf::from(format!("{}.wal.checkpoint", path.display()));
+    let shadow = PathBuf::from(format!("{}.shadow", path.display()));
+    if !matches!(frozen.try_exists(), Ok(true)) {
+        return None;
+    }
+    let shadow_state = std::fs::symlink_metadata(&shadow);
+    let matches_state = match shadow_state {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => is_orphaned_wal_error(msg),
+        Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {
+            let shadow_name = format!("{}.shadow", path.display());
+            msg.contains(&shadow_name) && msg.contains("does not match the current database")
+        }
+        _ => false,
+    };
+    matches_state.then_some(frozen)
 }
 
 /// Turn a failed open into a `StoreError`, consulting the write lease when — and
@@ -816,12 +1182,85 @@ fn open_failure(path: &Path, message: String, read_write: bool) -> StoreError {
     StoreError::from_engine_message_for_db(message, path)
 }
 
+/// Rewrite `<db>.engine-format` after the read-only probe verified the Meta
+/// marker. Best effort: the marker is inside the database, so a failed write
+/// degrades to one more probe on the next open, never a refusal.
+fn stamp_engine_format_sidecar(path: &Path) {
+    if let Err(error) = crate::engine_format::write_sidecar(path) {
+        tracing::warn!(
+            "could not write the engine-format marker {}: {error}; the next open \
+             re-derives it from the database",
+            crate::engine_format::sidecar_path(path).display()
+        );
+    }
+}
+
+/// Read the engine-format `Meta` row through a READ-ONLY open, by a full scan
+/// (never a primary-key lookup, see [`GraphStore::meta_value_by_scan`]).
+/// Called only when no sidecar exists and no crash debris is present, so the
+/// read-only open replays nothing. Refuses when the marker is absent; when it
+/// is found, rewrites the sidecar if `stamp_sidecar` (writable opens only).
+fn probe_engine_format_marker(path: &Path, stamp_sidecar: bool) -> Result<(), StoreError> {
+    use crate::engine_format::{ENGINE_FORMAT_META_KEY, ENGINE_FORMAT_VALUE};
+    let db = lbug::Database::new(path, bounded_system_config().read_only(true))
+        .map_err(|error| open_failure(path, error.to_string(), false))?;
+    let marker = {
+        let conn = lbug::Connection::new(&db)
+            .map(StoreConnection::unguarded)
+            .map_err(|error| open_failure(path, error.to_string(), false))?;
+        match GraphStore::meta_value_by_scan(&conn, ENGINE_FORMAT_META_KEY) {
+            Ok(marker) => marker,
+            // No `Meta` table at all: no marker, and not a NestWeaver graph
+            // this engine built.
+            Err(error)
+                if error.to_string().contains("Meta")
+                    && error.to_string().to_lowercase().contains("does not exist") =>
+            {
+                None
+            }
+            // Anything else (a damaged file, say) is reported as itself, never
+            // disguised as a format question.
+            Err(error) => return Err(open_failure(path, error.to_string(), false)),
+        }
+    };
+    drop(db);
+    match marker {
+        Some(value) if value == ENGINE_FORMAT_VALUE => {
+            if stamp_sidecar {
+                stamp_engine_format_sidecar(path);
+            }
+            Ok(())
+        }
+        Some(value) => Err(crate::engine_format::rebuild_required(
+            path,
+            format!("records an engine format this build does not recognise ({value:?})"),
+        )),
+        None => Err(crate::engine_format::rebuild_required(
+            path,
+            crate::engine_format::NO_MARKER_REASON,
+        )),
+    }
+}
+
+/// The reason a database whose sidecar and in-database marker disagree is
+/// refused.
+fn disagreeing_marker_reason(path: &Path) -> String {
+    format!(
+        "has an engine-format sidecar ({}) but no matching engine-format marker inside \
+         it, so the two disagree (the sidecar may be left over from a different database) \
+         and its format cannot be trusted",
+        crate::engine_format::sidecar_path(path).display()
+    )
+}
+
 /// Open an lbug database, auto-recovering once from crash debris that would
 /// otherwise make it permanently unopenable.
 ///
 /// `read_write` still selects diagnostics and forbids all recovery from a
 /// read-only open. Actual filesystem recovery additionally requires an exact
 /// `recovery_authority`, borrowed across this complete attempt and retry.
+use crate::error::classify_checkpoint_failure;
+
 fn open_lbug_with_recovery(
     path: &Path,
     read_write: bool,
@@ -836,6 +1275,168 @@ fn open_lbug_with_recovery(
     // `open_crash_guard` for why a header check and an out-of-process probe
     // were both rejected.
     let _crash_guard = crate::open_crash_guard::arm(path);
+    // Refuse a database an older storage engine built BEFORE the engine sees
+    // it: a writable open replays the log and checkpoints it into the file.
+    let precheck = crate::engine_format::check(path)?;
+    if precheck == crate::engine_format::Precheck::NeedsProbe {
+        // Only a writable open rewrites the sidecar: a read-only open (a
+        // sealed snapshot, a restore being validated) must not add a file to
+        // a directory whose inventory was just checked.
+        probe_engine_format_marker(path, read_write)?;
+    }
+    // A fresh file is claimed for this engine BEFORE the engine writes to it,
+    // and a failure to record that is an error. If the create then fails the
+    // claim is withdrawn, so a stray sidecar can never vouch for a file that
+    // appears at this path later.
+    // A WRITABLE open of an unverified file can already change it (the engine
+    // rewrites header pages), so when only the sidecar vouches for the file,
+    // confirm the in-database marker read-only FIRST. Only when crash debris
+    // makes a read-only open impossible is the sidecar trusted up to the
+    // post-open check below: that is the ordinary crash-recovery case of a
+    // database this engine created.
+    if read_write
+        && precheck == crate::engine_format::Precheck::Current
+        && crate::engine_format::debris_present(path).is_none()
+    {
+        match probe_engine_format_marker(path, false) {
+            Ok(()) => {}
+            Err(StoreError::RebuildRequired { .. }) => {
+                return Err(crate::engine_format::rebuild_required(
+                    path,
+                    disagreeing_marker_reason(path),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let fresh = read_write && precheck == crate::engine_format::Precheck::Fresh;
+    if fresh {
+        crate::engine_format::write_sidecar(path).map_err(|error| {
+            StoreError::Database(format!(
+                "could not record the storage-engine format for the new database {} \
+                 ({}): {error}",
+                path.display(),
+                crate::engine_format::sidecar_path(path).display()
+            ))
+        })?;
+    }
+    let withdraw_claim = || {
+        if fresh {
+            let _ = std::fs::remove_file(crate::engine_format::sidecar_path(path));
+        }
+    };
+    let db =
+        match open_engine_with_recovery_arms(path, read_write, recovery_authority, &make_config) {
+            Ok(db) => db,
+            Err(error) => {
+                withdraw_claim();
+                return Err(error);
+            }
+        };
+    if fresh {
+        // Only a create records the marker inside the database, and it does so
+        // at once, before any NestWeaver write. `init_schema` repeats the same
+        // `CREATE NODE TABLE IF NOT EXISTS Meta` DDL, so this cannot conflict.
+        if let Err(error) = stamp_engine_format_marker(&db) {
+            drop(db);
+            withdraw_claim();
+            return Err(error);
+        }
+        // Now that the file exists, bind the claim to it (device, inode).
+        if let Err(error) = crate::engine_format::write_sidecar(path) {
+            drop(db);
+            withdraw_claim();
+            return Err(StoreError::Database(format!(
+                "could not record the storage-engine format for the new database {}: {error}",
+                path.display()
+            )));
+        }
+    } else if precheck == crate::engine_format::Precheck::Current {
+        // The sidecar says current; the database must agree. A sidecar left
+        // behind by a failed create or a deleted file must never make this
+        // engine adopt whatever database appears at the path later.
+        let marker = {
+            let conn = StoreConnection::unguarded(lbug::Connection::new(&db)?);
+            GraphStore::meta_value_by_scan(&conn, crate::engine_format::ENGINE_FORMAT_META_KEY)
+                .unwrap_or(None)
+        };
+        if marker.as_deref() != Some(crate::engine_format::ENGINE_FORMAT_VALUE) {
+            drop(db);
+            return Err(crate::engine_format::rebuild_required(
+                path,
+                disagreeing_marker_reason(path),
+            ));
+        }
+        // Verified by the marker inside it: a copy's sidecar is re-bound to
+        // this file on its first writable open (best effort; the marker is
+        // the source of truth).
+        if read_write && !crate::engine_format::sidecar_names_this_file(path) {
+            stamp_engine_format_sidecar(path);
+        }
+    }
+    Ok(db)
+}
+
+/// Check a freshly opened database's graph-owned identity against `expected`,
+/// reading `Meta` by scan and writing nothing. Every mismatch, absence or
+/// unreadable value fails closed.
+fn verify_identity_before_writes(
+    path: &Path,
+    db: &lbug::Database,
+    expected: &PublicationIdentity,
+) -> Result<(), StoreError> {
+    let conn = StoreConnection::unguarded(lbug::Connection::new(db)?);
+    let read = |key: &str| GraphStore::meta_value_by_scan(&conn, key).ok().flatten();
+    let same = |observed: Option<String>, wanted: &str| {
+        observed
+            .as_deref()
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .zip(uuid::Uuid::parse_str(wanted).ok())
+            .is_some_and(|(left, right)| left == right)
+    };
+    let brain = read(BRAIN_UUID_META_KEY);
+    let publication = read(PUBLICATION_UUID_META_KEY);
+    if same(brain.clone(), &expected.brain_uuid)
+        && same(publication.clone(), &expected.publication_uuid)
+    {
+        return Ok(());
+    }
+    Err(StoreError::SelectedPublicationMismatch(
+        format!(
+            "{} is not the selected publication: CURRENT names brain {} publication {}, the \
+         graph holds brain {} publication {}. Refusing to open it (nothing was written).",
+            path.display(),
+            expected.brain_uuid,
+            expected.publication_uuid,
+            brain.as_deref().unwrap_or("<none>"),
+            publication.as_deref().unwrap_or("<none>")
+        )
+        .into_boxed_str(),
+    ))
+}
+
+/// Record the engine-format marker in a database this engine has just
+/// created. See [`crate::engine_format`].
+fn stamp_engine_format_marker(db: &lbug::Database) -> Result<(), StoreError> {
+    let conn = StoreConnection::unguarded(lbug::Connection::new(db)?);
+    conn.query(
+        "CREATE NODE TABLE IF NOT EXISTS Meta(\
+            key STRING, \
+            value STRING, \
+            PRIMARY KEY(key))",
+    )
+    .map_err(|e| StoreError::Query(e.to_string()))?;
+    GraphStore::ensure_engine_format_marker_on(&conn)
+}
+
+/// The engine open plus the crash-recovery arms. Called only by
+/// [`open_lbug_with_recovery`], after the engine-format checks.
+fn open_engine_with_recovery_arms(
+    path: &Path,
+    read_write: bool,
+    recovery_authority: Option<&DbWriteLease>,
+    make_config: &impl Fn() -> lbug::SystemConfig,
+) -> Result<lbug::Database, StoreError> {
     match lbug::Database::new(path, make_config()) {
         Ok(db) => Ok(db),
         Err(e) => {
@@ -855,12 +1456,25 @@ fn open_lbug_with_recovery(
                         .map(|()| authority)
                         .ok()
                 });
-            if is_stale_checkpoint_error(&msg) && remove_stale_checkpoint_sidecars(path, authority)
+            // LadybugDB 0.21 finishes an interrupted checkpoint during a
+            // writable open; running out of disk or buffer pool there is a
+            // resource failure, never corruption, and no arm below applies.
+            if classify_checkpoint_failure(&msg)
+                == Some(crate::error::CheckpointFailure::RecoveryCheckpointInterrupted)
+            {
+                return Err(StoreError::Database(
+                    crate::error::recovery_checkpoint_disclosure(path, &msg),
+                ));
+            }
+            if is_stale_checkpoint_error(&msg)
+                && let Some(aside) = quarantine_stale_checkpoint(path, authority)
             {
                 tracing::warn!(
-                    "recovered a stale WAL checkpoint for {} (a prior crash left \
-                     .wal.checkpoint/.shadow that made the DB unopenable); retrying open",
-                    path.display()
+                    "recovered a stale WAL checkpoint for {} (a prior crash left a \
+                     .wal.checkpoint from another database id that made the DB \
+                     unopenable); moved it to {} and retried — it was NOT deleted",
+                    path.display(),
+                    aside.display()
                 );
                 return lbug::Database::new(path, make_config())
                     .map_err(|e| open_failure(path, e.to_string(), read_write));
@@ -879,6 +1493,15 @@ fn open_lbug_with_recovery(
                 );
                 return lbug::Database::new(path, make_config())
                     .map_err(|e| open_failure(path, e.to_string(), read_write));
+            }
+            if let Some(frozen) = frozen_checkpoint_already_applied(path, &msg) {
+                return Err(StoreError::FrozenCheckpointAlreadyApplied(Box::new(
+                    crate::error::FrozenCheckpointApplied {
+                        path: path.to_path_buf(),
+                        frozen,
+                        detail: msg,
+                    },
+                )));
             }
             // nw-346 / nw-404. This is the frame that knows WHICH database
             // failed AND whether this open could be the one writing it — the
@@ -1125,7 +1748,7 @@ impl GraphStore {
     fn create_inner(path: &Path, authority: Option<&DbWriteLease>) -> Result<Self, StoreError> {
         let db = open_lbug_with_recovery(path, true, authority, hardened_system_config)?;
         let store = GraphStore {
-            db,
+            db: ReopenableDatabase::new(db),
             access_mode: GraphStoreAccessMode::ReadWrite,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
@@ -1150,6 +1773,7 @@ impl GraphStore {
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
             )),
+            checkpoint_deferred: std::sync::atomic::AtomicBool::new(false),
         };
         store.init_schema()?;
         store.ensure_publication_identity()?;
@@ -1220,7 +1844,7 @@ impl GraphStore {
     ) -> Result<Self, StoreError> {
         let db = open_lbug_with_recovery(path, true, authority, hardened_system_config)?;
         let store = GraphStore {
-            db,
+            db: ReopenableDatabase::new(db),
             access_mode: GraphStoreAccessMode::ReadWrite,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
@@ -1245,6 +1869,7 @@ impl GraphStore {
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
             )),
+            checkpoint_deferred: std::sync::atomic::AtomicBool::new(false),
         };
         store.init_schema()?;
         store.initialize_publication_identity(identity)?;
@@ -1257,20 +1882,50 @@ impl GraphStore {
     /// Runs schema migrations to ensure any new tables/columns from newer
     /// versions are present (all statements are idempotent).
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        Self::open_inner(path, None)
+        Self::open_inner(path, None, None)
     }
 
     /// Open an existing database while borrowing its canonical writer
     /// authority. Crash-debris recovery is permitted only on this path.
     pub fn open_with_authority(path: &Path, authority: &DbWriteLease) -> Result<Self, StoreError> {
         Self::require_matching_authority(path, authority)?;
-        Self::open_inner(path, Some(authority))
+        Self::open_inner(path, Some(authority), None)
     }
 
-    fn open_inner(path: &Path, authority: Option<&DbWriteLease>) -> Result<Self, StoreError> {
+    /// Open an EXISTING database that must be the publication `expected`
+    /// names, under its writer authority.
+    ///
+    /// The identity is checked right after the engine's own crash recovery and
+    /// BEFORE any NestWeaver write: no schema DDL, no column migration, no
+    /// identity minted. A foreign graph copied into a publication slot (which
+    /// only a writable open can read when it carries a leftover log) is refused
+    /// with its identity untouched. A missing file is refused, never created.
+    pub fn open_expecting_identity_with_authority(
+        path: &Path,
+        authority: &DbWriteLease,
+        expected: &PublicationIdentity,
+    ) -> Result<Self, StoreError> {
+        Self::require_matching_authority(path, authority)?;
+        if !matches!(path.try_exists(), Ok(true)) {
+            return Err(StoreError::Query(format!(
+                "the selected publication graph {} is missing; refusing to create it",
+                path.display()
+            )));
+        }
+        Self::open_inner(path, Some(authority), Some(expected))
+    }
+
+    fn open_inner(
+        path: &Path,
+        authority: Option<&DbWriteLease>,
+        expected: Option<&PublicationIdentity>,
+    ) -> Result<Self, StoreError> {
         let db = open_lbug_with_recovery(path, true, authority, hardened_system_config)?;
+        if let Some(expected) = expected {
+            verify_identity_before_writes(path, &db, expected)?;
+        }
         let store = GraphStore {
-            db,
+            db: ReopenableDatabase::new(db),
             access_mode: GraphStoreAccessMode::ReadWrite,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
@@ -1295,6 +1950,7 @@ impl GraphStore {
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
             )),
+            checkpoint_deferred: std::sync::atomic::AtomicBool::new(false),
         };
         store.init_schema()?;
         store.ensure_publication_identity()?;
@@ -1343,6 +1999,66 @@ impl GraphStore {
         Self::finish_read_only_open(path, db)
     }
 
+    /// Open a database an OLDER storage engine built, read-only, for the one
+    /// job of replacing it.
+    ///
+    /// This is the narrow exemption from the engine-format refusal: it skips
+    /// the marker check and every recovery arm, never runs DDL, never stamps a
+    /// marker, and returns a handle whose identity reads scan `Meta` instead of
+    /// using a primary-key lookup (the lookup structure is what changed). Only
+    /// `publication rebuild` (reading the incumbent it rebuilds from) and
+    /// `backup restore` (validating a pre-upgrade archive) call it. Any other
+    /// caller should get [`StoreError::RebuildRequired`] instead.
+    pub fn open_legacy_engine_read_only(path: &Path) -> Result<Self, StoreError> {
+        // A log left by the OLDER engine must be finished by that engine: this
+        // one would replay it (read-only opens replay in memory; a frozen log
+        // or shadow refuses the open outright), and its records were written
+        // with the old hash. Refused before the engine sees the file.
+        if let Some(debris) = crate::engine_format::debris_present(path) {
+            return Err(StoreError::Database(format!(
+                "{} was built by a storage engine older than LadybugDB 0.21 and was left \
+                 part-way through a write or checkpoint ({} is beside it). Open it once with \
+                 the previous NestWeaver version to finish that checkpoint (start and stop its \
+                 daemon), then back it up and rebuild it with this version.",
+                path.display(),
+                debris.display()
+            )));
+        }
+        let _crash_guard = crate::open_crash_guard::arm(path);
+        let db = lbug::Database::new(path, bounded_system_config().read_only(true))
+            .map_err(|error| open_failure(path, error.to_string(), false))?;
+        let mut store = Self::finish_read_only_open(path, db)?;
+        store.access_mode = GraphStoreAccessMode::LegacyEngineReadOnly;
+        Ok(store)
+    }
+
+    /// Open read-only, falling back to [`Self::open_legacy_engine_read_only`]
+    /// ONLY when the database was refused as built by an older engine. For the
+    /// rebuild and restore paths; see that function.
+    pub fn open_read_only_allowing_legacy_engine(path: &Path) -> Result<Self, StoreError> {
+        match Self::open_read_only_without_migration(path) {
+            Err(StoreError::RebuildRequired { .. }) => Self::open_legacy_engine_read_only(path),
+            other => other,
+        }
+    }
+
+    /// Decide, without a writable open, whether this binary may open `path`:
+    /// `Err(StoreError::RebuildRequired)` for a database an older storage
+    /// engine built. The same check every constructor runs first, exposed for
+    /// preflights that must refuse BEFORE spawning a process that would open
+    /// it. Never mutates the database; may rewrite the engine-format sidecar.
+    pub fn check_engine_format(path: &Path) -> Result<(), StoreError> {
+        if crate::engine_format::check(path)? == crate::engine_format::Precheck::NeedsProbe {
+            probe_engine_format_marker(path, false)?;
+        }
+        Ok(())
+    }
+
+    /// True when this handle reads a database an older storage engine built.
+    pub fn is_legacy_engine(&self) -> bool {
+        self.access_mode == GraphStoreAccessMode::LegacyEngineReadOnly
+    }
+
     /// Catalog migrations this handle still needs, rendered as
     /// `Table.column`. Strict read-only peers use this to fail with an
     /// actionable upgrade requirement instead of surfacing later binder
@@ -1370,6 +2086,7 @@ impl GraphStore {
         Self::rearm_borrowed_authority(path, authority)?;
         let mut db = initial?;
         let stale = lbug::Connection::new(&db)
+            .map(StoreConnection::unguarded)
             .map(|conn| {
                 Self::missing_migration_columns(&conn)
                     .iter()
@@ -1425,7 +2142,7 @@ impl GraphStore {
 
     fn finish_read_only_open(path: &Path, db: lbug::Database) -> Result<Self, StoreError> {
         let store = GraphStore {
-            db,
+            db: ReopenableDatabase::new(db),
             access_mode: GraphStoreAccessMode::ReadOnly,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
@@ -1450,6 +2167,7 @@ impl GraphStore {
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
             )),
+            checkpoint_deferred: std::sync::atomic::AtomicBool::new(false),
         };
         store.load_graph_generation(&store.generation_sidecar_path());
         store.load_recorded_embedding_model_into_index();
@@ -1473,7 +2191,7 @@ impl GraphStore {
     ) -> Result<Self, StoreError> {
         Self::require_matching_authority(path, authority)?;
         if path.exists() {
-            Self::open_inner(path, Some(authority))
+            Self::open_inner(path, Some(authority), None)
         } else {
             Self::create_inner(path, Some(authority))
         }
@@ -1505,7 +2223,7 @@ impl GraphStore {
             .tempdir()
             .map_err(|error| StoreError::Query(format!("create in-memory regex root: {error}")))?;
         let store = GraphStore {
-            db,
+            db: ReopenableDatabase::new(db),
             access_mode: GraphStoreAccessMode::ReadWrite,
             pagerank_cache: Mutex::new(None),
             pagerank_artifact_fingerprint: Mutex::new(None),
@@ -1530,6 +2248,7 @@ impl GraphStore {
             ppr_result_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
             )),
+            checkpoint_deferred: std::sync::atomic::AtomicBool::new(false),
         };
         store.init_schema()?;
         store.ensure_publication_identity()?;
@@ -3316,8 +4035,33 @@ impl GraphStore {
         Ok(())
     }
 
-    pub(crate) fn conn(&self) -> Result<lbug::Connection<'_>, StoreError> {
-        let conn = lbug::Connection::new(&self.db)?;
+    pub(crate) fn conn(&self) -> Result<StoreConnection<'_>, StoreError> {
+        self.db.wait_out_hold_off();
+        let open = self
+            .db
+            .gate
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        // SAFETY: the shared guard `open` is held (inside the returned
+        // `StoreConnection`) for as long as this reference is used; the cell is
+        // only replaced under the exclusive guard. See `ReopenableDatabase`.
+        let db = unsafe { &*self.db.cell.get() }.as_ref().ok_or_else(|| {
+            StoreError::Database(format!(
+                "{} is closed while it reopens after an interrupted checkpoint (last \
+                 attempt: {}); the reopen is retried automatically",
+                self.db_path
+                    .as_deref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "the graph".to_string()),
+                self.reopen_failure()
+                    .unwrap_or_else(|| "in progress".to_string())
+            ))
+        })?;
+        let conn = StoreConnection {
+            conn: lbug::Connection::new(db)?,
+            _open: Some(open),
+            deferred: Some(&self.checkpoint_deferred),
+        };
         if let Some(deadline) = READ_DEADLINE.get() {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
@@ -3331,7 +4075,7 @@ impl GraphStore {
     }
 
     fn publication_meta_value_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         key: &str,
     ) -> Result<Option<String>, StoreError> {
         let mut statement = conn
@@ -3349,7 +4093,7 @@ impl GraphStore {
     }
 
     fn create_publication_meta_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         key: &str,
         value: &str,
     ) -> Result<(), StoreError> {
@@ -3368,7 +4112,7 @@ impl GraphStore {
     }
 
     fn update_publication_meta_on(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         key: &str,
         value: &str,
     ) -> Result<(), StoreError> {
@@ -3392,8 +4136,13 @@ impl GraphStore {
     /// artifacts to this graph.
     pub fn publication_identity(&self) -> Result<Option<PublicationIdentity>, StoreError> {
         let conn = self.conn()?;
-        let brain_uuid = Self::publication_meta_value_on(&conn, BRAIN_UUID_META_KEY)?;
-        let publication_uuid = Self::publication_meta_value_on(&conn, PUBLICATION_UUID_META_KEY)?;
+        let read = if self.access_mode == GraphStoreAccessMode::LegacyEngineReadOnly {
+            Self::meta_value_by_scan
+        } else {
+            Self::publication_meta_value_on
+        };
+        let brain_uuid = read(&conn, BRAIN_UUID_META_KEY)?;
+        let publication_uuid = read(&conn, PUBLICATION_UUID_META_KEY)?;
         match (brain_uuid, publication_uuid) {
             (None, None) => Ok(None),
             (Some(brain_uuid), Some(publication_uuid)) => {
@@ -3466,6 +4215,9 @@ impl GraphStore {
     /// `None` means a database predating nw-246, or one with no data yet.
     pub fn data_instance_id(&self) -> Result<Option<String>, StoreError> {
         let conn = self.conn()?;
+        if self.access_mode == GraphStoreAccessMode::LegacyEngineReadOnly {
+            return Self::meta_value_by_scan(&conn, DATA_INSTANCE_ID_META_KEY);
+        }
         Self::publication_meta_value_on(&conn, DATA_INSTANCE_ID_META_KEY)
     }
 
@@ -3537,9 +4289,12 @@ impl GraphStore {
         })();
         match result {
             Ok(value) => {
-                conn.query("COMMIT").map_err(|error| {
-                    StoreError::Query(format!("commit data instance id: {error}"))
-                })?;
+                self.settle_commit(
+                    conn.query("COMMIT")
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                )
+                .map_err(|error| StoreError::Query(format!("commit data instance id: {error}")))?;
                 Ok(value)
             }
             Err(error) => {
@@ -3621,7 +4376,12 @@ impl GraphStore {
         })();
         match result {
             Ok(moved) => {
-                conn.query("COMMIT").map_err(|error| {
+                self.settle_commit(
+                    conn.query("COMMIT")
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                )
+                .map_err(|error| {
                     StoreError::Query(format!("commit re-record instance id: {error}"))
                 })?;
                 Ok(moved)
@@ -3715,7 +4475,12 @@ impl GraphStore {
 
         match result {
             Ok(identity) => {
-                conn.query("COMMIT").map_err(|error| {
+                self.settle_commit(
+                    conn.query("COMMIT")
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                )
+                .map_err(|error| {
                     StoreError::Query(format!("commit publication identity: {error}"))
                 })?;
                 Ok(identity)
@@ -3730,7 +4495,7 @@ impl GraphStore {
     /// Begin an explicit write transaction. All subsequent writes on the
     /// returned connection are grouped into a single transaction until
     /// `commit_transaction` is called, avoiding per-statement WAL flushes.
-    pub fn begin_transaction(&self) -> Result<lbug::Connection<'_>, StoreError> {
+    pub fn begin_transaction(&self) -> Result<StoreConnection<'_>, StoreError> {
         let conn = self.conn()?;
         conn.query("BEGIN TRANSACTION")
             .map_err(|e| StoreError::Query(format!("begin transaction: {e}")))?;
@@ -3738,10 +4503,197 @@ impl GraphStore {
     }
 
     /// Commit the explicit transaction opened by `begin_transaction`.
-    pub fn commit_transaction(&self, conn: &lbug::Connection<'_>) -> Result<(), StoreError> {
-        conn.query("COMMIT")
-            .map_err(|e| StoreError::Query(format!("commit: {e}")))?;
-        Ok(())
+    pub fn commit_transaction(
+        &self,
+        conn: &crate::db::StoreConnection<'_>,
+    ) -> Result<(), StoreError> {
+        let result = conn.query("COMMIT").map(|_| ()).map_err(|e| e.to_string());
+        self.settle_commit(result)
+    }
+
+    /// Turn a COMMIT result into the caller's answer.
+    ///
+    /// LadybugDB 0.21 can return an error from a COMMIT that SUCCEEDED: the
+    /// transaction is durable and only the checkpoint after it failed, most
+    /// often because the frozen log of an earlier interrupted checkpoint is
+    /// still pending (`WAL::rotateForCheckpoint`, `src/storage/wal/wal.cpp`;
+    /// wrapped by `TransactionManager::commit`,
+    /// `src/transaction/transaction_manager.cpp`). Reporting that as a failure
+    /// invites a retry that applies the write twice, or a rollback that the
+    /// engine can no longer perform. So it is reported as committed, and the
+    /// handle is flagged: it needs a reopen for recovery to finish the pending
+    /// checkpoint. See [`Self::reopen_required`].
+    pub(crate) fn settle_commit(&self, result: Result<(), String>) -> Result<(), StoreError> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(message)
+                if classify_checkpoint_failure(&message)
+                    == Some(crate::error::CheckpointFailure::CommittedCheckpointDeferred) =>
+            {
+                self.note_checkpoint_deferred(&message);
+                Ok(())
+            }
+            Err(message) => Err(StoreError::Query(format!("commit: {message}"))),
+        }
+    }
+
+    fn note_checkpoint_deferred(&self, message: &str) {
+        self.checkpoint_deferred
+            .store(true, std::sync::atomic::Ordering::Release);
+        tracing::warn!(
+            "{}: a write COMMITTED and is durable, but the storage engine deferred its \
+             checkpoint and needs the database reopened to finish it; the daemon reopens \
+             it automatically. The write was NOT retried. Engine: {message}",
+            self.db_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "in-memory graph".to_string())
+        );
+    }
+
+    /// True once the engine has deferred a checkpoint behind a committed write
+    /// on this handle. Nothing was lost; the database must be reopened (for the
+    /// daemon, a restart) so recovery completes the pending checkpoint. Until
+    /// then every later checkpoint fails the same way and the log keeps growing.
+    pub fn reopen_required(&self) -> bool {
+        self.checkpoint_deferred
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Why the last reopen attempt failed, while the handle is closed and the
+    /// reopen is being retried. `None` when the store is open.
+    pub fn reopen_failure(&self) -> Option<String> {
+        self.db
+            .last_reopen_error
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// Close and reopen the engine handle so recovery finishes the checkpoint
+    /// the engine deferred behind a committed write.
+    ///
+    /// Call at a safe point: with no write in flight (the daemon holds its
+    /// write gate). Never blocks: if any connection is still open it returns
+    /// [`ReopenOutcome::Busy`] and changes nothing. The reopen goes through the
+    /// ordinary open funnel, so recovery replays the pending frozen log and the
+    /// engine-format check still applies. `authority`, when given, is the
+    /// caller's writer lease: closing the old descriptor releases its POSIX
+    /// compatibility lock, so it is re-armed before and after the open.
+    pub fn reopen_after_deferred_checkpoint(
+        &self,
+        authority: Option<&DbWriteLease>,
+    ) -> Result<ReopenOutcome, StoreError> {
+        self.reopen_after_deferred_checkpoint_within(authority, None)
+    }
+
+    /// The escalated form of [`Self::reopen_after_deferred_checkpoint`], for
+    /// when readers keep a connection open at every non-blocking attempt.
+    ///
+    /// For at most `max_wait` it holds off NEW connections (they wait in
+    /// [`Self::conn`] for the hold-off to end; writer-preferring), so the
+    /// connections already open finish and the reopen gets in. It never
+    /// blocks longer than that: on timeout the hold-off ends and the answer is
+    /// [`ReopenOutcome::Busy`], for the caller to back off and retry. A
+    /// connection held for longer than `max_wait` (or a thread that holds one
+    /// and asks for a second during the hold-off) delays the reopen by one
+    /// bounded window; it cannot deadlock it.
+    pub fn reopen_after_deferred_checkpoint_waiting(
+        &self,
+        authority: Option<&DbWriteLease>,
+        max_wait: std::time::Duration,
+    ) -> Result<ReopenOutcome, StoreError> {
+        self.reopen_after_deferred_checkpoint_within(authority, Some(max_wait))
+    }
+
+    fn reopen_after_deferred_checkpoint_within(
+        &self,
+        authority: Option<&DbWriteLease>,
+        max_wait: Option<std::time::Duration>,
+    ) -> Result<ReopenOutcome, StoreError> {
+        if !self.reopen_required() {
+            return Ok(ReopenOutcome::NotNeeded);
+        }
+        let Some(path) = self.db_path.clone() else {
+            // In-memory stores never checkpoint to a file.
+            self.checkpoint_deferred
+                .store(false, std::sync::atomic::Ordering::Release);
+            return Ok(ReopenOutcome::NotNeeded);
+        };
+        if self.access_mode != GraphStoreAccessMode::ReadWrite {
+            return Ok(ReopenOutcome::NotNeeded);
+        }
+        let _exclusive = match max_wait {
+            None => match self.db.gate.try_write() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(ReopenOutcome::Busy),
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            },
+            Some(max_wait) => {
+                let _hold_off = self.db.hold_off_new_connections();
+                let deadline = std::time::Instant::now() + max_wait;
+                loop {
+                    match self.db.gate.try_write() {
+                        Ok(guard) => break guard,
+                        Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            if std::time::Instant::now() >= deadline {
+                                return Ok(ReopenOutcome::Busy);
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                    }
+                }
+            }
+        };
+        // SAFETY: exclusive guard held; no StoreConnection exists.
+        let cell = unsafe { &mut *self.db.cell.get() };
+        drop(cell.take());
+        let authority = authority.filter(|authority| authority.authorizes(&path));
+        if let Some(authority) = authority {
+            let _ = authority.rearm_legacy_writer_exclusion();
+        }
+        // Never let the reopen CREATE a database: a file that disappeared is
+        // reported, not replaced with an empty graph.
+        let reopened = if matches!(path.try_exists(), Ok(true)) {
+            open_lbug_with_recovery(&path, true, authority, hardened_system_config)
+        } else {
+            Err(StoreError::Database(format!(
+                "{} is missing; not reopening it",
+                path.display()
+            )))
+        };
+        if let Some(authority) = authority {
+            let _ = authority.rearm_legacy_writer_exclusion();
+        }
+        // The old handle cannot be kept while the new one opens (the engine
+        // holds the file lock), so a failed attempt leaves the handle closed,
+        // the flag set, and the reason recorded; every caller of the reopen
+        // (the daemon's loop) retries it.
+        let db = match reopened {
+            Ok(db) => db,
+            Err(error) => {
+                *self
+                    .db
+                    .last_reopen_error
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = Some(error.to_string());
+                return Err(error);
+            }
+        };
+        *cell = Some(db);
+        *self
+            .db
+            .last_reopen_error
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+        self.checkpoint_deferred
+            .store(false, std::sync::atomic::Ordering::Release);
+        tracing::info!(
+            "store reopened after an interrupted checkpoint: {}",
+            path.display()
+        );
+        Ok(ReopenOutcome::Reopened)
     }
 
     /// Roll back the explicit transaction opened by [`Self::begin_transaction`].
@@ -3749,7 +4701,10 @@ impl GraphStore {
     /// Destructive classified mutations call this explicitly so a successful
     /// rollback is affirmative evidence that an error happened before any
     /// durable change. A rollback failure is never treated as proof either way.
-    pub fn rollback_transaction(&self, conn: &lbug::Connection<'_>) -> Result<(), StoreError> {
+    pub fn rollback_transaction(
+        &self,
+        conn: &crate::db::StoreConnection<'_>,
+    ) -> Result<(), StoreError> {
         conn.query("ROLLBACK")
             .map_err(|e| StoreError::Query(format!("rollback: {e}")))?;
         Ok(())
@@ -3758,8 +4713,18 @@ impl GraphStore {
     /// Merge the WAL into the main database file.
     pub fn checkpoint(&self) -> Result<(), StoreError> {
         let conn = self.conn()?;
-        conn.query("CHECKPOINT")
-            .map_err(|e| StoreError::Query(format!("checkpoint: {e}")))?;
+        conn.query("CHECKPOINT").map_err(|e| {
+            let message = e.to_string();
+            // Nothing is lost when the engine refuses to checkpoint over a
+            // pending frozen log, but the log is NOT merged, so the caller
+            // still gets an error; the handle is flagged for a reopen.
+            if classify_checkpoint_failure(&message)
+                == Some(crate::error::CheckpointFailure::CommittedCheckpointDeferred)
+            {
+                self.note_checkpoint_deferred(&message);
+            }
+            StoreError::Query(format!("checkpoint: {message}"))
+        })?;
         Ok(())
     }
 
@@ -4200,7 +5165,53 @@ impl GraphStore {
         // above, so no migration can name a table that does not exist yet.
         Self::apply_column_migrations(&conn)?;
 
+        // The engine-format marker is NOT written here: only a create records
+        // it (`open_lbug_with_recovery`), so no open can adopt a database.
+        if self.db_path.is_none() {
+            Self::ensure_engine_format_marker_on(&conn)?;
+        }
+
         Ok(())
+    }
+
+    /// Record, inside the database, which string-hash format built it. See
+    /// [`crate::engine_format`]. Idempotent: an existing current marker is left
+    /// alone; a different one is refused rather than overwritten.
+    fn ensure_engine_format_marker_on(
+        conn: &crate::db::StoreConnection<'_>,
+    ) -> Result<(), StoreError> {
+        use crate::engine_format::{ENGINE_FORMAT_META_KEY, ENGINE_FORMAT_VALUE};
+        match Self::publication_meta_value_on(conn, ENGINE_FORMAT_META_KEY)? {
+            Some(value) if value == ENGINE_FORMAT_VALUE => Ok(()),
+            Some(value) => Err(StoreError::Query(format!(
+                "database records engine format {value:?} under {ENGINE_FORMAT_META_KEY}, \
+                 expected {ENGINE_FORMAT_VALUE:?}; refusing to overwrite it"
+            ))),
+            None => {
+                Self::create_publication_meta_on(conn, ENGINE_FORMAT_META_KEY, ENGINE_FORMAT_VALUE)
+            }
+        }
+    }
+
+    /// The engine-format marker, read by a FULL SCAN of `Meta`.
+    ///
+    /// A primary-key lookup (`MATCH (m:Meta {key: $key})`) goes through the
+    /// engine's hash index, which is exactly the structure whose hash changed
+    /// in LadybugDB 0.21. Every read of a database that may predate that change
+    /// scans instead; `Meta` holds a handful of rows.
+    fn meta_value_by_scan(
+        conn: &crate::db::StoreConnection<'_>,
+        key: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let rows = conn
+            .query("MATCH (m:Meta) RETURN m.key, m.value")
+            .map_err(|error| StoreError::Query(format!("scan Meta: {error}")))?;
+        for row in rows {
+            if crate::read::extract_string(&row, 0)? == key {
+                return crate::read::extract_string(&row, 1).map(Some);
+            }
+        }
+        Ok(None)
     }
 
     /// Apply every declared additive column migration, reporting anything that
@@ -4217,7 +5228,7 @@ impl GraphStore {
     /// that the open succeeds and the next read dies on "Binder exception:
     /// Cannot find property visibility for s" — an error naming neither the
     /// migration nor the database that needs one.
-    fn apply_column_migrations(conn: &lbug::Connection<'_>) -> Result<(), StoreError> {
+    fn apply_column_migrations(conn: &crate::db::StoreConnection<'_>) -> Result<(), StoreError> {
         Self::apply_migrations(conn, COLUMN_MIGRATIONS.iter())
     }
 
@@ -4225,7 +5236,7 @@ impl GraphStore {
     /// migration that cannot run must not stop the ones after it from running,
     /// or one absent table would withhold every column behind it.
     fn apply_migrations<'a>(
-        conn: &lbug::Connection<'_>,
+        conn: &crate::db::StoreConnection<'_>,
         migrations: impl Iterator<Item = &'a ColumnMigration>,
     ) -> Result<(), StoreError> {
         let mut failures = Vec::new();
@@ -4264,7 +5275,9 @@ impl GraphStore {
     /// A table `TABLE_INFO` cannot resolve is NOT reported as missing columns:
     /// it does not exist yet, so `init_schema` will `CREATE` it with the column
     /// already in place and there is nothing to migrate.
-    fn missing_migration_columns(conn: &lbug::Connection<'_>) -> Vec<&'static ColumnMigration> {
+    fn missing_migration_columns(
+        conn: &crate::db::StoreConnection<'_>,
+    ) -> Vec<&'static ColumnMigration> {
         let mut columns_by_table: HashMap<&'static str, Option<Vec<String>>> = HashMap::new();
         let mut missing = Vec::new();
         for migration in COLUMN_MIGRATIONS {
@@ -4281,7 +5294,7 @@ impl GraphStore {
     }
 
     /// Column names of `table`, or `None` when the table does not exist.
-    fn table_columns(conn: &lbug::Connection<'_>, table: &str) -> Option<Vec<String>> {
+    fn table_columns(conn: &crate::db::StoreConnection<'_>, table: &str) -> Option<Vec<String>> {
         let rows = conn
             .query(&format!("CALL TABLE_INFO('{table}') RETURN *"))
             .ok()?;
@@ -4332,7 +5345,7 @@ impl GraphStore {
         // convenience open must never turn into WAL/checkpoint recovery. An
         // orphaned WAL here is reported, not moved.
         let db = open_lbug_with_recovery(path, false, Some(authority), hardened_system_config)?;
-        let conn = lbug::Connection::new(&db)?;
+        let conn = crate::db::StoreConnection::unguarded(lbug::Connection::new(&db)?);
         // Only what is actually missing, re-derived under the writer so the
         // decision is made against the schema we are about to change rather
         // than the one a read-only connection saw a moment ago. Reporting a
@@ -5072,14 +6085,14 @@ mod tests {
         std::fs::write(&cp, b"stale-checkpoint-bytes").unwrap();
         std::fs::write(&shadow, b"").unwrap();
 
-        assert!(!remove_stale_checkpoint_sidecars(&db, None));
+        assert!(quarantine_stale_checkpoint(&db, None).is_none());
         assert!(cp.exists(), "the checkpoint must survive a read-only open");
         assert!(shadow.exists(), "and so must the shadow");
 
         let sibling = dir.path().join("sibling.lbug");
         let wrong = acquire_db_write_lease(&sibling).unwrap();
         assert!(
-            !remove_stale_checkpoint_sidecars(&db, Some(&wrong)),
+            quarantine_stale_checkpoint(&db, Some(&wrong)).is_none(),
             "a sibling authority must preserve every artifact"
         );
         assert!(cp.exists());
@@ -5088,7 +6101,7 @@ mod tests {
 
         let authority = acquire_db_write_lease(&db).unwrap();
         assert!(
-            remove_stale_checkpoint_sidecars(&db, Some(&authority)),
+            quarantine_stale_checkpoint(&db, Some(&authority)).is_some(),
             "the read-write self-heal is the reason this recovery exists and must \
              still fire — gating it into uselessness would restore the crash loop"
         );
@@ -5103,18 +6116,18 @@ mod tests {
         let cp = dir.path().join("db.lbug.wal.checkpoint");
         let shadow = dir.path().join("db.lbug.shadow");
 
-        // Empty shadow + checkpoint present → recover (remove both).
+        // Empty shadow + checkpoint present → recover (move both aside).
         std::fs::write(&cp, b"stale-checkpoint-bytes").unwrap();
         std::fs::write(&shadow, b"").unwrap();
         let authority = acquire_db_write_lease(&db).unwrap();
-        assert!(remove_stale_checkpoint_sidecars(&db, Some(&authority)));
-        assert!(!cp.exists(), "stale checkpoint should be removed");
-        assert!(!shadow.exists(), "empty shadow should be removed");
+        assert!(quarantine_stale_checkpoint(&db, Some(&authority)).is_some());
+        assert!(!cp.exists(), "stale checkpoint should be moved aside");
+        assert!(!shadow.exists(), "empty shadow should be moved aside");
 
         // Non-empty shadow (possible live writer) → do NOT touch the checkpoint.
         std::fs::write(&cp, b"stale").unwrap();
         std::fs::write(&shadow, b"live-writer-state").unwrap();
-        assert!(!remove_stale_checkpoint_sidecars(&db, Some(&authority)));
+        assert!(quarantine_stale_checkpoint(&db, Some(&authority)).is_none());
         assert!(
             cp.exists(),
             "must not remove checkpoint when shadow is non-empty"
@@ -6057,21 +7070,35 @@ mod schema_migration_tests {
     /// Column names of `table`, read straight from the catalog.
     fn columns(path: &std::path::Path, table: &str) -> Vec<String> {
         let db = lbug::Database::new(path, bounded_system_config()).unwrap();
-        let conn = lbug::Connection::new(&db).unwrap();
+        let conn = crate::db::StoreConnection::unguarded(lbug::Connection::new(&db).unwrap());
         GraphStore::table_columns(&conn, table).unwrap_or_default()
     }
 
     /// Run DDL against a closed database.
+    ///
+    /// Fixtures built here model a previous NestWeaver release on the SAME
+    /// storage engine: the schema is old, the engine format is current, so the
+    /// engine-format sidecar is written. (The engine-format refusal has its own
+    /// tests; these are about column migrations.)
     fn run(path: &std::path::Path, statements: &[String]) {
-        let db = lbug::Database::new(path, bounded_system_config()).unwrap();
-        let conn = lbug::Connection::new(&db).unwrap();
-        for statement in statements {
-            conn.query(statement)
-                .unwrap_or_else(|error| panic!("{statement}: {error}"));
+        {
+            let db = lbug::Database::new(path, bounded_system_config()).unwrap();
+            let conn = crate::db::StoreConnection::unguarded(lbug::Connection::new(&db).unwrap());
+            for statement in statements {
+                conn.query(statement)
+                    .unwrap_or_else(|error| panic!("{statement}: {error}"));
+            }
         }
+        // Both halves of the engine-format claim, as a create by this engine
+        // records them.
+        {
+            let db = lbug::Database::new(path, bounded_system_config()).unwrap();
+            super::stamp_engine_format_marker(&db).unwrap();
+        }
+        crate::engine_format::write_sidecar(path).unwrap();
     }
 
-    fn rows(conn: &lbug::Connection<'_>, query: &str) -> Vec<Vec<lbug::Value>> {
+    fn rows(conn: &crate::db::StoreConnection<'_>, query: &str) -> Vec<Vec<lbug::Value>> {
         let result = conn.query(query).unwrap_or_else(|e| panic!("{query}: {e}"));
         result.collect()
     }
@@ -6102,7 +7129,7 @@ mod schema_migration_tests {
         // unopenable in lbug 0.19.1 (`hash_index.cpp:497`).
         let ddl = {
             let db = lbug::Database::new(&reference_path, bounded_system_config()).unwrap();
-            let conn = lbug::Connection::new(&db).unwrap();
+            let conn = crate::db::StoreConnection::unguarded(lbug::Connection::new(&db).unwrap());
 
             let tables: Vec<(String, String)> = rows(&conn, "CALL SHOW_TABLES() RETURN *")
                 .iter()
@@ -6757,5 +7784,1211 @@ mod hardening_activity_tests {
             ("retained".into(), HashMap::from([("same.rs".into(), 0.2)])),
         ]));
         assert_eq!(store.git_activity_score("removed", "same.rs"), Some(0.1));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod engine_format_open_tests {
+    use super::{GraphStore, PublicationIdentity, acquire_db_write_lease, bounded_system_config};
+    use crate::StoreError;
+    use crate::engine_format::{ENGINE_FORMAT_META_KEY, ENGINE_FORMAT_VALUE, sidecar_path};
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    /// Every regular file under `dir`, with its bytes.
+    pub(crate) fn tree_bytes(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.insert(path.clone(), std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    fn repo(uid: &str) -> nestweaver_schema::Repo {
+        nestweaver_schema::Repo {
+            uid: uid.to_string(),
+            url: format!("file:///{uid}"),
+            indexed_sha: "sha".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "default".to_string(),
+            name: None,
+            root_path: None,
+        }
+    }
+
+    /// A database in the shape every release before the LadybugDB 0.21 cutover
+    /// left behind: a complete NestWeaver schema and identity, NO engine-format
+    /// `Meta` row and NO sidecar. Built by creating a current database and then
+    /// removing both markers, because this build cannot run the old engine.
+    /// The pre-open check never reads anything the old engine would have
+    /// written differently, so the shape is what matters.
+    pub(crate) fn make_legacy_fixture(path: &Path) {
+        {
+            let store = GraphStore::create(path).unwrap();
+            store.insert_repo(&repo("repo:café")).unwrap();
+        }
+        {
+            let db = lbug::Database::new(path, bounded_system_config()).unwrap();
+            let conn = crate::db::StoreConnection::unguarded(lbug::Connection::new(&db).unwrap());
+            conn.query(&format!(
+                "MATCH (m:Meta) WHERE m.key = '{ENGINE_FORMAT_META_KEY}' DELETE m"
+            ))
+            .unwrap();
+            conn.query("CHECKPOINT").unwrap();
+        }
+        std::fs::remove_file(sidecar_path(path)).unwrap();
+        for suffix in [".wal", ".wal.checkpoint", ".shadow"] {
+            let debris = PathBuf::from(format!("{}{suffix}", path.display()));
+            assert!(!debris.exists(), "fixture left {}", debris.display());
+        }
+    }
+
+    fn marker_in(path: &Path) -> Option<String> {
+        let db = lbug::Database::new(path, bounded_system_config().read_only(true)).unwrap();
+        let conn = crate::db::StoreConnection::unguarded(lbug::Connection::new(&db).unwrap());
+        GraphStore::meta_value_by_scan(&conn, ENGINE_FORMAT_META_KEY).unwrap()
+    }
+
+    fn assert_rebuild_required(result: Result<GraphStore, StoreError>, what: &str) {
+        match result {
+            Err(StoreError::RebuildRequired { path, reason }) => {
+                assert!(path.ends_with("graph.lbug"), "{what}: {}", path.display());
+                assert!(!reason.is_empty(), "{what}");
+            }
+            Err(other) => panic!("{what}: expected RebuildRequired, got {other}"),
+            Ok(_) => panic!("{what}: a pre-cutover database was opened"),
+        }
+    }
+
+    /// Unpack one of the databases LadybugDB 0.20.4 wrote
+    /// (`testdata/lbug-0.20.4/`, built by the generator beside them).
+    ///
+    /// `NESTWEAVER_OLD_ENGINE_FIXTURE_DIR`, when set, points at freshly
+    /// generated UNCOMPRESSED files instead: `regenerate.sh` uses it to check a
+    /// new fixture with this engine before replacing the committed one.
+    pub(crate) fn old_engine_fixture(dir: &Path, name: &str) -> PathBuf {
+        let target = dir.join(name);
+        if let Some(fresh) = std::env::var_os("NESTWEAVER_OLD_ENGINE_FIXTURE_DIR") {
+            for suffix in ["", ".wal"] {
+                let source = Path::new(&fresh).join(format!("{name}{suffix}"));
+                if source.exists() {
+                    std::fs::copy(&source, format!("{}{suffix}", target.display())).unwrap();
+                }
+            }
+            return target;
+        }
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/lbug-0.20.4");
+        for suffix in ["", ".wal"] {
+            let packed = source.join(format!("{name}{suffix}.zst"));
+            if !packed.exists() {
+                continue;
+            }
+            let mut decoder =
+                crate::zstd::Decoder::new(std::fs::File::open(&packed).unwrap()).unwrap();
+            let mut out =
+                std::fs::File::create(PathBuf::from(format!("{}{suffix}", target.display())))
+                    .unwrap();
+            std::io::copy(&mut decoder, &mut out).unwrap();
+        }
+        target
+    }
+
+    /// A create that fails withdraws its engine-format claim, so no sidecar is
+    /// left to vouch for a file that appears at the path later.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_create_leaves_no_engine_format_claim() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"").unwrap();
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let created = GraphStore::create(&db);
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            created.is_err(),
+            "the engine cannot open an unreadable file"
+        );
+        assert!(
+            !sidecar_path(&db).exists(),
+            "a failed create must withdraw its claim"
+        );
+    }
+
+    /// A stray sidecar (left by a deleted database) must never make this
+    /// engine adopt an old-engine database that later appears at the path:
+    /// the database itself carries no marker, so the two disagree and the
+    /// open is refused, with no byte changed and no marker written.
+    #[test]
+    fn a_stray_sidecar_cannot_adopt_an_old_engine_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = old_engine_fixture(dir.path(), "pre-cutover.lbug");
+        crate::engine_format::write_sidecar(&db).unwrap();
+        let before = tree_bytes(dir.path());
+        for open in [
+            GraphStore::open(&db),
+            GraphStore::open_read_only(&db),
+            GraphStore::open_or_create(&db),
+        ] {
+            match open {
+                Err(StoreError::RebuildRequired { reason, .. }) => {
+                    assert!(reason.contains("disagree"), "{reason}")
+                }
+                Err(other) => panic!("expected a rebuild refusal, got {other}"),
+                Ok(_) => panic!("a stray sidecar adopted an old-engine database"),
+            }
+        }
+        assert_eq!(tree_bytes(dir.path()), before);
+        assert_eq!(
+            marker_in(&db),
+            None,
+            "no engine-format marker may be written into it"
+        );
+    }
+
+    fn meta_rows(path: &Path) -> Vec<(String, String)> {
+        let db = lbug::Database::new(path, bounded_system_config().read_only(true)).unwrap();
+        let conn = lbug::Connection::new(&db).unwrap();
+        let mut rows: Vec<(String, String)> = conn
+            .query("MATCH (m:Meta) RETURN m.key, m.value")
+            .unwrap()
+            .map(|row| {
+                (
+                    crate::read::extract_string(&row, 0).unwrap(),
+                    crate::read::extract_string(&row, 1).unwrap(),
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// A foreign graph in a publication slot, with a leftover log that only a
+    /// writable open can recover, is refused by the identity-checked open
+    /// BEFORE anything NestWeaver writes: its identity is not replaced, no
+    /// identity is minted, no migration runs. Absent or unparsable identities
+    /// and a missing file fail closed.
+    #[test]
+    fn the_identity_checked_open_refuses_a_foreign_graph_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = PublicationIdentity::new_brain();
+
+        let foreign = dir.path().join("foreign.lbug");
+        drop(GraphStore::create(&foreign).unwrap());
+        let before = meta_rows(&foreign);
+        std::fs::write(format!("{}.wal.checkpoint", foreign.display()), b"").unwrap();
+        let authority = acquire_db_write_lease(&foreign).unwrap();
+        let error =
+            GraphStore::open_expecting_identity_with_authority(&foreign, &authority, &expected)
+                .err()
+                .expect("a foreign graph must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("is not the selected publication"),
+            "{error}"
+        );
+        drop(authority);
+        assert_eq!(
+            meta_rows(&foreign),
+            before,
+            "its identity must be untouched"
+        );
+
+        // No identity at all: refused, and none is minted.
+        let bare = dir.path().join("bare.lbug");
+        {
+            let db = lbug::Database::new(&bare, bounded_system_config()).unwrap();
+            super::stamp_engine_format_marker(&db).unwrap();
+        }
+        crate::engine_format::write_sidecar(&bare).unwrap();
+        let authority = acquire_db_write_lease(&bare).unwrap();
+        assert!(
+            GraphStore::open_expecting_identity_with_authority(&bare, &authority, &expected)
+                .is_err()
+        );
+        drop(authority);
+        assert!(
+            meta_rows(&bare)
+                .iter()
+                .all(|(key, _)| !key.starts_with("publication.")),
+            "no identity may be minted: {:?}",
+            meta_rows(&bare)
+        );
+
+        // A missing file is refused, never created.
+        let missing = dir.path().join("missing.lbug");
+        let authority = acquire_db_write_lease(&missing).unwrap();
+        let _ = std::fs::remove_file(&missing);
+        assert!(
+            GraphStore::open_expecting_identity_with_authority(&missing, &authority, &expected)
+                .is_err()
+        );
+        drop(authority);
+
+        // Counterweight: the graph CURRENT names opens.
+        let right = dir.path().join("right.lbug");
+        drop(GraphStore::create_with_publication_identity(&right, &expected).unwrap());
+        let authority = acquire_db_write_lease(&right).unwrap();
+        GraphStore::open_expecting_identity_with_authority(&right, &authority, &expected)
+            .expect("the selected graph opens");
+    }
+
+    /// A sidecar written for a DIFFERENT file, beside an old-engine database
+    /// that has a log: counted as no sidecar, so the file is refused before
+    /// any open, and neither it nor its log changes by a byte.
+    #[test]
+    fn a_stray_sidecar_with_crash_debris_is_refused_before_any_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = old_engine_fixture(dir.path(), "pre-cutover-wal.lbug");
+        let elsewhere = dir.path().join("elsewhere.lbug");
+        std::fs::write(&elsewhere, b"another file").unwrap();
+        crate::engine_format::write_sidecar(&elsewhere).unwrap();
+        std::fs::rename(sidecar_path(&elsewhere), sidecar_path(&db)).unwrap();
+        std::fs::remove_file(&elsewhere).unwrap();
+        let before = tree_bytes(dir.path());
+        for open in [GraphStore::open(&db), GraphStore::open_or_create(&db)] {
+            match open {
+                Err(StoreError::RebuildRequired { reason, .. }) => {
+                    assert!(reason.contains("crash debris"), "{reason}")
+                }
+                Err(other) => panic!("expected the pre-open refusal, got {other}"),
+                Ok(_) => panic!("a stray sidecar let an old-engine log be replayed"),
+            }
+        }
+        assert_eq!(
+            tree_bytes(dir.path()),
+            before,
+            "nothing opened, nothing written"
+        );
+    }
+
+    /// Counterweight: this engine's own database, crashed IN PLACE with a
+    /// log beside it, still recovers: the sidecar names this very file.
+    #[test]
+    fn a_new_database_with_crash_debris_in_place_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        drop(GraphStore::create(&db).unwrap());
+        assert!(
+            std::fs::read_to_string(sidecar_path(&db))
+                .unwrap()
+                .contains("file="),
+            "a create binds its claim to the file"
+        );
+        std::fs::write(dir.path().join("graph.lbug.wal.checkpoint"), b"").unwrap();
+        drop(GraphStore::open(&db).expect("its own crash debris must not block recovery"));
+    }
+
+    /// THE HAZARD, shown on a file the OLD engine wrote: this engine's
+    /// primary-key lookup misses a non-ASCII key, while a scan finds the row.
+    /// An ASCII key is unaffected. This is why a pre-cutover database is
+    /// refused, and why every read the exemption makes is a scan.
+    #[test]
+    fn a_pk_lookup_misses_a_non_ascii_key_the_old_engine_wrote_but_a_scan_finds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = old_engine_fixture(dir.path(), "pre-cutover.lbug");
+        let raw = lbug::Database::new(&db, bounded_system_config().read_only(true)).unwrap();
+        let conn = lbug::Connection::new(&raw).unwrap();
+        let count = |query: &str| conn.query(query).unwrap().count();
+        assert_eq!(
+            count("MATCH (r:Repo {uid: 'repo:default:café'}) RETURN r.uid"),
+            0,
+            "the old engine's hash for a non-ASCII key is not where this engine looks"
+        );
+        let scanned: Vec<String> = conn
+            .query("MATCH (r:Repo) RETURN r.uid")
+            .unwrap()
+            .map(|row| crate::read::extract_string(&row, 0).unwrap())
+            .collect();
+        assert!(
+            scanned.iter().any(|uid| uid == "repo:default:café"),
+            "{scanned:?}"
+        );
+        assert_eq!(
+            count("MATCH (m:Meta {key: 'publication.brain_uuid'}) RETURN m.value"),
+            1,
+            "an ASCII key hashes the same under both engines"
+        );
+    }
+
+    /// The same file through NestWeaver: refused on every constructor with no
+    /// byte changed, and the legacy exemption reads its identity and its
+    /// non-ASCII repository by scan.
+    #[test]
+    fn a_database_the_old_engine_wrote_is_refused_and_read_only_by_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = old_engine_fixture(dir.path(), "pre-cutover.lbug");
+        let before = tree_bytes(dir.path());
+        for open in [
+            GraphStore::open(&db),
+            GraphStore::open_read_only(&db),
+            GraphStore::open_read_only_without_migration(&db),
+        ] {
+            assert!(
+                matches!(open, Err(StoreError::RebuildRequired { .. })),
+                "{:?}",
+                open.err()
+            );
+        }
+        assert_eq!(tree_bytes(dir.path()), before);
+        let store = GraphStore::open_read_only_allowing_legacy_engine(&db).unwrap();
+        assert!(store.is_legacy_engine());
+        assert_eq!(
+            store.publication_identity().unwrap().unwrap().brain_uuid,
+            "3f2b8c1e-5d4a-4e6f-9a7b-1c2d3e4f5a6b"
+        );
+        assert_eq!(
+            store.data_instance_id().unwrap().as_deref(),
+            Some("default")
+        );
+        let repos = store.list_repos(None).unwrap();
+        assert_eq!(repos.len(), 1, "{repos:?}");
+        assert_eq!(repos[0].uid, "repo:default:café");
+        drop(store);
+        assert_eq!(
+            tree_bytes(dir.path()),
+            before,
+            "the exemption writes nothing"
+        );
+    }
+
+    /// An old-engine file with its last write still in the log is refused
+    /// BEFORE any engine replays it, and the exemption names the way out.
+    #[test]
+    fn an_old_engine_log_is_refused_before_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = old_engine_fixture(dir.path(), "pre-cutover-wal.lbug");
+        assert!(dir.path().join("pre-cutover-wal.lbug.wal").exists());
+        let before = tree_bytes(dir.path());
+        let refused = GraphStore::open(&db).err().expect("refused");
+        assert!(refused.is_rebuild_required(), "{refused}");
+        assert!(refused.to_string().contains(".wal"), "{refused}");
+        let exempt = GraphStore::open_legacy_engine_read_only(&db)
+            .err()
+            .expect("the exemption must not replay an old-engine log");
+        assert!(
+            exempt.to_string().contains("previous NestWeaver version"),
+            "{exempt}"
+        );
+        assert_eq!(
+            tree_bytes(dir.path()),
+            before,
+            "nothing replayed, nothing written"
+        );
+    }
+
+    #[test]
+    fn a_fresh_database_carries_both_markers_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        drop(GraphStore::create(&db).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(sidecar_path(&db))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap()
+                .trim(),
+            ENGINE_FORMAT_VALUE
+        );
+        assert_eq!(marker_in(&db).as_deref(), Some(ENGINE_FORMAT_VALUE));
+        drop(GraphStore::open(&db).unwrap());
+        drop(GraphStore::open_read_only(&db).unwrap());
+    }
+
+    /// The owner's decision: refused on EVERY constructor, with the typed
+    /// error, and the refusal changes no byte on disk (the engine never opened
+    /// the file writable, so nothing replayed or checkpointed).
+    #[test]
+    fn a_database_without_the_marker_is_refused_on_every_open_and_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        make_legacy_fixture(&db);
+        let before = tree_bytes(dir.path());
+
+        assert_rebuild_required(GraphStore::open(&db), "open");
+        assert_rebuild_required(GraphStore::create(&db), "create over it");
+        assert_rebuild_required(GraphStore::open_or_create(&db), "open_or_create");
+        assert_rebuild_required(GraphStore::open_read_only(&db), "open_read_only");
+        assert_rebuild_required(
+            GraphStore::open_read_only_without_migration(&db),
+            "open_read_only_without_migration",
+        );
+        assert!(
+            GraphStore::check_engine_format(&db)
+                .unwrap_err()
+                .is_rebuild_required()
+        );
+
+        assert_eq!(
+            tree_bytes(dir.path()),
+            before,
+            "a refused open changed the database directory"
+        );
+    }
+
+    #[test]
+    fn a_lost_sidecar_is_rederived_from_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        drop(GraphStore::create(&db).unwrap());
+        std::fs::remove_file(sidecar_path(&db)).unwrap();
+
+        drop(GraphStore::open_read_only(&db).unwrap());
+        assert!(
+            !sidecar_path(&db).exists(),
+            "a read-only open verifies but never adds a file"
+        );
+        drop(GraphStore::open(&db).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(sidecar_path(&db))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap()
+                .trim(),
+            ENGINE_FORMAT_VALUE,
+            "a writable open rewrites the sidecar it verified"
+        );
+    }
+
+    /// A current database whose writer died before a checkpoint: the image is
+    /// the data file plus a live `.wal`, captured while the store is open.
+    fn crashed_image(sidecar: bool) -> (tempfile::TempDir, PathBuf) {
+        let live = tempfile::tempdir().unwrap();
+        let live_db = live.path().join("graph.lbug");
+        let crashed = tempfile::tempdir().unwrap();
+        let crashed_db = crashed.path().join("graph.lbug");
+        let store = GraphStore::create(&live_db).unwrap();
+        store.insert_repo(&repo("repo:after-crash")).unwrap();
+        let wal = PathBuf::from(format!("{}.wal", live_db.display()));
+        assert!(wal.exists(), "the write must still be in the log");
+        std::fs::copy(&live_db, &crashed_db).unwrap();
+        std::fs::copy(&wal, format!("{}.wal", crashed_db.display())).unwrap();
+        if sidecar {
+            std::fs::copy(sidecar_path(&live_db), sidecar_path(&crashed_db)).unwrap();
+            // A copy path re-binds the claim to the copy, as a restore does.
+            crate::engine_format::restamp_after_copy(&crashed_db).unwrap();
+        }
+        drop(store);
+        (crashed, crashed_db)
+    }
+
+    #[test]
+    fn a_fresh_database_that_crashed_mid_write_still_recovers() {
+        let (_dir, db) = crashed_image(true);
+        let store = GraphStore::open(&db).unwrap();
+        let repos = store.list_repos(None).unwrap();
+        assert!(
+            repos.iter().any(|repo| repo.uid == "repo:after-crash"),
+            "the committed write in the log must be replayed: {repos:?}"
+        );
+    }
+
+    /// Conservative by design: without the sidecar, a log beside the file
+    /// means even a read-only probe would replay records of an unknown format.
+    #[test]
+    fn a_crashed_database_that_also_lost_its_sidecar_is_refused_untouched() {
+        let (dir, db) = crashed_image(false);
+        let before = tree_bytes(dir.path());
+        let error = GraphStore::open(&db).err().expect("must refuse");
+        assert!(error.is_rebuild_required(), "{error}");
+        assert!(error.to_string().contains(".wal"), "{error}");
+        assert_eq!(tree_bytes(dir.path()), before);
+    }
+
+    #[test]
+    fn the_legacy_exemption_reads_identity_by_scan_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        make_legacy_fixture(&db);
+        let before = tree_bytes(dir.path());
+
+        let store = GraphStore::open_read_only_allowing_legacy_engine(&db).unwrap();
+        assert!(store.is_legacy_engine());
+        assert!(!store.is_read_write());
+        assert!(store.publication_identity().unwrap().is_some());
+        let repos = store.list_repos(None).unwrap();
+        assert_eq!(repos.len(), 1, "{repos:?}");
+        drop(store);
+
+        assert_eq!(tree_bytes(dir.path()), before);
+        assert!(
+            !sidecar_path(&db).exists(),
+            "the exemption must never stamp"
+        );
+    }
+
+    #[test]
+    fn the_refusal_names_the_code_and_the_rebuild_in_its_own_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        make_legacy_fixture(&db);
+        let text = GraphStore::open(&db).err().unwrap().to_string();
+        assert!(text.contains(crate::DB_REBUILD_REQUIRED_CODE), "{text}");
+        assert!(text.contains("nestweaver publication rebuild"), "{text}");
+        assert!(text.contains(&db.display().to_string()), "{text}");
+    }
+}
+
+/// The crash-recovery arms re-derived against LadybugDB 0.21's recovery
+/// (`src/storage/wal/wal_replayer.cpp`, `src/storage/checkpointer.cpp`,
+/// `src/storage/wal/wal.cpp`).
+#[cfg(test)]
+mod wal_recovery_arm_tests {
+    use super::*;
+    use crate::error::{CheckpointFailure, classify_checkpoint_failure};
+
+    fn stale_files(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(prefix)
+            })
+            .collect()
+    }
+
+    /// A committed-but-uncheckpointed log from ANOTHER database, dropped in as
+    /// this database's frozen log: exactly the ID mismatch the stale arm keys
+    /// on. The arm must recover the open AND keep every byte of the log.
+    #[test]
+    fn a_foreign_frozen_log_is_renamed_aside_and_the_open_recovers() {
+        let other = tempfile::tempdir().unwrap();
+        let other_db = other.path().join("other.lbug");
+        let other_store = GraphStore::create(&other_db).unwrap();
+        other_store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:other".to_string(),
+                url: "file:///other".to_string(),
+                indexed_sha: "x".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        let foreign_log = std::fs::read(format!("{}.wal", other_db.display())).unwrap();
+        drop(other_store);
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        drop(GraphStore::create(&db).unwrap());
+        std::fs::write(format!("{}.wal.checkpoint", db.display()), &foreign_log).unwrap();
+
+        let authority = acquire_db_write_lease(&db).unwrap();
+        let store = GraphStore::open_with_authority(&db, &authority)
+            .expect("the stale-checkpoint arm must recover the open");
+        drop(store);
+
+        assert!(!dir.path().join("brain.lbug.wal.checkpoint").exists());
+        let aside = stale_files(dir.path(), "brain.lbug.wal.checkpoint.stale-");
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert_eq!(
+            std::fs::read(&aside[0]).unwrap(),
+            foreign_log,
+            "renamed, never deleted: every byte of the log survives"
+        );
+    }
+
+    /// A `.shadow` the filesystem cannot describe (here a symlink loop) is
+    /// possibly live. Both arms used to read it as absent or empty
+    /// (`exists()` is false on error, `unwrap_or(true)` called it empty).
+    #[cfg(unix)]
+    #[test]
+    fn both_arms_decline_when_the_shadow_cannot_be_inspected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        std::os::unix::fs::symlink("brain.lbug.shadow", dir.path().join("brain.lbug.shadow"))
+            .unwrap();
+        std::fs::write(dir.path().join("brain.lbug.wal.checkpoint"), b"frozen").unwrap();
+        let authority = acquire_db_write_lease(&db).unwrap();
+        assert!(quarantine_stale_checkpoint(&db, Some(&authority)).is_none());
+        assert!(dir.path().join("brain.lbug.wal.checkpoint").exists());
+
+        std::fs::remove_file(dir.path().join("brain.lbug.wal.checkpoint")).unwrap();
+        std::fs::write(dir.path().join("brain.lbug.wal"), b"live").unwrap();
+        assert!(quarantine_orphaned_wal(&db, Some(&authority)).is_none());
+        assert_eq!(
+            std::fs::read(dir.path().join("brain.lbug.wal")).unwrap(),
+            b"live"
+        );
+    }
+
+    /// The engine's exact text for the missing shadow: `LocalFileSystem::openFile`
+    /// throws `IOException(std::format("Cannot open file {}: {}", fullPath,
+    /// posixErrMessage()))` (`src/common/file_system/local_file_system.cpp`),
+    /// and `IOException` prefixes "IO exception: "
+    /// (`src/include/common/exception/io.h`). The path is the real one at
+    /// test time, so the detector sees what the engine would print.
+    fn shadow_missing(db: &Path) -> String {
+        format!(
+            "IO exception: Cannot open file {}.shadow: No such file or directory",
+            db.display()
+        )
+    }
+
+    /// The engine's exact text for the zero-length shadow:
+    /// `FileDBIDUtils::verifyDatabaseID` (`src/storage/file_db_id_utils.cpp`)
+    /// wrapped by `RuntimeException`'s "Runtime exception: " prefix
+    /// (`src/include/common/exception/runtime.h`).
+    fn shadow_id_mismatch(db: &Path) -> String {
+        format!(
+            "Runtime exception: Database ID for temporary file '{}.shadow' does not match \
+             the current database. This file may have been left behind from a previous \
+             database with the same name. If it is safe to do so, please delete this file \
+             and restart the database.",
+            db.display()
+        )
+    }
+
+    /// A frozen log ending in CHECKPOINT whose pages were applied before the
+    /// crash: named precisely, with the ONE move that fixes it, and nothing is
+    /// moved automatically.
+    #[test]
+    fn a_frozen_log_whose_pages_were_applied_gets_a_targeted_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        let frozen = dir.path().join("brain.lbug.wal.checkpoint");
+        std::fs::write(&frozen, b"frozen-ending-in-checkpoint").unwrap();
+        std::fs::write(dir.path().join("brain.lbug.wal"), b"later-commits").unwrap();
+
+        assert_eq!(
+            frozen_checkpoint_already_applied(&db, &shadow_missing(&db)),
+            Some(frozen.clone())
+        );
+        assert!(frozen.exists(), "a diagnostic, not an automatic move");
+        assert!(dir.path().join("brain.lbug.wal").exists());
+
+        let error = StoreError::FrozenCheckpointAlreadyApplied(Box::new(
+            crate::error::FrozenCheckpointApplied {
+                path: db.clone(),
+                frozen: frozen.clone(),
+                detail: shadow_missing(&db),
+            },
+        ));
+        let text = error.to_string();
+        assert!(
+            text.contains(&format!(
+                "mv {} {}.applied",
+                frozen.display(),
+                frozen.display()
+            )),
+            "{text}"
+        );
+        assert!(text.contains("Do NOT move"), "{text}");
+        assert!(text.contains("KEEP the .applied file"), "{text}");
+        assert!(
+            crate::error::classify_engine_corruption(&text).is_none(),
+            "not corruption: {text}"
+        );
+
+        // The zero-length shadow a crash between truncate and unlink leaves.
+        let shadow = dir.path().join("brain.lbug.shadow");
+        std::fs::write(&shadow, b"").unwrap();
+        let id_mismatch = shadow_id_mismatch(&db);
+        assert_eq!(
+            frozen_checkpoint_already_applied(&db, &id_mismatch),
+            Some(frozen.clone())
+        );
+        assert!(
+            frozen_checkpoint_already_applied(&db, &shadow_missing(&db)).is_none(),
+            "a present shadow is not the missing-shadow message"
+        );
+        std::fs::write(&shadow, b"not-empty").unwrap();
+        assert!(
+            frozen_checkpoint_already_applied(&db, &id_mismatch).is_none(),
+            "a non-empty shadow may hold unapplied pages"
+        );
+        std::fs::remove_file(&shadow).unwrap();
+
+        // Counterweights: any other shape is not this state.
+        std::fs::write(dir.path().join("brain.lbug.shadow"), b"s").unwrap();
+        assert!(frozen_checkpoint_already_applied(&db, &shadow_missing(&db)).is_none());
+        std::fs::remove_file(dir.path().join("brain.lbug.shadow")).unwrap();
+        assert!(frozen_checkpoint_already_applied(&db, "database is locked").is_none());
+        std::fs::remove_file(&frozen).unwrap();
+        assert!(frozen_checkpoint_already_applied(&db, &shadow_missing(&db)).is_none());
+    }
+
+    /// The real engine: a frozen log still pending makes the next checkpoint
+    /// refuse. The COMMIT that triggers it succeeded, and the classifier must
+    /// say so from the engine's exact words.
+    #[test]
+    fn a_post_commit_checkpoint_over_a_pending_frozen_log_is_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.lbug");
+        let db = lbug::Database::new(
+            &path,
+            bounded_system_config()
+                .auto_checkpoint(true)
+                .checkpoint_threshold(0),
+        )
+        .unwrap();
+        let conn = lbug::Connection::new(&db).unwrap();
+        conn.query("CREATE NODE TABLE T(k STRING, PRIMARY KEY(k))")
+            .unwrap();
+        std::fs::write(format!("{}.wal.checkpoint", path.display()), b"").unwrap();
+        let message = match conn.query("CREATE (:T {k: 'kept'})") {
+            Ok(_) => panic!("the post-commit checkpoint must refuse over a pending frozen log"),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(
+            classify_checkpoint_failure(&message),
+            Some(CheckpointFailure::CommittedCheckpointDeferred),
+            "{message}"
+        );
+        assert!(
+            crate::error::classify_engine_corruption(&message).is_none(),
+            "{message}"
+        );
+        let rows: Vec<_> = conn.query("MATCH (t:T) RETURN t.k").unwrap().collect();
+        assert_eq!(rows.len(), 1, "the write committed: {message}");
+    }
+
+    /// Through the store: a committed write is reported as committed (never
+    /// an error that invites a retry), and the handle asks for a reopen.
+    #[test]
+    fn the_store_reports_a_deferred_checkpoint_as_committed_and_flags_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = GraphStore::create(&db).unwrap();
+        assert!(!store.reopen_required());
+        let committed_elsewhere = "Checkpoint exception: Transaction committed successfully, \
+             but the post-commit checkpoint failed. The committed data is durable and will be \
+             recovered on restart: Runtime exception: Cannot checkpoint: the frozen WAL of an \
+             earlier checkpoint is still pending. Reopen the database to recover it.";
+        store
+            .settle_commit(Err(committed_elsewhere.to_string()))
+            .expect("a committed write is not a failure");
+        assert!(store.reopen_required());
+        assert!(
+            store
+                .settle_commit(Err("Runtime exception: write-write conflict".to_string()))
+                .is_err(),
+            "counterweight: a genuine commit failure is still an error"
+        );
+
+        // And the real engine refusal on an explicit checkpoint.
+        let fresh = GraphStore::create(&dir.path().join("second.lbug")).unwrap();
+        std::fs::write(dir.path().join("second.lbug.wal.checkpoint"), b"").unwrap();
+        let error = fresh.checkpoint().unwrap_err();
+        assert_eq!(
+            error.checkpoint_failure(),
+            Some(CheckpointFailure::CommittedCheckpointDeferred),
+            "{error}"
+        );
+        assert!(fresh.reopen_required());
+    }
+
+    /// The recovery the flag asks for: close and reopen the handle in place.
+    /// The pending frozen log is recovered by the engine's own open, a later
+    /// checkpoint succeeds, committed data survives, and the reopen never
+    /// happens while a connection is open.
+    #[test]
+    fn a_flagged_store_reopens_in_place_and_checkpoints_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = GraphStore::create(&db).unwrap();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:kept".to_string(),
+                url: "file:///kept".to_string(),
+                indexed_sha: "x".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        assert_eq!(
+            store.reopen_after_deferred_checkpoint(None).unwrap(),
+            ReopenOutcome::NotNeeded
+        );
+        std::fs::write(dir.path().join("brain.lbug.wal.checkpoint"), b"").unwrap();
+        assert!(store.checkpoint().is_err());
+        assert!(store.reopen_required());
+
+        {
+            let _open = store.conn().unwrap();
+            assert_eq!(
+                store.reopen_after_deferred_checkpoint(None).unwrap(),
+                ReopenOutcome::Busy,
+                "never swap the handle under an open connection"
+            );
+            assert!(store.reopen_required());
+        }
+
+        assert_eq!(
+            store.reopen_after_deferred_checkpoint(None).unwrap(),
+            ReopenOutcome::Reopened
+        );
+        assert!(!store.reopen_required());
+        store
+            .checkpoint()
+            .expect("a checkpoint after the reopen must succeed");
+        assert!(!dir.path().join("brain.lbug.wal.checkpoint").exists());
+        let repos = store.list_repos(None).unwrap();
+        assert!(
+            repos.iter().any(|repo| repo.uid == "repo:kept"),
+            "{repos:?}"
+        );
+    }
+
+    /// An ordinary auto-commit writer (no explicit transaction) whose commit
+    /// the engine follows with a refused checkpoint: the write is reported as
+    /// the success it is, the store is flagged for a reopen, and nothing is
+    /// written twice.
+    #[test]
+    fn an_auto_commit_write_that_committed_before_a_deferred_checkpoint_is_ok() {
+        super::CHECKPOINT_EVERY_COMMIT.with(|flag| flag.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = GraphStore::create(&db).unwrap();
+        super::CHECKPOINT_EVERY_COMMIT.with(|flag| flag.set(false));
+        std::fs::write(dir.path().join("brain.lbug.wal.checkpoint"), b"").unwrap();
+        let repo = nestweaver_schema::Repo {
+            uid: "repo:once".to_string(),
+            url: "file:///once".to_string(),
+            indexed_sha: "x".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "default".to_string(),
+            name: None,
+            root_path: None,
+        };
+        store
+            .insert_repo(&repo)
+            .expect("a committed write must not be reported as failed");
+        assert!(store.reopen_required());
+        let repos = store.list_repos(None).unwrap();
+        assert_eq!(
+            repos.iter().filter(|row| row.uid == "repo:once").count(),
+            1,
+            "{repos:?}"
+        );
+    }
+
+    /// A reopen that fails leaves the handle closed with the reason recorded
+    /// (surfaced by brain_status), keeps the flag, and the next attempt
+    /// recovers. A missing file is never recreated by a reopen.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_reopen_is_retried_and_never_creates_a_database() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = GraphStore::create(&db).unwrap();
+        std::fs::write(dir.path().join("brain.lbug.wal.checkpoint"), b"").unwrap();
+        assert!(store.checkpoint().is_err());
+
+        let moved = dir.path().join("moved.lbug");
+        std::fs::rename(&db, &moved).unwrap();
+        assert!(store.reopen_after_deferred_checkpoint(None).is_err());
+        assert!(!db.exists(), "a reopen must never create a database");
+        assert!(store.reopen_required());
+        assert!(store.reopen_failure().is_some());
+        let closed = store
+            .conn()
+            .err()
+            .expect("closed while reopening")
+            .to_string();
+        assert!(closed.contains("retried automatically"), "{closed}");
+        std::fs::rename(&moved, &db).unwrap();
+
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = store.reopen_after_deferred_checkpoint(None);
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(denied.is_err(), "{denied:?}");
+
+        assert_eq!(
+            store.reopen_after_deferred_checkpoint(None).unwrap(),
+            ReopenOutcome::Reopened
+        );
+        assert!(store.reopen_failure().is_none());
+        store
+            .checkpoint()
+            .expect("checkpoint after the recovered reopen");
+    }
+
+    /// A new database is claimed for this engine before the engine writes it,
+    /// on every path that creates one, including a recovery retry; and if the
+    /// claim cannot be recorded, nothing is created.
+    #[test]
+    fn a_new_database_is_stamped_on_every_create_path_or_not_created_at_all() {
+        // Recovery retry: a foreign frozen log beside a path with no database
+        // sends the first open through the stale-checkpoint arm.
+        let other = tempfile::tempdir().unwrap();
+        let other_db = other.path().join("other.lbug");
+        let other_store = GraphStore::create(&other_db).unwrap();
+        other_store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:other".to_string(),
+                url: "file:///other".to_string(),
+                indexed_sha: "x".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        let foreign_log = std::fs::read(format!("{}.wal", other_db.display())).unwrap();
+        drop(other_store);
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(format!("{}.wal.checkpoint", db.display()), &foreign_log).unwrap();
+        let authority = acquire_db_write_lease(&db).unwrap();
+        drop(GraphStore::create_with_authority(&db, &authority).unwrap());
+        assert!(
+            crate::engine_format::sidecar_path(&db).exists(),
+            "the retry path must carry the engine-format claim too"
+        );
+        drop(authority);
+
+        // Unrecordable claim: no database is created.
+        let blocked = dir.path().join("blocked.lbug");
+        std::fs::create_dir(crate::engine_format::sidecar_path(&blocked)).unwrap();
+        let error = GraphStore::create(&blocked).err().expect("must refuse");
+        assert!(
+            error.to_string().contains("storage-engine format"),
+            "{error}"
+        );
+        assert!(
+            !blocked.exists() || std::fs::metadata(&blocked).unwrap().len() == 0,
+            "no database may be created without its engine-format claim"
+        );
+    }
+
+    /// A committed write that RETURNs rows cannot hand back its rows after the
+    /// engine defers its checkpoint. It must not read as an empty result: the
+    /// caller gets an error that still says the write committed.
+    #[test]
+    fn a_committed_write_with_return_is_never_mistaken_for_an_empty_result() {
+        super::CHECKPOINT_EVERY_COMMIT.with(|flag| flag.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = GraphStore::create(&db).unwrap();
+        super::CHECKPOINT_EVERY_COMMIT.with(|flag| flag.set(false));
+        std::fs::write(dir.path().join("brain.lbug.wal.checkpoint"), b"").unwrap();
+        let conn = store.conn().unwrap();
+        let error = conn
+            .query("CREATE (m:Meta {key: 'probe', value: 'v'}) RETURN m.key")
+            .expect_err("rows the engine did not return must not read as none");
+        let error = StoreError::from(error);
+        assert!(error.is_committed_despite_error(), "{error}");
+        assert!(store.reopen_required());
+        drop(conn);
+        let conn = store.conn().unwrap();
+        let rows: Vec<_> = conn
+            .query("MATCH (m:Meta) WHERE m.key = 'probe' RETURN m.value")
+            .unwrap()
+            .collect();
+        assert_eq!(rows.len(), 1, "the write committed exactly once");
+        assert!(super::statement_returns_rows("match (n) return n"));
+        assert!(!super::statement_returns_rows(
+            "CREATE (:Meta {key: 'returned'})"
+        ));
+    }
+
+    /// The hold-off never parks an async executor: a connection taken on a
+    /// current-thread runtime does not wait for it, and one taken on a
+    /// multi-thread worker waits inside `block_in_place` without stalling the
+    /// runtime's other tasks.
+    #[test]
+    fn the_hold_off_never_parks_an_async_executor_thread() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(GraphStore::create(&dir.path().join("brain.lbug")).unwrap());
+        // Hold new connections off for 2 s from another thread, as an
+        // escalated reopen would.
+        let hold_for_two_seconds = |store: &Arc<GraphStore>| {
+            let store = Arc::clone(store);
+            let (armed, ready) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _hold = store.db.hold_off_new_connections();
+                armed.send(()).unwrap();
+                std::thread::sleep(Duration::from_secs(2));
+            });
+            ready.recv().unwrap();
+        };
+
+        hold_for_two_seconds(&store);
+        let current = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        current.block_on(async { drop(store.conn().unwrap()) });
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a current-thread executor must not wait out the hold-off"
+        );
+
+        // One worker: if the waiting task parked it, nothing else could run.
+        let multi = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+        while store
+            .db
+            .holding_off
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        hold_for_two_seconds(&store);
+        let started = Instant::now();
+        let finished_other_work = multi.block_on(async {
+            let waiter_store = Arc::clone(&store);
+            let waiter = tokio::spawn(async move { drop(waiter_store.conn().unwrap()) });
+            tokio::task::yield_now().await;
+            let other = tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Instant::now()
+            });
+            let done = other.await.unwrap();
+            waiter.await.unwrap();
+            done
+        });
+        assert!(
+            finished_other_work.duration_since(started) < Duration::from_millis(1500),
+            "other tasks must keep running while a worker waits out the hold-off"
+        );
+    }
+
+    /// Readers that keep a connection open at every moment starve the
+    /// non-blocking reopen. The escalated reopen holds off NEW connections for
+    /// a bounded window, the open ones finish, and the reopen gets in, while
+    /// the readers carry on afterwards.
+    #[test]
+    fn continuously_overlapping_readers_cannot_starve_the_escalated_reopen() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = Arc::new(GraphStore::create(&db).unwrap());
+        std::fs::write(dir.path().join("brain.lbug.wal.checkpoint"), b"").unwrap();
+        assert!(store.checkpoint().is_err());
+        assert!(store.reopen_required());
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let readers: Vec<_> = (0..4)
+            .map(|index| {
+                let store = Arc::clone(&store);
+                let stop = Arc::clone(&stop);
+                let reads = Arc::clone(&reads);
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(7 * index));
+                    while !stop.load(Ordering::SeqCst) {
+                        let conn = store.conn().unwrap();
+                        conn.query("MATCH (m:Meta) RETURN count(*)").unwrap();
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        drop(conn);
+                    }
+                })
+            })
+            .collect();
+        // Let the readers overlap first.
+        while reads.load(Ordering::SeqCst) < 8 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            store.reopen_after_deferred_checkpoint(None).unwrap(),
+            ReopenOutcome::Busy,
+            "the non-blocking attempt is starved by the overlapping readers"
+        );
+        let started = std::time::Instant::now();
+        let outcome = store
+            .reopen_after_deferred_checkpoint_waiting(None, std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(outcome, ReopenOutcome::Reopened);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let before = reads.load(Ordering::SeqCst);
+        while reads.load(Ordering::SeqCst) < before + 4 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        stop.store(true, Ordering::SeqCst);
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        store
+            .checkpoint()
+            .expect("checkpoint after the escalated reopen");
+    }
+
+    /// An interrupted checkpoint that recovery could not finish: a resource
+    /// problem ONLY when the wrapped cause says so; otherwise the cause is
+    /// relayed without a verdict. Never the corrupt-log runbook, whose
+    /// move-aside would discard the frozen log's committed records.
+    #[test]
+    fn a_recovery_checkpoint_failure_claims_a_resource_problem_only_on_its_evidence() {
+        for (cause, resource) in [
+            (
+                "Buffer manager exception: Unable to allocate memory! The buffer pool is full \
+                 and no memory could be freed!",
+                true,
+            ),
+            (
+                "IO exception: Cannot write to file: No space left on device",
+                true,
+            ),
+            (
+                "Corrupted wal file. Read out invalid WAL record type.",
+                false,
+            ),
+        ] {
+            let message = format!(
+                "Checkpoint exception: Failed while completing an interrupted checkpoint \
+                 during recovery: {cause}"
+            );
+            assert_eq!(
+                classify_checkpoint_failure(&message),
+                Some(CheckpointFailure::RecoveryCheckpointInterrupted),
+                "{message}"
+            );
+            assert!(
+                crate::error::classify_engine_corruption(&message).is_none(),
+                "{message}"
+            );
+            let disclosure =
+                crate::error::recovery_checkpoint_disclosure(Path::new("/x/brain.lbug"), &message);
+            assert_eq!(
+                disclosure.contains("ran out of a resource"),
+                resource,
+                "{disclosure}"
+            );
+            assert_eq!(
+                disclosure.contains("NESTWEAVER_LBUG_BUFFER_POOL_BYTES"),
+                resource,
+                "{disclosure}"
+            );
+            assert!(!disclosure.contains("NOT corrupt"), "{disclosure}");
+            assert!(disclosure.contains("Do NOT move"), "{disclosure}");
+            assert!(
+                disclosure.contains(cause.split(':').next().unwrap()),
+                "{disclosure}"
+            );
+            assert!(
+                crate::error::classify_engine_corruption(&disclosure).is_none(),
+                "the disclosure itself must not re-classify as corruption: {disclosure}"
+            );
+        }
     }
 }

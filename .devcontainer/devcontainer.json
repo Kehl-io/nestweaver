@@ -5,7 +5,8 @@
     "ghcr.io/devcontainers/features/node:1": { "version": "24" },
     "ghcr.io/devcontainers/features/github-cli:1": {}
   },
-  "postCreateCommand": "cargo build && cd crates/nestweaver-web/frontend && npm install",
+  "containerEnv": { "LBUG_SOURCE_DIR": "/opt/ladybug" },
+  "postCreateCommand": "sudo install -d -o \"$(id -u)\" /opt/ladybug && scripts/fetch-lbug-source.sh /opt/ladybug && cargo build && cd crates/nestweaver-web/frontend && npm install",
   "forwardPorts": [3000, 5173],
   "customizations": {
     "vscode": {

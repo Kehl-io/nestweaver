@@ -3626,9 +3626,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "lbug"
-version = "0.20.4"
+version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa792a6ec0595098bf41f2f6d243bb705a0d4c01bb94f44e63cc49988796b0e8"
+checksum = "417db8d481578b1014953a1ce24508382bd791938bb974f5462f1621cd1cfd3d"
 dependencies = [
  "cmake",
  "cxx",
@@ -4411,6 +4411,7 @@ dependencies = [
  "tantivy",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
  "toml",
  "tracing",
  "uuid",

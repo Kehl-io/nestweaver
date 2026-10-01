@@ -17,8 +17,19 @@ use crate::publication::{ArtifactDescriptor, ArtifactKind, PublicationBundleV3};
 /// publication identities. Writers fence out older readers that cannot enforce
 /// those invariants. The explicit capability version lets this development
 /// tree read snapshots it writes before the package version is raised.
-pub const MIN_SNAPSHOT_READER_VERSION: &str = "6.3.0";
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
+///
+/// Format v4 marks the storage-engine cutover to LadybugDB 0.21, whose string
+/// hash differs from every earlier engine's without a storage-version bump. A
+/// v4 snapshot's graph can only be read by a 0.21 engine, and this reader
+/// refuses anything older (see [`LEGACY_ENGINE_SNAPSHOT_FORMAT_VERSION`]), so
+/// the fence holds in both directions.
+pub const MIN_SNAPSHOT_READER_VERSION: &str = "11.0.0";
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 4;
+/// The last snapshot and publication-bundle format written by a storage engine
+/// older than LadybugDB 0.21. Its graph must be rebuilt, never loaded; only
+/// `publication rebuild` and `backup restore` read it, through the store's
+/// legacy read-only exemption.
+pub const LEGACY_ENGINE_SNAPSHOT_FORMAT_VERSION: u32 = 3;
 pub const SNAPSHOT_CAPABILITY_EMBEDDINGS: &str = "embedding-sidecar-v1";
 pub const SNAPSHOT_CAPABILITY_PUBLICATION_IDENTITY: &str = "publication-identity-v1";
 
@@ -900,6 +911,16 @@ fn verify_snapshot_envelope(snapshot_dir: &Path) -> Result<Stamp, anyhow::Error>
     if stamp.format_version > SNAPSHOT_FORMAT_VERSION {
         anyhow::bail!(
             "snapshot format {} is newer than this engine supports ({SNAPSHOT_FORMAT_VERSION})",
+            stamp.format_version
+        );
+    }
+    if stamp.format_version < SNAPSHOT_FORMAT_VERSION {
+        anyhow::bail!(
+            "snapshot format {} was written by a storage engine older than LadybugDB 0.21, and \
+             this NestWeaver refuses it (format {SNAPSHOT_FORMAT_VERSION} is required): its graph \
+             hashes text keys the old way and would silently miss lookups. Rebuild the database \
+             it came from with `nestweaver publication rebuild --config <instance.toml>`, then \
+             take a new snapshot",
             stamp.format_version
         );
     }
@@ -1858,8 +1879,49 @@ mod tests {
         assert!(error.contains("must be distinct"), "{error}");
     }
 
+    /// The storage-engine cutover fences out every older snapshot: a v2 or
+    /// v3 snapshot's graph was built by an engine that hashes text keys the
+    /// old way. The refusal names the rebuild, not a version mismatch.
     #[test]
-    fn reader_remains_compatible_with_v2_snapshots_without_identity_fields() {
+    fn a_pre_cutover_snapshot_is_refused_and_the_refusal_names_the_rebuild() {
+        for legacy in [2_u32, LEGACY_ENGINE_SNAPSHOT_FORMAT_VERSION] {
+            let dir = tempfile::tempdir().unwrap();
+            let snap_dir = dir.path().join("snapshot");
+            let db = make_test_db(dir.path());
+            build_snapshot(
+                &snap_dir,
+                &make_stamp("6.2.0", "4.1.1", "schema-hash-abc", "model"),
+                &make_manifest(),
+                &db,
+            )
+            .unwrap();
+            let stamp_path = snap_dir.join(STAMP_FILE);
+            let mut stamp: Stamp =
+                serde_json::from_str(&std::fs::read_to_string(&stamp_path).unwrap()).unwrap();
+            stamp.format_version = legacy;
+            std::fs::write(&stamp_path, serde_json::to_string_pretty(&stamp).unwrap()).unwrap();
+            std::fs::write(
+                snap_dir.join(CHECKSUM_FILE),
+                compute_checksums(&snap_dir).unwrap(),
+            )
+            .unwrap();
+
+            let error = verify_snapshot(&snap_dir).unwrap_err().to_string();
+            assert!(error.contains("LadybugDB 0.21"), "v{legacy}: {error}");
+            assert!(
+                error.contains("nestweaver publication rebuild"),
+                "v{legacy}: {error}"
+            );
+            let error =
+                load_snapshot_with_config(&snap_dir, MIN_SNAPSHOT_READER_VERSION, None, None)
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains("LadybugDB 0.21"), "v{legacy}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_current_snapshot_declares_the_cutover_format() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snapshot");
         let db = make_test_db(dir.path());
@@ -1870,30 +1932,9 @@ mod tests {
             &db,
         )
         .unwrap();
-
-        // Model a snapshot emitted by the v2 writer: identity was neither a
-        // declared capability nor part of the serialized stamp contract.
-        let stamp_path = snap_dir.join(STAMP_FILE);
-        let mut stamp: Stamp =
-            serde_json::from_str(&std::fs::read_to_string(&stamp_path).unwrap()).unwrap();
-        stamp.format_version = 2;
-        stamp.capabilities = vec![SNAPSHOT_CAPABILITY_EMBEDDINGS.to_string()];
-        stamp.brain_uuid.clear();
-        stamp.publication_uuid.clear();
-        stamp.min_compatible_engine = "4.1.1".to_string();
-        std::fs::write(&stamp_path, serde_json::to_string_pretty(&stamp).unwrap()).unwrap();
-        std::fs::write(
-            snap_dir.join(CHECKSUM_FILE),
-            compute_checksums(&snap_dir).unwrap(),
-        )
-        .unwrap();
-
-        let verified = verify_snapshot(&snap_dir).unwrap();
-        assert_eq!(verified.format_version, 2);
-        assert!(verified.brain_uuid.is_empty());
-        assert!(verified.publication_uuid.is_empty());
-        load_snapshot_with_config(&snap_dir, "6.2.0", None, None)
-            .expect("the v3 reader must retain v2 read compatibility");
+        let stamp = verify_snapshot(&snap_dir).unwrap();
+        assert_eq!(stamp.format_version, 4);
+        assert_eq!(stamp.min_compatible_engine, MIN_SNAPSHOT_READER_VERSION);
     }
 
     #[test]
@@ -2061,8 +2102,10 @@ mod tests {
         let legacy_checksum = hasher.finalize().to_hex().to_string();
         std::fs::write(snap_dir.join(CHECKSUM_FILE), &legacy_checksum).unwrap();
 
-        let loaded = verify_snapshot(&snap_dir).unwrap();
-        assert_eq!(loaded.instance_id, "test-instance");
+        // The legacy single-hash checksum still VERIFIES as intact; the
+        // snapshot is then refused for predating the storage-engine cutover.
+        let error = verify_snapshot(&snap_dir).unwrap_err().to_string();
+        assert!(error.contains("LadybugDB 0.21"), "{error}");
     }
 
     #[test]
@@ -2284,7 +2327,9 @@ mod tests {
             hasher.finalize().to_hex().as_bytes(),
         )
         .unwrap();
+        // Refused before any artifact check: format 0 predates the
+        // storage-engine cutover.
         let error = verify_snapshot(snapshot).unwrap_err();
-        assert!(error.to_string().contains("omits embeddings.bin"));
+        assert!(error.to_string().contains("LadybugDB 0.21"), "{error}");
     }
 }

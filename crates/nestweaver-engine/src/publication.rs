@@ -1136,9 +1136,44 @@ pub fn read_current(publication_root: &Path) -> anyhow::Result<Option<CurrentPub
 /// the validation/activation path; repeating a multi-gigabyte graph hash on
 /// every short-lived CLI invocation would make the selector itself O(graph).
 pub fn resolve_selected_database(base_db_path: &Path) -> anyhow::Result<PathBuf> {
+    resolve_selected_database_inner(base_db_path, false).map(|(path, _)| path)
+}
+
+/// [`resolve_selected_database`] plus the identity `CURRENT` names for the
+/// selected slot (`None` when there is no `CURRENT`). A WRITABLE opener must
+/// pass it to `GraphStore::open_expecting_identity_with_authority`: when the
+/// slot carries checkpoint debris, resolution cannot read the graph's own
+/// identity (the engine refuses read-only opens), so the writable opener
+/// checks it before writing anything.
+pub fn resolve_selected_database_with_identity(
+    base_db_path: &Path,
+) -> anyhow::Result<(PathBuf, Option<nestweaver_store::PublicationIdentity>)> {
+    resolve_selected_database_inner(base_db_path, false)
+}
+
+/// [`resolve_selected_database`] for the one caller that must read a slot an
+/// OLDER storage engine built: `publication rebuild`, which reads the incumbent
+/// it replaces. A selected slot sealed at the pre-cutover bundle format (see
+/// [`crate::snapshot::LEGACY_ENGINE_SNAPSHOT_FORMAT_VERSION`]) is admitted, and
+/// its graph is opened through the store's legacy read-only exemption. Every
+/// other caller gets `StoreError::RebuildRequired` for such a slot.
+pub fn resolve_selected_database_allowing_legacy_engine(
+    base_db_path: &Path,
+) -> anyhow::Result<PathBuf> {
+    resolve_selected_database_inner(base_db_path, true).map(|(path, _)| path)
+}
+
+fn resolve_selected_database_inner(
+    base_db_path: &Path,
+    allow_legacy_engine: bool,
+) -> anyhow::Result<(PathBuf, Option<nestweaver_store::PublicationIdentity>)> {
     let publication_root = default_publication_root(base_db_path);
     let Some(pointer) = read_current(&publication_root)? else {
-        return Ok(base_db_path.to_path_buf());
+        return Ok((base_db_path.to_path_buf(), None));
+    };
+    let expected = nestweaver_store::PublicationIdentity {
+        brain_uuid: pointer.brain_uuid.clone(),
+        publication_uuid: pointer.publication_uuid.clone(),
     };
     let slot = slot_path(&publication_root, &pointer.publication_uuid)?;
     let manifest_path = slot.join(PUBLICATION_MANIFEST_FILE);
@@ -1158,7 +1193,13 @@ pub fn resolve_selected_database(base_db_path: &Path) -> anyhow::Result<PathBuf>
                 manifest_path.display()
             )
         })?;
-    bundle.validate_metadata(crate::snapshot::SNAPSHOT_FORMAT_VERSION)?;
+    let legacy_engine_bundle =
+        bundle.format_version == crate::snapshot::LEGACY_ENGINE_SNAPSHOT_FORMAT_VERSION;
+    bundle.validate_metadata(if legacy_engine_bundle {
+        crate::snapshot::LEGACY_ENGINE_SNAPSHOT_FORMAT_VERSION
+    } else {
+        crate::snapshot::SNAPSHOT_FORMAT_VERSION
+    })?;
     if parse_uuid("CURRENT brain_uuid", &pointer.brain_uuid)?
         != parse_uuid("bundle brain_uuid", &bundle.brain_uuid)?
         || parse_uuid("CURRENT publication_uuid", &pointer.publication_uuid)?
@@ -1189,8 +1230,46 @@ pub fn resolve_selected_database(base_db_path: &Path) -> anyhow::Result<PathBuf>
     // A selected local graph remains writable after cutover, so its live size
     // and checksum legitimately advance beyond the sealed baseline. The graph
     // identity is the stable binding that must never change.
-    let store = nestweaver_store::GraphStore::open_read_only_without_migration(&graph_path)
-        .map_err(|error| anyhow::anyhow!("open selected publication graph: {error}"))?;
+    // A slot sealed before the storage-engine cutover holds a graph this
+    // engine must not open; say so with the typed refusal (its remedy is the
+    // rebuild) instead of a bundle-format mismatch nobody can act on.
+    if legacy_engine_bundle && !allow_legacy_engine {
+        return Err(anyhow::Error::new(
+            nestweaver_store::StoreError::RebuildRequired {
+                path: Box::new(graph_path),
+                reason: format!(
+                    "is the selected publication, sealed at bundle format {} by a storage engine \
+                 older than LadybugDB 0.21",
+                    bundle.format_version
+                )
+                .into_boxed_str(),
+            },
+        ));
+    }
+    // A crash mid-checkpoint leaves `.wal.checkpoint` or `.shadow` beside the
+    // graph, and the engine refuses EVERY read-only open of it until a
+    // writable open finishes the checkpoint. Checking identity here with a
+    // read-only open would then fail resolution itself, so the daemon could
+    // never reach the writable open that recovers it. The manifest identity
+    // above already matched CURRENT; the graph-owned identity is verified by
+    // the writable opener instead, before it writes anything
+    // (`GraphStore::open_expecting_identity_with_authority`).
+    let checkpoint_debris = [".wal.checkpoint", ".shadow"].iter().any(|suffix| {
+        let mut name = graph_path.as_os_str().to_owned();
+        name.push(suffix);
+        !matches!(PathBuf::from(name).try_exists(), Ok(false))
+    });
+    if checkpoint_debris {
+        return Ok((graph_path, Some(expected)));
+    }
+    // Keep the store error TYPED (context, not a flattened string) so a
+    // rebuild refusal reaches the CLI diagnostic intact.
+    let store = if allow_legacy_engine {
+        nestweaver_store::GraphStore::open_read_only_allowing_legacy_engine(&graph_path)
+    } else {
+        nestweaver_store::GraphStore::open_read_only_without_migration(&graph_path)
+    }
+    .map_err(|error| anyhow::Error::new(error).context("open selected publication graph"))?;
     let identity = store
         .publication_identity()
         .map_err(|error| anyhow::anyhow!("read selected publication identity: {error}"))?
@@ -1204,7 +1283,7 @@ pub fn resolve_selected_database(base_db_path: &Path) -> anyhow::Result<PathBuf>
     {
         anyhow::bail!("selected publication graph identity does not match CURRENT");
     }
-    Ok(graph_path)
+    Ok((graph_path, Some(expected)))
 }
 
 /// Durably select `next` when the currently selected publication UUID equals
@@ -1911,24 +1990,43 @@ mod tests {
         let generation = store.graph_generation();
         drop(store);
         let graph = std::fs::read(&graph_path).unwrap();
+        let engine_format_name = format!(
+            "{PUBLICATION_GRAPH_FILE}{}",
+            nestweaver_store::engine_format::ENGINE_FORMAT_SIDECAR_SUFFIX
+        );
+        let engine_format = std::fs::read(slot.join(&engine_format_name)).unwrap();
         let bundle = PublicationBundleV3 {
             format_version: crate::snapshot::SNAPSHOT_FORMAT_VERSION,
             brain_uuid: identity.brain_uuid.clone(),
             publication_uuid: identity.publication_uuid.clone(),
             producer_version: env!("CARGO_PKG_VERSION").to_string(),
             source_graph_generation: generation,
-            artifacts: vec![ArtifactDescriptor {
-                path: PUBLICATION_GRAPH_FILE.to_string(),
-                kind: ArtifactKind::Graph,
-                artifact_schema_version: 1,
-                byte_size: graph.len() as u64,
-                blake3: crate::hash::blake3_hex_bytes(&graph),
-                brain_uuid: identity.brain_uuid.clone(),
-                publication_uuid: identity.publication_uuid.clone(),
-                producer_version: env!("CARGO_PKG_VERSION").to_string(),
-                source_graph_generation: generation,
-                algorithm_fingerprint: "ladybugdb-graph-v1".to_string(),
-            }],
+            artifacts: vec![
+                ArtifactDescriptor {
+                    path: PUBLICATION_GRAPH_FILE.to_string(),
+                    kind: ArtifactKind::Graph,
+                    artifact_schema_version: 1,
+                    byte_size: graph.len() as u64,
+                    blake3: crate::hash::blake3_hex_bytes(&graph),
+                    brain_uuid: identity.brain_uuid.clone(),
+                    publication_uuid: identity.publication_uuid.clone(),
+                    producer_version: env!("CARGO_PKG_VERSION").to_string(),
+                    source_graph_generation: generation,
+                    algorithm_fingerprint: "ladybugdb-graph-v1".to_string(),
+                },
+                ArtifactDescriptor {
+                    path: engine_format_name,
+                    kind: ArtifactKind::CompatibilityStamp,
+                    artifact_schema_version: 1,
+                    byte_size: engine_format.len() as u64,
+                    blake3: crate::hash::blake3_hex_bytes(&engine_format),
+                    brain_uuid: identity.brain_uuid.clone(),
+                    publication_uuid: identity.publication_uuid.clone(),
+                    producer_version: env!("CARGO_PKG_VERSION").to_string(),
+                    source_graph_generation: generation,
+                    algorithm_fingerprint: "nestweaver-engine-format-v1".to_string(),
+                },
+            ],
         };
         let manifest = serde_json::to_vec_pretty(&bundle).unwrap();
         std::fs::write(slot.join(PUBLICATION_MANIFEST_FILE), &manifest).unwrap();

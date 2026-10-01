@@ -327,6 +327,10 @@ where
     // reuse, and an operator's `rm` erases it; the database lock has neither
     // hole.
     // Held for the whole pass, which can run for hours.
+    // The direct pass embeds what the daemon would serve, not a base database
+    // a publication rebuild left behind.
+    let selected = selected_db_path(path)?;
+    let path = selected.as_path();
     let write_lease = require_exclusive_store_access(path, "embed")?;
 
     let store =

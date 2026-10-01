@@ -17,6 +17,9 @@ members = [
     "crates/nestweaver-client",
     "crates/nestweaver-embed",
 ]
+# A standalone generator pinned to the previous storage engine; see
+# testdata/lbug-0.20.4/README.md. Never built with the workspace.
+exclude = ["testdata/lbug-0.20.4/generator"]
 
 [workspace.package]
 version = "10.3.1"

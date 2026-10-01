@@ -127,6 +127,7 @@ docs(cli): improve --help text for impact command
 # Clone and install native build prerequisites (see INSTALL.md for each OS)
 git clone https://github.com/Kehl-io/nestweaver.git
 cd nestweaver
+eval "$(scripts/fetch-lbug-source.sh)"   # sets LBUG_SOURCE_DIR; see INSTALL.md
 cargo build
 
 # Install pre-commit hooks (requires pre-commit and Node.js for commitlint)
@@ -142,6 +143,11 @@ from source instead of a prebuilt archive, which avoids zstd link errors; the
 initial native build can take several minutes. See
 [INSTALL.md](INSTALL.md#build-from-source) for CMake, C++, OpenSSL, zstd,
 `pkg-config`, and Protocol Buffers prerequisites.
+
+Every `cargo` command needs `LBUG_SOURCE_DIR` pointing at a LadybugDB checkout
+at the tag `scripts/fetch-lbug-source.sh` pins, until a published `lbug` crate
+builds from source again. Export it from your shell profile, or re-run the
+`eval` line above in each new shell; the script reuses an existing clone.
 
 #### Only one copy of zstd may be linked
 

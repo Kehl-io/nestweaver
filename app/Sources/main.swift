@@ -151,13 +151,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: binaryPath)
             process.arguments = ["daemon", "--db", dbPath, "start"]
-            process.environment = ProcessInfo.processInfo.environment
+            var environment = ProcessInfo.processInfo.environment
+            // One line per diagnostic, so the alert below shows the whole
+            // remedy rather than a terminal-width wrap of it.
+            environment["NESTWEAVER_DIAGNOSTIC_WIDTH"] = "1000"
+            process.environment = environment
+            let stderrPipe = Pipe()
+            process.standardError = stderrPipe
             do {
                 try process.run()
+                let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
                 if process.terminationStatus != 0 {
+                    let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
+                    // `daemon start` refuses, before any daemon exists, a
+                    // database this version must not open (built by an older
+                    // storage engine) or one stuck on a frozen checkpoint log.
+                    // Neither clears by retrying, and neither is retried here:
+                    // show the CLI's own diagnostic, which names the one
+                    // command or file move that fixes it.
+                    let terminal = stderrText.contains("nestweaver::db_rebuild_required")
+                        || stderrText.contains("frozen write-ahead log of a checkpoint")
                     DispatchQueue.main.async {
-                        self?.updateStatus("Daemon failed to start (\(process.terminationStatus))")
+                        if terminal {
+                            self?.updateStatus(
+                                stderrText.contains("nestweaver::db_rebuild_required")
+                                    ? "Database must be rebuilt" : "Database needs recovery")
+                            let alert = NSAlert()
+                            alert.messageText = "NestWeaver cannot open this database"
+                            alert.informativeText = stderrText
+                            alert.runModal()
+                        } else {
+                            self?.updateStatus("Daemon failed to start (\(process.terminationStatus))")
+                        }
                     }
                 }
             } catch {

@@ -2860,6 +2860,31 @@ async fn run_shutdown_drain(state: Arc<DaemonState>, ceiling: u64) {
 ///
 /// `trigger` names the route for the log only; behaviour is identical either
 /// way, which is the point.
+/// How often the daemon checks whether the store needs a reopen after a
+/// deferred checkpoint.
+const DEFERRED_CHECKPOINT_REOPEN_INTERVAL: Duration = Duration::from_secs(5);
+/// Consecutive busy non-blocking attempts (about a minute) before the daemon
+/// escalates to a bounded hold-off of new connections.
+const DEFERRED_CHECKPOINT_ESCALATE_AFTER: u32 = 12;
+/// How long an escalated reopen may hold off new connections.
+const DEFERRED_CHECKPOINT_ESCALATION_WAIT: Duration = Duration::from_secs(10);
+
+/// Reopen the store after a deferred checkpoint, holding the write gate so no
+/// write is in flight. Returns the store's verdict; `Busy` (a read still has a
+/// connection open) is retried by the caller's next tick.
+fn reopen_store_at_safe_point(
+    store: &GraphStore,
+    write_gate: &WriteGate,
+    authority: Option<&nestweaver_store::DbWriteLease>,
+    escalation: Option<Duration>,
+) -> Result<nestweaver_store::ReopenOutcome, nestweaver_store::StoreError> {
+    let _no_writes = write_gate.blocking_lock("reopen after interrupted checkpoint");
+    match escalation {
+        None => store.reopen_after_deferred_checkpoint(authority),
+        Some(max_wait) => store.reopen_after_deferred_checkpoint_waiting(authority, max_wait),
+    }
+}
+
 fn begin_shutdown_drain(state: Arc<DaemonState>, trigger: &'static str) {
     // T6.2: mark the pool drained BEFORE the drain wait loop so the worker
     // stops claiming NEW jobs immediately and only finishes in-flight work.
@@ -13984,10 +14009,10 @@ pub async fn run_server(
     let publication_root_lock = (!snapshot_replica)
         .then(|| nestweaver_engine::publication::PublicationRootLock::acquire(&publication_root))
         .transpose()?;
-    let db_path = if snapshot_replica {
-        requested_db_path
+    let (db_path, expected_identity) = if snapshot_replica {
+        (requested_db_path, None)
     } else {
-        nestweaver_engine::publication::resolve_selected_database(&base_db_path)?
+        nestweaver_engine::publication::resolve_selected_database_with_identity(&base_db_path)?
     };
 
     // Parse the asserted identity before writer-authority acquisition. The
@@ -14158,7 +14183,16 @@ pub async fn run_server(
         let authority = write_authority
             .as_deref()
             .expect("a read-write daemon acquired writer authority before opening the store");
-        match GraphStore::open_or_create_with_authority(&db_path, authority) {
+        // A selected publication is opened only as the publication CURRENT
+        // names, checked before any write (see
+        // `open_expecting_identity_with_authority`).
+        let opened = match expected_identity.as_ref() {
+            Some(expected) => {
+                GraphStore::open_expecting_identity_with_authority(&db_path, authority, expected)
+            }
+            None => GraphStore::open_or_create_with_authority(&db_path, authority),
+        };
+        match opened {
             Ok(s) => s,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -14627,6 +14661,69 @@ pub async fn run_server(
                         tracing::debug!("rate limiter stale entries swept");
                     }
                     _ = sweep_shutdown.changed() => break,
+                }
+            }
+        });
+    }
+
+    // LadybugDB 0.21 can report a write as committed and then refuse every
+    // later checkpoint until the database is reopened. The store flags that
+    // (`GraphStore::reopen_required`); this loop reopens it at the next safe
+    // point: holding the write gate (no write in flight) and only when no
+    // connection is open (`reopen_after_deferred_checkpoint` never waits).
+    if !read_only {
+        let store = state.store.clone();
+        let write_gate = state.write_gate.clone();
+        let authority = write_authority.clone();
+        let mut reopen_shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut busy_attempts = 0_u32;
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(DEFERRED_CHECKPOINT_REOPEN_INTERVAL) => {}
+                    _ = reopen_shutdown.changed() => break,
+                }
+                if !store.reopen_required() {
+                    busy_attempts = 0;
+                    continue;
+                }
+                // Readers that always hold a connection starve the
+                // non-blocking attempt; after a run of those, escalate to a
+                // bounded hold-off of new connections.
+                let escalate = busy_attempts >= DEFERRED_CHECKPOINT_ESCALATE_AFTER;
+                if escalate {
+                    tracing::warn!(
+                        attempts = busy_attempts,
+                        "the store still needs a reopen after an interrupted checkpoint and \
+                         open reads keep it busy; holding off new reads for up to {}s so it \
+                         can reopen",
+                        DEFERRED_CHECKPOINT_ESCALATION_WAIT.as_secs()
+                    );
+                }
+                let store = store.clone();
+                let write_gate = write_gate.clone();
+                let authority = authority.clone();
+                let outcome = tokio::task::spawn_blocking(move || {
+                    reopen_store_at_safe_point(
+                        &store,
+                        &write_gate,
+                        authority.as_deref(),
+                        escalate.then_some(DEFERRED_CHECKPOINT_ESCALATION_WAIT),
+                    )
+                })
+                .await;
+                match outcome {
+                    Ok(Ok(nestweaver_store::ReopenOutcome::Busy)) => {
+                        // An escalation that timed out backs off and starts
+                        // the non-blocking run again.
+                        busy_attempts = if escalate { 0 } else { busy_attempts + 1 };
+                    }
+                    Ok(Ok(_)) => busy_attempts = 0,
+                    Ok(Err(error)) => tracing::warn!(
+                        "reopening the store after an interrupted checkpoint failed; \
+                         will retry: {error}"
+                    ),
+                    Err(_) => {}
                 }
             }
         });
@@ -32086,5 +32183,45 @@ mod daemon_honesty_tests {
 
         assert_eq!(succeeded, 0);
         assert_eq!(failed, u32::MAX);
+    }
+}
+
+#[cfg(test)]
+mod deferred_checkpoint_reopen_tests {
+    use super::*;
+
+    /// The daemon's safe point: it waits out an in-flight write (the gate),
+    /// then the store reopens, and a later checkpoint succeeds.
+    #[test]
+    fn the_daemon_reopens_a_flagged_store_after_the_in_flight_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let authority = nestweaver_store::acquire_db_write_lease(&db).unwrap();
+        let store = Arc::new(GraphStore::open_or_create_with_authority(&db, &authority).unwrap());
+        std::fs::write(dir.path().join("brain.lbug.wal.checkpoint"), b"").unwrap();
+        assert!(store.checkpoint().is_err());
+        assert!(store.reopen_required());
+
+        let gate = WriteGate::new();
+        let in_flight = gate.blocking_lock("test write");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = {
+            let store = Arc::clone(&store);
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                let outcome = reopen_store_at_safe_point(&store, &gate, None, None);
+                tx.send(()).unwrap();
+                outcome
+            })
+        };
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the reopen must wait for the in-flight write"
+        );
+        drop(in_flight);
+        let outcome = worker.join().unwrap().unwrap();
+        assert_eq!(outcome, nestweaver_store::ReopenOutcome::Reopened);
+        assert!(!store.reopen_required());
+        store.checkpoint().expect("checkpoint after the reopen");
     }
 }

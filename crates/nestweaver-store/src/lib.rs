@@ -3,6 +3,7 @@ pub mod cache;
 pub mod context_graph;
 pub mod db;
 pub mod durable_sidecar;
+pub mod engine_format;
 pub mod error;
 pub mod generation;
 pub mod git_activity_sidecar;
@@ -23,18 +24,20 @@ pub mod zstd;
 pub use db::{
     EmbeddingIndexOccupancy, EmbeddingIndexReconciliation, EmbeddingSnapshotLease,
     EmbeddingSnapshotState, GraphStore, GraphStoreAccessMode, IndexPublicationLease,
-    PublicationIdentity,
+    PublicationIdentity, ReopenOutcome, StoreConnection,
 };
 pub use error::{
-    CancelReason, CorruptionKind, EngineCorruption, SelfHeldWriteLease, StoreError,
+    CancelReason, CheckpointFailure, CorruptionKind, DB_REBUILD_REQUIRED_CODE, EngineCorruption,
+    FrozenCheckpointApplied, SelfHeldWriteLease, StoreError, classify_checkpoint_failure,
     classify_engine_corruption, live_writer_holds_write_lease, note_self_held_write_lease,
     redact_build_paths, self_holds_write_lease,
 };
 
+pub use db::StoreConnection as DbConnection;
 /// Re-export the LadybugDB connection type so callers can use transactional
 /// APIs (`begin_transaction` / `commit_transaction`) and `_on` method variants
 /// without depending on `lbug` directly.
-pub use lbug::Connection as DbConnection;
+pub use db::{StoreRows, StoreStatement};
 pub use ranking::{
     DEFAULT_GIT_ACTIVITY_WEIGHT, GIT_ACTIVITY_MULT_MAX, GIT_ACTIVITY_MULT_MIN, GraphScope,
     PPR_MIN_SCORE, PathDeboostRule, QueryIntent, SEED_PATH_FACTOR_MAX, SEED_PATH_FACTOR_MIN,

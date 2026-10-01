@@ -15,7 +15,7 @@ pub(crate) fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
             // lock (there is no client-side quiesce that can fail).
             force: _,
         } => {
-            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            let db_path = resolve_db_with_config_allowing_legacy_engine(db, config.as_deref())?;
             if !db_path.exists() {
                 anyhow::bail!(
                     "database not found at {}; run 'nestweaver index' first",

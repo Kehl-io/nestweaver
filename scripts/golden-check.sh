@@ -15,8 +15,11 @@
 # Usage:
 #   scripts/golden-check.sh <db-path> [runs] [file1 file2 ...]
 # Env:
-#   NW_BIN   path to the nestweaver binary (default: target/release/nestweaver)
-#   NW_RUNS  number of runs per file (default: 3; overridden by the 2nd arg)
+#   NW_BIN         path to the nestweaver binary (default: target/release/nestweaver)
+#   NW_RUNS        number of runs per file (default: 3; overridden by the 2nd arg)
+#   NW_GOLDEN_OUT  keep every run's output in this directory (created if
+#                  missing) instead of a temporary one, so two binaries' results
+#                  can be diffed afterwards (e.g. an A/B across an engine upgrade)
 set -euo pipefail
 
 # Queries go through the daemon. Bypass is CI-test-only and is not a local
@@ -44,8 +47,13 @@ else
   )
 fi
 
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+if [[ -n "${NW_GOLDEN_OUT:-}" ]]; then
+  mkdir -p "$NW_GOLDEN_OUT"
+  tmp="$(cd "$NW_GOLDEN_OUT" && pwd)"
+else
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+fi
 fail=0
 
 # has_corrupt_identifier <json-file>: true if any IDENTIFIER field extracted

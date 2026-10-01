@@ -39,6 +39,10 @@ id_ed25519
 # DIFFERENT inode, and both processes then believe they hold exclusive access.
 # Never remove one by hand; stop the holder with `nestweaver daemon stop`.
 *.lbug.*
+# Compressed databases the previous storage engine wrote, used by the
+# storage-engine cutover tests (see testdata/lbug-0.20.4/generator).
+!testdata/lbug-0.20.4/*.lbug.zst
+!testdata/lbug-0.20.4/*.lbug.wal.zst
 
 # The shared write-namespace lock does NOT live beside the database: it is
 # created in the STABLE PARENT of the data directory, keyed by that directory's

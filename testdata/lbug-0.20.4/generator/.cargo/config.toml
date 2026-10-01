@@ -1,0 +1,7 @@
+# Applied whenever cargo runs from this directory (regenerate.sh does). The
+# lbug crate otherwise links the LATEST release library, which writes 0.21-format
+# files, and caches a prebuilt library inside ~/.cargo/registry. Building
+# 0.20.4 from source avoids both.
+[env]
+LBUG_VERSION = { value = "0.20.4", force = true }
+LBUG_BUILD_FROM_SOURCE = { value = "1", force = true }

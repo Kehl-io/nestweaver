@@ -1046,7 +1046,12 @@ impl GraphStore {
         // through the PK-driven batch lookup so no consumer of impact results
         // (blast radius, affected tests, flow trace) can surface corrupted
         // symbol names. One batched query per traversal.
-        if !result.nodes.is_empty() {
+        // `NESTWEAVER_SKIP_PK_DISPLAY_REPAIR=1` turns the repair off, for an
+        // A/B that measures whether the storage engine still needs it. An
+        // internal measurement switch, not an operator setting.
+        let skip_repair =
+            std::env::var_os("NESTWEAVER_SKIP_PK_DISPLAY_REPAIR").is_some_and(|value| value == "1");
+        if !result.nodes.is_empty() && !skip_repair {
             let uids: Vec<&str> = result.nodes.iter().map(|node| node.uid.as_str()).collect();
             match self.batch_lookup_symbols(&uids) {
                 Ok(map) => {
@@ -1077,8 +1082,8 @@ impl GraphStore {
     /// `impact_bfs` calls this once per visited node, so this setup is paid
     /// once per traversal instead of once per node (nw-065).
     fn direct_callers_prepared(
-        conn: &lbug::Connection<'_>,
-        stmts: &mut [(String, lbug::PreparedStatement)],
+        conn: &crate::db::StoreConnection<'_>,
+        stmts: &mut [(String, crate::db::StoreStatement<'_>)],
         uid: &str,
         min_confidence: f32,
         edges: &[EdgeType],
@@ -1153,10 +1158,10 @@ impl GraphStore {
     /// Prepare one caller-lookup statement per edge type, for reuse across a
     /// whole traversal. Edge types whose relationship table does not exist are
     /// skipped (same tolerance as the per-call path).
-    fn prepare_caller_stmts(
-        conn: &lbug::Connection<'_>,
+    fn prepare_caller_stmts<'c>(
+        conn: &'c crate::db::StoreConnection<'_>,
         edges: &[EdgeType],
-    ) -> Vec<(String, lbug::PreparedStatement)> {
+    ) -> Vec<(String, crate::db::StoreStatement<'c>)> {
         let mut out = Vec::new();
         for edge_type in edges.iter().map(|e| e.rel_table_name()) {
             let q = format!(

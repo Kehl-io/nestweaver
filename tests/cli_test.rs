@@ -2370,12 +2370,62 @@ fn cli_snapshot_build_and_verify() {
 #[test]
 fn cli_snapshot_push_succeeds() {
     let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("push.lbug");
+    let snap_dir = dir.path().join("snapshot");
+    let storage_dir = dir.path().join("storage");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&storage_dir).unwrap();
+    std::fs::write(repo_dir.join("a.js"), "export function a() { return 1; }\n").unwrap();
+
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    nestweaver_cmd()
+        .args(["snapshot", "build", "--db"])
+        .arg(&db_path)
+        .arg("--output")
+        .arg(&snap_dir)
+        .assert()
+        .success();
+
+    nestweaver_cmd()
+        .args([
+            "snapshot",
+            "push",
+            "--snapshot-dir",
+            &snap_dir.display().to_string(),
+            "--backend",
+            "local",
+            "--backend-path",
+            &storage_dir.display().to_string(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("Snapshot pushed"));
+
+    let versioned = storage_dir.join(format!("v{}", env!("CARGO_PKG_VERSION")));
+    assert!(
+        versioned.exists(),
+        "expected versioned snapshot directory {} in storage",
+        versioned.display()
+    );
+}
+
+/// A snapshot written before the storage-engine cutover (here a minimal
+/// format-0 one) is refused by `push`, and the refusal names the rebuild.
+#[test]
+fn cli_snapshot_push_refuses_a_pre_cutover_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
     let snap_dir = dir.path().join("snapshot");
     let storage_dir = dir.path().join("storage");
     std::fs::create_dir_all(&snap_dir).unwrap();
     std::fs::create_dir_all(&storage_dir).unwrap();
 
-    // Minimal valid snapshot files
     let graph_bytes = b"fake-graph-data";
     let manifest_bytes = b"{\"repos\":[]}";
     let stamp_bytes = br#"{
@@ -2390,12 +2440,9 @@ fn cli_snapshot_push_succeeds() {
         "built_at": "2026-06-01T00:00:00Z",
         "repos": []
     }"#;
-
     std::fs::write(snap_dir.join("graph.lbug"), graph_bytes).unwrap();
     std::fs::write(snap_dir.join("manifest.json"), manifest_bytes).unwrap();
     std::fs::write(snap_dir.join("stamp.json"), stamp_bytes).unwrap();
-
-    // Compute per-file checksums (blake3 format)
     let checksums = [
         ("graph.lbug", graph_bytes.as_slice()),
         ("manifest.json", manifest_bytes.as_slice()),
@@ -2420,14 +2467,10 @@ fn cli_snapshot_push_succeeds() {
             &storage_dir.display().to_string(),
         ])
         .assert()
-        .success()
-        .stdout(contains("Snapshot pushed"));
-
-    // A versioned directory v0.1.0 should exist in the storage dir
-    assert!(
-        storage_dir.join("v0.1.0").exists(),
-        "expected versioned snapshot directory v0.1.0 in storage"
-    );
+        .failure()
+        .stderr(contains("LadybugDB 0.21"))
+        .stderr(contains("nestweaver publication rebuild"));
+    assert!(!storage_dir.join("v0.1.0").exists());
 }
 
 #[test]
@@ -7339,9 +7382,17 @@ fn opening_a_corrupted_database_never_dies_on_a_signal() {
     );
 
     let mut crashed_at_least_once = false;
+    let mut failed_closed_at_least_once = false;
     for (index, (from, to)) in [(0.005, 0.2), (0.05, 0.95), (0.4, 0.6)].iter().enumerate() {
         let db = dir.path().join(format!("corrupt{index}.lbug"));
         std::fs::copy(&pristine, &db).unwrap();
+        // Keep the engine-format sidecar with its database, so the open goes
+        // straight to the engine rather than through the marker probe.
+        std::fs::copy(
+            nestweaver_store::engine_format::sidecar_path(&pristine),
+            nestweaver_store::engine_format::sidecar_path(&db),
+        )
+        .unwrap();
         let start = (size as f64 * from) as u64;
         let end = (size as f64 * to) as u64;
         assert!(
@@ -7390,8 +7441,15 @@ fn opening_a_corrupted_database_never_dies_on_a_signal() {
             stderr.contains(&file_name),
             "the error must name the database it could not open: {stderr}"
         );
+        // LadybugDB 0.21 validates index headers on open and returns an
+        // ordinary error for most of the damage 0.20 faulted on. Failing
+        // closed WITH a corruption diagnostic is the other honest outcome.
+        if stderr.contains("nestweaver::db_corrupt") {
+            failed_closed_at_least_once = true;
+        }
         if stderr.contains("the storage engine crashed while reading it") {
             crashed_at_least_once = true;
+            failed_closed_at_least_once = true;
             assert!(
                 stderr.contains("restore") || stderr.contains("re-index"),
                 "a crash attribution must offer a way out: {stderr}"
@@ -7399,12 +7457,16 @@ fn opening_a_corrupted_database_never_dies_on_a_signal() {
         }
     }
 
-    // If NO range faulted, this fixture never exercised the guard and the test
-    // would be green while proving nothing — say so rather than pass.
+    // If NO range either faulted or failed closed with a corruption
+    // diagnostic, this fixture exercised nothing and the test would be green
+    // while proving nothing: say so rather than pass. (Whether a crash still
+    // occurs at all depends on the engine version; the invariant above, never
+    // dying on a signal, is what must hold.)
+    let _ = crashed_at_least_once;
     assert!(
-        crashed_at_least_once,
-        "no corruption range reached the crashing code path, so this run did \
-         not exercise the crash-attribution guard at all"
+        failed_closed_at_least_once,
+        "no corruption range reached either the crash guard or a corruption \
+         diagnostic, so this run exercised neither"
     );
 }
 
@@ -13122,6 +13184,465 @@ fn brain_refresh_json_and_fail_on_skip_on_the_direct_route() {
     );
 }
 
+// ── Storage-engine cutover (LadybugDB 0.21) ─────────────────────────────────
+//
+// LadybugDB 0.21 changed how text keys are hashed and kept the same storage
+// version, so the engine opens an older file without complaint and then
+// silently misses lookups on non-ASCII keys. NestWeaver refuses such a file
+// BEFORE the engine opens it, prints `nestweaver::db_rebuild_required` with one
+// rebuild command, exits 1, and changes no byte on disk.
+
+/// Every regular file under `dir`, with its bytes.
+fn engine_cutover_tree_bytes(
+    dir: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.insert(path.clone(), std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    out
+}
+
+/// Turn a database this build created into the shape every pre-cutover
+/// release left behind: no engine-format `Meta` row and no
+/// `<db>.engine-format` sidecar. (This build cannot run the old engine; the
+/// refusal never reads anything the old engine would have written differently.)
+fn make_pre_cutover(db: &std::path::Path) {
+    {
+        let store = nestweaver_store::GraphStore::open(db).unwrap();
+        let conn = store.begin_transaction().unwrap();
+        conn.query(&format!(
+            "MATCH (m:Meta) WHERE m.key = '{}' DELETE m",
+            nestweaver_store::engine_format::ENGINE_FORMAT_META_KEY
+        ))
+        .unwrap();
+        store.commit_transaction(&conn).unwrap();
+        drop(conn);
+        store.checkpoint().unwrap();
+    }
+    std::fs::remove_file(nestweaver_store::engine_format::sidecar_path(db)).unwrap();
+    for suffix in [".wal", ".wal.checkpoint", ".shadow"] {
+        assert!(
+            !std::path::PathBuf::from(format!("{}{suffix}", db.display())).exists(),
+            "fixture left {suffix} debris"
+        );
+    }
+}
+
+/// A database LadybugDB 0.20.4 itself wrote (`testdata/lbug-0.20.4/`, built by
+/// the generator beside it), with NestWeaver's schema, an identity, and a
+/// repository and symbols whose keys are not ASCII: the case the 0.21 hash
+/// change breaks. Unpacked as `<dir>/brain.lbug` (plus its log, if any).
+fn old_engine_db(dir: &std::path::Path, fixture: &str) -> std::path::PathBuf {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/lbug-0.20.4");
+    let db = dir.join("brain.lbug");
+    for suffix in ["", ".wal"] {
+        let packed = source.join(format!("{fixture}{suffix}.zst"));
+        if !packed.exists() {
+            continue;
+        }
+        let mut decoder =
+            nestweaver_store::zstd::Decoder::new(std::fs::File::open(&packed).unwrap()).unwrap();
+        let mut out = std::fs::File::create(format!("{}{suffix}", db.display())).unwrap();
+        std::io::copy(&mut decoder, &mut out).unwrap();
+    }
+    db
+}
+
+fn pre_cutover_db(dir: &std::path::Path) -> std::path::PathBuf {
+    old_engine_db(dir, "pre-cutover.lbug")
+}
+
+#[test]
+fn a_pre_cutover_database_is_refused_with_the_rebuild_command_and_left_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = pre_cutover_db(dir.path());
+    let before = engine_cutover_tree_bytes(dir.path());
+
+    let output = nestweaver_cmd()
+        .args(["brain", "status", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a valid invocation the database cannot satisfy exits 1: {combined}"
+    );
+    assert!(
+        combined.contains("nestweaver::db_rebuild_required"),
+        "{combined}"
+    );
+    // No config on this invocation: the remedy indexes into a NEW path and
+    // never names the refused file as a write target.
+    let fresh = dir.path().join("brain-rebuilt.lbug");
+    assert!(
+        combined.contains(&format!(
+            "nestweaver index --repo <path> --db {}",
+            fresh.display()
+        )),
+        "{combined}"
+    );
+    assert!(
+        !combined.contains(&format!("--db {} ", db.display())),
+        "the remedy must not write to the refused database: {combined}"
+    );
+    assert!(
+        !combined.contains("db_corrupt") && !combined.contains("db_wal_corrupt"),
+        "an intact file of the wrong format is not corruption: {combined}"
+    );
+    assert_eq!(
+        engine_cutover_tree_bytes(dir.path()),
+        before,
+        "the refusal changed bytes on disk"
+    );
+}
+
+/// The direct (CI) write routes refuse a pre-cutover database without
+/// leaving anything behind. The index route records cross-repo link debt when
+/// it ends early; a refusal is not an early end of a write, so it must not
+/// stamp a `.cross_repo_links.json` (or any other sidecar) beside the file.
+#[test]
+fn direct_write_routes_refuse_a_pre_cutover_database_without_writing_a_sidecar() {
+    let sources = tempfile::tempdir().unwrap();
+    let repo = sources.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/a.ts"), "export function f() { return 1; }\n").unwrap();
+    let vault = sources.path().join("vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::write(vault.join("n.md"), "# N\n").unwrap();
+    let repo_arg = repo.display().to_string();
+    let vault_arg = vault.display().to_string();
+    let cases: Vec<Vec<&str>> = vec![
+        vec!["index", "--no-daemon", "--repo", &repo_arg],
+        vec!["index", "--no-daemon", "--force", "--repo", &repo_arg],
+        vec!["brain", "add", &vault_arg],
+        vec!["brain", "refresh", &vault_arg],
+        vec!["brain", "remove", &vault_arg],
+        vec!["remove-repo", "repo"],
+        vec!["repair"],
+        vec!["embed"],
+        vec!["brain", "reindex-search"],
+        vec!["prune-stale"],
+    ];
+    for args in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let db = pre_cutover_db(dir.path());
+        let before = engine_cutover_tree_bytes(dir.path());
+        let output = nestweaver_cmd()
+            .args(&args)
+            .arg("--db")
+            .arg(&db)
+            .output()
+            .unwrap();
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {combined}");
+        assert!(
+            combined.contains("nestweaver::db_rebuild_required"),
+            "{args:?}: {combined}"
+        );
+        let mut after = engine_cutover_tree_bytes(dir.path());
+        // The write lease's empty lock file is the one thing a direct write
+        // route may create before the refusal; it holds no data.
+        if let Some(lock) = after.remove(&std::path::PathBuf::from(format!(
+            "{}.write.lock",
+            db.display()
+        ))) {
+            assert!(lock.is_empty(), "{args:?}: the write lock holds data");
+        }
+        assert_eq!(
+            after.keys().collect::<Vec<_>>(),
+            before.keys().collect::<Vec<_>>(),
+            "{args:?} left files beside the refused database"
+        );
+        assert!(
+            after == before,
+            "{args:?} changed bytes of the refused database"
+        );
+    }
+}
+
+#[test]
+fn the_rebuild_remedy_names_the_config_the_invocation_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = pre_cutover_db(dir.path());
+    let config = dir.path().join("instance.toml");
+    let quote = |path: &std::path::Path| serde_json::to_string(&path.to_string_lossy()).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "instance_id = \"cutover\"\ndb = {}\n[snapshot_storage]\nbackend = \"local\"\npath = {}\n[workspace]\nbackend = \"local\"\npath = {}\n[inference]\nendpoint = \"http://localhost:11434\"\nembedding_model = \"unused\"\nsummary_model = \"unused\"\n[git]\ncredential_method = \"gh\"\n",
+            quote(&db),
+            quote(&dir.path().join("snapshots")),
+            quote(&dir.path().join("workspace")),
+        ),
+    )
+    .unwrap();
+
+    let output = nestweaver_cmd()
+        .args(["brain", "status", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1), "{combined}");
+    let canonical = std::fs::canonicalize(&config).unwrap();
+    assert!(
+        combined.contains(&format!(
+            "nestweaver publication rebuild --config {}",
+            canonical.display()
+        )),
+        "{combined}"
+    );
+}
+
+/// The daemon guard. A daemon started against a pre-cutover database would
+/// refuse it on boot and exit; under a supervisor that is a crash loop that
+/// buries the one sentence that matters. Both spawn routes refuse FIRST.
+#[test]
+fn no_daemon_is_spawned_for_a_pre_cutover_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = pre_cutover_db(dir.path());
+    let before = engine_cutover_tree_bytes(dir.path());
+
+    for args in [
+        vec!["brain", "status", "--db"],
+        vec!["daemon", "start", "--db"],
+    ] {
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let sock = tempfile::tempdir().unwrap();
+        let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+            .args(&args)
+            .arg(&db)
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+            .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
+            .env("XDG_STATE_HOME", state.path())
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+            .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "10")
+            .output()
+            .unwrap();
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {combined}");
+        assert!(
+            combined.contains("nestweaver::db_rebuild_required"),
+            "{args:?}: {combined}"
+        );
+        assert!(
+            !combined.contains("did not become healthy")
+                && !combined.contains("exited before becoming healthy"),
+            "{args:?}: the refusal must come before any spawn: {combined}"
+        );
+        let pidfiles = engine_cutover_tree_bytes(runtime.path())
+            .into_keys()
+            .filter(|path| path.ends_with("daemon.pid"))
+            .collect::<Vec<_>>();
+        assert!(
+            pidfiles.is_empty(),
+            "{args:?}: a daemon was spawned: {pidfiles:?}"
+        );
+    }
+    assert_eq!(engine_cutover_tree_bytes(dir.path()), before);
+}
+
+#[test]
+fn the_daemon_rebuild_guard_refuses_only_a_pre_cutover_database() {
+    use nestweaver_daemon::lifecycle::db_rebuild_required;
+    let dir = tempfile::tempdir().unwrap();
+    assert!(db_rebuild_required(&dir.path().join("absent.lbug")).is_none());
+    let healthy = dir.path().join("healthy.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&healthy).unwrap());
+    assert!(db_rebuild_required(&healthy).is_none());
+    let old = dir.path().join("old");
+    std::fs::create_dir_all(&old).unwrap();
+    let legacy = pre_cutover_db(&old);
+    assert!(
+        db_rebuild_required(&legacy)
+            .expect("a pre-cutover database must be refused")
+            .is_rebuild_required()
+    );
+}
+
+/// The MCP and web surfaces relay error TEXT, not the CLI diagnostic, so the
+/// code and the rebuild command must survive in the text itself: an MCP client
+/// gets them in the JSON-RPC error frame, a `ui` operator on stderr.
+#[test]
+fn mcp_and_ui_surfaces_carry_the_rebuild_code_and_command() {
+    let scratch = tempfile::Builder::new()
+        .prefix("nw-cutover-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let db = pre_cutover_db(scratch.path());
+    let home = scratch.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let isolated = |command: &mut StdCommand| {
+        command
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+            .env_remove("NESTWEAVER_UPSTREAM")
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_CACHE_HOME", home.join("cache"))
+            .env("XDG_DATA_HOME", home.join("data"))
+            .env("XDG_STATE_HOME", home.join("state"))
+            .env("XDG_RUNTIME_DIR", home.join("runtime"))
+            .env("NESTWEAVER_SOCK_FALLBACK_DIR", home.join("sock"))
+            .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
+            .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "10");
+    };
+
+    let init = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05" }
+    });
+    let mut mcp = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"));
+    mcp.args(["mcp", "--db"])
+        .arg(&db)
+        .env_remove("NESTWEAVER_NO_DAEMON");
+    isolated(&mut mcp);
+    let mut child = mcp
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn nestweaver mcp");
+    {
+        use std::io::Write;
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, "{}", serde_json::to_string(&init).unwrap()).unwrap();
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(output.status.code(), Some(0), "{stderr}");
+    let frame: serde_json::Value = stdout
+        .lines()
+        .find_map(|line| serde_json::from_str(line).ok())
+        .unwrap_or_else(|| panic!("no JSON-RPC frame on stdout: {stdout:?}\n{stderr}"));
+    let message = frame["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("nestweaver::db_rebuild_required")
+            && message.contains("nestweaver publication rebuild"),
+        "the MCP error frame must carry the code and the rebuild command: {frame}"
+    );
+
+    let mut ui = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"));
+    ui.args(["ui", "--no-open", "--port", "0", "--db"])
+        .arg(&db)
+        .env_remove("NESTWEAVER_NO_DAEMON");
+    isolated(&mut ui);
+    let output = ui.output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1), "{combined}");
+    assert!(
+        combined.contains("nestweaver::db_rebuild_required"),
+        "{combined}"
+    );
+}
+
+/// A minimal OpenAI-compatible `/v1/embeddings` endpoint on loopback, so a
+/// complete `publication rebuild` (which re-embeds by contract) runs without a
+/// model download. Deterministic, non-zero 8-dimensional vectors per input.
+fn spawn_fake_embedding_endpoint() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 16384];
+            let header_end = loop {
+                let Ok(read) = stream.read(&mut chunk) else {
+                    break None;
+                };
+                if read == 0 {
+                    break None;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                if let Some(at) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break Some(at + 4);
+                }
+            };
+            let Some(header_end) = header_end else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&buffer[..header_end]).to_lowercase();
+            let length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while buffer.len() < header_end + length {
+                let Ok(read) = stream.read(&mut chunk) else {
+                    break;
+                };
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            let request: serde_json::Value =
+                serde_json::from_slice(&buffer[header_end..]).unwrap_or_default();
+            let inputs = request["input"].as_array().cloned().unwrap_or_default();
+            let data: Vec<_> = inputs
+                .iter()
+                .map(|input| {
+                    let text = input.as_str().unwrap_or_default();
+                    let seed = text.bytes().fold(7u32, |acc, byte| {
+                        acc.wrapping_mul(31).wrapping_add(u32::from(byte))
+                    });
+                    let embedding: Vec<f32> = (0..8)
+                        .map(|i| 1.0 + ((seed.rotate_left(i * 4) & 0xff) as f32) / 255.0)
+                        .collect();
+                    serde_json::json!({ "embedding": embedding })
+                })
+                .collect();
+            let body = serde_json::json!({ "data": data }).to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    format!("http://{address}")
+}
+
 /// A rebuild re-indexes every repository from scratch, so it has to apply the
 /// same per-repository directory policy an ordinary `index --config` applies:
 /// `exclude` keeps committed vendored code out, and `unskip` re-admits a
@@ -13211,6 +13732,455 @@ fn a_rebuild_applies_each_repositorys_exclude_and_unskip_policy() {
     assert_eq!(
         rebuilt, expected,
         "the rebuild must apply exclude and unskip"
+    );
+}
+
+/// The rebuild path end to end: a pre-cutover database is refused everywhere
+/// EXCEPT by `publication rebuild`, which reads it through the store's legacy
+/// read-only exemption (no primary-key lookups, no writes), builds a fresh
+/// publication beside it, and switches CURRENT. Afterwards the ordinary open
+/// path serves the new graph, the daemon guard lets a daemon start, and the old
+/// file is byte-for-byte what it was: the rollback copy.
+#[test]
+fn a_pre_cutover_database_rebuilds_into_a_current_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join("café.js"),
+        "export function grüßen(name) { return `hi ${name}`; }\nexport function main() { return grüßen('x'); }\n",
+    )
+    .unwrap();
+    let db = dir.path().join("brain.lbug");
+    nestweaver_cmd()
+        .args(["index", "--db"])
+        .arg(&db)
+        .arg("--repo")
+        .arg(&repo)
+        .assert()
+        .success();
+    // Interaction history recorded before the upgrade, against a real node.
+    let remembered = {
+        let store = nestweaver_store::GraphStore::open_read_only(&db).unwrap();
+        store
+            .list_all_symbols()
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.name == "grüßen")
+            .expect("indexed symbol")
+            .uid
+    };
+    {
+        let tracker = nestweaver_engine::interactions::InteractionTracker::new(&db);
+        tracker.record_access("test", &remembered);
+        tracker.flush().unwrap();
+    }
+    make_pre_cutover(&db);
+    let legacy_bytes = std::fs::read(&db).unwrap();
+
+    let endpoint = spawn_fake_embedding_endpoint();
+    let config = dir.path().join("instance.toml");
+    let quote = |path: &std::path::Path| serde_json::to_string(&path.to_string_lossy()).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "instance_id = \"cutover\"\ndb = {}\n[snapshot_storage]\nbackend = \"local\"\npath = {}\n[workspace]\nbackend = \"local\"\npath = {}\n[inference]\nendpoint = \"http://localhost:11434\"\nembedding_model = \"unused\"\nsummary_model = \"unused\"\n[embedding]\nexternal_endpoint = \"{endpoint}\"\nexternal_model = \"fake\"\n[git]\ncredential_method = \"gh\"\n",
+            quote(&db),
+            quote(&dir.path().join("snapshots")),
+            quote(&dir.path().join("workspace")),
+        ),
+    )
+    .unwrap();
+
+    // Before: refused, with this exact command as the remedy.
+    let refused = nestweaver_cmd()
+        .args(["brain", "status", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(1));
+
+    let output = nestweaver_cmd()
+        .timeout(std::time::Duration::from_secs(300))
+        .args(["publication", "rebuild", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(0), "rebuild failed: {combined}");
+
+    let selected = nestweaver_engine::publication::resolve_selected_database(&db)
+        .expect("CURRENT must select the rebuilt publication");
+    assert_ne!(selected, db, "CURRENT must point at the new slot");
+    let store = nestweaver_store::GraphStore::open_read_only(&selected).unwrap();
+    assert!(!store.is_legacy_engine());
+    let symbols = store.count_symbols().unwrap();
+    assert!(symbols > 0, "the rebuilt graph holds the re-indexed repo");
+    drop(store);
+
+    let status = nestweaver_cmd()
+        .args(["brain", "status", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert_eq!(
+        status.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        nestweaver_daemon::lifecycle::db_rebuild_required(&db).is_none(),
+        "the daemon guard follows CURRENT, not the retained base"
+    );
+    // The history carried over, and the interactions commands read it
+    // through CURRENT: the uid is deterministic, so it still names the node.
+    // One more access recorded where the daemon now records (the selected
+    // slot) tells a CURRENT read (2) apart from a stale base read (1).
+    {
+        let tracker = nestweaver_engine::interactions::InteractionTracker::new(&selected);
+        tracker.record_access("test", &remembered);
+        tracker.flush().unwrap();
+    }
+    let history = nestweaver_cmd()
+        .args(["interactions", "show", "--uid", &remembered, "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let history_text = String::from_utf8_lossy(&history.stdout).to_string();
+    assert_eq!(history.status.code(), Some(0), "{history_text}");
+    assert!(
+        history_text.contains("access_count:           2"),
+        "{history_text}"
+    );
+    let selected_history = nestweaver_engine::interactions::load_node_score(&selected, &remembered);
+    assert!(
+        selected_history.is_some(),
+        "the rebuilt slot must hold the carried-over history"
+    );
+
+    // Commands that open the store directly follow CURRENT too, instead of
+    // refusing the rollback copy left at the base path.
+    for args in [
+        vec!["instance", "identity", "--db"],
+        vec!["repo-map", "--db"],
+        vec!["repair", "--dry-run", "--db"],
+    ] {
+        let output = nestweaver_cmd().args(&args).arg(&db).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        std::fs::read(&db).unwrap(),
+        legacy_bytes,
+        "the pre-cutover database is the rollback copy and must be untouched"
+    );
+
+    // A crash mid-checkpoint on the selected slot: the engine refuses every
+    // READ-ONLY open until a writable one finishes the checkpoint. Resolving
+    // CURRENT must not depend on a read-only open, or the daemon could never
+    // boot to recover it.
+    let frozen = std::path::PathBuf::from(format!("{}.wal.checkpoint", selected.display()));
+    std::fs::write(&frozen, b"").unwrap();
+    assert!(nestweaver_store::GraphStore::open_read_only(&selected).is_err());
+    assert_eq!(
+        nestweaver_engine::publication::resolve_selected_database(&db).unwrap(),
+        selected,
+        "CURRENT resolution must survive checkpoint debris on the slot"
+    );
+    let state = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let sock = tempfile::tempdir().unwrap();
+    let daemon_cmd = |args: &[&str]| {
+        let mut command = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"));
+        command
+            .args(args)
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+            .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
+            .env("XDG_STATE_HOME", state.path())
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("NESTWEAVER_SOCK_FALLBACK_DIR", sock.path())
+            .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "60");
+        command.output().unwrap()
+    };
+    let db_arg = db.display().to_string();
+    let booted = daemon_cmd(&["brain", "status", "--db", &db_arg]);
+    let booted_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&booted.stdout),
+        String::from_utf8_lossy(&booted.stderr)
+    );
+    let _ = daemon_cmd(&["daemon", "--db", &db_arg, "stop"]);
+    assert_eq!(
+        booted.status.code(),
+        Some(0),
+        "the daemon must boot and recover the slot: {booted_text}"
+    );
+    assert!(
+        !frozen.exists(),
+        "the daemon's writable open finished the checkpoint"
+    );
+
+    // Rolling back to the pre-upgrade database is not something this
+    // version can serve; the refusal names the way back instead.
+    let rollback = nestweaver_cmd()
+        .args(["publication", "rollback", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    let rollback_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&rollback.stdout),
+        String::from_utf8_lossy(&rollback.stderr)
+    );
+    assert_ne!(rollback.status.code(), Some(0), "{rollback_text}");
+    assert!(
+        rollback_text.contains("reinstall the previous NestWeaver version"),
+        "{rollback_text}"
+    );
+    assert_eq!(
+        nestweaver_engine::publication::resolve_selected_database(&db).unwrap(),
+        selected,
+        "a refused rollback leaves CURRENT where it was"
+    );
+
+    // A FOREIGN graph copied into the selected slot, with a leftover log so
+    // only a writable open can read it: the daemon refuses it before writing
+    // anything, and its identity is not replaced.
+    let foreign_dir = tempfile::tempdir().unwrap();
+    let foreign = foreign_dir.path().join("graph.lbug");
+    let foreign_identity = {
+        let store = nestweaver_store::GraphStore::create(&foreign).unwrap();
+        store.publication_identity().unwrap().unwrap()
+    };
+    std::fs::copy(&foreign, &selected).unwrap();
+    std::fs::copy(
+        nestweaver_store::engine_format::sidecar_path(&foreign),
+        nestweaver_store::engine_format::sidecar_path(&selected),
+    )
+    .unwrap();
+    // Copied as a copy path would (the claim re-bound to the copy), so what
+    // decides here is the identity check, not the file-identity rule.
+    nestweaver_store::engine_format::restamp_after_copy(&selected).unwrap();
+    for stale in [".wal", ".shadow"] {
+        let _ = std::fs::remove_file(format!("{}{stale}", selected.display()));
+    }
+    std::fs::write(&frozen, b"").unwrap();
+    let refused = daemon_cmd(&["brain", "status", "--db", &db_arg]);
+    let refused_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let _ = daemon_cmd(&["daemon", "--db", &db_arg, "stop"]);
+    assert_ne!(refused.status.code(), Some(0), "{refused_text}");
+    assert!(
+        refused_text.contains("is not the selected publication"),
+        "the refusal must name the identity mismatch: {refused_text}"
+    );
+    let _ = std::fs::remove_file(&frozen);
+    let after = nestweaver_store::GraphStore::open_read_only_without_migration(&selected)
+        .unwrap()
+        .publication_identity()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after, foreign_identity,
+        "the foreign graph's identity must be untouched: {refused_text}"
+    );
+    assert!(
+        !nestweaver_store::engine_format::sidecar_path(&db).exists(),
+        "nothing may stamp the pre-cutover database as current"
+    );
+}
+
+/// "Back up before upgrading" has to work after installing the upgrade:
+/// `backup save` reads a pre-cutover database through the legacy read-only
+/// exemption, changes no byte of it, and seals the archive as pre-cutover so
+/// the restore warns and the restored database is refused until rebuilt.
+#[test]
+fn backup_save_works_on_a_pre_cutover_database_and_the_restore_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = pre_cutover_db(dir.path());
+    let before = std::fs::read(&db).unwrap();
+    let archive = dir.path().join("before-upgrade.nwsnap.zst");
+
+    let saved = nestweaver_cmd()
+        .args(["backup", "save"])
+        .arg(&archive)
+        .arg("--db")
+        .arg(&db)
+        .output()
+        .unwrap();
+    let saved_text = String::from_utf8_lossy(&saved.stderr).to_string();
+    assert_eq!(saved.status.code(), Some(0), "{saved_text}");
+    assert!(saved_text.contains("LadybugDB 0.21"), "{saved_text}");
+    assert_eq!(
+        std::fs::read(&db).unwrap(),
+        before,
+        "backup changed the database"
+    );
+    assert!(
+        !nestweaver_store::engine_format::sidecar_path(&db).exists(),
+        "backup must not stamp the pre-cutover database as current"
+    );
+
+    let restored_dir = dir.path().join("restored");
+    let restored = nestweaver_cmd()
+        .args(["backup", "restore"])
+        .arg(&archive)
+        .arg("--data-dir")
+        .arg(&restored_dir)
+        .output()
+        .unwrap();
+    let restored_text = String::from_utf8_lossy(&restored.stderr).to_string();
+    assert_eq!(restored.status.code(), Some(0), "{restored_text}");
+    assert!(
+        restored_text.contains("It was restored unchanged")
+            && restored_text.contains("nestweaver publication rebuild"),
+        "{restored_text}"
+    );
+    let restored_db = restored_dir.join("brain.lbug");
+    assert_eq!(std::fs::read(&restored_db).unwrap(), before);
+    assert!(
+        nestweaver_store::GraphStore::open(&restored_db)
+            .err()
+            .expect("the restored pre-cutover database must be refused")
+            .is_rebuild_required()
+    );
+}
+
+/// The frozen-applied preflight probes ONLY the exact file shape, and an
+/// ordinary interrupted checkpoint in that shape is recovered by the same
+/// writable open the daemon would make, so the preflight lets it start.
+/// (The positive verdict is covered where the state is recognised, in the
+/// store; a frozen log ending in a CHECKPOINT record cannot be produced
+/// deterministically from outside the engine.)
+#[test]
+fn the_frozen_checkpoint_preflight_declines_everything_but_its_exact_state() {
+    use nestweaver_daemon::lifecycle::db_frozen_checkpoint_applied;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("brain.lbug");
+    assert!(db_frozen_checkpoint_applied(&db).is_none());
+    drop(nestweaver_store::GraphStore::open_or_create(&db).unwrap());
+    assert!(db_frozen_checkpoint_applied(&db).is_none(), "healthy");
+
+    // A non-empty shadow may hold unapplied pages: not this state, untouched.
+    let frozen = dir.path().join("brain.lbug.wal.checkpoint");
+    let shadow = dir.path().join("brain.lbug.shadow");
+    std::fs::write(&frozen, b"").unwrap();
+    std::fs::write(&shadow, b"pages").unwrap();
+    assert!(db_frozen_checkpoint_applied(&db).is_none());
+    assert!(frozen.exists() && shadow.exists());
+
+    // An empty frozen log and no shadow: the engine's own recovery clears it.
+    std::fs::remove_file(&shadow).unwrap();
+    assert!(db_frozen_checkpoint_applied(&db).is_none());
+    assert!(
+        !frozen.exists(),
+        "the probe's open recovered the empty frozen log"
+    );
+}
+
+/// The rebuild path on a file the OLD engine wrote: its non-ASCII repository
+/// is read by scan (a primary-key lookup would miss it), re-indexed from its
+/// working tree, and served from the new CURRENT; the old file is untouched.
+#[test]
+fn an_old_engine_database_rebuilds_into_a_current_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = pre_cutover_db(dir.path());
+    let before = std::fs::read(&db).unwrap();
+    // The fixture records its repository root as `fixture-repo`, relative to
+    // where the rebuild runs.
+    let repo = dir.path().join("fixture-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join("café.js"),
+        "export function grüßen(name) { return `hi ${name}`; }\n",
+    )
+    .unwrap();
+    let endpoint = spawn_fake_embedding_endpoint();
+    let config = dir.path().join("instance.toml");
+    let quote = |path: &std::path::Path| serde_json::to_string(&path.to_string_lossy()).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "instance_id = \"default\"\ndb = {}\n[snapshot_storage]\nbackend = \"local\"\npath = {}\n[workspace]\nbackend = \"local\"\npath = {}\n[inference]\nendpoint = \"http://localhost:11434\"\nembedding_model = \"unused\"\nsummary_model = \"unused\"\n[embedding]\nexternal_endpoint = \"{endpoint}\"\nexternal_model = \"fake\"\n[git]\ncredential_method = \"gh\"\n",
+            quote(&db),
+            quote(&dir.path().join("snapshots")),
+            quote(&dir.path().join("workspace")),
+        ),
+    )
+    .unwrap();
+    let output = nestweaver_cmd()
+        .current_dir(dir.path())
+        .timeout(std::time::Duration::from_secs(300))
+        .args(["publication", "rebuild", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(0), "rebuild failed: {combined}");
+    let selected = nestweaver_engine::publication::resolve_selected_database(&db).unwrap();
+    assert_ne!(selected, db);
+    let store = nestweaver_store::GraphStore::open_read_only(&selected).unwrap();
+    let repos = store.list_repos(None).unwrap();
+    assert!(
+        repos.iter().any(|repo| repo.url == "file:///fixture/café"),
+        "the non-ASCII repository carried over: {repos:?}"
+    );
+    assert!(
+        store
+            .list_all_symbols()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol.name == "grüßen"),
+        "and was re-indexed from its working tree"
+    );
+    drop(store);
+    assert_eq!(
+        std::fs::read(&db).unwrap(),
+        before,
+        "the old file is untouched"
+    );
+}
+
+/// "Back up before upgrading" on a file the old engine left with a write
+/// still in its log: refused before any replay, naming the way out.
+#[test]
+fn backup_save_of_an_old_engine_database_with_a_pending_log_names_the_way_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = old_engine_db(dir.path(), "pre-cutover-wal.lbug");
+    let wal = std::path::PathBuf::from(format!("{}.wal", db.display()));
+    let before = (std::fs::read(&db).unwrap(), std::fs::read(&wal).unwrap());
+    let output = nestweaver_cmd()
+        .args(["backup", "save"])
+        .arg(dir.path().join("out.nwsnap.zst"))
+        .arg("--db")
+        .arg(&db)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stderr).to_string();
+    assert_ne!(output.status.code(), Some(0), "{text}");
+    assert!(text.contains("previous NestWeaver version"), "{text}");
+    assert_eq!(
+        (std::fs::read(&db).unwrap(), std::fs::read(&wal).unwrap()),
+        before,
+        "the database and its old-engine log must be untouched"
     );
 }
 
@@ -13916,75 +14886,6 @@ fn a_resume_restarts_in_full_when_the_change_cannot_be_scoped() {
         .map(|(name, _, _)| name)
         .collect();
     assert!(names.contains(&"gamma_signal".to_string()), "{names:?}");
-}
-
-/// A minimal OpenAI-compatible `/v1/embeddings` endpoint on loopback, so a
-/// complete `publication rebuild` (which re-embeds by contract) runs without a
-/// model download. Deterministic, non-zero 8-dimensional vectors per input.
-fn spawn_fake_embedding_endpoint() -> String {
-    use std::io::{Read, Write};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { break };
-            let mut buffer = Vec::new();
-            let mut chunk = [0u8; 16384];
-            let header_end = loop {
-                let Ok(read) = stream.read(&mut chunk) else {
-                    break None;
-                };
-                if read == 0 {
-                    break None;
-                }
-                buffer.extend_from_slice(&chunk[..read]);
-                if let Some(at) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-                    break Some(at + 4);
-                }
-            };
-            let Some(header_end) = header_end else {
-                continue;
-            };
-            let headers = String::from_utf8_lossy(&buffer[..header_end]).to_lowercase();
-            let length = headers
-                .lines()
-                .find_map(|line| line.strip_prefix("content-length:"))
-                .and_then(|value| value.trim().parse::<usize>().ok())
-                .unwrap_or(0);
-            while buffer.len() < header_end + length {
-                let Ok(read) = stream.read(&mut chunk) else {
-                    break;
-                };
-                if read == 0 {
-                    break;
-                }
-                buffer.extend_from_slice(&chunk[..read]);
-            }
-            let request: serde_json::Value =
-                serde_json::from_slice(&buffer[header_end..]).unwrap_or_default();
-            let inputs = request["input"].as_array().cloned().unwrap_or_default();
-            let data: Vec<_> = inputs
-                .iter()
-                .map(|input| {
-                    let text = input.as_str().unwrap_or_default();
-                    let seed = text.bytes().fold(7u32, |acc, byte| {
-                        acc.wrapping_mul(31).wrapping_add(u32::from(byte))
-                    });
-                    let embedding: Vec<f32> = (0..8)
-                        .map(|i| 1.0 + ((seed.rotate_left(i * 4) & 0xff) as f32) / 255.0)
-                        .collect();
-                    serde_json::json!({ "embedding": embedding })
-                })
-                .collect();
-            let body = serde_json::json!({ "data": data }).to_string();
-            let _ = write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-        }
-    });
-    format!("http://{address}")
 }
 
 // ─── Repo-filter failures keep their class on every surface ────────────────

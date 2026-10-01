@@ -698,9 +698,114 @@ enum CliDiagnostic {
     )]
     ExportScopeUnsupported { format: String, scope: String },
 
+    /// A database built by a storage engine older than the one this binary
+    /// links (LadybugDB before 0.21), refused before the engine opened it.
+    ///
+    /// Not corruption and not an outage that clears: the file is intact, it is
+    /// the wrong format for this engine, and the engine itself cannot tell
+    /// because the upgrade changed the string hash without bumping the storage
+    /// version. Opening it anyway would silently miss lookups on non-ASCII keys.
+    /// The remedy is ONE command, rendered by [`rebuild_remedy_command`]: a
+    /// `publication rebuild` when the invocation named a config, or a fresh
+    /// `index` into a NEW path when it did not. Neither writes to this file.
+    #[error("Database must be rebuilt for this version of NestWeaver: {path}")]
+    #[diagnostic(
+        code(nestweaver::db_rebuild_required),
+        help(
+            "{path} {reason}.\n\
+             This NestWeaver's storage engine (LadybugDB 0.21) hashes text keys \
+             differently from the engine that built this database, and the file \
+             format did not change to say so, so the database was NOT opened and \
+             nothing in it was changed.\n\
+             Stop the daemon, then rebuild. The rebuild writes a new database \
+             beside this one and switches to it only after it validates; this \
+             file is left exactly as it is, so it remains your rollback copy for \
+             the previous NestWeaver version:\n  \
+             {remedy}"
+        )
+    )]
+    DatabaseRebuildRequired {
+        path: String,
+        reason: String,
+        remedy: String,
+    },
+
     #[error("{message}")]
     #[diagnostic(code(nestweaver::error))]
     General { message: String },
+}
+
+/// The configuration file this invocation loaded, if any. Set by the config
+/// resolvers, read only by [`rebuild_remedy_command`] so the rebuild remedy can
+/// name the real `--config` rather than a placeholder.
+static LAST_CONFIG_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+fn record_config_path(path: &Path) {
+    if let Ok(mut slot) = LAST_CONFIG_PATH.lock() {
+        *slot = Some(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+    }
+}
+
+/// The ONE command that rebuilds a database this engine refused.
+///
+/// With a config: `publication rebuild`, which reindexes every declared source
+/// into a new slot and cuts over only after validation. Without one there is
+/// nothing to rebuild FROM, so the remedy indexes into a NEW file beside the
+/// refused one; it never names the refused path as a write target.
+fn rebuild_remedy_command(db_path: &str) -> String {
+    let config = LAST_CONFIG_PATH.lock().ok().and_then(|slot| slot.clone());
+    match config {
+        Some(config) => format!(
+            "nestweaver publication rebuild --config {}",
+            shell_quote(&config.display().to_string())
+        ),
+        None => {
+            let refused = Path::new(db_path);
+            let stem = refused
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+                .unwrap_or_else(|| "nestweaver".to_string());
+            let fresh = refused.with_file_name(format!("{stem}-rebuilt.lbug"));
+            format!(
+                "nestweaver index --repo <path> --db {}",
+                shell_quote(&fresh.display().to_string())
+            )
+        }
+    }
+}
+
+fn rebuild_required_diagnostic(path: String, reason: String) -> miette::Report {
+    let remedy = rebuild_remedy_command(&path);
+    CliDiagnostic::DatabaseRebuildRequired {
+        path,
+        reason,
+        remedy,
+    }
+    .into()
+}
+
+/// Recover path and reason from the RENDERED [`nestweaver_store::StoreError::RebuildRequired`]
+/// when an intermediate frame flattened it to text (a relayed daemon error, or
+/// an `anyhow!("...: {error}")`).
+fn parse_rebuild_required(message: &str) -> Option<(String, String)> {
+    let marker = format!("({}): ", nestweaver_store::DB_REBUILD_REQUIRED_CODE);
+    let rest = &message[message.find(&marker)? + marker.len()..];
+    const REASON_STARTS: &[&str] = &[
+        " was built by",
+        " has no engine-format marker",
+        " carries an engine-format marker",
+        " records an engine format",
+    ];
+    let (at, _) = REASON_STARTS
+        .iter()
+        .filter_map(|start| rest.find(start).map(|at| (at, start)))
+        .min_by_key(|(at, _)| *at)?;
+    let path = rest[..at].trim().to_string();
+    let reason_end = rest[at..]
+        .find(". This NestWeaver")
+        .map(|end| at + end)
+        .unwrap_or(rest.len());
+    Some((path, rest[at..reason_end].trim().to_string()))
 }
 
 /// Replace any absolute path into a Rust build tree with the crate it points
@@ -905,6 +1010,16 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
                 detail: detail.clone(),
             }
             .into(),
+            CliDiagnostic::DatabaseRebuildRequired {
+                path,
+                reason,
+                remedy,
+            } => CliDiagnostic::DatabaseRebuildRequired {
+                path: path.clone(),
+                reason: reason.clone(),
+                remedy: remedy.clone(),
+            }
+            .into(),
             // Every other variant is currently produced BY this function rather
             // than raised as an error, so there is nothing to pass through.
             // A variant that starts being raised directly adds its arm here.
@@ -918,6 +1033,41 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
     // below remain for errors that arrive from OUTSIDE the store — relayed
     // over gRPC as a string, or synthesised by a CLI layer — where no type
     // survived to consult.
+    // A database an older storage engine built. Asked before corruption:
+    // the file is intact, and the corruption remedies would all be wrong.
+    if let Some(nestweaver_store::StoreError::RebuildRequired { path, reason }) = err
+        .chain()
+        .filter_map(|source| source.downcast_ref::<nestweaver_store::StoreError>())
+        .find(|store_error| store_error.is_rebuild_required())
+    {
+        return rebuild_required_diagnostic(
+            redact_build_paths(&path.display().to_string()),
+            reason.to_string(),
+        );
+    }
+    if let Some((path, reason)) = parse_rebuild_required(&format!("{err:#}")) {
+        return rebuild_required_diagnostic(path, reason);
+    }
+    // LadybugDB 0.21's two non-corruption checkpoint states. Their store
+    // errors already carry the one safe remedy in their own words; they must
+    // not reach the heuristic arms below, which read "no such file" as a
+    // missing database and "wal" as a runbook that discards committed writes.
+    if err
+        .chain()
+        .filter_map(|source| source.downcast_ref::<nestweaver_store::StoreError>())
+        .any(|store_error| {
+            matches!(
+                store_error,
+                nestweaver_store::StoreError::FrozenCheckpointAlreadyApplied(_)
+            ) || store_error.checkpoint_failure().is_some()
+        })
+        || nestweaver_store::classify_checkpoint_failure(&format!("{err:#}")).is_some()
+        || format!("{err:#}")
+            .contains("frozen write-ahead log of a checkpoint that already finished")
+    {
+        return miette::Report::msg(redact_build_paths(&format!("{err:#}")));
+    }
+
     let typed = err
         .chain()
         .find_map(|source| source.downcast_ref::<nestweaver_store::StoreError>())
@@ -1578,6 +1728,18 @@ const ENV_REGISTRY: &[EnvVar] = &[
     },
     EnvVar {
         name: "NESTWEAVER_TEST_CRASH_AFTER_STAGED_IDENTITY",
+        role: EnvRole::Internal,
+    },
+    // Test-only: `testdata/lbug-0.20.4/regenerate.sh` points the old-engine
+    // fixture tests at freshly generated files before replacing the fixtures.
+    EnvVar {
+        name: "NESTWEAVER_OLD_ENGINE_FIXTURE_DIR",
+        role: EnvRole::Internal,
+    },
+    // Measurement switch: turns off the primary-key display repair in impact
+    // traversal, to A/B whether the storage engine still needs it.
+    EnvVar {
+        name: "NESTWEAVER_SKIP_PK_DISPLAY_REPAIR",
         role: EnvRole::Internal,
     },
     EnvVar {
@@ -10130,6 +10292,40 @@ fn resolve_db_with_config_source(
     Ok((selected, source))
 }
 
+/// [`resolve_db_with_config`] for `backup save`, the one ordinary command
+/// that must also read a database an older storage engine built ("back up
+/// before upgrading" has to work after installing the upgrade). Follows
+/// `CURRENT` through a slot sealed before the cutover and checks the
+/// config's expected brain through the store's legacy read-only exemption.
+/// Everything else keeps refusing such a database.
+fn resolve_db_with_config_allowing_legacy_engine(
+    db: Option<PathBuf>,
+    config: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    let (resolved, cfg, _) = resolve_base_db_with_config_source(db, config)?;
+    let selected =
+        nestweaver_engine::publication::resolve_selected_database_allowing_legacy_engine(
+            &resolved,
+        )?;
+    if let Some(config) = cfg.as_ref()
+        && config.expected_brain_uuid.is_some()
+        && selected.exists()
+    {
+        let store = nestweaver_store::GraphStore::open_read_only_allowing_legacy_engine(&selected)
+            .with_context(|| {
+                format!(
+                    "open {} to verify expected_brain_uuid for instance '{}'",
+                    selected.display(),
+                    config.instance_id
+                )
+            })?;
+        config.assert_expected_brain(&store)?;
+    } else if let Some(config) = cfg.as_ref() {
+        assert_config_expected_brain(config, &selected)?;
+    }
+    Ok(selected)
+}
+
 /// Resolve the stable database anchor without following publication
 /// `CURRENT`. Publication administration derives its root from this path;
 /// ordinary reads and writes must use [`resolve_db_with_config`] instead.
@@ -10145,6 +10341,9 @@ fn resolve_base_db_with_config_source(
     db: Option<PathBuf>,
     config: Option<&Path>,
 ) -> anyhow::Result<(PathBuf, Option<nestweaver_engine::InstanceConfig>, DbSource)> {
+    if let Some(cfg_path) = config {
+        record_config_path(cfg_path);
+    }
     let cfg = config
         .map(|cfg_path| {
             nestweaver_engine::InstanceConfig::from_file(cfg_path)
@@ -10252,7 +10451,9 @@ fn reconcile_code_links_direct(
 
 /// Record that the direct index route owes a whole-graph cross-repo pass,
 /// and return the store to run it with. When the store cannot be opened the
-/// debt is recorded anyway (the links stay owed and disclosed).
+/// debt is recorded anyway (the links stay owed and disclosed), except when
+/// the database must be rebuilt: that refusal wrote nothing, so nothing is
+/// owed, and the refused file and its directory stay exactly as they were.
 fn record_cross_repo_debt_direct(
     db_path: &Path,
     write_lease: &nestweaver_daemon::lifecycle::DbWriteLease,
@@ -10263,6 +10464,7 @@ fn record_cross_repo_debt_direct(
             nestweaver_engine::cross_repo_links::mark_cross_repo_links_owed(&store, reason);
             Some(store)
         }
+        Err(nestweaver_store::StoreError::RebuildRequired { .. }) => None,
         Err(error) => {
             nestweaver_engine::cross_repo_links::mark_cross_repo_links_pending(db_path, reason);
             tracing::warn!(
@@ -11339,9 +11541,19 @@ fn daemon_held_store_error(path: &Path, upstream: nestweaver_store::StoreError) 
     anyhow::Error::new(upstream).context(format!("failed to open database at {}", path.display()))
 }
 
+/// The database a command that opens the store directly must use for `db`:
+/// the publication `CURRENT` selects, exactly as the daemon does
+/// (`resolve_selected_database`). Without a `CURRENT` this is `db` itself. A
+/// base database left behind by `publication rebuild` is the rollback copy,
+/// may predate the storage engine, and must not be what a command opens.
+fn selected_db_path(db: &Path) -> anyhow::Result<PathBuf> {
+    nestweaver_engine::publication::resolve_selected_database(db)
+}
+
 fn open_store(db: Option<&Path>) -> anyhow::Result<GraphStore> {
     let default = default_db_path();
-    let path = db.unwrap_or(&default);
+    let selected = selected_db_path(db.unwrap_or(&default))?;
+    let path = selected.as_path();
     // Absent file → the canonical `db_not_found` diagnostic, at the one place
     // every read-only open funnels through.
     //
@@ -15855,7 +16067,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             dry_run,
             force,
         } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = selected_db_path(&db.unwrap_or_else(default_db_path))?;
             require_existing_db(&db_path)?;
             let code = run_repair_index_publication(&db_path, json, dry_run, force)?;
             Ok((code, None))
@@ -18794,7 +19006,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
         Commands::Interactions { command } => match command {
             InteractionCommands::Status { db } => {
-                let db_path = db.unwrap_or_else(default_db_path);
+                // History lives beside the graph the daemon serves: follow the
+                // publication CURRENT, not a base left behind by a rebuild.
+                let db_path = selected_db_path(&db.unwrap_or_else(default_db_path))?;
                 match nestweaver_engine::load_interaction_data(&db_path) {
                     Some(data) => {
                         let node_count = data.scores.len();
@@ -18817,7 +19031,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Ok((EXIT_SUCCESS, None))
             }
             InteractionCommands::Clear { db } => {
-                let db_path = db.unwrap_or_else(default_db_path);
+                // History lives beside the graph the daemon serves: follow the
+                // publication CURRENT, not a base left behind by a rebuild.
+                let db_path = selected_db_path(&db.unwrap_or_else(default_db_path))?;
                 if nestweaver_engine::clear_interaction_sidecar(&db_path) {
                     println!("Interaction memory cleared.");
                 } else {
@@ -18865,7 +19081,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
             InteractionCommands::Show { uid, top, kind, db } => {
-                let db_path = db.unwrap_or_else(default_db_path);
+                // History lives beside the graph the daemon serves: follow the
+                // publication CURRENT, not a base left behind by a rebuild.
+                let db_path = selected_db_path(&db.unwrap_or_else(default_db_path))?;
                 if let Some(n) = top {
                     let rows = nestweaver_engine::top_uids_by_kind(&db_path, &kind, n);
                     if rows.is_empty() {
@@ -22984,7 +23202,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         }
 
         Commands::DetectImplicitProjects { vault, dry_run, db } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            let db_path = selected_db_path(&db.unwrap_or_else(default_db_path))?;
             require_existing_db(&db_path)?;
 
             if !vault.exists() || !vault.is_dir() {
@@ -23933,6 +24151,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 db_path.display()
                             )));
                         }
+                        // Same guard autostart runs: never spawn (or install a
+                        // launchd job for) a daemon that would crash-loop on a
+                        // database an older storage engine built.
+                        if let Some(error) =
+                            nestweaver_daemon::lifecycle::db_rebuild_required(&db_path)
+                        {
+                            return Err(anyhow::Error::new(error).context(format!(
+                                "refusing to start a daemon against the database at {}",
+                                db_path.display()
+                            )));
+                        }
+                        if let Some(error) =
+                            nestweaver_daemon::lifecycle::db_frozen_checkpoint_applied(&db_path)
+                        {
+                            return Err(anyhow::Error::new(error).context(format!(
+                                "refusing to start a daemon against the database at {}",
+                                db_path.display()
+                            )));
+                        }
                         Ok(())
                     };
 
@@ -24472,6 +24709,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // lock, with the loser dying with "Could not set lock on
                         // file ... another process may hold the write lock".
                         use std::os::unix::io::AsRawFd;
+                        // Whether this invocation creates the pidfile: a start
+                        // the guard below refuses must not leave behind a
+                        // pidfile it created, or a refusal reads as "a daemon
+                        // was here".
+                        let pidfile_preexisted = pidfile.exists();
                         let pid_lock = std::fs::OpenOptions::new()
                             .create(true)
                             .read(true)
@@ -24571,7 +24813,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // no daemon holds this pidfile, so this is a cold
                         // start and the double-fork below is the last step
                         // before a process exists.
-                        refuse_if_wal_unreadable()?;
+                        if let Err(refusal) = refuse_if_wal_unreadable() {
+                            // Still holding the flock, so no daemon owns the
+                            // file: remove it only if this start created it.
+                            if !pidfile_preexisted {
+                                let _ = std::fs::remove_file(&pidfile);
+                            }
+                            return Err(refusal);
+                        }
 
                         let stdout_file = std::fs::OpenOptions::new()
                             .create(true)
@@ -26424,6 +26673,7 @@ mod cli_help_contract_tests {
             CliDiagnostic::DatabaseWalCorrupt { .. } => "db_wal_corrupt",
             CliDiagnostic::DatabaseCheckpointDebris { .. } => "db_checkpoint_debris",
             CliDiagnostic::ExportScopeUnsupported { .. } => "export_scope_unsupported",
+            CliDiagnostic::DatabaseRebuildRequired { .. } => "db_rebuild_required",
             CliDiagnostic::General { .. } => "error",
         }
     }
@@ -26553,6 +26803,23 @@ mod cli_help_contract_tests {
                      to the invocation the caller is already writing",
                 ),
             ),
+            (
+                // A database an older storage engine built. It never clears:
+                // nothing that runs later changes the file's format. The remedy
+                // WRITES, but only to a NEW database beside this one (a
+                // publication slot, or a fresh `--db` path), and the refusal
+                // itself establishes that this file is untouched and stays the
+                // rollback copy, so the write cannot destroy the data it is
+                // about. Both rendered forms are real invocations.
+                CliDiagnostic::DatabaseRebuildRequired {
+                    path: sample("d"),
+                    reason: sample("was built by an older engine"),
+                    remedy: sample("nestweaver publication rebuild --config instance.toml"),
+                },
+                Clears::Never,
+                WriteRemedy::Allowed,
+                Remedy::Invocation,
+            ),
             // The catch-all. Its remedy is whatever the wrapped `anyhow` chain
             // said, so no static tier can check it — nw-334/G3.
             (
@@ -26594,7 +26861,7 @@ mod cli_help_contract_tests {
         // this equality is what then forces it into the inventory too.
         assert_eq!(
             inventory.len(),
-            12,
+            13,
             "a `CliDiagnostic` variant was added or removed without \
              classifying it here"
         );
@@ -30195,6 +30462,18 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
             )?;
             let store =
                 GraphStore::open_with_authority(&predecessor_db, &authority).map_err(|error| {
+                    if error.is_rebuild_required() {
+                        // A predecessor from before the storage-engine upgrade
+                        // cannot be served by this version at all.
+                        return anyhow::anyhow!(
+                            "the retained predecessor {} was built by a storage engine older \
+                             than LadybugDB 0.21, which this version cannot open, so it cannot \
+                             be rolled back to here. To roll back across the upgrade, reinstall \
+                             the previous NestWeaver version and restore the backup you took \
+                             before rebuilding.",
+                            predecessor_db.display()
+                        );
+                    }
                     anyhow::anyhow!("open retained predecessor for rollback: {error}")
                 })?;
             if let Some(cfg) = cfg.as_ref() {
@@ -30233,6 +30512,22 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
     }
 }
 
+/// Open the incumbent a `publication rebuild` reads from.
+///
+/// The ordinary read-only open (with its schema migration) for a database this
+/// engine built; the store's legacy read-only exemption ONLY when that open
+/// refused the database as built by an older storage engine. The exemption
+/// never writes, and every read the rebuild makes through it (identity, the
+/// repository and vault inventories) is a scan, never a primary-key lookup.
+fn open_rebuild_incumbent(path: &Path) -> Result<GraphStore, nestweaver_store::StoreError> {
+    match GraphStore::open_read_only(path) {
+        Err(nestweaver_store::StoreError::RebuildRequired { .. }) => {
+            GraphStore::open_legacy_engine_read_only(path)
+        }
+        other => other,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_publication_rebuild(
     db: Option<PathBuf>,
@@ -30253,7 +30548,8 @@ fn run_publication_rebuild(
     // reclaim or reselect a slot this one is building.
     let root_lock =
         nestweaver_engine::publication::PublicationRootLock::acquire(&publication_root)?;
-    let incumbent_db = nestweaver_engine::publication::resolve_selected_database(&base_db)?;
+    let incumbent_db =
+        nestweaver_engine::publication::resolve_selected_database_allowing_legacy_engine(&base_db)?;
     if !incumbent_db.exists() {
         anyhow::bail!(
             "incumbent database not found at {}; index the configured sources first",
@@ -30261,8 +30557,15 @@ fn run_publication_rebuild(
         );
     }
     ensure_no_live_daemon_for_snapshot_build(&incumbent_db)?;
-    let incumbent_store = GraphStore::open_read_only(&incumbent_db)
+    let incumbent_store = open_rebuild_incumbent(&incumbent_db)
         .map_err(|error| anyhow::anyhow!("open incumbent publication: {error}"))?;
+    if incumbent_store.is_legacy_engine() {
+        eprintln!(
+            "Rebuilding {} for the new storage engine. It was built by an older engine; it is \
+             read (never written) and stays in place as the rollback copy.",
+            incumbent_db.display()
+        );
+    }
     config.assert_expected_brain(&incumbent_store)?;
     let incumbent_identity = incumbent_store
         .publication_identity()?
@@ -30956,8 +31259,8 @@ fn run_publication_rebuild(
                     )?;
                 }
                 PublicationPhase::Validating => {
-                    let active_db = nestweaver_engine::publication::resolve_selected_database(&base_db)?;
-                    let active = GraphStore::open_read_only(&active_db)?;
+                    let active_db = nestweaver_engine::publication::resolve_selected_database_allowing_legacy_engine(&base_db)?;
+                    let active = open_rebuild_incumbent(&active_db)?;
                     let observed = sources.recapture_for_validation(&active)?;
                     drop(active);
                     let observed_state = nestweaver_engine::publication_state::PreservedStateSnapshot::capture(&active_db)?;
@@ -31002,7 +31305,18 @@ fn run_publication_rebuild(
                         &incumbent_db,
                         "activate the staged publication",
                     )?;
-                    let store = GraphStore::open_with_authority(&incumbent_db, &authority).map_err(|error| {
+                    // An incumbent an older storage engine built is never
+                    // opened writable (that would checkpoint it with the new
+                    // hash): the publication lease is process-local, so a
+                    // read-only handle serves the switch under the same
+                    // write authority.
+                    let store = match GraphStore::open_with_authority(&incumbent_db, &authority) {
+                        Err(nestweaver_store::StoreError::RebuildRequired { .. }) => {
+                            GraphStore::open_legacy_engine_read_only(&incumbent_db)
+                        }
+                        other => other,
+                    }
+                    .map_err(|error| {
                         anyhow::anyhow!(
                             "open retained incumbent publication for activation: {error}"
                         )
