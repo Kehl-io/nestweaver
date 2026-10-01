@@ -127,8 +127,26 @@ impl PreservedStateReceipt {
     }
 }
 
+/// Digest of the interaction history in a canonical order.
+///
+/// Both unordered collections are sorted first: the node map by uid, and each
+/// node's `session_ids` (a hash set, which serialises in iteration order).
+/// Without that, two loads of one sidecar produce two digests, and the
+/// resume and revalidation checks that compare them never agree.
 fn interaction_digest(store: &crate::interactions::InteractionStore) -> anyhow::Result<String> {
-    let mut entries: Vec<_> = store.node_scores.iter().collect();
+    let mut entries = store
+        .node_scores
+        .iter()
+        .map(|(uid, score)| {
+            let mut sessions: Vec<&String> = score.session_ids.iter().collect();
+            sessions.sort();
+            let mut fields = serde_json::to_value(score)?;
+            if let Some(object) = fields.as_object_mut() {
+                object.remove("session_ids");
+            }
+            Ok((uid, fields, sessions))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     entries.sort_by(|left, right| left.0.cmp(right.0));
     Ok(crate::hash::blake3_hex_bytes(&serde_json::to_vec(&(
         store.version,
@@ -141,6 +159,58 @@ fn interaction_digest(store: &crate::interactions::InteractionStore) -> anyhow::
 mod tests {
     use super::*;
     use nestweaver_schema::{Symbol, SymbolKind, Visibility};
+
+    /// The fingerprint gates resume and the final revalidation, so the same
+    /// sidecar must fingerprint the same on every load. `session_ids` is a
+    /// hash set: serialised in iteration order, two loads of one file gave
+    /// two digests, and a rebuild of any brain whose history held a node
+    /// seen in several sessions could never validate.
+    #[test]
+    fn the_fingerprint_of_one_sidecar_is_the_same_on_every_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let mut interactions = crate::interactions::InteractionStore::default();
+        for node in 0..8 {
+            let score = crate::interactions::NodeScore {
+                session_ids: (0..40)
+                    .map(|session| format!("session-{node}-{session}"))
+                    .collect(),
+                ..Default::default()
+            };
+            interactions
+                .node_scores
+                .insert(format!("sym:{node}"), score);
+        }
+        crate::interactions::save_interaction_store(&db, &interactions).unwrap();
+
+        let first = PreservedStateSnapshot::capture(&db)
+            .unwrap()
+            .fingerprint()
+            .unwrap();
+        for _ in 0..20 {
+            let again = PreservedStateSnapshot::capture(&db)
+                .unwrap()
+                .fingerprint()
+                .unwrap();
+            assert_eq!(again, first, "one sidecar, two fingerprints");
+        }
+
+        // Counterweight: a real change to the history still moves it.
+        interactions
+            .node_scores
+            .get_mut("sym:0")
+            .unwrap()
+            .session_ids
+            .insert("another-session".to_string());
+        crate::interactions::save_interaction_store(&db, &interactions).unwrap();
+        assert_ne!(
+            PreservedStateSnapshot::capture(&db)
+                .unwrap()
+                .fingerprint()
+                .unwrap(),
+            first
+        );
+    }
 
     #[test]
     fn import_preserves_live_interactions_and_prunes_stale_uids() {
