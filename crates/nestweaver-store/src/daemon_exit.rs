@@ -234,6 +234,13 @@ pub fn crash_behind_broken_connection(error_text: &str) -> Option<(PathBuf, Uncl
     Some((db_path, exit))
 }
 
+/// An operator is about to kill the daemon on purpose (`daemon stop --force`).
+/// Removing the sentinel first is what makes the next daemon stay quiet: the
+/// kill is deliberate, not an unexplained disappearance.
+pub fn note_deliberate_kill(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(RUNNING_FILE));
+}
+
 /// The state directory THIS process armed as a daemon, so `brain status`
 /// served by the daemon can report what it found at startup.
 static ARMED_DIR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
@@ -513,6 +520,17 @@ mod tests {
             None,
             "a client must not attribute its broken pipe to an engine crash"
         );
+        armed.clean_shutdown();
+    }
+
+    #[test]
+    fn a_deliberate_kill_is_not_reported() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(RUNNING_FILE), "4242\n").unwrap();
+        note_deliberate_kill(dir.path());
+        let armed = arm(dir.path()).unwrap();
+        assert_eq!(armed_report(), None);
         armed.clean_shutdown();
     }
 

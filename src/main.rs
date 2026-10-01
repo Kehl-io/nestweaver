@@ -25448,6 +25448,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                          empty or absent afterwards, that is nw-126 (stale WAL), not data \
                          loss."
                     );
+                    // The operator chose this kill, so the next daemon must
+                    // not report it as an unexpected exit.
+                    nestweaver_daemon::lifecycle::note_deliberate_daemon_kill(&instance_id);
                     unsafe {
                         libc::kill(pid, libc::SIGKILL);
                     }

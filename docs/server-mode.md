@@ -1265,11 +1265,15 @@ How to read the warning:
 - `exit: "engine_crashed"` with a `signal` means the daemon's own fatal-signal
   handler recorded the crash. Treat the database as corrupt.
 - `exit: "exited_unexpectedly"` with `signal: null` means the daemon vanished
-  without shutting down and without a recorded signal: `kill -9`,
-  `daemon stop --force`, the out-of-memory killer or a power loss. Nothing is
+  without shutting down and without a recorded signal: `kill -9`, the
+  out-of-memory killer or a power loss. Nothing is
   claimed about the storage engine.
 - `count` is the number of unclean exits since the last clean shutdown.
-- `daemon stop`, SIGTERM and an idle exit are clean and leave no warning.
+- `daemon stop`, `daemon stop --force`, SIGTERM, Ctrl-C on a foreground
+  `daemon run` and an idle exit are deliberate and leave no warning.
+- A command blames the crash by recency: any connection that breaks within 60
+  seconds of a recorded crash is reported as that crash, including one caused
+  by another client's request.
 - The warning clears when a daemon next shuts down cleanly. A restore or rebuild
   does not clear it by itself; `nestweaver daemon stop` afterwards does.
 

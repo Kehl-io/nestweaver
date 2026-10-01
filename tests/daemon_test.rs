@@ -8195,3 +8195,106 @@ fn an_mcp_tool_call_that_crashes_the_daemon_returns_an_error_result() {
         "the session must keep answering after the daemon died: {stdout}"
     );
 }
+
+/// `daemon stop --force` kills on purpose, so the kill is not an unexpected
+/// exit. The daemon is SIGSTOPped first so it cannot drain on SIGTERM and the
+/// SIGKILL escalation is really taken.
+#[test]
+fn a_forced_stop_leaves_no_warning() {
+    let scratch = CrashScratch::new();
+    let _guard = scratch.guard();
+
+    scratch.daemon("start").assert().success();
+    let pid = scratch.daemon_pid().expect("the daemon wrote its pidfile");
+    unsafe {
+        libc::kill(pid, libc::SIGSTOP);
+    }
+    let output = scratch
+        .daemon("stop")
+        .arg("--force")
+        .env("NESTWEAVER_STOP_GRACE_SECS", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("sending SIGKILL"),
+        "the escalation must have been taken: {stderr}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || unsafe { libc::kill(pid, 0) }
+            != 0),
+        "the forced stop must end daemon {pid}"
+    );
+    assert_eq!(
+        scratch.unclean_exit_warning(),
+        None,
+        "a kill the operator asked for is not an unexpected exit"
+    );
+}
+
+/// Ctrl-C on a foreground `daemon run` drains and returns like SIGTERM does,
+/// instead of dying on the signal.
+#[test]
+fn sigint_on_a_foreground_daemon_is_a_clean_shutdown() {
+    let scratch = CrashScratch::new();
+    let _guard = scratch.guard();
+
+    let mut command = StdCommand::new(bin_path());
+    command
+        .args(["daemon", "--db"])
+        .arg(&scratch.db)
+        .arg("run")
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .env_remove("NESTWEAVER_UPSTREAM")
+        .env("HOME", &scratch.home)
+        .env("XDG_CONFIG_HOME", scratch.home.join("config"))
+        .env("XDG_CACHE_HOME", scratch.home.join("cache"))
+        .env("XDG_DATA_HOME", scratch.home.join("data"))
+        .env("XDG_STATE_HOME", scratch.home.join("state"))
+        .env("XDG_RUNTIME_DIR", scratch.home.join("runtime"))
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", scratch.home.join("sock"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().expect("spawn foreground daemon");
+    let pid = child.id() as i32;
+    let ready = wait_until(Duration::from_secs(30), || {
+        // An answered RPC, not just a pidfile: the signal handlers are
+        // registered before the listener serves, and well after the pidfile.
+        scratch.daemon_pid() == Some(pid)
+            && scratch
+                .cmd(&["brain", "status"])
+                .output()
+                .is_ok_and(|output| output.status.success())
+    });
+    assert_eq!(
+        scratch.daemon_pid(),
+        Some(pid),
+        "the status probe must have reached this daemon, not started another"
+    );
+    if !ready {
+        let _ = child.kill();
+        panic!("the foreground daemon never became ready");
+    }
+
+    unsafe {
+        libc::kill(pid, libc::SIGINT);
+    }
+    let mut status = None;
+    let exited = wait_until(Duration::from_secs(30), || {
+        status = child.try_wait().unwrap();
+        status.is_some()
+    });
+    if !exited {
+        let _ = child.kill();
+        panic!("the daemon did not exit after SIGINT");
+    }
+    let status = status.unwrap();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "SIGINT must drain and return, not kill the process: {status:?}"
+    );
+    assert_eq!(scratch.unclean_exit_warning(), None);
+}

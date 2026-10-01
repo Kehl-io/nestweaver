@@ -3452,9 +3452,32 @@ async fn watch_sigterm(state: Arc<DaemonState>) {
             return;
         }
     };
-    while sig.recv().await.is_some() {
-        tracing::info!("received SIGTERM — draining before shutdown");
-        begin_shutdown_drain(Arc::clone(&state), "sigterm");
+    // SIGINT takes the same path: Ctrl-C on a foreground `daemon run` is a
+    // deliberate stop, and the default action would kill the process without
+    // draining or cleaning up.
+    let mut interrupt = match tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::interrupt(),
+    ) {
+        Ok(sig) => sig,
+        Err(error) => {
+            tracing::error!(%error, "could not register SIGINT handler — Ctrl-C will not drain");
+            return;
+        }
+    };
+    loop {
+        let trigger = tokio::select! {
+            received = sig.recv() => received.map(|()| "sigterm"),
+            received = interrupt.recv() => received.map(|()| "sigint"),
+        };
+        let Some(trigger) = trigger else {
+            break;
+        };
+        if trigger == "sigterm" {
+            tracing::info!("received SIGTERM — draining before shutdown");
+        } else {
+            tracing::info!("received SIGINT — draining before shutdown");
+        }
+        begin_shutdown_drain(Arc::clone(&state), trigger);
     }
 }
 
