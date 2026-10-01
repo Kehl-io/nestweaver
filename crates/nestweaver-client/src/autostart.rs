@@ -1698,8 +1698,20 @@ credential_method = "gh"
         );
     }
 
+    /// Serialises every test that sets, clears or depends on
+    /// `NESTWEAVER_REAL_DB_UNDER_TEMP_ROOT`. The process environment is
+    /// shared by the whole test binary, so a test that sets the override
+    /// while another builds a command for a temp path makes that other test
+    /// lose its `--idle-timeout`.
+    fn real_db_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn daemon_start_command_forwards_db_and_config() {
+        let _env = real_db_env_lock();
         // `tempfile::tempdir()` lives under the OS temp root by construction,
         // so this exercises the SAME `is_temp_db_path(db)` branch nw-088 leg
         // (2) added — the assertion below expects `--idle-timeout` for
@@ -1775,6 +1787,7 @@ credential_method = "gh"
     /// path itself is unambiguously temp-shaped.
     #[test]
     fn daemon_start_command_honours_the_real_db_under_temp_root_escape() {
+        let _env = real_db_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("brain.lbug");
         assert!(
@@ -1782,7 +1795,8 @@ credential_method = "gh"
             "precondition: this path must be classified as ephemeral"
         );
 
-        // SAFETY: single-threaded test; the override is read only here.
+        // SAFETY: `real_db_env_lock` is held, so no other test reads or
+        // writes the override while it is set.
         unsafe { std::env::set_var(REAL_DB_UNDER_TEMP_ROOT_ENV, "1") };
         let command = daemon_start_command(
             Path::new("/opt/nestweaver"),
@@ -1810,10 +1824,11 @@ credential_method = "gh"
     /// `--idle-timeout` for temp paths altogether, override or not.
     #[test]
     fn daemon_start_command_still_shortens_the_timeout_without_the_escape() {
+        let _env = real_db_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("brain.lbug");
 
-        // SAFETY: single-threaded test.
+        // SAFETY: `real_db_env_lock` is held.
         unsafe { std::env::remove_var(REAL_DB_UNDER_TEMP_ROOT_ENV) };
         let command = daemon_start_command(
             Path::new("/opt/nestweaver"),
@@ -1847,6 +1862,7 @@ credential_method = "gh"
     /// one-shot `index` against the same path.
     #[test]
     fn daemon_start_command_never_shortens_the_timeout_for_a_long_running_caller() {
+        let _env = real_db_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("brain.lbug");
         assert!(
@@ -1856,7 +1872,7 @@ credential_method = "gh"
              the path stopped looking temporary"
         );
 
-        // SAFETY: single-threaded test.
+        // SAFETY: `real_db_env_lock` is held.
         unsafe { std::env::remove_var(REAL_DB_UNDER_TEMP_ROOT_ENV) };
         let command = daemon_start_command(
             Path::new("/opt/nestweaver"),
@@ -1884,6 +1900,7 @@ credential_method = "gh"
     /// the timeout for temp paths at all, `DaemonUsage` or not.
     #[test]
     fn daemon_start_command_still_shortens_the_timeout_for_a_one_shot_caller_on_the_same_path() {
+        let _env = real_db_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("brain.lbug");
 
