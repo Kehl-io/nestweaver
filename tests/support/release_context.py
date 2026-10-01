@@ -113,7 +113,11 @@ def mcp(fixture, tool, arguments, expect_error=False):
         assert "error" in reply or reply.get("result", {}).get("isError"), reply
         assert "No seeds resolved" in json.dumps(reply), reply
         payload = reply.get("result", {}).get("structuredContent", {})
-        assert not payload.get("connected") and not payload.get("seeds"), payload
+        # The not-found envelope echoes the request under its target key
+        # (`seeds`), so a miss carries the unresolved inputs there, never
+        # resolved seed nodes.
+        assert not payload.get("connected"), payload
+        assert payload.get("seeds", arguments.get("seeds")) == arguments.get("seeds"), payload
         assert payload.get("semantic_seed_count", 0) == 0, payload
         return None
     assert "error" not in reply and not reply["result"].get("isError"), reply
