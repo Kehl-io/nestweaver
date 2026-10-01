@@ -667,9 +667,13 @@ mod tests {
     #[test]
     fn repeated_crashes_are_counted_and_the_latest_wins() {
         let dir = tempfile::tempdir().unwrap();
+        // SIGBUS is 10 on macOS and 7 on Linux, so the number is not a literal.
         std::fs::write(
             dir.path().join(CRASH_FILE),
-            "11 1700000000 10\ngarbage\n0 1700000100 11\n10 1700000200 12\n",
+            format!(
+                "11 1700000000 10\ngarbage\n0 1700000100 11\n{} 1700000200 12\n",
+                libc::SIGBUS
+            ),
         )
         .unwrap();
         let exit = read(dir.path()).unwrap();
