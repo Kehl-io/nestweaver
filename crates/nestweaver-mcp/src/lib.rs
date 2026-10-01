@@ -431,6 +431,8 @@ fn dispatch_method_daemon_cancellable(
 
             // Isolate a panicking tool so one bad call can't unwind the stdio
             // read loop and kill the session (mirrors the HTTP path).
+            // A session outlives many requests: restart the crash-attribution clock.
+            nestweaver_store::daemon_exit::note_request_start();
             let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 tools::dispatch_via_daemon_cancellable(client, rt, &name, arguments.clone(), cancel)
             }));

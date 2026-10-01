@@ -72,6 +72,13 @@ impl UncleanExit {
         self.signal.map(signal_name)
     }
 
+    /// True for SIGABRT: the daemon aborted itself (a panic that could not
+    /// unwind, or memory exhaustion). That is not a storage-engine fault and
+    /// says nothing about the database, unlike SIGSEGV, SIGBUS and SIGILL.
+    pub fn is_abort(&self) -> bool {
+        self.signal == Some(libc::SIGABRT)
+    }
+
     /// One sentence saying what happened, shared by every surface that reports
     /// it so the CLI, the MCP result and `brain status` cannot drift apart.
     pub fn summary(&self) -> String {
@@ -81,6 +88,13 @@ impl UncleanExit {
             format!("{} unclean exits", self.count)
         };
         match self.signal_name() {
+            Some(_) if self.is_abort() => format!(
+                "the previous daemon (pid {}) aborted (SIGABRT) at {} — an abort inside \
+                 the daemon, not evidence of a corrupt database ({times} since the last \
+                 clean shutdown)",
+                self.pid,
+                format_utc(self.at),
+            ),
             Some(name) => format!(
                 "the previous daemon (pid {}) was killed by {name} at {} — the storage \
                  engine crashed, and the database may be corrupt ({times} since the last \
@@ -99,13 +113,42 @@ impl UncleanExit {
         }
     }
 
+    /// What a client says happened. `during_request` is whether the crash was
+    /// recorded after this client's request started: only then may it claim
+    /// the crash happened "while answering this request". A crash recorded
+    /// earlier was caused by an earlier request or by another client.
+    pub fn client_headline(&self, during_request: bool) -> String {
+        match (self.is_abort(), during_request) {
+            (false, true) => "The storage engine crashed while answering this request".into(),
+            (true, true) => "The daemon aborted while answering this request".into(),
+            (false, false) => format!(
+                "The daemon serving this database crashed (pid {}) shortly before this request",
+                self.pid
+            ),
+            (true, false) => format!(
+                "The daemon serving this database aborted (pid {}) shortly before this request",
+                self.pid
+            ),
+        }
+    }
+
     /// The message a client reports when its request died with the daemon.
-    pub fn client_message(&self, db_path: &Path) -> String {
+    pub fn client_message(&self, db_path: &Path, during_request: bool) -> String {
         let signal = self.signal_name().unwrap_or("a fatal signal");
+        let advice = if self.is_abort() {
+            format!(
+                "That is an abort inside the daemon, not evidence of a corrupt database. \
+                 Check the daemon log. Recovery is only needed if it repeats: {RECOVERY}."
+            )
+        } else {
+            format!(
+                "The database may be corrupt. Recover it: {RECOVERY}. Do not keep \
+                 retrying: the request that crashed the daemon will crash it again."
+            )
+        };
         format!(
-            "the storage engine crashed while answering this request: the daemon for {} \
-             was killed by {signal}. The database may be corrupt. Recover it: {RECOVERY}. \
-             Do not keep retrying: the same request will crash the daemon again.",
+            "{}: the daemon for {} was killed by {signal}. {advice}",
+            self.client_headline(during_request),
             db_path.display()
         )
     }
@@ -167,14 +210,23 @@ fn read_lines(dir: &Path) -> Vec<(i32, u64, u32)> {
 }
 
 /// The unclean exit recorded in `dir`, if any.
+///
+/// One death is one entry however many lines it wrote: two threads faulting
+/// at once can both reach the handler, so lines are de-duplicated by pid and
+/// the first line for a pid (the original fault) is the one kept.
 pub fn read(dir: &Path) -> Option<UncleanExit> {
-    let lines = read_lines(dir);
-    let &(signal, at, pid) = lines.last()?;
+    let mut deaths: Vec<(i32, u64, u32)> = Vec::new();
+    for line in read_lines(dir) {
+        if !deaths.iter().any(|&(_, _, pid)| pid == line.2) {
+            deaths.push(line);
+        }
+    }
+    let &(signal, at, pid) = deaths.last()?;
     Some(UncleanExit {
         signal: (signal != 0).then_some(signal),
         at,
         pid,
-        count: lines.len(),
+        count: deaths.len(),
     })
 }
 
@@ -188,20 +240,42 @@ pub fn recent_crash(dir: &Path, window_secs: u64) -> Option<UncleanExit> {
     (now_unix().saturating_sub(exit.at) <= window_secs).then_some(exit)
 }
 
-/// The database and state directory a client process is talking to, recorded
-/// at connect time so an error funnel far from the connection can still ask
-/// whether the daemon crashed.
-static CLIENT_WATCH: std::sync::Mutex<Option<(PathBuf, PathBuf)>> = std::sync::Mutex::new(None);
+/// A recorded crash behind a client's broken connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientCrash {
+    pub db_path: PathBuf,
+    pub exit: UncleanExit,
+    /// The crash was recorded after this client's request started, so it may
+    /// be said to have happened while answering it.
+    pub during_request: bool,
+}
+
+/// The database, state directory and request start (unix seconds) of the
+/// daemon a client process is talking to, recorded at connect time so an
+/// error funnel far from the connection can still ask whether it crashed.
+static CLIENT_WATCH: std::sync::Mutex<Option<(PathBuf, PathBuf, u64)>> =
+    std::sync::Mutex::new(None);
 
 /// How long after a crash a broken connection is still attributed to it. The
 /// pipe breaks within milliseconds of the signal; the slack covers a client
 /// that retried the connection before giving up.
 const CLIENT_CRASH_WINDOW_SECS: u64 = 60;
 
-/// Record which daemon this client process is connected to.
+/// Record which daemon this client process is connected to. Connecting also
+/// starts the request clock.
 pub fn watch_as_client(db_path: &Path, state_dir: &Path) {
     if let Ok(mut slot) = CLIENT_WATCH.lock() {
-        *slot = Some((db_path.to_path_buf(), state_dir.to_path_buf()));
+        *slot = Some((db_path.to_path_buf(), state_dir.to_path_buf(), now_unix()));
+    }
+}
+
+/// A long-lived client (an MCP session) is starting a new request. Without
+/// this every crash after connect would count as "during this request".
+pub fn note_request_start() {
+    if let Ok(mut slot) = CLIENT_WATCH.lock()
+        && let Some(watch) = slot.as_mut()
+    {
+        watch.2 = now_unix();
     }
 }
 
@@ -223,15 +297,27 @@ fn is_broken_connection(message: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+/// Whether a crash recorded at `crash_at` happened during a request that
+/// started at `request_start`. Timestamps are whole seconds, so a crash in
+/// the second before the recorded start still counts.
+fn crashed_during_request(crash_at: u64, request_start: u64) -> bool {
+    crash_at + 1 >= request_start
+}
+
 /// If `error_text` is a broken daemon connection and the daemon this client
-/// connected to has just recorded a crash, the message to report instead.
-pub fn crash_behind_broken_connection(error_text: &str) -> Option<(PathBuf, UncleanExit)> {
+/// connected to has just recorded a crash, that crash. Attribution is by
+/// recency; `during_request` says whether the stronger claim is earned.
+pub fn crash_behind_broken_connection(error_text: &str) -> Option<ClientCrash> {
     if !is_broken_connection(error_text) {
         return None;
     }
-    let (db_path, dir) = CLIENT_WATCH.lock().ok()?.clone()?;
+    let (db_path, dir, request_start) = CLIENT_WATCH.lock().ok()?.clone()?;
     let exit = recent_crash(&dir, CLIENT_CRASH_WINDOW_SECS)?;
-    Some((db_path, exit))
+    Some(ClientCrash {
+        during_request: crashed_during_request(exit.at, request_start),
+        db_path,
+        exit,
+    })
 }
 
 /// An operator is about to kill the daemon on purpose (`daemon stop --force`).
@@ -261,6 +347,9 @@ mod imp {
     /// Pre-opened, append-mode descriptor for [`CRASH_FILE`]. `-1` when no
     /// daemon is armed, which makes the handler a pure pass-through.
     static CRASH_FD: AtomicI32 = AtomicI32::new(-1);
+    /// Set by the first thread to record this process's death. Two threads
+    /// can fault at once; only one line is written.
+    static RECORDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     pub(crate) const FATAL_SIGNALS: [libc::c_int; 4] =
         [libc::SIGSEGV, libc::SIGBUS, libc::SIGABRT, libc::SIGILL];
@@ -291,6 +380,10 @@ mod imp {
     pub(crate) fn record_fatal_signal(signal: libc::c_int) {
         let fd = CRASH_FD.load(Ordering::SeqCst);
         if fd < 0 {
+            return;
+        }
+        // An atomic swap is async-signal-safe.
+        if RECORDED.swap(true, Ordering::SeqCst) {
             return;
         }
         let mut buf = [0u8; 64];
@@ -421,6 +514,7 @@ mod imp {
             *slot = Some(dir.to_path_buf());
         }
         let fd = crash_log.into_raw_fd();
+        RECORDED.store(false, Ordering::SeqCst);
         CRASH_FD.store(fd, Ordering::SeqCst);
         for signal in FATAL_SIGNALS {
             set_action(signal, handler as *const () as libc::sighandler_t);
@@ -588,6 +682,86 @@ mod tests {
             None,
             "an old crash is not recent"
         );
+    }
+
+    #[test]
+    fn one_death_recorded_twice_is_counted_once() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        // The reader: two lines for one pid are one death, and the first
+        // (the original fault) is the one reported.
+        std::fs::write(
+            dir.path().join(CRASH_FILE),
+            "11 1700000000 10\n6 1700000001 10\n",
+        )
+        .unwrap();
+        let exit = read(dir.path()).unwrap();
+        assert_eq!((exit.count, exit.signal), (1, Some(11)));
+        std::fs::remove_file(dir.path().join(CRASH_FILE)).unwrap();
+
+        // The handler: a second faulting thread writes nothing.
+        let armed = arm(dir.path()).unwrap();
+        record_fatal_signal(libc::SIGSEGV);
+        record_fatal_signal(libc::SIGBUS);
+        let text = std::fs::read_to_string(dir.path().join(CRASH_FILE)).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        armed.clean_shutdown();
+    }
+
+    fn exit_with(signal: i32) -> UncleanExit {
+        UncleanExit {
+            signal: Some(signal),
+            at: 1_700_000_000,
+            pid: 77,
+            count: 1,
+        }
+    }
+
+    #[test]
+    fn only_a_crash_after_the_request_started_is_blamed_on_the_request() {
+        assert!(crashed_during_request(100, 100));
+        assert!(crashed_during_request(99, 100), "whole-second slack");
+        assert!(!crashed_during_request(98, 100));
+
+        let db = Path::new("/d/brain.lbug");
+        let during = exit_with(libc::SIGSEGV).client_message(db, true);
+        assert!(
+            during.contains("crashed while answering this request"),
+            "{during}"
+        );
+        let before = exit_with(libc::SIGSEGV).client_message(db, false);
+        assert!(
+            before.contains("crashed (pid 77) shortly before this request"),
+            "{before}"
+        );
+        assert!(!before.contains("while answering"), "{before}");
+        assert!(!before.contains("the same request"), "{before}");
+        for message in [&during, &before] {
+            assert!(message.contains("nestweaver backup restore"), "{message}");
+            assert!(message.contains("may be corrupt"), "{message}");
+        }
+    }
+
+    #[test]
+    fn an_abort_is_not_called_an_engine_crash_or_corruption() {
+        let abort = exit_with(libc::SIGABRT);
+        for text in [
+            abort.summary(),
+            abort.client_message(Path::new("/d/brain.lbug"), true),
+            abort.client_message(Path::new("/d/brain.lbug"), false),
+        ] {
+            assert!(text.contains("abort"), "{text}");
+            assert!(!text.contains("engine crashed"), "{text}");
+            assert!(!text.contains("may be corrupt"), "{text}");
+        }
+        let message = abort.client_message(Path::new("/d/brain.lbug"), true);
+        assert!(message.contains("Check the daemon log"), "{message}");
+        assert!(message.contains("only needed if it repeats"), "{message}");
+        // The other fatal signals keep the corruption wording.
+        for signal in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL] {
+            let summary = exit_with(signal).summary();
+            assert!(summary.contains("may be corrupt"), "{summary}");
+        }
     }
 
     #[test]

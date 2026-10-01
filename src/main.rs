@@ -744,24 +744,18 @@ enum CliDiagnostic {
     /// the same event to the person holding the file. The rebuild it names
     /// writes a NEW database (a publication slot, or a fresh `--db` path), never
     /// this one.
-    #[error("The storage engine crashed while answering this request: {path}")]
-    #[diagnostic(
-        code(nestweaver::daemon_engine_crashed),
-        help(
-            "The daemon serving {path} was killed by {signal} while answering, \
-             so the request got no reply. The database may be corrupt: it \
-             opened, and the engine then faulted while reading it.\n\
-             Recover it: restore the most recent backup with `nestweaver backup \
-             restore <archive>`, or rebuild it:\n  {remedy}\n\
-             Do not keep retrying: the same request will crash the daemon \
-             again. `nestweaver brain status` warns about the crash until a \
-             daemon next shuts down cleanly."
-        )
-    )]
+    ///
+    /// The headline claims "while answering this request" only when the crash
+    /// was recorded after this request started; an earlier crash is reported
+    /// as having happened shortly before it. SIGABRT is an abort inside the
+    /// daemon, so it is not called an engine crash and carries no corruption
+    /// claim. `daemon_crash_diagnostic` composes both strings.
+    #[error("{headline}: {path}")]
+    #[diagnostic(code(nestweaver::daemon_engine_crashed), help("{detail}"))]
     DaemonEngineCrashed {
+        headline: String,
         path: String,
-        signal: String,
-        remedy: String,
+        detail: String,
     },
 
     #[error("{message}")]
@@ -805,6 +799,52 @@ fn rebuild_remedy_command(db_path: &str) -> String {
                 shell_quote(&fresh.display().to_string())
             )
         }
+    }
+}
+
+/// Compose the `daemon_engine_crashed` diagnostic for a recorded daemon crash.
+fn daemon_crash_diagnostic(
+    path: String,
+    exit: &nestweaver_store::daemon_exit::UncleanExit,
+    during_request: bool,
+) -> CliDiagnostic {
+    let signal = exit.signal_name().unwrap_or("a fatal signal");
+    let remedy = rebuild_remedy_command(&path);
+    let when = if during_request {
+        "while answering, so the request got no reply"
+    } else {
+        "shortly before this request, so the connection was already gone"
+    };
+    let detail = if exit.is_abort() {
+        format!(
+            "The daemon serving {path} was killed by {signal} {when}. That is an \
+             abort inside the daemon, not evidence of a corrupt database.\n\
+             Check the daemon log. Recovery is only needed if it repeats: \
+             restore the most recent backup with `nestweaver backup restore \
+             <archive>`, or rebuild the database:\n  {remedy}\n\
+             `nestweaver brain status` warns about it until a daemon next \
+             shuts down cleanly."
+        )
+    } else {
+        let again = if during_request {
+            "the same request will crash the daemon again"
+        } else {
+            "the request that crashed the daemon will crash it again"
+        };
+        format!(
+            "The daemon serving {path} was killed by {signal} {when}. The \
+             database may be corrupt: it opened, and the engine then faulted \
+             while reading it.\n\
+             Recover it: restore the most recent backup with `nestweaver backup \
+             restore <archive>`, or rebuild it:\n  {remedy}\n\
+             Do not keep retrying: {again}. `nestweaver brain status` warns \
+             about the crash until a daemon next shuts down cleanly."
+        )
+    };
+    CliDiagnostic::DaemonEngineCrashed {
+        headline: exit.client_headline(during_request),
+        path,
+        detail,
     }
 }
 
@@ -1064,16 +1104,11 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
     // A connection that broke because the daemon died on a fatal signal. Asked
     // before every text arm below: they would read "broken pipe" as an
     // unclassified error and print it with no remedy.
-    if let Some((db_path, exit)) =
+    if let Some(crash) =
         nestweaver_store::daemon_exit::crash_behind_broken_connection(&format!("{err:#}"))
     {
-        let path = redact_build_paths(&db_path.display().to_string());
-        return CliDiagnostic::DaemonEngineCrashed {
-            remedy: rebuild_remedy_command(&path),
-            signal: exit.signal_name().unwrap_or("a fatal signal").to_string(),
-            path,
-        }
-        .into();
+        let path = redact_build_paths(&crash.db_path.display().to_string());
+        return daemon_crash_diagnostic(path, &crash.exit, crash.during_request).into();
     }
 
     // nw-346. Ask the TYPE before asking the prose. `StoreError::Corruption`
@@ -26886,11 +26921,16 @@ mod cli_help_contract_tests {
                 // publication slot, or a fresh `--db` path), so it cannot
                 // destroy the file it is about. Both rendered forms are real
                 // invocations.
-                CliDiagnostic::DaemonEngineCrashed {
-                    path: sample("d"),
-                    signal: sample("SIGSEGV"),
-                    remedy: sample("nestweaver publication rebuild --config instance.toml"),
-                },
+                daemon_crash_diagnostic(
+                    sample("d"),
+                    &nestweaver_store::daemon_exit::UncleanExit {
+                        signal: Some(libc::SIGSEGV),
+                        at: 0,
+                        pid: 1,
+                        count: 1,
+                    },
+                    true,
+                ),
                 Clears::Never,
                 WriteRemedy::Allowed,
                 Remedy::Invocation,
@@ -26911,6 +26951,44 @@ mod cli_help_contract_tests {
                 ),
             ),
         ]
+    }
+
+    /// The crash diagnostic has four renderings. Each must stay honest about
+    /// what it knows: only a crash after the request started is blamed on the
+    /// request, and an abort is never called corruption.
+    #[test]
+    fn the_daemon_crash_diagnostic_claims_only_what_it_knows() {
+        use miette::Diagnostic;
+        let exit = |signal| nestweaver_store::daemon_exit::UncleanExit {
+            signal: Some(signal),
+            at: 0,
+            pid: 4242,
+            count: 1,
+        };
+        let render = |signal, during| {
+            let diagnostic = daemon_crash_diagnostic("d.lbug".into(), &exit(signal), during);
+            format!("{diagnostic}\n{}", diagnostic.help().unwrap())
+        };
+
+        let during = render(libc::SIGSEGV, true);
+        assert!(during.contains("storage engine crashed while answering this request"));
+        let before = render(libc::SIGSEGV, false);
+        assert!(before.contains("crashed (pid 4242) shortly before this request"));
+        assert!(!before.contains("while answering"), "{before}");
+        assert!(!before.contains("the same request"), "{before}");
+
+        for during in [true, false] {
+            let abort = render(libc::SIGABRT, during);
+            assert!(abort.contains("aborted"), "{abort}");
+            assert!(!abort.contains("engine crashed"), "{abort}");
+            assert!(!abort.contains("may be corrupt"), "{abort}");
+            assert!(abort.contains("Check the daemon log"), "{abort}");
+            assert!(abort.contains("only needed if it repeats"), "{abort}");
+        }
+        for text in [&during, &before] {
+            assert!(text.contains("may be corrupt"), "{text}");
+            assert!(text.contains("nestweaver backup restore"), "{text}");
+        }
     }
 
     /// nw-334/G2. The inventory must name every variant EXACTLY once, on every

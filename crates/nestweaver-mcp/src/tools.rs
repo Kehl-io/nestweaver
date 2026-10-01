@@ -5680,10 +5680,14 @@ pub fn wrap_tool_not_found(envelope: Value) -> Value {
 pub fn wrap_tool_failure(tool: &str, error: &anyhow::Error) -> Value {
     // The daemon died on a fatal signal while answering: say that, with the
     // way out, instead of the broken pipe the client was left holding.
-    if let Some((db_path, exit)) =
+    if let Some(crash) =
         nestweaver_store::daemon_exit::crash_behind_broken_connection(&format!("{error:#}"))
     {
-        return wrap_tool_error(&exit.client_message(&db_path));
+        return wrap_tool_error(
+            &crash
+                .exit
+                .client_message(&crash.db_path, crash.during_request),
+        );
     }
     match lookup_miss_envelope(tool, error) {
         Some(envelope) => wrap_tool_not_found(envelope),
@@ -9522,7 +9526,13 @@ fn daemon_unclean_exit_warning(exit: &nestweaver_store::daemon_exit::UncleanExit
     let crashed = exit.signal.is_some();
     json!({
         "kind": "daemon_unclean_exit",
-        "warning": if crashed {
+        "warning": if exit.is_abort() {
+            format!(
+                "{}. Check the daemon log. Recovery is only needed if it repeats: {}.",
+                exit.summary(),
+                nestweaver_store::daemon_exit::RECOVERY
+            )
+        } else if crashed {
             format!(
                 "{}. Recover it: {}.",
                 exit.summary(),
@@ -9536,7 +9546,13 @@ fn daemon_unclean_exit_warning(exit: &nestweaver_store::daemon_exit::UncleanExit
                 nestweaver_store::daemon_exit::RECOVERY
             )
         },
-        "exit": if crashed { "engine_crashed" } else { "exited_unexpectedly" },
+        "exit": if exit.is_abort() {
+            "aborted"
+        } else if crashed {
+            "engine_crashed"
+        } else {
+            "exited_unexpectedly"
+        },
         "signal": exit.signal_name(),
         "at_unix": exit.at,
         "pid": exit.pid,

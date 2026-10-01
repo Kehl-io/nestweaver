@@ -1272,8 +1272,12 @@ How to read the warning:
 - `daemon stop`, `daemon stop --force`, SIGTERM, Ctrl-C on a foreground
   `daemon run` and an idle exit are deliberate and leave no warning.
 - A command blames the crash by recency: any connection that breaks within 60
-  seconds of a recorded crash is reported as that crash, including one caused
-  by another client's request.
+  seconds of a recorded crash is reported as that crash. It says "while
+  answering this request" only when the crash was recorded after the request
+  started; otherwise it says the daemon crashed shortly before the request.
+- `exit: "aborted"` (SIGABRT) is an abort inside the daemon, such as a panic or
+  memory exhaustion. It is not evidence of a corrupt database: check the daemon
+  log, and recover only if it repeats.
 - The warning clears when a daemon next shuts down cleanly. A restore or rebuild
   does not clear it by itself; `nestweaver daemon stop` afterwards does.
 
