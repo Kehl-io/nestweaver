@@ -444,19 +444,12 @@ fn detect_changes_impact_with_work_budget(
     let mut affected_uids: HashSet<String> = HashSet::new();
     let mut status = AnalysisStatus::Complete;
     let mut notifications = Vec::new();
-    // nw-424: the SET is unchanged (every incompatible repository still
-    // degrades), but the message now says whether the caller owns the problem.
+    // A stale repository degrades only when it owns or is linked to
+    // a changed file; an unrelated one is disclosed without degrading.
     let incompatibility =
         crate::resolver_generation::incompatibility_for_changed_files(store, &changed_files)?;
     let resolver_stale_repos = incompatibility.all();
-    if incompatibility.is_incompatible() {
-        status = status.max(AnalysisStatus::Degraded);
-        notifications.push(Notification {
-            level: NotificationLevel::Error,
-            message: incompatibility.message(),
-            descriptor: crate::resolver_generation::INCOMPATIBLE_RESOLVER_DESCRIPTOR.to_string(),
-        });
-    }
+    incompatibility.apply(&mut status, &mut notifications);
 
     for file_path in &changed_files {
         GraphStore::check_read_deadline()?;

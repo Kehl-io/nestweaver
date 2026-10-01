@@ -128,6 +128,22 @@ fn dispatch_err_to_status(tool_name: &str, e: anyhow::Error) -> Status {
         );
     }
 
+    // An unresolved repo filter carries its class (not found / ambiguous /
+    // malformed) and candidates in the status details, and its message is
+    // the typed error's own text: the outermost context alone hid both, so
+    // an ambiguous selector read as not found on the daemon route.
+    if let Some(unresolved) = nestweaver_mcp::tools::repo_filter_failure(&e) {
+        let mut with_details = Status::with_details(
+            status.code(),
+            format!("tool {tool_name} failed: {unresolved}"),
+            serde_json::to_vec(&unresolved.envelope())
+                .unwrap_or_default()
+                .into(),
+        );
+        *with_details.metadata_mut() = status.metadata().clone();
+        return with_details;
+    }
+
     // nw-557: a lookup miss keeps its gRPC code and message (the CLI
     // classifies both) and carries the MCP not-found envelope in the status
     // details, so an MCP client behind the daemon proxy or the hybrid client
@@ -199,11 +215,16 @@ fn list_contracts_impl(
             .into_iter()
             .filter(|repo| repo_is_visible(&repo.uid))
             .collect();
+        // Mapped like every repo filter: the typed error carries its class
+        // (not found / ambiguous / malformed) to the client in the details.
         let repo =
             nestweaver_engine::resolve_repo_selector(&visible_repos, filter).map_err(|error| {
-                Status::invalid_argument(format!(
-                    "no indexed repo matches --repo '{filter}': {error}"
-                ))
+                dispatch_err_to_status(
+                    "list_contracts",
+                    anyhow::Error::new(nestweaver_engine::node_scope::RepoFilterUnresolved::new(
+                        filter, &error,
+                    )),
+                )
             })?;
         Some(repo.uid.clone())
     } else {
@@ -273,6 +294,48 @@ mod dispatch_err_to_status_tests {
         );
     }
 
+    /// An AMBIGUOUS repo filter wrapped in a tool's own `.context()` must
+    /// still reach the client as ambiguous, with its candidates: the status
+    /// message used to be only the outermost context, so `clusters --repo`
+    /// on the daemon route reported an ambiguous name as not found.
+    #[test]
+    fn a_wrapped_ambiguous_repo_filter_keeps_its_class_and_candidates() {
+        let resolver = nestweaver_engine::RepoSelectorError::error(
+            nestweaver_engine::RepoSelectorFailure::Ambiguous,
+            vec!["repo:a".to_string(), "repo:b".to_string()],
+            "repository selector 'web-app' is ambiguous; use an exact UID: \
+             web-app (repo:a), web-app (repo:b)"
+                .to_string(),
+        );
+        let error = anyhow::Error::new(nestweaver_engine::node_scope::RepoFilterUnresolved::new(
+            "web-app", &resolver,
+        ))
+        .context("compute_clusters_scoped");
+        let status = dispatch_err_to_status("clusters", error);
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("ambiguous") && status.message().contains("repo:b"),
+            "the message must be the typed error's, not the outer context: {:?}",
+            status.message()
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(status.details())
+            .expect("the class travels in the status details");
+        assert_eq!(envelope["status"], "ambiguous", "{envelope}");
+        assert_eq!(
+            envelope["candidates"],
+            serde_json::json!(["repo:a", "repo:b"])
+        );
+        assert_eq!(
+            status
+                .metadata()
+                .get(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
+                .and_then(|value| value.to_str().ok()),
+            Some(nestweaver_engine::node_scope::REPO_FILTER_UNRESOLVED_CODE),
+            "federation still keys on the unchanged code"
+        );
+    }
+
     /// COUNTERWEIGHT: an ordinary failure must carry NO code, or the client's
     /// typed check would absorb every local outage into a degraded stand-in.
     #[test]
@@ -329,8 +392,9 @@ mod dispatch_err_to_status_tests {
 
     /// nw-557 F3: `brain_diff`'s unknown `repo` is its lookup miss. The
     /// status keeps `repo-filter-unresolved` (the code the CLI's exit 2 keys
-    /// on) and carries the MCP envelope in its details. Counterweight: the
-    /// same error from a tool whose `repo` is only a filter gets no envelope.
+    /// on) and carries the MCP envelope in its details. A repo FILTER that
+    /// names no repo is a lookup miss too, with the same envelope; an
+    /// ambiguous one is not, so it yields no not-found envelope.
     #[test]
     fn brain_diff_unknown_repo_carries_the_envelope_and_keeps_its_code() {
         let unresolved = || {
@@ -354,9 +418,25 @@ mod dispatch_err_to_status_tests {
         assert!(envelope["message"].as_str().is_some());
 
         let filter = dispatch_err_to_status("hub_nodes", unresolved());
+        let envelope =
+            nestweaver_mcp::tools::envelope_from_status_details(filter.details()).unwrap();
+        assert_eq!(envelope["status"], "not_found");
+        assert_eq!(envelope["repo"], "no-such-repo");
+
+        let ambiguous = dispatch_err_to_status(
+            "hub_nodes",
+            anyhow::Error::new(nestweaver_engine::node_scope::RepoFilterUnresolved::new(
+                "web-app",
+                &nestweaver_engine::RepoSelectorError::error(
+                    nestweaver_engine::RepoSelectorFailure::Ambiguous,
+                    vec!["repo:a".to_string(), "repo:b".to_string()],
+                    "ambiguous".to_string(),
+                ),
+            )),
+        );
         assert!(
-            filter.details().is_empty(),
-            "a filter miss is not a lookup miss"
+            nestweaver_mcp::tools::envelope_from_status_details(ambiguous.details()).is_none(),
+            "an ambiguous filter is not a lookup miss"
         );
     }
 
@@ -459,8 +539,12 @@ mod list_contracts_tests {
         assert!(
             empty
                 .message()
-                .contains("no indexed repo matches --repo ''")
+                .contains("repository selector cannot be empty"),
+            "{}",
+            empty.message()
         );
+        let envelope: serde_json::Value = serde_json::from_slice(empty.details()).unwrap();
+        assert_eq!(envelope["status"], "malformed", "{envelope}");
 
         let visible = VisibleRepos::Only(HashSet::from(["target".to_string()]));
         let unfiltered = list_contracts_impl(&store, None, &visible).unwrap();
@@ -470,7 +554,16 @@ mod list_contracts_tests {
         for filter in ["repo:display", "does-not-exist"] {
             let error = list_contracts_impl(&store, Some(filter), &visible).unwrap_err();
             assert_eq!(error.code(), tonic::Code::InvalidArgument);
-            assert!(error.message().contains("no indexed repo matches --repo"));
+            // A hidden repo is indistinguishable from a missing one.
+            assert!(
+                error
+                    .message()
+                    .contains(&format!("repo '{filter}' not found")),
+                "{}",
+                error.message()
+            );
+            let envelope: serde_json::Value = serde_json::from_slice(error.details()).unwrap();
+            assert_eq!(envelope["status"], "not_found", "{envelope}");
         }
     }
 }
@@ -4626,9 +4719,10 @@ fn degrade_blast_radius_if_resolver_stale(
     store: &GraphStore,
     db_path: &Path,
     visible: &nestweaver_engine::authz::VisibleRepos,
+    changed_files: &[PathBuf],
     result: &mut nestweaver_engine::blast_radius::BlastRadiusResult,
 ) -> Result<(), Status> {
-    let repos: Vec<nestweaver_schema::Repo> = store
+    let mut repos: Vec<nestweaver_schema::Repo> = store
         .list_repos(None)
         .map_err(|error| {
             // Log the chain server-side; the client gets no store internals.
@@ -4638,6 +4732,22 @@ fn degrade_blast_radius_if_resolver_stale(
         .into_iter()
         .filter(|repo| visible.allows(&repo.uid))
         .collect();
+    // Only a stale repository that owns or is linked to a changed
+    // file degrades; the engine already disclosed any unrelated one.
+    let changed: Vec<String> = changed_files
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    nestweaver_engine::resolver_generation::incompatibility_for_changed_files_at(
+        store,
+        Some(db_path),
+        &changed,
+    )
+    .map_err(|error| {
+        tracing::error!("pr_impact: resolver-generation verdict: {error:#}");
+        Status::unavailable("resolver-generation verdict unavailable")
+    })?
+    .retain_degrading(&mut repos);
     let Some(refusal) =
         nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(db_path, &repos)
     else {
@@ -6763,7 +6873,13 @@ impl NestWeaverDaemon for DaemonService {
         let owner_pid = peer_owner_pid(&request);
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
-        let vault_name = req.vault_name.clone();
+        // A defaulted name is resolved by the engine: a registered vault
+        // keeps its stored name, a new one takes its directory's.
+        let vault_name = if req.vault_name_defaulted {
+            String::new()
+        } else {
+            req.vault_name.clone()
+        };
         let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         let extra_patterns = req.extra_ignore_patterns.clone();
         let force = req.force;
@@ -8068,7 +8184,13 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
-        let vault_name = req.vault_name.clone();
+        // A defaulted name is resolved by the engine: a registered vault
+        // keeps its stored name, a new one takes its directory's.
+        let vault_name = if req.vault_name_defaulted {
+            String::new()
+        } else {
+            req.vault_name.clone()
+        };
         let extra_patterns = req.extra_ignore_patterns.clone();
         let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         let note_limits = resolve_request_note_limits(req.max_note_bytes, &self.state)?;
@@ -8309,7 +8431,13 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
-        let vault_name = req.vault_name.clone();
+        // A defaulted name is resolved by the engine: a registered vault
+        // keeps its stored name, a new one takes its directory's.
+        let vault_name = if req.vault_name_defaulted {
+            String::new()
+        } else {
+            req.vault_name.clone()
+        };
         let extra_patterns = req.extra_ignore_patterns.clone();
         let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         let note_limits = resolve_request_note_limits(req.max_note_bytes, &self.state)?;
@@ -10809,6 +10937,12 @@ impl NestWeaverDaemon for DaemonService {
         let cancel_for_task = cancel.clone();
         let handler = async move {
             tokio::task::spawn_blocking(move || {
+                // Declared `[[links]]` are reachability evidence for the
+                // resolver-generation gate; this worker thread is
+                // not a tool dispatch, so install them here.
+                nestweaver_engine::resolver_generation::set_declared_link_config(
+                    state.instance_cfg.clone(),
+                );
                 // TODO(nw-033): resolve target repo_uid from the working repo
                 let options = nestweaver_engine::BlastRadiusOptions {
                     target_repo: None,
@@ -10860,6 +10994,7 @@ impl NestWeaverDaemon for DaemonService {
                     &state.store,
                     &state.db_path,
                     &visible,
+                    &changed_files,
                     &mut result,
                 )?;
                 serde_json::to_string(&result)
@@ -18507,6 +18642,125 @@ repos = ["alpha"]
             (55..=60).contains(&delay),
             "second failure backs off ~60s: {delay}"
         );
+    }
+
+    /// A request whose name is only the directory default keeps a registered
+    /// vault's stored name; an explicit name still renames it.
+    #[tokio::test]
+    async fn a_defaulted_vault_name_keeps_the_registered_name() {
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\n").unwrap();
+        let index = |name: &str, defaulted: bool| {
+            let service = DaemonService::new(state.clone());
+            let mut request = Request::new(IndexVaultRequest {
+                vault_path: root.display().to_string(),
+                vault_name: name.to_string(),
+                vault_name_defaulted: defaulted,
+                ..Default::default()
+            });
+            request.extensions_mut().insert(crate::auth::IsAdmin(true));
+            async move {
+                let mut rx = service
+                    .index_vault(request)
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .into_inner();
+                let mut last = None;
+                while let Some(event) = rx.recv().await {
+                    last = Some(event.unwrap());
+                }
+                assert_eq!(last.unwrap().phase, Phase::Done as i32);
+            }
+        };
+        let name = || state.store.list_vaults(None).unwrap()[0].name.clone();
+        index("other", false).await;
+        assert_eq!(name(), "other");
+        index("dirname", true).await;
+        assert_eq!(name(), "other", "a defaulted name is not a rename");
+        index("renamed", false).await;
+        assert_eq!(name(), "renamed", "an explicit name still renames");
+    }
+
+    /// Links are stored with the confidence the resolver gave them at index
+    /// time, so a vault derived before exact unique names resolved at 1.0
+    /// still holds their old 0.95 rows. Its record at derivation version 1
+    /// must be re-derived, which rewrites them at 1.0; a record already at
+    /// the current version must be left alone. Reverting the version bump
+    /// makes version 1 current again and fails the first half.
+    #[tokio::test]
+    async fn a_vault_derived_before_exact_unique_links_is_re_derived() {
+        use nestweaver_engine::markdown_derivation::{DERIVATION_VERSION, DerivationPhase};
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\nsee [[B]]\n").unwrap();
+        std::fs::write(root.join("B.md"), "# B\n").unwrap();
+        let progress = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(progress.last().unwrap().phase, Phase::Done as i32);
+
+        // What a version-1 derivation stored for `[[B]]`: a 0.95 row.
+        let plant_old_row = || {
+            let vault_uid = state.store.list_vaults(None).unwrap()[0].uid.clone();
+            let edges = state
+                .store
+                .wikilink_edges_for_vault(&vault_uid, "WIKILINK_TO_NOTE", "dst:Note")
+                .unwrap();
+            let (section, note, _, display, target) = edges
+                .iter()
+                .find(|edge| edge.3.eq_ignore_ascii_case("B"))
+                .expect("[[B]] resolved")
+                .clone();
+            state
+                .store
+                .batch_insert_wikilink_to_note_edges(&[(&section, &note, 0.95, &display, &target)])
+                .unwrap();
+        };
+        let low_rows = || {
+            nestweaver_engine::broken_links(&state.store, 0)
+                .unwrap()
+                .into_iter()
+                .filter(|link| link.confidence < 1.0)
+                .count()
+        };
+
+        // Counterweight: at the CURRENT version nothing is due, and the old
+        // row stays exactly where it is.
+        plant_old_row();
+        assert_eq!(
+            low_rows(),
+            1,
+            "precondition: the planted 0.95 row is visible"
+        );
+        assert_eq!(
+            vault_derivation_record(&state).derivation_version,
+            DERIVATION_VERSION
+        );
+        assert_eq!(vault_derivation::inspect_next(&state).unwrap(), None);
+        assert_eq!(low_rows(), 1);
+
+        // A COMPLETED version-1 record, exactly as a version-1 binary left
+        // it: Current, with its witness. Only the version makes it due, so
+        // this half fails if version 1 is ever current again.
+        let mut record = vault_derivation_record(&state);
+        assert_eq!(record.phase, DerivationPhase::Current);
+        record.derivation_version = 1;
+        record
+            .witness
+            .as_mut()
+            .expect("a Current record has a witness")
+            .derivation_version = 1;
+        save_vault_derivation_record(&state, record);
+        let due = vault_derivation::inspect_next(&state)
+            .unwrap()
+            .expect("a version-1 vault must be re-derived");
+        vault_derivation::migrate_named(&state, &due).unwrap();
+        assert_eq!(low_rows(), 0, "re-derivation rewrites the old 0.95 row");
+        let current = vault_derivation_record(&state);
+        assert_eq!(current.derivation_version, DERIVATION_VERSION);
+        assert_eq!(current.phase, DerivationPhase::Current);
     }
 
     /// A NUL byte in a note's leading 8 KiB is the same policy skip the code
@@ -28198,6 +28452,47 @@ external_model = "unavailable-test-model"
         );
     }
 
+    /// A stale repository with no link to the changed file is
+    /// disclosed, not degrading. The counterweight is the test above: the
+    /// same fixture with the OWNING repository stale degrades.
+    #[tokio::test]
+    async fn an_unrelated_stale_repo_does_not_degrade_pr_impact_through_the_daemon() {
+        let state = nw412_state();
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:nw412:unrelated",
+                "https://github.com/example/unrelated",
+                Some("/tmp/unrelated"),
+            ))
+            .unwrap();
+        nestweaver_engine::resolver_generation::record(&state.db_path, NW412_REPO)
+            .expect("recording the current generation must succeed");
+
+        let value = nw412_pr_impact(state).await;
+
+        assert_eq!(value["gate_state"], serde_json::json!("ok"), "{value}");
+        let notifications = value["notifications"].as_array().expect("notifications");
+        assert!(
+            notifications
+                .iter()
+                .all(|n| n["descriptor"] != serde_json::json!("resolver.generation-stale")),
+            "{value}"
+        );
+        assert!(
+            notifications.iter().any(|n| {
+                n["descriptor"]
+                    == serde_json::json!(
+                        nestweaver_engine::resolver_generation::UNRELATED_STALE_RESOLVER_DESCRIPTOR
+                    )
+                    && n["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains("repo:nw412:unrelated"))
+            }),
+            "the unrelated stale repository must still be disclosed: {value}"
+        );
+    }
+
     /// nw-050: a UDS trusted-admin request must see ALL repos under an enabled
     /// `[authz]` policy. The UDS interceptor is the trusted-local-admin
     /// boundary; before the fix it attached only `IsAdmin(true)` and no
@@ -29207,6 +29502,7 @@ external_model = "unavailable-test-model"
                 extra_ignore_patterns: Vec::new(),
                 force: false,
                 max_note_bytes: 0,
+                vault_name_defaulted: false,
             }))
             .await
             .expect("WatchVault RPC")
@@ -31479,6 +31775,7 @@ mod watcher_e2e_tests {
             extra_ignore_patterns: Vec::new(),
             force,
             max_note_bytes: 0,
+            vault_name_defaulted: false,
         };
 
         let v1 = client

@@ -298,7 +298,91 @@ pub fn repos_json_with_display_name(repos: &[nestweaver_schema::Repo]) -> serde_
     )
 }
 
+/// Why a repository selector did not resolve. The class decides the exit
+/// code and envelope a caller reports, so it travels as a type rather than
+/// being re-read from the message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoSelectorFailure {
+    /// No indexed repository matches.
+    NotFound,
+    /// Several repositories match; the caller must pick one by UID.
+    Ambiguous,
+    /// The selector itself is invalid (empty, or longer than
+    /// [`MAX_REPO_SELECTOR_LEN`]), whatever is indexed.
+    Malformed,
+}
+
+impl RepoSelectorFailure {
+    /// The `status` word callers put in their JSON envelopes.
+    pub fn status(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::Ambiguous => "ambiguous",
+            Self::Malformed => "malformed",
+        }
+    }
+
+    /// Parse [`Self::status`] back, for a class carried across a wire.
+    pub fn from_status(status: &str) -> Option<Self> {
+        match status {
+            "not_found" => Some(Self::NotFound),
+            "ambiguous" => Some(Self::Ambiguous),
+            "malformed" => Some(Self::Malformed),
+            _ => None,
+        }
+    }
+}
+
+/// The longest repository selector any surface accepts, matching the MCP
+/// identifier limit.
+pub const MAX_REPO_SELECTOR_LEN: usize = 512;
+
+/// A repository selector that did not resolve. `Display` is the
+/// human-readable message; `failure` and `candidates` are for callers that
+/// must classify it.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct RepoSelectorError {
+    pub failure: RepoSelectorFailure,
+    /// The matching repository UIDs when ambiguous; empty otherwise.
+    pub candidates: Vec<String>,
+    message: String,
+}
+
+impl RepoSelectorError {
+    /// The error, boxed as the resolver returns it. Public so a
+    /// status-mapping test can build each class without a store.
+    pub fn error(
+        failure: RepoSelectorFailure,
+        candidates: Vec<String>,
+        message: String,
+    ) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            failure,
+            candidates,
+            message,
+        })
+    }
+
+    fn ambiguous(selector: &str, matches: &[&nestweaver_schema::Repo]) -> anyhow::Error {
+        let listed = matches
+            .iter()
+            .map(|repo| format!("{} ({})", repo_display_name(repo), repo.uid))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Self::error(
+            RepoSelectorFailure::Ambiguous,
+            matches.iter().map(|repo| repo.uid.clone()).collect(),
+            format!("repository selector '{selector}' is ambiguous; use an exact UID: {listed}"),
+        )
+    }
+}
+
 /// Resolve a user-facing repository selector deterministically.
+///
+/// Failures are a [`RepoSelectorError`] inside the `anyhow::Error`, so a
+/// caller can tell not found, ambiguous and malformed apart by type.
 ///
 /// Candidates must already be filtered for the caller's authorization scope.
 /// Resolution precedence is exact UID, Unicode-lowercase display name, exact
@@ -309,7 +393,23 @@ pub fn resolve_repo_selector<'a>(
     selector: &str,
 ) -> Result<&'a nestweaver_schema::Repo, anyhow::Error> {
     if selector.trim().is_empty() {
-        anyhow::bail!("repository selector cannot be empty");
+        return Err(RepoSelectorError::error(
+            RepoSelectorFailure::Malformed,
+            Vec::new(),
+            "repository selector cannot be empty".to_string(),
+        ));
+    }
+    if selector.len() > MAX_REPO_SELECTOR_LEN {
+        // The selector is not echoed: an over-long value in an error message
+        // is what used to break the gRPC status header.
+        return Err(RepoSelectorError::error(
+            RepoSelectorFailure::Malformed,
+            Vec::new(),
+            format!(
+                "repository selector is {} bytes; the maximum is {MAX_REPO_SELECTOR_LEN}",
+                selector.len()
+            ),
+        ));
     }
 
     if let Some(repo) = repos.iter().find(|repo| repo.uid == selector) {
@@ -324,16 +424,7 @@ pub fn resolve_repo_selector<'a>(
     match names.as_slice() {
         [repo] => return Ok(*repo),
         [] => {}
-        _ => {
-            let candidates = names
-                .iter()
-                .map(|repo| format!("{} ({})", repo_display_name(repo), repo.uid))
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow::bail!(
-                "repository selector '{selector}' is ambiguous; use an exact UID: {candidates}"
-            );
-        }
+        _ => return Err(RepoSelectorError::ambiguous(selector, &names)),
     }
 
     let exact_locations = repos
@@ -345,16 +436,7 @@ pub fn resolve_repo_selector<'a>(
     match exact_locations.as_slice() {
         [repo] => return Ok(*repo),
         [] => {}
-        _ => {
-            let candidates = exact_locations
-                .iter()
-                .map(|repo| format!("{} ({})", repo_display_name(repo), repo.uid))
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow::bail!(
-                "repository selector '{selector}' is ambiguous; use an exact UID: {candidates}"
-            );
-        }
+        _ => return Err(RepoSelectorError::ambiguous(selector, &exact_locations)),
     }
 
     let matches = repos
@@ -387,26 +469,21 @@ pub fn resolve_repo_selector<'a>(
             } else {
                 String::new()
             };
-            anyhow::bail!(
-                "repo '{selector}' not found in graph; run `nestweaver list-repos` to see \
-                 indexed repos by name/uid{}{suffix}",
-                if known.is_empty() {
-                    String::new()
-                } else {
-                    format!(" — known repos: {}", known.join(", "))
-                }
-            );
+            Err(RepoSelectorError::error(
+                RepoSelectorFailure::NotFound,
+                Vec::new(),
+                format!(
+                    "repo '{selector}' not found in graph; run `nestweaver list-repos` to see \
+                     indexed repos by name/uid{}{suffix}",
+                    if known.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — known repos: {}", known.join(", "))
+                    }
+                ),
+            ))
         }
-        _ => {
-            let candidates = matches
-                .iter()
-                .map(|repo| format!("{} ({})", repo_display_name(repo), repo.uid))
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow::bail!(
-                "repository selector '{selector}' is ambiguous; use an exact UID: {candidates}"
-            )
-        }
+        _ => Err(RepoSelectorError::ambiguous(selector, &matches)),
     }
 }
 
@@ -533,7 +610,8 @@ pub use blast_radius::{
 pub use blast_radius_sarif::{append_contract_breaks_to_sarif, blast_radius_to_sarif};
 pub use brain_docgraph::{
     BrokenLink, CoOccurringTag, DocStats, OrphanDocument, TagCount, TagGraph, TopicCluster,
-    broken_links, doc_stats, orphan_documents, tag_graph, tag_graph_all, topic_clusters,
+    broken_links, broken_links_payload, doc_stats, orphan_documents, split_broken_links, tag_graph,
+    tag_graph_all, topic_clusters,
 };
 pub use brain_memory::{
     ConsolidationManifest, ConsolidationProposal, Contradiction, DanglingRelationship,

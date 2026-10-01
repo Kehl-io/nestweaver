@@ -123,6 +123,11 @@ pub const REPO_FILTER_UNRESOLVED_CODE: &str = "repo-filter-unresolved";
 pub struct RepoFilterUnresolved {
     /// The selector as the caller spelled it.
     pub selector: String,
+    /// Not found, ambiguous or malformed: decides the caller's exit code and
+    /// envelope. Read from the resolver's typed error, never from prose.
+    pub failure: crate::RepoSelectorFailure,
+    /// The matching repository UIDs when ambiguous; empty otherwise.
+    pub candidates: Vec<String>,
     /// The underlying resolver failure, pre-rendered with `{:#}` so the
     /// "ambiguous; use an exact UID: …" candidate list survives — see the
     /// note in `resolve_repo_filter` on why `.context()` is wrong here.
@@ -132,11 +137,48 @@ pub struct RepoFilterUnresolved {
 impl RepoFilterUnresolved {
     /// Public so the daemon's own status-mapping test can build one without
     /// standing up a graph store just to provoke a resolver failure.
+    ///
+    /// An `error` that is not a [`crate::RepoSelectorError`] is classed as
+    /// not found, the class every such caller used before the type existed.
     pub fn new(selector: &str, error: &anyhow::Error) -> Self {
+        let typed = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::RepoSelectorError>());
+        // An over-long selector is not echoed back: it is what used to break
+        // the gRPC status header.
+        let selector = if selector.len() > crate::MAX_REPO_SELECTOR_LEN {
+            format!(
+                "{}…",
+                &selector[..selector.floor_char_boundary(crate::MAX_REPO_SELECTOR_LEN / 8)]
+            )
+        } else {
+            selector.to_string()
+        };
         Self {
-            selector: selector.to_string(),
+            selector,
+            failure: typed.map_or(crate::RepoSelectorFailure::NotFound, |t| t.failure),
+            candidates: typed.map(|t| t.candidates.clone()).unwrap_or_default(),
             rendered: format!("{error:#}"),
         }
+    }
+
+    /// The JSON envelope every surface reports this failure with:
+    /// `{status, error, repo, message}`, plus `candidates` when ambiguous.
+    pub fn envelope(&self) -> serde_json::Value {
+        let mut envelope = serde_json::json!({
+            "status": self.failure.status(),
+            "error": match self.failure {
+                crate::RepoSelectorFailure::NotFound => "not found",
+                crate::RepoSelectorFailure::Ambiguous => "ambiguous",
+                crate::RepoSelectorFailure::Malformed => "malformed",
+            },
+            "repo": self.selector,
+            "message": self.to_string(),
+        });
+        if self.failure == crate::RepoSelectorFailure::Ambiguous {
+            envelope["candidates"] = serde_json::json!(self.candidates);
+        }
+        envelope
     }
 }
 

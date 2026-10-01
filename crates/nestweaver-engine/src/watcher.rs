@@ -737,11 +737,19 @@ impl BrainWatcher {
         // Make sure the Vault node exists — first-time runs (no prior
         // `brain add`) still get a working graph.
         let v_uid = vault_uid(&self.instance_id, &self.vault_root.to_string_lossy());
+        // An empty name keeps a registered vault's own name; later batches
+        // resolve it the same way in the refresh route.
+        let vault_name = crate::vault_registration::effective_vault_name(
+            &store,
+            &v_uid,
+            &self.vault_name,
+            &self.vault_root,
+        );
         // nw-608: before publishing the Vault node below.
         crate::vault_registration::refuse_duplicate_vault_name(
             &store,
             &v_uid,
-            &self.vault_name,
+            &vault_name,
             &self.vault_root,
         )?;
         let _initial_mutation_lease = match self.acquire_mutation_lease("watch_vault_initial") {
@@ -762,7 +770,7 @@ impl BrainWatcher {
             &v_uid,
             &self.vault_root,
             &self.instance_id,
-            &self.vault_name,
+            &vault_name,
         );
         let initial_finalization = self.finalize_graph_publication_with_io(
             initial_publication,
@@ -2115,6 +2123,35 @@ mod tests {
         let copied = store.list_notes(Some(&copy_uid)).unwrap();
         assert_eq!(copied.len(), 1, "{copied:?}");
         assert_eq!(store.list_vaults(None).unwrap().len(), 2);
+    }
+
+    /// Watching a vault registered under a custom name, with no name given,
+    /// keeps that name: both roots here are named `notes`, so defaulting to
+    /// the directory name collided with the other vault and was refused.
+    #[test]
+    fn watching_without_a_name_keeps_the_registered_name() {
+        let _guard = serial_watcher_test();
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("a").join("notes");
+        let second = dir.path().join("b").join("notes");
+        for root in [&first, &second] {
+            std::fs::create_dir_all(root).unwrap();
+            std::fs::write(root.join("Orphan.md"), "# Orphan\n").unwrap();
+        }
+        let first = first.canonicalize().unwrap();
+        let second = second.canonicalize().unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&first, &db_path, "default", "").unwrap();
+        crate::index_md::index_markdown_directory(&second, &db_path, "default", "other").unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
+        let watcher = BrainWatcher::new(&db_path, &second, "default", "");
+        let stop = watcher.shutdown_handle();
+        watcher
+            .with_ready_callback(move || stop.stop())
+            .run_with_store(store.clone(), None)
+            .unwrap();
+        let uid = vault_uid("default", &second.to_string_lossy());
+        assert_eq!(store.lookup_vault(&uid).unwrap().name, "other");
     }
 
     /// nw-653: notes created, edited or deleted while no watcher was

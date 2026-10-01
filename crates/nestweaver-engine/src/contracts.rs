@@ -1517,10 +1517,10 @@ fn resolve_repo_uid(
     let Some(filter) = filter else {
         return Ok(None);
     };
-    let repos = store.list_repos(None)?;
-    Ok(Some(
-        crate::resolve_repo_selector(&repos, filter)?.uid.clone(),
-    ))
+    // Typed like every repo filter, so a caller can tell not found, ambiguous
+    // and malformed apart.
+    let resolved = crate::node_scope::resolve_repo_filter(store, &[filter.to_string()], None)?;
+    Ok(resolved.into_iter().next())
 }
 
 pub fn drift_for_store(

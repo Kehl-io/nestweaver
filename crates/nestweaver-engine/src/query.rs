@@ -4036,7 +4036,18 @@ pub fn service_summary(
             let repos = store
                 .list_repos(instance_id)
                 .map_err(|e| anyhow::anyhow!(e))?;
-            Some(crate::resolve_repo_selector(&repos, selector)?.uid.clone())
+            // Typed like every repo filter, so a caller can tell not found,
+            // ambiguous and malformed apart.
+            Some(
+                crate::resolve_repo_selector(&repos, selector)
+                    .map_err(|error| {
+                        anyhow::Error::new(crate::node_scope::RepoFilterUnresolved::new(
+                            selector, &error,
+                        ))
+                    })?
+                    .uid
+                    .clone(),
+            )
         }
         None => None,
     };

@@ -2244,6 +2244,8 @@ fn index_markdown_since_with_reader_mode(
     let vault_root = reader.root();
     let root_str = vault_root.to_string_lossy().into_owned();
     let v_uid = vault_uid(instance_id, &root_str);
+    let vault_name =
+        &crate::vault_registration::effective_vault_name(store, &v_uid, vault_name, vault_root);
     crate::vault_registration::refuse_duplicate_vault_name(store, &v_uid, vault_name, vault_root)?;
 
     let existing_notes = store
@@ -3514,6 +3516,8 @@ where
     let vault_root = reader.root();
     let root_str = vault_root.to_string_lossy().into_owned();
     let v_uid = vault_uid(instance_id, &root_str);
+    let vault_name =
+        &crate::vault_registration::effective_vault_name(store, &v_uid, vault_name, vault_root);
     // nw-608: before any scan work. The server-mode route names a vault by its
     // repo URL and roots it at a bare clone, so it is not a local registration.
     if record_repo_sha.is_none() {
@@ -4676,13 +4680,15 @@ impl<'a> WikilinkLookup<'a> {
         // runs ABOVE the title tiers — a filename is a stronger claim on a bare
         // `[[Name]]` than a heading is (nw-290).
         //
-        // It must stay at 0.95, not 1.0: `broken_wikilinks` selects
-        // `confidence < 1.0`, and `a_lower_tier_resolution_is_not_broken`
-        // depends on a same-folder match remaining visible there as a
-        // resolved-but-lower-tier row.
+        // An EXACT, UNIQUE name scores 1.0 whichever tier finds it: when the
+        // key is the filename stem of exactly one note and no other note
+        // carries it as a title, there is nothing to be unsure about, and
+        // Obsidian resolves it the same way. The 0.95 / 0.92 / 0.90 tiers
+        // remain for a stem shared by several notes and narrowed by
+        // proximity, which is a lower-confidence resolution.
         // Priorities 2-4 are one ladder over a BARE stem, extracted so the
         // path-qualified fallback below can RE-ENTER it (nw-343).
-        if let Some(candidate) = self.resolve_bare_stem(&key, source_folder) {
+        if let Some(candidate) = self.resolve_bare_stem(&key, source_folder, true) {
             return ResolveOutcome::Resolved(vec![candidate]);
         }
 
@@ -4740,7 +4746,9 @@ impl<'a> WikilinkLookup<'a> {
             && let Some(base) = key.rsplit('/').find(|segment| !segment.is_empty())
             && base != key
         {
-            if let Some(candidate) = self.resolve_bare_stem(base, source_folder) {
+            // `exact: false`: only the basename matched, not the path the
+            // author wrote, so this stays a lower-confidence resolution.
+            if let Some(candidate) = self.resolve_bare_stem(base, source_folder, false) {
                 return ResolveOutcome::Resolved(vec![candidate]);
             }
             // Below the exact-path tiers: only the filename was corroborated,
@@ -4802,7 +4810,29 @@ impl<'a> WikilinkLookup<'a> {
     /// tolerate global ambiguity (they narrow by directory first), 0.90 does
     /// not. Jumping straight to 0.90's global-uniqueness test threw away the
     /// two tiers that could still have answered.
-    fn resolve_bare_stem(&self, key: &str, source_folder: &str) -> Option<ResolveCandidate> {
+    ///
+    /// With `exact`, a key that names exactly one note — its filename stem is
+    /// unique in the vault and no OTHER note has it as a title — resolves at
+    /// 1.0: an exact, unique match is a resolved link, not a lower tier.
+    fn resolve_bare_stem(
+        &self,
+        key: &str,
+        source_folder: &str,
+        exact: bool,
+    ) -> Option<ResolveCandidate> {
+        if exact
+            && let Some(uids) = self.by_stem.get(key)
+            && let [uid] = uids.as_slice()
+            && self
+                .by_title
+                .get(key)
+                .is_none_or(|titled| titled.iter().all(|other| other == uid))
+        {
+            return Some(ResolveCandidate {
+                note_uid: uid.to_string(),
+                confidence: 1.0,
+            });
+        }
         // Priority 2: same-folder filename stem.
         if let Some(uids) = self
             .by_folder_stem
@@ -5681,6 +5711,9 @@ mod tests {
                 "# X\n\n| col |\n| --- |\n| [[Backlog\\|the backlog]] |\n",
             ),
             ("f/Backlog.md", "# Not The Same Title\n"),
+            // A second `Backlog` elsewhere, so the same-folder tier (not an
+            // exact unique match at 1.0) is what resolves it.
+            ("g/Backlog.md", "# Another Backlog\n"),
         ]);
         let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
         assert_eq!(result.unresolved_link_occurrences, 0);
@@ -9709,5 +9742,51 @@ mod duplicate_vault_name_tests {
         .unwrap();
         let unique = index_markdown_directory(&copy, &db, "default", "r4-copy").unwrap();
         assert_eq!(unique.notes_count, 1);
+    }
+
+    /// No name (an empty one) is not a rename. Both roots here are named
+    /// `vault`, so defaulting a refresh of the `other`-named copy to its
+    /// directory name collided with the original and the refresh was refused.
+    /// Without a name a registered vault keeps its own; a new one takes its
+    /// directory's.
+    #[test]
+    fn a_refresh_without_a_name_keeps_the_registered_name_on_both_routes() {
+        let original_dir = tempfile::tempdir().unwrap();
+        let copy_dir = tempfile::tempdir().unwrap();
+        let original = vault_at(original_dir.path(), "original");
+        let copy = vault_at(copy_dir.path(), "copy");
+        let db = original_dir.path().join("brain.lbug");
+        let first = index_markdown_directory(&original, &db, "default", "").unwrap();
+        assert_eq!(
+            first.vault_name, "vault",
+            "a new vault takes its directory's name"
+        );
+        index_markdown_directory(&copy, &db, "default", "other").unwrap();
+
+        let full = index_markdown_directory(&copy, &db, "default", "").unwrap();
+        assert_eq!(full.vault_name, "other");
+        index_markdown_directory_since(&copy, &db, "default", "", std::time::UNIX_EPOCH).unwrap();
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let mut names: Vec<String> = store
+            .list_vaults(None)
+            .unwrap()
+            .into_iter()
+            .map(|vault| vault.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["other".to_string(), "vault".to_string()]);
+        drop(store);
+
+        // Counterweight: an EXPLICIT name equal to the directory's is still a
+        // rename onto the original's name, and is refused.
+        let error = index_markdown_directory(&copy, &db, "default", "vault")
+            .err()
+            .expect("an explicit rename onto another root's name is refused");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<crate::vault_registration::DuplicateVaultName>()),
+            "{error:#}"
+        );
     }
 }

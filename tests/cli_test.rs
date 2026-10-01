@@ -2819,6 +2819,152 @@ fn a_vault_name_already_held_by_another_root_is_refused_by_add_and_watch() {
     assert_eq!(stdout.matches("r4-vault").count(), 1, "{stdout}");
 }
 
+/// The same guard on the RENAME route: a vault already in the graph used to
+/// skip the check entirely, so `brain add b --name other` followed by
+/// `brain add b --name notes` (or `brain refresh b --name NOTES`) left two
+/// vaults named `notes`. Refused like a new root, with the same message and
+/// exit 1. Counterweight: renaming to a free name still works.
+#[test]
+fn renaming_a_registered_vault_to_a_name_another_root_holds_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("a").join("notes");
+    let second = dir.path().join("b").join("notes");
+    for root in [&first, &second] {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join("Orphan.md"), "# Orphan\n\nbody\n").unwrap();
+    }
+    let db_path = dir.path().join("brain.lbug");
+    let brain = |args: &[&str]| {
+        nestweaver_cmd()
+            .arg("brain")
+            .args(args)
+            .arg("--db")
+            .arg(&db_path)
+            .timeout(std::time::Duration::from_secs(120))
+            .output()
+            .unwrap()
+    };
+    let path = |p: &std::path::Path| p.to_string_lossy().to_string();
+    assert!(brain(&["add", &path(&first)]).status.success());
+    assert!(
+        brain(&["add", &path(&second), "--name", "other"])
+            .status
+            .success()
+    );
+
+    for args in [
+        vec![
+            "add".to_string(),
+            path(&second),
+            "--name".into(),
+            "notes".into(),
+        ],
+        vec![
+            "refresh".to_string(),
+            path(&second),
+            "--name".into(),
+            "NOTES".into(),
+        ],
+    ] {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = brain(&args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("a vault named 'notes' is already indexed at")
+                && stderr.contains("brain remove"),
+            "{args:?}: {stderr}"
+        );
+    }
+    let list = brain(&["list", "--json"]);
+    let vaults: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let names: Vec<String> = vaults
+        .as_array()
+        .or_else(|| vaults["vaults"].as_array())
+        .unwrap()
+        .iter()
+        .map(|v| v["name"].as_str().unwrap().to_lowercase())
+        .collect();
+    assert_eq!(
+        names.iter().filter(|n| n.as_str() == "notes").count(),
+        1,
+        "{names:?}"
+    );
+
+    // Counterweight: a rename to a name no other root holds succeeds.
+    assert!(
+        brain(&["add", &path(&second), "--name", "second-notes"])
+            .status
+            .success()
+    );
+}
+
+/// Without `--name`, `brain refresh` and `brain watch` keep a vault's
+/// registered name. They used to default it to the directory name, which for
+/// `b/notes` registered as `other` collided with `a/notes` and was refused.
+#[test]
+fn refresh_and_watch_without_a_name_keep_the_registered_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("a").join("notes");
+    let second = dir.path().join("b").join("notes");
+    for root in [&first, &second] {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join("Orphan.md"), "# Orphan\n\nbody\n").unwrap();
+    }
+    let db_path = dir.path().join("brain.lbug");
+    let brain = |args: &[&str], timeout: u64| {
+        nestweaver_cmd()
+            .arg("brain")
+            .args(args)
+            .arg("--db")
+            .arg(&db_path)
+            .timeout(std::time::Duration::from_secs(timeout))
+            .output()
+            .unwrap()
+    };
+    let path = |p: &std::path::Path| p.to_string_lossy().to_string();
+    assert!(brain(&["add", &path(&first)], 120).status.success());
+    assert!(
+        brain(&["add", &path(&second), "--name", "other"], 120)
+            .status
+            .success()
+    );
+    let names = || {
+        let list = brain(&["list", "--json"], 120);
+        let vaults: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+        let mut names: Vec<String> = vaults
+            .as_array()
+            .or_else(|| vaults["vaults"].as_array())
+            .unwrap()
+            .iter()
+            .map(|v| v["name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        names
+    };
+
+    let refresh = brain(&["refresh", &path(&second)], 120);
+    assert_eq!(
+        refresh.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&refresh.stderr)
+    );
+    assert_eq!(names(), vec!["notes".to_string(), "other".to_string()]);
+
+    // `brain watch` runs until stopped: it must still be running when the
+    // timeout kills it, rather than exit refused.
+    let watch = brain(&["watch", &path(&second)], 8);
+    let stderr = String::from_utf8_lossy(&watch.stderr);
+    assert!(
+        watch.status.code().is_none_or(|code| code == 0),
+        "watch must not be refused: {:?} {stderr}",
+        watch.status
+    );
+    assert!(!stderr.contains("already indexed"), "{stderr}");
+    assert_eq!(names(), vec!["notes".to_string(), "other".to_string()]);
+}
+
 fn index_vault_notes(vault_dir: &std::path::Path, db_path: &std::path::Path) {
     nestweaver_cmd()
         .args(["brain", "add"])
@@ -7339,28 +7485,30 @@ fn a_missing_db_still_reports_db_not_found() {
 // POPULATION, not the page.
 // ---------------------------------------------------------------------------
 
-/// Build a vault with a known, unequal split: six links that resolve at a lower
-/// confidence tier (unique global filename-stem match, 0.90) and three that
-/// resolve to nothing at all.
+/// Build a vault with a known, unequal split of BROKEN links: six ambiguous
+/// ones (a title two notes share) and three that resolve to nothing at all,
+/// plus two low-confidence links (a stem two notes share, narrowed by the
+/// source's folder) that are listed separately and are not broken.
 ///
-/// The store emits the low-confidence group first, so any page shorter than six
-/// is a pure sample of the benign category — which is exactly the shape that
-/// made a 226-unresolved vault print `0 unresolved (genuinely broken)`.
+/// Any page shorter than the broken population is a sample, which is exactly
+/// the shape that made a 226-unresolved vault print `0 unresolved`.
 fn broken_links_vault(root: &std::path::Path) -> std::path::PathBuf {
     let vault = root.join("vault");
-    std::fs::create_dir_all(vault.join("targets")).unwrap();
-    std::fs::create_dir_all(vault.join("sources")).unwrap();
+    for dir in ["one", "two", "sources", "elsewhere"] {
+        std::fs::create_dir_all(vault.join(dir)).unwrap();
+    }
     for i in 1..=6 {
-        // Title deliberately unlike the stem, so the link misses the 1.0
-        // unique-title tier and lands on the 0.90 global-stem tier.
-        std::fs::write(
-            vault.join(format!("targets/stemkey-{i}.md")),
-            format!("---\ntitle: Utterly Different Title {i}\n---\n\nbody\n"),
-        )
-        .unwrap();
+        // Two notes share the title, so `[[Dup Title i]]` is ambiguous.
+        for (dir, stem) in [("one", "first"), ("two", "second")] {
+            std::fs::write(
+                vault.join(format!("{dir}/{stem}-{i}.md")),
+                format!("---\ntitle: Dup Title {i}\n---\n\nbody\n"),
+            )
+            .unwrap();
+        }
         std::fs::write(
             vault.join(format!("sources/src{i}.md")),
-            format!("---\ntitle: Source {i}\n---\n\nSee [[stemkey-{i}]]\n"),
+            format!("---\ntitle: Source {i}\n---\n\nSee [[Dup Title {i}]]\n"),
         )
         .unwrap();
     }
@@ -7368,6 +7516,20 @@ fn broken_links_vault(root: &std::path::Path) -> std::path::PathBuf {
         std::fs::write(
             vault.join(format!("sources/miss{i}.md")),
             format!("---\ntitle: Miss {i}\n---\n\nSee [[Nonexistent Note {i}]]\n"),
+        )
+        .unwrap();
+    }
+    for i in 1..=2 {
+        for dir in ["sources", "elsewhere"] {
+            std::fs::write(
+                vault.join(format!("{dir}/shared-{i}.md")),
+                format!("---\ntitle: Shared {dir} {i}\n---\n\nbody\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            vault.join(format!("sources/near{i}.md")),
+            format!("---\ntitle: Near {i}\n---\n\nSee [[shared-{i}]]\n"),
         )
         .unwrap();
     }
@@ -7401,8 +7563,8 @@ fn broken_links_classification_counts_the_population_not_the_page() {
         .success();
     let full = String::from_utf8(full.get_output().stdout.clone()).unwrap();
     assert!(
-        full.contains("3 unresolved (genuinely broken), 6 resolved"),
-        "the whole population is 3 unresolved / 6 lower-tier: {full}"
+        full.contains("3 unresolved and 6 ambiguous (broken); 2 more resolved"),
+        "the whole population is 3 unresolved / 6 ambiguous / 2 low-confidence: {full}"
     );
 
     let page = nestweaver_cmd()
@@ -7416,7 +7578,7 @@ fn broken_links_classification_counts_the_population_not_the_page() {
         "the page itself is still bounded by --limit: {page}"
     );
     assert!(
-        page.contains("3 unresolved (genuinely broken), 6 resolved"),
+        page.contains("3 unresolved and 6 ambiguous (broken); 2 more resolved"),
         "the classification describes the population, not the page: {page}"
     );
 }
@@ -7442,10 +7604,12 @@ fn broken_links_json_carries_the_population_split() {
         value["unresolved"], 3,
         "the genuinely-broken count is a property of the vault: {out}"
     );
+    assert_eq!(value["ambiguous"], 6, "payload: {out}");
     assert_eq!(
-        value["low_confidence"], 6,
-        "and so is the benign count: {out}"
+        value["low_confidence_total"], 2,
+        "and so is the benign count, which is not in `total`: {out}"
     );
+    assert_eq!(value["low_confidence"].as_array().unwrap().len(), 2);
 }
 
 /// `memory lint` is the second surface onto the same `broken_links` call, so it
@@ -7462,7 +7626,10 @@ fn memory_lint_splits_the_broken_wikilink_count() {
         .success();
     let out = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(
-        out.contains("broken wikilinks:      9 (3 genuinely broken, 6 lower-tier resolutions)"),
+        out.contains(
+            "broken wikilinks:      9 (3 unresolved, 6 ambiguous on this page; \
+             2 low-confidence resolutions listed separately, not broken)"
+        ),
         "the bare length conflates two categories: {out}"
     );
 }
@@ -13818,4 +13985,408 @@ fn spawn_fake_embedding_endpoint() -> String {
         }
     });
     format!("http://{address}")
+}
+
+// ─── Repo-filter failures keep their class on every surface ────────────────
+//
+// Every repo filter resolves through one resolver, and its failure class
+// decides the exit code: not found 2, ambiguous 3 (with the candidates),
+// malformed 64. Each surface below is checked for all three, with a
+// counterweight proving an exact selector still answers.
+
+/// Two indexed repos that share the display name `web-app`, so `web-app` is
+/// ambiguous while each repo's root path selects exactly one.
+fn two_web_apps(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let db_path = root.join("test.lbug");
+    let mut first = None;
+    for (dir, function) in [("one", "greet_one"), ("two", "greet_two")] {
+        let repo = root.join(dir).join("web-app");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join("main.js"),
+            format!(
+                "function {function}(n) {{ return helper_{dir}(n); }}\n\
+                 function helper_{dir}(n) {{ return n; }}\n\
+                 function shared_fn(n) {{ return n; }}\n"
+            ),
+        )
+        .unwrap();
+        nestweaver_cmd()
+            .args(["index", "--repo"])
+            .arg(&repo)
+            .arg("--db")
+            .arg(&db_path)
+            .assert()
+            .success();
+        first.get_or_insert(repo);
+    }
+    (db_path, first.unwrap().canonicalize().unwrap())
+}
+
+/// Run `args(selector)` against `db` and check the three failure classes plus
+/// the exact-selector counterweight.
+fn assert_repo_filter_classes(
+    db: &std::path::Path,
+    exact: &str,
+    malformed: &str,
+    args: impl Fn(&str) -> Vec<String>,
+) {
+    assert_repo_filter_classes_with(db, exact, malformed, Some(0), args);
+}
+
+/// [`assert_repo_filter_classes`] where the exact selector's own exit code
+/// differs (a lookup that then misses on its target, not on the repo).
+fn assert_repo_filter_classes_with(
+    db: &std::path::Path,
+    exact: &str,
+    malformed: &str,
+    exact_code: Option<i32>,
+    args: impl Fn(&str) -> Vec<String>,
+) {
+    let run = |selector: &str| {
+        let output = nestweaver_cmd()
+            .args(args(selector))
+            .arg("--db")
+            .arg(db)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        (output.status.code(), stdout, stderr)
+    };
+    let envelope = |stdout: &str| -> serde_json::Value {
+        serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("expected one JSON envelope ({e}): {stdout:?}"))
+    };
+
+    let (code, stdout, stderr) = run("no-such-repo");
+    assert_eq!(code, Some(2), "not found must exit 2: {stdout}\n{stderr}");
+    assert_eq!(envelope(&stdout)["status"], "not_found", "{stdout}");
+
+    let (code, stdout, stderr) = run("web-app");
+    assert_eq!(code, Some(3), "ambiguous must exit 3: {stdout}\n{stderr}");
+    let payload = envelope(&stdout);
+    assert_eq!(payload["status"], "ambiguous", "{stdout}");
+    assert_eq!(
+        payload["candidates"].as_array().map(Vec::len),
+        Some(2),
+        "an ambiguous selector must name both candidates: {stdout}"
+    );
+
+    let (code, stdout, stderr) = run(malformed);
+    assert_eq!(code, Some(64), "malformed must exit 64: {stdout}\n{stderr}");
+
+    let (code, stdout, stderr) = run(exact);
+    assert_eq!(
+        code, exact_code,
+        "COUNTERWEIGHT: an exact selector still answers: {stdout}\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("repo filter entry") && !stderr.contains("repo filter entry"),
+        "an exact selector must resolve: {stdout}\n{stderr}"
+    );
+}
+
+fn owned(args: &[&str]) -> Vec<String> {
+    args.iter().map(|a| a.to_string()).collect()
+}
+
+#[test]
+fn clusters_repo_filter_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let long = "z".repeat(5000);
+    assert_repo_filter_classes(&db, exact.to_str().unwrap(), &long, |repo| {
+        owned(&["clusters", "--json", "--repo", repo])
+    });
+}
+
+#[test]
+fn dead_code_repo_filter_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let long = "z".repeat(5000);
+    assert_repo_filter_classes(&db, exact.to_str().unwrap(), &long, |repo| {
+        owned(&["dead-code", "--json", "--repo", repo])
+    });
+}
+
+#[test]
+fn brain_context_repo_filter_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let long = "z".repeat(5000);
+    assert_repo_filter_classes(&db, exact.to_str().unwrap(), &long, |repo| {
+        owned(&["brain", "context", "greet_one", "--json", "--repos", repo])
+    });
+}
+
+/// `repo:web-app` used to MERGE both repos (a substring match on the UID)
+/// instead of refusing the ambiguous name.
+#[test]
+fn investigate_repo_scope_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let root = dir.path().to_path_buf();
+    assert_repo_filter_classes(&db, exact.to_str().unwrap(), "", |repo| {
+        vec![
+            "investigate".to_string(),
+            "greet_one".to_string(),
+            "--json".to_string(),
+            "--root".to_string(),
+            root.to_string_lossy().to_string(),
+            "--scope".to_string(),
+            format!("repo:{repo}"),
+        ]
+    });
+}
+
+#[test]
+fn cross_repo_contracts_repo_filter_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let long = "z".repeat(5000);
+    assert_repo_filter_classes(&db, exact.to_str().unwrap(), &long, |repo| {
+        owned(&[
+            "cross-repo-contracts",
+            "greet_one",
+            "--json",
+            "--repo",
+            repo,
+        ])
+    });
+}
+
+/// `impact --repo` used to fall back to substring matching over file paths
+/// and UIDs when the selector did not resolve.
+#[test]
+fn impact_repo_filter_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let long = "z".repeat(5000);
+    assert_repo_filter_classes(&db, exact.to_str().unwrap(), &long, |repo| {
+        owned(&["impact", "greet_one", "--json", "--repo", repo])
+    });
+}
+
+#[test]
+fn flow_trace_repo_filter_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let long = "z".repeat(5000);
+    assert_repo_filter_classes(&db, exact.to_str().unwrap(), &long, |repo| {
+        owned(&["flow-trace", "greet_one", "--json", "--repo", repo])
+    });
+}
+
+#[test]
+fn contracts_list_repo_filter_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let long = "z".repeat(5000);
+    assert_repo_filter_classes(&db, exact.to_str().unwrap(), &long, |repo| {
+        owned(&["contracts", "list", "--json", "--repo", repo])
+    });
+}
+
+#[test]
+fn contracts_drift_repo_filter_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let long = "z".repeat(5000);
+    assert_repo_filter_classes(&db, exact.to_str().unwrap(), &long, |repo| {
+        owned(&["contracts", "drift", "--json", "--repo", repo])
+    });
+}
+
+/// The fixture has no services, so an exact repo resolves and the SERVICE
+/// then misses: still exit 2, but not a repo-filter failure.
+#[test]
+fn service_summary_repo_filter_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let long = "z".repeat(5000);
+    assert_repo_filter_classes_with(&db, exact.to_str().unwrap(), &long, Some(2), |repo| {
+        owned(&["service-summary", "web-app", "--json", "--repo", repo])
+    });
+}
+
+/// A value outside a flag's fixed vocabulary is invalid argv: exit 64 with
+/// the valid values named, not exit 1 with "Internal error".
+#[test]
+fn enum_like_context_flags_reject_unknown_values_as_usage_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = two_web_apps(dir.path());
+    let run = |args: &[&str]| {
+        let output = nestweaver_cmd()
+            .args(args)
+            .arg("--db")
+            .arg(&db)
+            .output()
+            .unwrap();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    };
+    for (args, names) in [
+        (
+            vec!["brain", "context", "greet_one", "--kinds", "bogus"],
+            "Symbol, Note, Section, Tag, Heading",
+        ),
+        (
+            vec!["brain", "context", "greet_one", "--kinds", "Symbol,bogus"],
+            "Symbol, Note, Section, Tag, Heading",
+        ),
+        (
+            vec!["brain", "context", "greet_one", "--intent", "bogus"],
+            "find-definition",
+        ),
+        (
+            vec!["context", "greet_one", "--intent", "bogus"],
+            "find-definition",
+        ),
+    ] {
+        let (code, stderr) = run(&args);
+        assert_eq!(code, Some(64), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("bogus") && stderr.contains(names),
+            "{args:?} must name the valid values: {stderr}"
+        );
+    }
+    // Counterweight: valid values are accepted.
+    for args in [
+        vec![
+            "brain",
+            "context",
+            "greet_one",
+            "--kinds",
+            "Symbol,Symbol/Function",
+        ],
+        vec![
+            "brain",
+            "context",
+            "greet_one",
+            "--intent",
+            "find-definition",
+        ],
+        vec!["context", "greet_one", "--intent", "find-definition"],
+    ] {
+        let (code, stderr) = run(&args);
+        assert_eq!(code, Some(0), "{args:?}: {stderr}");
+    }
+}
+
+/// The direct `affected-tests` route reads declared `[[links]]` from the
+/// config this database's daemon last started with. It never loaded them, so
+/// a stale repository linked to the change only by a declared link was
+/// classed unrelated and the selection was trusted.
+#[test]
+fn direct_affected_tests_honours_a_declared_link_to_a_stale_repo() {
+    use nestweaver_engine::resolver_generation::{
+        RESOLVER_GENERATION, RESOLVER_GENERATION_SIDECAR, load, record,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    for (name, file) in [("mine-repo", "mine.js"), ("other-repo", "other.js")] {
+        let repo = dir.path().join(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join(file), "function f(n) { return n; }\n").unwrap();
+        nestweaver_cmd()
+            .args(["index", "--repo"])
+            .arg(&repo)
+            .arg("--db")
+            .arg(&db_path)
+            .assert()
+            .success();
+    }
+    // `other-repo` claims a resolver generation this binary does not run.
+    let other_uid = {
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        store
+            .list_repos(None)
+            .unwrap()
+            .into_iter()
+            .find(|repo| repo.url.ends_with("other-repo"))
+            .unwrap()
+            .uid
+    };
+    record(&db_path, &other_uid).unwrap();
+    let mut generations = load(&db_path);
+    generations
+        .repos
+        .insert(other_uid.clone(), RESOLVER_GENERATION + 1);
+    std::fs::write(
+        sidecar_path(&db_path, RESOLVER_GENERATION_SIDECAR),
+        serde_json::to_string(&generations).unwrap(),
+    )
+    .unwrap();
+
+    let run = || {
+        let output = nestweaver_cmd()
+            .args(["affected-tests", "--files", "mine.js", "--json", "--db"])
+            .arg(&db_path)
+            .output()
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&output.stdout)));
+        (output.status.code(), payload)
+    };
+
+    // Counterweight: with no declared link the stale repo is unrelated.
+    let (code, payload) = run();
+    assert_eq!(code, Some(0), "{payload}");
+    assert_ne!(payload["refused"], true, "{payload}");
+
+    let config = dir.path().join("instance.toml");
+    std::fs::write(
+        &config,
+        r#"instance_id = "declared-link"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp"
+
+[workspace]
+backend = "local"
+path = "/tmp"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "model"
+summary_model = "model"
+
+[git]
+credential_method = "ssh"
+
+[[links]]
+from = "mine-repo"
+to = "other-repo"
+type = "http-api"
+"#,
+    )
+    .unwrap();
+    nestweaver_daemon::lifecycle::write_last_successful_config(&db_path, &config).unwrap();
+
+    let (code, payload) = run();
+    assert_ne!(code, Some(0), "{payload}");
+    assert_eq!(payload["refused"], true, "{payload}");
+    assert_eq!(
+        payload["resolver_stale_repos"],
+        serde_json::json!([other_uid]),
+        "{payload}"
+    );
+}
+
+/// `cross-repo-refs --repo` disambiguates an AMBIGUOUS symbol name (it
+/// deliberately never scopes a unique one) through the repo resolver, and
+/// reports its failure class like every repo filter.
+#[test]
+fn cross_repo_refs_repo_filter_keeps_its_failure_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, exact) = two_web_apps(dir.path());
+    let long = "z".repeat(5000);
+    assert_repo_filter_classes(&db, exact.to_str().unwrap(), &long, |repo| {
+        owned(&["cross-repo-refs", "shared_fn", "--json", "--repo", repo])
+    });
 }
