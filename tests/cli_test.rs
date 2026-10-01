@@ -13144,6 +13144,74 @@ fn a_pre_cutover_database_is_refused_with_the_rebuild_command_and_left_untouched
     );
 }
 
+/// The direct (CI) write routes refuse a pre-cutover database without
+/// leaving anything behind. The index route records cross-repo link debt when
+/// it ends early; a refusal is not an early end of a write, so it must not
+/// stamp a `.cross_repo_links.json` (or any other sidecar) beside the file.
+#[test]
+fn direct_write_routes_refuse_a_pre_cutover_database_without_writing_a_sidecar() {
+    let sources = tempfile::tempdir().unwrap();
+    let repo = sources.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/a.ts"), "export function f() { return 1; }\n").unwrap();
+    let vault = sources.path().join("vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::write(vault.join("n.md"), "# N\n").unwrap();
+    let repo_arg = repo.display().to_string();
+    let vault_arg = vault.display().to_string();
+    let cases: Vec<Vec<&str>> = vec![
+        vec!["index", "--no-daemon", "--repo", &repo_arg],
+        vec!["index", "--no-daemon", "--force", "--repo", &repo_arg],
+        vec!["brain", "add", &vault_arg],
+        vec!["brain", "refresh", &vault_arg],
+        vec!["brain", "remove", &vault_arg],
+        vec!["remove-repo", "repo"],
+        vec!["repair"],
+        vec!["embed"],
+        vec!["brain", "reindex-search"],
+        vec!["prune-stale"],
+    ];
+    for args in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let db = pre_cutover_db(dir.path());
+        let before = engine_cutover_tree_bytes(dir.path());
+        let output = nestweaver_cmd()
+            .args(&args)
+            .arg("--db")
+            .arg(&db)
+            .output()
+            .unwrap();
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {combined}");
+        assert!(
+            combined.contains("nestweaver::db_rebuild_required"),
+            "{args:?}: {combined}"
+        );
+        let mut after = engine_cutover_tree_bytes(dir.path());
+        // The write lease's empty lock file is the one thing a direct write
+        // route may create before the refusal; it holds no data.
+        if let Some(lock) = after.remove(&std::path::PathBuf::from(format!(
+            "{}.write.lock",
+            db.display()
+        ))) {
+            assert!(lock.is_empty(), "{args:?}: the write lock holds data");
+        }
+        assert_eq!(
+            after.keys().collect::<Vec<_>>(),
+            before.keys().collect::<Vec<_>>(),
+            "{args:?} left files beside the refused database"
+        );
+        assert!(
+            after == before,
+            "{args:?} changed bytes of the refused database"
+        );
+    }
+}
+
 #[test]
 fn the_rebuild_remedy_names_the_config_the_invocation_used() {
     let dir = tempfile::tempdir().unwrap();

@@ -10425,7 +10425,9 @@ fn reconcile_code_links_direct(
 
 /// Record that the direct index route owes a whole-graph cross-repo pass,
 /// and return the store to run it with. When the store cannot be opened the
-/// debt is recorded anyway (the links stay owed and disclosed).
+/// debt is recorded anyway (the links stay owed and disclosed), except when
+/// the database must be rebuilt: that refusal wrote nothing, so nothing is
+/// owed, and the refused file and its directory stay exactly as they were.
 fn record_cross_repo_debt_direct(
     db_path: &Path,
     write_lease: &nestweaver_daemon::lifecycle::DbWriteLease,
@@ -10436,6 +10438,7 @@ fn record_cross_repo_debt_direct(
             nestweaver_engine::cross_repo_links::mark_cross_repo_links_owed(&store, reason);
             Some(store)
         }
+        Err(nestweaver_store::StoreError::RebuildRequired { .. }) => None,
         Err(error) => {
             nestweaver_engine::cross_repo_links::mark_cross_repo_links_pending(db_path, reason);
             tracing::warn!(
