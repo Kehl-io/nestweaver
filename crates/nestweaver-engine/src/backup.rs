@@ -1417,8 +1417,29 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
     // here rather than just before the cutover means a target left broken by
     // an earlier death is repaired even if THIS archive turns out to be
     // invalid.
+    // Recovery can rename `<data>.restoring` back into place before the
+    // occupancy check. Remember that it had something to reconcile, so a
+    // later refusal does not claim the directory was left untouched.
+    let interrupted_restore = restoring_dir_for(&config.data_dir).exists();
     let recovery = recover_interrupted_restore(&config.data_dir)?;
     if !config.replace && restore_target_occupied(&config.data_dir)? {
+        if interrupted_restore || recovery.preserved.is_some() {
+            let preserved = recovery
+                .preserved
+                .as_ref()
+                .map_or_else(String::new, |path| {
+                    format!(
+                        " A copy that could not be proven redundant was kept at {}.",
+                        path.display()
+                    )
+                });
+            anyhow::bail!(
+                "backup restore refused: {} is not empty. An interrupted restore was reconciled \
+                 first, and the archive was not applied.{preserved} Re-run with --force to replace \
+                 this directory.",
+                config.data_dir.display()
+            );
+        }
         anyhow::bail!(
             "backup restore refused: {} is not empty. Restore renames that directory aside and \
              deletes it after the new data is in place. Re-run with --force to replace it. \
@@ -3333,6 +3354,70 @@ mod tests {
         .expect("replace restores over the existing directory");
         assert!(data_dir.join("graph.lbug").exists());
         assert!(!data_dir.join("sentinel.txt").exists());
+    }
+
+    /// A retry of an interrupted restore reconciles the aside copy before it
+    /// decides the target is occupied. The refusal must not claim that
+    /// reconciliation left the directory untouched.
+    #[test]
+    fn restore_without_replace_reports_an_interrupted_restore_it_reconciled() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("a.py"), "def f():\n    return 1\n").unwrap();
+        let db_path = dir.path().join("graph.lbug");
+        crate::index::index_directory(&repo, &db_path, "test", "file:///repo", "sha").unwrap();
+        let snapshot = dir.path().join("out.nwsnap.zst");
+        backup_save(&BackupConfig {
+            db_path,
+            output_path: snapshot.clone(),
+            include_clones: false,
+            instance_id: "test".to_string(),
+            workspace_path: None,
+            overwrite: false,
+        })
+        .unwrap();
+
+        let data_dir = dir.path().join("live");
+        let restoring = restoring_dir_for(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&restoring).unwrap();
+        std::fs::write(data_dir.join("partial.txt"), b"partial").unwrap();
+        std::fs::write(restoring.join("good.txt"), b"good").unwrap();
+        publish_restore_phase(&RestoreJournal {
+            version: RESTORE_JOURNAL_VERSION,
+            phase: RestorePhase::CopyInProgress,
+            data_dir: data_dir.clone(),
+            restoring_dir: restoring.clone(),
+            snapshot_path: snapshot.clone(),
+        })
+        .unwrap();
+
+        let error = backup_restore(&RestoreConfig {
+            snapshot_path: snapshot.clone(),
+            data_dir: data_dir.clone(),
+            replace: false,
+        })
+        .expect_err("a reconciled directory still needs --force");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("interrupted restore was reconciled"),
+            "{message}"
+        );
+        assert!(!message.contains("Nothing in"), "{message}");
+        assert_eq!(std::fs::read(data_dir.join("good.txt")).unwrap(), b"good");
+        assert!(!data_dir.join("partial.txt").exists());
+        assert!(!restoring.exists());
+        assert!(!restore_journal_path(&data_dir).exists());
+
+        backup_restore(&RestoreConfig {
+            snapshot_path: snapshot,
+            data_dir: data_dir.clone(),
+            replace: true,
+        })
+        .expect("force applies the archive after reconciliation");
+        assert!(data_dir.join("graph.lbug").is_file());
+        assert!(!data_dir.join("good.txt").exists());
     }
 
     /// nw-289, defect (2), separated as the finding asks: when a guard DOES
