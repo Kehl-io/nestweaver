@@ -11,9 +11,9 @@ pub(crate) fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
             db,
             config,
             include_clones,
-            // `--force` is obsolete: the daemon now backs up under its own write
-            // lock (there is no client-side quiesce that can fail).
-            force: _,
+            // `--force` overwrites an existing archive. It does not bypass
+            // artifact integrity checks.
+            force,
         } => {
             let db_path = resolve_db_with_config_allowing_legacy_engine(db, config.as_deref())?;
             if !db_path.exists() {
@@ -38,6 +38,7 @@ pub(crate) fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                 include_clones,
                 instance_id: instance_id.clone(),
                 workspace_path,
+                overwrite: force,
             };
 
             let rt = tokio::runtime::Runtime::new()?;
@@ -64,6 +65,7 @@ pub(crate) fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                             .backup(nestweaver_proto::BackupRequest {
                                 output_path: config.output_path.to_string_lossy().into_owned(),
                                 include_clones,
+                                overwrite: config.overwrite,
                             })
                             .await
                     })
@@ -170,6 +172,7 @@ pub(crate) fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
             path,
             data_dir,
             start,
+            force,
         } => {
             eprintln!("Restoring backup from {}...", path.display());
 
@@ -189,6 +192,7 @@ pub(crate) fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
             let config = nestweaver_engine::RestoreConfig {
                 snapshot_path: path,
                 data_dir: data_dir.clone(),
+                replace: force,
             };
 
             let result = with_exclusive_restore_access(&data_dir, || {

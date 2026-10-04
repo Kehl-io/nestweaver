@@ -105,6 +105,9 @@ pub struct BackupConfig {
     pub include_clones: bool,
     pub instance_id: String,
     pub workspace_path: Option<PathBuf>,
+    /// Replace an archive that already exists at `output_path`. Without this,
+    /// save leaves that file untouched.
+    pub overwrite: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +162,10 @@ pub struct BackupResult {
 pub struct RestoreConfig {
     pub snapshot_path: PathBuf,
     pub data_dir: PathBuf,
+    /// Rename a non-empty `data_dir` aside and delete it after the restored
+    /// data is in place. Without this, restore refuses and leaves the
+    /// directory untouched.
+    pub replace: bool,
 }
 
 #[derive(Debug)]
@@ -229,8 +236,9 @@ fn seal_publication_slot_inner(
         include_clones: false,
         instance_id: "publication".to_string(),
         workspace_path: None,
+        overwrite: false,
     };
-    let bundle = build_backup_publication_bundle_inner(
+    let (bundle, _excluded) = build_backup_publication_bundle_inner(
         &config,
         slot_root,
         &identity,
@@ -492,12 +500,15 @@ pub fn package_staged(config: &BackupConfig, staged: StagedBackup) -> anyhow::Re
             .context("exclude legacy activity from backup staging")?;
         warnings.push("Legacy unversioned git-activity scores were excluded from this backup because repository ownership cannot be recovered safely. Graph data is preserved; reindex repositories with --with-git-activity after restore to rebuild activity ranking.".to_string());
     }
-    let mut bundle = build_backup_publication_bundle(
+    let (mut bundle, excluded) = build_backup_publication_bundle(
         config,
         staging.path(),
         &publication_identity,
         source_graph_generation,
     )?;
+    for item in &excluded {
+        warnings.push(format!("excluded rebuildable artifact: {item}"));
+    }
     if pre_cutover_engine {
         // Seal a pre-cutover graph at the pre-cutover format: a reader must
         // never mistake it for a graph this engine can open.
@@ -534,7 +545,7 @@ pub fn package_staged(config: &BackupConfig, staged: StagedBackup) -> anyhow::Re
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
     std::fs::write(staging.path().join("manifest.json"), &manifest_json)?;
 
-    package_tar_zstd(staging.path(), &config.output_path)?;
+    publish_backup_archive(staging.path(), &config.output_path, config.overwrite)?;
 
     // The compressed size is only known after packaging, so it cannot live in
     // the sealed in-archive manifest. Fill it on the returned manifest here;
@@ -1407,6 +1418,15 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
     // an earlier death is repaired even if THIS archive turns out to be
     // invalid.
     let recovery = recover_interrupted_restore(&config.data_dir)?;
+    if !config.replace && restore_target_occupied(&config.data_dir)? {
+        anyhow::bail!(
+            "backup restore refused: {} is not empty. Restore renames that directory aside and \
+             deletes it after the new data is in place. Re-run with --force to replace it. \
+             Nothing in {} was changed.",
+            config.data_dir.display(),
+            config.data_dir.display()
+        );
+    }
 
     // Extract to a sibling temp directory so we can atomically rename on success.
     let parent = config
@@ -1789,7 +1809,7 @@ fn build_backup_publication_bundle(
     staging: &Path,
     identity: &nestweaver_store::PublicationIdentity,
     source_graph_generation: u64,
-) -> anyhow::Result<crate::publication::PublicationBundleV3> {
+) -> anyhow::Result<(crate::publication::PublicationBundleV3, Vec<String>)> {
     build_backup_publication_bundle_inner(config, staging, identity, source_graph_generation, false)
 }
 
@@ -1799,7 +1819,7 @@ fn build_backup_publication_bundle_inner(
     identity: &nestweaver_store::PublicationIdentity,
     source_graph_generation: u64,
     live_writer: bool,
-) -> anyhow::Result<crate::publication::PublicationBundleV3> {
+) -> anyhow::Result<(crate::publication::PublicationBundleV3, Vec<String>)> {
     identity
         .validate()
         .map_err(|error| anyhow::anyhow!("invalid backup publication identity: {error}"))?;
@@ -1859,12 +1879,16 @@ fn build_backup_publication_bundle_inner(
             Ok(contract) => contract,
             Err(error) => {
                 let message = format!("{error:#}");
-                if nestweaver_store::artifact_envelope::is_stale_artifact_generation(&message) {
+                if nestweaver_store::artifact_envelope::is_rebuildable_artifact(&message) {
                     // Drop it from STAGING too, not just from the bundle: the
                     // archive inventory is exact, so a file present on disk
                     // and absent from the manifest fails verification.
+                    // A producer-only mismatch is the same class as a stale
+                    // generation: the payload is rebuildable derived data, and
+                    // readers already refuse it. Foreign identity, a corrupt
+                    // checksum, and an incompatible algorithm stay fatal.
                     std::fs::remove_file(entry.path()).with_context(|| {
-                        format!("exclude stale artifact {}", entry.path().display())
+                        format!("exclude rebuildable artifact {}", entry.path().display())
                     })?;
                     excluded.push(format!("{path}: {message}"));
                 } else {
@@ -1896,9 +1920,9 @@ fn build_backup_publication_bundle_inner(
     }
     if !excluded.is_empty() {
         tracing::warn!(
-            "backup excluded {} derived artifact(s) that describe an older graph \
-             generation; the graph itself is backed up in full and these are \
-             regenerated by the next index:\n  {}",
+            "backup excluded {} rebuildable derived artifact(s); the graph \
+             itself is backed up in full and these are regenerated by the next \
+             index:\n  {}",
             excluded.len(),
             excluded.join("\n  ")
         );
@@ -1912,7 +1936,7 @@ fn build_backup_publication_bundle_inner(
         artifacts,
     };
     bundle.validate_metadata(crate::snapshot::SNAPSHOT_FORMAT_VERSION)?;
-    Ok(bundle)
+    Ok((bundle, excluded))
 }
 
 fn backup_artifact_contract_for_path(
@@ -2299,6 +2323,168 @@ fn validate_restored_logical_identity(
     Ok(())
 }
 
+/// Whether `path` already holds something restore would rename aside.
+fn restore_target_occupied(path: &Path) -> anyhow::Result<bool> {
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => Ok(entries.next().is_some()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => Ok(true),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect restore target {}", path.display()))
+        }
+    }
+}
+
+/// Write the archive beside `output`, then publish it.
+///
+/// The destination is never truncated in place. Without `overwrite`, an
+/// existing destination is left byte-for-byte alone, including a file that
+/// appears after the first existence check. `rename` would replace that file.
+fn publish_backup_archive(staging: &Path, output: &Path, overwrite: bool) -> anyhow::Result<()> {
+    if !overwrite && output.exists() {
+        archive_exists(output)?;
+    }
+    let temp = archive_partial_path(output);
+    if let Some(parent) = temp
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let packaged = package_tar_zstd(staging, &temp);
+    if packaged.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    packaged?;
+    let published = if overwrite {
+        publish_replacing(&temp, output)
+    } else if output.exists() {
+        archive_exists(output)
+    } else {
+        publish_exclusive(&temp, output)
+    };
+    if published.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    published?;
+    let _ = std::fs::remove_file(&temp);
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        let _ = fsync_dir(parent);
+    }
+    Ok(())
+}
+
+fn archive_exists(output: &Path) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "backup refused: {} already exists; re-run with --force to overwrite it. \
+         The existing archive was not modified.",
+        output.display()
+    );
+}
+
+/// Replace `output` with `temp`. A failed rename must not fall back to a copy
+/// that truncates an archive already at `output`.
+fn publish_replacing(temp: &Path, output: &Path) -> anyhow::Result<()> {
+    match std::fs::rename(temp, output) {
+        Ok(()) => Ok(()),
+        Err(error) if output.exists() => Err(error).with_context(|| {
+            format!(
+                "publish backup archive to {}; the existing archive was not modified",
+                output.display()
+            )
+        }),
+        Err(error) => copy_new_file(temp, output).with_context(|| {
+            format!(
+                "publish backup archive to {} after rename failed: {error}",
+                output.display()
+            )
+        }),
+    }
+}
+
+/// Publish without replacing. `hard_link` fails if `output` appeared; `rename`
+/// would have overwritten it.
+fn publish_exclusive(temp: &Path, output: &Path) -> anyhow::Result<()> {
+    match std::fs::hard_link(temp, output) {
+        Ok(()) => Ok(()),
+        Err(error) if is_already_exists(&error) => archive_exists(output),
+        Err(error) => match copy_new_file(temp, output) {
+            Ok(()) => Ok(()),
+            Err(copy_error) if is_already_exists(&copy_error) => archive_exists(output),
+            Err(copy_error) => Err(copy_error).with_context(|| {
+                format!(
+                    "publish backup archive to {} after link failed: {error}",
+                    output.display()
+                )
+            }),
+        },
+    }
+}
+
+fn copy_new_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut source = std::fs::File::open(from)?;
+    let mut dest = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    std::io::copy(&mut source, &mut dest)?;
+    dest.sync_all()?;
+    Ok(())
+}
+
+fn is_already_exists(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::AlreadyExists
+}
+
+fn archive_partial_path(output: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PARTIAL_SEQ: AtomicU64 = AtomicU64::new(0);
+    let mut name = output
+        .file_name()
+        .unwrap_or(std::ffi::OsStr::new("backup.nwsnap.zst"))
+        .to_os_string();
+    // A unique name, not a stable `*.partial`. Exclusive publish links this
+    // file onto `output`; a crash before the link is dropped must not leave a
+    // name the next save will truncate, because that truncation would hit the
+    // published archive too.
+    name.push(format!(
+        ".partial.{}.{}",
+        std::process::id(),
+        PARTIAL_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    match output.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+#[cfg(test)]
+fn leftover_partials(output: &Path) -> bool {
+    let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return false;
+    };
+    let Some(prefix) = output.file_name() else {
+        return false;
+    };
+    let prefix = prefix.to_string_lossy();
+    std::fs::read_dir(parent)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(prefix.as_ref()) && name.contains(".partial.")
+        })
+}
+
 /// Package a staging directory as tar + zstd.
 fn package_tar_zstd(staging: &Path, output: &Path) -> anyhow::Result<()> {
     if let Some(parent) = output.parent() {
@@ -2309,7 +2495,8 @@ fn package_tar_zstd(staging: &Path, output: &Path) -> anyhow::Result<()> {
     let mut tar_builder = tar::Builder::new(encoder);
     tar_builder.append_dir_all(".", staging)?;
     let encoder = tar_builder.into_inner()?;
-    encoder.finish()?;
+    let file = encoder.finish()?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -2646,6 +2833,7 @@ mod tests {
                 include_clones: false,
                 instance_id: "test".into(),
                 workspace_path: None,
+                overwrite: false,
             })
             .unwrap();
             assert_eq!(
@@ -2660,6 +2848,7 @@ mod tests {
             let restored = backup_restore(&RestoreConfig {
                 snapshot_path: output,
                 data_dir: data_dir.clone(),
+                replace: true,
             })
             .unwrap();
             assert_eq!(restored.manifest.warnings, saved.manifest.warnings);
@@ -2697,7 +2886,8 @@ mod tests {
                 output_path: output.clone(),
                 include_clones: false,
                 instance_id: "test".into(),
-                workspace_path: None
+                workspace_path: None,
+                overwrite: false,
             })
             .is_err()
         );
@@ -2734,7 +2924,8 @@ mod tests {
                     output_path: output.clone(),
                     include_clones: false,
                     instance_id: "test".into(),
-                    workspace_path: None
+                    workspace_path: None,
+                    overwrite: false,
                 })
                 .is_err()
             );
@@ -2757,6 +2948,7 @@ mod tests {
             include_clones: false,
             instance_id: "test".to_string(),
             workspace_path: None,
+            overwrite: false,
         };
 
         let result = backup_save(&config).unwrap();
@@ -2799,6 +2991,7 @@ mod tests {
             include_clones: false,
             instance_id: "nested".to_string(),
             workspace_path: None,
+            overwrite: false,
         };
 
         backup_save(&config).unwrap();
@@ -2884,6 +3077,7 @@ mod tests {
             include_clones: false,
             instance_id: "test".to_string(),
             workspace_path: None,
+            overwrite: false,
         });
         assert!(
             result.is_ok(),
@@ -2941,6 +3135,7 @@ mod tests {
             include_clones: false,
             instance_id: "test".to_string(),
             workspace_path: None,
+            overwrite: false,
         });
         assert!(
             result.is_ok(),
@@ -2966,6 +3161,178 @@ mod tests {
             "a stale derived artifact must be excluded, not shipped: {:?}",
             inspected.checksums.keys().collect::<Vec<_>>()
         );
+    }
+
+    /// nw-728. The first upgrade step is `backup save` of a database whose
+    /// derived sidecars were written by the previous release. A producer-only
+    /// mismatch is rebuildable; it must not refuse the archive. `--force` does
+    /// not enter into it.
+    #[test]
+    fn backup_save_excludes_a_sidecar_from_an_older_producer() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("a.py"), "def f():\n    return 1\n").unwrap();
+        let db_path = dir.path().join("graph.lbug");
+        crate::index::index_directory(&repo, &db_path, "test", "file:///repo", "sha").unwrap();
+        let manifests = crate::manifest::manifest_cache_path(&db_path);
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifests).unwrap()).unwrap();
+        envelope["producer_version"] = serde_json::Value::String("10.3.1".to_string());
+        std::fs::write(&manifests, serde_json::to_vec_pretty(&envelope).unwrap()).unwrap();
+
+        let output = dir.path().join("out.nwsnap.zst");
+        let result = backup_save(&BackupConfig {
+            db_path: db_path.clone(),
+            output_path: output.clone(),
+            include_clones: false,
+            instance_id: "test".to_string(),
+            workspace_path: None,
+            overwrite: false,
+        })
+        .expect("an older producer on a rebuildable sidecar must not refuse backup");
+        assert!(
+            result
+                .manifest
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("10.3.1")),
+            "the operator must be told which sidecar was left out: {:?}",
+            result.manifest.warnings
+        );
+        let inspected = backup_inspect(&output).unwrap();
+        assert!(inspected.checksums.contains_key("graph.lbug"));
+        assert!(
+            !inspected
+                .checksums
+                .contains_key("graph.lbug.manifests.json")
+        );
+        assert!(
+            manifests.exists(),
+            "excluding a sidecar from the archive must not delete the live file"
+        );
+    }
+
+    /// Widening the rebuildable exclusion must not ship a sidecar that belongs
+    /// to a different graph.
+    #[test]
+    fn backup_save_still_refuses_a_foreign_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("a.py"), "def f():\n    return 1\n").unwrap();
+        let db_path = dir.path().join("graph.lbug");
+        crate::index::index_directory(&repo, &db_path, "test", "file:///repo", "sha").unwrap();
+        let manifests = crate::manifest::manifest_cache_path(&db_path);
+        let before = std::fs::read(&manifests).unwrap();
+        let mut envelope: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        envelope["brain_uuid"] =
+            serde_json::Value::String("00000000-0000-4000-8000-000000000099".to_string());
+        std::fs::write(&manifests, serde_json::to_vec_pretty(&envelope).unwrap()).unwrap();
+
+        let output = dir.path().join("out.nwsnap.zst");
+        let error = backup_save(&BackupConfig {
+            db_path,
+            output_path: output.clone(),
+            include_clones: false,
+            instance_id: "test".to_string(),
+            workspace_path: None,
+            overwrite: false,
+        })
+        .expect_err("a foreign artifact must still refuse the backup");
+        let message = format!("{error:#}");
+        assert!(message.contains("do not belong to this graph"), "{message}");
+        assert!(message.contains("foreign artifact identity"), "{message}");
+        assert!(
+            !output.exists(),
+            "a refused backup must not publish an archive"
+        );
+    }
+
+    /// nw-727. Save must not truncate an archive that is already at the
+    /// destination, and the bytes that land must be published by rename.
+    #[test]
+    fn backup_save_leaves_an_existing_archive_untouched_without_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("a.py"), "def f():\n    return 1\n").unwrap();
+        let db_path = dir.path().join("graph.lbug");
+        crate::index::index_directory(&repo, &db_path, "test", "file:///repo", "sha").unwrap();
+        let output = dir.path().join("out.nwsnap.zst");
+        std::fs::write(&output, b"keep-me").unwrap();
+
+        let config = BackupConfig {
+            db_path: db_path.clone(),
+            output_path: output.clone(),
+            include_clones: false,
+            instance_id: "test".to_string(),
+            workspace_path: None,
+            overwrite: false,
+        };
+        let error = backup_save(&config).expect_err("an existing archive needs --force");
+        let message = format!("{error:#}");
+        assert!(message.contains("already exists"), "{message}");
+        assert_eq!(std::fs::read(&output).unwrap(), b"keep-me");
+        assert!(!leftover_partials(&output));
+
+        let saved = backup_save(&BackupConfig {
+            overwrite: true,
+            ..config
+        })
+        .expect("overwrite publishes a new archive");
+        assert_ne!(std::fs::read(&output).unwrap(), b"keep-me");
+        assert_eq!(saved.output_path, output);
+        assert!(backup_inspect(&output).is_ok());
+        assert!(!leftover_partials(&output));
+    }
+
+    /// nw-727. Restore must not rename a non-empty data directory aside unless
+    /// the caller asked to replace it.
+    #[test]
+    fn backup_restore_refuses_a_non_empty_data_dir_without_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("a.py"), "def f():\n    return 1\n").unwrap();
+        let db_path = dir.path().join("graph.lbug");
+        crate::index::index_directory(&repo, &db_path, "test", "file:///repo", "sha").unwrap();
+        let snapshot = dir.path().join("out.nwsnap.zst");
+        backup_save(&BackupConfig {
+            db_path,
+            output_path: snapshot.clone(),
+            include_clones: false,
+            instance_id: "test".to_string(),
+            workspace_path: None,
+            overwrite: false,
+        })
+        .unwrap();
+
+        let data_dir = dir.path().join("live");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(data_dir.join("sentinel.txt"), b"keep").unwrap();
+        let error = backup_restore(&RestoreConfig {
+            snapshot_path: snapshot.clone(),
+            data_dir: data_dir.clone(),
+            replace: false,
+        })
+        .expect_err("a non-empty data directory needs --force");
+        let message = format!("{error:#}");
+        assert!(message.contains("not empty"), "{message}");
+        assert_eq!(
+            std::fs::read(data_dir.join("sentinel.txt")).unwrap(),
+            b"keep"
+        );
+        assert!(!data_dir.join("graph.lbug").exists());
+
+        backup_restore(&RestoreConfig {
+            snapshot_path: snapshot,
+            data_dir: data_dir.clone(),
+            replace: true,
+        })
+        .expect("replace restores over the existing directory");
+        assert!(data_dir.join("graph.lbug").exists());
+        assert!(!data_dir.join("sentinel.txt").exists());
     }
 
     /// nw-289, defect (2), separated as the finding asks: when a guard DOES
@@ -3021,6 +3388,7 @@ mod tests {
             include_clones: false,
             instance_id: "test".to_string(),
             workspace_path: None,
+            overwrite: false,
         };
 
         let staged = stage_backup_from_store(&store, &config).expect("stage");
@@ -3056,6 +3424,7 @@ mod tests {
             include_clones: false,
             instance_id: "test".into(),
             workspace_path: None,
+            overwrite: false,
         };
         let error = match stage_backup_from_store(&store_a, &config) {
             Ok(_) => panic!("mismatched store and config unexpectedly produced a staged backup"),
@@ -3084,6 +3453,7 @@ mod tests {
             include_clones: false,
             instance_id: "test".into(),
             workspace_path: None,
+            overwrite: false,
         };
 
         let staged = stage_backup_from_store(&store, &config).unwrap();
@@ -3111,6 +3481,7 @@ mod tests {
             include_clones: false,
             instance_id: "test".into(),
             workspace_path: None,
+            overwrite: false,
         };
         let staged = stage_backup_from_store(&store, &config).unwrap();
         let result = package_staged(&config, staged).unwrap();
@@ -3138,6 +3509,7 @@ mod tests {
             include_clones: false,
             instance_id: "test".into(),
             workspace_path: None,
+            overwrite: false,
         };
         let store = Arc::new(nestweaver_store::GraphStore::open_or_create(&db_path).unwrap());
 
@@ -3201,6 +3573,7 @@ mod tests {
         backup_restore(&RestoreConfig {
             snapshot_path: output,
             data_dir: restore_dir.clone(),
+            replace: true,
         })
         .unwrap();
 
@@ -3231,6 +3604,7 @@ mod tests {
             include_clones: false,
             instance_id: "test".into(),
             workspace_path: None,
+            overwrite: false,
         };
         let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
         let abandoned = crate::index::establish_index_publication_marker_with_io(
@@ -3551,6 +3925,7 @@ mod tests {
         if let Err(error) = backup_restore(&RestoreConfig {
             snapshot_path: PathBuf::from(snapshot),
             data_dir: PathBuf::from(data_dir),
+            replace: true,
         }) {
             eprintln!("child restore returned an error: {error}");
             // A distinct code, so the parent can tell "the restore refused"
@@ -3629,6 +4004,7 @@ mod tests {
                 include_clones: false,
                 instance_id: "crash-test".to_string(),
                 workspace_path: None,
+                overwrite: false,
             })
             .unwrap();
 
@@ -3666,6 +4042,7 @@ mod tests {
             backup_restore(&RestoreConfig {
                 snapshot_path: snapshot.clone(),
                 data_dir: data_dir.clone(),
+                replace: true,
             })
             .unwrap_or_else(|error| panic!("retry after {crash_at}: {error}"));
             assert!(
@@ -3699,6 +4076,7 @@ mod tests {
             include_clones: false,
             instance_id: "validation-failure".to_string(),
             workspace_path: None,
+            overwrite: false,
         })
         .unwrap();
 
@@ -3741,6 +4119,7 @@ mod tests {
         backup_restore(&RestoreConfig {
             snapshot_path: snapshot,
             data_dir: data_dir.clone(),
+            replace: true,
         })
         .expect("the retry after a rolled-back validation failure must succeed");
         assert!(nestweaver_store::GraphStore::open_read_only(&data_dir.join("test.lbug")).is_ok());
@@ -3761,6 +4140,7 @@ mod tests {
             include_clones: false,
             instance_id: "absent-target".to_string(),
             workspace_path: None,
+            overwrite: false,
         })
         .unwrap();
 
@@ -3768,6 +4148,7 @@ mod tests {
         backup_restore(&RestoreConfig {
             snapshot_path: snapshot,
             data_dir: data_dir.clone(),
+            replace: true,
         })
         .unwrap();
 
@@ -3827,6 +4208,7 @@ mod tests {
             include_clones: false,
             instance_id: "test".to_string(),
             workspace_path: None,
+            overwrite: false,
         };
 
         let result = backup_save(&config).unwrap();
@@ -3865,6 +4247,7 @@ mod tests {
             include_clones: false,
             instance_id: "test".to_string(),
             workspace_path: None,
+            overwrite: false,
         };
 
         backup_save(&config).unwrap();
@@ -3873,6 +4256,7 @@ mod tests {
         let restore_config = RestoreConfig {
             snapshot_path: output,
             data_dir: restore_dir.clone(),
+            replace: true,
         };
 
         let result = backup_restore(&restore_config).unwrap();
@@ -3978,6 +4362,7 @@ mod tests {
             include_clones: false,
             instance_id: "test".to_string(),
             workspace_path: None,
+            overwrite: false,
         })
         .unwrap();
 
@@ -3985,6 +4370,7 @@ mod tests {
         let fresh = backup_restore(&RestoreConfig {
             snapshot_path: current.clone(),
             data_dir: dir.path().join("fresh"),
+            replace: true,
         })
         .unwrap();
         assert!(
@@ -4003,6 +4389,7 @@ mod tests {
         let result = backup_restore(&RestoreConfig {
             snapshot_path: legacy,
             data_dir: restore_dir.clone(),
+            replace: true,
         })
         .expect("a pre-cutover archive must still restore");
         let warning = result
@@ -4045,12 +4432,14 @@ mod tests {
             include_clones: false,
             instance_id: "test".to_string(),
             workspace_path: None,
+            overwrite: false,
         })
         .unwrap();
         let restore_dir = dir.path().join("restored");
         backup_restore(&RestoreConfig {
             snapshot_path: archive,
             data_dir: restore_dir.clone(),
+            replace: true,
         })
         .unwrap();
         let restored = restore_dir.join("test.lbug");
@@ -4078,6 +4467,7 @@ mod tests {
                 include_clones: false,
                 instance_id: "test".to_string(),
                 workspace_path: None,
+                overwrite: false,
             };
             backup_save(&config).unwrap();
         }
@@ -4100,6 +4490,7 @@ mod tests {
             include_clones: false,
             instance_id: "test".to_string(),
             workspace_path: None,
+            overwrite: false,
         };
         backup_save(&config).unwrap();
 
@@ -4107,6 +4498,7 @@ mod tests {
         let restore_config = RestoreConfig {
             snapshot_path: output,
             data_dir: restore_dir.clone(),
+            replace: true,
         };
         backup_restore(&restore_config).unwrap();
 
@@ -4140,6 +4532,7 @@ mod tests {
             include_clones: false,
             instance_id: "bare-test".to_string(),
             workspace_path: None,
+            overwrite: false,
         };
 
         let result = backup_save(&config).unwrap();
@@ -4192,6 +4585,7 @@ mod tests {
             include_clones: false,
             instance_id: "default".to_string(),
             workspace_path: None,
+            overwrite: false,
         })
         .expect("a backup must accept the code-links stamp");
         assert!(
@@ -4388,6 +4782,7 @@ mod tests {
             include_clones: false,
             instance_id: "physical-path-hash".into(),
             workspace_path: None,
+            overwrite: false,
         };
         let result = backup_save(&config).unwrap();
         assert_eq!(result.manifest.instance_id, "logical-owner");
@@ -4399,6 +4794,7 @@ mod tests {
         backup_restore(&RestoreConfig {
             snapshot_path: config.output_path,
             data_dir: restored.clone(),
+            replace: true,
         })
         .unwrap();
         let reopened =
@@ -4424,6 +4820,7 @@ mod tests {
             include_clones: false,
             instance_id: "wrong-config".into(),
             workspace_path: None,
+            overwrite: false,
         })
         .unwrap();
         let extracted = dir.path().join("extracted");
@@ -4443,6 +4840,7 @@ mod tests {
         let error = backup_restore(&RestoreConfig {
             snapshot_path: forged,
             data_dir: target.clone(),
+            replace: true,
         })
         .unwrap_err();
         assert!(
@@ -4588,6 +4986,7 @@ mod tests {
             include_clones: false,
             instance_id: "lease-race".to_string(),
             workspace_path: None,
+            overwrite: false,
         })
         .unwrap();
 
@@ -4608,6 +5007,7 @@ mod tests {
         let error = backup_restore(&RestoreConfig {
             snapshot_path: snapshot,
             data_dir: data_dir.clone(),
+            replace: true,
         })
         .expect_err(
             "a bare engine call must be refused while another process holds the target's \
@@ -4670,6 +5070,7 @@ mod tests {
             include_clones: false,
             instance_id: "outer-authority".to_string(),
             workspace_path: None,
+            overwrite: false,
         })
         .unwrap();
 
@@ -4688,6 +5089,7 @@ mod tests {
         backup_restore(&RestoreConfig {
             snapshot_path: snapshot,
             data_dir: data_dir.clone(),
+            replace: true,
         })
         .expect(
             "a caller that already holds the outer authority must not be fought by \
@@ -4726,6 +5128,7 @@ mod tests {
             include_clones: false,
             instance_id: "namespace-only-claim".to_string(),
             workspace_path: None,
+            overwrite: false,
         })
         .unwrap();
 
@@ -4756,6 +5159,7 @@ mod tests {
         let error = backup_restore(&RestoreConfig {
             snapshot_path: snapshot,
             data_dir: data_dir.clone(),
+            replace: true,
         })
         .expect_err(
             "a namespace-only claim must not license Borrowed over a real, unexcluded \
@@ -4818,6 +5222,7 @@ mod hardening_statistics_tests {
             include_clones: false,
             instance_id: "default".into(),
             workspace_path: None,
+            overwrite: false,
         };
         for stage in 0..3 {
             let result = stage_backup_with_statistics(&store, &config, &Fault(stage));

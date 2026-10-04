@@ -6871,6 +6871,7 @@ impl NestWeaverDaemon for DaemonService {
             } else {
                 None
             },
+            overwrite: req.overwrite,
         };
 
         // Stage under exact-worker ownership. Packaging below is detached from

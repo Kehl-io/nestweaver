@@ -9794,7 +9794,7 @@ enum BackupCommands {
         include_clones: bool,
         #[arg(
             long,
-            help = "Proceed even if the daemon is running (backup may be inconsistent)"
+            help = "Overwrite an existing archive. Without this flag, save leaves that file untouched"
         )]
         force: bool,
     },
@@ -9818,6 +9818,11 @@ enum BackupCommands {
         /// Launch the daemon after restore
         #[arg(long)]
         start: bool,
+        #[arg(
+            long,
+            help = "Replace a non-empty data directory. Without this flag, restore leaves that directory untouched"
+        )]
+        force: bool,
     },
 }
 
@@ -33186,6 +33191,10 @@ mod restore_guard_tests {
             path: archive.clone(),
             data_dir: data_dir.path().to_path_buf(),
             start: false,
+            // The fixture directory is not empty. Opt into replacement so the
+            // refusal this test asserts is the write lease, which is acquired
+            // before restore looks at the directory.
+            force: true,
         })
         .expect_err("run_backup must refuse while the write lease is held");
         let rendered = error.to_string();
@@ -33230,6 +33239,7 @@ mod restore_guard_tests {
                     path,
                     data_dir,
                     start,
+                    force: _,
                 } => (path, data_dir, start),
                 _ => panic!("expected a Restore subcommand"),
             }
