@@ -3805,7 +3805,17 @@ fn prepare_index_resolution(
         }
 
         let mut member_of_edges: Vec<ResolvedEdge> = Vec::new();
+        // nw-726. MEMBER_OF is intra-file. An incremental resolution deletes
+        // resolved edges only for the affected files, then inserts every edge
+        // this pass built. Emitting MEMBER_OF for files outside that set
+        // inserts a second copy of edges the delete did not touch.
         for (rel_path, raw_symbols, _, _) in parsed_files_for_resolver {
+            if resolve_filter
+                .as_ref()
+                .is_some_and(|filter| !filter.contains(rel_path.as_str()))
+            {
+                continue;
+            }
             for raw_sym in raw_symbols {
                 if let Some(parent_name) = &raw_sym.parent_name {
                     let key = (rel_path.clone(), parent_name.clone());
@@ -18252,6 +18262,66 @@ impl Counter {
             "expected at least 2 MEMBER_OF edges (new + increment), got {}: {member_of:?}",
             member_of.len()
         );
+    }
+
+    /// nw-726. Editing one file in a multi-file repo used to insert a second
+    /// copy of every other file's MEMBER_OF edges. Three successive edits must
+    /// leave the same count a fresh index of the same tree produces.
+    #[test]
+    fn incremental_reindex_does_not_duplicate_member_of_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let source = |struct_name: &str, edit: u32| {
+            format!(
+                "pub struct {struct_name} {{ value: u32 }}\n\
+                 impl {struct_name} {{\n\
+                     pub fn new() -> Self {{ {struct_name} {{ value: {edit} }} }}\n\
+                     pub fn bump(&mut self) {{ self.value += 1; }}\n\
+                 }}\n"
+            )
+        };
+        fs::write(repo.join("src/a.rs"), source("Alpha", 0)).unwrap();
+        fs::write(repo.join("src/b.rs"), source("Beta", 0)).unwrap();
+        fs::write(repo.join("src/c.rs"), source("Gamma", 0)).unwrap();
+        let db = dir.path().join("graph.lbug");
+        let url = "file:///member-of";
+        let member_of_count = |path: &std::path::Path| {
+            let store = GraphStore::open(path).unwrap();
+            store
+                .load_typed_edges()
+                .unwrap()
+                .iter()
+                .filter(|(_, _, edge_type, _, _)| edge_type == "MEMBER_OF")
+                .count()
+        };
+        index_directory_with_options(&repo, &db, "test", url, "sha0", false, None).unwrap();
+        let initial = member_of_count(&db);
+        assert!(
+            initial >= 6,
+            "three structs with two methods each should emit at least 6 MEMBER_OF edges, got {initial}"
+        );
+        for edit in 1..=3 {
+            fs::write(repo.join("src/a.rs"), source("Alpha", edit)).unwrap();
+            index_directory_with_options(
+                &repo,
+                &db,
+                "test",
+                url,
+                &format!("sha{edit}"),
+                false,
+                None,
+            )
+            .unwrap();
+            let now = member_of_count(&db);
+            assert_eq!(
+                now, initial,
+                "incremental edit {edit} changed the MEMBER_OF count from {initial} to {now}"
+            );
+        }
+        let fresh = dir.path().join("fresh.lbug");
+        index_directory_with_options(&repo, &fresh, "test", url, "fresh", true, None).unwrap();
+        assert_eq!(member_of_count(&db), member_of_count(&fresh));
     }
 
     #[test]
