@@ -664,15 +664,17 @@ pub fn launchd_socket_path(instance_id: &str) -> PathBuf {
 /// path is a second candidate. Linux systemd user units inherit
 /// `XDG_RUNTIME_DIR`, so they stay on the single caller path.
 pub fn daemon_socket_candidates(instance_id: &str) -> Vec<PathBuf> {
-    let mut sockets = vec![socket_path(instance_id)];
+    let caller = socket_path(instance_id);
+    // The second candidate exists only on macOS. Building it inside `cfg`
+    // keeps the binding immutable on Linux, where `-D unused-mut` is denied.
     #[cfg(target_os = "macos")]
     {
         let supervised = launchd_socket_path(instance_id);
-        if supervised != sockets[0] {
-            sockets.push(supervised);
+        if supervised != caller {
+            return vec![caller, supervised];
         }
     }
-    sockets
+    vec![caller]
 }
 
 /// The candidate socket that accepts a connection right now, if any.
@@ -686,15 +688,15 @@ pub fn accepting_daemon_socket(instance_id: &str) -> Option<PathBuf> {
 /// [`daemon_socket_candidates`]: the caller's runtime dir, then the launchd
 /// state dir on macOS when those differ.
 pub fn pidfile_candidates(instance_id: &str) -> Vec<PathBuf> {
-    let mut paths = vec![pidfile_path(instance_id)];
+    let caller = pidfile_path(instance_id);
     #[cfg(target_os = "macos")]
     {
         let supervised = launchd_runtime_dir(instance_id).join("daemon.pid");
-        if supervised != paths[0] {
-            paths.push(supervised);
+        if supervised != caller {
+            return vec![caller, supervised];
         }
     }
-    paths
+    vec![caller]
 }
 
 fn socket_path_in(instance_id: &str, runtime: &Path) -> PathBuf {

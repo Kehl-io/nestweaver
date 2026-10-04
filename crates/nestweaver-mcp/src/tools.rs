@@ -10398,15 +10398,16 @@ fn mcp_socket_candidates(
             .join("daemon.sock"),
         None => mcp_state_socket(instance_id),
     };
-    let mut sockets = vec![caller];
+    // Second candidate is macOS-only. Avoid `mut` so Linux clippy (`-D unused-mut`)
+    // accepts the single-path return.
     #[cfg(target_os = "macos")]
     {
         let supervised = mcp_state_socket(instance_id);
-        if supervised != sockets[0] {
-            sockets.push(supervised);
+        if supervised != caller {
+            return vec![caller, supervised];
         }
     }
-    sockets
+    vec![caller]
 }
 
 #[cfg(feature = "daemon")]
