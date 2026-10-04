@@ -6802,6 +6802,12 @@ impl NestWeaverDaemon for DaemonService {
         &self,
         _request: Request<HealthCheckRequest>,
     ) -> Result<Response<HealthCheckResponse>, Status> {
+        // nw-730 / nw-749. `brain watch` and the UI supervisor poll this RPC
+        // every couple of seconds and hold no streaming call, so the read
+        // counter never moves. Counting the poll itself resets the idle
+        // timer. A registered watcher also fails `is_idle` outright, in case
+        // the controller pauses longer than the timeout between polls.
+        self.state.idle_notify.notify_one();
         let uptime = self.state.start_time.elapsed().as_secs();
         let active = self.state.active_reads.load(Ordering::Relaxed)
             + self.state.active_writes.load(Ordering::Relaxed);
@@ -7056,7 +7062,12 @@ impl NestWeaverDaemon for DaemonService {
 
             let watcher_task = tokio::task::spawn_blocking(move || {
                 wait_for_watcher_predecessors(&state, &predecessors);
-                tracing::info!(vault = %vault_path.display(), "watcher thread started");
+                tracing::info!(
+                    vault = %vault_path.display(),
+                    watcher_id,
+                    owner_pid,
+                    "watcher thread started"
+                );
 
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     watcher.run_with_store(store, on_change)
@@ -7441,6 +7452,9 @@ impl NestWeaverDaemon for DaemonService {
                 read_only: state.read_only,
                 max_note_bytes: vault_derivation::http_max_note_bytes(&state),
             });
+        // nw-749. Browser polls never enter a gRPC ConnectionGuard, so the
+        // UI router notifies the same idle handle the gRPC server uses.
+        let _ = app_state.idle_activity.set(Arc::clone(&state.idle_notify));
         // nw-029: pre-warm PageRank so the first overview/impact query never pays
         // the lazy compute. Fire-and-forget; single-flight (nw-029 T1) makes a
         // concurrent first query wait on this instead of duplicating it. A DB
@@ -11888,12 +11902,43 @@ fn watch_path_allowed(
     Ok(())
 }
 
-/// The daemon is idle only when there is no active read/write AND no index job
-/// in flight. Index jobs bump `indexing_active` (not `active_writes`), so an
-/// idle-timeout check that ignores it could fire mid-index — the same footgun
-/// the shutdown drain already guards against.
-fn is_idle(active_readwrite: u32, indexing_active: bool) -> bool {
-    active_readwrite == 0 && !indexing_active
+/// The daemon is idle only when there is no active read/write, no index job,
+/// and no registered watcher. Index jobs bump `indexing_active` (not
+/// `active_writes`), so an idle-timeout check that ignores it could fire
+/// mid-index — the same footgun the shutdown drain already guards against.
+///
+/// `watcher_attached` is the daemon-side `WatchCode` / `WatchVault`
+/// registration (nw-730). Those RPCs are unary: the CLI returns and polls
+/// health, so a live watcher is not an active read. A registration whose
+/// owner process is already dead does not count — `kill -9` leaves the slot
+/// occupied until the next watch request reclaims it (nw-302), and treating
+/// that corpse as attached would disable idle shutdown for the rest of the
+/// process.
+fn is_idle(active_readwrite: u32, indexing_active: bool, watcher_attached: bool) -> bool {
+    active_readwrite == 0 && !indexing_active && !watcher_attached
+}
+
+/// Whether a watcher registration should hold the daemon past its idle timeout.
+///
+/// `None` means the owner could not be established (TCP, or an in-process
+/// call). That is not evidence of death, so the registration still holds.
+/// A known owner holds only while that process is alive.
+fn watcher_owner_counts_as_attached(owner_pid: Option<i32>) -> bool {
+    match owner_pid {
+        Some(pid) => lifecycle::process_is_live(pid),
+        None => true,
+    }
+}
+
+/// A poisoned watcher lock is treated as attached. Idling out a daemon whose
+/// watcher state cannot be read is the worse failure.
+fn watcher_is_attached(state: &DaemonState) -> bool {
+    match state.watcher_stop.lock() {
+        Ok(guard) => guard
+            .as_ref()
+            .is_some_and(|reg| watcher_owner_counts_as_attached(reg.owner_pid)),
+        Err(_) => true,
+    }
 }
 
 /// gRPC methods that only READ graph/store state. On a read-only snapshot
@@ -14863,11 +14908,11 @@ pub async fn run_server(
                 tokio::select! {
                     _ = notify.notified() => continue,
                     _ = tokio::time::sleep(timeout) => {
-                        if is_idle(
-                            active.active_reads.load(Ordering::Relaxed)
-                                + active.active_writes.load(Ordering::Relaxed),
-                            active.indexing_active.load(Ordering::Relaxed),
-                        ) {
+                        let active_readwrite = active.active_reads.load(Ordering::Relaxed)
+                            + active.active_writes.load(Ordering::Relaxed);
+                        let indexing_active = active.indexing_active.load(Ordering::Relaxed);
+                        let watcher_attached = watcher_is_attached(&active);
+                        if is_idle(active_readwrite, indexing_active, watcher_attached) {
                             tracing::info!(
                                 timeout_secs = timeout.as_secs(),
                                 "idle timeout reached — shutting down"
@@ -14880,6 +14925,12 @@ pub async fn run_server(
                             begin_shutdown_drain(Arc::clone(&active), "idle_timeout");
                             return;
                         }
+                        tracing::debug!(
+                            active_readwrite,
+                            indexing_active,
+                            watcher_attached,
+                            "idle timeout elapsed but the daemon is not idle"
+                        );
                     }
                 }
             }
@@ -23702,11 +23753,44 @@ repos = ["alpha"]
 
     #[test]
     fn idle_requires_no_active_work_or_indexing() {
-        assert!(is_idle(0, false), "no active work and not indexing is idle");
-        assert!(!is_idle(1, false), "active read/write blocks idle");
+        assert!(
+            is_idle(0, false, false),
+            "no active work and not indexing is idle"
+        );
+        assert!(!is_idle(1, false, false), "active read/write blocks idle");
         // An in-flight index job bumps `indexing_active`, not `active_writes`,
         // so it must independently block an idle shutdown.
-        assert!(!is_idle(0, true), "an in-flight index blocks idle shutdown");
+        assert!(
+            !is_idle(0, true, false),
+            "an in-flight index blocks idle shutdown"
+        );
+        // nw-730. A registered watcher is a live session even though its RPC
+        // already returned.
+        assert!(
+            !is_idle(0, false, true),
+            "a registered watcher blocks idle shutdown"
+        );
+    }
+
+    /// nw-730 follow-up. `kill -9` of `brain watch` leaves the registration in
+    /// place until the next watch request reclaims it. That corpse must not
+    /// hold the idle timer; a live owner and an unknown owner still do.
+    #[test]
+    fn a_dead_watcher_owner_does_not_count_as_attached() {
+        assert!(
+            watcher_owner_counts_as_attached(None),
+            "an unknown owner is not evidence the watcher is dead"
+        );
+        assert!(watcher_owner_counts_as_attached(Some(
+            std::process::id() as i32
+        )));
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        child.wait().unwrap();
+        assert!(
+            !watcher_owner_counts_as_attached(Some(pid)),
+            "a watcher whose owner has exited must not hold the daemon"
+        );
     }
 
     #[test]
@@ -29473,6 +29557,7 @@ external_model = "unavailable-test-model"
             state.active_reads.load(Ordering::Relaxed)
                 + state.active_writes.load(Ordering::Relaxed),
             state.indexing_active.load(Ordering::Relaxed),
+            watcher_is_attached(&state),
         ));
 
         let admitted = ConnectionGuard::write(&state)
@@ -30178,6 +30263,24 @@ external_model = "unavailable-test-model"
             .into_inner();
         assert_eq!(resp.pid, std::process::id());
         assert!(resp.embedding_identity_repair);
+    }
+
+    /// nw-730. The watcher's health poll is the only traffic a `brain watch`
+    /// session produces. It has to reset the idle timer or the daemon exits
+    /// out from under the watcher.
+    #[tokio::test]
+    async fn health_check_resets_the_idle_timer() {
+        let state = test_state_with_writer();
+        let notify = Arc::clone(&state.idle_notify);
+        let service = DaemonService::new(state);
+        let notified = notify.notified();
+        service
+            .health_check(Request::new(HealthCheckRequest {}))
+            .await
+            .expect("health check ok");
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .expect("health_check must notify the idle timer");
     }
 
     /// A second watcher registration is refused without force; with

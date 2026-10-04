@@ -146,6 +146,20 @@ async fn json_api_errors(
     rebuilt
 }
 
+/// Reset the daemon idle timer for every UI request (nw-749).
+///
+/// No-op when the router was built outside a daemon (`idle_activity` unset).
+async fn note_http_activity(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some(notify) = state.idle_activity.get() {
+        notify.notify_one();
+    }
+    next.run(request).await
+}
+
 pub fn create_router(state: Arc<AppState>) -> Router {
     // Touch all lazy metric statics so the /metrics endpoint always reports
     // the full set of metric names, even before any events occur.
@@ -269,6 +283,14 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/events", get(routes::events::events))
         .fallback(get(spa_fallback))
         .layer(axum::middleware::from_fn(json_api_errors))
+        // nw-749. Outermost on the UI router so every request, including
+        // static assets and API polls, resets the daemon idle timer. The
+        // admin router is a separate Router and is intentionally not wrapped:
+        // server mode forces the idle timeout off.
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            note_http_activity,
+        ))
         // No CORS layer: the SPA is served same-origin (serve_ui) in production
         // and via Vite's same-origin dev proxy in development, so no
         // cross-origin access is needed. Sending `Access-Control-Allow-Origin: *`
@@ -534,6 +556,41 @@ mod frontend_assets_tests {
         let response = spa_fallback(request).await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// nw-749. A UI poll has to notify the idle handle the daemon installed.
+    #[tokio::test]
+    async fn http_request_notifies_idle_activity() {
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("idle.lbug");
+        let store = nestweaver_store::GraphStore::open_or_create(&db).unwrap();
+        let state = AppState::new(store, None, db);
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        state
+            .idle_activity
+            .set(std::sync::Arc::clone(&notify))
+            .unwrap();
+        let app = Router::new()
+            .route("/api/v1/health", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                std::sync::Arc::clone(&state),
+                note_http_activity,
+            ))
+            .with_state(state);
+        let notified = notify.notified();
+        app.oneshot(
+            Request::builder()
+                .uri("/api/v1/health")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .expect("an HTTP request must reset the idle timer");
     }
 }
 

@@ -536,7 +536,23 @@ pub fn runtime_dir(instance_id: &str) -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
         return PathBuf::from(xdg).join("nestweaver").join(instance_id);
     }
+    state_runtime_dir(instance_id)
+}
 
+/// Runtime directory a launchd-supervised daemon actually binds.
+///
+/// launchd does not inherit the installing shell's environment, and the plist
+/// does not bake `XDG_RUNTIME_DIR`. The supervised process therefore always
+/// resolves [`runtime_dir`] with that variable unset — the state-dir fallback
+/// below. A client that has `XDG_RUNTIME_DIR` set must still look here before
+/// deciding the instance is down (nw-729). Callers keep using [`runtime_dir`]
+/// for processes that do inherit their environment; this function is only the
+/// supervised location.
+pub fn launchd_runtime_dir(instance_id: &str) -> PathBuf {
+    state_runtime_dir(instance_id)
+}
+
+fn state_runtime_dir(instance_id: &str) -> PathBuf {
     // Stable per-user directory that doesn't depend on caller env.
     // Co-located with daemon logs (which already use this path).
     dirs::state_dir()
@@ -633,7 +649,58 @@ fn secure_fallback_sock_dir(dir: &Path, expected_uid: u32) -> std::io::Result<Fa
 /// fall back to the (over-long) runtime-dir path so the bind fails loudly
 /// instead of trusting the squatted dir.
 pub fn socket_path(instance_id: &str) -> PathBuf {
-    let default = runtime_dir(instance_id).join("daemon.sock");
+    socket_path_in(instance_id, &runtime_dir(instance_id))
+}
+
+/// Socket path a launchd-supervised daemon binds. See [`launchd_runtime_dir`].
+pub fn launchd_socket_path(instance_id: &str) -> PathBuf {
+    socket_path_in(instance_id, &launchd_runtime_dir(instance_id))
+}
+
+/// Sockets a client may find this instance listening on.
+///
+/// The caller's [`socket_path`] is first. On macOS a launchd job binds
+/// [`launchd_socket_path`] instead whenever `XDG_RUNTIME_DIR` differs, so that
+/// path is a second candidate. Linux systemd user units inherit
+/// `XDG_RUNTIME_DIR`, so they stay on the single caller path.
+pub fn daemon_socket_candidates(instance_id: &str) -> Vec<PathBuf> {
+    let caller = socket_path(instance_id);
+    // The second candidate exists only on macOS. Building it inside `cfg`
+    // keeps the binding immutable on Linux, where `-D unused-mut` is denied.
+    #[cfg(target_os = "macos")]
+    {
+        let supervised = launchd_socket_path(instance_id);
+        if supervised != caller {
+            return vec![caller, supervised];
+        }
+    }
+    vec![caller]
+}
+
+/// The candidate socket that accepts a connection right now, if any.
+pub fn accepting_daemon_socket(instance_id: &str) -> Option<PathBuf> {
+    daemon_socket_candidates(instance_id)
+        .into_iter()
+        .find(|path| std::os::unix::net::UnixStream::connect(path).is_ok())
+}
+
+/// Pidfiles a client may find this instance's flock on. Same split as
+/// [`daemon_socket_candidates`]: the caller's runtime dir, then the launchd
+/// state dir on macOS when those differ.
+pub fn pidfile_candidates(instance_id: &str) -> Vec<PathBuf> {
+    let caller = pidfile_path(instance_id);
+    #[cfg(target_os = "macos")]
+    {
+        let supervised = launchd_runtime_dir(instance_id).join("daemon.pid");
+        if supervised != caller {
+            return vec![caller, supervised];
+        }
+    }
+    vec![caller]
+}
+
+fn socket_path_in(instance_id: &str, runtime: &Path) -> PathBuf {
+    let default = runtime.join("daemon.sock");
     if default.as_os_str().len() < SUN_PATH_LIMIT {
         return default;
     }
@@ -1442,7 +1509,13 @@ pub fn write_effective_config_binding(
 pub fn read_effective_config_binding(
     instance_id: &str,
 ) -> Result<EffectiveConfigBinding, EffectiveConfigBindingError> {
-    let path = effective_config_binding_path(instance_id);
+    read_effective_config_binding_at(&effective_config_binding_path(instance_id))
+}
+
+fn read_effective_config_binding_at(
+    path: &Path,
+) -> Result<EffectiveConfigBinding, EffectiveConfigBindingError> {
+    let path = path.to_path_buf();
     #[cfg(unix)]
     {
         let parent = path
@@ -1560,15 +1633,69 @@ pub fn read_effective_config_binding_for_verified_pid(
     instance_id: &str,
     expected_pid: u32,
 ) -> Result<EffectiveConfigBinding, EffectiveConfigBindingError> {
-    let binding = read_effective_config_binding(instance_id)?;
-    if binding.pid != expected_pid {
-        return Err(EffectiveConfigBindingError::PidMismatch {
-            path: effective_config_binding_path(instance_id),
-            expected: expected_pid,
-            found: binding.pid,
-        });
+    let caller_path = effective_config_binding_path(instance_id);
+    match read_effective_config_binding(instance_id) {
+        Ok(binding) if binding.pid == expected_pid => Ok(binding),
+        // A record in the caller's runtime dir for a different process does
+        // not describe the PID the caller already verified. When that dir is
+        // not the one launchd bound, the supervised binding may still match.
+        Ok(binding) => match read_launchd_binding_for_verified_pid(
+            instance_id,
+            expected_pid,
+            caller_path.clone(),
+        ) {
+            Ok(supervised) => Ok(supervised),
+            Err(_) => Err(EffectiveConfigBindingError::PidMismatch {
+                path: caller_path,
+                expected: expected_pid,
+                found: binding.pid,
+            }),
+        },
+        // The caller's runtime dir has no binding. A launchd daemon writes
+        // its binding beside the socket it actually bound, which ignores
+        // XDG_RUNTIME_DIR (nw-729). Accept that record only when its PID is
+        // the one the caller already verified — a stale file for a different
+        // process stays Absent rather than becoming a PidMismatch.
+        Err(EffectiveConfigBindingError::Absent { path }) => {
+            read_launchd_binding_for_verified_pid(instance_id, expected_pid, path)
+        }
+        // `daemon start` creates the caller's runtime dir (mode follows the
+        // umask, often 0755) before it knows a launchd job is already
+        // healthy. That manufactured directory is Unsafe, not Absent, and
+        // used to hide the supervised binding. Trust the launchd record when
+        // it matches the verified PID; if it does not, keep the Unsafe error.
+        // Same-path lookups never substitute: the launchd path is this path,
+        // so a loose real runtime dir still fails closed.
+        Err(error @ EffectiveConfigBindingError::Unsafe { .. }) => {
+            match read_launchd_binding_for_verified_pid(instance_id, expected_pid, caller_path) {
+                Ok(supervised) => Ok(supervised),
+                Err(_) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
     }
-    Ok(binding)
+}
+
+fn read_launchd_binding_for_verified_pid(
+    instance_id: &str,
+    expected_pid: u32,
+    absent: PathBuf,
+) -> Result<EffectiveConfigBinding, EffectiveConfigBindingError> {
+    #[cfg(target_os = "macos")]
+    {
+        let alt = launchd_runtime_dir(instance_id).join(EFFECTIVE_CONFIG_BINDING_FILE);
+        if alt != effective_config_binding_path(instance_id)
+            && let Ok(binding) = read_effective_config_binding_at(&alt)
+            && binding.pid == expected_pid
+        {
+            return Ok(binding);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (instance_id, expected_pid);
+    }
+    Err(EffectiveConfigBindingError::Absent { path: absent })
 }
 
 /// Remove an instance's live binding. Absence is already the desired state.
@@ -1896,10 +2023,19 @@ pub fn note_deliberate_daemon_kill(instance_id: &str) {
 /// guaranteed not to hold the tracing error they are looking for, which is the
 /// dead end this hint exists to avoid.
 pub fn log_hint(instance_id: &str) -> String {
+    log_hint_for_dir(&log_dir(instance_id))
+}
+
+/// Same wording as [`log_hint`], for a directory the caller already resolved.
+///
+/// Status uses this when the accepting socket is the launchd socket: that
+/// job's stderr was baked into the state dir at install time, while
+/// [`log_dir`] follows the caller's `XDG_STATE_HOME`.
+pub fn log_hint_for_dir(dir: &Path) -> String {
     format!(
         "{} — `daemon.log` is stderr; `daemon.log.<date>` has the structured \
          boot timing and errors",
-        log_dir(instance_id).display()
+        dir.display()
     )
 }
 
@@ -3958,6 +4094,100 @@ mod tests {
         unsafe {
             std::env::remove_var("XDG_RUNTIME_DIR");
         }
+    }
+
+    /// nw-729. The launchd job does not see the caller's XDG_RUNTIME_DIR, so
+    /// its socket must stay on the state-dir path even while a client is
+    /// pointed at a different runtime dir.
+    #[test]
+    fn launchd_runtime_dir_ignores_xdg_runtime_dir() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+        let id = "xdghide1";
+        assert_eq!(launchd_runtime_dir(id), runtime_dir(id));
+        assert_eq!(launchd_socket_path(id), socket_path(id));
+        assert_eq!(daemon_socket_candidates(id), vec![socket_path(id)]);
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", "/tmp/nw-xdg-hide-test");
+        }
+        assert_eq!(
+            runtime_dir(id),
+            PathBuf::from("/tmp/nw-xdg-hide-test/nestweaver/xdghide1")
+        );
+        assert_ne!(launchd_runtime_dir(id), runtime_dir(id));
+        assert!(
+            !launchd_runtime_dir(id).starts_with("/tmp/nw-xdg-hide-test"),
+            "supervised runtime dir must not follow the caller's XDG_RUNTIME_DIR"
+        );
+        let candidates = daemon_socket_candidates(id);
+        assert_eq!(candidates[0], socket_path(id));
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(candidates.len(), 2);
+            assert_eq!(candidates[1], launchd_socket_path(id));
+            assert_eq!(pidfile_candidates(id).len(), 2);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(candidates.len(), 1);
+        }
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+    }
+
+    /// nw-729. `daemon start` creates the caller's runtime dir before it
+    /// discovers the launchd job, and umask makes that dir 0755. The binding
+    /// read must still return the supervised record for the verified PID
+    /// instead of failing closed on the directory this process just created.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn verified_pid_binding_ignores_an_unsafe_foreign_runtime_dir() {
+        struct RemoveOnDrop(PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let id = "t729bind";
+        let xdg = std::env::temp_dir().join("nw-t729bind-xdg");
+        let _cleanup_xdg = RemoveOnDrop(xdg.clone());
+        let caller_dir = xdg.join("nestweaver").join(id);
+        std::fs::create_dir_all(&caller_dir).unwrap();
+        std::fs::set_permissions(&caller_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let supervised_dir = launchd_runtime_dir(id);
+        let _cleanup_supervised = RemoveOnDrop(supervised_dir.clone());
+        std::fs::create_dir_all(&supervised_dir).unwrap();
+        std::fs::set_permissions(&supervised_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let binding =
+            EffectiveConfigBinding::new(4242, EffectiveConfigBindingSource::CompiledDefaults);
+        let bytes = serde_json::to_vec(&binding).unwrap();
+        let binding_path = supervised_dir.join(EFFECTIVE_CONFIG_BINDING_FILE);
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&binding_path)
+                .unwrap();
+            file.write_all(&bytes).unwrap();
+        }
+        with_xdg_runtime(&xdg, || {
+            let read = read_effective_config_binding_for_verified_pid(id, 4242)
+                .expect("supervised binding must win over an unsafe caller dir");
+            assert_eq!(read.pid, 4242);
+            assert!(matches!(
+                read.effective_config,
+                EffectiveConfigBindingSource::CompiledDefaults
+            ));
+        });
     }
 
     #[test]

@@ -345,6 +345,10 @@ pub fn run_stdio_server_daemon(
     db_path: &std::path::Path,
 ) -> Result<(), anyhow::Error> {
     tools::set_lite_mode(lite);
+    tools::set_stdio_daemon_db(db_path);
+    // nw-730. Kept alive for the session so an idle timeout cannot reap the
+    // daemon between tool calls. Dropped when this function returns.
+    let _heartbeat = tools::spawn_mcp_daemon_heartbeat(db_path);
 
     let tracker: Option<nestweaver_engine::InteractionTracker> = if track_interactions {
         Some(nestweaver_engine::InteractionTracker::new(db_path))

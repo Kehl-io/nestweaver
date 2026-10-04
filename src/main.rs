@@ -24432,6 +24432,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                         return Ok((EXIT_SUCCESS, None));
                                     }
                                     Err(error) if launchd_owned || live_pidfile => {
+                                        // nw-729. A healthy job bound on the
+                                        // state-dir socket is not this
+                                        // process's to replace, even when it
+                                        // is still on compiled defaults. Say
+                                        // so before the displacement line,
+                                        // which would otherwise claim a
+                                        // replacement that the guard below
+                                        // then refuses.
+                                        if let Some(socket) =
+                                            nestweaver_daemon::launchd::hidden_healthy_socket(
+                                                &instance_id,
+                                            )
+                                        {
+                                            eprintln!(
+                                                "Daemon already running under launchd (socket {}). \
+                                                 Not replacing a healthy job from a different runtime directory. \
+                                                 Stop it with `nestweaver daemon --db {} stop` before installing \
+                                                 a new agent.",
+                                                socket.display(),
+                                                db_path.display()
+                                            );
+                                            return Ok((EXIT_SUCCESS, None));
+                                        }
                                         // Self-heal. An incumbent attesting
                                         // CompiledDefaults provenance IS the bad
                                         // state this item exists to fix, and
@@ -24539,6 +24562,31 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 start_at_login,
                             );
 
+                            // nw-729. A client whose XDG_RUNTIME_DIR hides the
+                            // supervised socket used to reach this bootout and
+                            // rewrite StandardOut/ErrorPath into its own state
+                            // dir. A loaded job whose socket accepts is
+                            // attached to, not replaced. A dead registration
+                            // (loaded, socket down) still falls through so
+                            // crash recovery can reinstall. Same-path starts
+                            // are unchanged: hidden_healthy_socket is None
+                            // when the caller already sees the supervised
+                            // socket, so an explicit config displacement of a
+                            // compiled-defaults daemon still works.
+                            if let Some(socket) =
+                                nestweaver_daemon::launchd::hidden_healthy_socket(&instance_id)
+                            {
+                                eprintln!(
+                                    "Daemon already running under launchd (socket {}). \
+                                     Not replacing a healthy job from a different runtime directory. \
+                                     Stop it with `nestweaver daemon --db {} stop` before installing \
+                                     a new agent.",
+                                    socket.display(),
+                                    db_path.display()
+                                );
+                                return Ok((EXIT_SUCCESS, None));
+                            }
+
                             // Clean up any existing agent or fork-based daemon
                             // before installing the new plist.
                             //
@@ -24623,7 +24671,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 nestweaver_daemon::lifecycle::launchd_plist_path(&instance_id)
                                     .display()
                             );
-                            eprintln!("  Socket: {}", socket.display());
+                            eprintln!(
+                                "  Socket: {}",
+                                nestweaver_daemon::lifecycle::launchd_socket_path(&instance_id)
+                                    .display()
+                            );
                             eprintln!("  Log:    {log_hint}");
 
                             // Poll connect_existing + health_check
@@ -25544,6 +25596,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_SUCCESS, None))
                 }
                 DaemonAction::Status { json } => {
+                    // nw-729. Reachability follows the socket that accepts.
+                    // A launchd job binds the state-dir socket, which a client
+                    // with `XDG_RUNTIME_DIR` set does not compute. Reporting
+                    // that caller's missing socket as UNREACHABLE told
+                    // operators to kill a healthy daemon.
+                    let caller_socket = socket.clone();
+                    let socket =
+                        nestweaver_daemon::lifecycle::accepting_daemon_socket(&instance_id)
+                            .unwrap_or(caller_socket.clone());
+                    let log_hint = if socket != caller_socket {
+                        nestweaver_daemon::log_hint_for_dir(
+                            &nestweaver_daemon::lifecycle::launchd_runtime_dir(&instance_id),
+                        )
+                    } else {
+                        log_hint
+                    };
                     let (reachable, endpoint_error) =
                         match daemon_status_reachable_pid(&db_path, &socket) {
                             Ok(pid) => (pid, None),
