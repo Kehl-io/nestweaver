@@ -7911,7 +7911,7 @@ impl NestWeaverDaemon for DaemonService {
             .limits(index_limits)
             .excludes(&repo_excludes)
             .unskip(&repo_unskip)
-            .write_gate(write_lock, "index_repo");
+            .write_gate(write_lock.clone(), "index_repo");
 
             #[cfg(feature = "release-fixture-hooks")]
             let fixture_scope = match nestweaver_engine::release_fixture::begin_index(
@@ -8135,18 +8135,21 @@ impl NestWeaverDaemon for DaemonService {
                         }
                     }
 
-                    // Trigram index.
+                    // Trigram index. The index write gate was released at the
+                    // graph-write boundary. Take it again so this refresh
+                    // cannot open a second write transaction beside
+                    // vault_derivation or code_link_reconcile (nw-756).
                     let mut trigram_refresh = None;
                     if with_trigrams {
                         let _ = tx.blocking_send(Ok(IndexProgress {
                             message: "Refreshing trigram index...".to_string(),
                             ..Default::default()
                         }));
-                        let refresh = if rebuild_trigrams {
-                            state.store.rebuild_trigram_index()
-                        } else {
-                            state.store.refresh_trigram_index(false)
-                        };
+                        let refresh = refresh_requested_trigram_index(
+                            &state.store,
+                            &write_lock,
+                            rebuild_trigrams,
+                        );
                         match refresh {
                             Ok(stats) => {
                                 tracing::info!(?stats, "trigram index refreshed");
@@ -8167,6 +8170,7 @@ impl NestWeaverDaemon for DaemonService {
                                 }));
                             }
                             Err(e) => {
+                                // Logged inside refresh_requested_trigram_index.
                                 let _ = tx.blocking_send(Ok(IndexProgress {
                                     phase: Phase::Error as i32,
                                     message: format!(
@@ -13398,6 +13402,40 @@ fn resolve_trigram_policy(
             legacy_with_trigrams || daemon_config_enabled
         }
     }
+}
+
+/// Refresh trigrams under the daemon write gate.
+///
+/// IndexRepo releases the gate at the graph-write boundary, then used to call
+/// `refresh_trigram_index` with no gate at all. That opens a Ladybug write
+/// transaction of its own and collides with `vault_derivation` and
+/// `code_link_reconcile`, which are already queued on the same gate. A failure
+/// is logged at ERROR; the Ok path stays at INFO in the caller.
+fn refresh_requested_trigram_index(
+    store: &nestweaver_store::GraphStore,
+    gate: &WriteGate,
+    rebuild: bool,
+) -> Result<nestweaver_store::TrigramRefreshStats, nestweaver_store::StoreError> {
+    refresh_requested_trigram_index_with(store, gate, rebuild, &mut || {})
+}
+
+fn refresh_requested_trigram_index_with(
+    store: &nestweaver_store::GraphStore,
+    gate: &WriteGate,
+    rebuild: bool,
+    on_locked: &mut dyn FnMut(),
+) -> Result<nestweaver_store::TrigramRefreshStats, nestweaver_store::StoreError> {
+    let _lease = gate.blocking_lock("index_repo_trigram_refresh");
+    on_locked();
+    let result = if rebuild {
+        store.rebuild_trigram_index()
+    } else {
+        store.refresh_trigram_index(false)
+    };
+    if let Err(error) = &result {
+        tracing::error!(%error, "requested trigram refresh failed");
+    }
+    result
 }
 
 /// The artifact mode daemon STARTUP loads under.
@@ -31538,6 +31576,139 @@ mod watch_path_allowed_tests {
             resolve_trigram_policy(Unspecified, true, false),
             "an old client's with_trigrams=true must still be honoured"
         );
+    }
+
+    /// nw-756. While this refresh holds the write gate, the two background
+    /// writers that collided with it stay queued instead of opening their own
+    /// transactions.
+    #[test]
+    fn requested_trigram_refresh_keeps_background_writers_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let store = std::sync::Arc::new(
+            nestweaver_store::GraphStore::open_or_create(&db).expect("scratch database"),
+        );
+        let gate = super::WriteGate::new();
+        let joins = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let parked = std::sync::Arc::clone(&joins);
+        let parked_gate = gate.clone();
+        super::refresh_requested_trigram_index_with(&store, &gate, true, &mut || {
+            for label in ["vault_derivation", "code_link_reconcile"] {
+                let waiter_gate = parked_gate.clone();
+                parked.lock().unwrap().push(std::thread::spawn(move || {
+                    let _lease = waiter_gate.blocking_lock(label);
+                }));
+            }
+            let started = std::time::Instant::now();
+            while parked_gate.waiting() < 2 {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(5),
+                    "background writers did not queue behind the trigram refresh"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(
+                parked_gate.holder_snapshot().map(|(what, _)| what),
+                Some("index_repo_trigram_refresh".to_string())
+            );
+        })
+        .expect("trigram refresh on a scratch database");
+        for handle in joins.lock().unwrap().drain(..) {
+            handle
+                .join()
+                .expect("queued writer finishes after the refresh");
+        }
+        assert_eq!(gate.waiting(), 0);
+        assert!(gate.holder_snapshot().is_none());
+    }
+
+    /// nw-756, the other direction: a writer that already holds the gate keeps
+    /// the refresh from opening its transaction until that writer finishes.
+    #[test]
+    fn requested_trigram_refresh_waits_for_the_write_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let store = std::sync::Arc::new(
+            nestweaver_store::GraphStore::open_or_create(&db).expect("scratch database"),
+        );
+        let gate = super::WriteGate::new();
+        let held = gate.blocking_lock("vault_derivation");
+        let refresh_store = std::sync::Arc::clone(&store);
+        let refresh_gate = gate.clone();
+        let refresh = std::thread::spawn(move || {
+            super::refresh_requested_trigram_index(&refresh_store, &refresh_gate, false)
+        });
+        let started = std::time::Instant::now();
+        while gate.waiting() == 0 {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "refresh did not wait on the write gate"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            gate.holder_snapshot().map(|(what, _)| what),
+            Some("vault_derivation".to_string())
+        );
+        drop(held);
+        refresh
+            .join()
+            .expect("refresh thread")
+            .expect("refresh succeeds after the holder releases the gate");
+    }
+
+    /// nw-757. The failure arm must be an ERROR log line, not only a progress
+    /// message the operator has to be watching.
+    #[test]
+    fn a_failed_trigram_refresh_is_logged_at_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("a.py"), "def f():\n    return 1\n").unwrap();
+        let db = dir.path().join("graph.lbug");
+        nestweaver_engine::index::index_directory(&repo, &db, "test", "file:///repo", "sha")
+            .expect("index a scratch repo so a regex scope exists");
+        // A file where the shard directory must be makes the refresh's write fail.
+        let sidecar = dir.path().join("graph.lbug.regex-v3");
+        let _ = std::fs::remove_dir_all(&sidecar);
+        std::fs::write(&sidecar, b"not-a-directory").unwrap();
+        let store = nestweaver_store::GraphStore::open(&db).expect("reopen scratch database");
+
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(LogBuf(std::sync::Arc::clone(&buffer)))
+            .with_ansi(false)
+            .with_max_level(tracing::Level::ERROR)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let error = super::refresh_requested_trigram_index(&store, &super::WriteGate::new(), true)
+            .expect_err("a sidecar path that is a file must fail the refresh");
+        let text = String::from_utf8_lossy(&buffer.lock().unwrap()).into_owned();
+        assert!(
+            text.contains("ERROR") && text.contains("requested trigram refresh failed"),
+            "failure must be logged at ERROR: {text}\nrefresh error: {error}"
+        );
+    }
+
+    struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            LogBuf(std::sync::Arc::clone(&self.0))
+        }
     }
 
     use super::*;
