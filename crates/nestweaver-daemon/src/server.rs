@@ -7062,7 +7062,12 @@ impl NestWeaverDaemon for DaemonService {
 
             let watcher_task = tokio::task::spawn_blocking(move || {
                 wait_for_watcher_predecessors(&state, &predecessors);
-                tracing::info!(vault = %vault_path.display(), "watcher thread started");
+                tracing::info!(
+                    vault = %vault_path.display(),
+                    watcher_id,
+                    owner_pid,
+                    "watcher thread started"
+                );
 
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     watcher.run_with_store(store, on_change)
@@ -11904,16 +11909,34 @@ fn watch_path_allowed(
 ///
 /// `watcher_attached` is the daemon-side `WatchCode` / `WatchVault`
 /// registration (nw-730). Those RPCs are unary: the CLI returns and polls
-/// health, so a live watcher is not an active read.
+/// health, so a live watcher is not an active read. A registration whose
+/// owner process is already dead does not count — `kill -9` leaves the slot
+/// occupied until the next watch request reclaims it (nw-302), and treating
+/// that corpse as attached would disable idle shutdown for the rest of the
+/// process.
 fn is_idle(active_readwrite: u32, indexing_active: bool, watcher_attached: bool) -> bool {
     active_readwrite == 0 && !indexing_active && !watcher_attached
+}
+
+/// Whether a watcher registration should hold the daemon past its idle timeout.
+///
+/// `None` means the owner could not be established (TCP, or an in-process
+/// call). That is not evidence of death, so the registration still holds.
+/// A known owner holds only while that process is alive.
+fn watcher_owner_counts_as_attached(owner_pid: Option<i32>) -> bool {
+    match owner_pid {
+        Some(pid) => lifecycle::process_is_live(pid),
+        None => true,
+    }
 }
 
 /// A poisoned watcher lock is treated as attached. Idling out a daemon whose
 /// watcher state cannot be read is the worse failure.
 fn watcher_is_attached(state: &DaemonState) -> bool {
     match state.watcher_stop.lock() {
-        Ok(guard) => guard.is_some(),
+        Ok(guard) => guard
+            .as_ref()
+            .is_some_and(|reg| watcher_owner_counts_as_attached(reg.owner_pid)),
         Err(_) => true,
     }
 }
@@ -14885,12 +14908,11 @@ pub async fn run_server(
                 tokio::select! {
                     _ = notify.notified() => continue,
                     _ = tokio::time::sleep(timeout) => {
-                        if is_idle(
-                            active.active_reads.load(Ordering::Relaxed)
-                                + active.active_writes.load(Ordering::Relaxed),
-                            active.indexing_active.load(Ordering::Relaxed),
-                            watcher_is_attached(&active),
-                        ) {
+                        let active_readwrite = active.active_reads.load(Ordering::Relaxed)
+                            + active.active_writes.load(Ordering::Relaxed);
+                        let indexing_active = active.indexing_active.load(Ordering::Relaxed);
+                        let watcher_attached = watcher_is_attached(&active);
+                        if is_idle(active_readwrite, indexing_active, watcher_attached) {
                             tracing::info!(
                                 timeout_secs = timeout.as_secs(),
                                 "idle timeout reached — shutting down"
@@ -14903,6 +14925,12 @@ pub async fn run_server(
                             begin_shutdown_drain(Arc::clone(&active), "idle_timeout");
                             return;
                         }
+                        tracing::debug!(
+                            active_readwrite,
+                            indexing_active,
+                            watcher_attached,
+                            "idle timeout elapsed but the daemon is not idle"
+                        );
                     }
                 }
             }
@@ -23741,6 +23769,27 @@ repos = ["alpha"]
         assert!(
             !is_idle(0, false, true),
             "a registered watcher blocks idle shutdown"
+        );
+    }
+
+    /// nw-730 follow-up. `kill -9` of `brain watch` leaves the registration in
+    /// place until the next watch request reclaims it. That corpse must not
+    /// hold the idle timer; a live owner and an unknown owner still do.
+    #[test]
+    fn a_dead_watcher_owner_does_not_count_as_attached() {
+        assert!(
+            watcher_owner_counts_as_attached(None),
+            "an unknown owner is not evidence the watcher is dead"
+        );
+        assert!(watcher_owner_counts_as_attached(Some(
+            std::process::id() as i32
+        )));
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        child.wait().unwrap();
+        assert!(
+            !watcher_owner_counts_as_attached(Some(pid)),
+            "a watcher whose owner has exited must not hold the daemon"
         );
     }
 
