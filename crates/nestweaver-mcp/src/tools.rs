@@ -10246,25 +10246,7 @@ async fn inline_connect_daemon(
     nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient<tonic::transport::Channel>,
     anyhow::Error,
 > {
-    use tonic::transport::{Endpoint, Uri};
-
-    let path = sock_path.to_path_buf();
-    let channel = Endpoint::try_from("http://[::]:50051")
-        .map_err(|e| anyhow::anyhow!("failed to create endpoint: {e}"))?
-        .connect_with_connector(tower::service_fn(move |_: Uri| {
-            let path = path.clone();
-            async move {
-                let stream = tokio::net::UnixStream::connect(path).await?;
-                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
-            }
-        }))
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to connect to daemon: {e}"))?;
-
-    let mut client =
-        nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient::new(channel)
-            .max_decoding_message_size(256 * 1024 * 1024)
-            .max_encoding_message_size(256 * 1024 * 1024);
+    let mut client = connect_daemon_channel(sock_path).await?;
 
     // nw-201 landed a version check on `daemon start --config` only. This path
     // — how every MCP tool reaches the daemon — had NONE: `inline_ensure_daemon`
@@ -10291,17 +10273,159 @@ async fn inline_connect_daemon(
     Ok(client)
 }
 
-/// Ensure the daemon is running (spawning it if needed) and return the
-/// socket path. Mirrors `nestweaver_client::autostart::ensure_daemon`.
-///
-/// The socket-path derivation is inlined from `nestweaver_daemon::lifecycle`
-/// to avoid a dependency cycle (nestweaver-mcp → nestweaver-daemon → nestweaver-mcp).
-// TODO: deduplicate with nestweaver_daemon::lifecycle::socket_path()
 #[cfg(feature = "daemon")]
-fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+thread_local! {
+    static STDIO_DAEMON_DB: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record the database path of the stdio MCP session so a dropped daemon can
+/// be restarted from the tool-dispatch thread (nw-730).
+#[cfg(feature = "daemon")]
+pub fn set_stdio_daemon_db(path: &std::path::Path) {
+    STDIO_DAEMON_DB.with(|slot| *slot.borrow_mut() = Some(path.to_path_buf()));
+}
+
+#[cfg(feature = "daemon")]
+fn stdio_daemon_db() -> Option<std::path::PathBuf> {
+    STDIO_DAEMON_DB.with(|slot| slot.borrow().clone())
+}
+
+/// Transport failures worth one reconnect. Application errors (invalid args,
+/// not found, permission denied) must not restart the daemon.
+#[cfg(feature = "daemon")]
+pub(crate) fn is_daemon_transport_failure(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "connection refused",
+        "no such file or directory",
+        "transport error",
+        "error trying to connect",
+        "daemon socket not found",
+        "failed to connect to daemon",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+/// Stops the MCP heartbeat thread. Dropping it is enough; the thread exits
+/// within a second.
+#[cfg(feature = "daemon")]
+pub struct McpHeartbeat {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "daemon")]
+impl Drop for McpHeartbeat {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Ping the daemon every 10s from a thread the stdio loop cannot stall.
+///
+/// The session runtime only polls while a tool call is inside `block_on`, so
+/// a task spawned there does not run between calls. This thread owns its own
+/// runtime and its own gRPC channel (a Unix socket cannot be polled from two
+/// tokio runtimes). It never spawns a daemon — restart belongs to the next
+/// tool call, which can name the failure (nw-730).
+#[cfg(feature = "daemon")]
+pub fn spawn_mcp_daemon_heartbeat(db_path: &std::path::Path) -> McpHeartbeat {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_flag = std::sync::Arc::clone(&stop);
+    let db_path = db_path.to_path_buf();
+    let _ = std::thread::Builder::new()
+        .name("mcp-daemon-heartbeat".into())
+        .spawn(move || mcp_daemon_heartbeat_loop(db_path, stop_flag));
+    McpHeartbeat { stop }
+}
+
+#[cfg(feature = "daemon")]
+fn mcp_daemon_heartbeat_loop(
+    db_path: std::path::PathBuf,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return;
+    };
+    let mut client: Option<DaemonGrpcClient> = None;
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        for _ in 0..10 {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        let Some(sock) = accepting_mcp_socket(&db_path) else {
+            client = None;
+            continue;
+        };
+        if client.is_none() {
+            client = rt.block_on(connect_daemon_channel(&sock)).ok();
+        }
+        let health = if let Some(connected) = client.as_mut() {
+            rt.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    connected.health_check(nestweaver_proto::HealthCheckRequest {}),
+                )
+                .await
+                .is_ok()
+            })
+        } else {
+            false
+        };
+        if !health {
+            client = None;
+        }
+    }
+}
+
+/// Socket candidates for this process, then the launchd state-dir socket on
+/// macOS when `XDG_RUNTIME_DIR` points somewhere else (nw-729).
+#[cfg(feature = "daemon")]
+fn mcp_socket_candidates(
+    instance_id: &str,
+    xdg_runtime_dir: Option<&str>,
+) -> Vec<std::path::PathBuf> {
+    let caller = match xdg_runtime_dir {
+        Some(xdg) => std::path::PathBuf::from(xdg)
+            .join("nestweaver")
+            .join(instance_id)
+            .join("daemon.sock"),
+        None => mcp_state_socket(instance_id),
+    };
+    let mut sockets = vec![caller];
+    #[cfg(target_os = "macos")]
+    {
+        let supervised = mcp_state_socket(instance_id);
+        if supervised != sockets[0] {
+            sockets.push(supervised);
+        }
+    }
+    sockets
+}
+
+#[cfg(feature = "daemon")]
+fn mcp_state_socket(instance_id: &str) -> std::path::PathBuf {
+    dirs::state_dir()
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                .join(".local/state")
+        })
+        .join("nestweaver")
+        .join(instance_id)
+        .join("daemon.sock")
+}
+
+#[cfg(feature = "daemon")]
+fn mcp_instance_id(db_path: &std::path::Path) -> String {
     use sha2::{Digest, Sha256};
 
-    // Compute the 8-char hex instance ID (same SHA-256 algorithm as lifecycle.rs).
     let canonical = if let Ok(c) = std::fs::canonicalize(db_path) {
         c
     } else if let (Some(parent), Some(file_name)) = (db_path.parent(), db_path.file_name())
@@ -10314,37 +10438,71 @@ fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::
     let mut hasher = Sha256::new();
     hasher.update(canonical.to_string_lossy().as_bytes());
     let hash = hasher.finalize();
-    let instance_id = format!(
+    format!(
         "{:02x}{:02x}{:02x}{:02x}",
         hash[0], hash[1], hash[2], hash[3]
-    );
+    )
+}
 
-    // Must match nestweaver_daemon::lifecycle::runtime_dir() exactly.
-    // $TMPDIR is deliberately NOT consulted: on macOS, different launchers
-    // see different TMPDIR values, causing socket-path mismatch.
-    let rt_dir = if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        std::path::PathBuf::from(xdg)
-            .join("nestweaver")
-            .join(&instance_id)
-    } else {
-        dirs::state_dir()
-            .unwrap_or_else(|| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                    .join(".local/state")
-            })
-            .join("nestweaver")
-            .join(&instance_id)
-    };
-    let sock = rt_dir.join("daemon.sock");
+#[cfg(feature = "daemon")]
+fn accepting_mcp_socket(db_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+    mcp_socket_candidates(&mcp_instance_id(db_path), xdg.as_deref())
+        .into_iter()
+        .find(|sock| std::os::unix::net::UnixStream::connect(sock).is_ok())
+}
 
-    // The socket inode can appear before the daemon starts accepting connections.
-    if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
-        return Ok(sock);
+#[cfg(feature = "daemon")]
+async fn connect_daemon_channel(
+    sock_path: &std::path::Path,
+) -> Result<DaemonGrpcClient, anyhow::Error> {
+    use tonic::transport::{Endpoint, Uri};
+
+    let path = sock_path.to_path_buf();
+    let channel = Endpoint::try_from("http://[::]:50051")
+        .map_err(|e| anyhow::anyhow!("failed to create endpoint: {e}"))?
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .connect_with_connector(tower::service_fn(move |_: Uri| {
+            let path = path.clone();
+            async move {
+                let stream = tokio::net::UnixStream::connect(path).await?;
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+            }
+        }))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to connect to daemon: {e}"))?;
+
+    Ok(
+        nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient::new(channel)
+            .max_decoding_message_size(256 * 1024 * 1024)
+            .max_encoding_message_size(256 * 1024 * 1024),
+    )
+}
+
+/// Ensure the daemon is running (spawning it if needed) and return the
+/// socket path. Mirrors `nestweaver_client::autostart::ensure_daemon`.
+///
+/// The socket-path derivation is inlined from `nestweaver_daemon::lifecycle`
+/// to avoid a dependency cycle (nestweaver-mcp → nestweaver-daemon → nestweaver-mcp).
+// TODO: deduplicate with nestweaver_daemon::lifecycle::socket_path()
+#[cfg(feature = "daemon")]
+fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+    let instance_id = mcp_instance_id(db_path);
+    let candidates = mcp_socket_candidates(&instance_id, xdg.as_deref());
+
+    // Already listening — including a launchd job whose socket is not under
+    // this process's XDG_RUNTIME_DIR. Do not spawn `daemon start` over it.
+    for sock in &candidates {
+        if std::os::unix::net::UnixStream::connect(sock).is_ok() {
+            return Ok(sock.clone());
+        }
     }
 
-    // Spawn the daemon: `nestweaver daemon --db <path> start`
-    std::fs::create_dir_all(&rt_dir).ok();
+    let caller = candidates[0].clone();
+    if let Some(parent) = caller.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
     let exe = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("failed to determine current exe: {e}"))?;
     std::process::Command::new(&exe)
@@ -10357,23 +10515,25 @@ fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn daemon: {e}"))?;
 
-    // Poll for the socket to accept connections (up to 5s, same as autostart.rs).
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(5);
     let mut delay = std::time::Duration::from_millis(50);
     while start.elapsed() < timeout {
-        if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
-            return Ok(sock);
+        for sock in &candidates {
+            if std::os::unix::net::UnixStream::connect(sock).is_ok() {
+                return Ok(sock.clone());
+            }
         }
         std::thread::sleep(delay);
         delay = (delay * 2).min(std::time::Duration::from_millis(500));
     }
-    if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
-        return Ok(sock);
-    }
     Err(anyhow::anyhow!(
         "daemon socket did not accept connections within 5s at {}",
-        sock.display()
+        candidates
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" or ")
     ))
 }
 
@@ -16112,7 +16272,47 @@ pub fn dispatch_via_daemon_cancellable(
     args: serde_json::Value,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<serde_json::Value, anyhow::Error> {
-    dispatch_via_daemon_inner(client, rt, name, args, cancel).map(provenance_seam::stamp)
+    let args_for_retry = args.clone();
+    match dispatch_via_daemon_inner(client, rt, name, args, cancel) {
+        Ok(value) => Ok(provenance_seam::stamp(value)),
+        Err(error) if is_daemon_transport_failure(&format!("{error:#}")) => {
+            reconnect_stdio_daemon(client, rt, &error)?;
+            dispatch_via_daemon_inner(client, rt, name, args_for_retry, cancel)
+                .map(provenance_seam::stamp)
+                .map_err(|retry| {
+                    anyhow::anyhow!(
+                        "the daemon was not running ({error:#}). A replacement was started, but the retried `{name}` call failed: {retry:#}"
+                    )
+                })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// One reconnect after the daemon socket disappears (idle exit or `kill -9`).
+/// The error names a dead daemon when the restart itself fails (nw-730).
+#[cfg(feature = "daemon")]
+fn reconnect_stdio_daemon(
+    client: &mut DaemonGrpcClient,
+    rt: &tokio::runtime::Runtime,
+    original: &anyhow::Error,
+) -> anyhow::Result<()> {
+    let Some(db) = stdio_daemon_db() else {
+        anyhow::bail!(
+            "the daemon is not running ({original:#}). This MCP session has no database path recorded, so it cannot restart the daemon."
+        );
+    };
+    let sock = inline_ensure_daemon(&db).map_err(|restart| {
+        anyhow::anyhow!("the daemon is not running ({original:#}). Restart failed: {restart:#}")
+    })?;
+    let replacement = rt.block_on(inline_connect_daemon(&sock)).map_err(|connect| {
+        anyhow::anyhow!(
+            "the daemon is not running ({original:#}). The socket at {} did not accept a new session: {connect:#}",
+            sock.display()
+        )
+    })?;
+    *client = replacement;
+    Ok(())
 }
 
 /// The daemon-route tool table. Returns [`Unstamped`] so that no arm — the
@@ -29176,5 +29376,52 @@ mod lookup_not_found_contract_tests {
             wrap_tool_failure("flow_trace", &hybrid)["structuredContent"],
             envelope
         );
+    }
+}
+
+#[cfg(all(test, feature = "daemon"))]
+mod daemon_supervision_tests {
+    use super::is_daemon_transport_failure;
+    use super::mcp_socket_candidates;
+
+    #[test]
+    fn transport_failure_matches_a_dead_daemon_and_not_an_application_error() {
+        assert!(is_daemon_transport_failure(
+            "tonic::transport::Error: Connection refused"
+        ));
+        assert!(is_daemon_transport_failure(
+            "daemon socket not found at /tmp/nestweaver/abc/daemon.sock"
+        ));
+        assert!(is_daemon_transport_failure(
+            "No such file or directory (os error 2)"
+        ));
+        assert!(is_daemon_transport_failure(
+            "error trying to connect: tcp connect error"
+        ));
+        assert!(!is_daemon_transport_failure("repo 'missing' not found"));
+        assert!(!is_daemon_transport_failure(
+            "invalid argument: name is required"
+        ));
+    }
+
+    #[test]
+    fn socket_candidates_follow_xdg_then_the_supervised_dir_on_macos() {
+        let caller_only = mcp_socket_candidates("abcd1234", None);
+        assert_eq!(caller_only.len(), 1);
+        assert!(caller_only[0].ends_with("daemon.sock"));
+
+        let hidden = mcp_socket_candidates("abcd1234", Some("/tmp/nw-mcp-xdg"));
+        assert_eq!(
+            hidden[0],
+            std::path::PathBuf::from("/tmp/nw-mcp-xdg/nestweaver/abcd1234/daemon.sock")
+        );
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(hidden.len(), 2);
+            assert_ne!(hidden[0], hidden[1]);
+            assert!(hidden[1].ends_with("nestweaver/abcd1234/daemon.sock"));
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(hidden.len(), 1);
     }
 }

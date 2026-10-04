@@ -583,6 +583,59 @@ pub fn is_running(instance_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// What a loaded launchd job means for a client that may be looking at a
+/// different runtime directory than the one the job bound (nw-729).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadedJob {
+    /// `launchctl print` does not see the label. A listening socket, if any,
+    /// belongs to some other supervisor.
+    NotLoaded,
+    /// The label is loaded and its socket accepts connections. Attach or
+    /// refuse; do not bootout or rewrite the plist.
+    Healthy { socket: PathBuf },
+    /// The label is loaded but nothing accepts on the supervised socket.
+    /// Crash recovery may bootout and reinstall.
+    LoadedButUnreachable { socket: PathBuf },
+}
+
+/// Pure classifier. `loaded` is the `launchctl print` result and
+/// `socket_accepts` is a successful connect to `socket`. No launchctl.
+pub fn classify_loaded_job(loaded: bool, socket_accepts: bool, socket: PathBuf) -> LoadedJob {
+    if !loaded {
+        LoadedJob::NotLoaded
+    } else if socket_accepts {
+        LoadedJob::Healthy { socket }
+    } else {
+        LoadedJob::LoadedButUnreachable { socket }
+    }
+}
+
+/// Classify the launchd job for `instance_id` by probing launchctl and the
+/// socket the job actually binds ([`lifecycle::launchd_socket_path`]).
+pub fn loaded_job(instance_id: &str) -> LoadedJob {
+    let socket = lifecycle::launchd_socket_path(instance_id);
+    let accepts = std::os::unix::net::UnixStream::connect(&socket).is_ok();
+    classify_loaded_job(is_running(instance_id), accepts, socket)
+}
+
+/// Socket of a loaded job that is accepting connections, if that socket is
+/// not the path the caller would compute from its own `XDG_RUNTIME_DIR`.
+///
+/// When the two paths match, the caller's own pidfile and socket checks are
+/// the authority and this returns `None` so a same-environment `daemon start`
+/// can still replace a compiled-defaults incumbent. When they differ, a
+/// healthy supervised job must be attached to, never rewritten.
+pub fn hidden_healthy_socket(instance_id: &str) -> Option<PathBuf> {
+    let LoadedJob::Healthy { socket } = loaded_job(instance_id) else {
+        return None;
+    };
+    if socket == lifecycle::socket_path(instance_id) {
+        None
+    } else {
+        Some(socket)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,6 +693,34 @@ mod tests {
         });
         assert!(result);
         assert_eq!(calls.get(), 3);
+    }
+
+    /// nw-729. The decision to attach, refuse, or reinstall is a pure function
+    /// of "is the label loaded" and "does the supervised socket accept". It
+    /// must not call launchctl — that probe is what a unit test cannot aim at
+    /// the live user domain.
+    #[test]
+    fn classify_loaded_job_attaches_only_when_the_socket_accepts() {
+        let socket = PathBuf::from("/tmp/nw-supervised.sock");
+        assert_eq!(
+            classify_loaded_job(false, false, socket.clone()),
+            LoadedJob::NotLoaded
+        );
+        assert_eq!(
+            classify_loaded_job(false, true, socket.clone()),
+            LoadedJob::NotLoaded,
+            "a listening socket with no loaded label is not this job"
+        );
+        assert_eq!(
+            classify_loaded_job(true, true, socket.clone()),
+            LoadedJob::Healthy {
+                socket: socket.clone()
+            }
+        );
+        assert_eq!(
+            classify_loaded_job(true, false, socket.clone()),
+            LoadedJob::LoadedButUnreachable { socket }
+        );
     }
 
     #[test]

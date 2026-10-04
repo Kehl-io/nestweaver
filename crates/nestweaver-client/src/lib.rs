@@ -321,8 +321,14 @@ fn select_restart_config(
 }
 
 fn open_verified_live_pidfile(instance_id: &str, health_pid: u32) -> Result<fs::File> {
-    let path = nestweaver_daemon::lifecycle::pidfile_path(instance_id);
-    open_verified_live_pidfile_at(&path, health_pid)
+    let mut last_error = None;
+    for path in nestweaver_daemon::lifecycle::pidfile_candidates(instance_id) {
+        match open_verified_live_pidfile_at(&path, health_pid) {
+            Ok(file) => return Ok(file),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.expect("pidfile candidates is never empty"))
 }
 
 fn open_verified_live_pidfile_at(path: &Path, health_pid: u32) -> Result<fs::File> {
@@ -421,14 +427,29 @@ fn adopt_pidfileless_incumbent(
     instance_id: &str,
     health: &nestweaver_proto::HealthCheckResponse,
 ) -> std::result::Result<(), String> {
-    let socket = nestweaver_daemon::lifecycle::socket_path(instance_id);
-    let stream = std::os::unix::net::UnixStream::connect(&socket).map_err(|error| {
-        format!(
-            "cannot connect to daemon socket {}: {error}",
-            socket.display()
-        )
-    })?;
-    socket_peer_matches_health(&stream, health.pid)?;
+    let mut last_error = String::from("no daemon socket accepted a connection");
+    let mut corroborated = false;
+    for socket in nestweaver_daemon::lifecycle::daemon_socket_candidates(instance_id) {
+        let stream = match std::os::unix::net::UnixStream::connect(&socket) {
+            Ok(stream) => stream,
+            Err(error) => {
+                last_error = format!(
+                    "cannot connect to daemon socket {}: {error}",
+                    socket.display()
+                );
+                continue;
+            }
+        };
+        if let Err(error) = socket_peer_matches_health(&stream, health.pid) {
+            last_error = error;
+            continue;
+        }
+        corroborated = true;
+        break;
+    }
+    if !corroborated {
+        return Err(last_error);
+    }
     adoption_lock_verdict(
         nestweaver_daemon::lifecycle::db_write_lock(db_path),
         health.pid,
@@ -1046,7 +1067,12 @@ impl DaemonClient {
     pub async fn connect_existing(db_path: &Path) -> Result<Self> {
         let canonical_db = std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
         let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(&canonical_db);
-        let sock_path = nestweaver_daemon::lifecycle::socket_path(&instance_id);
+        // Prefer a socket that is already accepting. A launchd job binds the
+        // state-dir socket even when this process's XDG_RUNTIME_DIR points
+        // somewhere else (nw-729). Falling back to the caller path preserves
+        // the "not ready yet" poll.
+        let sock_path = nestweaver_daemon::lifecycle::accepting_daemon_socket(&instance_id)
+            .unwrap_or_else(|| nestweaver_daemon::lifecycle::socket_path(&instance_id));
         if !sock_path.exists() {
             anyhow::bail!("daemon socket not found at {}", sock_path.display());
         }

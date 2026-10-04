@@ -24539,6 +24539,31 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 start_at_login,
                             );
 
+                            // nw-729. A client whose XDG_RUNTIME_DIR hides the
+                            // supervised socket used to reach this bootout and
+                            // rewrite StandardOut/ErrorPath into its own state
+                            // dir. A loaded job whose socket accepts is
+                            // attached to, not replaced. A dead registration
+                            // (loaded, socket down) still falls through so
+                            // crash recovery can reinstall. Same-path starts
+                            // are unchanged: hidden_healthy_socket is None
+                            // when the caller already sees the supervised
+                            // socket, so an explicit config displacement of a
+                            // compiled-defaults daemon still works.
+                            if let Some(socket) =
+                                nestweaver_daemon::launchd::hidden_healthy_socket(&instance_id)
+                            {
+                                eprintln!(
+                                    "Daemon already running under launchd (socket {}). \
+                                     Not replacing a healthy job from a different runtime directory. \
+                                     Stop it with `nestweaver daemon --db {} stop` before installing \
+                                     a new agent.",
+                                    socket.display(),
+                                    db_path.display()
+                                );
+                                return Ok((EXIT_SUCCESS, None));
+                            }
+
                             // Clean up any existing agent or fork-based daemon
                             // before installing the new plist.
                             //
@@ -24623,7 +24648,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 nestweaver_daemon::lifecycle::launchd_plist_path(&instance_id)
                                     .display()
                             );
-                            eprintln!("  Socket: {}", socket.display());
+                            eprintln!(
+                                "  Socket: {}",
+                                nestweaver_daemon::lifecycle::launchd_socket_path(&instance_id)
+                                    .display()
+                            );
                             eprintln!("  Log:    {log_hint}");
 
                             // Poll connect_existing + health_check

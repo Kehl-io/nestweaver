@@ -460,6 +460,23 @@ fn ensure_daemon_impl(
                 wait_for_socket(&sock)?;
                 return Ok(sock);
             }
+            // nw-729. The caller's runtime dir (often `$XDG_RUNTIME_DIR`) has
+            // no listener, but a launchd job for this same database may
+            // already be serving the state-dir socket. Attach to it. Spawning
+            // `daemon start` from here would bootout that job and rewrite its
+            // plist into this process's XDG paths.
+            if let Some(supervised) =
+                nestweaver_daemon::lifecycle::accepting_daemon_socket(&instance_id)
+            {
+                debug!(
+                    socket = %supervised.display(),
+                    "attaching to the daemon already listening outside this process's runtime dir"
+                );
+                unsafe { libc::flock(fd, libc::LOCK_UN) };
+                drop(file);
+                wait_for_socket(&supervised)?;
+                return Ok(supervised);
+            }
         }
         Err(error) => bail!("flock on pidfile failed: {error}"),
     }
@@ -623,13 +640,18 @@ fn ensure_daemon_with_spawn_lock_impl(
     };
 
     // Re-check: another client may have started the daemon while we waited for the spawn-lock.
-    if socket_accepts_connections(&sock) {
-        debug!("daemon started by a concurrent client while awaiting spawn lock");
+    // On macOS that listener may be the launchd socket rather than this
+    // process's XDG socket (nw-729). Return the socket that actually accepted.
+    if let Some(live) = nestweaver_daemon::lifecycle::accepting_daemon_socket(&instance_id) {
+        debug!(
+            socket = %live.display(),
+            "daemon started by a concurrent client while awaiting spawn lock"
+        );
         // The winner is not trusted merely because it accepted a Unix
         // connection. It must attest the same automatic/captured config plan
         // before this contender releases the transaction lock.
         wait_for_daemon_ready(db_path, None, &restart_config, None)?;
-        return Ok(sock);
+        return Ok(live);
     }
 
     // Whatever PID the pidfile names right now belongs to a daemon that is
@@ -693,8 +715,12 @@ fn ensure_daemon_with_spawn_lock_impl(
     let waited = wait_for_daemon_ready(db_path, stale_pid, &restart_config, Some(&mut launcher));
     waited?;
 
-    info!("daemon started, socket at {}", sock.display());
-    Ok(sock)
+    // launchd drops XDG_RUNTIME_DIR, so the socket that became ready may not
+    // be the one this process computed. Hand the caller the listener that
+    // accepted (nw-729).
+    let live = nestweaver_daemon::lifecycle::accepting_daemon_socket(&instance_id).unwrap_or(sock);
+    info!("daemon started, socket at {}", live.display());
+    Ok(live)
 }
 
 /// Async-safe guarded spawn/readiness commit. The guard is moved into the

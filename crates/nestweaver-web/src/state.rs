@@ -52,6 +52,10 @@ pub struct AppState {
     pub gaps_cache: GapsCache,
     pub manifest_recovery: OnceLock<Arc<nestweaver_engine::manifest::ManifestRecoveryRuntime>>,
     pub vault_derivation: OnceLock<VaultDerivationHttp>,
+    /// Set by the daemon when this UI is served inside a process that has an
+    /// idle timeout. Each HTTP request notifies it (nw-749). Absent in tests
+    /// and in any router that is not tied to a daemon idle loop.
+    pub idle_activity: OnceLock<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 pub struct VaultDerivationHttp {
@@ -88,6 +92,7 @@ impl AppState {
             gaps_cache: GapsCache::new(),
             manifest_recovery: OnceLock::new(),
             vault_derivation: OnceLock::new(),
+            idle_activity: OnceLock::new(),
         })
     }
 
@@ -107,6 +112,7 @@ impl AppState {
             gaps_cache: GapsCache::new(),
             manifest_recovery: OnceLock::new(),
             vault_derivation: OnceLock::new(),
+            idle_activity: OnceLock::new(),
         })
     }
 
@@ -126,6 +132,7 @@ impl AppState {
             gaps_cache: GapsCache::new(),
             manifest_recovery: OnceLock::new(),
             vault_derivation: OnceLock::new(),
+            idle_activity: OnceLock::new(),
         })
     }
 }
