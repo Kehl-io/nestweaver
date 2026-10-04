@@ -2337,6 +2337,7 @@ dependencies = ["requests>=2.28", "pydantic>=2.0"]
             include_clones: false,
             instance_id: "test".to_string(),
             workspace_path: None,
+            overwrite: false,
         };
         let backup_error = crate::backup::stage_backup_from_store(&store, &backup_config)
             .err()

@@ -1016,10 +1016,14 @@ and not representative of deployed behavior.
 ### Create a backup
 
 ```bash
-# Save a snapshot of the current database (written to the exact path you pass)
+# Save a snapshot of the current database (written to the exact path you pass).
+# The archive is written beside that path and renamed into place, so a crash
+# cannot leave a truncated file at the destination.
 nestweaver backup save ./brain-backup.nwsnap.zst
 
-# Output: ./brain-backup.nwsnap.zst
+# Re-running onto the same path requires --force. Without it the existing
+# archive is left untouched.
+nestweaver backup save ./brain-backup.nwsnap.zst --force
 ```
 
 The backup process:
@@ -1032,12 +1036,15 @@ The backup process:
 ### Restore from backup
 
 ```bash
-# Restore a snapshot
+# Restore into an absent or empty directory.
 nestweaver backup restore /backups/brain-2026-06-25T10-30-00.nwsnap.zst \
-  --data-dir ./brain.lbug
+  --data-dir ./restored-brain
 
-# All queries work immediately after restore
-# Bare clones are re-fetched in the background
+# A directory that already holds files is left untouched unless --force is set.
+# Restore then renames that directory aside and deletes it only after the new
+# data is in place.
+nestweaver backup restore /backups/brain-2026-06-25T10-30-00.nwsnap.zst \
+  --data-dir ./restored-brain --force
 ```
 
 ### Inspect a backup
@@ -1255,7 +1262,8 @@ Recover the database; do not retry the request, which will crash the daemon
 again:
 
 ```bash
-nestweaver backup restore <archive>
+nestweaver backup restore <archive> --data-dir <directory>
+# add --force when <directory> already exists and is not empty
 # or, with an instance config, rebuild into a new database beside this one:
 nestweaver publication rebuild --config <instance.toml>
 ```

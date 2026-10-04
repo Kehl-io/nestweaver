@@ -33,7 +33,11 @@ To upgrade:
 1. Stop the daemon and run `nestweaver backup save <file>`. This works with
    either version: this release reads the old database read-only (no
    checkpoint, no marker) and seals the archive as pre-upgrade, so restoring
-   it later warns that it must be rebuilt.
+   it later warns that it must be rebuilt. A derived sidecar such as
+   `<db>.manifests.json` whose producer is the older release is left out of
+   the archive with a warning; the graph is still saved. `--force` is not
+   required for that. `--force` only overwrites an archive that already
+   exists at `<file>`.
 2. Run the command the error prints (below). The
    rebuild reads the old database read-only through a narrow exemption that
    scans rather than using primary-key lookups, writes the new graph into a

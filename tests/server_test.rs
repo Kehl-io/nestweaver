@@ -3165,6 +3165,7 @@ async fn server_backup_rpc_produces_snapshot() {
     let mut req = tonic::Request::new(BackupRequest {
         output_path: out.to_string_lossy().into_owned(),
         include_clones: false,
+        overwrite: false,
     });
     req.metadata_mut()
         .insert("authorization", format!("Bearer {admin}").parse().unwrap());

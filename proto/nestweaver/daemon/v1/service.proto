@@ -1046,6 +1046,9 @@ message FlowTraceContinueResponse {
 message BackupRequest {
   string output_path = 1;   // daemon-local path (or s3://…) for the .nwsnap.zst
   bool include_clones = 2;  // full tier (include workspace/*.git)
+  // Replace an archive that already exists at output_path. Absent or false
+  // leaves that file untouched.
+  bool overwrite = 3;
 }
 
 message BackupResponse {

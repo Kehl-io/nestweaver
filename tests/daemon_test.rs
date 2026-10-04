@@ -3793,12 +3793,14 @@ fn restored_pending_extension_migration_recovers_automatically_on_daemon_start()
         include_clones: false,
         instance_id: "backup-source".to_string(),
         workspace_path: None,
+        overwrite: false,
     })
     .unwrap();
     let restored_data = dir.path().join("restored-data");
     nestweaver_engine::backup_restore(&nestweaver_engine::RestoreConfig {
         snapshot_path: snapshot,
         data_dir: restored_data.clone(),
+        replace: true,
     })
     .unwrap();
     let restored_db = restored_data.join("test.lbug");
