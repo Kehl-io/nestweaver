@@ -3814,11 +3814,13 @@ mod tests {
         let beta = dir.path().join("beta");
         std::fs::create_dir_all(alpha.join("src")).unwrap();
         std::fs::create_dir_all(beta.join("src")).unwrap();
-        let helper = "export function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n";
+        std::fs::write(alpha.join("package.json"), "{\"name\":\"@org/alpha\"}\n").unwrap();
+        std::fs::write(beta.join("package.json"), "{\"name\":\"@org/beta\"}\n").unwrap();
+        let helper = "const { betaUtil } = require('@org/beta');\nexport function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n";
         std::fs::write(alpha.join("src/helper.js"), helper).unwrap();
         std::fs::write(
             beta.join("src/caller.js"),
-            "export function betaCaller() {\n  return alphaHelper();\n}\nexport function betaUtil() { return 2; }\n",
+            "const { alphaHelper } = require('@org/alpha');\nexport function betaCaller() {\n  return alphaHelper();\n}\nexport function betaUtil() { return 2; }\n",
         )
         .unwrap();
         let alpha = std::fs::canonicalize(&alpha).unwrap();

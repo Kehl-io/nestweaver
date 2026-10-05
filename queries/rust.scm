@@ -63,9 +63,10 @@
   function: (scoped_identifier
     name: (identifier) @name)) @reference.call
 
-; Macro invocations as calls
+; Macro invocations are not function calls. `format!(...)` must not resolve
+; to a field or function that merely shares the name.
 (macro_invocation
-  macro: (identifier) @name) @reference.call
+  macro: (identifier) @name) @reference.macro
 
 ; Use declarations as imports. The whole declaration is captured and expanded
 ; in parse.rs (expand_rust_use_imports) so list forms (`use a::{b, c};`),

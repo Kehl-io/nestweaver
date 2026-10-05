@@ -17642,14 +17642,16 @@ credential_method = "gh"
         let beta = root.join("beta");
         std::fs::create_dir_all(alpha.join("src")).unwrap();
         std::fs::create_dir_all(beta.join("src")).unwrap();
+        std::fs::write(alpha.join("package.json"), "{\"name\":\"@org/alpha\"}\n").unwrap();
+        std::fs::write(beta.join("package.json"), "{\"name\":\"@org/beta\"}\n").unwrap();
         std::fs::write(
             alpha.join("src/helper.js"),
-            "export function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n",
+            "const { betaUtil } = require('@org/beta');\nexport function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n",
         )
         .unwrap();
         std::fs::write(
             beta.join("src/caller.js"),
-            "export function betaCaller() {\n  return alphaHelper();\n}\nexport function betaUtil() { return 2; }\n",
+            "const { alphaHelper } = require('@org/alpha');\nexport function betaCaller() {\n  return alphaHelper();\n}\nexport function betaUtil() { return 2; }\n",
         )
         .unwrap();
         (alpha.canonicalize().unwrap(), beta.canonicalize().unwrap())
@@ -17757,7 +17759,7 @@ credential_method = "gh"
         tokio::time::sleep(Duration::from_millis(500)).await;
         std::fs::write(
             alpha.join("src/helper.js"),
-            "export function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n// edited\n",
+            "const { betaUtil } = require('@org/beta');\nexport function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n// edited\n",
         )
         .unwrap();
         assert!(

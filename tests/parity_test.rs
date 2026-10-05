@@ -5823,24 +5823,31 @@ fn flow_trace_repo_uniquely_pins_one_ping() {
 
 // ─── Name-inferred cross-repo links follow the whole graph ──────────────────
 
-/// Two repositories that call into each other: `alpha` calls beta's
-/// `betaUtil`, `beta` calls alpha's `alphaHelper`.
+/// Two repositories that call into each other through the other's package:
+/// `alpha` imports `betaUtil` from `@org/beta`, `beta` imports `alphaHelper`
+/// from `@org/alpha`.
 fn write_calling_repos(root: &Path) -> (PathBuf, PathBuf) {
     let alpha = root.join("alpha");
     let beta = root.join("beta");
     write_repo_files(
         &alpha,
-        &[(
-            "src/helper.js",
-            "export function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n",
-        )],
+        &[
+            ("package.json", "{\"name\":\"@org/alpha\"}\n"),
+            (
+                "src/helper.js",
+                "const { betaUtil } = require('@org/beta');\nexport function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n",
+            ),
+        ],
     );
     write_repo_files(
         &beta,
-        &[(
-            "src/caller.js",
-            "export function betaCaller() {\n  return alphaHelper();\n}\nexport function betaUtil() { return 2; }\n",
-        )],
+        &[
+            ("package.json", "{\"name\":\"@org/beta\"}\n"),
+            (
+                "src/caller.js",
+                "const { alphaHelper } = require('@org/alpha');\nexport function betaCaller() {\n  return alphaHelper();\n}\nexport function betaUtil() { return 2; }\n",
+            ),
+        ],
     );
     (alpha, beta)
 }
@@ -5947,7 +5954,7 @@ fn reindexing_a_repository_restores_the_links_into_it() {
     // An edit that keeps every symbol where it was (same uids).
     std::fs::write(
         alpha.join("src/helper.js"),
-        "export function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n// edited\n",
+        "const { betaUtil } = require('@org/beta');\nexport function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n// edited\n",
     )
     .unwrap();
     index_direct(&alpha, &db, &[]);

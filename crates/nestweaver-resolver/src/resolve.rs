@@ -182,10 +182,16 @@ pub fn resolve_references_with_file_languages(
             }
             let mut local_edges = Vec::new();
             let language = language_for(file_path);
+            let local_bindings: Vec<(&str, u32)> = references
+                .iter()
+                .filter(|reference| reference.kind == ReferenceKind::LocalBinding)
+                .map(|reference| (reference.name.as_str(), reference.start_line))
+                .collect();
             for reference in references {
                 if let Some(edge) = resolve_single_reference(
                     file_path,
                     reference,
+                    &local_bindings,
                     sorted_syms,
                     &symbol_map,
                     &extends_map,
@@ -412,6 +418,7 @@ pub fn resolve_references_with_file_languages(
 fn resolve_single_reference(
     file_path: &str,
     reference: &RawReference,
+    local_bindings: &[(&str, u32)],
     sorted_syms: &[&RawSymbol],
     symbol_map: &std::collections::HashMap<String, Vec<(&str, &RawSymbol)>>,
     extends_map: &std::collections::HashMap<String, Vec<String>>,
@@ -421,7 +428,7 @@ fn resolve_single_reference(
     type_envs: Option<&std::collections::HashMap<String, crate::types::TypeEnvironment>>,
 ) -> Option<ResolvedEdge> {
     let edge_type = match reference.kind {
-        ReferenceKind::Call => EdgeType::Calls,
+        ReferenceKind::Call | ReferenceKind::Macro => EdgeType::Calls,
         ReferenceKind::Extends => EdgeType::Extends,
         ReferenceKind::Implements => EdgeType::Implements,
         ReferenceKind::Includes => EdgeType::Includes,
@@ -430,7 +437,8 @@ fn resolve_single_reference(
         ReferenceKind::Import
         | ReferenceKind::ImportAlias
         | ReferenceKind::PackageBinding
-        | ReferenceKind::Uses => return None,
+        | ReferenceKind::Uses
+        | ReferenceKind::LocalBinding => return None,
     };
 
     // nw-349 (1). The three cases are now distinguishable, and only two of them
@@ -449,6 +457,12 @@ fn resolve_single_reference(
         Enclosing::ModuleScope => return None,
     };
     let source_uid = symbol_uid(repo_uid, file_path, &source_sym.name, source_sym.start_line);
+
+    // nw-724: a parameter, let, or lambda binding is the target. Do not
+    // continue on to a same-named function in this file or another.
+    if name_is_locally_bound(local_bindings, sorted_syms, reference) {
+        return Some(unresolved_edge(source_uid, &reference.name, edge_type));
+    }
 
     // ── Type-aware resolution for member calls with known receiver type ──
     if edge_type == EdgeType::Calls
@@ -557,7 +571,9 @@ fn resolve_single_reference(
     // same name, so this check runs on the reference's own name, before any
     // alias rewriting.
     if let Some(syms) = symbol_map.get(name.as_str())
-        && let Some((_, sym)) = syms.iter().find(|(f, _)| *f == file_path)
+        && let Some((_, sym)) = syms
+            .iter()
+            .find(|(f, sym)| *f == file_path && candidate_matches(reference, file_path, f, sym))
     {
         let target_uid = symbol_uid(repo_uid, file_path, &sym.name, sym.start_line);
         let confidence = confidence_score(MatchType::SameFileExact, language);
@@ -583,7 +599,9 @@ fn resolve_single_reference(
         .find(|b| b.local_name == *name);
     if let Some(binding) = binding
         && let Some(syms) = symbol_map.get(binding.original_name.as_str())
-        && let Some((_, sym)) = syms.iter().find(|(f, _)| f == &binding.source_file)
+        && let Some((_, sym)) = syms.iter().find(|(f, sym)| {
+            f == &binding.source_file && candidate_matches(reference, file_path, f, sym)
+        })
     {
         let target_uid = symbol_uid(repo_uid, &binding.source_file, &sym.name, sym.start_line);
         let confidence = confidence_score(MatchType::ImportResolved, language);
@@ -620,23 +638,25 @@ fn resolve_single_reference(
     // The parser now records the qualifier as the reference receiver, so prefer
     // a candidate whose file stem matches the qualifier's last module segment.
     //
-    // Gated on the qualifier containing `::` so this only fires for a genuine
-    // multi-segment path. A bare receiver -- a JS variable in `store.method()`,
-    // or the type in `HashMap::new()` -- is excluded, because matching those
-    // against a same-named file would invent edges rather than recover them.
+    // Gated on a path receiver (`module::Type`), not on a value expression
+    // that merely mentions `::`. A bare receiver -- a JS variable in
+    // `store.method()`, or the type in `HashMap::new()` -- is excluded,
+    // because matching those against a same-named file would invent edges
+    // rather than recover them.
     if let Some(qualifier) = reference.receiver.as_deref()
-        && qualifier.contains("::")
+        && is_path_receiver(qualifier)
         && let Some(syms) = &candidates
         && let Some(module) = qualifier.rsplit("::").find(|segment| !segment.is_empty())
     {
         let mut qualified: Vec<_> = syms
             .iter()
-            .filter(|(candidate_file, _)| {
-                candidate_file
-                    .rsplit('/')
-                    .next()
-                    .and_then(|base| base.split('.').next())
-                    .is_some_and(|stem| stem == module)
+            .filter(|(candidate_file, sym)| {
+                candidate_matches(reference, file_path, candidate_file, sym)
+                    && candidate_file
+                        .rsplit('/')
+                        .next()
+                        .and_then(|base| base.split('.').next())
+                        .is_some_and(|stem| stem == module)
             })
             .collect();
         qualified.sort_by_key(|(path, _)| *path);
@@ -658,27 +678,25 @@ fn resolve_single_reference(
         }
     }
 
-    // nw-308 / nw-327: the receiver gate. See `receiver_denotes` -- the nw-150
-    // fix put exactly this test in, but only on Priority 4, the WEAKEST tier.
-    // Priorities 2 and 3 return first and were ungated, so importing ANY symbol
-    // from a file donated every bare method name in it: `.collect()` in
-    // `tools.rs` bound to a private `SegmentCollector::collect` in
-    // `tantivy_index.rs` purely because `tools.rs:30` imports `SearchTotal`
+    // nw-308 / nw-327: the receiver gate. See `candidate_matches` -- the
+    // nw-150 fix put exactly this test in, but only on Priority 4, the
+    // WEAKEST tier. Priorities 2 and 3 return first and were ungated, so
+    // importing ANY symbol from a file donated every bare method name in it:
+    // `.collect()` in `tools.rs` bound to a private `SegmentCollector::collect`
+    // in `tantivy_index.rs` purely because `tools.rs:30` imports `SearchTotal`
     // from that file. The comment at the Priority 4 tier below is a verbatim
-    // description of this bug at a different tier.
-    let value_receiver = reference
-        .receiver
-        .as_deref()
-        .filter(|r| !is_path_receiver(r));
+    // description of this bug at a different tier. nw-724 extends the same
+    // gate to the same-file tier and refuses calls that land on a field,
+    // type alias, or macro invocation.
 
     // Priority 2: Direct imports
     let mut imports = graph.imports_of(file_path);
     imports.sort_by(|(_, a), (_, b)| a.cmp(b));
     for (_, imported_file) in &imports {
         if let Some(syms) = &candidates
-            && let Some((_, sym)) = syms
-                .iter()
-                .find(|(f, sym)| f == imported_file && receiver_denotes(f, sym, value_receiver))
+            && let Some((_, sym)) = syms.iter().find(|(f, sym)| {
+                f == imported_file && candidate_matches(reference, file_path, f, sym)
+            })
         {
             let target_uid = symbol_uid(repo_uid, imported_file, &sym.name, sym.start_line);
             let confidence = confidence_score(MatchType::ImportResolved, language);
@@ -724,7 +742,8 @@ fn resolve_single_reference(
         for transitive_file in &next_frontier {
             if let Some(syms) = &candidates
                 && let Some((_, sym)) = syms.iter().find(|(f, sym)| {
-                    *f == transitive_file.as_str() && receiver_denotes(f, sym, value_receiver)
+                    *f == transitive_file.as_str()
+                        && candidate_matches(reference, file_path, f, sym)
                 })
             {
                 let target_uid = symbol_uid(repo_uid, transitive_file, &sym.name, sym.start_line);
@@ -770,7 +789,9 @@ fn resolve_single_reference(
             .filter(|(candidate_file, _)| {
                 *candidate_file != file_path && parent_dir(candidate_file) == same_dir
             })
-            .filter(|(candidate_file, sym)| receiver_denotes(candidate_file, sym, value_receiver))
+            .filter(|(candidate_file, sym)| {
+                candidate_matches(reference, file_path, candidate_file, sym)
+            })
             .collect();
         same_pkg.sort_by_key(|(path, _)| *path);
         if let Some((candidate_file, sym)) = same_pkg.into_iter().next() {
@@ -791,8 +812,119 @@ fn resolve_single_reference(
         }
     }
 
-    // No match → unresolved
-    Some(ResolvedEdge {
+    // No match → unresolved. A path receiver that denoted nothing is included:
+    // `candidate_matches` does not treat it as a bare name, which is how
+    // `Vec::len` used to bind whatever `fn len` an import happened to donate.
+    Some(unresolved_edge(source_uid, name, edge_type))
+}
+
+/// Whether `reference` may name `sym`.
+///
+/// nw-724. A call is not a field access and a macro invocation is not a
+/// call: `format!(...)` was binding to a struct field named `format`, and
+/// `Err(...)` to `type Err = String`. A method call (`items.len()`) does not
+/// name a free function in a file the caller happens to import. A field
+/// access may still name a field in the same file; it may not name a function.
+fn candidate_matches(
+    reference: &RawReference,
+    source_file: &str,
+    candidate_file: &str,
+    sym: &RawSymbol,
+) -> bool {
+    match reference.kind {
+        ReferenceKind::Macro => {
+            if !is_macro_symbol(sym) {
+                return false;
+            }
+        }
+        ReferenceKind::Call => {
+            if !is_callable_symbol(sym) {
+                return false;
+            }
+        }
+        ReferenceKind::ReadAccess | ReferenceKind::WriteAccess
+            if source_file == candidate_file
+                && matches!(
+                    sym.kind,
+                    SymbolKind::Property
+                        | SymbolKind::Constant
+                        | SymbolKind::Variable
+                        | SymbolKind::TypeAlias
+                ) =>
+        {
+            return true;
+        }
+        _ => {}
+    }
+    match reference.receiver.as_deref() {
+        None => true,
+        Some(receiver) if is_path_receiver(receiver) => path_denotes(candidate_file, sym, receiver),
+        Some(receiver) if is_self_receiver(receiver) => source_file == candidate_file,
+        Some(receiver) => receiver_denotes(candidate_file, sym, Some(receiver)),
+    }
+}
+
+fn is_callable_symbol(sym: &RawSymbol) -> bool {
+    matches!(
+        sym.kind,
+        SymbolKind::Function | SymbolKind::Method | SymbolKind::Class | SymbolKind::Variable
+    )
+}
+
+fn is_macro_symbol(sym: &RawSymbol) -> bool {
+    let signature = sym.signature.as_str();
+    signature.contains("macro_rules!") || signature.contains("proc_macro")
+}
+
+fn is_self_receiver(receiver: &str) -> bool {
+    matches!(receiver, "self" | "this" | "$this")
+}
+
+/// A path receiver denotes a candidate when any of its segments is the
+/// candidate's file stem (`store::GraphStore` → `store.rs`) or its last
+/// segment is the candidate's declaring type.
+fn path_denotes(candidate_file: &str, sym: &RawSymbol, qualifier: &str) -> bool {
+    let segments: Vec<&str> = qualifier
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let stem = candidate_file
+        .rsplit('/')
+        .next()
+        .and_then(|base| base.split('.').next());
+    if stem.is_some_and(|stem| segments.contains(&stem)) {
+        return true;
+    }
+    segments
+        .last()
+        .is_some_and(|last| sym.parent_name.as_deref() == Some(*last))
+}
+
+/// A local binding shadows `reference` when it sits in the same enclosing
+/// symbol at or before the use, and it is not the declaration of a graph
+/// symbol of that name (a `const len = ...` that IS the symbol).
+fn name_is_locally_bound(
+    bindings: &[(&str, u32)],
+    sorted_syms: &[&RawSymbol],
+    reference: &RawReference,
+) -> bool {
+    let enclosing = match find_enclosing_symbol(sorted_syms, reference.start_line) {
+        Enclosing::Exact(symbol) | Enclosing::Degenerate(symbol) => symbol,
+        Enclosing::ModuleScope => return false,
+    };
+    bindings.iter().any(|(name, line)| {
+        *name == reference.name
+            && *line <= reference.start_line
+            && *line >= enclosing.start_line
+            && *line <= enclosing.end_line
+            && !sorted_syms
+                .iter()
+                .any(|symbol| symbol.name == reference.name && symbol.start_line == *line)
+    })
+}
+
+fn unresolved_edge(source_uid: String, name: &str, edge_type: EdgeType) -> ResolvedEdge {
+    ResolvedEdge {
         source_uid,
         target_uid: format!("unresolved:{name}"),
         edge_type,
@@ -803,7 +935,7 @@ fn resolve_single_reference(
             weight: 0.0,
             note: None,
         }],
-    })
+    }
 }
 
 /// How many re-export hops the Priority 3 tier walks.
@@ -1134,6 +1266,99 @@ mod tests {
             edge.target_uid.starts_with("unresolved:"),
             "target_uid should start with 'unresolved:', got {}",
             edge.target_uid
+        );
+    }
+
+    /// nw-724: `items.len()` does not call a free `fn len`, in this file or
+    /// in a file this file imports.
+    #[test]
+    fn a_method_call_does_not_resolve_to_a_free_function_of_the_same_name() {
+        let mut caller = make_symbol("check", 10);
+        caller.end_line = 30;
+        let mut call = make_ref("len", ReferenceKind::Call, 20);
+        call.receiver = Some("items".to_string());
+        let mut same_file = make_ref("len", ReferenceKind::Call, 12);
+        same_file.receiver = Some("items".to_string());
+
+        let files = vec![
+            (
+                "src/check.rs".to_string(),
+                vec![make_symbol("len", 1), caller],
+                vec![
+                    make_ref("./regex_index", ReferenceKind::Import, 1),
+                    same_file,
+                    call.clone(),
+                ],
+            ),
+            (
+                "src/regex_index.rs".to_string(),
+                vec![make_symbol("len", 186)],
+                vec![],
+            ),
+        ];
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        let resolved: Vec<_> = edges
+            .iter()
+            .filter(|edge| {
+                edge.edge_type == EdgeType::Calls && !edge.target_uid.starts_with("unresolved:")
+            })
+            .collect();
+        assert!(
+            resolved.is_empty(),
+            "items.len() must not resolve to fn len: {resolved:?}"
+        );
+    }
+
+    /// nw-724: `format!(...)` does not call a field named `format`, and
+    /// `Err(...)` does not call `type Err = String`.
+    #[test]
+    fn a_macro_and_a_type_alias_are_not_call_targets() {
+        let mut format_field = make_symbol("format", 87);
+        format_field.kind = SymbolKind::Property;
+        let mut err_alias = make_symbol("Err", 4);
+        err_alias.kind = SymbolKind::TypeAlias;
+        let mut caller = make_symbol("show", 10);
+        caller.end_line = 40;
+        let files = vec![(
+            "src/engine_format.rs".to_string(),
+            vec![format_field, err_alias, caller],
+            vec![
+                make_ref("format", ReferenceKind::Macro, 20),
+                make_ref("Err", ReferenceKind::Call, 22),
+            ],
+        )];
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        let resolved: Vec<_> = edges
+            .iter()
+            .filter(|edge| {
+                edge.edge_type == EdgeType::Calls && !edge.target_uid.starts_with("unresolved:")
+            })
+            .collect();
+        assert!(
+            resolved.is_empty(),
+            "format! and Err(...) must not resolve to the field or the alias: {resolved:?}"
+        );
+    }
+
+    /// nw-724: a call of a locally bound name does not resolve to a function
+    /// of that name.
+    #[test]
+    fn a_locally_bound_name_does_not_resolve_to_another_function() {
+        let mut caller = make_symbol("run", 10);
+        caller.end_line = 20;
+        let files = vec![(
+            "src/run.kt".to_string(),
+            vec![make_symbol("transform", 1), caller],
+            vec![
+                make_ref("transform", ReferenceKind::LocalBinding, 10),
+                make_ref("transform", ReferenceKind::Call, 12),
+            ],
+        )];
+        let edges = resolve_references(&files, Language::Kotlin, "repo:test:abc");
+        let phantom = symbol_uid("repo:test:abc", "src/run.kt", "transform", 1);
+        assert!(
+            !edges.iter().any(|edge| edge.target_uid == phantom),
+            "a lambda parameter must not call the function of the same name: {edges:?}"
         );
     }
 

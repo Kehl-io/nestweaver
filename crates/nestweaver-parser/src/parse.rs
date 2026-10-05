@@ -126,6 +126,13 @@ pub enum ReferenceKind {
     TypeRef,
     ReadAccess,
     WriteAccess,
+    /// A macro invocation (`format!(...)`). Not a function call: name-only
+    /// resolution must not bind it to a field or function that shares the name.
+    Macro,
+    /// A local binding (parameter, `let`, lambda parameter). Not an edge.
+    /// A use of this name inside the enclosing symbol names the binding, not
+    /// an unrelated symbol of the same name.
+    LocalBinding,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1750,6 +1757,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     "type_ref" => ReferenceKind::TypeRef,
                     "read_access" => ReferenceKind::ReadAccess,
                     "write_access" => ReferenceKind::WriteAccess,
+                    "macro" => ReferenceKind::Macro,
                     _ => continue,
                 };
 
@@ -1952,6 +1960,9 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     if lang == Language::Rust {
         collect_rust_macro_calls(tree.root_node(), source_bytes, &mut references);
     }
+
+    // nw-724: parameters and local declarations shadow same-named symbols.
+    collect_local_bindings(tree.root_node(), source_bytes, &mut references);
 
     // nw-291 follow-up: recover constant/static reads written as a bare name.
     if let Some(rules) = constant_read_rules(lang) {
@@ -2546,23 +2557,189 @@ fn collect_calls_in_token_tree(
     let children: Vec<tree_sitter::Node<'_>> = tree_node.children(&mut cursor).collect();
     for (index, child) in children.iter().enumerate() {
         if child.kind() == "identifier"
-            && children
-                .get(index + 1)
-                .is_some_and(|next| next.kind() == "token_tree")
             && let Ok(name) = child.utf8_text(source_bytes)
         {
-            references.push(RawReference {
-                name: name.to_string(),
-                kind: ReferenceKind::Call,
-                start_line: child.start_position().row as u32 + 1,
-                context: String::new(),
-                receiver: None,
-            });
+            let macro_call = children
+                .get(index + 1)
+                .is_some_and(|next| next.kind() == "!")
+                && children
+                    .get(index + 2)
+                    .is_some_and(|next| next.kind() == "token_tree");
+            let function_call = children
+                .get(index + 1)
+                .is_some_and(|next| next.kind() == "token_tree");
+            if macro_call || function_call {
+                // nw-724: `items.len()` inside `assert!(...)` is an identifier
+                // followed by a token tree, which used to be recorded as a
+                // bare call. The receiver is the tokens before the `.` or
+                // `::`, so the resolver can refuse an unrelated `fn len`.
+                references.push(RawReference {
+                    name: name.to_string(),
+                    kind: if macro_call {
+                        ReferenceKind::Macro
+                    } else {
+                        ReferenceKind::Call
+                    },
+                    start_line: child.start_position().row as u32 + 1,
+                    context: String::new(),
+                    receiver: if macro_call {
+                        None
+                    } else {
+                        token_tree_receiver(&children, index, source_bytes)
+                    },
+                });
+            }
         }
         if child.kind() == "token_tree" {
             collect_calls_in_token_tree(*child, source_bytes, references);
         }
     }
+}
+
+/// Receiver of a call written inside a macro token tree.
+///
+/// `items.len()` is `identifier "." identifier token_tree`. `Vec::len()` is
+/// the same with `::` (one token, or two `:` tokens). The returned text is
+/// the last segment before the separator (`items`, `Vec`), which is what the
+/// resolver's receiver gate compares to a file stem or a declaring type.
+/// A bare `helper()` has no separator and returns `None`.
+fn token_tree_receiver(
+    children: &[tree_sitter::Node<'_>],
+    index: usize,
+    source_bytes: &[u8],
+) -> Option<String> {
+    if index == 0 {
+        return None;
+    }
+    let separator = children[index - 1].kind();
+    let method = separator == "." || separator == "::" || separator == ":";
+    if !method {
+        return None;
+    }
+    let mut cursor = index - 1;
+    while cursor > 0 {
+        let previous = children[cursor - 1].kind();
+        if previous == "identifier" || previous == "." || previous == ":" || previous == "::" {
+            cursor -= 1;
+            continue;
+        }
+        break;
+    }
+    let mut segments = Vec::new();
+    for token in &children[cursor..index] {
+        if token.kind() == "identifier"
+            && let Ok(text) = token.utf8_text(source_bytes)
+        {
+            segments.push(text);
+        }
+    }
+    segments.last().map(|segment| (*segment).to_string())
+}
+
+/// Record parameters and local declarations so a call of that name is not
+/// resolved to an unrelated symbol (nw-724).
+fn collect_local_bindings(
+    root: tree_sitter::Node<'_>,
+    source_bytes: &[u8],
+    references: &mut Vec<RawReference>,
+) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if is_local_binding_site(node.kind()) {
+            emit_binding_names(node, source_bytes, references);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+}
+
+fn is_local_binding_site(kind: &str) -> bool {
+    matches!(
+        kind,
+        "parameter"
+            | "formal_parameter"
+            | "required_parameter"
+            | "optional_parameter"
+            | "rest_parameter"
+            | "typed_parameter"
+            | "default_parameter"
+            | "typed_default_parameter"
+            | "let_declaration"
+            | "variable_declarator"
+            | "lambda_parameters"
+            | "closure_parameters"
+            | "for_expression"
+    )
+}
+
+fn emit_binding_names(
+    node: tree_sitter::Node<'_>,
+    source_bytes: &[u8],
+    references: &mut Vec<RawReference>,
+) {
+    let root = match node.kind() {
+        "let_declaration" | "for_expression" => node.child_by_field_name("pattern"),
+        "variable_declarator" => node.child_by_field_name("name"),
+        _ => Some(node),
+    };
+    let Some(root) = root else {
+        return;
+    };
+    let mut stack = vec![root];
+    while let Some(current) = stack.pop() {
+        if is_type_node(current.kind()) {
+            continue;
+        }
+        if is_binding_identifier(current.kind())
+            && let Ok(name) = current.utf8_text(source_bytes)
+            && is_bindable_name(name)
+        {
+            references.push(RawReference {
+                name: name.to_string(),
+                kind: ReferenceKind::LocalBinding,
+                start_line: current.start_position().row as u32 + 1,
+                context: String::new(),
+                receiver: None,
+            });
+            continue;
+        }
+        let mut cursor = current.walk();
+        for child in current.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+}
+
+fn is_type_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "type_identifier"
+            | "generic_type"
+            | "reference_type"
+            | "scoped_type_identifier"
+            | "user_type"
+            | "function_type"
+            | "tuple_type"
+            | "array_type"
+            | "pointer_type"
+            | "bounded_type"
+            | "lifetime"
+            | "type_arguments"
+            | "nullable_type"
+    )
+}
+
+fn is_binding_identifier(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier" | "simple_identifier" | "shorthand_field_identifier"
+    )
+}
+
+fn is_bindable_name(name: &str) -> bool {
+    !name.is_empty() && name != "_" && name != "self" && name != "this"
 }
 
 /// How to recognise a bare constant read in one language.
@@ -8412,6 +8589,7 @@ void run() {
         fn parsed_references(filename: &str, source: &str) -> Vec<RawReference> {
             let parsed = parse_source(Path::new(filename), source).unwrap();
             let mut refs = parsed.references;
+            refs.retain(|r| r.kind != ReferenceKind::LocalBinding);
             refs.sort_by(|a, b| a.start_line.cmp(&b.start_line).then(a.name.cmp(&b.name)));
             refs
         }
@@ -8972,6 +9150,86 @@ fn main() {
         assert_eq!(
             call_refs[0].receiver, None,
             "free function should have no receiver"
+        );
+    }
+
+    #[test]
+    fn a_method_call_inside_a_macro_keeps_its_receiver() {
+        let source = r#"
+fn check(items: &[u8]) {
+    assert!(items.len() == 1);
+}
+"#;
+        let parsed = parse_source(Path::new("t.rs"), source).unwrap();
+        let len_calls: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call && r.name == "len")
+            .collect();
+        assert!(
+            !len_calls.is_empty(),
+            "items.len() inside assert! is a call"
+        );
+        assert_eq!(len_calls[0].receiver.as_deref(), Some("items"));
+    }
+
+    #[test]
+    fn a_macro_invocation_is_not_a_function_call() {
+        let source = r#"
+fn show() {
+    let _ = format!("hi");
+}
+"#;
+        let parsed = parse_source(Path::new("t.rs"), source).unwrap();
+        let format_refs: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.name == "format")
+            .collect();
+        assert!(
+            format_refs.iter().any(|r| r.kind == ReferenceKind::Macro),
+            "format! must be a macro reference, got {format_refs:?}"
+        );
+        assert!(
+            format_refs.iter().all(|r| r.kind != ReferenceKind::Call),
+            "format! must not also be a function call, got {format_refs:?}"
+        );
+    }
+
+    #[test]
+    fn a_parameter_is_a_local_binding() {
+        let source = r#"
+fn run(transform: fn(i32) -> i32) {
+    transform(1);
+}
+"#;
+        let parsed = parse_source(Path::new("t.rs"), source).unwrap();
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|r| r.kind == ReferenceKind::LocalBinding && r.name == "transform"),
+            "the parameter must shadow calls of its name, got {:?}",
+            parsed.references
+        );
+    }
+
+    #[test]
+    fn a_kotlin_lambda_parameter_is_a_local_binding() {
+        let source =
+            "fun run(items: List<Int>) {\n    items.forEach { value -> value.toString() }\n}\n";
+        let parsed = parse_source(Path::new("t.kt"), source).unwrap();
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|r| r.kind == ReferenceKind::LocalBinding && r.name == "value"),
+            "a lambda parameter must be a local binding, got {:?}",
+            parsed
+                .references
+                .iter()
+                .map(|r| format!("{:?} {}", r.kind, r.name))
+                .collect::<Vec<_>>()
         );
     }
 
