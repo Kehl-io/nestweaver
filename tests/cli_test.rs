@@ -1496,6 +1496,33 @@ fn release_workflow_syncs_the_lockfile_however_the_release_pr_got_there() {
     );
 }
 
+/// `gh pr list --json author` reports the Release Please app as
+/// `app/github-actions`. The pulls API still reports `github-actions[bot]`,
+/// and the lockfile lease correctly keeps checking that. The changelog dedupe
+/// step uses the list payload. Requiring only the pulls-API login made it
+/// skip on 11.0.1 and leave merge-commit duplicates in the notes.
+#[test]
+fn release_changelog_dedupe_accepts_the_actions_app_author() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        std::fs::read_to_string(repo_root.join(".github/workflows/release-please.yml")).unwrap();
+    let step = workflow_step(
+        &workflow,
+        "Deduplicate CHANGELOG.md on the release PR branch (nw-096)",
+    );
+
+    assert!(
+        step.contains(".[0].author.login == \"github-actions[bot]\"")
+            && step.contains(".[0].author.login == \"app/github-actions\""),
+        "changelog dedupe must accept both author logins gh pr list has reported \
+         for the Release Please app"
+    );
+    assert!(
+        step.contains("no single trusted open release PR found"),
+        "a release PR that fails the author, base, or fork check must skip the rewrite"
+    );
+}
+
 /// The Linux entries pin an OLD runner deliberately: glibc is backward
 /// compatible but not forward, so the build host's glibc is the compatibility
 /// floor shipped to users. These were `ubuntu-latest`/`ubuntu-24.04-arm`, and
