@@ -456,14 +456,20 @@ jobs:
           fi
 
           # Same trust shape as "Locate the open release PR" below (open,
-          # based on the default branch, authored by github-actions[bot], not
-          # a fork) before mutating anything on that branch.
+          # based on the default branch, authored by the release-please app,
+          # not a fork) before mutating anything on that branch.
+          #
+          # `gh pr list --json author` reports that app as `app/github-actions`.
+          # The pulls API still reports `.user.login` as `github-actions[bot]`,
+          # which is what the lockfile lease below checks. Requiring only the
+          # pulls-API login here made this step skip on 11.0.1 and leave the
+          # merge-commit duplicates in CHANGELOG.md.
           pr_json="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
             --head "$BRANCH" --json number,baseRefName,author,isCrossRepository)"
           if ! jq -e --arg base "$DEFAULT_BRANCH" '
             length == 1 and
             .[0].baseRefName == $base and
-            .[0].author.login == "github-actions[bot]" and
+            (.[0].author.login == "github-actions[bot]" or .[0].author.login == "app/github-actions") and
             .[0].isCrossRepository == false
           ' <<< "$pr_json" >/dev/null; then
             echo "no single trusted open release PR found for branch $BRANCH; skipping dedup" >&2
