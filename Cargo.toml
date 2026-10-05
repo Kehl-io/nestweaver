@@ -22,7 +22,7 @@ members = [
 exclude = ["testdata/lbug-0.20.4/generator"]
 
 [workspace.package]
-version = "11.0.0"
+version = "11.0.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Kehl-io/nestweaver"
