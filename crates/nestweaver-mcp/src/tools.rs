@@ -9610,11 +9610,10 @@ fn brain_status_warnings_for(
                 })
                 .collect();
 
-            // Suggest a concrete merge command. The keeper is the row with
-            // the highest note_count (most data); ties break on the
-            // lexicographically smallest instance_id so the suggestion is
-            // deterministic. Emit one command per non-keeper row so callers
-            // collapse all ghosts into the canonical instance.
+            // The keeper is the row with the highest note_count; ties break
+            // on the lexicographically smallest instance_id. The other rows
+            // are removed. Merging instances rewrites every uid and is not
+            // the repair for two vaults at one root (nw-732, nw-098, nw-112).
             let keeper = rows_with_counts
                 .iter()
                 .max_by(|a, b| {
@@ -9624,20 +9623,21 @@ fn brain_status_warnings_for(
                 .map(|(v, _)| v);
             let (remediation_commands, remediation_hint) = match keeper {
                 Some(keeper_v) => {
+                    let root_q = nestweaver_engine::shell_quote(root);
                     let cmds: Vec<String> = rows_with_counts
                         .iter()
                         .filter(|(v, _)| v.instance_id != keeper_v.instance_id)
                         .map(|(v, _)| {
                             format!(
-                                "nestweaver instance merge --from {} --to {}",
-                                v.instance_id, keeper_v.instance_id,
+                                "nestweaver brain remove {} --instance {}",
+                                root_q,
+                                nestweaver_engine::shell_quote(&v.instance_id),
                             )
                         })
                         .collect();
                     let hint = format!(
-                        "Multiple instance_ids share this vault root. Keep '{}' (has the most data) and merge the others into it using the commands below. Take a snapshot of {} first.",
+                        "Keep instance '{}' (it has the most notes) and remove the other registration at this root. A second vault duplicates search rows.",
                         keeper_v.instance_id,
-                        db_path.and_then(|p| p.to_str()).unwrap_or("the database"),
                     );
                     (cmds, hint)
                 }

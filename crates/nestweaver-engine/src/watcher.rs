@@ -805,11 +805,12 @@ impl BrainWatcher {
             &self.vault_root,
         );
         // nw-608: before publishing the Vault node below.
-        crate::vault_registration::refuse_duplicate_vault_name(
+        crate::vault_registration::refuse_new_local_vault(
             &store,
             &v_uid,
             &vault_name,
             &self.vault_root,
+            &self.instance_id,
         )?;
         let _initial_mutation_lease = match self.acquire_mutation_lease("watch_vault_initial") {
             Ok(lease) => lease,
