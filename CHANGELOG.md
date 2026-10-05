@@ -8,19 +8,14 @@
 * **backup:** refuse destructive restore and accept old sidecars ([b480009](https://github.com/Kehl-io/nestweaver/commit/b480009bc2c8a65640b660c115b316e7c3abd45c))
 * **backup:** report recovery when a restore is refused ([74c4925](https://github.com/Kehl-io/nestweaver/commit/74c492513046a7dd30b5ab348a5d0ce4f62290c1))
 * **daemon:** attach hidden launchd jobs and count session activity ([27c31f6](https://github.com/Kehl-io/nestweaver/commit/27c31f6f4a8580676a29d67903ceee474e44f457))
-* **daemon:** attach hidden launchd jobs and count session activity ([55931f2](https://github.com/Kehl-io/nestweaver/commit/55931f2b682cf0e98ec2117529ce50bc029276d3))
 * **daemon:** avoid unused mut in linux socket candidates ([eb7f6bb](https://github.com/Kehl-io/nestweaver/commit/eb7f6bbe7fe719fb7c9acbcbfed13e4ef277eb9d))
 * **daemon:** hold the write lock for requested trigram refresh ([4dc6183](https://github.com/Kehl-io/nestweaver/commit/4dc61836e8295b5ec1d0af54f0dd6344c166b7d4))
 * **daemon:** report the launchd socket and drop dead watchers ([4423853](https://github.com/Kehl-io/nestweaver/commit/44238539d006accb301f8fed4d9ea4b93d90faa6))
 * **index:** stop duplicating MEMBER_OF on incremental index ([fc613ab](https://github.com/Kehl-io/nestweaver/commit/fc613ab7190ea93daf107c9cb994784b257e79d9))
 * refuse destructive backups and serialize trigram refresh ([37793e2](https://github.com/Kehl-io/nestweaver/commit/37793e216f38d811d537726528fb9f401c576c0f))
 * **resolve:** stop false name matches on calls and cross-repo links ([f73b513](https://github.com/Kehl-io/nestweaver/commit/f73b513b7364cf53f57f19f9e7aa3e1427d78450))
-* **resolve:** stop false name matches on calls and cross-repo links ([9f07083](https://github.com/Kehl-io/nestweaver/commit/9f0708388d52400bc11b5002727d541e565e1757))
 * **vault:** refuse a second instance before the vault is committed ([b1fe204](https://github.com/Kehl-io/nestweaver/commit/b1fe20459c274b204767ec63840c83d6637ae08c))
-* **vault:** refuse a second instance before the vault is committed ([6feb4df](https://github.com/Kehl-io/nestweaver/commit/6feb4df56a2c7e3d45becbb0bad0ba08f644ca9f))
 * **watcher:** reconcile notes when a vault directory moves ([2a02457](https://github.com/Kehl-io/nestweaver/commit/2a02457143896acd09488f68f3492a9f54cdb4ca))
-* **watcher:** reconcile notes when a vault directory moves ([65480a5](https://github.com/Kehl-io/nestweaver/commit/65480a58e2d647b4e3ea6a60d7a8f47f37252e0a))
-
 ## [11.0.0](https://github.com/Kehl-io/nestweaver/compare/v10.3.1...v11.0.0) (2026-10-01)
 
 
