@@ -3180,6 +3180,32 @@ pub(crate) struct WholeGraphCrossRepoInference {
     pub(crate) reparsed: usize,
 }
 
+/// Package names the caller does not already know, read from each repo's
+/// indexed sources (`package.json` and the other manifests
+/// [`crate::manifest::parse_manifest`] understands). A name already in
+/// `known` is left alone.
+fn fill_missing_package_names(
+    db_path: &Path,
+    limits: crate::index_limits::IndexLimits,
+    repos: &[Repo],
+    known: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut names = known.clone();
+    for repo in repos {
+        if names.contains_key(&repo.uid) {
+            continue;
+        }
+        for source in crate::cross_repo_links::repo_sources(repo, db_path, limits) {
+            if let Some(name) = crate::manifest::parse_manifest(source.reader.as_ref()).package_name
+            {
+                names.insert(repo.uid.clone(), name);
+                break;
+            }
+        }
+    }
+    names
+}
+
 /// Infer every name-matched cross-repo call link over the whole graph without
 /// writing anything (see [`reinfer_cross_repo_links`] for the inputs and the
 /// refusal rule). `None` when `should_stop` asked it to stop between
@@ -3212,6 +3238,11 @@ pub(crate) fn infer_whole_graph_cross_repo_links(
     if repos.len() < 2 {
         return Ok(Some(inference));
     }
+    // A published manifest name wins. A repo missing from that map (a
+    // server-mode fetch publishes no sidecar; manifest recovery may not
+    // have run) still declares its package in source, and the link has to
+    // see that name at the indexed revision.
+    let package_names = fill_missing_package_names(db_path, limits, &repos, package_names);
     // A long-lived caller's cache catches up with other writers' entries.
     parsed_cache.refresh(&parsed_cache_path);
     let unavailable = |repo: &str, detail: String| -> anyhow::Error {
@@ -3330,7 +3361,7 @@ pub(crate) fn infer_whole_graph_cross_repo_links(
         inference.edges.extend(infer_cross_repo_call_edges_with(
             repo_uid,
             files,
-            package_names,
+            &package_names,
             &targets,
         )?);
     }
@@ -3391,21 +3422,16 @@ fn infer_cross_repo_call_edges_with(
     use nestweaver_parser::ReferenceKind;
     use nestweaver_schema::{CrossRepoLinkType, EdgeEvidence, EdgeType, ResolvedEdge, Visibility};
 
-    // A bare call name matching many public definitions store-wide carries no
-    // attribution signal — `run`, `get`, `new`, `handle`, `init` are defined once
-    // per type/module across every repo. Mature cross-repo indexers (SCIP/LSIF
-    // monikers, Kythe VNames) resolve by package-qualified identity + import
-    // corroboration and never join on a bare name, precisely because name-only
-    // matching has near-zero precision on ubiquitous identifiers. We approximate
-    // that cheaply: (a) a candidate-count cap drops ubiquitous names entirely, and
-    // (b) import corroboration raises confidence for names the calling file
-    // actually imports. Un-corroborated name matches stay at a low, sub-"breaking"
-    // confidence (< the 0.5 org-severity cutoff) so they surface as hints, not as
-    // breaking org-wide impact. (A stronger, import-resolved cross-repo resolver
-    // already exists in `nestweaver-resolver::cross_repo`; this is the cheap
-    // hypothesis layer.)
+    // A bare call name is not a cross-repo edge. `exit`, `abs`, `Date` and
+    // `defer` were linking to whatever public symbol shared the name, and
+    // blast-radius followed those links into unrelated repositories.
+    // nw-725: an inferred link exists only when the call is bound from a
+    // package the target repository declares. Language builtins and keywords
+    // never originate one, even then. Declared links are a separate pass
+    // (`nestweaver-resolver::cross_repo`); this one does not invent them
+    // from a shared name. A candidate-count cap still drops ubiquitous
+    // package exports (`run`, `get`, `new`).
     const MAX_CROSS_REPO_NAME_CANDIDATES: usize = 3;
-    const NAME_ONLY_CONFIDENCE: f32 = 0.20; // info tier (< 0.25 warning cutoff)
     const IMPORT_CORROBORATED_CONFIDENCE: f32 = 0.50; // SamePackageFallback
 
     let local_symbol_names: std::collections::HashSet<&str> = parsed_files
@@ -3416,12 +3442,6 @@ fn infer_cross_repo_call_edges_with(
     let mut seen = std::collections::HashSet::new();
     for file in parsed_files {
         let (rel_path, symbols, references) = (file.rel_path, file.symbols, file.references);
-        // Names this file imports — corroborates a same-named cross-repo call.
-        let imported_names: std::collections::HashSet<&str> = references
-            .iter()
-            .filter(|r| r.kind == ReferenceKind::Import)
-            .map(|r| r.name.as_str())
-            .collect();
         // nw-688: names bound from a package (`const { isEmpty } =
         // require('lodash')`), with the specifier they come from. Such a call
         // is that package's function: it links only to a repo whose manifest
@@ -3437,10 +3457,17 @@ fn infer_cross_repo_call_edges_with(
             if reference.kind != ReferenceKind::Call || reference.receiver.is_some() {
                 continue;
             }
+            if call_originates_from_builtin(rel_path, &reference.name) {
+                continue;
+            }
             if local_symbol_names.contains(reference.name.as_str()) {
                 continue;
             }
-            let bound_package = package_bound.get(reference.name.as_str()).copied();
+            // No package binding: there is no import relationship to a
+            // repository. A shared name is not one.
+            let Some(bound_package) = package_bound.get(reference.name.as_str()).copied() else {
+                continue;
+            };
 
             let Some(source_symbol) = containing_symbol_for_line(symbols, reference.start_line)
             else {
@@ -3463,32 +3490,16 @@ fn infer_cross_repo_call_edges_with(
                     repo_uid != current_repo_uid
                         && *uid != source_uid
                         && *visibility != Visibility::Private
-                        && bound_package.is_none_or(|specifier| {
-                            package_names
-                                .get(repo_uid)
-                                .is_some_and(|package| specifier_names_package(specifier, package))
-                        })
+                        && package_names
+                            .get(repo_uid)
+                            .is_some_and(|package| specifier_names_package(bound_package, package))
                 })
                 .collect();
             if candidates.is_empty() || candidates.len() > MAX_CROSS_REPO_NAME_CANDIDATES {
                 continue;
             }
 
-            // A package binding that matched the target repo's package IS
-            // the import that corroborates the call.
-            let import_corroborated =
-                bound_package.is_some() || imported_names.contains(reference.name.as_str());
-            let confidence = if import_corroborated {
-                IMPORT_CORROBORATED_CONFIDENCE
-            } else {
-                NAME_ONLY_CONFIDENCE
-            };
-            let evidence_kind = if import_corroborated {
-                "cross_repo_name_import_corroborated"
-            } else {
-                "cross_repo_name_match"
-            };
-
+            let confidence = IMPORT_CORROBORATED_CONFIDENCE;
             for (target_uid, _, _) in candidates {
                 if seen.insert((source_uid.clone(), target_uid.clone())) {
                     edges.push(ResolvedEdge {
@@ -3498,16 +3509,11 @@ fn infer_cross_repo_call_edges_with(
                         confidence,
                         link_type: Some(CrossRepoLinkType::SharedImport),
                         evidence: vec![EdgeEvidence {
-                            kind: evidence_kind.to_string(),
+                            kind: "cross_repo_name_import_corroborated".to_string(),
                             weight: confidence,
                             note: Some(format!(
-                                "cross-repo call '{}' matched by name{}",
-                                reference.name,
-                                if import_corroborated {
-                                    " (import-corroborated)"
-                                } else {
-                                    ""
-                                }
+                                "cross-repo call '{}' matched by name (import-corroborated)",
+                                reference.name
                             )),
                         }],
                     });
@@ -3516,6 +3522,235 @@ fn infer_cross_repo_call_edges_with(
         }
     }
     Ok(edges)
+}
+
+/// nw-725: a call whose name is a language builtin or keyword. These are not
+/// imports of another repository, and name-matching them (`exit` → a Rust
+/// field, `abs` → a TypeScript function, `new Date()` → a component,
+/// `defer` → a Rust function) is how blast-radius left its own repository.
+fn call_originates_from_builtin(path: &str, name: &str) -> bool {
+    let extension = path.rsplit('.').next().unwrap_or("");
+    let names: &[&str] = match extension {
+        "sh" | "bash" | "zsh" | "ksh" => &[
+            "alias",
+            "bg",
+            "bind",
+            "break",
+            "builtin",
+            "caller",
+            "cd",
+            "command",
+            "compgen",
+            "complete",
+            "continue",
+            "declare",
+            "dirs",
+            "disown",
+            "echo",
+            "enable",
+            "eval",
+            "exec",
+            "exit",
+            "export",
+            "false",
+            "fc",
+            "fg",
+            "getopts",
+            "hash",
+            "help",
+            "history",
+            "jobs",
+            "kill",
+            "let",
+            "local",
+            "logout",
+            "mapfile",
+            "popd",
+            "printf",
+            "pushd",
+            "pwd",
+            "read",
+            "readarray",
+            "readonly",
+            "return",
+            "set",
+            "shift",
+            "shopt",
+            "source",
+            "suspend",
+            "test",
+            "times",
+            "trap",
+            "true",
+            "type",
+            "typeset",
+            "ulimit",
+            "umask",
+            "unalias",
+            "unset",
+            "wait",
+        ],
+        "py" | "pyi" => &[
+            "abs",
+            "all",
+            "any",
+            "ascii",
+            "bin",
+            "bool",
+            "breakpoint",
+            "bytearray",
+            "bytes",
+            "callable",
+            "chr",
+            "classmethod",
+            "compile",
+            "complex",
+            "delattr",
+            "dict",
+            "dir",
+            "divmod",
+            "enumerate",
+            "eval",
+            "exec",
+            "filter",
+            "float",
+            "format",
+            "frozenset",
+            "getattr",
+            "globals",
+            "hasattr",
+            "hash",
+            "help",
+            "hex",
+            "id",
+            "input",
+            "int",
+            "isinstance",
+            "issubclass",
+            "iter",
+            "len",
+            "list",
+            "locals",
+            "map",
+            "max",
+            "memoryview",
+            "min",
+            "next",
+            "object",
+            "oct",
+            "open",
+            "ord",
+            "pow",
+            "print",
+            "property",
+            "range",
+            "repr",
+            "reversed",
+            "round",
+            "set",
+            "setattr",
+            "slice",
+            "sorted",
+            "staticmethod",
+            "str",
+            "sum",
+            "super",
+            "tuple",
+            "type",
+            "vars",
+            "zip",
+        ],
+        "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" => &[
+            "Array",
+            "BigInt",
+            "Boolean",
+            "Date",
+            "Error",
+            "Infinity",
+            "JSON",
+            "Map",
+            "Math",
+            "NaN",
+            "Number",
+            "Object",
+            "Promise",
+            "Proxy",
+            "Reflect",
+            "RegExp",
+            "Set",
+            "String",
+            "Symbol",
+            "WeakMap",
+            "WeakSet",
+            "clearInterval",
+            "clearTimeout",
+            "decodeURI",
+            "decodeURIComponent",
+            "encodeURI",
+            "encodeURIComponent",
+            "eval",
+            "isFinite",
+            "isNaN",
+            "parseFloat",
+            "parseInt",
+            "queueMicrotask",
+            "setInterval",
+            "setTimeout",
+            "undefined",
+        ],
+        "swift" => &[
+            "associatedtype",
+            "async",
+            "await",
+            "break",
+            "case",
+            "catch",
+            "class",
+            "continue",
+            "defer",
+            "deinit",
+            "else",
+            "enum",
+            "extension",
+            "fallthrough",
+            "false",
+            "for",
+            "func",
+            "guard",
+            "if",
+            "import",
+            "in",
+            "init",
+            "inout",
+            "internal",
+            "is",
+            "let",
+            "nil",
+            "operator",
+            "private",
+            "protocol",
+            "public",
+            "repeat",
+            "return",
+            "self",
+            "static",
+            "struct",
+            "subscript",
+            "super",
+            "switch",
+            "throw",
+            "throws",
+            "true",
+            "try",
+            "typealias",
+            "var",
+            "where",
+            "while",
+        ],
+        _ => &[],
+    };
+    debug_assert!(names.is_sorted());
+    names.binary_search(&name).is_ok()
 }
 
 /// nw-688: whether an import specifier names `package` or a subpath of it
@@ -8361,8 +8596,8 @@ mod tests {
     }
     use std::fs;
 
-    /// Two indexed repositories that call into each other, for the
-    /// whole-graph cross-repo inference pass.
+    /// Two indexed repositories that call into each other through the
+    /// other's package, for the whole-graph cross-repo inference pass.
     struct CrossRepoFixture {
         _dir: tempfile::TempDir,
         db: PathBuf,
@@ -8375,14 +8610,16 @@ mod tests {
         let beta = dir.path().join("beta");
         fs::create_dir_all(alpha.join("src")).unwrap();
         fs::create_dir_all(beta.join("src")).unwrap();
+        fs::write(alpha.join("package.json"), "{\"name\":\"@org/alpha\"}\n").unwrap();
+        fs::write(beta.join("package.json"), "{\"name\":\"@org/beta\"}\n").unwrap();
         fs::write(
             alpha.join("src/helper.js"),
-            "export function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n",
+            "const { betaUtil } = require('@org/beta');\nexport function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n",
         )
         .unwrap();
         fs::write(
             beta.join("src/caller.js"),
-            "export function betaCaller() {\n  return alphaHelper();\n}\nexport function betaUtil() { return 2; }\n",
+            "const { alphaHelper } = require('@org/alpha');\nexport function betaCaller() {\n  return alphaHelper();\n}\nexport function betaUtil() { return 2; }\n",
         )
         .unwrap();
         let db = dir.path().join("graph.lbug");
@@ -8417,10 +8654,16 @@ mod tests {
 
     fn reinfer(fx: &CrossRepoFixture) -> Result<usize, anyhow::Error> {
         let store = GraphStore::open(&fx.db).unwrap();
+        let package_names = crate::manifest::package_names_hint(&fx.db);
+        assert!(
+            package_names.values().any(|name| name == "@org/alpha")
+                && package_names.values().any(|name| name == "@org/beta"),
+            "both repos publish a package name: {package_names:?}"
+        );
         reinfer_cross_repo_links(
             &store,
             &fx.db,
-            &HashMap::new(),
+            &package_names,
             crate::index_limits::IndexLimits::default(),
         )
     }
@@ -11283,7 +11526,7 @@ function hello(name) { return "Hello " + name; }
     }
 
     #[test]
-    fn index_infers_cross_repo_call_edges_for_exported_symbol_names() {
+    fn a_bare_exported_name_does_not_form_a_cross_repo_call_edge() {
         let dir = tempfile::tempdir().unwrap();
         let api = dir.path().join("api");
         let web = dir.path().join("web");
@@ -11340,16 +11583,16 @@ function hello(name) { return "Hello " + name; }
             .expect("processPayment indexed");
         let impacted = store.impact(&process_payment.uid, 3, 0.0).unwrap();
         assert!(
-            impacted.iter().any(|s| s.name == "WebCheckoutSymbol"),
-            "expected WebCheckoutSymbol in impact set, got {impacted:#?}"
+            impacted.iter().all(|s| s.name != "WebCheckoutSymbol"),
+            "a bare call must not link to another repo's processPayment, got {impacted:#?}"
         );
     }
 
     #[test]
     fn cross_repo_edges_cap_ubiquitous_names_and_keep_distinctive() {
-        // A bare call to a ubiquitous name (`run`, defined publicly in 4 repos)
-        // must NOT fan out into cross-repo edges; a distinctive name (1 def) must
-        // still link. Guards the frequency-cap precision fix.
+        // Neither a ubiquitous name nor a distinctive one links without a
+        // package import. The cap still applies once a package binding exists;
+        // a shared name alone is not a cross-repo edge (nw-725).
         let dir = tempfile::tempdir().unwrap();
         let store = GraphStore::in_memory().unwrap();
 
@@ -11426,8 +11669,8 @@ function hello(name) { return "Hello " + name; }
             .expect("distinctive indexed");
         let dist_impact = store.impact(&dist.uid, 3, 0.0).unwrap();
         assert!(
-            dist_impact.iter().any(|s| s.name == "Caller"),
-            "distinctive cross-repo call must still link, got {dist_impact:#?}"
+            dist_impact.iter().all(|s| s.name != "Caller"),
+            "a distinctive bare name must not link across repos, got {dist_impact:#?}"
         );
     }
 
@@ -13574,8 +13817,8 @@ module.exports = { check, viaPackage };\n";
 
     /// nw-688: a call to a name bound from an npm package (`lodash`'s
     /// `isEmpty`) must not become a CROSS_REPO_LINK to another indexed repo's
-    /// same-named symbol. Counterweight: a free call with no package binding
-    /// still gets the name-matched hint.
+    /// same-named symbol. nw-725: a free call with no package binding does
+    /// not get a name-matched hint either.
     #[test]
     fn npm_package_calls_do_not_link_to_another_repos_same_named_symbol() {
         let dir = tempfile::tempdir().unwrap();
@@ -13619,8 +13862,104 @@ module.exports = { check, plain };\n";
             "lodash's isEmpty must not link to another repo's isEmpty: {links:?}"
         );
         assert!(
-            links.contains(&(plain, shared)),
-            "an unbound free call keeps its name-matched hint: {links:?}"
+            !links.contains(&(plain, shared)),
+            "an unbound free call must not link by name: {links:?}"
+        );
+    }
+
+    /// nw-725: bash `exit`, Python `abs()`, `new Date()` and Swift `defer`
+    /// do not link to a same-named symbol in another repository, and
+    /// blast-radius of that symbol stays in its own repository.
+    #[test]
+    fn builtin_calls_do_not_pull_other_repos_into_blast_radius() {
+        let dir = tempfile::tempdir().unwrap();
+        let rust_repo = dir.path().join("rust");
+        let bash_repo = dir.path().join("bash");
+        let py_repo = dir.path().join("py");
+        fs::create_dir_all(rust_repo.join("crates/nestweaver-store/src")).unwrap();
+        fs::create_dir_all(&bash_repo).unwrap();
+        fs::create_dir_all(&py_repo).unwrap();
+        fs::write(
+            rust_repo.join("crates/nestweaver-store/src/daemon_exit.rs"),
+            "pub struct UncleanExit;\npub struct Exit { pub exit: UncleanExit }\npub fn abs() {}\npub fn defer() {}\npub struct Date;\n",
+        )
+        .unwrap();
+        let js_repo = dir.path().join("js");
+        let swift_repo = dir.path().join("swift");
+        fs::create_dir_all(&js_repo).unwrap();
+        fs::create_dir_all(&swift_repo).unwrap();
+        fs::write(bash_repo.join("stop.sh"), "exit 1\n").unwrap();
+        fs::write(
+            py_repo.join("maths.py"),
+            "def magnitude(n):\n    return abs(n)\n",
+        )
+        .unwrap();
+        fs::write(
+            js_repo.join("when.js"),
+            "function show() { return new Date(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            swift_repo.join("later.swift"),
+            "func show() { defer { } }\n",
+        )
+        .unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+        for (root, url) in [
+            (&rust_repo, "https://example.com/rust"),
+            (&bash_repo, "https://example.com/bash"),
+            (&py_repo, "https://example.com/py"),
+            (&js_repo, "https://example.com/js"),
+            (&swift_repo, "https://example.com/swift"),
+        ] {
+            index_into_store(
+                &crate::content_reader::FilesystemReader::new(root),
+                &store,
+                "test",
+                url,
+                "sha",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let exit_field = store
+            .lookup_symbols_by_name("exit")
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.name == "exit")
+            .expect("exit indexed");
+        let impacted = store.impact(&exit_field.uid, 3, 0.0).unwrap();
+        assert!(
+            impacted.is_empty(),
+            "bash exit must not impact the rust field, got {impacted:#?}"
+        );
+
+        let rust_uid = repo_uid("test", "https://example.com/rust");
+        let result = crate::blast_radius::analyze_blast_radius(
+            &store,
+            &[std::path::PathBuf::from(
+                "crates/nestweaver-store/src/daemon_exit.rs",
+            )],
+            &crate::blast_radius::BlastRadiusOptions {
+                target_repo: Some(rust_uid),
+                ..crate::blast_radius::BlastRadiusOptions::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            result.coverage.repos_in_scope,
+            vec![repo_uid("test", "https://example.com/rust")],
+            "blast-radius of daemon_exit.rs must stay in one repo, got {:?}",
+            result.coverage.repos_in_scope
         );
     }
 

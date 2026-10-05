@@ -14210,19 +14210,21 @@ impl LinkedRebuildFixture {
             "pub struct SharedWidget;\npub struct AlphaGadget;\n",
         );
         write(alpha.join("src/extra.rs"), "pub fn alpha_extra() {}\n");
+        write(alpha.join("package.json"), "{\"name\":\"@org/alpha\"}\n");
         write(
             alpha.join("src/helper.js"),
-            "export function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n",
+            "const { betaUtil } = require('@org/beta');\nexport function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n",
         );
-        // beta calls alpha: a name-inferred cross-repo call link, whose
-        // presence must not depend on which repository is indexed first.
+        // beta calls alpha through @org/alpha. The link must not depend on
+        // which repository is indexed first.
         write(
             beta.join("src/widget.rs"),
             "pub struct SharedWidget;\npub struct BetaGadget;\n",
         );
+        write(beta.join("package.json"), "{\"name\":\"@org/beta\"}\n");
         write(
             beta.join("src/caller.js"),
-            "export function betaCaller() {\n  return alphaHelper();\n}\nexport function betaUtil() { return 2; }\n",
+            "const { alphaHelper } = require('@org/alpha');\nexport function betaCaller() {\n  return alphaHelper();\n}\nexport function betaUtil() { return 2; }\n",
         );
         write(
             vault.join("Workspaces/Alpha/design.md"),

@@ -1358,17 +1358,23 @@ mod tests {
         let beta = tmp.path().join("beta");
         create_source_repo(
             &alpha,
-            &[(
-                "src/helper.js",
-                "export function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n",
-            )],
+            &[
+                ("package.json", "{\"name\":\"@org/alpha\"}\n"),
+                (
+                    "src/helper.js",
+                    "const { betaUtil } = require('@org/beta');\nexport function alphaHelper() { return 1; }\nexport function alphaUses() {\n  return betaUtil();\n}\n",
+                ),
+            ],
         );
         create_source_repo(
             &beta,
-            &[(
-                "src/caller.js",
-                "export function betaCaller() {\n  return alphaHelper();\n}\nexport function betaUtil() { return 2; }\n",
-            )],
+            &[
+                ("package.json", "{\"name\":\"@org/beta\"}\n"),
+                (
+                    "src/caller.js",
+                    "const { alphaHelper } = require('@org/alpha');\nexport function betaCaller() {\n  return alphaHelper();\n}\nexport function betaUtil() { return 2; }\n",
+                ),
+            ],
         );
         let db = tmp.path().join("graph.lbug");
         let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
