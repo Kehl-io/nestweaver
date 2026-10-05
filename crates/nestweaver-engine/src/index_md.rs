@@ -2246,7 +2246,13 @@ fn index_markdown_since_with_reader_mode(
     let v_uid = vault_uid(instance_id, &root_str);
     let vault_name =
         &crate::vault_registration::effective_vault_name(store, &v_uid, vault_name, vault_root);
-    crate::vault_registration::refuse_duplicate_vault_name(store, &v_uid, vault_name, vault_root)?;
+    crate::vault_registration::refuse_new_local_vault(
+        store,
+        &v_uid,
+        vault_name,
+        vault_root,
+        instance_id,
+    )?;
 
     let existing_notes = store
         .list_notes(Some(&v_uid))
@@ -3521,8 +3527,12 @@ where
     // nw-608: before any scan work. The server-mode route names a vault by its
     // repo URL and roots it at a bare clone, so it is not a local registration.
     if record_repo_sha.is_none() {
-        crate::vault_registration::refuse_duplicate_vault_name(
-            store, &v_uid, vault_name, vault_root,
+        crate::vault_registration::refuse_new_local_vault(
+            store,
+            &v_uid,
+            vault_name,
+            vault_root,
+            instance_id,
         )?;
     }
 

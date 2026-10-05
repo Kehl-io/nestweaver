@@ -206,8 +206,9 @@ pub fn default_vault_name(root: &Path) -> String {
 ///     existed. Renaming it (`--name`) is checked like a new registration:
 ///     skipping the check for every known uid let a rename take a name
 ///     another root already held;
-///   * another vault at the SAME root (a different instance) is nw-098's case,
-///     guarded by the CLI and repaired by `instance merge`, not this one.
+///   * another vault at the SAME root under a different instance is
+///     [`refuse_vault_root_under_other_instance`]: refused before any write,
+///     in both directions. Removing the other registration is the repair.
 ///
 /// Every local vault publication calls this — the full and `--since` index
 /// routes and the watcher's startup — so `brain add`, `brain refresh`,
@@ -244,6 +245,96 @@ pub fn refuse_duplicate_vault_name(
         existing_uid: existing.uid.clone(),
         existing_instance: existing.instance_id.clone(),
     }))
+}
+
+/// Both pre-write registration refusals, in one place, so `brain add`,
+/// `brain refresh`, `brain watch`, the daemon RPCs and MCP cannot grow a
+/// path that checks only one of them.
+pub fn refuse_new_local_vault(
+    store: &nestweaver_store::GraphStore,
+    uid: &str,
+    name: &str,
+    root: &Path,
+    instance_id: &str,
+) -> anyhow::Result<()> {
+    refuse_duplicate_vault_name(store, uid, name, root)?;
+    refuse_vault_root_under_other_instance(store, instance_id, root)
+}
+
+/// nw-732: refuse to register `root` under `instance_id` when another
+/// instance already holds that root.
+///
+/// Vault UIDs embed the instance, so the second registration is a different
+/// vault at the same files. Search then returns both, and note counts become
+/// the sum. The check is symmetric: instance `one` then `other` is refused
+/// the same way as `other` then `one`. Re-adding the instance that already
+/// holds the root refreshes that vault in place, including when a fork
+/// already exists and the caller named one side of it.
+///
+/// Runs before any graph write. The remedy is to refresh the existing
+/// instance or remove it. It does not suggest merging instances.
+pub fn refuse_vault_root_under_other_instance(
+    store: &nestweaver_store::GraphStore,
+    instance_id: &str,
+    root: &Path,
+) -> anyhow::Result<()> {
+    let wanted = canonical(root);
+    let vaults = store.list_vaults(None)?;
+    let refreshing_existing = vaults.iter().any(|vault| {
+        vault.instance_id == instance_id && canonical(Path::new(&vault.root_path)) == wanted
+    });
+    if refreshing_existing {
+        return Ok(());
+    }
+    let mut others: Vec<&nestweaver_schema::Vault> = vaults
+        .iter()
+        .filter(|vault| {
+            vault.instance_id != instance_id && canonical(Path::new(&vault.root_path)) == wanted
+        })
+        .collect();
+    if others.is_empty() {
+        return Ok(());
+    }
+    others.sort_by(|left, right| {
+        left.instance_id
+            .cmp(&right.instance_id)
+            .then_with(|| left.uid.cmp(&right.uid))
+    });
+    let existing = others[0];
+    let other_instances = others
+        .iter()
+        .map(|vault| vault.instance_id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(anyhow::Error::new(VaultRegisteredUnderOtherInstance {
+        root: root.display().to_string(),
+        requested_instance: instance_id.to_string(),
+        existing_instance: existing.instance_id.clone(),
+        existing_uid: existing.uid.clone(),
+        other_instances,
+    }))
+}
+
+/// A vault root refused because a different instance already holds it.
+/// Typed so every route reports it the same way, and so the text cannot
+/// recommend merging instances.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error(
+    "{root} is already registered under instance '{existing_instance}' ({existing_uid}); \
+     refusing to register it again under instance '{requested_instance}'. \
+     Other instances at this root: {other_instances}.\n\
+     A second vault at the same root splits note counts and makes searches return duplicate rows.\n\
+     help: re-run with --instance {existing_q}, or remove that registration first \
+     (`nestweaver brain remove {root_q} --instance {existing_q}`).",
+    existing_q = crate::shell_quote(.existing_instance),
+    root_q = crate::shell_quote(.root)
+)]
+pub struct VaultRegisteredUnderOtherInstance {
+    pub root: String,
+    pub requested_instance: String,
+    pub existing_instance: String,
+    pub existing_uid: String,
+    pub other_instances: String,
 }
 
 /// A vault registration (new, or a rename) refused because another root
@@ -558,6 +649,129 @@ mod tests {
             })
             .unwrap();
         refuse_duplicate_vault_name(&store, "vlt:default:c", "notes", &forked).unwrap();
+    }
+
+    fn insert_root(store: &nestweaver_store::GraphStore, instance: &str, root: &Path) {
+        let root_str = root.to_string_lossy().into_owned();
+        store
+            .insert_vault(&nestweaver_schema::Vault {
+                uid: nestweaver_schema::vault_uid(instance, &root_str),
+                name: "notes".into(),
+                root_path: root_str,
+                instance_id: instance.into(),
+            })
+            .unwrap();
+    }
+
+    /// nw-732: a second instance at the same root is refused in either order,
+    /// before a caller would commit it. The same instance may be added again.
+    /// The refusal tells the operator to remove or re-run; it does not name
+    /// an instance-merge command.
+    #[test]
+    fn a_root_registered_under_another_instance_is_refused_both_ways() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        insert_root(&store, "one", &root);
+        let forward = refuse_vault_root_under_other_instance(&store, "other", &root)
+            .expect_err("one then other");
+        let forward_message = format!("{forward:#}");
+        assert!(
+            forward
+                .downcast_ref::<VaultRegisteredUnderOtherInstance>()
+                .is_some(),
+            "{forward_message}"
+        );
+        assert!(
+            !forward_message.contains("instance merge"),
+            "{forward_message}"
+        );
+        assert!(
+            forward_message.contains("--instance one"),
+            "{forward_message}"
+        );
+        assert!(
+            forward_message.contains("brain remove"),
+            "{forward_message}"
+        );
+        assert_eq!(store.list_vaults(None).unwrap().len(), 1);
+
+        let reversed = nestweaver_store::GraphStore::in_memory().unwrap();
+        insert_root(&reversed, "other", &root);
+        let backward = refuse_vault_root_under_other_instance(&reversed, "one", &root)
+            .expect_err("other then one");
+        assert!(
+            backward
+                .downcast_ref::<VaultRegisteredUnderOtherInstance>()
+                .is_some()
+        );
+        assert!(!format!("{backward:#}").contains("instance merge"));
+
+        refuse_vault_root_under_other_instance(&store, "one", &root)
+            .expect("the instance that already holds the root still refreshes");
+        // A fork that already exists can still refresh the side the caller named.
+        insert_root(&store, "other", &root);
+        refuse_vault_root_under_other_instance(&store, "one", &root)
+            .expect("refreshing an existing side of a fork is not a new registration");
+        let third = refuse_vault_root_under_other_instance(&store, "third", &root)
+            .expect_err("a third instance is still a new registration");
+        assert!(
+            format!("{third:#}").contains("one, other") || format!("{third:#}").contains("one")
+        );
+    }
+
+    /// The index route refuses before the second vault is committed.
+    #[test]
+    fn indexing_the_same_root_under_another_instance_does_not_commit_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), "# Alpha\n").unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        crate::index_md::index_markdown_directory_with_store(
+            &store,
+            &root,
+            &db,
+            "one",
+            "vault",
+            &[],
+        )
+        .unwrap();
+        let error = match crate::index_md::index_markdown_directory_with_store(
+            &store,
+            &root,
+            &db,
+            "other",
+            "vault",
+            &[],
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("the second instance must be refused"),
+        };
+        assert!(
+            error
+                .downcast_ref::<VaultRegisteredUnderOtherInstance>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(!format!("{error:#}").contains("instance merge"));
+        let vaults = store.list_vaults(None).unwrap();
+        assert_eq!(vaults.len(), 1, "{vaults:?}");
+        assert_eq!(vaults[0].instance_id, "one");
+
+        crate::index_md::index_markdown_directory_with_store(
+            &store,
+            &root,
+            &db,
+            "one",
+            "vault",
+            &[],
+        )
+        .expect("the same instance can be indexed again");
+        assert_eq!(store.list_vaults(None).unwrap().len(), 1);
     }
 
     #[test]

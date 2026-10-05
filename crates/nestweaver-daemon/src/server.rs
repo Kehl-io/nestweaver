@@ -1083,6 +1083,35 @@ fn establish_search_reconciliation_debt(
     Ok(SearchDebtAdmission { had_existing_debt })
 }
 
+/// A registration refusal happens before any graph write. Recording it as
+/// search debt would make the next read treat an unchanged corpus as diverged.
+/// Returns true when `error` is that kind of refusal and the fresh debt from
+/// this attempt has been dropped. Debt that already existed is left alone.
+fn search_debt_after_prewrite_refusal(
+    state: &DaemonState,
+    error: &anyhow::Error,
+    had_existing_debt: bool,
+) -> bool {
+    let refused = error
+        .downcast_ref::<nestweaver_engine::vault_registration::VaultRegisteredUnderOtherInstance>()
+        .is_some()
+        || error
+            .downcast_ref::<nestweaver_engine::vault_registration::DuplicateVaultName>()
+            .is_some();
+    if !refused {
+        return false;
+    }
+    if !had_existing_debt
+        && let Err(marker_error) = clear_search_reconciliation_debt(&state.db_path)
+    {
+        tracing::error!(
+            error = %marker_error,
+            "failed to clear search-reconciliation debt after a vault registration refusal"
+        );
+    }
+    true
+}
+
 fn record_search_reconciliation_failure(
     state: &DaemonState,
     operation: &str,
@@ -6308,6 +6337,31 @@ fn forget_vault_registration(state: &DaemonState, vault_uid: &str, root_path: Op
     if let Some(root) = root_path {
         nestweaver_engine::index_md::forget_vault_skipped_notes(&state.db_path, Path::new(root));
     }
+    // nw-732: the derivation sidecar is stamped with the instance that indexed
+    // the vault. Leaving it after the vault is gone makes the next add under
+    // another instance fail as a foreign identity, with nothing left in the
+    // graph to explain why.
+    forget_vault_derivation(state, vault_uid);
+}
+
+fn forget_vault_derivation(state: &DaemonState, vault_uid: &str) {
+    let identity = match state.store.publication_identity() {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(
+                "nw-732: publication identity unavailable; markdown derivation for {vault_uid} was not cleared: {error:#}"
+            );
+            return;
+        }
+    };
+    if let Err(error) = nestweaver_engine::markdown_derivation::forget_vault_record(
+        &state.db_path,
+        &identity,
+        vault_uid,
+    ) {
+        tracing::warn!("nw-732: failed to clear markdown derivation for {vault_uid}: {error:#}");
+    }
 }
 
 fn run_remove_vault_with_projection(
@@ -8461,14 +8515,20 @@ impl NestWeaverDaemon for DaemonService {
                     }));
                 }
                 Err(e) => {
-                    let error = anyhow::anyhow!("IndexVault graph mutation failed: {e:#}");
-                    if let Err(marker_error) =
-                        record_search_reconciliation_failure(&state, "index_vault", &error)
-                    {
-                        tracing::error!(
-                            error = %marker_error,
-                            "failed to update durable search debt after IndexVault error"
-                        );
+                    if !search_debt_after_prewrite_refusal(
+                        &state,
+                        &e,
+                        search_admission.had_existing_debt,
+                    ) {
+                        let error = anyhow::anyhow!("IndexVault graph mutation failed: {e:#}");
+                        if let Err(marker_error) =
+                            record_search_reconciliation_failure(&state, "index_vault", &error)
+                        {
+                            tracing::error!(
+                                error = %marker_error,
+                                "failed to update durable search debt after IndexVault error"
+                            );
+                        }
                     }
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Error as i32,
@@ -8727,17 +8787,23 @@ impl NestWeaverDaemon for DaemonService {
                     }));
                 }
                 Err(error) => {
-                    let debt_error =
-                        anyhow::anyhow!("RefreshVaultSince graph mutation failed: {error:#}");
-                    if let Err(marker_error) = record_search_reconciliation_failure(
+                    if !search_debt_after_prewrite_refusal(
                         &state,
-                        "refresh_vault_since",
-                        &debt_error,
+                        &error,
+                        search_admission.had_existing_debt,
                     ) {
-                        tracing::error!(
-                            error = %marker_error,
-                            "failed to update durable search debt after RefreshVaultSince error"
-                        );
+                        let debt_error =
+                            anyhow::anyhow!("RefreshVaultSince graph mutation failed: {error:#}");
+                        if let Err(marker_error) = record_search_reconciliation_failure(
+                            &state,
+                            "refresh_vault_since",
+                            &debt_error,
+                        ) {
+                            tracing::error!(
+                                error = %marker_error,
+                                "failed to update durable search debt after RefreshVaultSince error"
+                            );
+                        }
                     }
                     let _ = tx.blocking_send(Ok(IndexProgress {
                         phase: Phase::Error as i32,
@@ -19353,6 +19419,33 @@ repos = ["alpha"]
         run_remove_vault_with_projection(&state, "vlt:debt:gone", None).unwrap();
 
         assert_only_debt_left_for(&state, "/other/vault");
+    }
+
+    /// nw-732: `brain remove` used to leave `<db>.markdown-derivation.json`
+    /// stamped with the old instance, so the next add under another instance
+    /// failed as a foreign identity with no vault left to explain it.
+    #[test]
+    fn remove_vault_deletes_the_derivation_sidecar() {
+        let state = test_state_with_writer();
+        let root = tempfile::tempdir().unwrap();
+        let root_str = root.path().to_string_lossy().into_owned();
+        seed_vault_note_heading_embeddings(&state, "vlt:derive:gone", "old", &root_str);
+        let identity = state.store.ensure_publication_identity().unwrap();
+        nestweaver_engine::markdown_derivation::save_records(
+            &state.db_path,
+            &nestweaver_engine::markdown_derivation::DerivationRecords::default(),
+            &nestweaver_engine::markdown_derivation::expectation(&identity, "old"),
+        )
+        .unwrap();
+        let sidecar = nestweaver_engine::markdown_derivation::record_path(&state.db_path);
+        assert!(sidecar.exists());
+
+        run_remove_vault_with_projection(&state, "vlt:derive:gone", None).unwrap();
+
+        assert!(
+            !sidecar.exists(),
+            "removing the vault must delete a derivation sidecar stamped for its instance"
+        );
     }
 
     #[test]

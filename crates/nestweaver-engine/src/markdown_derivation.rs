@@ -446,14 +446,46 @@ pub fn decode_records(
     {
         return Err(RecordError::ForeignIdentity);
     }
+    verify_payload_checksum(&envelope)?;
+    records_from_envelope(&envelope)
+}
+
+fn decode_envelope(bytes: &[u8]) -> Result<RecordEnvelope, RecordError> {
+    if bytes.len() > MAX_RECORD_BYTES {
+        return Err(RecordError::LimitExceeded);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| RecordError::Corrupt("invalid JSON"))?;
+    let schema = value
+        .get("schema_version")
+        .and_then(|v| v.as_u64())
+        .ok_or(RecordError::Corrupt("schema is absent"))?;
+    if schema != u64::from(RECORD_SCHEMA_VERSION) {
+        return Err(RecordError::UnsupportedSchema(schema));
+    }
+    let envelope: RecordEnvelope = serde_json::from_value(value)
+        .map_err(|_| RecordError::Corrupt("invalid envelope fields"))?;
+    envelope
+        .identity
+        .validate()
+        .map_err(|_| RecordError::InvalidIdentity)?;
+    verify_payload_checksum(&envelope)?;
+    Ok(envelope)
+}
+
+fn verify_payload_checksum(envelope: &RecordEnvelope) -> Result<(), RecordError> {
     let payload = serde_json::to_vec(&envelope.payload)
         .map_err(|_| RecordError::Corrupt("payload cannot be encoded"))?;
     if blake3::hash(&payload).to_hex().as_str() != envelope.payload_checksum {
         return Err(RecordError::Corrupt("payload checksum mismatch"));
     }
-    let records: DerivationRecords = serde_json::from_value(envelope.payload)
+    Ok(())
+}
+
+fn records_from_envelope(envelope: &RecordEnvelope) -> Result<DerivationRecords, RecordError> {
+    let records: DerivationRecords = serde_json::from_value(envelope.payload.clone())
         .map_err(|_| RecordError::Corrupt("invalid record payload"))?;
-    check_records(&records, expected.identity)?;
+    check_records(&records, &envelope.identity)?;
     Ok(records)
 }
 
@@ -602,6 +634,46 @@ pub fn rebind_ambient_default_records(
     })
     .map_err(|e| RecordError::Io(e.kind()))?;
     Ok(true)
+}
+
+/// Drop `vault_uid` from the derivation sidecar after that vault was removed
+/// on purpose.
+///
+/// When nothing remains, the file is deleted. An empty file would keep the
+/// envelope's data instance, and the next add under another instance would
+/// fail as a foreign identity (nw-732). Remaining vaults are rewritten under
+/// the envelope's own instance. A sidecar whose publication identity is a
+/// different brain is left untouched.
+pub fn forget_vault_record(
+    db_path: &Path,
+    identity: &PublicationIdentity,
+    vault_uid: &str,
+) -> Result<(), RecordError> {
+    identity
+        .validate()
+        .map_err(|_| RecordError::InvalidIdentity)?;
+    let path = record_path(db_path);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(RecordError::Io(error.kind())),
+    };
+    let envelope = decode_envelope(&bytes)?;
+    if &envelope.identity != identity {
+        return Ok(());
+    }
+    let mut records = records_from_envelope(&envelope)?;
+    records.vaults.remove(vault_uid);
+    if records.vaults.is_empty() {
+        nestweaver_store::durable_sidecar::remove_file_durable_if_exists(&path)
+            .map_err(|error| RecordError::Io(error.kind()))?;
+        return Ok(());
+    }
+    save_records(
+        db_path,
+        &records,
+        &expectation(identity, &envelope.data_instance_id),
+    )
 }
 
 /// Admission for persistent graph state. Callers must separately establish
@@ -1175,6 +1247,101 @@ mod tests {
         )
         .unwrap();
         assert!(!rebind_ambient_default_records(&db, &id, "qa-fr").unwrap());
+    }
+
+    fn pending_record(instance: &str, root: &Path) -> VaultDerivationRecord {
+        let source = filesystem_source(root).unwrap();
+        let uid = vault_uid(instance, &source.canonical_root);
+        VaultDerivationRecord {
+            vault_uid: uid,
+            data_instance_id: instance.to_string(),
+            source,
+            coverage: CoverageIdentity {
+                scope: CoverageScope::FullRegisteredPolicy,
+                policy_digest: "a".repeat(64),
+                max_note_bytes: 1024,
+                extra_ignore_patterns: Vec::new(),
+            },
+            derivation_version: DERIVATION_VERSION,
+            phase: DerivationPhase::Pending,
+            attempts: 0,
+            last_error: None,
+            retry_after_unix_seconds: None,
+            pending_generation: None,
+            completed_generation: None,
+            witness: None,
+        }
+    }
+
+    fn records_for(records: Vec<VaultDerivationRecord>) -> DerivationRecords {
+        DerivationRecords {
+            vaults: records
+                .into_iter()
+                .map(|record| (record.vault_uid.clone(), record))
+                .collect(),
+        }
+    }
+
+    /// nw-732: removing the last vault deletes the sidecar, so a later add
+    /// under another instance is not a foreign identity. A sibling vault
+    /// stays, still stamped with the envelope's instance.
+    #[test]
+    fn removing_the_last_vault_deletes_the_derivation_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let first = dir.path().join("one");
+        let second = dir.path().join("two");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let id = identity();
+        let kept = pending_record("old", &first);
+        let dropped = pending_record("old", &second);
+        let dropped_uid = dropped.vault_uid.clone();
+        let kept_uid = kept.vault_uid.clone();
+        save_records(
+            &db,
+            &records_for(vec![kept, dropped]),
+            &expectation(&id, "old"),
+        )
+        .unwrap();
+
+        forget_vault_record(&db, &id, &dropped_uid).unwrap();
+        let left = load_records(&db, &expectation(&id, "old"))
+            .unwrap()
+            .expect("the sibling vault's record stays");
+        assert_eq!(left.vaults.len(), 1);
+        assert!(left.vaults.contains_key(&kept_uid));
+        assert_eq!(
+            load_records(&db, &expectation(&id, "new")).unwrap_err(),
+            RecordError::ForeignIdentity
+        );
+
+        forget_vault_record(&db, &id, &kept_uid).unwrap();
+        assert!(!record_path(&db).exists());
+        save_records(&db, &DerivationRecords::default(), &expectation(&id, "new")).unwrap();
+        load_records(&db, &expectation(&id, "new"))
+            .unwrap()
+            .expect("a fresh instance can stamp the sidecar after the old one is gone");
+    }
+
+    /// A file stamped for another brain is not this removal's to delete.
+    #[test]
+    fn a_derivation_sidecar_for_another_brain_is_left_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let root = dir.path().join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+        let owner = identity();
+        let caller = identity();
+        let record = pending_record("old", &root);
+        let uid = record.vault_uid.clone();
+        save_records(&db, &records_for(vec![record]), &expectation(&owner, "old")).unwrap();
+
+        forget_vault_record(&db, &caller, &uid).unwrap();
+        assert!(record_path(&db).exists());
+        load_records(&db, &expectation(&owner, "old"))
+            .unwrap()
+            .expect("the other brain's record is unchanged");
     }
 
     #[test]

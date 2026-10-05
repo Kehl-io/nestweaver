@@ -5125,6 +5125,32 @@ fn stale_check_row_line(r: &serde_json::Value) -> String {
     }
 }
 
+/// Remove commands for every instance at a forked vault root except the one
+/// with the most notes. Ties keep the lexicographically smallest instance.
+fn duplicate_root_remove_commands(entries: &[serde_json::Value], root_q: &str) -> Vec<String> {
+    let keeper = entries.iter().max_by(|left, right| {
+        let left_notes = left["note_count"].as_u64().unwrap_or(0);
+        let right_notes = right["note_count"].as_u64().unwrap_or(0);
+        let left_instance = left["instance_id"].as_str().unwrap_or("");
+        let right_instance = right["instance_id"].as_str().unwrap_or("");
+        left_notes
+            .cmp(&right_notes)
+            .then_with(|| right_instance.cmp(left_instance))
+    });
+    let keeper_instance = keeper.and_then(|entry| entry["instance_id"].as_str());
+    entries
+        .iter()
+        .filter_map(|entry| entry["instance_id"].as_str())
+        .filter(|instance| Some(*instance) != keeper_instance)
+        .map(|instance| {
+            format!(
+                "nestweaver brain remove {root_q} --instance {}",
+                nestweaver_engine::shell_quote(instance)
+            )
+        })
+        .collect()
+}
+
 fn format_brain_status_warnings(warnings: &[serde_json::Value]) -> String {
     let mut out = String::new();
     for w in warnings {
@@ -5150,44 +5176,36 @@ fn format_brain_status_warnings(warnings: &[serde_json::Value]) -> String {
                 "  This usually means brain add was run with different --instance values.\n",
             );
             // Prefer the targeted remediation produced by tool_brain_status
-            // when present, fall back to the generic three-option guidance
-            // for older daemon binaries.
-            let cmds = w["remediation_commands"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
+            // when present. Commands and hints that merge instances are
+            // dropped: that rewrite is destructive for a forked vault
+            // (nw-098, nw-112). An older daemon still sends them. The repair
+            // is to remove the extra registration.
             let hint = w["remediation_hint"].as_str().unwrap_or("");
-            if !cmds.is_empty() {
-                if !hint.is_empty() {
-                    out.push_str(&format!("  {hint}\n"));
-                }
+            let root_q = nestweaver_engine::shell_quote(root);
+            let mut commands: Vec<String> = w["remediation_commands"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|command| command.as_str())
+                .filter(|command| !command.contains("instance merge"))
+                .map(str::to_string)
+                .collect();
+            if commands.is_empty() {
+                commands = duplicate_root_remove_commands(&entries, &root_q);
+            }
+            if !hint.is_empty() && !hint.contains("merge") {
+                out.push_str(&format!("  {hint}\n"));
+            }
+            if !commands.is_empty() {
                 out.push_str("  Run:\n");
-                for c in &cmds {
-                    if let Some(s) = c.as_str() {
-                        out.push_str(&format!("      {s}\n"));
-                    }
+                for command in &commands {
+                    out.push_str(&format!("      {command}\n"));
                 }
             } else {
-                // nw-310, third site in the same family: the fallback for an
-                // older daemon that sends no remediation commands. `entries`
-                // carries every `instance_id`, so the consolidation half is
-                // rendered from the values rather than from placeholders.
-                let observed: Vec<String> = entries
-                    .iter()
-                    .filter_map(|e| e["instance_id"].as_str())
-                    .map(str::to_string)
-                    .collect();
-                let consolidation =
-                    nestweaver_engine::instance_remedy::instance_consolidation_remedy(
-                        &observed, None,
-                    );
                 out.push_str(&format!(
-                    "  Fix one row precisely with:\n      nestweaver brain remove --instance <instance-id>\n  \
-                     Or sweep all rows at this path:\n      nestweaver brain remove {root}\n"
+                    "  Remove one registration with:\n      nestweaver brain remove {root_q} --instance <instance-id>\n  \
+                     Or every row at this path:\n      nestweaver brain remove {root_q}\n"
                 ));
-                if !consolidation.is_empty() {
-                    out.push_str(&format!("  Or {consolidation}\n"));
-                }
             }
         } else {
             // Generic forwarding: a warning kind this binary does not know —
@@ -5274,7 +5292,7 @@ mod brain_status_warning_tests {
                 {"name": "v", "instance_id": "b", "uid": "u2", "note_count": 0},
             ],
             "remediation_commands": ["nestweaver instance merge --from b --to a"],
-            "remediation_hint": "keep a",
+            "remediation_hint": "merge the others into a",
         })];
         let out = format_brain_status_warnings(&warnings);
         assert!(
@@ -5282,9 +5300,12 @@ mod brain_status_warning_tests {
             "{out:?}"
         );
         assert!(out.contains("uid=u1"), "{out:?}");
-        assert!(out.contains("keep a"), "{out:?}");
         assert!(
-            out.contains("nestweaver instance merge --from b --to a"),
+            !out.contains("instance merge"),
+            "a forked vault is removed, not merged: {out:?}"
+        );
+        assert!(
+            out.contains("nestweaver brain remove /vault --instance b"),
             "{out:?}"
         );
     }
