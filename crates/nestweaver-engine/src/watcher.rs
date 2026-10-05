@@ -309,6 +309,65 @@ pub struct BrainWatcher {
 }
 
 impl BrainWatcher {
+    /// Notes a directory create, rename, or removal has to reconcile.
+    ///
+    /// File events already name the markdown path. A directory event does
+    /// not, so the subtree on disk is added and every indexed note whose
+    /// exact path is gone is added too (the old spelling, including a
+    /// case-only rename on a case-insensitive volume). A directory the
+    /// process cannot list contributes nothing: its notes were not observed
+    /// gone.
+    fn directory_event_paths(
+        &self,
+        store: &GraphStore,
+        batch: &[PathBuf],
+    ) -> Result<Vec<PathBuf>, anyhow::Error> {
+        let directory_events: Vec<&Path> = batch
+            .iter()
+            .map(PathBuf::as_path)
+            .filter(|path| path.starts_with(&self.vault_root) && !is_markdown(path))
+            .collect();
+        if directory_events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let covered_by_file = |dir: &Path| {
+            batch.iter().any(|path| {
+                is_markdown(path)
+                    && path.starts_with(dir)
+                    && path
+                        .strip_prefix(dir)
+                        .is_ok_and(|rest| !rest.as_os_str().is_empty())
+            })
+        };
+        let v_uid = vault_uid(&self.instance_id, &self.vault_root.to_string_lossy());
+        let indexed = store
+            .list_notes(Some(&v_uid))
+            .context("list notes for a directory watcher event")?;
+        let mut cache = crate::index_md::ExactPathCache::new();
+        let mut extra = Vec::new();
+        for note in &indexed {
+            let rel = Path::new(&note.file_path);
+            if cache.state(&self.vault_root, rel) == crate::index_md::ExactPathState::Absent {
+                extra.push(self.vault_root.join(rel));
+            }
+        }
+        for dir in directory_events {
+            // `is_dir` follows symlinks. A linked directory must stay a
+            // disclosed symlink, not a second copy of the notes it points at.
+            let real_directory =
+                std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_dir());
+            if !real_directory || covered_by_file(dir) || path_in_skip_dir(dir) {
+                continue;
+            }
+            let rel = dir.strip_prefix(&self.vault_root).unwrap_or(dir);
+            if cache.state(&self.vault_root, rel) != crate::index_md::ExactPathState::Present {
+                continue;
+            }
+            collect_markdown_files(dir, &self.vault_root, &self.ignore_set, &mut extra);
+        }
+        Ok(extra)
+    }
+
     fn event_targets_graph(&self, path: &Path) -> bool {
         if !is_markdown(path) || path_in_skip_dir(path) {
             return false;
@@ -953,6 +1012,10 @@ impl BrainWatcher {
         on_change: &Option<Box<dyn Fn() + Send>>,
     ) -> Result<Option<SidecarDebt>, anyhow::Error> {
         let mut unique_paths = batch;
+        // A directory rename arrives as the directory, not as each note.
+        // Those paths are not markdown, so the batch used to be a no-op
+        // (`mutation_batch = false`) and the old spellings stayed indexed.
+        unique_paths.extend(self.directory_event_paths(store, &unique_paths)?);
         unique_paths.sort();
         unique_paths.dedup();
         let batch_started = Instant::now();
@@ -1970,6 +2033,44 @@ fn log_outcome(outcome: &UpdateOutcome) {
 /// is the shared one, so a `target/` notes folder with no build manifest beside
 /// it is watched exactly as the vault walk now indexes it. `path` is the
 /// absolute event path, so the manifest probe is a plain stat.
+fn collect_markdown_files(
+    dir: &Path,
+    vault_root: &Path,
+    ignore_set: &GlobSet,
+    out: &mut Vec<PathBuf>,
+) {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path_in_skip_dir(&path) {
+                continue;
+            }
+            let rel = path.strip_prefix(vault_root).unwrap_or(&path);
+            if crate::brainignore::is_ignored(&rel.to_string_lossy(), ignore_set) {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                if is_markdown(&path) {
+                    out.push(path);
+                }
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if is_markdown(&path) {
+                out.push(path);
+            }
+        }
+    }
+}
+
 fn path_in_skip_dir(path: &Path) -> bool {
     crate::index::path_in_skip_dirs(
         path,
@@ -2875,6 +2976,124 @@ mod tests {
             store.all_unresolved_wikilinks().unwrap(),
             fresh.all_unresolved_wikilinks().unwrap()
         );
+    }
+
+    fn indexed_paths(store: &GraphStore) -> Vec<String> {
+        let mut paths: Vec<String> = store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .map(|note| note.file_path)
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn directory_rename_reindexes_the_subtree_and_drops_the_old_paths() {
+        let (_dir, root) =
+            make_vault(&[("d1/a.md", "# A\n\n[[B]]\n"), ("d1/b.md", "# B\n\n[[A]]\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        fs::rename(root.join("d1"), root.join("d2")).unwrap();
+        watcher
+            .process_batch(
+                &store,
+                None,
+                &v_uid,
+                vec![root.join("d1"), root.join("d2")],
+                &None,
+            )
+            .expect("a directory rename must not fail the watcher");
+        assert_eq!(
+            indexed_paths(&store),
+            vec!["d2/a.md".to_string(), "d2/b.md".to_string()]
+        );
+
+        fs::write(
+            root.join("d2/a.md"),
+            "# A\n\nedited after the rename\n\n[[B]]\n",
+        )
+        .unwrap();
+        watcher
+            .process_batch(&store, None, &v_uid, vec![root.join("d2/a.md")], &None)
+            .expect("an edit after a directory rename must not kill the watcher");
+        assert_eq!(
+            indexed_paths(&store),
+            vec!["d2/a.md".to_string(), "d2/b.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn directory_moved_in_is_indexed_and_moved_out_is_dropped() {
+        let (_dir, root) = make_vault(&[("keep.md", "# Keep\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+
+        let outside = db_dir.path().join("outside");
+        fs::create_dir_all(outside.join("brought")).unwrap();
+        fs::write(outside.join("brought/n.md"), "# Brought\n").unwrap();
+        fs::rename(outside.join("brought"), root.join("brought")).unwrap();
+        watcher
+            .process_batch(&store, None, &v_uid, vec![root.join("brought")], &None)
+            .unwrap();
+        assert_eq!(
+            indexed_paths(&store),
+            vec!["brought/n.md".to_string(), "keep.md".to_string()]
+        );
+
+        fs::rename(root.join("brought"), outside.join("brought")).unwrap();
+        watcher
+            .process_batch(&store, None, &v_uid, vec![root.join("brought")], &None)
+            .unwrap();
+        assert_eq!(indexed_paths(&store), vec!["keep.md".to_string()]);
+    }
+
+    #[test]
+    fn case_only_directory_rename_keeps_only_the_new_spelling() {
+        let (_dir, root) = make_vault(&[("d1/a.md", "# A\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        fs::rename(root.join("d1"), root.join("D1")).unwrap();
+        watcher
+            .process_batch(
+                &store,
+                None,
+                &v_uid,
+                vec![root.join("d1"), root.join("D1")],
+                &None,
+            )
+            .unwrap();
+        assert_eq!(indexed_paths(&store), vec!["D1/a.md".to_string()]);
+    }
+
+    #[test]
+    fn missing_affected_note_is_dropped_instead_of_failing_the_batch() {
+        let (_dir, root) = make_vault(&[("a.md", "# A\n"), ("b.md", "# B\n\n[[A]]\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        crate::index_md::index_markdown_directory(&root, &db_path, "default", "test").unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let watcher = BrainWatcher::new(&db_path, &root, "default", "test");
+        fs::remove_file(root.join("b.md")).unwrap();
+        fs::write(root.join("a.md"), "# A\n\nedited\n").unwrap();
+        watcher
+            .process_batch(&store, None, &v_uid, vec![root.join("a.md")], &None)
+            .expect("a missing affected note must not fail the watcher");
+        assert_eq!(indexed_paths(&store), vec!["a.md".to_string()]);
     }
 
     #[test]
