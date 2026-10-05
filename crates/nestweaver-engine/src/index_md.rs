@@ -2070,6 +2070,89 @@ impl ContentReader for WatchedNoteReader {
     }
 }
 
+/// Whether a vault-relative path is present under `root` with this exact
+/// casing. A case-insensitive volume still reports the other case as existing
+/// to `metadata`, which left a renamed directory's old notes in the graph.
+///
+/// `Unreadable` is not absence: a directory the process cannot list was not
+/// observed gone, and callers must not delete the notes under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExactPathState {
+    Present,
+    Absent,
+    Unreadable,
+}
+
+#[derive(Clone, Debug)]
+enum DirectoryListing {
+    Names(HashSet<std::ffi::OsString>),
+    Missing,
+    Unreadable,
+}
+
+pub(crate) struct ExactPathCache {
+    dirs: HashMap<PathBuf, DirectoryListing>,
+}
+
+impl ExactPathCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            dirs: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn state(&mut self, root: &Path, rel: &Path) -> ExactPathState {
+        let mut dir = root.to_path_buf();
+        let mut saw_component = false;
+        for component in rel.components() {
+            let name = match component {
+                std::path::Component::CurDir => continue,
+                std::path::Component::Normal(name) => name,
+                _ => return ExactPathState::Absent,
+            };
+            saw_component = true;
+            let listing =
+                self.dirs
+                    .entry(dir.clone())
+                    .or_insert_with(|| match std::fs::read_dir(&dir) {
+                        Ok(entries) => DirectoryListing::Names(
+                            entries
+                                .filter_map(|entry| entry.ok())
+                                .map(|entry| entry.file_name())
+                                .collect(),
+                        ),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            DirectoryListing::Missing
+                        }
+                        Err(_) => DirectoryListing::Unreadable,
+                    });
+            match listing {
+                DirectoryListing::Unreadable => return ExactPathState::Unreadable,
+                DirectoryListing::Missing => return ExactPathState::Absent,
+                DirectoryListing::Names(names) if !names.contains(name) => {
+                    return ExactPathState::Absent;
+                }
+                DirectoryListing::Names(_) => {}
+            }
+            dir.push(name);
+        }
+        if saw_component || root.is_dir() {
+            ExactPathState::Present
+        } else {
+            ExactPathState::Absent
+        }
+    }
+}
+
+/// `read_file` stringifies the IO error, so the `NotFound` kind does not
+/// survive the `anyhow` conversion. The platform text is what the watcher sees.
+fn note_source_is_missing(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}");
+    text.contains("No such file")
+        || text.contains("os error 2")
+        || text.contains("The system cannot find the file")
+}
+
 /// Commit the watcher's changed `paths` through the incremental indexer.
 /// Returns the source text of each changed note that was read (keyed by
 /// vault-relative path) — the exact text parsed and committed — so the
@@ -2095,11 +2178,20 @@ pub(crate) fn refresh_watched_paths(
     let mut changed = HashSet::new();
     let mut symlinks = Vec::new();
     let mut not_symlinks = Vec::new();
+    let mut exact_paths = ExactPathCache::new();
     for path in paths {
         let relative = path
             .strip_prefix(vault_root)
             .context("watched path outside vault")?
             .to_path_buf();
+        // Case-insensitive volumes report the other spelling as present.
+        // A rename is a deletion of the stored spelling, not an update of it.
+        if exact_paths.state(vault_root, &relative) == ExactPathState::Absent {
+            files.remove(&relative);
+            // The path is gone, so a symlink skip row recorded for it is too.
+            not_symlinks.push(relative.to_string_lossy().into_owned());
+            continue;
+        }
         // Not followed, as the full walk does not follow it: a note that was
         // at this path is gone from the graph, and the link is disclosed.
         if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
@@ -2640,9 +2732,20 @@ fn index_markdown_since_with_reader_mode(
                 "cannot safely rebuild affected indexed note {source_uid}; its source is ignored or unavailable"
             ));
         };
-        let source = reader
-            .read_file(Path::new(rel_path))
-            .with_context(|| format!("read affected indexed note {rel_path}"))?;
+        let source = match reader.read_file(Path::new(rel_path)) {
+            Ok(source) => source,
+            // The watcher still lists a note whose file was renamed or
+            // removed out from under an in-flight batch. Deleting that note
+            // keeps the rest of the batch; aborting here is what ended the
+            // watcher and left later edits unindexed.
+            Err(err) if note_source_is_missing(&err) => {
+                delete_note_uids.push(source_uid.clone());
+                continue;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("read affected indexed note {rel_path}"));
+            }
+        };
         let parsed = parse_markdown(rel_path, &source)
             .with_context(|| format!("parse affected indexed note {rel_path}"))?;
         candidates.push(ParsedCandidate {
@@ -2653,6 +2756,8 @@ fn index_markdown_since_with_reader_mode(
             changed: false,
         });
     }
+    delete_note_uids.sort();
+    delete_note_uids.dedup();
 
     let existing_tag_uids: std::collections::HashSet<String> = store
         .list_tags(Some(&v_uid))

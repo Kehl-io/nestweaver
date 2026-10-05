@@ -1465,6 +1465,82 @@ fn watcher_status(state: &DaemonState) -> Option<nestweaver_proto::WatcherStatus
     })
 }
 
+fn note_watcher_exit(state: &DaemonState, kind: &str, error: Option<String>) {
+    let Some(error) = error else {
+        return;
+    };
+    let message = format!(
+        "{kind} watcher exited and is no longer indexing edits: {error}. \
+         Restart watching; later edits stay unindexed until it is running again."
+    );
+    if let Ok(mut slot) = state.watcher_failure.lock() {
+        *slot = Some(message);
+    }
+}
+
+fn clear_watcher_failure(state: &DaemonState) {
+    if let Ok(mut slot) = state.watcher_failure.lock() {
+        *slot = None;
+    }
+}
+
+fn watcher_failure_message(state: &DaemonState) -> Option<String> {
+    state
+        .watcher_failure
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
+#[cfg(test)]
+mod watcher_failure_disclosure_tests {
+    use super::disclose_watcher_failure;
+
+    #[test]
+    fn a_dead_watcher_is_a_status_warning() {
+        let mut value = serde_json::json!({"warnings": [{"kind": "other", "warning": "kept"}]});
+        disclose_watcher_failure(&mut value, Some("vault watcher exited"));
+        let warnings = value["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[1]["kind"], "watcher_exited");
+        assert_eq!(warnings[1]["warning"], "vault watcher exited");
+        assert!(
+            warnings[1]["action"]
+                .as_str()
+                .unwrap()
+                .contains("brain watch")
+        );
+    }
+
+    #[test]
+    fn no_failure_adds_nothing() {
+        let mut value = serde_json::json!({"notes": 1});
+        disclose_watcher_failure(&mut value, None);
+        disclose_watcher_failure(&mut value, Some(""));
+        assert!(value.get("warnings").is_none());
+    }
+}
+
+/// Attach a dead-watcher warning to a `brain status` document. Absence of a
+/// failure leaves the document unchanged, including when `warnings` is missing.
+fn disclose_watcher_failure(value: &mut serde_json::Value, failure: Option<&str>) {
+    let Some(failure) = failure.filter(|message| !message.is_empty()) else {
+        return;
+    };
+    let warning = serde_json::json!({
+        "kind": "watcher_exited",
+        "warning": failure,
+        "action": "nestweaver brain watch",
+    });
+    match value
+        .get_mut("warnings")
+        .and_then(|warnings| warnings.as_array_mut())
+    {
+        Some(warnings) => warnings.push(warning),
+        None => value["warnings"] = serde_json::json!([warning]),
+    }
+}
+
 fn watcher_status_json(state: &DaemonState) -> serde_json::Value {
     match watcher_status(state) {
         Some(w) => serde_json::json!({"id": w.id, "kind": w.kind, "target": w.target,
@@ -2241,6 +2317,11 @@ pub struct DaemonState {
     pub idle_notify: Arc<Notify>,
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
     pub watcher_stop: std::sync::Mutex<Option<WatcherRegistration>>,
+    /// Set when a watcher exits with an error. Cleared once a replacement
+    /// vault watcher reaches ready. `brain status` prints it; a clean stop
+    /// does not set it, which is why a dead watcher used to vanish with no
+    /// warning.
+    pub watcher_failure: std::sync::Mutex<Option<String>>,
     /// Monotonic id source for [`WatcherRegistration`]s.
     pub next_watcher_id: std::sync::atomic::AtomicU64,
     /// Parsed `nestweaver-instance.toml` if `--config` was supplied at
@@ -3837,13 +3918,19 @@ impl DaemonService {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 watcher.run_with_store(store, on_change)
             }));
-            match result {
+            let failure = match &result {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(format!("{error:#}")),
+                Err(_) => Some("the watcher thread panicked".to_string()),
+            };
+            match &result {
                 Ok(Ok(())) => tracing::info!(watcher_id, "code watcher exited cleanly"),
                 Ok(Err(error)) => {
                     tracing::error!(%error, watcher_id, "code watcher exited with error")
                 }
                 Err(_) => tracing::error!(watcher_id, "code watcher thread panicked"),
             }
+            note_watcher_exit(&state, "code", failure);
             clear_watcher_registration(&state, watcher_id);
         });
 
@@ -7139,11 +7226,17 @@ impl NestWeaverDaemon for DaemonService {
                 {
                     let _ = sender.send(Err(startup_error));
                 }
-                match result {
+                let failure = match &result {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(format!("{error:#}")),
+                    Err(_) => Some("the watcher thread panicked".to_string()),
+                };
+                match &result {
                     Ok(Ok(())) => tracing::info!("watcher exited cleanly"),
-                    Ok(Err(e)) => tracing::error!(error = %e, "watcher exited with error"),
+                    Ok(Err(error)) => tracing::error!(error = %error, "watcher exited with error"),
                     Err(_) => tracing::error!("watcher thread panicked"),
                 }
+                note_watcher_exit(&state, "vault", failure);
 
                 clear_watcher_registration(&state, watcher_id);
             });
@@ -7181,6 +7274,7 @@ impl NestWeaverDaemon for DaemonService {
         match ready_rx.await {
             Ok(Ok(())) if !pending.stop.is_stopped() => {
                 pending.armed = false;
+                clear_watcher_failure(&self.state);
             }
             result => {
                 pending.stop.stop();
@@ -9869,6 +9963,7 @@ impl NestWeaverDaemon for DaemonService {
         if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&json_resp.result_json) {
             value["runtime_telemetry"] = serde_json::json!("available");
             value["watcher"] = watcher_status_json(&self.state);
+            disclose_watcher_failure(&mut value, watcher_failure_message(&self.state).as_deref());
             value["watcher_pid"] =
                 serde_json::json!(watcher_status(&self.state).and_then(|w| w.controller_pid));
             value["supervision"] =
@@ -14728,6 +14823,7 @@ pub async fn run_server(
         idle_notify: idle_notify.clone(),
         shutdown_tx: shutdown_tx.clone(),
         watcher_stop: std::sync::Mutex::new(None),
+        watcher_failure: std::sync::Mutex::new(None),
         next_watcher_id: std::sync::atomic::AtomicU64::new(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -24941,6 +25037,7 @@ repos = ["alpha"]
             idle_notify: Arc::new(Notify::new()),
             shutdown_tx,
             watcher_stop: std::sync::Mutex::new(None),
+            watcher_failure: std::sync::Mutex::new(None),
             next_watcher_id: std::sync::atomic::AtomicU64::new(0),
             instance_cfg: None,
             effective_config: EffectiveConfigProvenance::CompiledDefaults,
@@ -25398,6 +25495,7 @@ credential_method = "gh"
             idle_notify: Arc::new(Notify::new()),
             shutdown_tx,
             watcher_stop: std::sync::Mutex::new(None),
+            watcher_failure: std::sync::Mutex::new(None),
             next_watcher_id: std::sync::atomic::AtomicU64::new(0),
             instance_cfg: None,
             effective_config: EffectiveConfigProvenance::CompiledDefaults,
