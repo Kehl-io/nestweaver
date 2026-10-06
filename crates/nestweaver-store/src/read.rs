@@ -2895,6 +2895,45 @@ impl GraphStore {
         }
     }
 
+    /// Read only direct seed identity and retrieval labels, avoiding note bodies and
+    /// complete symbol records. Missing UIDs are absent; blank labels remain present.
+    /// Callers bound batches and preserve their own input order and duplicates.
+    pub fn brain_seed_labels(&self, uids: &[&str]) -> Result<HashMap<String, String>, StoreError> {
+        let conn = self.conn()?;
+        let mut labels = HashMap::new();
+        for (prefix, table, field) in [("sym:", "Symbol", "name"), ("note:", "Note", "title")] {
+            let selected: Vec<&str> = uids
+                .iter()
+                .copied()
+                .filter(|uid| uid.starts_with(prefix))
+                .collect();
+            for chunk in selected.chunks(256) {
+                let mut stmt = conn.prepare(&format!(
+                    "UNWIND $uids AS want_uid MATCH (n:{table} {{uid: want_uid}}) RETURN n.uid, n.{field}"
+                )).map_err(|e| StoreError::Query(format!("prepare seed labels: {e}")))?;
+                let rows = conn
+                    .execute(
+                        &mut stmt,
+                        vec![(
+                            "uids",
+                            Value::List(
+                                lbug::LogicalType::String,
+                                chunk
+                                    .iter()
+                                    .map(|uid| Value::String((*uid).into()))
+                                    .collect(),
+                            ),
+                        )],
+                    )
+                    .map_err(|e| StoreError::Query(format!("seed labels: {e}")))?;
+                for row in rows {
+                    labels.insert(extract_string(&row, 0)?, extract_string(&row, 1)?);
+                }
+            }
+        }
+        Ok(labels)
+    }
+
     /// Batch primary-key-oriented note hydration for derived-index hits.
     pub fn lookup_notes_by_uids(&self, uids: &[String]) -> Result<Vec<Note>, StoreError> {
         // nw-141: primary-key probes via UNWIND, not a disjunction of equality
@@ -4303,7 +4342,7 @@ impl GraphStore {
             project_uid,
             &predicates.join(" AND "),
             params,
-            "RETURN s.uid, s.pagerank_score ORDER BY s.pagerank_score DESC LIMIT $limit",
+            "RETURN s.uid, s.pagerank_score ORDER BY s.pagerank_score DESC, s.uid ASC LIMIT $limit",
         )?;
         // Merge the two sources: best score first, each symbol once.
         rows.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));

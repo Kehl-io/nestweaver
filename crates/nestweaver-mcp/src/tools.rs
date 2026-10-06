@@ -13486,9 +13486,7 @@ fn tool_project_context(
     // See `tool_brain_context` — same reason, same parameter.
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
-    // Reject an empty/whitespace project — otherwise the UID-substring fallback below
-    // (`uid.contains(project_str)`) matches EVERY project on "" and silently resolves to the
-    // first one. Reachable via the daemon path, where the proto `project` field defaults to "".
+    // Reject an empty selector, including the daemon proto's default empty value.
     let project_str = args
         .get("project")
         .and_then(|v| v.as_str())
@@ -13535,66 +13533,67 @@ fn tool_project_context(
         .as_ref()
         .is_some_and(|kinds| kinds_are_symbol_only(kinds));
 
-    // 1. Resolve the project: name/alias/UID.
-    let project = if project_str.starts_with("proj:") {
-        // Direct UID — list all projects and find by uid or substring.
-        let all = store
-            .list_projects()
-            .map_err(|e| anyhow!("list_projects: {e}"))?;
-        all.into_iter()
-            .find(|p| p.uid == project_str || p.uid.contains(project_str))
-            .ok_or_else(|| {
-                target_not_found(
-                    format!("project UID '{project_str}' not found"),
-                    "project",
-                    json!(project_str),
-                    &[],
-                )
-            })?
-    } else {
-        // Try name match first.
-        match store
-            .lookup_project_by_name(project_str)
-            .map_err(|e| anyhow!("lookup_project_by_name: {e}"))?
-        {
-            Some(p) => p,
-            None => {
-                let all = store
-                    .list_projects()
-                    .map_err(|e| anyhow!("list_projects: {e}"))?;
-
-                // Try alias match via extension sidecar.
-                let db_path = current_db_path(store).unwrap_or_default();
-                let ext_store = load_extensions(&db_path);
-                let needle = project_str.to_lowercase();
-                let alias_match = all.iter().find(|p| {
-                    if let Some(serde_json::Value::Array(aliases)) =
-                        ext_store.get(&p.uid).and_then(|m| m.get("aliases"))
-                    {
-                        aliases
-                            .iter()
-                            .any(|a| a.as_str().is_some_and(|s| s.to_lowercase() == needle))
-                    } else {
-                        false
-                    }
-                });
-                if let Some(p) = alias_match {
-                    p.clone()
-                } else {
-                    // Fall back to UID substring match.
-                    let suggestions = project_did_you_mean(&all, project_str);
-                    all.into_iter()
-                        .find(|p| p.uid.contains(project_str))
-                        .ok_or_else(|| {
-                            target_not_found(
-                                format!("project '{project_str}' not found"),
-                                "project",
-                                json!(project_str),
-                                &suggestions,
-                            )
-                        })?
-                }
+    // Resolve an identity, never a UID substring. Collisions require an exact
+    // UID instead of selecting whichever project the database returned first.
+    let all = store
+        .list_projects()
+        .map_err(|e| anyhow!("list_projects: {e}"))?;
+    let ext_store = load_extensions(&current_db_path(store).unwrap_or_default());
+    let instance = current_instance_config();
+    let needle = project_str.to_lowercase();
+    let mut matches: Vec<_> = all
+        .iter()
+        .filter(|project| {
+            if project_str.starts_with("proj:") {
+                return project.uid == project_str;
             }
+            if project.name.to_lowercase() == needle {
+                return true;
+            }
+            let extension_match = ext_store
+                .get(&project.uid)
+                .and_then(|props| props.get("aliases"))
+                .and_then(Value::as_array)
+                .is_some_and(|aliases| {
+                    aliases.iter().any(|alias| {
+                        alias
+                            .as_str()
+                            .is_some_and(|alias| alias.to_lowercase() == needle)
+                    })
+                });
+            let config_match = instance.as_ref().is_some_and(|cfg| {
+                cfg.projects.iter().any(|configured| {
+                    project.instance_id == cfg.instance_id
+                        && configured.name.eq_ignore_ascii_case(&project.name)
+                        && configured
+                            .aliases
+                            .iter()
+                            .any(|alias| alias.to_lowercase() == needle)
+                })
+            });
+            extension_match || config_match
+        })
+        .collect();
+    matches.sort_by(|a, b| a.uid.cmp(&b.uid));
+    let project = match matches.as_slice() {
+        [project] => (*project).clone(),
+        [] => {
+            return Err(target_not_found(
+                format!("project '{project_str}' not found"),
+                "project",
+                json!(project_str),
+                &project_did_you_mean(&all, project_str),
+            ));
+        }
+        _ => {
+            return Err(anyhow!(
+                "ambiguous project '{project_str}'; choose an exact UID: {}",
+                matches
+                    .iter()
+                    .map(|project| project.uid.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
     };
 
@@ -13619,13 +13618,15 @@ fn tool_project_context(
     member_sources.insert(project.uid.clone(), project.uid.clone());
 
     // 3. If include_components, also collect note/symbol UIDs from each component project.
-    let component_uids = if include_components {
+    let mut component_uids = if include_components {
         store
             .list_project_component_uids(&project.uid)
             .map_err(|e| anyhow!("list_project_component_uids: {e}"))?
     } else {
         vec![]
     };
+    component_uids.sort();
+    component_uids.dedup();
     for comp_uid in &component_uids {
         member_sources.insert(comp_uid.clone(), comp_uid.clone());
         let comp_notes = store
@@ -13652,6 +13653,7 @@ fn tool_project_context(
     // Deduplicate members.
     let mut seen = std::collections::HashSet::new();
     member_uids.retain(|u| seen.insert(u.clone()));
+    member_uids.sort();
 
     if member_uids.is_empty() {
         let mut response = json!({
@@ -13710,9 +13712,11 @@ fn tool_project_context(
         Some(ref selectors) => Some(resolve_repo_filter(store, selectors, visible)?),
         None => None,
     };
-    let seed_repo_uids: Option<Vec<String>> = repo_scope
-        .as_ref()
-        .map(|uids| uids.iter().cloned().collect());
+    let seed_repo_uids: Option<Vec<String>> = repo_scope.as_ref().map(|uids| {
+        let mut ordered: Vec<String> = uids.iter().cloned().collect();
+        ordered.sort();
+        ordered
+    });
 
     // 4. Seed PPR from the project node, its components, and — critically —
     //    the project's member notes (Bug #12). Seeding the notes guarantees
@@ -13751,7 +13755,7 @@ fn tool_project_context(
                 path_prefix.as_deref(),
                 seed_repo_uids.as_deref(),
             )
-            .unwrap_or_default();
+            .map_err(|e| anyhow!("component project symbols: {e}"))?;
         member_symbol_uids.extend(comp_top);
     }
 
@@ -13762,6 +13766,8 @@ fn tool_project_context(
     }
     ppr_seeds.extend(member_symbol_uids.iter().cloned());
 
+    ppr_seeds.sort();
+    ppr_seeds.dedup();
     let intent: nestweaver_store::QueryIntent = args
         .get("intent")
         .and_then(|v| v.as_str())
@@ -13852,8 +13858,13 @@ fn tool_project_context(
     }
     result.connected.sort_by(|a, b| {
         b.relevance
-            .partial_cmp(&a.relevance)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&a.relevance)
+            .then_with(|| a.uid.cmp(&b.uid))
+    });
+    result.seeds.sort_by(|a, b| {
+        b.relevance
+            .total_cmp(&a.relevance)
+            .then_with(|| a.uid.cmp(&b.uid))
     });
 
     // 5. Apply optional kinds filter.
@@ -14004,6 +14015,33 @@ fn tool_project_context(
         .map(|n| render_cost(n, concise))
         .sum();
     let remaining_budget = token_budget.saturating_sub(seed_tokens);
+    // Reserve useful representation of both admitted categories, only after
+    // all filters. The final serialized-budget pass still accounts for metadata.
+    let note = result
+        .connected
+        .iter()
+        .position(|node| node.kind.starts_with("Note"));
+    let code = result
+        .connected
+        .iter()
+        .position(|node| node.kind.starts_with("Symbol"));
+    if let (Some(note), Some(code)) = (note, code) {
+        if render_cost(&result.connected[note], concise)
+            + render_cost(&result.connected[code], concise)
+            <= remaining_budget
+        {
+            let mut selected = vec![note, code];
+            selected.sort_unstable();
+            let reserved: Vec<_> = selected
+                .iter()
+                .map(|i| result.connected[*i].clone())
+                .collect();
+            for index in selected.into_iter().rev() {
+                result.connected.remove(index);
+            }
+            result.connected.splice(0..0, reserved);
+        }
+    }
     let (cut, connected_tokens) = budgeted_cut(&result.connected, remaining_budget, concise);
     let used_tokens = seed_tokens + connected_tokens;
     // nw-188: a caller could not distinguish "this project is empty" from
@@ -18103,6 +18141,208 @@ mod project_context_bug12_tests {
                 0,
                 "strict membership at budget {budget}"
             );
+        }
+    }
+
+    #[test]
+    fn project_context_rejects_partial_uid_and_ambiguous_canonical_names() {
+        let store = GraphStore::in_memory().unwrap();
+        for (uid, name) in [("proj:alpha-long", "Alpha"), ("proj:other", "Alpha")] {
+            store
+                .insert_project(&Project {
+                    uid: uid.into(),
+                    name: name.into(),
+                    summary: None,
+                    instance_id: "default".into(),
+                })
+                .unwrap();
+        }
+        for selector in ["proj:alpha", "alpha-long", "Alpha"] {
+            let response = tool_project_context(
+                &store,
+                None,
+                json!({"project":selector,"no_embed":true}),
+                None,
+                None,
+                None,
+            );
+            assert!(
+                response.is_err(),
+                "partial or ambiguous selector {selector} must refuse: {response:?}"
+            );
+        }
+        let response = tool_project_context(
+            &store,
+            None,
+            json!({"project":"proj:alpha-long","no_embed":true}),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(response["project_uid"], "proj:alpha-long");
+    }
+
+    #[test]
+    fn project_context_resolves_config_and_extension_aliases_and_refuses_collisions() {
+        let store = GraphStore::in_memory().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let previous_db = CURRENT_DB_PATH.with(|path| path.borrow().clone());
+        let previous_config = current_instance_config();
+        let db = tmp.path().join("brain.lbug");
+        set_current_db_path(db.clone());
+        for (uid, name) in [("proj:alpha", "Alpha"), ("proj:beta", "Beta")] {
+            store
+                .insert_project(&Project {
+                    uid: uid.into(),
+                    name: name.into(),
+                    summary: None,
+                    instance_id: "default".into(),
+                })
+                .unwrap();
+        }
+        let mut extensions = load_extensions(&db);
+        nestweaver_engine::set_property(
+            &mut extensions,
+            "proj:alpha",
+            "aliases",
+            json!(["extension alias", "shared"]),
+        );
+        nestweaver_engine::set_property(&mut extensions, "proj:beta", "aliases", json!(["shared"]));
+        nestweaver_engine::save_extensions(&db, &extensions).unwrap();
+        let cfg = serde_json::from_value(json!({
+            "instance_id":"default","repos":[],"projects":[{"name":"Beta","aliases":["config alias","shared"]}],
+            "snapshot_storage":{"backend":"local","path":"/tmp"},"workspace":{"backend":"local","path":"/tmp"},
+            "inference":{"endpoint":"","embedding_model":"","summary_model":""},"git":{"credential_method":"ssh"}
+        })).unwrap();
+        set_current_instance_config(Some(std::sync::Arc::new(cfg)));
+        let ask = |selector| {
+            tool_project_context(
+                &store,
+                None,
+                json!({"project":selector,"no_embed":true}),
+                None,
+                None,
+                None,
+            )
+        };
+        let extension = ask("EXTENSION ALIAS");
+        let config = ask("config alias");
+        let canonical = ask("Beta");
+        let ambiguous = ask("shared");
+        let unknown = ask("does-not-exist");
+        set_current_instance_config(previous_config);
+        CURRENT_DB_PATH.with(|path| *path.borrow_mut() = previous_db);
+        assert_eq!(extension.unwrap()["project_uid"], "proj:alpha");
+        assert_eq!(config.unwrap()["project_uid"], "proj:beta");
+        assert_eq!(canonical.unwrap()["project_uid"], "proj:beta");
+        assert!(
+            ambiguous
+                .unwrap_err()
+                .to_string()
+                .ends_with("proj:alpha, proj:beta")
+        );
+        assert!(not_found_envelope(&unknown.unwrap_err()).is_some());
+    }
+
+    #[test]
+    fn project_context_balances_code_and_notes_after_kind_filters() {
+        for (note_count, symbol_count) in [(3, 50), (30, 1)] {
+            let store = GraphStore::in_memory().unwrap();
+            store
+                .insert_project(&Project {
+                    uid: "proj:balanced".into(),
+                    name: "Balanced".into(),
+                    summary: None,
+                    instance_id: "default".into(),
+                })
+                .unwrap();
+            store
+                .insert_vault(&Vault {
+                    uid: "vlt:t".into(),
+                    name: "t".into(),
+                    root_path: "/v".into(),
+                    instance_id: "default".into(),
+                })
+                .unwrap();
+            let mut notes = Vec::new();
+            for i in 0..note_count {
+                let uid = format!("note:balanced-{i:02}");
+                store
+                    .insert_note(&mk_note(
+                        &uid,
+                        "vlt:t",
+                        &format!("docs/n{i}.md"),
+                        &format!("Curated note {i}"),
+                    ))
+                    .unwrap();
+                notes.push(uid);
+            }
+            store
+                .batch_insert_project_note_edges(
+                    &notes
+                        .iter()
+                        .map(|uid| ("proj:balanced", uid.as_str()))
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            let mut symbols = Vec::new();
+            for i in 0..symbol_count {
+                let uid = format!("sym:balanced-{i:02}");
+                store
+                    .insert_symbol(&mk_symbol(
+                        &uid,
+                        "repo:r",
+                        &format!("src/f{i}.rs"),
+                        &format!("important_function_{i}"),
+                    ))
+                    .unwrap();
+                symbols.push(uid);
+            }
+            store
+                .batch_insert_project_symbol_edges("proj:balanced", &symbols, 1.0)
+                .unwrap();
+            let ask = |kinds: Value| {
+                tool_project_context(&store,None,json!({"project":"Balanced","no_embed":true,"token_budget":1000,"response_format":"detailed","kinds":kinds}),None,None,None).unwrap()
+            };
+            let response = ask(json!(["note", "symbol"]));
+            let rows = response["connected"].as_array().unwrap();
+            assert!(
+                rows.iter().any(|row| row["uid"]
+                    .as_str()
+                    .is_some_and(|uid| uid.starts_with("sym:"))),
+                "code must survive note mass: {response}"
+            );
+            assert!(
+                rows.iter().any(|row| row["kind"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("Note"))),
+                "notes must survive: {response}"
+            );
+            assert!(
+                response["tokens_used"].as_u64().unwrap() <= 1000,
+                "honest cap: {response}"
+            );
+            for (kinds, prefix) in [(json!(["note"]), "note:"), (json!(["symbol"]), "sym:")] {
+                let filtered = ask(kinds);
+                assert!(!filtered["connected"].as_array().unwrap().is_empty());
+                assert!(
+                    filtered["connected"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|row| row["uid"].as_str().unwrap().starts_with(prefix)),
+                    "{filtered}"
+                );
+            }
+            let first = ask(json!(["note", "symbol"]));
+            for _ in 0..4 {
+                assert_eq!(
+                    ask(json!(["note", "symbol"])),
+                    first,
+                    "unchanged query must be deterministic"
+                );
+            }
         }
     }
 
