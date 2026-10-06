@@ -78,14 +78,14 @@ fn largest(value: &Value, path: &mut Vec<Step>, key: &str, best: &mut Option<Cut
         Value::String(text) if text.len() > 128 && !identity(key) => Some((text.len(), false)),
         _ => None,
     };
-    if let Some((size, array)) = candidate {
-        if best.as_ref().is_none_or(|old| size > old.size) {
-            *best = Some(Cut {
-                path: path.clone(),
-                size,
-                array,
-            });
-        }
+    if let Some((size, array)) = candidate
+        && best.as_ref().is_none_or(|old| size > old.size)
+    {
+        *best = Some(Cut {
+            path: path.clone(),
+            size,
+            array,
+        });
     }
     match value {
         Value::Object(map) => {
@@ -143,13 +143,14 @@ fn shrink(value: &mut Value, omitted: &mut BTreeMap<String, Value>) -> Result<bo
                     "impact_nodes" => Some("nodes"),
                     _ => None,
                 };
-                if let Some(sibling) = sibling {
-                    if parent[key].is_array() && parent[key] == parent[sibling] {
-                        let mut path = cut.path.clone();
-                        path[index] = Step::Key(sibling.into());
-                        mirror = Some(path);
-                        break;
-                    }
+                if let Some(sibling) = sibling
+                    && parent[key].is_array()
+                    && parent[key] == parent[sibling]
+                {
+                    let mut path = cut.path.clone();
+                    path[index] = Step::Key(sibling.into());
+                    mirror = Some(path);
+                    break;
                 }
             }
             parent = match step {
@@ -253,24 +254,23 @@ fn shrink(value: &mut Value, omitted: &mut BTreeMap<String, Value>) -> Result<bo
                         .unwrap_or(0)
                         .saturating_add(other_len as u64)
                         >= parent[total_key].as_u64().unwrap_or(u64::MAX);
-                if let Some(array) = parent.get_mut(sibling).and_then(Value::as_array_mut) {
-                    if !exhausted_smaller
-                        && (array.len() == keep + count || (broken_pair && array.len() > keep))
-                    {
-                        let paired_count = array.len() - keep;
-                        array.truncate(keep);
-                        paired = Some(sibling);
-                        if broken_pair {
-                            let mut path = cut.path.clone();
-                            *path.last_mut().unwrap() = Step::Key(sibling.into());
-                            let label = cut_label(&path);
-                            let prior = omitted
-                                .get(&label)
-                                .and_then(|v| v["items_omitted"].as_u64())
-                                .unwrap_or(0);
-                            if omitted.len() < 16 || omitted.contains_key(&label) {
-                                omitted.insert(label, json!({"items_omitted":prior+paired_count as u64,"count_kind":"exact_completed_array","paired_array":key}));
-                            }
+                if let Some(array) = parent.get_mut(sibling).and_then(Value::as_array_mut)
+                    && !exhausted_smaller
+                    && (array.len() == keep + count || (broken_pair && array.len() > keep))
+                {
+                    let paired_count = array.len() - keep;
+                    array.truncate(keep);
+                    paired = Some(sibling);
+                    if broken_pair {
+                        let mut path = cut.path.clone();
+                        *path.last_mut().unwrap() = Step::Key(sibling.into());
+                        let label = cut_label(&path);
+                        let prior = omitted
+                            .get(&label)
+                            .and_then(|v| v["items_omitted"].as_u64())
+                            .unwrap_or(0);
+                        if omitted.len() < 16 || omitted.contains_key(&label) {
+                            omitted.insert(label, json!({"items_omitted":prior+paired_count as u64,"count_kind":"exact_completed_array","paired_array":key}));
                         }
                     }
                 }
@@ -291,15 +291,16 @@ fn shrink(value: &mut Value, omitted: &mut BTreeMap<String, Value>) -> Result<bo
                 "unreachable_symbols" => Some(("offset", "next_offset")),
                 _ => None,
             };
-            if let Some((offset, next)) = cursor {
-                if parent.get(next).is_some() && parent.get(offset).is_some() {
-                    parent[next] = json!(
-                        parent[offset]
-                            .as_u64()
-                            .unwrap_or(0)
-                            .saturating_add(keep as u64)
-                    );
-                }
+            if let Some((offset, next)) = cursor
+                && parent.get(next).is_some()
+                && parent.get(offset).is_some()
+            {
+                parent[next] = json!(
+                    parent[offset]
+                        .as_u64()
+                        .unwrap_or(0)
+                        .saturating_add(keep as u64)
+                );
             }
             if key == "unreachable_symbols" && parent.get("has_more").is_some() {
                 parent["has_more"] = json!(true);

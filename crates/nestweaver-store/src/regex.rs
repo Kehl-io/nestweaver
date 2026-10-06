@@ -1890,7 +1890,7 @@ impl GraphStore {
             StoreError::Query("regex v3 requires graph publication identity".to_string())
         })?;
         let states = if bounded_prefix {
-            self.read_regex_scope_states_selected(&active_scopes, &interrupted)?
+            self.read_regex_scope_states_selected(&active_scopes, interrupted)?
         } else {
             self.read_regex_scope_states()?
         };

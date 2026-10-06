@@ -231,15 +231,14 @@ impl AppState {
                         .repo_freshness
                         .lock()
                         .unwrap_or_else(|error| error.into_inner());
-                    if cache.entries.len() >= FRESHNESS_CACHE_LIMIT {
-                        if let Some(oldest) = cache
+                    if cache.entries.len() >= FRESHNESS_CACHE_LIMIT
+                        && let Some(oldest) = cache
                             .entries
                             .iter()
                             .min_by_key(|(_, (at, _))| *at)
                             .map(|(key, _)| key.clone())
-                        {
-                            cache.entries.remove(&oldest);
-                        }
+                    {
+                        cache.entries.remove(&oldest);
                     }
                     cache
                         .entries

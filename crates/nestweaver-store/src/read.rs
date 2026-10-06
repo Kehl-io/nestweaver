@@ -30,6 +30,12 @@ pub type CodeEdge = (String, String, f64);
 /// Edge data with type and evidence: (source_uid, target_uid, edge_type, confidence, evidence_json).
 pub type TypedEdge = (String, String, String, f64, String);
 
+/// Bounded forward adjacency: (callees with edge types, redacted count, work cut).
+pub type BoundedFlowCallees = (Vec<(Symbol, String)>, usize, bool);
+
+/// Bounded tag membership: (note tag sets, work cut).
+pub type BoundedNoteTagSets = (Vec<(String, Vec<String>)>, bool);
+
 /// One vault relation, described exactly once.
 ///
 /// nw-288 was two independent enumerations of "the vault's edges" in one
@@ -3520,7 +3526,7 @@ impl GraphStore {
         uid: &str,
         limit: usize,
         visible: Option<&HashSet<String>>,
-    ) -> Result<(Vec<(Symbol, String)>, usize, bool), StoreError> {
+    ) -> Result<BoundedFlowCallees, StoreError> {
         let conn = self.conn()?;
         let cols = SYMBOL_COLUMNS
             .replace("s.", "t.")
@@ -5059,7 +5065,7 @@ impl GraphStore {
     pub fn note_tag_sets_bounded(
         &self,
         edge_limit: usize,
-    ) -> Result<(Vec<(String, Vec<String>)>, bool), StoreError> {
+    ) -> Result<BoundedNoteTagSets, StoreError> {
         let conn = self.conn()?;
         let mut by_note: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
             std::collections::BTreeMap::new();

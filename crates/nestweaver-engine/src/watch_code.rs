@@ -1786,52 +1786,48 @@ impl CodeWatcher {
                 reject_recovered_publication(&publication)?;
                 self.finalize_graph_publication_with_io(publication, &io)?;
             }
-            if last {
-                if let (Some(captured), Some(predecessor)) = (&manifest_capture, &predecessor) {
-                    let strict_reader = self.reader_for(repo_url)?.strict_enumeration();
-                    let verify = || {
-                        let mut budget = 32 * 1024 * 1024;
-                        crate::manifest::capture_manifest_inputs(
-                            &strict_reader,
-                            &mut budget,
-                            Instant::now() + Duration::from_secs(60),
-                        )
-                    };
-                    anyhow::ensure!(
-                        *captured == verify()?,
-                        "manifest inputs changed during startup replay"
-                    );
-                    let mut manifests = predecessor.clone();
-                    manifests.insert(r_uid.to_owned(), crate::manifest::parse_manifest(captured));
-                    let live: HashSet<_> = store
-                        .list_repos(None)?
-                        .into_iter()
-                        .map(|repo| repo.uid)
-                        .collect();
-                    anyhow::ensure!(
-                        live == manifests.keys().cloned().collect(),
-                        "repository inventory changed during startup manifest reconciliation"
-                    );
-                    anyhow::ensure!(
-                        manifest_revision
-                            == crate::manifest::manifest_debt_revision(&self.db_path)?,
-                        "manifest debt changed during startup replay"
-                    );
-                    crate::manifest::save_manifest_cache_for_db(&manifests, store, &self.db_path)?;
-                    anyhow::ensure!(
-                        *captured == verify()?,
-                        "manifest inputs changed during startup save"
-                    );
-                    anyhow::ensure!(
-                        manifest_revision
-                            == crate::manifest::manifest_debt_revision(&self.db_path)?,
-                        "manifest debt changed during startup save"
-                    );
-                    if manifest_revision.is_some() {
-                        nestweaver_store::durable_sidecar::remove_file_durable_if_exists(
-                            &crate::manifest::manifest_debt_path(&self.db_path),
-                        )?;
-                    }
+            if last && let (Some(captured), Some(predecessor)) = (&manifest_capture, &predecessor) {
+                let strict_reader = self.reader_for(repo_url)?.strict_enumeration();
+                let verify = || {
+                    let mut budget = 32 * 1024 * 1024;
+                    crate::manifest::capture_manifest_inputs(
+                        &strict_reader,
+                        &mut budget,
+                        Instant::now() + Duration::from_secs(60),
+                    )
+                };
+                anyhow::ensure!(
+                    *captured == verify()?,
+                    "manifest inputs changed during startup replay"
+                );
+                let mut manifests = predecessor.clone();
+                manifests.insert(r_uid.to_owned(), crate::manifest::parse_manifest(captured));
+                let live: HashSet<_> = store
+                    .list_repos(None)?
+                    .into_iter()
+                    .map(|repo| repo.uid)
+                    .collect();
+                anyhow::ensure!(
+                    live == manifests.keys().cloned().collect(),
+                    "repository inventory changed during startup manifest reconciliation"
+                );
+                anyhow::ensure!(
+                    manifest_revision == crate::manifest::manifest_debt_revision(&self.db_path)?,
+                    "manifest debt changed during startup replay"
+                );
+                crate::manifest::save_manifest_cache_for_db(&manifests, store, &self.db_path)?;
+                anyhow::ensure!(
+                    *captured == verify()?,
+                    "manifest inputs changed during startup save"
+                );
+                anyhow::ensure!(
+                    manifest_revision == crate::manifest::manifest_debt_revision(&self.db_path)?,
+                    "manifest debt changed during startup save"
+                );
+                if manifest_revision.is_some() {
+                    nestweaver_store::durable_sidecar::remove_file_durable_if_exists(
+                        &crate::manifest::manifest_debt_path(&self.db_path),
+                    )?;
                 }
             }
             if let Some(callback) = on_change {

@@ -459,24 +459,14 @@ pub fn services_for_project(
 
 pub fn symbols_for_repo(store: &GraphStore, repo_uid: &str) -> Result<Vec<Symbol>, ApiError> {
     Ok(store
-        .workspace_symbol_page(
-            Some(repo_uid),
-            None,
-            None,
-            usize::MAX.min(i64::MAX as usize),
-        )
+        .workspace_symbol_page(Some(repo_uid), None, None, i64::MAX as usize)
         .map_err(|e| ApiError::from_ranking(e.into()))?
         .0)
 }
 
 pub fn symbols_for_project(store: &GraphStore, project_uid: &str) -> Result<Vec<Symbol>, ApiError> {
     Ok(store
-        .workspace_symbol_page(
-            None,
-            Some(project_uid),
-            None,
-            usize::MAX.min(i64::MAX as usize),
-        )
+        .workspace_symbol_page(None, Some(project_uid), None, i64::MAX as usize)
         .map_err(|e| ApiError::from_ranking(e.into()))?
         .0)
 }

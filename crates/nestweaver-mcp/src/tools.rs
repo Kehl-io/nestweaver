@@ -12046,6 +12046,8 @@ struct FlowFrontier {
     cut: HashMap<String, usize>,
 }
 
+type FlowCalleeRead = (Vec<(nestweaver_schema::Symbol, String)>, usize, bool, usize);
+
 /// One callee read, plus the cancellation check that must precede it.
 ///
 /// A failed callee lookup is NOT "this function calls nothing". This was once
@@ -12056,7 +12058,7 @@ fn read_flow_callees(
     store: &GraphStore,
     uid: &str,
     opts: &FlowTraceOpts<'_>,
-) -> Result<(Vec<(nestweaver_schema::Symbol, String)>, usize, bool, usize), anyhow::Error> {
+) -> Result<FlowCalleeRead, anyhow::Error> {
     if opts
         .cancel
         .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
@@ -14811,21 +14813,21 @@ fn tool_project_context(
         let opposite = if *note { minimum_code } else { minimum_note }?;
         (cost.saturating_add(opposite) <= remaining_budget).then_some((*index, *note, *cost))
     });
-    if let Some((first, note, cost)) = affordable {
-        if let Some((second, _, _)) = categories.iter().find(|(_, other, other_cost)| {
+    if let Some((first, note, cost)) = affordable
+        && let Some((second, _, _)) = categories.iter().find(|(_, other, other_cost)| {
             *other != note && cost.saturating_add(*other_cost) <= remaining_budget
-        }) {
-            let mut selected = [first, *second];
-            selected.sort_unstable();
-            let reserved: Vec<_> = selected
-                .iter()
-                .map(|i| result.connected[*i].clone())
-                .collect();
-            for index in selected.into_iter().rev() {
-                result.connected.remove(index);
-            }
-            result.connected.splice(0..0, reserved);
+        })
+    {
+        let mut selected = [first, *second];
+        selected.sort_unstable();
+        let reserved: Vec<_> = selected
+            .iter()
+            .map(|i| result.connected[*i].clone())
+            .collect();
+        for index in selected.into_iter().rev() {
+            result.connected.remove(index);
         }
+        result.connected.splice(0..0, reserved);
     }
     let (cut, connected_tokens) = budgeted_cut(&result.connected, remaining_budget, concise);
     let used_tokens = seed_tokens + connected_tokens;

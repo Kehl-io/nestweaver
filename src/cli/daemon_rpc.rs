@@ -811,41 +811,6 @@ pub(crate) fn hybrid_catalogue_reply(
     }
 }
 
-#[cfg(test)]
-mod hybrid_catalogue_tests {
-    use super::*;
-    use serde_json::{Value, json};
-    #[test]
-    fn request_cursor_pages_intact_hybrid_catalogue_and_errors_are_correlated() {
-        let expected = nestweaver_mcp::tools::tool_list(false)["tools"]
-            .as_array()
-            .unwrap()
-            .clone();
-        let mut actual = Vec::new();
-        let mut params = json!({});
-        for index in 0..100 {
-            let request = nestweaver_mcp::protocol::validate_request(json!({"jsonrpc":"2.0","id":format!("page-{index}"),"method":"tools/list","params":params})).unwrap();
-            let reply = hybrid_catalogue_reply(&request, false);
-            assert_eq!(reply["id"], format!("page-{index}"));
-            let page = &reply["result"];
-            assert!(nestweaver_mcp::output_budget::escaped_size(page) <= 32_000);
-            let tools = page["tools"].as_array().unwrap();
-            assert!(tools.len() <= 8);
-            actual.extend(tools.iter().cloned());
-            if let Some(cursor) = page.get("nextCursor").and_then(Value::as_str) {
-                params = json!({"cursor":cursor});
-            } else {
-                break;
-            }
-        }
-        assert_eq!(actual, expected);
-        let request = nestweaver_mcp::protocol::validate_request(json!({"jsonrpc":"2.0","id":"bad-cursor","method":"tools/list","params":{"cursor":"broken"}})).unwrap();
-        let error = hybrid_catalogue_reply(&request, false);
-        assert_eq!(error["id"], "bad-cursor");
-        assert_eq!(error["error"]["code"], -32602);
-    }
-}
-
 /// Run the MCP stdio server using HybridClient for query routing.
 ///
 /// Read-only queries are dispatched through `HybridClient::query()` which
@@ -1055,4 +1020,39 @@ pub(crate) fn run_mcp_hybrid(
     nestweaver_mcp::session::run_stdio(|request, cancel| {
         dispatch_hybrid_mcp_request(&mut hybrid, &rt, lite, &write_tools, request, cancel)
     })
+}
+
+#[cfg(test)]
+mod hybrid_catalogue_tests {
+    use super::*;
+    use serde_json::{Value, json};
+    #[test]
+    fn request_cursor_pages_intact_hybrid_catalogue_and_errors_are_correlated() {
+        let expected = nestweaver_mcp::tools::tool_list(false)["tools"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let mut actual = Vec::new();
+        let mut params = json!({});
+        for index in 0..100 {
+            let request = nestweaver_mcp::protocol::validate_request(json!({"jsonrpc":"2.0","id":format!("page-{index}"),"method":"tools/list","params":params})).unwrap();
+            let reply = hybrid_catalogue_reply(&request, false);
+            assert_eq!(reply["id"], format!("page-{index}"));
+            let page = &reply["result"];
+            assert!(nestweaver_mcp::output_budget::escaped_size(page) <= 32_000);
+            let tools = page["tools"].as_array().unwrap();
+            assert!(tools.len() <= 8);
+            actual.extend(tools.iter().cloned());
+            if let Some(cursor) = page.get("nextCursor").and_then(Value::as_str) {
+                params = json!({"cursor":cursor});
+            } else {
+                break;
+            }
+        }
+        assert_eq!(actual, expected);
+        let request = nestweaver_mcp::protocol::validate_request(json!({"jsonrpc":"2.0","id":"bad-cursor","method":"tools/list","params":{"cursor":"broken"}})).unwrap();
+        let error = hybrid_catalogue_reply(&request, false);
+        assert_eq!(error["id"], "bad-cursor");
+        assert_eq!(error["error"]["code"], -32602);
+    }
 }

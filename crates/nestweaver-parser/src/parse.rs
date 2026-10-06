@@ -2356,12 +2356,10 @@ fn commonjs_object_exports<'a>(
                 if let (Some(key), Some(value)) = (
                     property.child_by_field_name("key"),
                     property.child_by_field_name("value"),
-                ) {
-                    if matches!(key.kind(), "property_identifier" | "string")
-                        && value.kind() == "identifier"
-                    {
-                        exports.push((strip_quotes(key.utf8_text(source).unwrap_or("")), value));
-                    }
+                ) && matches!(key.kind(), "property_identifier" | "string")
+                    && value.kind() == "identifier"
+                {
+                    exports.push((strip_quotes(key.utf8_text(source).unwrap_or("")), value));
                 }
             }
             _ => {}
@@ -3340,45 +3338,45 @@ fn collect_js_import_bindings(
             }
             continue;
         }
-        if statement.kind() == "expression_statement" {
-            if let Some(assignment) = statement.named_child(0) {
-                // Property assignments name one public key. Function values already
-                // have a parser symbol with that key; identifier values name a local.
-                if assignment.kind() == "assignment_expression"
-                    && let (Some(left), Some(value)) = (
-                        assignment.child_by_field_name("left"),
-                        assignment.child_by_field_name("right"),
-                    )
-                    && left.kind() == "member_expression"
-                    && is_commonjs_export_assignment(Language::JavaScript, assignment, source)
-                    && let Some(key) = left.child_by_field_name("property")
-                    && key.kind() == "property_identifier"
-                    && matches!(
-                        value.kind(),
-                        "identifier" | "function_expression" | "arrow_function"
-                    )
-                {
-                    references.push(RawReference {
-                        name: text(key),
-                        kind: ReferenceKind::ExportAlias,
-                        start_line: key.start_position().row as u32 + 1,
-                        context: if value.kind() == "identifier" {
-                            text(value)
-                        } else {
-                            text(key)
-                        },
-                        receiver: None,
-                    });
-                }
-                for (exported, local) in commonjs_object_exports(assignment, source) {
-                    references.push(RawReference {
-                        name: exported,
-                        kind: ReferenceKind::ExportAlias,
-                        start_line: local.start_position().row as u32 + 1,
-                        context: text(local),
-                        receiver: None,
-                    });
-                }
+        if statement.kind() == "expression_statement"
+            && let Some(assignment) = statement.named_child(0)
+        {
+            // Property assignments name one public key. Function values already
+            // have a parser symbol with that key; identifier values name a local.
+            if assignment.kind() == "assignment_expression"
+                && let (Some(left), Some(value)) = (
+                    assignment.child_by_field_name("left"),
+                    assignment.child_by_field_name("right"),
+                )
+                && left.kind() == "member_expression"
+                && is_commonjs_export_assignment(Language::JavaScript, assignment, source)
+                && let Some(key) = left.child_by_field_name("property")
+                && key.kind() == "property_identifier"
+                && matches!(
+                    value.kind(),
+                    "identifier" | "function_expression" | "arrow_function"
+                )
+            {
+                references.push(RawReference {
+                    name: text(key),
+                    kind: ReferenceKind::ExportAlias,
+                    start_line: key.start_position().row as u32 + 1,
+                    context: if value.kind() == "identifier" {
+                        text(value)
+                    } else {
+                        text(key)
+                    },
+                    receiver: None,
+                });
+            }
+            for (exported, local) in commonjs_object_exports(assignment, source) {
+                references.push(RawReference {
+                    name: exported,
+                    kind: ReferenceKind::ExportAlias,
+                    start_line: local.start_position().row as u32 + 1,
+                    context: text(local),
+                    receiver: None,
+                });
             }
         }
         let (specifier, bindings): (String, Vec<(tree_sitter::Node<'_>, String)>) = match statement
@@ -3468,10 +3466,9 @@ fn collect_js_import_bindings(
                                     if let (Some(key), Some(local)) = (
                                         property.child_by_field_name("key"),
                                         property.child_by_field_name("value"),
-                                    ) {
-                                        if local.kind() == "identifier" {
-                                            bindings.push((local, text(key)));
-                                        }
+                                    ) && local.kind() == "identifier"
+                                    {
+                                        bindings.push((local, text(key)));
                                     }
                                 }
                                 "object_assignment_pattern" => {

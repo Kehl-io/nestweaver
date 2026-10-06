@@ -7804,14 +7804,14 @@ impl NestWeaverDaemon for DaemonService {
                         let store = Arc::clone(&generation_store);
                         if let Ok(Some(generation)) = tokio::task::spawn_blocking(move || {
                             store.clean_published_generation_snapshot().ok()
-                        }).await {
-                            if published_generation != Some(generation) {
-                                published_generation = Some(generation);
-                                let _ = manifest_events.send(nestweaver_web::state::GraphEvent {
-                                    event_type: "graph:updated".into(),
-                                    payload: serde_json::json!({ "generation": generation }),
-                                });
-                            }
+                        }).await
+                            && published_generation != Some(generation)
+                        {
+                            published_generation = Some(generation);
+                            let _ = manifest_events.send(nestweaver_web::state::GraphEvent {
+                                event_type: "graph:updated".into(),
+                                payload: serde_json::json!({ "generation": generation }),
+                            });
                         }
                     }
                     result = changed.changed() => {
