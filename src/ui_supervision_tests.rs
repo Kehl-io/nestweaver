@@ -25,6 +25,7 @@ struct Peer {
     port: u16,
     requests: Arc<AtomicUsize>,
     stops: Arc<AtomicUsize>,
+    health_delay: std::time::Duration,
 }
 impl tonic::server::NamedService for Peer {
     const NAME: &'static str = "nestweaver.daemon.v1.NestWeaverDaemon";
@@ -50,11 +51,14 @@ impl Service<http::Request<Body>> for Peer {
                 }};
             }
             Ok(match request.uri().path().rsplit('/').next().unwrap() {
-                "HealthCheck" => respond!(
-                    HealthCheckResponse,
-                    HealthCheckRequest,
-                    HealthCheckResponse::default()
-                ),
+                "HealthCheck" => {
+                    tokio::time::sleep(peer.health_delay).await;
+                    respond!(
+                        HealthCheckResponse,
+                        HealthCheckRequest,
+                        HealthCheckResponse::default()
+                    )
+                }
                 "ServeUi" => {
                     peer.requests.fetch_add(1, Ordering::SeqCst);
                     respond!(
@@ -140,6 +144,7 @@ fn supervisor_error_cleans_up(mismatch: bool) {
         },
         requests: requests.clone(),
         stops: stops.clone(),
+        health_delay: std::time::Duration::ZERO,
     };
     let server = rt.spawn(async move {
         tonic::transport::Server::builder()
@@ -196,4 +201,130 @@ fn ui_port_parser_accepts_sentinel_and_boundaries_but_not_overflow() {
         .unwrap()
         .join()
         .unwrap()
+}
+
+#[test]
+fn repeated_ui_health_timeouts_preserve_live_owned_listener() {
+    use std::os::unix::io::AsRawFd;
+    let _environment = crate::XDG_RUNTIME_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("fixture.lbug");
+    std::fs::write(&db, "fixture identity only").unwrap();
+    let instance = nestweaver_daemon::instance_id_from_db_path(&db);
+    let socket = nestweaver_daemon::socket_path(&instance);
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let _cleanup = SocketCleanup(socket.clone());
+    let pidfile = nestweaver_daemon::pidfile_path(&instance);
+    let owner = std::fs::File::create(&pidfile).unwrap();
+    assert_eq!(unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let listener = {
+        let _entered = rt.enter();
+        tokio::net::UnixListener::bind(&socket).unwrap()
+    };
+    let ui = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = ui.local_addr().unwrap().port();
+    let peer = Peer {
+        port,
+        requests: Arc::new(AtomicUsize::new(0)),
+        stops: Arc::new(AtomicUsize::new(0)),
+        health_delay: std::time::Duration::from_secs(60),
+    };
+    let server = rt.spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(peer)
+            .serve_with_incoming(
+                tonic::codegen::tokio_stream::wrappers::UnixListenerStream::new(listener),
+            )
+            .await
+            .unwrap();
+    });
+    let mut client = rt
+        .block_on(nestweaver_client::DaemonClient::connect_existing(&db))
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    // At least two 2s health timeouts; Ctrl-C must still complete promptly.
+    let deadline = rt.spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(7)).await;
+        let _ = tx.send(());
+    });
+    let began = std::time::Instant::now();
+    let result = supervise_ui_daemon(&rt, &db, port, false, "", &rx, &mut client);
+    server.abort();
+    deadline.abort();
+    let _ = std::fs::remove_file(&pidfile);
+    assert!(
+        result.unwrap(),
+        "a timeout cannot declare a live owned daemon lost"
+    );
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(12),
+        "shutdown stalled on an unbounded reconnect"
+    );
+    assert!(
+        ui_port_serving(port),
+        "the owned UI listener must be retained"
+    );
+}
+
+#[test]
+fn dead_ui_daemon_without_an_owner_enters_degraded_service() {
+    let _environment = crate::XDG_RUNTIME_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("dead.lbug");
+    std::fs::write(&db, "fixture identity only").unwrap();
+    let instance = nestweaver_daemon::instance_id_from_db_path(&db);
+    let socket = nestweaver_daemon::socket_path(&instance);
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let _cleanup = SocketCleanup(socket.clone());
+    let listener = {
+        let _entered = rt.enter();
+        tokio::net::UnixListener::bind(&socket).unwrap()
+    };
+    let ui = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = ui.local_addr().unwrap().port();
+    drop(ui);
+    let peer = Peer {
+        port,
+        requests: Arc::new(AtomicUsize::new(0)),
+        stops: Arc::new(AtomicUsize::new(0)),
+        health_delay: std::time::Duration::ZERO,
+    };
+    let server = rt.spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(peer)
+            .serve_with_incoming(
+                tonic::codegen::tokio_stream::wrappers::UnixListenerStream::new(listener),
+            )
+            .await
+            .unwrap();
+    });
+    let mut client = rt
+        .block_on(nestweaver_client::DaemonClient::connect_existing(&db))
+        .unwrap();
+    server.abort();
+    let _ = rt.block_on(server);
+    // Leave the stale socket pathname as a killed daemon does. It is not identity.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = observed.clone();
+    let witness = rt.spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        seen.store(ui_port_serving(port), Ordering::SeqCst);
+        let _ = tx.send(());
+    });
+    assert!(
+        !supervise_ui_daemon(&rt, &db, port, false, "", &rx, &mut client).unwrap(),
+        "a verified absent daemon must remain down at shutdown"
+    );
+    witness.abort();
+    assert!(
+        observed.load(Ordering::SeqCst),
+        "verified absence must serve the degraded endpoint"
+    );
 }

@@ -11945,20 +11945,75 @@ impl DegradedUiServer {
     }
 }
 
-/// Probe the daemon that serves the UI. `Err` carries why the daemon is
-/// considered down (socket gone, connect failed, RPC failed, timed out).
+/// Probe and return a healthy existing connection within one shared budget.
+/// A deadline is an observation failure, not evidence that the daemon died.
 fn ui_daemon_health_probe(
     rt: &tokio::runtime::Runtime,
     db_path: &std::path::Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<nestweaver_client::DaemonClient> {
     rt.block_on(async {
         tokio::time::timeout(UI_DAEMON_PROBE_TIMEOUT, async {
             let mut probe = nestweaver_client::DaemonClient::connect_existing(db_path).await?;
             probe.health_check().await?;
-            anyhow::Ok(())
+            anyhow::Ok(probe)
         })
         .await
         .context("daemon health probe timed out")?
+    })
+}
+
+/// Prove absence before taking over a daemon's listener. Unknown ownership,
+/// slow RPCs and accepting sockets are inconclusive; they cannot justify
+/// displacement. All socket candidates share one cancellable connect budget.
+fn ui_daemon_absence_verified(
+    rt: &tokio::runtime::Runtime,
+    db_path: &std::path::Path,
+    probe_error: &anyhow::Error,
+) -> bool {
+    if probe_error
+        .chain()
+        .any(|cause| cause.is::<tokio::time::error::Elapsed>())
+    {
+        return false;
+    }
+    let instance = nestweaver_daemon::instance_id_from_db_path(db_path);
+    for pidfile in nestweaver_daemon::lifecycle::pidfile_candidates(&instance) {
+        if unreachable_daemon_owner(db_path, &pidfile).is_some() {
+            return false;
+        }
+        // Failure to inspect a present pidfile is unknown ownership. Its raw
+        // contents alone never identify an incumbent or a recycled PID.
+        if let Err(error) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pidfile)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return false;
+        }
+        if nestweaver_client::autostart::read_pid(&pidfile)
+            .is_some_and(|pid| daemon_identity_cmdline_ok(pid, db_path))
+        {
+            return false;
+        }
+    }
+    rt.block_on(async {
+        tokio::time::timeout(UI_DAEMON_PROBE_TIMEOUT, async {
+            for socket in nestweaver_daemon::lifecycle::daemon_socket_candidates(&instance) {
+                match tokio::net::UnixStream::connect(&socket).await {
+                    Ok(_) => return false,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                        ) => {}
+                    Err(_) => return false,
+                }
+            }
+            true
+        })
+        .await
+        .unwrap_or(false)
     })
 }
 
@@ -12109,11 +12164,10 @@ fn supervise_ui_daemon(
 ) -> anyhow::Result<bool> {
     let mut daemon_up = true;
     let mut degraded: Option<DegradedUiServer> = None;
-    // Two consecutive probe failures before an outage is declared: a busy
-    // daemon can exceed the probe timeout without being down, and degrading
-    // against a LIVE daemon means grabbing (and failing to bind) a port it
-    // still owns.
+    // Only verified absence counts toward an outage. Repeated timeouts while
+    // an owner remains live must retain its listener and remain retryable.
     let mut probe_failures = 0u32;
+    let mut inconclusive_logged = false;
     // Same two-strike rule for the port probe (the daemon's server task can
     // take a moment to bind after a fresh serve_ui).
     let mut port_failures = 0u32;
@@ -12130,8 +12184,10 @@ fn supervise_ui_daemon(
 
         if daemon_up {
             match ui_daemon_health_probe(rt, db_path) {
-                Ok(()) => {
+                Ok(candidate) => {
+                    *client = candidate;
                     probe_failures = 0;
+                    inconclusive_logged = false;
                     // A healthy daemon does not prove the UI port is served
                     // (its server task can have died independently), so probe
                     // the port itself. The daemon still owns the port here,
@@ -12179,6 +12235,18 @@ fn supervise_ui_daemon(
                     }
                 }
                 Err(error) => {
+                    if !ui_daemon_absence_verified(rt, db_path, &error) {
+                        probe_failures = 0;
+                        if !inconclusive_logged {
+                            tracing::warn!(
+                                port,
+                                "daemon health observation is inconclusive ({error:#}); retaining its UI listener and retrying"
+                            );
+                            inconclusive_logged = true;
+                        }
+                        continue;
+                    }
+                    inconclusive_logged = false;
                     probe_failures += 1;
                     if probe_failures == 1 {
                         tracing::warn!(
@@ -12222,10 +12290,7 @@ fn supervise_ui_daemon(
             }
 
             // Re-resolve the daemon connection; the startup client is dead.
-            if let Ok(mut candidate) =
-                rt.block_on(nestweaver_client::DaemonClient::connect_existing(db_path))
-                && rt.block_on(candidate.health_check()).is_ok()
-            {
+            if let Ok(mut candidate) = ui_daemon_health_probe(rt, db_path) {
                 // Ask BEFORE releasing the degraded port: while we hold it
                 // the daemon cannot bind, so ok:true here can only mean it
                 // ALREADY serves a UI — possibly a different port, if

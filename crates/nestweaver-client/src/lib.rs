@@ -1067,17 +1067,28 @@ impl DaemonClient {
     pub async fn connect_existing(db_path: &Path) -> Result<Self> {
         let canonical_db = std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
         let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(&canonical_db);
-        // Prefer a socket that is already accepting. A launchd job binds the
-        // state-dir socket even when this process's XDG_RUNTIME_DIR points
-        // somewhere else (nw-729). Falling back to the caller path preserves
-        // the "not ready yet" poll.
-        let sock_path = nestweaver_daemon::lifecycle::accepting_daemon_socket(&instance_id)
-            .unwrap_or_else(|| nestweaver_daemon::lifecycle::socket_path(&instance_id));
-        if !sock_path.exists() {
-            anyhow::bail!("daemon socket not found at {}", sock_path.display());
+        // Attempt each candidate asynchronously. A synchronous acceptance
+        // preflight both consumed an extra peer connection and could pin the
+        // executor behind a full Unix backlog, defeating callers' deadlines.
+        let candidates = nestweaver_daemon::lifecycle::daemon_socket_candidates(&instance_id);
+        let mut last_error = None;
+        for sock_path in &candidates {
+            if !sock_path.exists() {
+                continue;
+            }
+            nestweaver_daemon::lifecycle::watch_daemon_exit_as_client(db_path);
+            match Self::connect_to_socket(sock_path).await {
+                Ok(client) => return Ok(client),
+                Err(error) => last_error = Some(error),
+            }
         }
-        nestweaver_daemon::lifecycle::watch_daemon_exit_as_client(db_path);
-        Self::connect_to_socket(&sock_path).await
+        if let Some(error) = last_error {
+            return Err(error);
+        }
+        anyhow::bail!(
+            "daemon socket not found at {}",
+            nestweaver_daemon::lifecycle::socket_path(&instance_id).display()
+        )
     }
 
     /// Connect to an existing socket without auto-start or version check.
@@ -2806,5 +2817,207 @@ credential_method = "gh"
             message.contains("socket peer-credential corroboration also failed"),
             "the peer-credential detail must be appended: {message}"
         );
+    }
+}
+
+#[cfg(test)]
+mod bounded_existing_connection_tests {
+    use super::*;
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd;
+
+    #[derive(Clone)]
+    struct Endpoint;
+    impl tonic::server::NamedService for Endpoint {
+        const NAME: &'static str = "fixture.endpoint";
+    }
+    impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>> for Endpoint {
+        type Response = tonic::codegen::http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, _: tonic::codegen::http::Request<tonic::body::Body>) -> Self::Future {
+            std::future::ready(Ok(tonic::Status::unimplemented("fixture").into_http()))
+        }
+    }
+
+    #[test]
+    fn existing_connection_does_not_consume_a_throwaway_peer_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("one-accept.lbug");
+        fs::write(&db, "fixture").unwrap();
+        let instance = nestweaver_daemon::instance_id_from_db_path(&db);
+        let socket = nestweaver_daemon::socket_path(&instance);
+        fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let listener = {
+            let _entered = rt.enter();
+            tokio::net::UnixListener::bind(&socket).unwrap()
+        };
+        let server = rt.spawn(async move {
+            // A single real HTTP/2 connection. An unnecessary synchronous
+            // preflight consumes it, leaving the actual RPC without a peer.
+            let (stream, _) = listener.accept().await.unwrap();
+            tonic::transport::Server::builder()
+                .add_service(Endpoint)
+                .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(stream)))
+                .await
+                .unwrap();
+        });
+        let result = rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(300), async {
+                let mut client = DaemonClient::connect_existing(&db).await?;
+                client.health_check().await
+            })
+            .await
+        });
+        server.abort();
+        let _ = fs::remove_file(&socket);
+        let _ = fs::remove_dir(socket.parent().unwrap());
+        match result {
+            Ok(Err(error)) => assert!(
+                error.chain().any(|cause| cause
+                    .downcast_ref::<tonic::Status>()
+                    .is_some_and(|status| status.code() == tonic::Code::Unimplemented)),
+                "real peer response required: {error:#}"
+            ),
+            _ => panic!(
+                "existing attach must use the one available peer connection and receive its HTTP/2 reply"
+            ),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn existing_connection_timeout_survives_a_saturated_unix_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("fixture.lbug");
+        fs::write(&db, "fixture identity only").unwrap();
+        let instance = nestweaver_daemon::instance_id_from_db_path(&db);
+        let socket = nestweaver_daemon::socket_path(&instance);
+        fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut connections = Vec::new();
+        let mut saturated = false;
+        for _ in 0..32 {
+            match rt.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_millis(20), async {
+                    tokio::net::UnixStream::connect(&socket).await
+                })
+                .await
+            }) {
+                Ok(Ok(connection)) => connections.push(connection),
+                Err(_) => {
+                    saturated = true;
+                    break;
+                }
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Linux nonblocking Unix connect reports a full backlog
+                    // as EAGAIN instead of awaiting readiness.
+                    saturated = true;
+                    break;
+                }
+                Ok(Err(error)) => panic!("unexpected backlog connect: {error}"),
+            }
+        }
+        assert!(
+            saturated,
+            "fixture must actually saturate the kernel backlog"
+        );
+        // A watchdog releases the listener even if the old synchronous select
+        // blocks the only executor; elapsed time exposes that hidden stall.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            drop(listener);
+        });
+        let began = std::time::Instant::now();
+        let result = rt.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                DaemonClient::connect_existing(&db),
+            )
+            .await
+        });
+        let elapsed = began.elapsed();
+        release.join().unwrap();
+        let _ = fs::remove_file(&socket);
+        let _ = fs::remove_dir(socket.parent().unwrap());
+        assert!(
+            matches!(result, Err(_) | Ok(Err(_))),
+            "a full backlog must fail or remain cancellable by the caller deadline"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(300),
+            "async connection blocked its caller for {elapsed:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn existing_connection_falls_back_from_stale_caller_socket_to_launchd() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("fallback.lbug");
+        fs::write(&db, "fixture").unwrap();
+        let instance = nestweaver_daemon::instance_id_from_db_path(&db);
+        let candidates = nestweaver_daemon::lifecycle::daemon_socket_candidates(&instance);
+        for socket in &candidates {
+            fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        }
+        // A leftover first socket refuses; the second endpoint really accepts HTTP/2.
+        if candidates.len() > 1 {
+            let stale = std::os::unix::net::UnixListener::bind(&candidates[0]).unwrap();
+            drop(stale);
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let listener = {
+            let _entered = rt.enter();
+            tokio::net::UnixListener::bind(candidates.last().unwrap()).unwrap()
+        };
+        let server = rt.spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(Endpoint)
+                .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let result = rt.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                DaemonClient::connect_existing(&db),
+            )
+            .await
+        });
+        server.abort();
+        for socket in &candidates {
+            let _ = fs::remove_file(socket);
+            let _ = fs::remove_dir(socket.parent().unwrap());
+        }
+        assert!(
+            matches!(result, Ok(Ok(_))),
+            "the launchd candidate must remain attachable when caller socket refuses"
+        );
+    }
+
+    #[test]
+    fn existing_connection_absence_preserves_the_missing_socket_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("absent.lbug");
+        fs::write(&db, "fixture").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let message = match rt.block_on(DaemonClient::connect_existing(&db)) {
+            Err(error) => format!("{error:#}"),
+            Ok(_) => panic!("must not autostart a missing daemon"),
+        };
+        assert!(message.contains("daemon socket not found"), "{message}");
     }
 }

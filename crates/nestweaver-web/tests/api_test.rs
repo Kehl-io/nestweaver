@@ -2847,3 +2847,66 @@ async fn brain_context_on_an_empty_repo_is_409_with_the_index_remedy() {
     assert!(message.contains("index"), "{json}");
     assert!(!message.contains("add notes"), "{json}");
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn context_reads_leave_the_async_executor_deadline_scope() {
+    // An expired thread-local store deadline witnesses any synchronous read
+    // left on this executor. Blocking workers have their own read scope.
+    for uri in ["/api/v1/context", "/api/v1/brain/context"] {
+        let store = std::sync::Arc::new(setup_test_store());
+        let state = AppState::new_with_store(store.clone(), None, "/tmp/test.lbug".into());
+        let app = create_router(state);
+        let response = store.with_read_deadline(std::time::Instant::now(), || {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"seeds":["greet"]}"#))
+                    .unwrap(),
+            )
+        });
+        // The deadline must encompass polling, not merely future creation.
+        let response = store
+            .with_read_deadline(std::time::Instant::now(), || {
+                futures::executor::block_on(response)
+            })
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{uri} performed reads on its async caller"
+        );
+    }
+}
+
+#[tokio::test]
+async fn brain_context_web_discloses_route_capability_without_blame_on_model() {
+    let app = make_app();
+    let (status, payload) =
+        post_json(&app, "/api/v1/brain/context", json!({"seeds": ["greet"]})).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["semantic_applied"], false);
+    assert_eq!(
+        payload["semantic_unavailable"]["reason"],
+        "web_surface_unsupported"
+    );
+    assert_eq!(payload["semantic_unavailable"]["stage"], "route_capability");
+    let remedy = payload["semantic_unavailable"]["remediation"]
+        .as_str()
+        .unwrap();
+    assert!(
+        remedy.contains("CLI") && remedy.contains("MCP"),
+        "{payload}"
+    );
+    assert!(
+        !remedy.contains("rebuild") && !remedy.contains("verify"),
+        "{payload}"
+    );
+    assert!(
+        payload["degraded_components"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("semantic"))
+    );
+}
