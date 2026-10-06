@@ -1526,8 +1526,10 @@ mod clusters_envelope_parity_tests {
     /// nw-559. `clusters --json` and MCP `clusters` named the same data
     /// differently (`communities`/`total_communities`/`returned_communities`/
     /// `member_count` against `clusters`/`total`/`returned`/`size`). One
-    /// envelope now: the same top-level and per-cluster keys on both surfaces.
-    /// Counterweight: the member populations are still the same.
+    /// semantic envelope now: shared data has the same keys and populations.
+    /// MCP also discloses bounded-page transport fields; CLI zero bounds retain
+    /// complete output. Check those differences explicitly rather than treating
+    /// a continuation token as cluster data.
     #[test]
     fn cli_clusters_json_uses_the_mcp_clusters_envelope() {
         let store = store();
@@ -1542,14 +1544,51 @@ mod clusters_envelope_parity_tests {
         )
         .unwrap();
 
-        assert_eq!(keys(&cli), keys(&mcp), "cli: {cli}\nmcp: {mcp}");
+        let mut mcp_keys = keys(&mcp);
+        for key in ["cluster_offset", "next_cluster_offset", "page_token"] {
+            assert!(mcp_keys.remove(key), "MCP must expose {key}: {mcp}");
+        }
+        assert_eq!(keys(&cli), mcp_keys, "cli: {cli}\nmcp: {mcp}");
+        assert_eq!(cli["limit"], 0);
+        assert_eq!(mcp["limit"], 50);
+        assert_eq!(mcp["cluster_offset"], 0);
+        assert!(mcp["next_cluster_offset"].is_null());
+        assert!(
+            mcp["page_token"]
+                .as_str()
+                .unwrap()
+                .starts_with("nw-clusters-v1:")
+        );
         let cli_clusters = cli["clusters"].as_array().expect("cli clusters array");
         let mcp_clusters = mcp["clusters"].as_array().expect("mcp clusters array");
         assert!(!cli_clusters.is_empty());
         assert_eq!(cli_clusters.len(), mcp_clusters.len());
         for (c, m) in cli_clusters.iter().zip(mcp_clusters) {
-            assert_eq!(keys(c), keys(m));
+            let mut mcp_keys = keys(m);
+            for key in [
+                "member_offset",
+                "next_member_offset",
+                "members_omitted",
+                "retry_guidance",
+            ] {
+                assert!(mcp_keys.remove(key), "MCP must expose {key}: {m}");
+            }
+            assert_eq!(keys(c), mcp_keys);
+            assert_eq!(m["member_offset"], 0);
+            assert!(m["next_member_offset"].is_null());
+            assert_eq!(m["members_omitted"], 0);
+            assert!(m["retry_guidance"].is_null());
             assert_eq!(c["size"], m["size"]);
+            for key in [
+                "id",
+                "name",
+                "cohesion",
+                "key_files",
+                "returned_members",
+                "members_truncated",
+            ] {
+                assert_eq!(c[key], m[key], "{key}");
+            }
         }
         let members = |clusters: &[serde_json::Value]| -> BTreeSet<String> {
             clusters
@@ -1560,7 +1599,17 @@ mod clusters_envelope_parity_tests {
         };
         assert_eq!(members(cli_clusters), members(mcp_clusters));
         assert_eq!(members(cli_clusters).len(), 4);
-        for key in ["cluster_count", "total", "returned", "truncated"] {
+        for key in [
+            "cluster_count",
+            "total",
+            "returned",
+            "truncated",
+            "graph_generation",
+            "resolution",
+            "modularity",
+            "symbol_count",
+            "cached",
+        ] {
             assert_eq!(cli[key], mcp[key], "{key}");
         }
     }

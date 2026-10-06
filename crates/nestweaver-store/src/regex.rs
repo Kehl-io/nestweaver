@@ -57,6 +57,10 @@ pub const MAX_PATTERN_BYTES: usize = 4096;
 /// instead of on every search.
 static TRIGRAM_STALE_WARNED: AtomicBool = AtomicBool::new(false);
 
+/// Serializes test searches that can set or clear the process-global warning latch.
+#[cfg(test)]
+pub(crate) static LATCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Compiled-program size limit for a single regex. The `regex` crate defaults to
 /// 10 MiB; we cap lower because patterns arrive from untrusted clients. The
 /// engine is finite-automata / linear-time (no catastrophic backtracking), so
@@ -2686,6 +2690,7 @@ mod tests {
     /// `candidates` held real, already-collected matches.
     #[test]
     fn hydration_candidate_cap_does_not_discard_already_collected_candidates() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = GraphStore::in_memory().unwrap();
         for i in 0..4 {
             store
@@ -2819,13 +2824,6 @@ mod tests {
 
     use super::*;
     use nestweaver_schema::{Note, NoteKind, Section, Symbol, SymbolKind, Visibility};
-
-    /// Serializes tests that touch the process-global TRIGRAM_STALE_WARNED
-    /// latch: a parallel stale observation (which sets the latch) can land
-    /// between the fresh-index re-arm and its assertion, flaking
-    /// `fresh_index_observation_rearms_stale_warning_latch` under load (seen
-    /// on CI). Every stale-observation test must hold this lock too.
-    static LATCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// nw-142: within ONE literal the trigrams are CONJUNCTS - a match must
     /// contain all of them. Only across alternation branches are they
@@ -2999,6 +2997,7 @@ mod tests {
     /// index, so the comparison is not two scans.
     #[test]
     fn planned_regex_results_match_a_full_scan() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let planned_store = GraphStore::open(&temp.path().join("brain.lbug")).unwrap();
         let scan_store = GraphStore::in_memory().unwrap();
@@ -3158,6 +3157,7 @@ mod tests {
     /// the newer epoch. The refresh must defer it, disclose it, and succeed.
     #[test]
     fn a_scope_advanced_mid_publication_is_deferred_not_fatal() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         store.mark_regex_scope_dirty("repo:1", false).unwrap();
         store.mark_regex_scope_dirty("vlt:v", false).unwrap();
@@ -3248,6 +3248,7 @@ mod tests {
 
     #[test]
     fn deleting_one_file_queues_its_scope_and_reports_live_posting_deletions() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         let mut kept = store.lookup_symbol("sym:1").unwrap();
         let repo = kept.repo_uid.clone();
@@ -3279,6 +3280,7 @@ mod tests {
 
     #[test]
     fn refresh_reports_live_posting_deltas_across_rebuild_edit_and_retirement() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         let first = store.rebuild_trigram_index().unwrap();
         assert!(first.postings_added > 0);
@@ -3321,6 +3323,7 @@ mod tests {
 
     #[test]
     fn on_disk_store_uses_identity_bound_regex_v3_shards() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let db = temp.path().join("brain.lbug");
         let store = GraphStore::open(&db).unwrap();
@@ -3373,6 +3376,7 @@ mod tests {
     /// a remedy that could not repair anything.
     #[test]
     fn refresh_repairs_every_shard_search_distrusts_not_only_outbox_scopes() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let db = temp.path().join("brain.lbug");
         let store = GraphStore::open(&db).unwrap();
@@ -3424,6 +3428,7 @@ mod tests {
 
     #[test]
     fn corrupt_regex_v3_shard_widens_only_that_scope_to_scan() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let db = temp.path().join("brain.lbug");
         let store = GraphStore::open(&db).unwrap();
@@ -3474,6 +3479,7 @@ mod tests {
 
     #[test]
     fn regex_search_finds_pattern_in_section_and_symbol_without_index() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         // No trigram index built → must fall back to a direct scan and still
         // find the matches.
@@ -3491,6 +3497,7 @@ mod tests {
 
     #[test]
     fn regex_search_uses_trigram_index_when_built() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         let written = store.build_trigram_index().unwrap();
         assert!(written > 0, "expected trigram postings to be written");
@@ -3545,6 +3552,7 @@ mod tests {
 
     #[test]
     fn correction_budget_regex_scope_inventory_state_and_work_share_small_allowance() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = correction_many_scope_fixture();
         let clauses = required_trigram_clauses("authenticateUser").unwrap();
         let full = store
@@ -3591,6 +3599,7 @@ mod tests {
 
     #[test]
     fn correction_budget_regex_scope_order_and_incomplete_population_are_explicit() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = correction_many_scope_fixture();
         let first = store.active_regex_scopes_bounded(2).unwrap();
         let second = store.active_regex_scopes_bounded(2).unwrap();
@@ -3619,6 +3628,7 @@ mod tests {
 
     #[test]
     fn correction_budget_regex_many_scope_exact_counts_remain_exhaustive() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = correction_many_scope_fixture();
         let patterns = ["authenticateUser".to_string()];
         let complete = store.count_patterns(&patterns, None, None).unwrap();
@@ -3637,6 +3647,7 @@ mod tests {
 
     #[test]
     fn exact_count_planning_cap_saturation_preserves_occurrences() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         for uid in ["sym:extra:a", "sym:extra:b"] {
             let mut symbol = store.lookup_symbol("sym:1").unwrap();
@@ -3664,6 +3675,7 @@ mod tests {
 
     #[test]
     fn exact_count_planning_cap_is_per_scope_for_multiple_ready_scopes() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         store.build_trigram_index().unwrap();
         let patterns = ["authenticateUser".to_string()];
@@ -3688,6 +3700,7 @@ mod tests {
 
     #[test]
     fn count_patterns_counts_occurrences_not_nodes() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         // nw-300 / F-VAULT-4: 449 occurrences in one file were reported as
         // `total_matches: 2` because the verification loop increments once per
         // matching NODE. Five occurrences inside ONE section must count as 5.
@@ -3744,6 +3757,7 @@ mod tests {
     /// results with five distinct line numbers, not one.
     #[test]
     fn regex_search_returns_every_occurrence_within_a_node() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = GraphStore::in_memory().unwrap();
         store
             .insert_note(&Note {
@@ -3800,6 +3814,7 @@ mod tests {
     /// what it matched. Counterweight: a single match is still a single row.
     #[test]
     fn regex_search_rows_on_one_line_carry_a_distinct_span() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = GraphStore::in_memory().unwrap();
         store
             .insert_note(&Note {
@@ -3866,6 +3881,7 @@ mod tests {
 
     #[test]
     fn count_patterns_matches_manual_count() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         // "token" appears in the section body and the symbol signature (Token).
         // Case-sensitive "token" → only the section (lowercase) matches.
@@ -3894,6 +3910,7 @@ mod tests {
 
     #[test]
     fn count_filters_do_not_make_complete_scopes_look_stale() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         store.build_trigram_index().unwrap();
         let counts = store
@@ -3911,6 +3928,7 @@ mod tests {
 
     #[test]
     fn symbol_match_reports_real_start_line_not_one() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         // QA bug B: a Symbol's text is its signature, but the reported `line`
         // must be the symbol's real start_line in the file, not 1.
         let store = store_with_text();
@@ -3938,6 +3956,7 @@ mod tests {
 
     #[test]
     fn section_match_reports_line_offset_by_section_start() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         // QA bug B: a Section body match reports the line *within the file*,
         // offset by the section's start_line (5). The match is on the section's
         // first body line, so the reported line should be 5.
@@ -3965,6 +3984,7 @@ mod tests {
 
     #[test]
     fn kinds_filter_restricts_candidates() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         let res = store
             .regex_search(
@@ -4011,6 +4031,7 @@ mod tests {
 
     #[test]
     fn regex_search_does_not_drop_a_match_ordered_late_in_the_candidate_set() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         // nw-076: the fallback scan used to pre-truncate the candidate list to
         // the first 5000 nodes in collect order (Sections → Notes → Symbols), so
         // a match on a symbol ordered past the cap was silently dropped and
@@ -4098,6 +4119,7 @@ mod tests {
     /// on one unreadable row.
     #[test]
     fn a_corpus_that_lost_rows_is_reported_partial_and_still_returns_its_matches() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         // The clean corpus answers definitively.
         let clean = store
@@ -4171,6 +4193,7 @@ mod tests {
     /// set must be identical to the full-scan result set across the matrix.
     #[test]
     fn alternation_prefilter_matches_full_scan() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let patterns = [
             "(login|token)",
             "(alpha|beta|gamma)",
@@ -4214,6 +4237,7 @@ mod tests {
     /// branch.
     #[test]
     fn alternation_with_unusable_branch_disables_prefilter() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         store.build_trigram_index().unwrap();
         for pattern in ["(tokenize|ok)", "(authenticateUser|x.*)"] {
@@ -4368,6 +4392,7 @@ mod tests {
 
     #[test]
     fn moving_a_node_to_an_earlier_scope_cannot_erase_new_postings() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         store.refresh_trigram_index(false).unwrap();
 
@@ -4576,6 +4601,7 @@ mod tests {
     /// PREFIX in the indexed text must survive the trigram pre-filter.
     #[test]
     fn greek_final_sigma_prefilter_does_not_drop_matches() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = GraphStore::in_memory().unwrap();
         store
             .insert_note(&Note {
@@ -4625,6 +4651,7 @@ mod tests {
     /// before a match is pushed, not after (previously one slipped through).
     #[test]
     fn limit_zero_returns_no_results() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         let res = store
             .regex_search("authenticateUser", None, None, Some(0), None)
@@ -4640,6 +4667,7 @@ mod tests {
     /// (`SEARCH_PRESENTATION_LIMIT_MAX`) instead of accepting any limit.
     #[test]
     fn limit_above_presentation_max_is_rejected() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         let err = store
             .regex_search(
@@ -4673,6 +4701,7 @@ mod tests {
     /// match actually is.
     #[test]
     fn location_points_at_match_line_not_section_start() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = GraphStore::in_memory().unwrap();
         store
             .insert_note(&Note {
@@ -4748,6 +4777,7 @@ mod tests {
     #[test]
     #[ignore = "wall-clock perf harness; run explicitly with --ignored --nocapture"]
     fn perf_verification_budget_stays_within_the_callers_deadline() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = GraphStore::in_memory().unwrap();
         // ~4000 symbols x ~2.6KB signature, each with 8 embedded date-shaped
         // occurrences: big enough that collecting + regex-scanning the whole

@@ -39028,6 +39028,20 @@ fn collect_cluster_tool_pages(
                 row["members"] = json!(members);
                 row["returned_members"] = json!(members.len());
                 row["members_truncated"] = json!(members.len() < size);
+                row["member_offset"] = json!(0);
+                row["members_omitted"] = json!(size.saturating_sub(members.len()));
+                row["next_member_offset"] = if members.len() < size {
+                    json!(members.len())
+                } else {
+                    Value::Null
+                };
+                row["retry_guidance"] = if members.len() < size {
+                    json!(
+                        "Query this cluster_id with member_offset=next_member_offset, the same repos/resolution, expected_generation=graph_generation, and page_token from this response to retrieve omitted members."
+                    )
+                } else {
+                    Value::Null
+                };
             }
             rows.push(row);
         }
@@ -39159,12 +39173,46 @@ mod clusters_forwarding_tests {
                     150
                 );
                 assert!(rows.iter().all(|row| row["members_truncated"] == false));
+                assert!(
+                    rows.iter().any(|row| row["size"].as_u64().unwrap() > 20),
+                    "fixture must collect a community across member pages"
+                );
+                for row in rows {
+                    assert_eq!(
+                        row["members_omitted"], 0,
+                        "completed membership must not retain a first-page omission count: {row}"
+                    );
+                    assert!(row["next_member_offset"].is_null(), "{row}");
+                    assert!(
+                        row["retry_guidance"].is_null(),
+                        "completed membership must not advise a nonexistent next page: {row}"
+                    );
+                }
             } else {
                 for row in rows {
                     assert_eq!(
                         row["members"].as_array().unwrap().len(),
                         3.min(row["size"].as_u64().unwrap() as usize)
                     );
+                    assert_eq!(
+                        row["members_omitted"].as_u64().unwrap(),
+                        row["size"].as_u64().unwrap() - row["returned_members"].as_u64().unwrap(),
+                        "explicit previews must still disclose the omitted membership: {row}"
+                    );
+                    assert_eq!(row["member_offset"], 0, "{row}");
+                    if row["members_truncated"] == true {
+                        assert_eq!(row["next_member_offset"], row["returned_members"], "{row}");
+                        assert!(
+                            row["retry_guidance"]
+                                .as_str()
+                                .unwrap()
+                                .contains("page_token"),
+                            "{row}"
+                        );
+                    } else {
+                        assert!(row["next_member_offset"].is_null(), "{row}");
+                        assert!(row["retry_guidance"].is_null(), "{row}");
+                    }
                 }
             }
         }

@@ -5865,6 +5865,7 @@ mod frontmatter_backfill_tests {
     /// fix for nw-298, which is the whole item.
     #[test]
     fn frontmatter_text_is_unreachable_on_a_pre_column_note() {
+        let _latch_guard = crate::regex::LATCH_TEST_LOCK.lock().unwrap();
         let store = GraphStore::in_memory().unwrap();
         let mut legacy = note("note:legacy", "Legacy");
         legacy.frontmatter = Some(r#"{"status":"loadbearing"}"#.to_string());

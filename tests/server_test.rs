@@ -920,49 +920,65 @@ async fn server_mcp_http_initialize() {
 async fn server_mcp_http_tools_list() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.lbug");
-    let repo_dir = dir.path().join("repo");
-    write_test_repo(&repo_dir);
-
-    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
-        .env("NESTWEAVER_NO_DAEMON", "1")
-        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
-        .args([
-            "index",
-            "--repo",
-            &repo_dir.display().to_string(),
-            "--db",
-            &db_path.display().to_string(),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "index failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    // Catalogue discovery is graph-independent. Initialize a private fixture
+    // without an indexing subprocess that could autostart a competing daemon.
+    drop(nestweaver_store::GraphStore::open(&db_path).unwrap());
 
     let guard = helpers::server_guard::ServerGuard::start(&db_path);
     let mcp_addr = guard.mcp_addr();
 
     let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{mcp_addr}/mcp"))
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/list",
-        }))
-        .send()
-        .await
-        .expect("MCP HTTP request failed");
-
-    assert_eq!(resp.status(), 200);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["id"], 2);
-    let tools = body["result"]["tools"]
-        .as_array()
-        .expect("tools should be an array");
-    assert!(tools.len() >= 30, "expected 30+ tools, got {}", tools.len());
+    let mut params = json!({});
+    let mut tools = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    let mut cursors = std::collections::HashSet::new();
+    let mut complete = false;
+    for index in 0..100 {
+        let resp = client
+            .post(format!("{mcp_addr}/mcp"))
+            .json(&json!({"jsonrpc":"2.0","id":index+2,"method":"tools/list","params":params}))
+            .send()
+            .await
+            .expect("MCP HTTP request failed");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["id"], index + 2);
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert!(body.get("error").is_none(), "{body}");
+        let result = &body["result"];
+        assert!(
+            nestweaver_mcp::output_budget::escaped_size(result)
+                <= nestweaver_mcp::output_budget::CATALOGUE_BYTES
+        );
+        let entries = result["tools"].as_array().unwrap();
+        assert!(!entries.is_empty());
+        assert!(entries.len() <= nestweaver_mcp::output_budget::CATALOGUE_TOOLS);
+        for tool in entries {
+            assert!(
+                names.insert(tool["name"].as_str().unwrap().to_owned()),
+                "duplicate tool: {tool}"
+            );
+            tools.push(tool.clone());
+        }
+        let Some(cursor) = result.get("nextCursor") else {
+            complete = true;
+            break;
+        };
+        let cursor = cursor.as_str().unwrap().to_owned();
+        assert!(
+            cursors.insert(cursor.clone()),
+            "catalogue cursor did not advance"
+        );
+        params = json!({"cursor":cursor});
+    }
+    assert!(complete, "catalogue exceeded the page bound");
+    assert_eq!(
+        tools,
+        *nestweaver_mcp::tools::tool_list(false)["tools"]
+            .as_array()
+            .unwrap(),
+        "HTTP catalogue profile diverged"
+    );
 }
 
 #[tokio::test]

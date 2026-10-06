@@ -11575,7 +11575,7 @@ fn tool_brain_impact(
                 file_path: &'a str,
                 start_line: u32,
                 edge_type: &'a str,
-                confidence: f32,
+                confidence: f64,
                 depth: u32,
                 impact_score: f64,
             }
@@ -11586,7 +11586,7 @@ fn tool_brain_impact(
                     file_path: &n.file_path,
                     start_line: n.start_line,
                     edge_type: &n.edge_type,
-                    confidence: n.confidence,
+                    confidence: f64::from(n.confidence),
                     depth: n.depth,
                     impact_score: n.impact_score,
                 },
@@ -13092,7 +13092,7 @@ fn mcp_cluster_page(
             "returned_members":rows.len(),"members_truncated":next<c.members.len(),
             "member_offset":offset,"next_member_offset":if next<c.members.len() && !rows.is_empty() {Some(next)} else {None},
             "members_omitted":c.members.len().saturating_sub(rows.len()),
-            "retry_guidance":if next<c.members.len() {Some("Query this cluster_id with next_member_offset, the same repos/resolution, and expected_generation. If no member fits, narrow the scope.")} else {None},
+            "retry_guidance":if next<c.members.len() {Some("Query this cluster_id with member_offset=next_member_offset, the same repos/resolution, expected_generation=graph_generation, and page_token from this response. If no member fits, narrow the scope.")} else {None},
         }),
     )
 }
@@ -24345,6 +24345,13 @@ mod arg_alias_tests {
             json!({"repos":["repo-a"],"cluster_id":largest["id"],"members":20}),
         )
         .unwrap();
+        assert!(
+            first["clusters"][0]["retry_guidance"]
+                .as_str()
+                .unwrap()
+                .contains("page_token")
+        );
+        assert!(tool_clusters(&store, json!({"repos":["repo-a"],"cluster_id":largest["id"],"members":20,"member_offset":20,"expected_generation":first["graph_generation"]})).unwrap_err().to_string().contains("token changed or missing"));
         let next = tool_clusters(
             &store,
             json!({"repos":["repo-a"],"cluster_id":largest["id"],"members":20,"member_offset":20,"expected_generation":first["graph_generation"],"page_token":first["page_token"]}),
@@ -28933,6 +28940,31 @@ mod flow_trace_truncation_tests {
                 .unwrap();
         }
         store
+    }
+
+    #[test]
+    fn bounded_impact_rows_preserve_direct_json_confidence() {
+        let store = store_with(
+            &[
+                symbol("sym:root", "precisionRoot", SymbolKind::Function, 1),
+                symbol("sym:caller", "precisionCaller", SymbolKind::Function, 10),
+            ],
+            &[("sym:caller", "sym:root", EdgeType::Calls)],
+        );
+        let result =
+            tool_brain_impact(&store, json!({"symbol":"precisionRoot"}), None, None).unwrap();
+        let rows = result["impact_nodes"].as_array().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "actual caller must survive bounded delivery: {result}"
+        );
+        assert_eq!(
+            rows[0]["confidence"],
+            json!(0.9_f32),
+            "streaming a bounded row must preserve the direct Value number representation"
+        );
+        assert_eq!(result["nodes"], result["impact_nodes"]);
     }
 
     #[test]

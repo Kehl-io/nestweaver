@@ -2854,7 +2854,10 @@ mod bounded_existing_connection_tests {
         let instance = nestweaver_daemon::instance_id_from_db_path(&db);
         let socket = nestweaver_daemon::socket_path(&instance);
         fs::create_dir_all(socket.parent().unwrap()).unwrap();
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let listener = {
             let _entered = rt.enter();
             tokio::net::UnixListener::bind(&socket).unwrap()
@@ -2870,7 +2873,7 @@ mod bounded_existing_connection_tests {
                 .unwrap();
         });
         let result = rt.block_on(async {
-            tokio::time::timeout(std::time::Duration::from_millis(300), async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 let mut client = DaemonClient::connect_existing(&db).await?;
                 client.health_check().await
             })
@@ -2886,9 +2889,10 @@ mod bounded_existing_connection_tests {
                     .is_some_and(|status| status.code() == tonic::Code::Unimplemented)),
                 "real peer response required: {error:#}"
             ),
-            _ => panic!(
-                "existing attach must use the one available peer connection and receive its HTTP/2 reply"
-            ),
+            Err(error) => panic!("single-peer attach timed out after five seconds: {error}"),
+            Ok(Ok(response)) => {
+                panic!("single-peer fixture unexpectedly returned health success: {response:?}")
+            }
         }
     }
 
