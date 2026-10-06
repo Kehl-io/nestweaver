@@ -354,18 +354,14 @@ fn is_ingest_failure(code: SkipReasonCode) -> bool {
     )
 }
 
-/// A file's mtime in the representation notes record (`Note::modified_at`).
-///
-/// nw-653: this is WHOLE SECONDS (`format_system_time`), so a change made in
-/// the same second as the recorded one is invisible to anything comparing
-/// these strings — the watcher's startup reconciliation included. An edit
-/// made while no watcher ran, within the second of the previous ingest, is
-/// not detected at startup; the next edit or a `brain refresh` picks it up.
+/// A file's mtime in the fixed-width UTC representation notes record.
+/// Fractional evidence distinguishes stopped-window edits within one second;
+/// older seconds-format records differ once and migrate on the next replay.
 fn file_mtime_string(path: &Path) -> Option<String> {
     std::fs::metadata(path)
         .ok()
         .and_then(|meta| meta.modified().ok())
-        .and_then(format_system_time)
+        .and_then(format_modified_system_time)
 }
 
 /// nw-653: the vault paths whose graph state no longer matches disk, for the
@@ -419,7 +415,6 @@ pub(crate) fn vault_startup_drift(
         let rel_str = rel_path.to_string_lossy().into_owned();
         let abs_path = vault_root.join(&rel_path);
         let meta = std::fs::metadata(&abs_path).ok();
-        // Whole-second granularity: see `file_mtime_string`.
         let on_disk = file_mtime_string(&abs_path);
         let drifted = match indexed.get(&rel_str) {
             // An oversized note the graph never held would only be skipped
@@ -3441,7 +3436,7 @@ fn prepare_single_note(
     let (created_at, modified_at) = match std::fs::metadata(path) {
         Ok(meta) => {
             let c = meta.created().ok().and_then(format_system_time);
-            let m = meta.modified().ok().and_then(format_system_time);
+            let m = meta.modified().ok().and_then(format_modified_system_time);
             (c, m)
         }
         Err(_) => (None, None),
@@ -3877,7 +3872,7 @@ where
         {
             Ok(meta) => {
                 let created = meta.created().ok().and_then(format_system_time);
-                let modified = meta.modified().ok().and_then(format_system_time);
+                let modified = meta.modified().ok().and_then(format_modified_system_time);
                 (created, modified)
             }
             Err(_) => (None, None),
@@ -5217,6 +5212,16 @@ fn slugify_anchor(anchor: &str) -> String {
 
 /// Render a `SystemTime` as RFC 3339-ish UTC string. Falls back to None on
 /// pre-epoch dates.
+fn format_modified_system_time(t: std::time::SystemTime) -> Option<String> {
+    let duration = t.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let whole = format_system_time(t)?;
+    Some(format!(
+        "{}.{:09}Z",
+        whole.strip_suffix('Z')?,
+        duration.subsec_nanos()
+    ))
+}
+
 fn format_system_time(t: std::time::SystemTime) -> Option<String> {
     let duration = t.duration_since(std::time::UNIX_EPOCH).ok()?;
     let secs = duration.as_secs() as i64;

@@ -2367,6 +2367,70 @@ mod tests {
         assert!(restarted.last_batch_phase_timings().is_none());
     }
 
+    #[test]
+    fn watcher_startup_reconciles_same_second_edit_and_migrates_legacy_stamp_once() {
+        let _guard = serial_watcher_test();
+        let (_dir, root) = make_vault(&[("Alpha.md", "# Alpha\n\nold body\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = db_dir.path().join("brain.lbug");
+        let path = root.join("Alpha.md");
+        let second = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let stamp = |nanos| {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(second + Duration::from_nanos(nanos))
+                .unwrap();
+        };
+        stamp(100_000_000);
+        crate::index_md::index_markdown_directory(&root, &db, "default", "test").unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db).unwrap());
+        let v_uid = vault_uid("default", &root.to_string_lossy());
+        let before = store.list_notes(Some(&v_uid)).unwrap().remove(0);
+        fs::write(&path, "# Alpha\n\nchanged within the same second\n").unwrap();
+        stamp(900_000_000);
+        assert!(
+            startup_batch_leases(&db, &root, &store) > 0,
+            "same-second stopped-window edit must replay"
+        );
+        let after = store.list_notes(Some(&v_uid)).unwrap().remove(0);
+        assert_ne!(before.content_hash, after.content_hash);
+        assert!(store.list_all_sections().unwrap().iter().any(|section| {
+            section
+                .text_content
+                .contains("changed within the same second")
+        }));
+        assert_eq!(startup_batch_leases(&db, &root, &store), 0);
+        for input in [
+            "2023-11-14T22:13:20.987654321Z",
+            "2023-11-15T00:13:20+02:00",
+            "2023-11-14",
+        ] {
+            let boundary = crate::parse_since(input).unwrap();
+            assert!(
+                store
+                    .list_note_uids_modified_since(&boundary)
+                    .unwrap()
+                    .contains(&after.uid)
+            );
+            assert!(
+                !store
+                    .list_section_uids_modified_since(&boundary)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        // An existing seconds-format record is upgraded once, even at an
+        // exact-second filesystem mtime, then a second unchanged restart is idle.
+        let mut legacy = after;
+        legacy.modified_at = Some("2023-11-14T22:13:20Z".into());
+        store.upsert_note(&legacy).unwrap();
+        stamp(0);
+        assert!(startup_batch_leases(&db, &root, &store) > 0);
+        assert_eq!(startup_batch_leases(&db, &root, &store), 0);
+    }
+
     /// Start a watcher over `root`, stop it at readiness, and return how many
     /// batch-scoped leases (`watch_vault_batch`) its startup acquired — zero
     /// means startup ran no batch at all.

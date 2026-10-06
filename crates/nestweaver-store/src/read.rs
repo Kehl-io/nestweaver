@@ -3488,24 +3488,23 @@ impl GraphStore {
         since: &str,
     ) -> Result<std::collections::HashSet<String>, StoreError> {
         let conn = self.conn()?;
+        // parse_since deliberately floors to a second. Pad that UTC boundary
+        // so precise ...SS.123Z rows sort after it, while legacy ...SSZ rows
+        // remain included. Do not change the caller's documented floor.
+        let boundary = if since.len() == 20 && since.ends_with('Z') {
+            format!("{}.000000000Z", &since[..19])
+        } else {
+            since.to_string()
+        };
         let q = "MATCH (n:Note) WHERE n.modified_at >= $since RETURN n.uid";
         let mut stmt = match conn.prepare(q) {
             Ok(s) => s,
-            Err(e) => {
-                tracing::trace!(
-                    "list_note_uids_modified_since: query skipped (table may not exist): {e}"
-                );
+            Err(e) if e.to_string().contains("Table Note does not exist.") => {
                 return Ok(std::collections::HashSet::new());
             }
+            Err(e) => return Err(StoreError::Query(e.to_string())),
         };
-        // nw-295. A failed query and "nothing has been modified since then"
-        // are different facts and used to be the same value — the execute
-        // error was swallowed into `Ok(HashSet::new())`, so a broken query
-        // presented as a confidently narrowed result and the caller lost
-        // every Note and Section without being told why. The `prepare`
-        // fallback above is different and stays: a Note table that does not
-        // exist means there genuinely are no notes.
-        let result = conn.execute(&mut stmt, vec![("since", Value::String(since.to_string()))])?;
+        let result = conn.execute(&mut stmt, vec![("since", Value::String(boundary))])?;
         let mut uids = std::collections::HashSet::new();
         for row in result {
             if let Some(Value::String(uid)) = row.first() {
@@ -3532,15 +3531,9 @@ impl GraphStore {
             let q = "MATCH (s:Section) WHERE s.note_uid = $nid RETURN s.uid";
             let mut stmt = match conn.prepare(q) {
                 Ok(s) => s,
-                Err(e) => {
-                    tracing::trace!(
-                        "list_section_uids_modified_since: query skipped (table may not exist): {e}"
-                    );
-                    return Ok(uids);
-                }
+                Err(e) if e.to_string().contains("Table Section does not exist.") => continue,
+                Err(e) => return Err(StoreError::Query(e.to_string())),
             };
-            // Same argument one layer down: the `continue` this replaces
-            // silently dropped one note's sections from the answer.
             let result = conn.execute(&mut stmt, vec![("nid", Value::String(note_uid.clone()))])?;
             for row in result {
                 if let Some(Value::String(uid)) = row.first() {
@@ -5798,5 +5791,70 @@ mod workspace_membership_error_tests {
             store.project_legacy_symbol_repos("proj:legacy").is_err(),
             "a broken Symbol schema must not become empty legacy membership"
         );
+    }
+}
+
+#[cfg(test)]
+mod modified_since_precision_tests {
+    use super::*;
+
+    #[test]
+    fn same_second_precise_and_legacy_notes_include_parent_sections() {
+        let store = GraphStore::in_memory().unwrap();
+        for (uid, modified) in [
+            ("note:old", Some("2023-11-14T22:13:19.999999999Z")),
+            ("note:exact", Some("2023-11-14T22:13:20.000000000Z")),
+            ("note:precise", Some("2023-11-14T22:13:20.123456789Z")),
+            ("note:legacy", Some("2023-11-14T22:13:20Z")),
+            ("note:unknown", None),
+        ] {
+            store
+                .insert_note(&Note {
+                    uid: uid.into(),
+                    vault_uid: "vault:v".into(),
+                    file_path: format!("{uid}.md"),
+                    title: uid.into(),
+                    note_kind: NoteKind::General,
+                    word_count: 1,
+                    content_hash: "h".into(),
+                    frontmatter: None,
+                    frontmatter_raw: None,
+                    created_at: None,
+                    modified_at: modified.map(str::to_owned),
+                    pagerank_score: None,
+                    embedding: None,
+                })
+                .unwrap();
+            store
+                .insert_section(&Section {
+                    uid: format!("section:{uid}"),
+                    note_uid: uid.into(),
+                    heading_uid: None,
+                    start_line: 1,
+                    end_line: 1,
+                    text_hash: "h".into(),
+                    text_content: "body".into(),
+                    word_count: 1,
+                    pagerank_score: None,
+                })
+                .unwrap();
+        }
+        let expected: std::collections::HashSet<_> = ["note:exact", "note:precise", "note:legacy"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        for boundary in ["2023-11-14T22:13:20Z", "2023-11-14T22:13:20.000000000Z"] {
+            assert_eq!(
+                store.list_note_uids_modified_since(boundary).unwrap(),
+                expected
+            );
+            assert_eq!(
+                store.list_section_uids_modified_since(boundary).unwrap(),
+                expected
+                    .iter()
+                    .map(|uid| format!("section:{uid}"))
+                    .collect()
+            );
+        }
     }
 }

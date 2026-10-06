@@ -26,6 +26,7 @@ struct Peer {
     requests: Arc<AtomicUsize>,
     stops: Arc<AtomicUsize>,
     health_delay: std::time::Duration,
+    watcher_id: Option<u64>,
 }
 impl tonic::server::NamedService for Peer {
     const NAME: &'static str = "nestweaver.daemon.v1.NestWeaverDaemon";
@@ -56,7 +57,13 @@ impl Service<http::Request<Body>> for Peer {
                     respond!(
                         HealthCheckResponse,
                         HealthCheckRequest,
-                        HealthCheckResponse::default()
+                        HealthCheckResponse {
+                            watcher: peer.watcher_id.map(|id| WatcherStatus {
+                                id,
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }
                     )
                 }
                 "ServeUi" => {
@@ -144,6 +151,7 @@ fn supervisor_error_cleans_up(mismatch: bool) {
         },
         requests: requests.clone(),
         stops: stops.clone(),
+        watcher_id: None,
         health_delay: std::time::Duration::ZERO,
     };
     let server = rt.spawn(async move {
@@ -230,6 +238,7 @@ fn repeated_ui_health_timeouts_preserve_live_owned_listener() {
         port,
         requests: Arc::new(AtomicUsize::new(0)),
         stops: Arc::new(AtomicUsize::new(0)),
+        watcher_id: None,
         health_delay: std::time::Duration::from_secs(60),
     };
     let server = rt.spawn(async move {
@@ -293,6 +302,7 @@ fn dead_ui_daemon_without_an_owner_enters_degraded_service() {
         port,
         requests: Arc::new(AtomicUsize::new(0)),
         stops: Arc::new(AtomicUsize::new(0)),
+        watcher_id: None,
         health_delay: std::time::Duration::ZERO,
     };
     let server = rt.spawn(async move {
@@ -404,4 +414,141 @@ fn ui_absence_pidfile_fixture(
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     check(&rt, &db, &pidfile, &listener);
     let _ = std::fs::remove_file(pidfile);
+}
+
+#[test]
+fn slow_watcher_health_does_not_terminate_controller() {
+    let _environment = crate::XDG_RUNTIME_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("slow-watcher.lbug");
+    std::fs::write(&db, "fixture identity only").unwrap();
+    let instance = nestweaver_daemon::instance_id_from_db_path(&db);
+    let socket = nestweaver_daemon::socket_path(&instance);
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let _cleanup = SocketCleanup(socket.clone());
+    let listener = {
+        let _entered = rt.enter();
+        tokio::net::UnixListener::bind(&socket).unwrap()
+    };
+    let requests = Arc::new(AtomicUsize::new(0));
+    let stops = Arc::new(AtomicUsize::new(0));
+    let peer = Peer {
+        port: 1,
+        requests: requests.clone(),
+        stops: stops.clone(),
+        watcher_id: Some(17),
+        health_delay: std::time::Duration::from_secs(10),
+    };
+    let server = rt.spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(peer)
+            .serve_with_incoming(
+                tonic::codegen::tokio_stream::wrappers::UnixListenerStream::new(listener),
+            )
+            .await
+            .unwrap();
+    });
+    let mut client = rt
+        .block_on(nestweaver_client::DaemonClient::connect_existing(&db))
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let deadline = rt.spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(7)).await;
+        let _ = tx.send(());
+    });
+    let started = std::time::Instant::now();
+    let result = wait_for_daemon_watcher(&rt, &mut client, 17, &db, &rx);
+    server.abort();
+    deadline.abort();
+    assert!(
+        result.is_ok(),
+        "live accepting peer is inconclusive on timeout: {result:?}"
+    );
+    assert!(started.elapsed() >= std::time::Duration::from_secs(7));
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        0,
+        "no watcher replacement/autostart"
+    );
+    assert_eq!(
+        stops.load(Ordering::SeqCst),
+        0,
+        "no unconditional successor stop"
+    );
+}
+
+#[test]
+fn watcher_controller_terminates_on_actual_death_and_explicit_displacement() {
+    let _environment = crate::XDG_RUNTIME_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for died in [false, true] {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut peer_runtime = Some(tokio::runtime::Runtime::new().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("owned-watcher.lbug");
+        std::fs::write(&db, "fixture identity only").unwrap();
+        let socket =
+            nestweaver_daemon::socket_path(&nestweaver_daemon::instance_id_from_db_path(&db));
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let _cleanup = SocketCleanup(socket.clone());
+        let listener = {
+            let _entered = peer_runtime.as_ref().unwrap().enter();
+            tokio::net::UnixListener::bind(&socket).unwrap()
+        };
+        let requests = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let peer = Peer {
+            port: 1,
+            requests: requests.clone(),
+            stops: stops.clone(),
+            health_delay: std::time::Duration::ZERO,
+            watcher_id: Some(18),
+        };
+        let server = peer_runtime.as_ref().unwrap().spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(peer)
+                .serve_with_incoming(
+                    tonic::codegen::tokio_stream::wrappers::UnixListenerStream::new(listener),
+                )
+                .await
+                .unwrap();
+        });
+        let mut client = rt
+            .block_on(nestweaver_client::DaemonClient::connect_existing(&db))
+            .unwrap();
+        if died {
+            // Own and stop every listener and established connection task.
+            peer_runtime
+                .take()
+                .unwrap()
+                .shutdown_timeout(std::time::Duration::from_secs(1));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let deadline = rt.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            let _ = tx.send(());
+        });
+        let result = wait_for_daemon_watcher(&rt, &mut client, 17, &db, &rx);
+        server.abort();
+        deadline.abort();
+        let error = result.expect_err("death/displacement must terminate owned controller");
+        assert!(
+            error.to_string().contains(if died {
+                "no longer running"
+            } else {
+                "displaced or stopped"
+            }),
+            "{error:#}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            stops.load(Ordering::SeqCst),
+            0,
+            "successor must never receive stop"
+        );
+    }
 }

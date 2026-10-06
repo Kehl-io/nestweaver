@@ -12107,6 +12107,7 @@ fn wait_for_daemon_watcher(
     rt: &tokio::runtime::Runtime,
     client: &mut nestweaver_client::DaemonClient,
     watcher_id: u64,
+    db_path: &std::path::Path,
     rx: &std::sync::mpsc::Receiver<()>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -12117,17 +12118,49 @@ fn wait_for_daemon_watcher(
         match rx.recv_timeout(std::time::Duration::from_secs(2)) {
             Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let health = rt
-                    .block_on(async {
-                        tokio::time::timeout(
-                            std::time::Duration::from_secs(3),
-                            client.health_check(),
-                        )
+                let health = match rt.block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(3), client.health_check())
                         .await
-                    })
-                    .context(
-                        "watcher status timed out; controller is no longer observing its watcher",
-                    )??;
+                }) {
+                    Ok(Ok(health)) => health,
+                    Err(_) => continue, // A deadline cannot prove daemon death.
+                    Ok(Err(error)) => {
+                        match rx.try_recv() {
+                            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                return Ok(());
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        }
+                        if ui_daemon_absence_verified(rt, db_path, &error) {
+                            return Err(error.context("watcher daemon is no longer running"));
+                        }
+                        match rx.try_recv() {
+                            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                return Ok(());
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        }
+                        // Reconnect only to an existing selected peer within
+                        // the shared health budget. Session identity stays
+                        // fixed; no autostart or unconditional successor stop.
+                        match rt.block_on(async {
+                            tokio::time::timeout(UI_DAEMON_PROBE_TIMEOUT, async {
+                                let mut observed =
+                                    nestweaver_client::DaemonClient::connect_existing(db_path)
+                                        .await?;
+                                let health = observed.health_check().await?;
+                                anyhow::Ok((observed, health))
+                            })
+                            .await
+                        }) {
+                            Ok(Ok((observed, health))) => {
+                                *client = observed;
+                                health
+                            }
+                            _ => continue,
+                        }
+                    }
+                };
                 anyhow::ensure!(
                     health.watcher.as_ref().is_some_and(|w| w.id == watcher_id),
                     "watcher session {watcher_id} was displaced or stopped; this controller has terminated"
@@ -20682,7 +20715,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         let _ = ctrlc_handler(move || {
                             let _ = tx.send(());
                         });
-                        wait_for_daemon_watcher(&rt, &mut client, resp.watcher_id, &rx)?;
+                        wait_for_daemon_watcher(&rt, &mut client, resp.watcher_id, &db_path, &rx)?;
 
                         stop_owned_daemon_watcher(&rt, &mut client, resp.watcher_id)?;
                         eprintln!("Watcher stopped.");

@@ -7731,6 +7731,14 @@ impl NestWeaverDaemon for DaemonService {
         // Build web UI router, mounting the admin API when available so the
         // admin dashboard SPA can reach its backend on the same origin.
         let manifest_events = app_state.event_tx.clone();
+        let generation_store = Arc::clone(&app_state.store);
+        let mut published_generation = tokio::task::spawn_blocking({
+            let store = Arc::clone(&generation_store);
+            move || store.clean_published_generation_snapshot().ok()
+        })
+        .await
+        .ok()
+        .flatten();
         let manifest_runtime = Arc::clone(&state.manifest_recovery);
         let mut web_router = nestweaver_web::create_router(app_state);
         if let Some(admin_state) = state.admin_state.get() {
@@ -7779,6 +7787,10 @@ impl NestWeaverDaemon for DaemonService {
             let serve = nestweaver_web::start_server_with_router(web_router, port, open_browser);
             tokio::pin!(serve);
             let mut changed = manifest_runtime.changed.subscribe();
+            // This poll lives in the retained UI task. Aborting StopUI cancels
+            // future probes and sends; no detached periodic task survives it.
+            let mut publications = tokio::time::interval(Duration::from_millis(250));
+            publications.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     result = &mut serve => {
@@ -7787,6 +7799,20 @@ impl NestWeaverDaemon for DaemonService {
                             Err(error) => tracing::error!(%error, "UI server error"),
                         }
                         break;
+                    }
+                    _ = publications.tick() => {
+                        let store = Arc::clone(&generation_store);
+                        if let Ok(Some(generation)) = tokio::task::spawn_blocking(move || {
+                            store.clean_published_generation_snapshot().ok()
+                        }).await {
+                            if published_generation != Some(generation) {
+                                published_generation = Some(generation);
+                                let _ = manifest_events.send(nestweaver_web::state::GraphEvent {
+                                    event_type: "graph:updated".into(),
+                                    payload: serde_json::json!({ "generation": generation }),
+                                });
+                            }
+                        }
                     }
                     result = changed.changed() => {
                         if result.is_err() { break; }
@@ -24712,6 +24738,89 @@ repos = ["alpha"]
         });
         request.extensions_mut().insert(crate::auth::IsAdmin(true));
         request
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_ui_emits_only_coalesced_clean_generations_and_stops_event_work() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let state = test_state_with_writer_generation(Some(10)).0;
+        let service = DaemonService::new(state.clone());
+        let port = free_port();
+        assert!(
+            service
+                .serve_ui(admin_serve_ui_request(port))
+                .await
+                .unwrap()
+                .into_inner()
+                .ok
+        );
+        let mut stream = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                    Ok(stream) => break stream,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        stream
+            .write_all(b"GET /api/v1/events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut bytes = [0u8; 8192];
+        let count = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&bytes[..count]).contains("200 OK"));
+        // Leave a dirty successor for more than a poll interval: it must
+        // never masquerade as a committed generation event.
+        let publication = nestweaver_engine::manifest::begin_graph_mutation_publication(
+            &state.store,
+            "clean generation event fixture",
+        )
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(750), stream.read(&mut bytes))
+                .await
+                .is_err()
+        );
+        publication.finish(true).unwrap();
+        let expected = state.store.clean_published_generation_snapshot().unwrap();
+        let count = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut bytes))
+            .await
+            .expect("clean publication must reach SSE without a ranked HTTP request")
+            .unwrap();
+        let event = String::from_utf8_lossy(&bytes[..count]);
+        assert_eq!(event.matches("event: graph:updated").count(), 1, "{event}");
+        assert!(
+            event.contains(&format!("\"generation\":{expected}")),
+            "{event}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(750), stream.read(&mut bytes))
+                .await
+                .is_err(),
+            "unchanged snapshots must not repeat an event"
+        );
+        let mut stop = Request::new(StopUiRequest {});
+        stop.extensions_mut().insert(crate::auth::IsAdmin(true));
+        assert!(service.stop_ui(stop).await.unwrap().into_inner().ok);
+        let publication = nestweaver_engine::manifest::begin_graph_mutation_publication(
+            &state.store,
+            "after UI stopped",
+        )
+        .unwrap();
+        publication.finish(true).unwrap();
+        if let Ok(Ok(count)) =
+            tokio::time::timeout(Duration::from_millis(750), stream.read(&mut bytes)).await
+        {
+            assert!(
+                !String::from_utf8_lossy(&bytes[..count]).contains("graph:updated"),
+                "stopped UI must not retain generation event work"
+            );
+        }
     }
 
     /// Regression (dead URL): when the UI is already running, `serve_ui`

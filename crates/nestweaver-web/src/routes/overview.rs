@@ -221,7 +221,7 @@ fn overview_response(state: &Arc<AppState>, params: &OverviewParams) -> Result<R
         Some(LandmarkKind::Symbol) => counts.symbol_count,
         Some(LandmarkKind::Note) => counts.note_count,
     };
-    let meta = workspaces::p1_meta_for_result_set(
+    let mut meta = workspaces::p1_meta_for_result_set(
         &workspace,
         meta_state.result,
         meta_state.unsupported,
@@ -231,6 +231,7 @@ fn overview_response(state: &Arc<AppState>, params: &OverviewParams) -> Result<R
         Some(total_landmark_count),
     );
 
+    meta.trust.freshness = state.aggregate_repo_freshness(&repos);
     let start_here = landmarks.iter().take(8).cloned().collect();
     let response = OverviewResponse {
         counts: OverviewCounts {

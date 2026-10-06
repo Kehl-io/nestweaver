@@ -1410,3 +1410,115 @@ async fn scoped_top_preserves_repo_keyed_git_activity_scores() {
     assert_eq!(scoped[0]["uid"], "sym:rank:z");
     assert_eq!(scoped[0]["pagerank_score"], all[0]["pagerank_score"]);
 }
+
+#[tokio::test]
+async fn local_git_freshness_is_shared_by_repo_workspace_and_overview() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    let empty_git_dir = dir.path().join("empty-git-config");
+    std::fs::create_dir(&empty_git_dir).unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TEMPLATE_DIR", &empty_git_dir)
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "tag.gpgsign=false",
+                "-c",
+            ])
+            .arg(format!("core.hooksPath={}", empty_git_dir.display()))
+            .args(args)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {:?}", output.stderr);
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "fixture@example.com"]);
+    git(&["config", "user.name", "Fixture"]);
+    std::fs::write(root.join("a.txt"), "one").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "one"]);
+    let indexed = git(&["rev-parse", "HEAD"]);
+    let store = GraphStore::in_memory().unwrap();
+    let mut indexed_repo = repo("repo:local", "local");
+    indexed_repo.root_path = Some(root.to_string_lossy().into_owned());
+    indexed_repo.indexed_sha = indexed.clone();
+    indexed_repo.staleness_commits_behind = 0;
+    store.insert_repo(&indexed_repo).unwrap();
+    let state = AppState::new(store, None, dir.path().join("graph.lbug"));
+    let app = create_router(state.clone());
+    let (_, current) = get_json(&app, "/api/v1/repos").await;
+    assert_eq!(current[0]["freshness"]["status"], "current");
+    std::fs::write(root.join("a.txt"), "two").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "two"]);
+    // Generation invalidation must force a new observation even within TTL.
+    state.store.bump_graph_generation();
+    let (_, behind) = get_json(&app, "/api/v1/repos").await;
+    assert_eq!(behind[0]["freshness"]["status"], "behind");
+    assert_eq!(behind[0]["freshness"]["commits_behind"], 1);
+    let (_, overview) = get_json(&app, "/api/v1/overview?workspace=repo:local").await;
+    assert_eq!(overview["_meta"]["trust"]["freshness"], "behind");
+    let (_, catalog) = get_json(&app, "/api/v1/workspaces").await;
+    let entry = catalog["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["uid"] == "repo:local")
+        .unwrap();
+    assert_eq!(entry["_meta"]["trust"]["freshness"], "behind");
+    // A rewind and independent branch must not read as "current, 0 behind".
+    let newer = git(&["rev-parse", "HEAD"]);
+    indexed_repo.indexed_sha = newer.clone();
+    state
+        .store
+        .update_repo_sha(&indexed_repo.uid, &indexed_repo.indexed_sha)
+        .unwrap();
+    git(&["checkout", "--detach", &indexed]);
+    state.store.bump_graph_generation();
+    let (_, ahead) = get_json(&app, "/api/v1/repos").await;
+    assert_eq!(ahead[0]["freshness"]["status"], "ahead");
+    git(&["checkout", "-qb", "independent"]);
+    std::fs::write(root.join("a.txt"), "independent").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "independent"]);
+    state.store.bump_graph_generation();
+    let (_, diverged) = get_json(&app, "/api/v1/repos").await;
+    assert_eq!(diverged[0]["freshness"]["status"], "diverged");
+    assert_eq!(diverged[0]["freshness"]["commits_ahead"], 1);
+    assert_eq!(diverged[0]["freshness"]["commits_behind"], 1);
+    std::fs::remove_file(root.join(".git/HEAD")).unwrap();
+    state.store.bump_graph_generation();
+    let (_, failed_observation) = get_json(&app, "/api/v1/repos").await;
+    assert_eq!(failed_observation[0]["freshness"]["status"], "unknown");
+    // Missing, present non-Git, and invalid indexed SHA are distinct.
+    std::fs::remove_dir_all(&root).unwrap();
+    state.store.bump_graph_generation();
+    let (_, missing) = get_json(&app, "/api/v1/repos").await;
+    assert_eq!(missing[0]["freshness"]["status"], "missing");
+    std::fs::create_dir(&root).unwrap();
+    state.store.bump_graph_generation();
+    let (_, untracked) = get_json(&app, "/api/v1/repos").await;
+    assert_eq!(untracked[0]["freshness"]["status"], "untracked");
+    git(&["init", "-q"]);
+    std::fs::write(root.join("a.txt"), "three").unwrap();
+    git(&["config", "user.email", "fixture@example.com"]);
+    git(&["config", "user.name", "Fixture"]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "three"]);
+    indexed_repo.indexed_sha = "watch".into();
+    state
+        .store
+        .update_repo_sha(&indexed_repo.uid, &indexed_repo.indexed_sha)
+        .unwrap();
+    state.store.bump_graph_generation();
+    let (_, unknown) = get_json(&app, "/api/v1/repos").await;
+    assert_eq!(unknown[0]["freshness"]["status"], "unknown");
+    assert!(unknown[0]["freshness"]["commits_behind"].is_null());
+}

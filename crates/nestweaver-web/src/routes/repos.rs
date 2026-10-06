@@ -12,9 +12,21 @@ use crate::rank_events::with_rank_event;
 use crate::state::AppState;
 
 pub async fn list_repos(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
-    let repos = nestweaver_engine::list_repos(&state.store, None)?;
-    let json = serde_json::to_value(&repos)?;
-    Ok(Json(json).into_response())
+    tokio::task::spawn_blocking(move || {
+        let repos = nestweaver_engine::list_repos(&state.store, None)?;
+        let freshness = state.repo_freshness(&repos);
+        let payload = repos
+            .iter()
+            .map(|repo| {
+                let mut value = serde_json::to_value(repo)?;
+                value["freshness"] = serde_json::to_value(freshness.get(&repo.uid))?;
+                Ok(value)
+            })
+            .collect::<Result<Vec<serde_json::Value>, serde_json::Error>>()?;
+        Ok(Json(payload).into_response())
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?
 }
 
 pub async fn list_services(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {

@@ -1381,7 +1381,7 @@ pub(crate) fn run_brain(
                     let _ = tx.send(());
                 });
 
-                wait_for_daemon_watcher(&rt, &mut client, resp.watcher_id, &rx)?;
+                wait_for_daemon_watcher(&rt, &mut client, resp.watcher_id, &db_path, &rx)?;
 
                 stop_owned_daemon_watcher(&rt, &mut client, resp.watcher_id)?;
                 out.status("Watcher stopped.");

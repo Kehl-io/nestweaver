@@ -191,22 +191,47 @@ struct WorkspaceCatalogResponse {
 const WORKSPACE_CATALOG_LIMIT: usize = 500;
 
 pub async fn workspaces(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
-    let entries = workspace_entries(&state.store)?;
-    let all = ResolvedWorkspace::all();
-    let meta = p1_meta_for_result_set(
-        &all,
-        entries.result_state("complete"),
-        Vec::<&str>::new(),
-        vec![P1Provenance::local_graph_store("workspace catalog")],
-        Some(WORKSPACE_CATALOG_LIMIT),
-        entries.items.len(),
-        Some(entries.total_count),
-    );
-    Ok(Json(WorkspaceCatalogResponse {
-        workspaces: entries.items,
-        meta,
+    tokio::task::spawn_blocking(move || {
+        let mut entries = workspace_entries(&state.store)?;
+        let all = ResolvedWorkspace::all();
+        let mut meta = p1_meta_for_result_set(
+            &all,
+            entries.result_state("complete"),
+            Vec::<&str>::new(),
+            vec![P1Provenance::local_graph_store("workspace catalog")],
+            Some(WORKSPACE_CATALOG_LIMIT),
+            entries.items.len(),
+            Some(entries.total_count),
+        );
+        let repos = state.store.list_repos(None)?;
+        let freshness = state.repo_freshness(&repos);
+        for entry in &mut entries.items {
+            let repo_uids = match entry.kind.as_str() {
+                "all" => repos.iter().map(|repo| repo.uid.clone()).collect(),
+                "repo" => entry.uid.iter().cloned().collect(),
+                "project" => state
+                    .store
+                    .project_display_repo_uids(entry.uid.as_deref().unwrap_or_default())?,
+                _ => Vec::new(),
+            };
+            entry.meta.trust.freshness =
+                crate::state::aggregate_freshness(repo_uids.iter().map(|uid| {
+                    freshness
+                        .get(uid)
+                        .map_or("unknown", |value| value.status.as_str())
+                }));
+        }
+        meta.trust.freshness = crate::state::aggregate_freshness(
+            freshness.values().map(|value| value.status.as_str()),
+        );
+        Ok(Json(WorkspaceCatalogResponse {
+            workspaces: entries.items,
+            meta,
+        })
+        .into_response())
     })
-    .into_response())
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?
 }
 
 pub fn workspace_param<'a>(workspace: Option<&'a str>, scope: Option<&'a str>) -> Option<&'a str> {
@@ -339,7 +364,7 @@ pub fn p1_meta(
         trust: P1TrustMeta {
             data_scope: workspace.kind.data_scope().to_string(),
             federation: "local-only".to_string(),
-            freshness: if partial { "partial" } else { "current" }.to_string(),
+            freshness: "unknown".to_string(),
             capability: "local-index".to_string(),
             result: result.to_string(),
             source_confidence: "extracted".to_string(),
