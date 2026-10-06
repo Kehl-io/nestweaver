@@ -410,6 +410,9 @@ mod timeout_tests {
             nestweaver_store::StoreError::Query(
                 "context edges: Runtime exception: Query interrupted.".into(),
             ),
+            nestweaver_store::StoreError::Query(
+                "context edges ACCESSES: Query execution failed: Interrupted.".into(),
+            ),
         ] {
             let response =
                 map_context_engine_error(anyhow::Error::new(error).context("context graph read"))
@@ -513,6 +516,9 @@ mod timeout_tests {
         for error in [
             nestweaver_store::StoreError::Query("Binder exception: missing schema".into()),
             nestweaver_store::StoreError::Query("checkpoint failed: timeout".into()),
+            nestweaver_store::StoreError::Query(
+                "checkpoint: Query execution failed: Interrupted.".into(),
+            ),
             nestweaver_store::StoreError::Database("Runtime exception: Query interrupted.".into()),
         ] {
             assert_eq!(

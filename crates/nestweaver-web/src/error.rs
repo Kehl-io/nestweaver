@@ -70,7 +70,8 @@ impl ApiError {
                     )) => true,
                     Some(nestweaver_store::StoreError::Query(message)) => {
                         message.starts_with("context edges")
-                            && message.ends_with("Runtime exception: Query interrupted.")
+                            && (message.ends_with("Runtime exception: Query interrupted.")
+                                || message.ends_with("Query execution failed: Interrupted."))
                     }
                     _ => false,
                 },
