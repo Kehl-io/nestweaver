@@ -16,8 +16,8 @@ pub struct NamedBinding {
     pub local_name: String,
     /// The original exported name from the source file.
     pub original_name: String,
-    /// The file that exports the original name.
-    pub source_file: String,
+    /// The file that exports the original name, or a failed JS/TS import.
+    pub source_file: Option<String>,
     /// Import location, used to keep function-local bindings inside their owner.
     pub start_line: u32,
 }
@@ -30,7 +30,7 @@ pub struct ImportGraph {
     exports: HashMap<String, Vec<String>>,
     /// file → [named bindings (aliased imports)]
     named_bindings: HashMap<String, Vec<NamedBinding>>,
-    export_aliases: HashMap<String, HashMap<String, String>>,
+    export_aliases: HashMap<String, HashMap<String, (String, Option<String>)>>,
 }
 
 impl ImportGraph {
@@ -63,13 +63,30 @@ impl ImportGraph {
             .unwrap_or(&[])
     }
 
-    /// Resolve an exact module-local public alias to its declaration name.
-    pub fn exported_local<'a>(&'a self, file: &str, name: &'a str) -> &'a str {
-        self.export_aliases
-            .get(file)
-            .and_then(|aliases| aliases.get(name))
-            .map(String::as_str)
-            .unwrap_or(name)
+    /// Follow only exact named public exports, bounded like the existing barrel walk.
+    /// A public declaration name is not automatically another public export key.
+    pub fn exported_target<'a>(
+        &'a self,
+        file: &'a str,
+        name: &'a str,
+    ) -> Option<(&'a str, &'a str, usize)> {
+        let mut file = file;
+        let mut name = name;
+        let mut visited = HashSet::new();
+        for depth in 0..=3 {
+            if !visited.insert((file, name)) {
+                return None;
+            }
+            let (local, source) = self.export_aliases.get(file)?.get(name)?;
+            match source {
+                Some(source) => {
+                    file = source;
+                    name = local;
+                }
+                None => return Some((file, local, depth)),
+            }
+        }
+        None
     }
 
     /// Returns all resolved imports across all files as (source_file, specifier, target_file) triples.
@@ -126,7 +143,19 @@ pub(crate) fn build_import_graph_with_languages(
             references
                 .iter()
                 .filter(|reference| reference.kind == ReferenceKind::ExportAlias)
-                .map(|reference| (reference.name.clone(), reference.context.clone()))
+                .filter_map(|reference| {
+                    let source = match reference.receiver.as_deref() {
+                        Some(specifier) => Some(resolve_specifier(
+                            file_path,
+                            specifier,
+                            &known_files,
+                            language,
+                            workspace_ctx,
+                        )?),
+                        None => None,
+                    };
+                    Some((reference.name.clone(), (reference.context.clone(), source)))
+                })
                 .collect(),
         );
 
@@ -140,28 +169,32 @@ pub(crate) fn build_import_graph_with_languages(
             // is already covered by its own Import reference, so it is not
             // added to `imports` again here.
             if reference.kind == ReferenceKind::ImportAlias {
-                if let Some(resolved) = resolve_specifier(
+                let resolved = resolve_specifier(
                     file_path,
                     &reference.context,
                     &known_files,
                     language,
                     workspace_ctx,
-                ) {
-                    let original_name = reference
-                        .receiver
-                        .as_deref()
-                        .unwrap_or(&reference.context)
-                        .rsplit("::")
-                        .next()
-                        .unwrap_or(reference.context.as_str())
-                        .to_string();
-                    bindings.push(NamedBinding {
-                        local_name: reference.name.clone(),
-                        original_name,
-                        source_file: resolved,
-                        start_line: reference.start_line,
-                    });
+                );
+                if resolved.is_none()
+                    && !matches!(language, Language::JavaScript | Language::TypeScript)
+                {
+                    continue;
                 }
+                let original_name = reference
+                    .receiver
+                    .as_deref()
+                    .unwrap_or(&reference.context)
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(reference.context.as_str())
+                    .to_string();
+                bindings.push(NamedBinding {
+                    local_name: reference.name.clone(),
+                    original_name,
+                    source_file: resolved,
+                    start_line: reference.start_line,
+                });
                 continue;
             }
             if !matches!(
@@ -419,7 +452,7 @@ mod tests {
             vec![NamedBinding {
                 local_name: "MyAlias".to_string(),
                 original_name: "OriginalName".to_string(),
-                source_file: "src/lib.js".to_string(),
+                source_file: Some("src/lib.js".to_string()),
                 start_line: 1,
             }],
         );
@@ -467,7 +500,7 @@ mod tests {
         assert_eq!(bindings.len(), 1, "only the resolved alias gets a binding");
         assert_eq!(bindings[0].local_name, "load_config");
         assert_eq!(bindings[0].original_name, "load");
-        assert_eq!(bindings[0].source_file, "src/config.rs");
+        assert_eq!(bindings[0].source_file.as_deref(), Some("src/config.rs"));
         // The ImportAlias reference must not duplicate the resolved import.
         assert_eq!(
             graph.imports_of("src/main.rs"),

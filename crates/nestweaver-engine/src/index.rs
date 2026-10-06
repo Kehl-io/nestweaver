@@ -8258,9 +8258,9 @@ fn build_reresolve_edges(
     // visibility into other files' symbols.  To restore those
     // changed→unchanged edges we must include the unchanged files' symbols
     // in the resolver's symbol map so the resolver can find them as
-    // targets.  We add them to `file_data` with empty references (we
-    // don't need to resolve their references — those edges were never
-    // deleted) and populate `uid_to_file` so the edge filter can look up
+    // targets. We initially add them to `file_data` with empty references
+    // (their outgoing edges were never deleted); reachable JS/TS targets'
+    // export metadata is hydrated below and populate `uid_to_file` so the edge filter can look up
     // their file paths.  `db_symbols` is the repo's live (post-mutation)
     // symbol set, fetched by the caller.
     let mut unchanged_by_file: HashMap<String, Vec<RawSymbol>> = HashMap::new();
@@ -8324,6 +8324,85 @@ fn build_reresolve_edges(
     } else {
         Default::default()
     };
+
+    // Unchanged JS/TS targets need their exact public keys, not just stored
+    // symbol visibility. Hydrate direct targets of scoped files, then only
+    // named forwarding sources, without re-parsing unrelated repo files.
+    let mut frontier: std::collections::HashSet<String> = scope
+        .iter()
+        .filter(|file| {
+            matches!(
+                file_languages.get(*file),
+                Some(Language::JavaScript | Language::TypeScript)
+            )
+        })
+        .cloned()
+        .collect();
+    let mut hydrated = scope.clone();
+    let positions: HashMap<String, usize> = file_data
+        .iter()
+        .enumerate()
+        .map(|(position, (path, _, _))| (path.clone(), position))
+        .collect();
+    // One direct-import layer and at most three named forwarding hops.
+    for _ in 0..=3 {
+        let graph = nestweaver_resolver::imports::build_import_graph(
+            &file_data,
+            Language::JavaScript,
+            &workspace_ctx,
+        );
+        let targets: std::collections::HashSet<String> = graph
+            .all_resolved_imports()
+            .into_iter()
+            .filter(|(from, _, _)| frontier.contains(*from))
+            .map(|(_, _, target)| target.to_string())
+            .collect();
+        let mut next = std::collections::HashSet::new();
+        for target in targets {
+            if !matches!(
+                file_languages.get(&target),
+                Some(Language::JavaScript | Language::TypeScript)
+            ) || !hydrated.insert(target.clone())
+            {
+                continue;
+            }
+            let Some(&position) = positions.get(&target) else {
+                continue;
+            };
+            let references = if let Some((_, references)) =
+                prepared_file_data.and_then(|prepared| prepared.get(&target))
+            {
+                references.clone()
+            } else {
+                let Ok(source) = reader.read_file(Path::new(&target)) else {
+                    continue;
+                };
+                let Ok(parsed) = parse_source(&reader.root().join(&target), &source) else {
+                    continue;
+                };
+                parsed.references
+            };
+            let forwarding_sources: std::collections::HashSet<&str> = references
+                .iter()
+                .filter(|reference| reference.kind == nestweaver_parser::ReferenceKind::ExportAlias)
+                .filter_map(|reference| reference.receiver.as_deref())
+                .collect();
+            file_data[position].2 = references
+                .iter()
+                .filter(|reference| {
+                    reference.kind == nestweaver_parser::ReferenceKind::ExportAlias
+                        || (reference.kind == nestweaver_parser::ReferenceKind::Import
+                            && forwarding_sources.contains(reference.name.as_str()))
+                })
+                .cloned()
+                .collect();
+            next.insert(target);
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
 
     let resolved_edges = resolve_references_with_file_languages(
         &file_data,
@@ -14010,6 +14089,125 @@ module.exports = { check, plain };\n";
                     && edge.edge_type == nestweaver_schema::EdgeType::Imports
             }),
             "watcher re-resolution must use the importing file's language: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn watcher_reresolve_hydrates_only_reachable_export_metadata() {
+        struct CountingReader {
+            root: PathBuf,
+            reads: std::sync::Mutex<Vec<PathBuf>>,
+        }
+        impl crate::content_reader::ContentReader for CountingReader {
+            fn read_file(&self, path: &Path) -> anyhow::Result<String> {
+                self.reads.lock().unwrap().push(path.to_path_buf());
+                Ok(fs::read_to_string(self.root.join(path))?)
+            }
+            fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
+                Ok(Vec::new())
+            }
+            fn file_meta_nanos(&self, _: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+                Ok(None)
+            }
+            fn root(&self) -> &Path {
+                &self.root
+            }
+            fn version_id(&self) -> &str {
+                "counting"
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("App.js"),
+            "import Chosen from './Router.js';\nfunction app() {\n  Chosen();\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Router.js"),
+            "export default function Router() {}\nexport function unused() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("unrelated.js"),
+            "export function unrelated() {}\n",
+        )
+        .unwrap();
+        let (_, store) =
+            index_directory_in_memory(root, "test", "https://example.com/hydrate", "sha").unwrap();
+        let repo = repo_uid("test", "https://example.com/hydrate");
+        let symbols = store.lookup_symbols_by_repo(&repo).unwrap();
+        let reader = CountingReader {
+            root: root.to_path_buf(),
+            reads: Default::default(),
+        };
+        let changed = std::collections::HashSet::from(["App.js".to_string()]);
+        let assert_target = |edges: &[nestweaver_schema::ResolvedEdge]| {
+            for kind in [
+                nestweaver_schema::EdgeType::Calls,
+                nestweaver_schema::EdgeType::Imports,
+            ] {
+                assert!(
+                    edges.iter().any(|edge| edge.source_uid
+                        == symbol_uid(&repo, "App.js", "app", 2)
+                        && edge.target_uid == symbol_uid(&repo, "Router.js", "Router", 1)
+                        && edge.edge_type == kind),
+                    "{edges:#?}"
+                );
+            }
+        };
+        let edges = build_reresolve_edges(
+            &reader,
+            &repo,
+            &changed,
+            &Default::default(),
+            &symbols,
+            None,
+        )
+        .unwrap();
+        assert_target(&edges);
+        let reads = reader.reads.lock().unwrap().clone();
+        assert_eq!(
+            reads
+                .iter()
+                .filter(|path| path.as_path() == Path::new("Router.js"))
+                .count(),
+            1
+        );
+        assert!(
+            !reads
+                .iter()
+                .any(|path| path.as_path() == Path::new("unrelated.js")),
+            "{reads:?}"
+        );
+
+        // Frozen target metadata avoids reading the same target again.
+        let parsed = parse_source(
+            &root.join("Router.js"),
+            &fs::read_to_string(root.join("Router.js")).unwrap(),
+        )
+        .unwrap();
+        let prepared =
+            HashMap::from([("Router.js".to_string(), (parsed.symbols, parsed.references))]);
+        reader.reads.lock().unwrap().clear();
+        let edges = build_reresolve_edges(
+            &reader,
+            &repo,
+            &changed,
+            &Default::default(),
+            &symbols,
+            Some(&prepared),
+        )
+        .unwrap();
+        assert_target(&edges);
+        assert!(
+            !reader
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.as_path() == Path::new("Router.js")
+                    || path.as_path() == Path::new("unrelated.js"))
         );
     }
 

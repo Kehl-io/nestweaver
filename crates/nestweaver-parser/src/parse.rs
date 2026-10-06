@@ -134,8 +134,9 @@ pub enum ReferenceKind {
     /// A use of this name inside the enclosing symbol names the binding, not
     /// an unrelated symbol of the same name.
     LocalBinding,
-    /// Exact module-local export alias. `name` is the public name (including
-    /// `default`), `context` is the existing local declaration. Not an edge.
+    /// Exact public export. `name` is the public name (including `default`),
+    /// `context` is the local declaration or original forwarded name, and
+    /// `receiver` is the source module for a named re-export. Not an edge.
     ExportAlias,
 }
 
@@ -3272,7 +3273,6 @@ fn collect_js_import_bindings(
             && statement
                 .parent()
                 .is_some_and(|parent| parent.kind() == "program")
-            && statement.child_by_field_name("source").is_none()
         {
             let mut push_export = |exported: String, local: tree_sitter::Node<'_>| {
                 references.push(RawReference {
@@ -3280,7 +3280,9 @@ fn collect_js_import_bindings(
                     kind: ReferenceKind::ExportAlias,
                     start_line: local.start_position().row as u32 + 1,
                     context: text(local),
-                    receiver: None,
+                    receiver: statement
+                        .child_by_field_name("source")
+                        .map(|source| strip_quotes(&text(source))),
                 });
             };
             let mut cursor = statement.walk();
@@ -3298,6 +3300,24 @@ fn collect_js_import_bindings(
                     });
                 if let Some(local) = local {
                     push_export("default".into(), local);
+                }
+            }
+            if !is_default && let Some(declaration) = statement.child_by_field_name("declaration") {
+                if let Some(local) = declaration.child_by_field_name("name") {
+                    push_export(text(local), local);
+                } else {
+                    let mut cursor = declaration.walk();
+                    for declarator in declaration
+                        .named_children(&mut cursor)
+                        .filter(|node| node.kind() == "variable_declarator")
+                    {
+                        if let Some(local) = declarator
+                            .child_by_field_name("name")
+                            .filter(|node| node.kind() == "identifier")
+                        {
+                            push_export(text(local), local);
+                        }
+                    }
                 }
             }
             let mut cursor = statement.walk();
@@ -3320,12 +3340,36 @@ fn collect_js_import_bindings(
             }
             continue;
         }
-        if statement.kind() == "expression_statement"
-            && statement
-                .parent()
-                .is_some_and(|parent| parent.kind() == "program")
-        {
+        if statement.kind() == "expression_statement" {
             if let Some(assignment) = statement.named_child(0) {
+                // Property assignments name one public key. Function values already
+                // have a parser symbol with that key; identifier values name a local.
+                if assignment.kind() == "assignment_expression"
+                    && let (Some(left), Some(value)) = (
+                        assignment.child_by_field_name("left"),
+                        assignment.child_by_field_name("right"),
+                    )
+                    && left.kind() == "member_expression"
+                    && is_commonjs_export_assignment(Language::JavaScript, assignment, source)
+                    && let Some(key) = left.child_by_field_name("property")
+                    && key.kind() == "property_identifier"
+                    && matches!(
+                        value.kind(),
+                        "identifier" | "function_expression" | "arrow_function"
+                    )
+                {
+                    references.push(RawReference {
+                        name: text(key),
+                        kind: ReferenceKind::ExportAlias,
+                        start_line: key.start_position().row as u32 + 1,
+                        context: if value.kind() == "identifier" {
+                            text(value)
+                        } else {
+                            text(key)
+                        },
+                        receiver: None,
+                    });
+                }
                 for (exported, local) in commonjs_object_exports(assignment, source) {
                     references.push(RawReference {
                         name: exported,

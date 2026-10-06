@@ -450,6 +450,24 @@ fn resolve_single_reference(
 
     let name = &reference.name;
 
+    // Aliased import (`use path::to::original as name;`): the binding records
+    // the original name and the file it was imported from.
+    let binding = graph.bindings_of(file_path).iter().find(|binding| {
+        let owner = find_enclosing_symbol(sorted_syms, binding.start_line).symbol();
+        let in_scope = owner.is_none_or(|owner| {
+            owner.start_line == source_sym.start_line && owner.name == source_sym.name
+        });
+        in_scope
+            && if binding.original_name == "*" {
+                reference.receiver.as_deref() == Some(binding.local_name.as_str())
+            } else {
+                binding.local_name == *name && reference.receiver.is_none()
+            }
+    });
+    if binding.is_some_and(|binding| binding.source_file.is_none()) {
+        return Some(unresolved_edge(source_uid, &reference.name, edge_type));
+    }
+
     // Priority 1: Same file. A local symbol shadows an import alias of the
     // same name, so this check runs on the reference's own name, before any
     // alias rewriting.
@@ -474,30 +492,28 @@ fn resolve_single_reference(
         });
     }
 
-    // Aliased import (`use path::to::original as name;`): the binding records
-    // the original name and the file it was imported from.
-    let binding = graph.bindings_of(file_path).iter().find(|binding| {
-        let owner = find_enclosing_symbol(sorted_syms, binding.start_line).symbol();
-        let in_scope = owner.is_none_or(|owner| {
-            owner.start_line == source_sym.start_line && owner.name == source_sym.name
-        });
-        in_scope
-            && if binding.original_name == "*" {
-                reference.receiver.as_deref() == Some(binding.local_name.as_str())
-            } else {
-                binding.local_name == *name && reference.receiver.is_none()
-            }
-    });
     if let Some(binding) = binding {
         let original = if binding.original_name == "*" {
             name.as_str()
         } else {
             binding.original_name.as_str()
         };
-        let original = graph.exported_local(&binding.source_file, original);
+        let source_file = binding
+            .source_file
+            .as_deref()
+            .expect("unresolved binding handled above");
+        let exact_exports = matches!(language, Language::JavaScript | Language::TypeScript);
+        let (target_file, original, depth) = if exact_exports {
+            let Some(target) = graph.exported_target(source_file, original) else {
+                return Some(unresolved_edge(source_uid, name, edge_type));
+            };
+            target
+        } else {
+            (source_file, original, 0)
+        };
         if let Some(symbols) = symbol_map.get(original) {
             let mut targets = symbols.iter().filter(|(file, symbol)| {
-                *file == binding.source_file
+                *file == target_file
                     && symbol.visibility != Visibility::Private
                     && candidate_matches(
                         &RawReference {
@@ -515,7 +531,14 @@ fn resolve_single_reference(
                     return Some(unresolved_edge(source_uid, name, edge_type));
                 }
                 {
-                    let confidence = confidence_score(MatchType::ImportResolved, language);
+                    let confidence = confidence_score(
+                        if depth == 0 {
+                            MatchType::ImportResolved
+                        } else {
+                            MatchType::ReExportResolved
+                        },
+                        language,
+                    );
                     return Some(ResolvedEdge {
                         source_uid,
                         target_uid: symbol_uid(repo_uid, file, &symbol.name, symbol.start_line),
@@ -523,7 +546,12 @@ fn resolve_single_reference(
                         confidence,
                         link_type: None,
                         evidence: vec![EdgeEvidence {
-                            kind: "import_alias".into(),
+                            kind: if depth == 0 {
+                                "import_alias"
+                            } else {
+                                "reexport_resolved"
+                            }
+                            .into(),
                             weight: confidence,
                             note: Some(format!("{} -> {}", binding.local_name, original)),
                         }],
@@ -531,10 +559,13 @@ fn resolve_single_reference(
                 }
             }
             if symbols.iter().any(|(file, symbol)| {
-                *file == binding.source_file && symbol.visibility == Visibility::Private
+                *file == target_file && symbol.visibility == Visibility::Private
             }) {
                 return Some(unresolved_edge(source_uid, name, edge_type));
             }
+        }
+        if exact_exports {
+            return Some(unresolved_edge(source_uid, name, edge_type));
         }
     }
 
@@ -617,7 +648,10 @@ fn resolve_single_reference(
 
     // Priority 2: Direct imports
     let mut imports = if let Some(binding) = binding {
-        vec![(binding.local_name.clone(), binding.source_file.clone())]
+        vec![(
+            binding.local_name.clone(),
+            binding.source_file.clone().expect("resolved binding"),
+        )]
     } else {
         graph.imports_of(file_path)
     };
@@ -1131,6 +1165,16 @@ mod tests {
         }
     }
 
+    fn make_export(public: &str, local: &str, source: Option<&str>, line: u32) -> RawReference {
+        RawReference {
+            name: public.into(),
+            kind: ReferenceKind::ExportAlias,
+            start_line: line,
+            context: local.into(),
+            receiver: source.map(str::to_string),
+        }
+    }
+
     #[test]
     fn resolves_same_file_call() {
         // caller() at line 10 calls helper() at line 1, both in same file
@@ -1171,7 +1215,7 @@ mod tests {
             (
                 "src/helper.js".to_string(),
                 vec![make_symbol("helperFn", 1)],
-                vec![],
+                vec![make_export("helperFn", "helperFn", None, 1)],
             ),
         ];
 
@@ -1553,7 +1597,7 @@ mod tests {
             (
                 "src/helper.js".to_string(),
                 vec![make_symbol("helperFn", 1)],
-                vec![],
+                vec![make_export("helperFn", "helperFn", None, 1)],
             ),
         ];
         let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
@@ -1588,7 +1632,7 @@ mod tests {
             (
                 "src/store.js".to_string(),
                 vec![make_symbol("query", 5)],
-                vec![],
+                vec![make_export("query", "query", None, 5)],
             ),
         ];
         let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
@@ -1611,7 +1655,7 @@ mod tests {
             (
                 "src/common/money.ts".to_string(),
                 vec![make_symbol("roundMoney", 5)],
-                vec![],
+                vec![make_export("roundMoney", "roundMoney", None, 5)],
             ),
             (
                 "src/common/__tests__/money.test.ts".to_string(),
@@ -1672,17 +1716,33 @@ mod tests {
             (
                 "src/common/errors.ts".to_string(),
                 vec![],
-                vec![make_ref("./errors/index.js", ReferenceKind::Import, 1)],
+                vec![
+                    make_ref("./errors/index.js", ReferenceKind::Import, 1),
+                    make_export(
+                        "NotFoundError",
+                        "NotFoundError",
+                        Some("./errors/index.js"),
+                        1,
+                    ),
+                ],
             ),
             (
                 "src/common/errors/index.ts".to_string(),
                 vec![],
-                vec![make_ref("./http-errors.js", ReferenceKind::Import, 1)],
+                vec![
+                    make_ref("./http-errors.js", ReferenceKind::Import, 1),
+                    make_export(
+                        "NotFoundError",
+                        "NotFoundError",
+                        Some("./http-errors.js"),
+                        1,
+                    ),
+                ],
             ),
             (
                 "src/common/errors/http-errors.ts".to_string(),
                 vec![make_symbol("NotFoundError", 20)],
-                vec![],
+                vec![make_export("NotFoundError", "NotFoundError", None, 20)],
             ),
         ];
         let edges = resolve_references(&files, Language::TypeScript, "repo:test:abc");
@@ -2053,7 +2113,7 @@ mod tests {
             (
                 "src/helper.js".to_string(),
                 vec![make_symbol("helperFn", 1)],
-                vec![],
+                vec![make_export("helperFn", "helperFn", None, 1)],
             ),
         ];
 
@@ -2897,7 +2957,7 @@ mod tests {
                 (
                     "src/helper.js".to_string(),
                     vec![make_symbol("helperFn", 1)],
-                    vec![],
+                    vec![make_export("helperFn", "helperFn", None, 1)],
                 ),
             ];
             assert_yaml_snapshot!(sorted_edges(files, Language::JavaScript));
@@ -3766,6 +3826,140 @@ mod user_pain_reference_tests {
             !edges.iter().any(|edge| edge.target_uid.starts_with("sym:")
                 && edge.target_uid == uid(&files, "src/helper.js", "selected")),
             "shadowed parameter bound to import: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn public_name_alias_is_not_a_second_export_of_the_local_name() {
+        for (exporter, valid_import, valid_target, invalid_import) in [
+            (
+                "function actual() {}\nmodule.exports = { renamed: actual };\n",
+                "const { renamed } = require('./helper.js');",
+                "actual",
+                "const { actual } = require('./helper.js');",
+            ),
+            (
+                "function Router() {}\nexport { Router as default };\n",
+                "import renamed from './helper.js';",
+                "Router",
+                "import { Router as actual } from './helper.js';",
+            ),
+        ] {
+            let valid_call = "renamed()";
+            let valid = format!("{valid_import}\nfunction user() {{\n  {valid_call};\n}}\n");
+            let files = parsed_files(&[("src/helper.js", exporter), ("src/user.js", &valid)]);
+            let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+            assert!(
+                edges
+                    .iter()
+                    .any(|edge| edge.source_uid == uid(&files, "src/user.js", "user")
+                        && edge.target_uid == uid(&files, "src/helper.js", valid_target)
+                        && edge.edge_type == EdgeType::Calls),
+                "valid public alias: {edges:#?}"
+            );
+            let invalid = format!("{invalid_import}\nfunction user() {{\n  actual();\n}}\n");
+            let files = parsed_files(&[("src/helper.js", exporter), ("src/user.js", &invalid)]);
+            let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+            assert!(
+                !edges
+                    .iter()
+                    .any(|edge| edge.target_uid == uid(&files, "src/helper.js", valid_target)),
+                "local declaration was not exported under its own name: {edges:#?}"
+            );
+        }
+        for name in ["actual", "renamed"] {
+            let consumer = format!(
+                "import {{ {name} }} from './helper.js';\nfunction user() {{\n  {name}();\n}}\n"
+            );
+            let files = parsed_files(&[
+                (
+                    "src/helper.js",
+                    "export function actual() {}\nexport { actual as renamed };\n",
+                ),
+                ("src/user.js", &consumer),
+            ]);
+            let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+            assert!(
+                edges.iter().any(
+                    |edge| edge.target_uid == uid(&files, "src/helper.js", "actual")
+                        && edge.edge_type == EdgeType::Calls
+                ),
+                "valid {name} public name: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_bound_import_cannot_fall_back_to_a_sibling_homonym() {
+        for importer in [
+            "import { selected } from './missing.js';\nfunction user() {\n  selected();\n}\n",
+            "import * as ns from './missing.js';\nfunction user() {\n  ns.selected();\n}\n",
+        ] {
+            let files = parsed_files(&[
+                ("src/other.js", "export function selected() {}\n"),
+                ("src/user.js", importer),
+            ]);
+            let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+            assert!(
+                !edges
+                    .iter()
+                    .any(|edge| edge.target_uid == uid(&files, "src/other.js", "selected")),
+                "unresolved binding donated sibling: {edges:#?}"
+            );
+        }
+        let files = parsed_files(&[(
+            "src/user.js",
+            "function selected() {}\nasync function owner() {\n  const { selected } = await import('./missing.js');\n  selected();\n}\nfunction outsider() {\n  selected();\n}\n",
+        )]);
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let target = uid(&files, "src/user.js", "selected");
+        assert!(
+            !edges.iter().any(
+                |edge| edge.source_uid == uid(&files, "src/user.js", "owner")
+                    && edge.target_uid == target
+            ),
+            "unresolved local binding must shadow the global function: {edges:#?}"
+        );
+        assert!(
+            edges.iter().any(
+                |edge| edge.source_uid == uid(&files, "src/user.js", "outsider")
+                    && edge.target_uid == target
+                    && edge.edge_type == EdgeType::Calls
+            ),
+            "local missing import must not escape into outsider: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn named_default_reexport_preserves_exact_default_target() {
+        let files = parsed_files(&[
+            (
+                "src/Router.js",
+                "export default function Router() {}\nexport function unused() {}\n",
+            ),
+            ("src/barrel.js", "export { default } from './Router.js';\n"),
+            (
+                "src/user.js",
+                "import Router from './barrel.js';\nfunction user() {\n  Router();\n}\n",
+            ),
+        ]);
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let target = uid(&files, "src/Router.js", "Router");
+        for kind in [EdgeType::Calls, EdgeType::Imports] {
+            assert!(
+                edges
+                    .iter()
+                    .any(|edge| edge.source_uid == uid(&files, "src/user.js", "user")
+                        && edge.target_uid == target
+                        && edge.edge_type == kind),
+                "{edges:#?}"
+            );
+        }
+        assert!(
+            !edges
+                .iter()
+                .any(|edge| edge.target_uid == uid(&files, "src/Router.js", "unused")),
+            "{edges:#?}"
         );
     }
 
