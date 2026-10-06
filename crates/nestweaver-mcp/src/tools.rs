@@ -14017,20 +14017,35 @@ fn tool_project_context(
     let remaining_budget = token_budget.saturating_sub(seed_tokens);
     // Reserve useful representation of both admitted categories, only after
     // all filters. The final serialized-budget pass still accounts for metadata.
-    let note = result
+    let categories: Vec<_> = result
         .connected
         .iter()
-        .position(|node| node.kind.starts_with("Note"));
-    let code = result
-        .connected
+        .enumerate()
+        .filter_map(|(index, node)| {
+            let note = node.kind.starts_with("Note");
+            (note || node.kind.starts_with("Symbol"))
+                .then(|| (index, note, render_cost(node, concise)))
+        })
+        .collect();
+    let minimum_note = categories
         .iter()
-        .position(|node| node.kind.starts_with("Symbol"));
-    if let (Some(note), Some(code)) = (note, code) {
-        if render_cost(&result.connected[note], concise)
-            + render_cost(&result.connected[code], concise)
-            <= remaining_budget
-        {
-            let mut selected = vec![note, code];
+        .filter(|(_, note, _)| *note)
+        .map(|(_, _, cost)| *cost)
+        .min();
+    let minimum_code = categories
+        .iter()
+        .filter(|(_, note, _)| !*note)
+        .map(|(_, _, cost)| *cost)
+        .min();
+    let affordable = categories.iter().find_map(|(index, note, cost)| {
+        let opposite = if *note { minimum_code } else { minimum_note }?;
+        (cost.saturating_add(opposite) <= remaining_budget).then_some((*index, *note, *cost))
+    });
+    if let Some((first, note, cost)) = affordable {
+        if let Some((second, _, _)) = categories.iter().find(|(_, other, other_cost)| {
+            *other != note && cost.saturating_add(*other_cost) <= remaining_budget
+        }) {
+            let mut selected = [first, *second];
             selected.sort_unstable();
             let reserved: Vec<_> = selected
                 .iter()
@@ -14176,6 +14191,96 @@ fn tool_project_context(
     resp = provenance_seam::stamp(Unstamped::new(resp));
 
     finalize_project_budget(&mut resp)?;
+    // The wrapper itself can force the estimated reservation to lose one
+    // category. Retry only that case against the complete serialized contract,
+    // preserving the seed-charge allowance and honest omitted-row accounting.
+    let has_category = |category: &str| {
+        resp["connected"].as_array().is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row["kind"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with(category))
+            })
+        })
+    };
+    if !has_category("Note") || !has_category("Symbol") {
+        let candidates: Vec<_> = result
+            .connected
+            .iter()
+            .filter(|node| node.kind.starts_with("Note") || node.kind.starts_with("Symbol"))
+            .map(|node| {
+                let row = render_node(node);
+                let bytes = serde_json::to_vec(&row)?.len();
+                Ok((
+                    node.kind.starts_with("Note"),
+                    render_cost(node, concise),
+                    row,
+                    bytes,
+                ))
+            })
+            .collect::<Result<Vec<_>, anyhow::Error>>()?;
+        if candidates.iter().any(|(note, _, _, _)| *note)
+            && candidates.iter().any(|(note, _, _, _)| !*note)
+        {
+            let mut pair_response = resp.clone();
+            // A smaller pair may recover an irreducible-overhead first attempt.
+            pair_response.as_object_mut().unwrap().remove("budget_note");
+            pair_response["connected"] = json!([]);
+            pair_response["tokens_used"] = json!(0);
+            pair_response["budget_exceeded"] = json!(false);
+            pair_response["more_available"] = json!(result.connected.len().saturating_sub(2));
+            pair_response["truncated"] = json!(result.connected.len() > 2);
+            pair_response["truncated_by"] = if result.connected.len() > 2 {
+                json!("token_budget")
+            } else {
+                Value::Null
+            };
+            let base_bytes = serde_json::to_vec(&pair_response)?.len();
+            let note_indices: Vec<_> = candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.0)
+                .map(|(index, _)| index)
+                .collect();
+            let code_indices: Vec<_> = candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| !row.0)
+                .map(|(index, _)| index)
+                .collect();
+            let mut selected = None;
+            'pairs: for (first, (note, cost, _, bytes)) in candidates.iter().enumerate() {
+                if *cost > remaining_budget || *bytes > token_budget.saturating_mul(4) {
+                    continue;
+                }
+                let opposite = if *note { &code_indices } else { &note_indices };
+                for second in opposite.iter().copied().filter(|second| *second > first) {
+                    let (_, other_cost, _, other_bytes) = &candidates[second];
+                    if cost.saturating_add(*other_cost) > remaining_budget {
+                        continue;
+                    }
+                    // [] becomes [row,row]; tokens_used replaces its initial 0.
+                    let payload_bytes = base_bytes
+                        .saturating_add(*bytes)
+                        .saturating_add(*other_bytes)
+                        .saturating_add(1);
+                    let mut tokens = payload_bytes.div_ceil(4);
+                    for _ in 0..4 {
+                        tokens = (payload_bytes - 1 + tokens.to_string().len()).div_ceil(4);
+                    }
+                    if tokens <= token_budget {
+                        selected = Some((first, second));
+                        break 'pairs;
+                    }
+                }
+            }
+            if let Some((first, second)) = selected {
+                pair_response["connected"] = json!([candidates[first].2, candidates[second].2]);
+                finalize_project_budget(&mut pair_response)?;
+                resp = pair_response;
+            }
+        }
+    }
 
     Ok(resp)
 }
@@ -18343,6 +18448,73 @@ mod project_context_bug12_tests {
                     "unchanged query must be deterministic"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn project_context_reserves_affordable_note_when_highest_note_is_oversized() {
+        for (width, budget) in [(100_000, 10_000), (1_000, 400)] {
+            let store = GraphStore::in_memory().unwrap();
+            store
+                .insert_project(&Project {
+                    uid: "proj:p".into(),
+                    name: "P".into(),
+                    summary: None,
+                    instance_id: "default".into(),
+                })
+                .unwrap();
+            store
+                .insert_vault(&Vault {
+                    uid: "vlt:v".into(),
+                    name: "v".into(),
+                    root_path: "/v".into(),
+                    instance_id: "default".into(),
+                })
+                .unwrap();
+            for (uid, path, title) in [
+                ("note:a", "a.md", "x".repeat(width)),
+                ("note:b", "b.md", "Short note".into()),
+            ] {
+                store
+                    .insert_note(&mk_note(uid, "vlt:v", path, &title))
+                    .unwrap();
+            }
+            store
+                .batch_insert_project_note_edges(&[("proj:p", "note:a"), ("proj:p", "note:b")])
+                .unwrap();
+            store
+                .insert_symbol(&mk_symbol("sym:c", "repo:r", "c.rs", "code"))
+                .unwrap();
+            store
+                .batch_insert_project_symbol_edges("proj:p", &["sym:c".into()], 1.0)
+                .unwrap();
+            let response = tool_project_context(
+                &store,
+                None,
+                json!({"project":"P","no_embed":true,"token_budget":budget,"include_seeds":false}),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let rows = response["connected"].as_array().unwrap();
+            assert!(
+                rows.iter().any(|row| row["title"] == "Short note"),
+                "affordable note must survive oversized predecessor: {response}"
+            );
+            assert!(
+                rows.iter().any(|row| row["title"] == "code"),
+                "affordable code must survive: {response}"
+            );
+            assert!(
+                response["tokens_used"].as_u64().unwrap() <= budget,
+                "{response}"
+            );
+            assert_eq!(
+                response["truncated"], true,
+                "omitted oversized row must be disclosed"
+            );
+            assert!(response["more_available"].as_u64().unwrap() > 0);
         }
     }
 
