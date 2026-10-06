@@ -6646,10 +6646,11 @@ exclude = {exclude}
 // checked here only because it still exists and must not diverge; it is not
 // the reference implementation, and nothing below treats it as one.
 //
-// `unreferencedOrphan` is the non-vacuity control. It is exported exactly like
-// `glueInit`, sits in the same package, and nothing references it. If merely
-// being an ES export rooted a symbol, it would come back live too and the
-// `glueInit` assertion would prove nothing about manifests.
+// Top-level runtime ES exports are roots independently of manifests. Keep
+// `glueInit` and the orphan private, and first prove both unreachable without
+// a manifest. Adding `main` must make only the private entry-file function
+// live. The exported helper remains an independently live public API control;
+// it does not prove the manifest seeded a downstream walk.
 //
 // The `daemon_` prefix is load-bearing: the main Linux CI job runs
 // `--skip daemon_` and a separate job runs `-- daemon_`.
@@ -6663,13 +6664,9 @@ fn daemon_dead_code_honors_manifest_entry_files_on_every_route() {
         &repo_dir,
         &[
             (
-                "packages/glue/package.json",
-                r#"{"name":"glue","version":"1.0.0","main":"glue_entry.js"}"#,
-            ),
-            (
                 "packages/glue/glue_entry.js",
                 "import { helperCalledOnlyByEntry } from './helper.js';\n\
-                 export function glueInit() { return helperCalledOnlyByEntry(); }\n",
+                 function glueInit() { return helperCalledOnlyByEntry(); }\n",
             ),
             (
                 "packages/glue/helper.js",
@@ -6677,7 +6674,7 @@ fn daemon_dead_code_honors_manifest_entry_files_on_every_route() {
             ),
             (
                 "packages/glue/orphan.js",
-                "export function unreferencedOrphan() { return 2; }\n",
+                "function unreferencedOrphan() { return 2; }\n",
             ),
         ],
     );
@@ -6685,22 +6682,6 @@ fn daemon_dead_code_honors_manifest_entry_files_on_every_route() {
 
     let _guard = DaemonGuard::new(&db_path);
     start_daemon(&db_path);
-
-    // Re-index inside the SAME daemon session. The manifest sidecar is
-    // generation-bound, and the live daemon holds an open store — so a fix
-    // that only works against a freshly opened database, or only against the
-    // sidecar written by the cold index before the daemon existed, is caught
-    // here rather than in production.
-    daemon_cmd()
-        .args([
-            "index",
-            "--repo",
-            &repo_dir.display().to_string(),
-            "--db",
-            &db_path.display().to_string(),
-        ])
-        .assert()
-        .success();
 
     // Every route, named by how a user actually reaches it.
     let unreachable_from_cli = |cmd: &mut Command| -> Vec<String> {
@@ -6761,20 +6742,62 @@ fn daemon_dead_code_honors_manifest_entry_files_on_every_route() {
             .collect()
     };
 
-    let routes = [
-        (
-            "default CLI (daemon)",
-            unreachable_from_cli(&mut daemon_cmd()),
-        ),
-        ("MCP direct", unreachable_from_mcp(McpMode::Direct)),
-        ("MCP via daemon", unreachable_from_mcp(McpMode::Daemon)),
-        // The `--no-daemon` bypass. Checked so it cannot drift while it still
-        // exists; it is NOT the baseline the others are compared against.
-        (
-            "CLI bypass (--no-daemon)",
-            unreachable_from_cli(&mut no_daemon_cmd()),
-        ),
-    ];
+    let collect_routes = || {
+        [
+            (
+                "default CLI (daemon)",
+                unreachable_from_cli(&mut daemon_cmd()),
+            ),
+            ("MCP direct", unreachable_from_mcp(McpMode::Direct)),
+            ("MCP via daemon", unreachable_from_mcp(McpMode::Daemon)),
+            // The `--no-daemon` bypass. Checked so it cannot drift while it still
+            // exists; it is NOT the baseline the others are compared against.
+            (
+                "CLI bypass (--no-daemon)",
+                unreachable_from_cli(&mut no_daemon_cmd()),
+            ),
+        ]
+    };
+
+    assert!(!repo_dir.join("packages/glue/package.json").exists());
+    let without_manifest = collect_routes();
+    for (route, unreachable) in &without_manifest {
+        for private in ["glueInit", "unreferencedOrphan"] {
+            assert!(
+                unreachable.iter().any(|name| name == private),
+                "{route}: without a manifest the private control {private} must be unreachable: {unreachable:?}"
+            );
+        }
+        assert!(
+            !unreachable
+                .iter()
+                .any(|name| name == "helperCalledOnlyByEntry"),
+            "{route}: the exported helper is an independent root even before the manifest: {unreachable:?}"
+        );
+    }
+    std::fs::write(
+        repo_dir.join("packages/glue/package.json"),
+        r#"{"name":"glue","version":"1.0.0","main":"glue_entry.js"}"#,
+    )
+    .unwrap();
+    // Re-index inside the SAME daemon session. The manifest sidecar is
+    // generation-bound, and the live daemon holds an open store — so a fix
+    // that only works against a freshly opened database, or only against the
+    // sidecar written by the cold index before the daemon existed, is caught
+    // here rather than in production.
+    daemon_cmd()
+        .args([
+            "index",
+            "--force",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    let routes = collect_routes();
 
     for (route, unreachable) in &routes {
         assert!(
@@ -6792,9 +6815,19 @@ fn daemon_dead_code_honors_manifest_entry_files_on_every_route() {
             !unreachable
                 .iter()
                 .any(|name| name == "helperCalledOnlyByEntry"),
-            "{route}: reachable only THROUGH the manifest-declared entry \
-             point, so it proves the entry file seeded a walk rather than \
-             merely marking one symbol live. Got: {unreachable:?}"
+            "{route}: the exported helper remains an independently live public \
+             API root. Got: {unreachable:?}"
+        );
+    }
+
+    for (route, unreachable) in &without_manifest[1..] {
+        let mut this = unreachable.clone();
+        let mut first = without_manifest[0].1.clone();
+        this.sort();
+        first.sort();
+        assert_eq!(
+            this, first,
+            "{route} disagrees with the pre-manifest control population"
         );
     }
 
