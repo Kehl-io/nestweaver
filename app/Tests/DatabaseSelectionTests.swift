@@ -78,6 +78,22 @@ struct DatabaseSelectionTests {
         check(select(parserHome) == nil, "section db never treated as top-level db")
         try write(parserConfig, "db = '\(quotedDB)' # literal path\n")
         check(select(parserHome)?.databasePath == quotedDB, "literal path with trailing comment")
+        // CRLF is one Swift Character; losing its boundary can hide db after a
+        // comment/key or accidentally accept an invalid multiline basic path.
+        try write(parserConfig, "# leading comment\r\ndb = '\(quotedDB)'\r\n")
+        check(select(parserHome)?.databasePath == quotedDB, "CRLF leading comment ends before db")
+        try write(parserConfig, "instance_id = 'fixture'\r\ndb = '\(quotedDB)'\r\n")
+        check(select(parserHome)?.databasePath == quotedDB, "CRLF preceding key does not absorb db")
+        try write(parserConfig, "db = '\(quotedDB)'\r\n[section]\r\ndb = 'wrong'\r\n")
+        check(select(parserHome)?.databasePath == quotedDB, "CRLF section boundary preserves top-level db")
+        try write(parserConfig, "# leading comment\r\n[section]\r\ndb = '\(quotedDB)'\r\n")
+        check(select(parserHome) == nil, "CRLF section db stays excluded")
+        try write(parserConfig, "instance_id = 'fixture' # preceding comment\r\ndb = \"\(parserHome)/brain#=\\\"quoted.lbug\" # trailing comment\r\n")
+        check(select(parserHome)?.databasePath == quotedDB, "CRLF quoted path preserves hash, equals and escaped quote")
+        let invalidMultilineDB = parserHome + "/line\r\nbreak.lbug"
+        try write(invalidMultilineDB)
+        try write(parserConfig, "db = '\(invalidMultilineDB)'\r\n")
+        check(select(parserHome) == nil, "raw CRLF inside single-line string cannot select a path")
         print("\(checks - failures)/\(checks) checks passed")
         if failures > 0 { exit(1) }
     }

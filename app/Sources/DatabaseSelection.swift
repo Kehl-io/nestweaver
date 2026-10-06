@@ -87,9 +87,11 @@ enum DatabaseSelector {
                 }
                 buffer.append(char)
             } else if char == "#" {
-                while index < chars.count, chars[index] != "\n" { index += 1 }
+                while index < chars.count, chars[index] != "\n", chars[index] != "\r\n" { index += 1 }
                 continue
-            } else if char == "\n" {
+            } else if char == "\n" || char == "\r\n" {
+                // Swift treats CRLF as a single Character. Preserve string
+                // contents above, but recognize both TOML line endings here.
                 statements.append(buffer)
                 buffer = ""
             } else if char == "\"" || char == "'" {
@@ -127,7 +129,7 @@ enum DatabaseSelector {
         var index = 1
         while index < chars.count - 1 {
             let char = chars[index]
-            if char == delimiter || char == "\n" || char == "\r" { return nil }
+            if char == delimiter || char == "\n" || char == "\r" || char == "\r\n" { return nil }
             if char == "\\", delimiter == "\"" {
                 index += 1
                 guard index < chars.count - 1 else { return nil }
