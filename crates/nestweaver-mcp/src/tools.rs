@@ -12211,15 +12211,45 @@ fn build_flow_tree(
         for (index, (callee, edge_type)) in callees.iter().enumerate() {
             // Reserve the largest detailed/stub representation before adding
             // another rendered node or descending into its subtree.
-            let cost = crate::output_budget::escaped_size(
-                &json!({"uid":callee.uid,"name":callee.name,"file_path":callee.file_path,"repo_uid":callee.repo_uid,"deduped_ref":callee.uid,"edge_type":edge_type,"depth":depth+1,"children":[]}),
-            ) + 160;
+            #[derive(serde::Serialize)]
+            struct Preflight<'a> {
+                uid: &'a str,
+                name: &'a str,
+                file_path: &'a str,
+                repo_uid: &'a str,
+                deduped_ref: &'a str,
+                edge_type: &'a str,
+                depth: usize,
+                children: [(); 0],
+            }
+            let allowance = opts.budget.borrow().render_bytes.saturating_sub(160);
+            let preflight = bounded_metadata(
+                &Preflight {
+                    uid: &callee.uid,
+                    name: &callee.name,
+                    file_path: &callee.file_path,
+                    repo_uid: &callee.repo_uid,
+                    deduped_ref: &callee.uid,
+                    edge_type,
+                    depth: depth + 1,
+                    children: [],
+                },
+                allowance,
+            )?;
+            #[cfg(test)]
+            delivery_allocation_witness::record(
+                "flow_preflight",
+                preflight
+                    .as_ref()
+                    .map_or(0, crate::output_budget::escaped_size),
+            );
             let mut budget = opts.budget.borrow_mut();
-            if cost > budget.render_bytes {
+            let Some(preflight) = preflight else {
                 budget.cut = true;
                 children_omitted += callees.len() - index;
                 break;
-            }
+            };
+            let cost = crate::output_budget::escaped_size(&preflight) + 160;
             budget.render_bytes -= cost;
             let expanded = budget.expanded.contains(&callee.uid);
             drop(budget);
@@ -24224,6 +24254,53 @@ mod arg_alias_tests {
     }
 
     #[test]
+    fn quality_budget_completed_cluster_renderer_page_keeps_late_continuation() {
+        let mut communities: Vec<_> = (0..3)
+            .map(|id| nestweaver_engine::CommunityInfo {
+                id,
+                name: "\\".repeat(1100),
+                cohesion: 1.0,
+                member_count: 1,
+                members: vec![nestweaver_engine::ClusterMember {
+                    uid: format!("sym:{id}"),
+                    name: "\\".repeat(1100),
+                    file_path: "src/a.rs".into(),
+                    kind: "Function".into(),
+                }],
+                key_files: vec![],
+            })
+            .collect();
+        let (rows, total) = mcp_clusters_rows(&mut communities, None, 50, 20, 0, 0).unwrap();
+        assert_eq!(
+            rows.len(),
+            3,
+            "real renderer completed all three singleton clusters"
+        );
+        let mut raw = json!({"clusters":rows,"total":total,"returned":rows.len(),"resolution":0.5,"graph_generation":17,"cluster_offset":0,"next_cluster_offset":null,"truncated":false});
+        bind_cluster_page(&mut raw, &json!({}), 17, false).unwrap();
+        let token = raw["page_token"].clone();
+        let wrapped = wrap_tool_result(raw);
+        assert!(crate::output_budget::escaped_size(&wrapped) <= 40_000);
+        let payload = &wrapped["structuredContent"];
+        let retained = payload["clusters"].as_array().unwrap().len();
+        assert!(
+            retained > 0 && retained < 3,
+            "escaped dual frame must force a listing prefix cut"
+        );
+        assert_eq!(payload["returned"], retained);
+        assert_eq!(payload["next_cluster_offset"], retained);
+        assert_eq!(payload["total"], 3);
+        assert_eq!(payload["graph_generation"], 17);
+        assert_eq!(payload["page_token"], token);
+        let (tail, _) = mcp_clusters_rows(&mut communities, None, 50, 20, 0, retained).unwrap();
+        assert_eq!(
+            retained + tail.len(),
+            3,
+            "continuation recovers every cluster"
+        );
+    }
+
+    #[test]
     fn remaining_budget_cluster_zero_and_single_cluster_have_bounded_pages() {
         let store = cluster_scope_store();
         let template = store.lookup_symbol("a0").unwrap();
@@ -29093,6 +29170,38 @@ mod flow_trace_truncation_tests {
             None,
         )
         .expect("flow_trace")
+    }
+
+    #[test]
+    fn quality_budget_flow_callee_preflight_does_not_materialize_huge_name() {
+        let mut callee = symbol("sym:huge", "callee", SymbolKind::Function, 10);
+        callee.name = "x".repeat(2_000_000);
+        let store = store_with(
+            &[
+                symbol("sym:root", "rootFn", SymbolKind::Function, 1),
+                callee,
+            ],
+            &[("sym:root", "sym:huge", EdgeType::Calls)],
+        );
+        assert_eq!(
+            store.lookup_symbol("sym:huge").unwrap().name.len(),
+            2_000_000
+        );
+        let guard = delivery_allocation_witness::Guard::new();
+        let result = trace(&store, 3);
+        assert_eq!(result["tree"]["uid"], "sym:root");
+        let observed = guard.events.borrow();
+        assert!(
+            observed.iter().any(|(kind, _)| *kind == "flow_preflight"),
+            "real flow preflight reached"
+        );
+        assert!(
+            observed
+                .iter()
+                .filter(|(kind, _)| *kind == "flow_preflight")
+                .all(|(_, bytes)| *bytes <= 14_000),
+            "native callee preflight allocation: {observed:?}"
+        );
     }
 
     #[test]

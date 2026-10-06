@@ -127,11 +127,11 @@ fn cut_label(path: &[Step]) -> String {
     label
 }
 
-fn shrink(value: &mut Value, omitted: &mut BTreeMap<String, Value>) -> bool {
+fn shrink(value: &mut Value, omitted: &mut BTreeMap<String, Value>) -> Result<bool, ()> {
     let mut best = None;
     largest(value, &mut Vec::new(), "", &mut best);
     let Some(cut) = best else {
-        return false;
+        return Ok(false);
     };
     let mirror_path = if !cut.array {
         let mut parent = &*value;
@@ -161,6 +161,47 @@ fn shrink(value: &mut Value, omitted: &mut BTreeMap<String, Value>) -> bool {
     } else {
         None
     };
+    let mut shared_keep = None;
+    if cut.array
+        && let Some(Step::Key(key)) = cut.path.last()
+        && matches!(key.as_str(), "broken_links" | "low_confidence")
+    {
+        let mut parent = &*value;
+        for step in &cut.path[..cut.path.len() - 1] {
+            parent = match step {
+                Step::Key(key) => &parent[key],
+                Step::Index(i) => &parent[*i],
+            };
+        }
+        let sibling = if key == "broken_links" {
+            "low_confidence"
+        } else {
+            "broken_links"
+        };
+        if let Some(other) = parent.get(sibling).and_then(Value::as_array) {
+            let mut keep = parent[key].as_array().unwrap().len().div_ceil(2);
+            let total_key = if sibling == "broken_links" {
+                "total"
+            } else {
+                "low_confidence_total"
+            };
+            let offset = parent["offset"].as_u64().unwrap_or(0);
+            let exhausted = offset.saturating_add(other.len() as u64)
+                >= parent[total_key].as_u64().unwrap_or(u64::MAX);
+            // A secondary-only cut cannot be safely advanced using the primary
+            // returned counter. Refuse rather than publish a misleading window.
+            if key == "low_confidence" && other.is_empty() {
+                return Err(());
+            }
+            if other.len() < keep && !exhausted {
+                keep = other.len();
+            }
+            if keep == 0 {
+                return Err(());
+            }
+            shared_keep = Some(keep);
+        }
+    }
     let mut selected = &mut *value;
     for step in &cut.path {
         selected = match step {
@@ -171,7 +212,7 @@ fn shrink(value: &mut Value, omitted: &mut BTreeMap<String, Value>) -> bool {
     let label = cut_label(&cut.path);
     if cut.array {
         let items = selected.as_array_mut().unwrap();
-        let keep = items.len().div_ceil(2);
+        let keep = shared_keep.unwrap_or_else(|| items.len().div_ceil(2));
         let count = items.len() - keep;
         items.truncate(keep);
         // Recognized shared contracts have paired identity/alias arrays and
@@ -190,13 +231,47 @@ fn shrink(value: &mut Value, omitted: &mut BTreeMap<String, Value>) -> bool {
                 "candidate_uids" => Some("candidates"),
                 "nodes" => Some("impact_nodes"),
                 "impact_nodes" => Some("nodes"),
+                "broken_links" => Some("low_confidence"),
+                "low_confidence" => Some("broken_links"),
                 _ => None,
             };
             if let Some(sibling) = sibling {
+                let broken_pair = matches!(key.as_str(), "broken_links" | "low_confidence");
+                let total_key = if sibling == "broken_links" {
+                    "total"
+                } else {
+                    "low_confidence_total"
+                };
+                let other_len = parent
+                    .get(sibling)
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
+                let exhausted_smaller = broken_pair
+                    && other_len < keep + count
+                    && parent["offset"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        .saturating_add(other_len as u64)
+                        >= parent[total_key].as_u64().unwrap_or(u64::MAX);
                 if let Some(array) = parent.get_mut(sibling).and_then(Value::as_array_mut) {
-                    if array.len() == keep + count {
+                    if !exhausted_smaller
+                        && (array.len() == keep + count || (broken_pair && array.len() > keep))
+                    {
+                        let paired_count = array.len() - keep;
                         array.truncate(keep);
                         paired = Some(sibling);
+                        if broken_pair {
+                            let mut path = cut.path.clone();
+                            *path.last_mut().unwrap() = Step::Key(sibling.into());
+                            let label = cut_label(&path);
+                            let prior = omitted
+                                .get(&label)
+                                .and_then(|v| v["items_omitted"].as_u64())
+                                .unwrap_or(0);
+                            if omitted.len() < 16 || omitted.contains_key(&label) {
+                                omitted.insert(label, json!({"items_omitted":prior+paired_count as u64,"count_kind":"exact_completed_array","paired_array":key}));
+                            }
+                        }
                     }
                 }
             }
@@ -205,21 +280,48 @@ fn shrink(value: &mut Value, omitted: &mut BTreeMap<String, Value>) -> bool {
                 "members" => &["returned_members"],
                 "impact_nodes" | "nodes" | "clusters" | "tags" | "results" => &["returned"],
                 "affected_symbols" => &["returned_affected_symbol_count"],
+                "unreachable_symbols" | "broken_links" => &["returned"],
+                "backlinks" => &["count"],
+                "summaries" | "hubs" | "bridges" => &["returned", "count"],
                 _ => &[],
             };
             let cursor = match key.as_str() {
                 "members" => Some(("member_offset", "next_member_offset")),
                 "clusters" => Some(("cluster_offset", "next_cluster_offset")),
+                "unreachable_symbols" => Some(("offset", "next_offset")),
                 _ => None,
             };
             if let Some((offset, next)) = cursor {
-                if parent.get(next).is_some_and(|v| !v.is_null()) {
+                if parent.get(next).is_some() && parent.get(offset).is_some() {
                     parent[next] = json!(
                         parent[offset]
                             .as_u64()
                             .unwrap_or(0)
                             .saturating_add(keep as u64)
                     );
+                }
+            }
+            if key == "unreachable_symbols" && parent.get("has_more").is_some() {
+                parent["has_more"] = json!(true);
+            }
+            if key == "members" {
+                parent["members_truncated"] = json!(true);
+                if let Some(size) = parent["size"].as_u64() {
+                    parent["members_omitted"] = json!(size.saturating_sub(keep as u64));
+                }
+                parent["retry_guidance"] = json!(
+                    "Query this cluster_id with next_member_offset, identical repos/resolution, expected_generation and page_token."
+                );
+            }
+            if matches!(key.as_str(), "broken_links" | "low_confidence") {
+                if key == "low_confidence" || paired == Some("low_confidence") {
+                    parent["low_confidence_truncated"] = json!(true);
+                }
+                if key == "broken_links" || paired == Some("broken_links") {
+                    parent["truncated"] = json!(true);
+                }
+                if parent.get("broken_links").is_some() && parent.get("returned").is_some() {
+                    parent["returned"] = json!(parent["broken_links"].as_array().unwrap().len());
                 }
             }
             for counter in counters {
@@ -261,7 +363,7 @@ fn shrink(value: &mut Value, omitted: &mut BTreeMap<String, Value>) -> bool {
             omitted.insert(label, json!({"bytes_omitted":previous + (previous_len - clipped_len) as u64,"text_truncated":true,"mirrored_alias_path":mirror_label}));
         }
     }
-    true
+    Ok(true)
 }
 fn disclose(payload: &mut Value, omitted: &BTreeMap<String, Value>, prior_complete: bool) {
     if let Some(map) = payload.as_object_mut() {
@@ -305,10 +407,17 @@ pub fn finalize(mut result: Value) -> Value {
                     return result;
                 }
             }
-            let reduced = shrink(&mut result["structuredContent"], &mut omitted)
-                || result
-                    .get_mut("_meta")
-                    .is_some_and(|meta| shrink(meta, &mut omitted));
+            let reduced = match shrink(&mut result["structuredContent"], &mut omitted) {
+                Err(()) => return refusal(result),
+                Ok(true) => true,
+                Ok(false) => match result.get_mut("_meta") {
+                    Some(meta) => match shrink(meta, &mut omitted) {
+                        Ok(reduced) => reduced,
+                        Err(()) => return refusal(result),
+                    },
+                    None => false,
+                },
+            };
             if !reduced {
                 return refusal(result);
             }
@@ -405,6 +514,14 @@ fn refusal(result: Value) -> Value {
         "deadline_exceeded",
         "counts_complete",
         "traversal_truncated",
+        "total",
+        "returned",
+        "low_confidence_total",
+        "offset",
+        "unresolved",
+        "ambiguous",
+        "graph_generation",
+        "page_token",
     ] {
         if let Some(value) = original.get(key) {
             let bounded = metadata(value, &mut budget, 0);
@@ -448,6 +565,196 @@ fn refusal(result: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn quality_wrapped(payload: Value) -> Value {
+        let result = crate::tools::wrap_tool_result(payload);
+        assert!(escaped_size(&result) <= RESULT_BYTES);
+        assert_eq!(
+            serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+            result["structuredContent"]
+        );
+        result["structuredContent"].clone()
+    }
+
+    #[test]
+    fn quality_budget_dead_code_late_cut_preserves_continuation() {
+        let rows: Vec<_> = (0..50).map(|index| json!({"uid":format!("sym:{index}"),"name":"\\".repeat(600),"file_path":"src/a.rs","confidence":"low"})).collect();
+        for matching in [50, 100] {
+            let payload = quality_wrapped(
+                json!({"unreachable_symbols":rows,"returned":50,"matching_count":matching,"unreachable_count":100,"offset":0,"next_offset":if matching>50 {Some(50)} else {None},"has_more":matching>50,"truncated":matching>50,"graph_generation":17,"page_token":"nw-dead-code-original","review_only":true,"coverage":"complete"}),
+            );
+            let retained = payload["unreachable_symbols"].as_array().unwrap().len();
+            assert!(
+                retained > 0 && retained < 50,
+                "actual array late cut required"
+            );
+            assert_eq!(payload["returned"], retained);
+            assert_eq!(payload["has_more"], true);
+            assert_eq!(payload["next_offset"], retained);
+            assert_eq!(payload["matching_count"], matching);
+            assert_eq!(payload["graph_generation"], 17);
+            assert_eq!(payload["page_token"], "nw-dead-code-original");
+            assert_eq!(payload["review_only"], true);
+        }
+    }
+
+    #[test]
+    fn quality_budget_completed_member_page_gets_continuation_after_late_cut() {
+        let members: Vec<_> = (0..50).map(|index| json!({"uid":format!("sym:{index}"),"name":"\\".repeat(600),"file_path":"src/a.rs","kind":"Function"})).collect();
+        let payload = quality_wrapped(
+            json!({"clusters":[{"id":3,"name":"cluster","size":80,"members":members,"returned_members":50,"member_offset":30,"next_member_offset":null,"members_truncated":false,"members_omitted":30,"retry_guidance":null}],"total":1,"returned":1,"cluster_offset":0,"next_cluster_offset":null,"graph_generation":17,"page_token":"nw-clusters-original"}),
+        );
+        let row = &payload["clusters"][0];
+        let retained = row["members"].as_array().unwrap().len();
+        assert!(retained > 0 && retained < 50);
+        assert_eq!(row["returned_members"], retained);
+        assert_eq!(row["members_truncated"], true);
+        assert_eq!(row["next_member_offset"], 30 + retained);
+        assert_eq!(row["size"], 80);
+        assert_eq!(row["members_omitted"], 80 - retained);
+        assert!(
+            row["retry_guidance"]
+                .as_str()
+                .unwrap()
+                .contains("next_member_offset")
+        );
+        assert_eq!(payload["graph_generation"], 17);
+        assert_eq!(payload["page_token"], "nw-clusters-original");
+    }
+
+    fn quality_count_case(key: &str, counters: &[&str]) {
+        let rows: Vec<_> = (0..50)
+            .map(|index| json!({"uid":format!("sym:{index}"),"name":"\\".repeat(600)}))
+            .collect();
+        let mut original = json!({"total":100,"truncated":false});
+        for counter in counters {
+            original[*counter] = json!(50);
+        }
+        if key == "summaries" {
+            original["total_available"] = json!(100);
+        }
+        original[key] = json!(rows);
+        let payload = quality_wrapped(original);
+        let retained = payload[key].as_array().unwrap().len();
+        assert!(retained < 50, "{key} must exercise array cut");
+        for counter in counters {
+            assert_eq!(payload[*counter], retained, "{key} {counter}");
+        }
+        assert_eq!(payload["total"], 100);
+        if key == "summaries" {
+            assert_eq!(payload["total_available"], 100);
+        }
+    }
+    #[test]
+    fn quality_budget_backlinks_count_follows_late_prefix() {
+        quality_count_case("backlinks", &["count"]);
+    }
+    #[test]
+    fn quality_budget_summary_count_aliases_follow_late_prefix() {
+        quality_count_case("summaries", &["count", "returned"]);
+    }
+    #[test]
+    fn quality_budget_broken_links_returned_follows_late_prefix() {
+        quality_count_case("broken_links", &["returned"]);
+    }
+    #[test]
+    fn quality_budget_hub_count_aliases_follow_late_prefix() {
+        quality_count_case("hubs", &["count", "returned"]);
+    }
+    #[test]
+    fn quality_budget_bridge_count_aliases_follow_late_prefix() {
+        quality_count_case("bridges", &["count", "returned"]);
+    }
+
+    #[test]
+    fn quality_budget_empty_primary_secondary_cut_has_retry_or_refusal() {
+        let low: Vec<_> = (0..40).map(|index| json!({"wikilink_text":"\\".repeat(600),"source_note_uid":format!("note:{index}"),"confidence":0.8})).collect();
+        let payload = quality_wrapped(
+            json!({"offset":0,"returned":0,"total":0,"unresolved":0,"ambiguous":0,"truncated":false,"broken_links":[],"low_confidence":low,"low_confidence_total":40,"low_confidence_truncated":false}),
+        );
+        if payload["status"] == "refused" {
+            assert_eq!(payload["error"], "output_budget_exceeded");
+            assert_eq!(payload["original_assessment"]["total"], 0);
+            assert_eq!(payload["original_assessment"]["low_confidence_total"], 40);
+            assert_eq!(payload["original_assessment"]["offset"], 0);
+            assert!(
+                payload["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("Narrow"))
+            );
+        } else {
+            assert_eq!(payload["returned"], 0);
+            assert_eq!(payload["total"], 0);
+            assert!(payload["low_confidence"].as_array().unwrap().len() < 40);
+            assert_eq!(payload["low_confidence_truncated"], true);
+            assert!(payload["output_budget"]["retry"].is_string());
+        }
+    }
+
+    #[test]
+    fn quality_budget_exhausted_smaller_broken_population_keeps_legitimate_rows() {
+        let broken: Vec<_> = (0..3).map(|index| json!({"source_note_uid":format!("note:{index}"),"wikilink_text":format!("missing{index}")})).collect();
+        let low: Vec<_> = (0..40).map(|index| json!({"source_note_uid":format!("note:{index}"),"wikilink_text":"\\".repeat(600)})).collect();
+        let payload = quality_wrapped(
+            json!({"offset":7,"broken_links":broken,"returned":3,"total":10,"truncated":false,"low_confidence":low,"low_confidence_total":100,"low_confidence_truncated":false}),
+        );
+        assert_eq!(payload["broken_links"], json!(broken));
+        assert_eq!(payload["returned"], 3);
+        assert_eq!(payload["total"], 10);
+        assert_eq!(payload["low_confidence_total"], 100);
+        assert_eq!(payload["low_confidence_truncated"], true);
+        assert_eq!(payload["offset"], 7);
+    }
+
+    #[test]
+    fn quality_budget_dead_code_nonzero_offset_never_skips_late_rows() {
+        let rows: Vec<_> = (10..60)
+            .map(|index| json!({"uid":format!("sym:{index}"),"name":"\\".repeat(600)}))
+            .collect();
+        let payload = quality_wrapped(
+            json!({"unreachable_symbols":rows,"returned":50,"matching_count":100,"offset":10,"next_offset":60,"has_more":true,"graph_generation":17,"page_token":"original-token"}),
+        );
+        let retained = payload["unreachable_symbols"].as_array().unwrap().len();
+        assert!(retained < 50);
+        assert_eq!(payload["next_offset"], 10 + retained);
+        assert_eq!(payload["returned"], retained);
+        assert_eq!(payload["page_token"], "original-token");
+        assert_eq!(payload["graph_generation"], 17);
+    }
+
+    #[test]
+    fn quality_budget_ordinary_completed_pages_and_empty_populations_stay_exact() {
+        for payload in [
+            json!({"unreachable_symbols":[{"uid":"sym:a"}],"returned":1,"matching_count":1,"offset":0,"next_offset":null,"has_more":false,"graph_generation":17,"page_token":"token"}),
+            json!({"clusters":[{"id":0,"members":[{"uid":"sym:a"}],"returned_members":1,"size":1,"member_offset":0,"next_member_offset":null,"members_truncated":false}],"returned":1,"total":1,"cluster_offset":0,"next_cluster_offset":null,"graph_generation":17,"page_token":"token"}),
+            json!({"broken_links":[],"low_confidence":[],"returned":0,"total":0,"low_confidence_total":0,"truncated":false,"low_confidence_truncated":false,"offset":0}),
+        ] {
+            assert_eq!(quality_wrapped(payload.clone()), payload);
+        }
+    }
+
+    #[test]
+    fn quality_budget_broken_link_shared_offset_keeps_compatible_prefixes() {
+        let broken: Vec<_> = (0..40).map(|index| json!({"wikilink_text":format!("missing{index}"),"source_note_uid":format!("note:{index}"),"confidence":0.0})).collect();
+        let low: Vec<_> = (0..40).map(|index| json!({"wikilink_text":"\\".repeat(600),"source_note_uid":format!("note:{index}"),"confidence":0.8})).collect();
+        let payload = quality_wrapped(
+            json!({"offset":5,"returned":40,"total":100,"unresolved":100,"ambiguous":0,"truncated":false,"broken_links":broken,"low_confidence":low,"low_confidence_total":100,"low_confidence_truncated":false}),
+        );
+        let broken = payload["broken_links"].as_array().unwrap();
+        let low = payload["low_confidence"].as_array().unwrap();
+        assert!(low.len() < 40);
+        assert_eq!(
+            broken.len(),
+            low.len(),
+            "one shared offset must not skip the longer emitted prefix"
+        );
+        assert_eq!(payload["returned"], broken.len());
+        assert_eq!(payload["low_confidence_truncated"], true);
+        assert_eq!(payload["truncated"], true);
+        assert_eq!(payload["offset"], 5);
+        assert_eq!(payload["total"], 100);
+        assert_eq!(payload["low_confidence_total"], 100);
+    }
+
     #[test]
     fn differing_singleton_aliases_are_not_overwritten_by_string_cuts() {
         let result = finalize(
