@@ -54,6 +54,41 @@ struct DatabaseSelectionTests {
         check(select(try home("empty")) == nil, "no DB returns nil")
         check(select(globalHome, ["NESTWEAVER_DB": "~/override.lbug"])?.databasePath == globalHome + "/override.lbug", "explicit DB override and injected tilde home")
         check(select(globalHome, ["NESTWEAVER_DB": "~/override.lbug"])?.configPath == config, "DB override retains existing global config")
+        let aliasHome = (try home("publication-alias") as NSString).resolvingSymlinksInPath
+        let aliasDB = aliasHome + "/alias.lbug"
+        let aliasConfig = aliasHome + "/.nestweaver/instance.toml"
+        let slotA = "11111111-1111-4111-8111-111111111111"
+        let slotB = "22222222-2222-4222-8222-222222222222"
+        let graphA = aliasDB + ".publications/slots/" + slotA + "/graph.lbug"
+        let graphB = aliasDB + ".publications/slots/" + slotB + "/graph.lbug"
+        try write(graphA, "fixture graph A")
+        try write(graphB, "fixture graph B")
+        try fm.createSymbolicLink(atPath: aliasDB, withDestinationPath: graphA)
+        try write(aliasDB + ".publications/CURRENT", slotA + "\n")
+        try write(aliasConfig, "db = '\(aliasDB)'\n")
+        check(fm.fileExists(atPath: graphA) && fm.fileExists(atPath: graphB)
+              && (aliasDB as NSString).resolvingSymlinksInPath == graphA,
+              "publication alias fixture has two physical graphs and symlink to slot A")
+        let aliasSelection = select(aliasHome)
+        check(aliasSelection?.databasePath == aliasDB, "config publication alias retains logical DB name")
+        check(aliasSelection?.daemonArguments == ["daemon", "--db", aliasDB, "start", "--config", aliasConfig], "daemon receives publication alias without physical slot UUID")
+        check(aliasSelection?.uiArguments(port: 9377) == ["ui", "--port", "9377", "--no-open", "--db", aliasDB, "--config", aliasConfig], "UI receives publication alias without physical slot UUID")
+        check(select(aliasHome, ["NESTWEAVER_DB": "~/alias.lbug"])?.databasePath == aliasDB, "explicit DB override retains publication alias after tilde expansion")
+        try write(aliasDB + ".publications/CURRENT", slotB + "\n")
+        check(select(aliasHome)?.databasePath == aliasDB, "CURRENT rotation retains logical alias despite symlink still pointing to slot A")
+        let aliasFallbackHome = (try home("publication-alias-fallback") as NSString).resolvingSymlinksInPath
+        let aliasFallbackDB = aliasFallbackHome + "/.local/share/nestweaver/a/brain.lbug"
+        try write(aliasFallbackDB + ".publications/slots/" + slotA + "/graph.lbug", "fixture graph A")
+        try fm.createSymbolicLink(atPath: aliasFallbackDB,
+                                  withDestinationPath: aliasFallbackDB + ".publications/slots/" + slotA + "/graph.lbug")
+        try write(aliasFallbackDB + ".publications/CURRENT", slotA + "\n")
+        check(select(aliasFallbackHome)?.databasePath == aliasFallbackDB, "glob fallback retains publication alias")
+        let ordinaryAlias = aliasHome + "/ordinary-alias.lbug"
+        let ordinaryTarget = aliasHome + "/ordinary-target.lbug"
+        try write(ordinaryTarget)
+        try fm.createSymbolicLink(atPath: ordinaryAlias, withDestinationPath: ordinaryTarget)
+        try write(aliasConfig, "db = '\(ordinaryAlias)'\n")
+        check(select(aliasHome)?.databasePath == ordinaryTarget, "ordinary DB symlink without CURRENT remains canonical")
         let explicit = globalHome + "/selected.toml"
         try write(explicit, "db = '~/brain.lbug' # comment\n")
         check(select(globalHome, ["NESTWEAVER_CONFIG": "~/selected.toml"])?.configPath == explicit, "explicit config wins over global")

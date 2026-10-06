@@ -21,9 +21,17 @@ struct DatabaseSelection {
 enum DatabaseSelector {
     static func select(environment: [String: String], home: String,
                        fileManager: FileManager = .default) -> DatabaseSelection? {
-        func resolve(_ path: String, relativeTo directory: String) -> String {
+        func resolve(_ path: String, relativeTo directory: String,
+                     preservePublicationName: Bool = false) -> String {
             let expanded = path.hasPrefix("~/") ? home + String(path.dropFirst()) : path
             let absolute = expanded.hasPrefix("/") ? expanded : directory + "/" + expanded
+            if preservePublicationName {
+                let parent = ((absolute as NSString).deletingLastPathComponent as NSString).resolvingSymlinksInPath
+                let logical = (parent as NSString).appendingPathComponent((absolute as NSString).lastPathComponent)
+                // A DB symlink may still point at an older slot. Keep its name
+                // so the CLI resolves CURRENT in the logical publication namespace.
+                if fileManager.fileExists(atPath: logical + ".publications/CURRENT") { return logical }
+            }
             return (absolute as NSString).resolvingSymlinksInPath
         }
         func exists(_ logical: String) -> Bool {
@@ -37,19 +45,22 @@ enum DatabaseSelector {
                                       relativeTo: fileManager.currentDirectoryPath)
         let config = fileManager.fileExists(atPath: candidateConfig) ? candidateConfig : nil
         if let db = environment["NESTWEAVER_DB"], !db.isEmpty {
-            return DatabaseSelection(databasePath: resolve(db, relativeTo: fileManager.currentDirectoryPath),
+            return DatabaseSelection(databasePath: resolve(db, relativeTo: fileManager.currentDirectoryPath,
+                                                           preservePublicationName: true),
                                      configPath: config)
         }
         if let config = config,
            let contents = try? String(contentsOfFile: config, encoding: .utf8),
            let db = topLevelDatabase(contents) {
-            let logical = resolve(db, relativeTo: (config as NSString).deletingLastPathComponent)
+            let logical = resolve(db, relativeTo: (config as NSString).deletingLastPathComponent,
+                                  preservePublicationName: true)
             if exists(logical) { return DatabaseSelection(databasePath: logical, configPath: config) }
         }
         let nestDir = home + "/.local/share/nestweaver"
         if let dirs = try? fileManager.contentsOfDirectory(atPath: nestDir) {
             for dir in dirs.sorted() {
-                let logical = resolve(nestDir + "/" + dir + "/brain.lbug", relativeTo: home)
+                let logical = resolve(nestDir + "/" + dir + "/brain.lbug", relativeTo: home,
+                                      preservePublicationName: true)
                 if exists(logical) { return DatabaseSelection(databasePath: logical, configPath: config) }
             }
         }
