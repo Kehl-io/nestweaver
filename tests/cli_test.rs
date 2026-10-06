@@ -15936,7 +15936,7 @@ fn cli_operator_config_follows_current_on_each_invocation() {
     drop(base);
     let next = identity.next_publication().unwrap();
     for (identity, name) in [(&identity, "first-slot"), (&next, "second-slot")] {
-        cli_sealed_selection_fixture(&fixture.db, identity, name);
+        let selected = cli_sealed_selection_fixture(&fixture.db, identity, name);
         for args in [
             vec!["stale-check", "--json"],
             vec!["brain", "stale-check", "--json"],
@@ -15995,6 +15995,31 @@ fn cli_operator_config_follows_current_on_each_invocation() {
                     .to_string()
             ),
             "{text}"
+        );
+        let expected_status = format!(
+            "No publication operations in {}",
+            nestweaver_engine::publication::default_publication_root(&fixture.db).display()
+        );
+        let mut physical_failures = Vec::new();
+        for use_env in [false, true] {
+            let mut command = fixture.command();
+            command.args(["publication", "status"]);
+            if use_env {
+                command.env("NESTWEAVER_DB", &selected);
+            } else {
+                command.arg("--db").arg(&selected);
+            }
+            let output = command.output().unwrap();
+            let actual = String::from_utf8_lossy(&output.stdout);
+            if output.status.code() != Some(0) || actual.trim() != expected_status {
+                physical_failures.push(format!("physical target via {} must inspect the logical root: exit={:?}, stdout={actual:?}, stderr={:?}",
+                    if use_env { "environment" } else { "--db" }, output.status.code(), String::from_utf8_lossy(&output.stderr)));
+            }
+        }
+        assert!(
+            physical_failures.is_empty(),
+            "{}",
+            physical_failures.join("\n")
         );
         if name == "second-slot" {
             let repo = fixture.db.parent().unwrap().join("selected-index-repo");

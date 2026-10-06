@@ -30729,10 +30729,15 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
             db,
             json,
         } => {
-            if explicit_root.is_none() {
-                let selected = resolve_db_with_config(db.clone(), None)?;
+            let db = if explicit_root.is_none() {
+                let selected = resolve_db_with_config(db, None)?;
                 require_openable_db(&selected)?;
-            }
+                Some(nestweaver_engine::publication::instance_anchor_database(
+                    &selected,
+                ))
+            } else {
+                db
+            };
             let root = root(explicit_root, db)?;
             if let Some(operation) = operation {
                 let state =
