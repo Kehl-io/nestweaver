@@ -3823,6 +3823,254 @@ impl GraphStore {
         Ok(out)
     }
 
+    /// Repositories represented by a project, including explicitly selected
+    /// repositories with no symbols. Legacy symbol edges contribute only their
+    /// owning repository to this display list, never additional symbol members.
+    pub fn project_display_repo_uids(&self, project_uid: &str) -> Result<Vec<String>, StoreError> {
+        let mut repos = self.project_member_repo_uids(project_uid)?;
+        repos.extend(
+            self.project_legacy_symbol_repos(project_uid)?
+                .into_iter()
+                .map(|(_, repo)| repo),
+        );
+        repos.sort();
+        repos.dedup();
+        Ok(repos)
+    }
+
+    /// Legacy individual members as lightweight UID/repo pairs. These pairs
+    /// are sufficient to combine aggregate repo counts without symbol hydration.
+    pub fn project_legacy_symbol_repos(
+        &self,
+        project_uid: &str,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        let read = (|| -> Result<Vec<(String, String)>, StoreError> {
+            let conn = self.conn()?;
+            let mut stmt = conn.prepare(
+                "MATCH (p:Project {uid: $uid})-[:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) RETURN DISTINCT s.uid, s.repo_uid",
+            ).map_err(|e| StoreError::Query(format!("prepare legacy symbol repos: {e}")))?;
+            conn.execute(&mut stmt, vec![("uid", Value::String(project_uid.into()))])
+                .map_err(|e| StoreError::Query(format!("legacy symbol repos: {e}")))?
+                .map(|row| Ok((extract_string(&row, 0)?, extract_string(&row, 1)?)))
+                .collect()
+        })();
+        tolerate_missing_table(read)
+    }
+
+    /// Scope and match before the database limits the result; hydrate only the
+    /// selected UIDs through primary-key probes. Count includes every matching
+    /// member once, including overlap between legacy and repo membership.
+    pub fn workspace_symbol_page(
+        &self,
+        repo_uid: Option<&str>,
+        project_uid: Option<&str>,
+        query: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<Symbol>, usize), StoreError> {
+        let _flight = (limit > 0).then(|| {
+            self.pagerank_compute_lock
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+        });
+        if limit > 0 && self.index_publication_blocks_ranking() {
+            self.invalidate_ranking_caches_locked();
+            return Err(StoreError::RankingUnavailable);
+        }
+        let conn = self.conn()?;
+        let mut predicates = Vec::new();
+        let mut params = Vec::new();
+        if let Some(project) = project_uid {
+            let repos = self.project_member_repo_uids(project)?;
+            let legacy = (|| -> Result<Vec<Value>, StoreError> {
+                let mut stmt = conn.prepare(
+                    "MATCH (p:Project {uid: $project})-[:PROJECT_INCLUDES_SYMBOL]->(s:Symbol) RETURN DISTINCT s.uid",
+                ).map_err(|e| StoreError::Query(format!("prepare legacy members: {e}")))?;
+                conn.execute(&mut stmt, vec![("project", Value::String(project.into()))])
+                    .map_err(|e| StoreError::Query(format!("legacy members: {e}")))?
+                    .map(|row| extract_string(&row, 0).map(Value::String))
+                    .collect()
+            })();
+            let legacy = tolerate_missing_table(legacy)?;
+            predicates.push("(s.repo_uid IN $repos OR s.uid IN $legacy)");
+            params.push((
+                "repos",
+                Value::List(
+                    lbug::LogicalType::String,
+                    repos.into_iter().map(Value::String).collect(),
+                ),
+            ));
+            params.push(("legacy", Value::List(lbug::LogicalType::String, legacy)));
+        } else if let Some(repo) = repo_uid {
+            predicates.push("s.repo_uid = $repo");
+            params.push(("repo", Value::String(repo.into())));
+        }
+        if let Some(query) = query {
+            predicates.push("(lower(s.name) CONTAINS $needle OR lower(s.file_path) CONTAINS $needle OR lower(s.signature) CONTAINS $needle)");
+            params.push(("needle", Value::String(query.to_lowercase())));
+        }
+        let where_clause = if predicates.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", predicates.join(" AND "))
+        };
+        let mut count = conn
+            .prepare(&format!(
+                "MATCH (s:Symbol){where_clause} RETURN count(s.uid)"
+            ))
+            .map_err(|e| StoreError::Query(format!("prepare scoped symbol count: {e}")))?;
+        let total = conn
+            .execute(&mut count, params.clone())
+            .map_err(|e| StoreError::Query(format!("scoped symbol count: {e}")))?
+            .next()
+            .map(|row| extract_i64(&row, 0))
+            .transpose()?
+            .unwrap_or(0)
+            .max(0) as usize;
+        if limit == 0 || total == 0 {
+            return Ok((Vec::new(), total));
+        }
+        let match_order = if query.is_some() {
+            "CASE WHEN lower(s.name) = $needle THEN 0 WHEN lower(s.name) STARTS WITH $needle THEN 1 WHEN lower(s.name) CONTAINS $needle THEN 2 ELSE 3 END ASC, "
+        } else {
+            ""
+        };
+        let mut stmt = conn.prepare(&format!(
+            "MATCH (s:Symbol){where_clause} RETURN s.uid ORDER BY {match_order}coalesce(s.pagerank_score, 0.0) DESC, s.uid ASC LIMIT $limit"
+        )).map_err(|e| StoreError::Query(format!("prepare scoped symbol page: {e}")))?;
+        params.push(("limit", Value::Int64(limit.min(i64::MAX as usize) as i64)));
+        let uids = conn
+            .execute(&mut stmt, params)
+            .map_err(|e| StoreError::Query(format!("scoped symbol page: {e}")))?
+            .map(|row| extract_string(&row, 0))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut symbols =
+            self.batch_lookup_symbols(&uids.iter().map(String::as_str).collect::<Vec<_>>())?;
+        let ordered = uids
+            .into_iter()
+            .map(|uid| {
+                symbols.remove(&uid).ok_or_else(|| {
+                    StoreError::Query(format!("scoped symbol disappeared during hydration: {uid}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((ordered, total))
+    }
+
+    /// Aggregate counts without hydrating global symbol rows.
+    pub fn symbol_counts_by_repo(&self) -> Result<HashMap<String, usize>, StoreError> {
+        let conn = self.conn()?;
+        let rows = conn
+            .query("MATCH (s:Symbol) RETURN s.repo_uid, count(s.uid)")
+            .map_err(|e| StoreError::Query(format!("symbol counts: {e}")))?;
+        rows.map(|row| {
+            Ok((
+                extract_string(&row, 0)?,
+                extract_i64(&row, 1)?.max(0) as usize,
+            ))
+        })
+        .collect()
+    }
+
+    pub fn project_note_vault_uids(&self, project_uid: &str) -> Result<Vec<String>, StoreError> {
+        let read = (|| -> Result<Vec<String>, StoreError> {
+            let conn = self.conn()?;
+            let mut stmt = conn.prepare(
+                "MATCH (p:Project {uid: $project})-[:PROJECT_INCLUDES_NOTE]->(n:Note) RETURN DISTINCT n.vault_uid ORDER BY n.vault_uid",
+            ).map_err(|e| StoreError::Query(format!("prepare project vaults: {e}")))?;
+            conn.execute(
+                &mut stmt,
+                vec![("project", Value::String(project_uid.into()))],
+            )
+            .map_err(|e| StoreError::Query(format!("project vaults: {e}")))?
+            .map(|row| extract_string(&row, 0))
+            .collect()
+        })();
+        tolerate_missing_table(read)
+    }
+
+    /// Bounded note metadata selection for workspace title/path search and
+    /// overview. Full note properties are fetched only for the chosen page.
+    pub fn workspace_note_page(
+        &self,
+        project_uid: Option<&str>,
+        vault_uid: Option<&str>,
+        query: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<Note>, usize), StoreError> {
+        let read = (|| -> Result<(Vec<Note>, usize), StoreError> {
+            let conn = self.conn()?;
+            let mut params = Vec::new();
+            let base = if let Some(project) = project_uid {
+                params.push(("project", Value::String(project.into())));
+                "MATCH (p:Project {uid: $project})-[:PROJECT_INCLUDES_NOTE]->(n:Note)"
+            } else {
+                "MATCH (n:Note)"
+            };
+            let mut predicates = Vec::new();
+            if let Some(vault) = vault_uid {
+                params.push(("vault", Value::String(vault.into())));
+                predicates.push("n.vault_uid = $vault");
+            }
+            if let Some(query) = query {
+                params.push(("needle", Value::String(query.to_lowercase())));
+                predicates.push(
+                    "(lower(n.title) CONTAINS $needle OR lower(n.file_path) CONTAINS $needle)",
+                );
+            }
+            let where_clause = if predicates.is_empty() {
+                String::new()
+            } else {
+                format!(" WHERE {}", predicates.join(" AND "))
+            };
+            let mut stmt = conn
+                .prepare(&format!(
+                    "{base}{where_clause} RETURN count(DISTINCT n.uid)"
+                ))
+                .map_err(|e| StoreError::Query(format!("prepare workspace note count: {e}")))?;
+            let total = conn
+                .execute(&mut stmt, params.clone())
+                .map_err(|e| StoreError::Query(format!("workspace note count: {e}")))?
+                .next()
+                .map(|row| extract_i64(&row, 0))
+                .transpose()?
+                .unwrap_or(0)
+                .max(0) as usize;
+            if limit == 0 || total == 0 {
+                return Ok((Vec::new(), total));
+            }
+            let mut stmt = conn.prepare(&format!(
+            "{base}{where_clause} RETURN DISTINCT n.uid, coalesce(n.pagerank_score, 0.0) AS rank ORDER BY rank DESC, n.uid ASC LIMIT $limit"
+        )).map_err(|e| StoreError::Query(format!("prepare workspace notes: {e}")))?;
+            params.push(("limit", Value::Int64(limit.min(i64::MAX as usize) as i64)));
+            let uids = conn
+                .execute(&mut stmt, params)
+                .map_err(|e| StoreError::Query(format!("workspace notes: {e}")))?
+                .map(|row| extract_string(&row, 0))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut notes: HashMap<_, _> = self
+                .lookup_notes_by_uids(&uids)?
+                .into_iter()
+                .map(|note| (note.uid.clone(), note))
+                .collect();
+            let ordered = uids
+                .into_iter()
+                .map(|uid| {
+                    notes.remove(&uid).ok_or_else(|| {
+                        StoreError::Query(format!(
+                            "workspace note disappeared during hydration: {uid}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((ordered, total))
+        })();
+        if project_uid.is_some() {
+            tolerate_missing_table(read)
+        } else {
+            read
+        }
+    }
+
     /// The top `limit` symbols of `repo_uid` by stored PageRank (ties by
     /// UID), plus how many symbols the repository holds in all.
     ///

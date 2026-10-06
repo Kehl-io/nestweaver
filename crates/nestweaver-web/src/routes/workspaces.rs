@@ -288,7 +288,7 @@ pub fn workspace_counts(
                 service_count: services_for_repo(store, uid)?.len(),
                 vault_count: 0,
                 note_count: 0,
-                symbol_count: symbols_for_repo(store, uid)?.len(),
+                symbol_count: store.workspace_symbol_page(Some(uid), None, None, 0)?.1,
             })
         }
         WorkspaceKind::Vault => {
@@ -411,9 +411,9 @@ pub fn services_for_project(
     store: &GraphStore,
     project_uid: &str,
 ) -> Result<Vec<Service>, ApiError> {
-    let repo_uids: HashSet<String> = symbols_for_project(store, project_uid)?
+    let repo_uids: HashSet<String> = store
+        .project_display_repo_uids(project_uid)?
         .into_iter()
-        .map(|symbol| symbol.repo_uid)
         .collect();
     Ok(store
         .list_services(None)?
@@ -423,41 +423,59 @@ pub fn services_for_project(
 }
 
 pub fn symbols_for_repo(store: &GraphStore, repo_uid: &str) -> Result<Vec<Symbol>, ApiError> {
-    let mut symbols: Vec<Symbol> = store
-        .list_all_symbols()?
-        .into_iter()
-        .filter(|symbol| symbol.repo_uid == repo_uid)
-        .collect();
-    symbols.sort_by(|a, b| {
-        b.pagerank_score
-            .unwrap_or(0.0)
-            .partial_cmp(&a.pagerank_score.unwrap_or(0.0))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    Ok(symbols)
+    Ok(store
+        .workspace_symbol_page(
+            Some(repo_uid),
+            None,
+            None,
+            usize::MAX.min(i64::MAX as usize),
+        )
+        .map_err(|e| ApiError::from_ranking(e.into()))?
+        .0)
 }
 
 pub fn symbols_for_project(store: &GraphStore, project_uid: &str) -> Result<Vec<Symbol>, ApiError> {
-    let mut symbols: Vec<Symbol> = store
-        .list_project_symbol_uids(project_uid)?
-        .into_iter()
-        .filter_map(|uid| store.lookup_symbol(&uid).ok())
-        .collect();
-    symbols.sort_by(|a, b| {
-        b.pagerank_score
-            .unwrap_or(0.0)
-            .partial_cmp(&a.pagerank_score.unwrap_or(0.0))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    Ok(symbols)
+    Ok(store
+        .workspace_symbol_page(
+            None,
+            Some(project_uid),
+            None,
+            usize::MAX.min(i64::MAX as usize),
+        )
+        .map_err(|e| ApiError::from_ranking(e.into()))?
+        .0)
+}
+
+pub fn symbols_page(
+    store: &GraphStore,
+    workspace: &ResolvedWorkspace,
+    query: Option<&str>,
+    limit: usize,
+) -> Result<BoundedResults<Symbol>, ApiError> {
+    if workspace.kind == WorkspaceKind::Vault {
+        return Ok(BoundedResults {
+            items: Vec::new(),
+            total_count: 0,
+        });
+    }
+    let (items, total_count) = store
+        .workspace_symbol_page(
+            (workspace.kind == WorkspaceKind::Repo)
+                .then_some(workspace.uid.as_deref())
+                .flatten(),
+            (workspace.kind == WorkspaceKind::Project)
+                .then_some(workspace.uid.as_deref())
+                .flatten(),
+            query,
+            limit,
+        )
+        .map_err(|e| ApiError::from_ranking(e.into()))?;
+    Ok(BoundedResults { items, total_count })
 }
 
 pub fn notes_for_project(store: &GraphStore, project_uid: &str) -> Result<Vec<Note>, ApiError> {
-    let mut notes: Vec<Note> = store
-        .list_project_note_uids(project_uid)?
-        .into_iter()
-        .filter_map(|uid| store.lookup_note(&uid).ok())
-        .collect();
+    let mut notes: Vec<Note> =
+        store.lookup_notes_by_uids(&store.list_project_note_uids(project_uid)?)?;
     notes.sort_by(|a, b| {
         b.pagerank_score
             .unwrap_or(0.0)
@@ -484,9 +502,9 @@ pub fn note_lites_for_project(
 }
 
 pub fn repos_for_project(store: &GraphStore, project_uid: &str) -> Result<Vec<Repo>, ApiError> {
-    let repo_uids: HashSet<String> = symbols_for_project(store, project_uid)?
+    let repo_uids: HashSet<String> = store
+        .project_display_repo_uids(project_uid)?
         .into_iter()
-        .map(|symbol| symbol.repo_uid)
         .collect();
     Ok(store
         .list_repos(None)?
@@ -496,9 +514,9 @@ pub fn repos_for_project(store: &GraphStore, project_uid: &str) -> Result<Vec<Re
 }
 
 pub fn vaults_for_project(store: &GraphStore, project_uid: &str) -> Result<Vec<Vault>, ApiError> {
-    let vault_uids: HashSet<String> = notes_for_project(store, project_uid)?
+    let vault_uids: HashSet<String> = store
+        .project_note_vault_uids(project_uid)?
         .into_iter()
-        .map(|note| note.vault_uid)
         .collect();
     Ok(store
         .list_vaults(None)?
@@ -508,66 +526,102 @@ pub fn vaults_for_project(store: &GraphStore, project_uid: &str) -> Result<Vec<V
 }
 
 fn project_counts(store: &GraphStore, project_uid: &str) -> Result<WorkspaceCounts, ApiError> {
-    let symbols = symbols_for_project(store, project_uid)?;
-    let notes = notes_for_project(store, project_uid)?;
-    let repo_uids: HashSet<&str> = symbols
-        .iter()
-        .map(|symbol| symbol.repo_uid.as_str())
+    let repo_uids: HashSet<String> = store
+        .project_display_repo_uids(project_uid)?
+        .into_iter()
         .collect();
-    let vault_uids: HashSet<&str> = notes.iter().map(|note| note.vault_uid.as_str()).collect();
     let service_count = store
         .list_services(None)?
         .into_iter()
-        .filter(|service| repo_uids.contains(service.repo_uid.as_str()))
+        .filter(|service| repo_uids.contains(&service.repo_uid))
         .count();
-
     Ok(WorkspaceCounts {
         project_count: 1,
         repo_count: repo_uids.len(),
         service_count,
-        vault_count: vault_uids.len(),
-        note_count: notes.len(),
-        symbol_count: symbols.len(),
+        vault_count: store.project_note_vault_uids(project_uid)?.len(),
+        note_count: store
+            .workspace_note_page(Some(project_uid), None, None, 0)?
+            .1,
+        symbol_count: store
+            .workspace_symbol_page(None, Some(project_uid), None, 0)?
+            .1,
     })
 }
 
-/// Like [`project_counts`] but derives every count from pre-built graph maps
-/// plus the project's own symbol/note uid lists, so it never touches the full
-/// `list_services` / `list_all_symbols` scans. The catalog builder calls this
-/// once per project; using the maps keeps the whole catalog linear in graph
-/// size instead of O(projects × store) — the difference between ~1s and ~50s
-/// on a large multi-repo graph.
+/// Catalog counts reuse the one aggregate pass; only legacy membership pairs
+/// and note UID lists are read per project, without rescanning Symbol rows.
 fn project_counts_scoped(
     store: &GraphStore,
     project_uid: &str,
-    repo_by_symbol_uid: &HashMap<String, String>,
+    symbol_counts_by_repo: &HashMap<String, usize>,
     vault_by_note_uid: &HashMap<String, String>,
     service_counts_by_repo: &HashMap<String, usize>,
 ) -> Result<WorkspaceCounts, ApiError> {
-    let symbol_uids = store.list_project_symbol_uids(project_uid)?;
-    let note_uids = store.list_project_note_uids(project_uid)?;
-
-    let repo_uids: HashSet<&str> = symbol_uids
+    let explicit_repos: HashSet<String> = store
+        .project_member_repo_uids(project_uid)?
+        .into_iter()
+        .collect();
+    let legacy = store.project_legacy_symbol_repos(project_uid)?;
+    let legacy_only: HashSet<&str> = legacy
         .iter()
-        .filter_map(|uid| repo_by_symbol_uid.get(uid).map(String::as_str))
+        .filter(|(_, repo)| !explicit_repos.contains(repo))
+        .map(|(uid, _)| uid.as_str())
+        .collect();
+    let symbol_count = explicit_repos
+        .iter()
+        .map(|repo| symbol_counts_by_repo.get(repo).copied().unwrap_or(0))
+        .sum::<usize>()
+        + legacy_only.len();
+    let repo_uids: HashSet<&str> = explicit_repos
+        .iter()
+        .map(String::as_str)
+        .chain(legacy.iter().map(|(_, repo)| repo.as_str()))
+        .collect();
+    let note_uids: HashSet<String> = store
+        .list_project_note_uids(project_uid)?
+        .into_iter()
         .collect();
     let vault_uids: HashSet<&str> = note_uids
         .iter()
         .filter_map(|uid| vault_by_note_uid.get(uid).map(String::as_str))
         .collect();
-    let service_count = repo_uids
-        .iter()
-        .map(|repo| service_counts_by_repo.get(*repo).copied().unwrap_or(0))
-        .sum();
-
     Ok(WorkspaceCounts {
         project_count: 1,
         repo_count: repo_uids.len(),
-        service_count,
+        service_count: repo_uids
+            .iter()
+            .map(|repo| service_counts_by_repo.get(*repo).copied().unwrap_or(0))
+            .sum(),
         vault_count: vault_uids.len(),
         note_count: note_uids.len(),
-        symbol_count: symbol_uids.len(),
+        symbol_count,
     })
+}
+
+pub fn notes_page(
+    store: &GraphStore,
+    workspace: &ResolvedWorkspace,
+    query: Option<&str>,
+    limit: usize,
+) -> Result<BoundedResults<Note>, ApiError> {
+    if workspace.kind == WorkspaceKind::Repo {
+        return Ok(BoundedResults {
+            items: Vec::new(),
+            total_count: 0,
+        });
+    }
+    let (items, total_count) = store.workspace_note_page(
+        (workspace.kind == WorkspaceKind::Project)
+            .then_some(workspace.uid.as_deref())
+            .flatten(),
+        (workspace.kind == WorkspaceKind::Vault)
+            .then_some(workspace.uid.as_deref())
+            .flatten(),
+        query,
+        limit,
+    )?;
+    Ok(BoundedResults { items, total_count })
 }
 
 pub fn notes_for_query(
@@ -576,33 +630,7 @@ pub fn notes_for_query(
     workspace: &ResolvedWorkspace,
     limit: usize,
 ) -> Result<BoundedResults<Note>, ApiError> {
-    let needle = query.to_lowercase();
-    let mut notes: Vec<Note> = match workspace.kind {
-        WorkspaceKind::All => store.list_notes(None)?,
-        WorkspaceKind::Project => {
-            notes_for_project(store, workspace.uid.as_deref().unwrap_or_default())?
-        }
-        WorkspaceKind::Vault => store.list_notes(workspace.uid.as_deref())?,
-        WorkspaceKind::Repo => Vec::new(),
-    }
-    .into_iter()
-    .filter(|note| {
-        note.title.to_lowercase().contains(&needle)
-            || note.file_path.to_lowercase().contains(&needle)
-    })
-    .collect();
-    notes.sort_by(|a, b| {
-        b.pagerank_score
-            .unwrap_or(0.0)
-            .partial_cmp(&a.pagerank_score.unwrap_or(0.0))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let total_count = notes.len();
-    notes.truncate(limit);
-    Ok(BoundedResults {
-        items: notes,
-        total_count,
-    })
+    notes_page(store, workspace, Some(query), limit)
 }
 
 pub fn symbols_for_query(
@@ -611,36 +639,7 @@ pub fn symbols_for_query(
     workspace: &ResolvedWorkspace,
     limit: usize,
 ) -> Result<BoundedResults<Symbol>, ApiError> {
-    let needle = query.to_lowercase();
-    let mut symbols: Vec<Symbol> = match workspace.kind {
-        WorkspaceKind::All => store.list_all_symbols()?,
-        WorkspaceKind::Project => {
-            symbols_for_project(store, workspace.uid.as_deref().unwrap_or_default())?
-        }
-        WorkspaceKind::Repo => {
-            symbols_for_repo(store, workspace.uid.as_deref().unwrap_or_default())?
-        }
-        WorkspaceKind::Vault => Vec::new(),
-    }
-    .into_iter()
-    .filter(|symbol| {
-        symbol.name.to_lowercase().contains(&needle)
-            || symbol.file_path.to_lowercase().contains(&needle)
-            || symbol.signature.to_lowercase().contains(&needle)
-    })
-    .collect();
-    symbols.sort_by(|a, b| {
-        b.pagerank_score
-            .unwrap_or(0.0)
-            .partial_cmp(&a.pagerank_score.unwrap_or(0.0))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let total_count = symbols.len();
-    symbols.truncate(limit);
-    Ok(BoundedResults {
-        items: symbols,
-        total_count,
-    })
+    symbols_page(store, workspace, Some(query), limit)
 }
 
 pub fn note_search_hit(note: Note) -> serde_json::Value {
@@ -670,7 +669,8 @@ fn workspace_entries(store: &GraphStore) -> Result<BoundedResults<WorkspaceEntry
     let repos = store.list_repos(None)?;
     let vaults = store.list_vaults(None)?;
     let services = store.list_services(None)?;
-    let symbols = store.list_all_symbols()?;
+    let symbol_counts_by_repo = store.symbol_counts_by_repo()?;
+    let symbol_count = symbol_counts_by_repo.values().sum();
     let notes = store.list_notes_lite(None)?;
 
     let mut service_counts_by_repo = HashMap::<String, usize>::new();
@@ -678,15 +678,6 @@ fn workspace_entries(store: &GraphStore) -> Result<BoundedResults<WorkspaceEntry
         *service_counts_by_repo
             .entry(service.repo_uid.clone())
             .or_default() += 1;
-    }
-
-    let mut symbol_counts_by_repo = HashMap::<String, usize>::new();
-    let mut repo_by_symbol_uid = HashMap::<String, String>::with_capacity(symbols.len());
-    for symbol in &symbols {
-        *symbol_counts_by_repo
-            .entry(symbol.repo_uid.clone())
-            .or_default() += 1;
-        repo_by_symbol_uid.insert(symbol.uid.clone(), symbol.repo_uid.clone());
     }
 
     let mut note_counts_by_vault = HashMap::<String, usize>::new();
@@ -709,7 +700,7 @@ fn workspace_entries(store: &GraphStore) -> Result<BoundedResults<WorkspaceEntry
             service_count: services.len(),
             vault_count: vaults.len(),
             note_count: notes.len(),
-            symbol_count: symbols.len(),
+            symbol_count,
         },
         "complete",
         Vec::<&str>::new(),
@@ -724,7 +715,7 @@ fn workspace_entries(store: &GraphStore) -> Result<BoundedResults<WorkspaceEntry
             project_counts_scoped(
                 store,
                 &project.uid,
-                &repo_by_symbol_uid,
+                &symbol_counts_by_repo,
                 &vault_by_note_uid,
                 &service_counts_by_repo,
             )?,

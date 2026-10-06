@@ -1158,3 +1158,161 @@ async fn p1_brain_context_nodes_expose_scene_bridge_scores() {
         );
     }
 }
+
+#[tokio::test]
+async fn scoped_symbol_search_prefers_exact_name_before_rank_and_keeps_legacy_scope() {
+    let store = setup_p1_store();
+    store
+        .insert_symbol(&symbol("sym:alpha:bot", "repo:alpha", "bot", 0.00001))
+        .unwrap();
+    store
+        .insert_symbol(&symbol(
+            "sym:alpha:max",
+            "repo:alpha",
+            "MAX_BOTS_PER_ROOM",
+            100.0,
+        ))
+        .unwrap();
+    store
+        .insert_symbol(&symbol("sym:beta:bot", "repo:beta", "bot", 200.0))
+        .unwrap();
+    store
+        .batch_insert_project_symbol_edges(
+            "proj:local:alpha",
+            &["sym:alpha:bot".into(), "sym:alpha:max".into()],
+            1.0,
+        )
+        .unwrap();
+    let state = AppState::new(store, None, "/tmp/scoped-search.lbug".into());
+    let app = create_router(state);
+    for workspace in ["repo:alpha", "proj:local:alpha"] {
+        let (status, body) = get_json(
+            &app,
+            &format!("/api/v1/brain/search?q=bot&workspace={workspace}&limit=1"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["results"][0]["uid"], "sym:alpha:bot", "{body}");
+        assert_eq!(body["_meta"]["truncation"]["omitted_count"], 1);
+    }
+}
+
+#[tokio::test]
+async fn symbols_top_scopes_before_limit_and_does_not_widen_legacy_membership() {
+    let store = setup_p1_store();
+    store
+        .insert_symbol(&symbol(
+            "sym:alpha:unselected",
+            "repo:alpha",
+            "unselected",
+            300.0,
+        ))
+        .unwrap();
+    store
+        .insert_symbol(&symbol("sym:beta:global", "repo:beta", "global", 400.0))
+        .unwrap();
+    let state = AppState::new(store, None, "/tmp/scoped-top.lbug".into());
+    let app = create_router(state);
+    let (status, body) = get_json(
+        &app,
+        "/api/v1/symbols/top?workspace=proj:local:alpha&limit=1",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body[0]["repo_uid"], "repo:alpha");
+    assert_ne!(body[0]["uid"], "sym:alpha:unselected");
+    let (_, body) = get_json(&app, "/api/v1/symbols/top?workspace=repo:alpha&limit=1").await;
+    assert_eq!(body[0]["uid"], "sym:alpha:unselected");
+    let (_, body) = get_json(&app, "/api/v1/symbols/top?workspace=vlt:brain&limit=1").await;
+    assert_eq!(body, json!([]));
+    let (status, _) = get_json(&app, "/api/v1/symbols/top?workspace=repo:missing").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn project_overview_includes_explicit_empty_repository_and_true_counts() {
+    let store = setup_p1_store();
+    store.insert_repo(&repo("repo:empty", "empty")).unwrap();
+    store
+        .replace_project_repo_edges(
+            &["proj:local:alpha".into()],
+            &[("proj:local:alpha".into(), "repo:empty".into())],
+        )
+        .unwrap();
+    let state = AppState::new(store, None, "/tmp/empty-project.lbug".into());
+    let app = create_router(state);
+    let (status, body) = get_json(
+        &app,
+        "/api/v1/overview?workspace=proj:local:alpha&kind=repo&limit=6",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["counts"]["repo_count"], 2, "{body}");
+    assert_eq!(body["counts"]["symbol_count"], 2);
+    assert!(
+        body["landmarks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["uid"] == "repo:empty")
+    );
+    let (_, catalog) = get_json(&app, "/api/v1/workspaces").await;
+    let project = catalog["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["uid"] == "proj:local:alpha")
+        .unwrap();
+    assert_eq!(project["counts"]["repo_count"], 2);
+}
+
+#[tokio::test]
+async fn scoped_top_deduplicates_repo_and_legacy_members_and_breaks_ties_by_uid() {
+    let store = GraphStore::in_memory().unwrap();
+    store.insert_repo(&repo("repo:member", "member")).unwrap();
+    store.insert_repo(&repo("repo:foreign", "foreign")).unwrap();
+    store
+        .insert_project(&project("proj:member", "Member"))
+        .unwrap();
+    for uid in ["sym:member:z", "sym:member:a", "sym:member:m"] {
+        store
+            .insert_symbol(&symbol(uid, "repo:member", "tied", 1.0))
+            .unwrap();
+    }
+    for i in 0..12 {
+        store
+            .insert_symbol(&symbol(
+                &format!("sym:foreign:{i}"),
+                "repo:foreign",
+                "tied",
+                100.0,
+            ))
+            .unwrap();
+    }
+    store
+        .replace_project_repo_edges(
+            &["proj:member".into()],
+            &[("proj:member".into(), "repo:member".into())],
+        )
+        .unwrap();
+    store
+        .batch_insert_project_symbol_edges("proj:member", &["sym:member:a".into()], 1.0)
+        .unwrap();
+    let app = create_router(AppState::new(store, None, "/tmp/tied-project.lbug".into()));
+    let (_, body) = get_json(&app, "/api/v1/symbols/top?workspace=proj:member&limit=2").await;
+    assert_eq!(
+        body.as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["uid"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["sym:member:a", "sym:member:m"]
+    );
+    let (_, body) = get_json(
+        &app,
+        "/api/v1/overview?workspace=proj:member&kind=symbol&limit=6",
+    )
+    .await;
+    assert_eq!(body["counts"]["symbol_count"], 3);
+    assert_eq!(body["landmarks"].as_array().unwrap().len(), 3);
+}

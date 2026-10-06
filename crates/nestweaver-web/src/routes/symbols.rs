@@ -105,6 +105,8 @@ pub async fn symbols_in_file(
 #[derive(Deserialize)]
 pub struct TopParams {
     pub limit: Option<usize>,
+    pub workspace: Option<String>,
+    pub scope: Option<String>,
 }
 
 pub async fn symbols_top(
@@ -118,10 +120,21 @@ pub async fn symbols_top(
     with_rank_event(&state, move || {
         // A dirty index publication fails ranking closed: surface 503 so the
         // UI says "ranking unavailable" instead of rendering an empty list.
-        let symbols = state2
-            .store
-            .symbols_by_pagerank(Some(limit))
-            .map_err(|e| ApiError::from_ranking(e.into()))?;
+        let workspace = crate::routes::workspaces::resolve_workspace(
+            &state2.store,
+            crate::routes::workspaces::workspace_param(
+                params.workspace.as_deref(),
+                params.scope.as_deref(),
+            ),
+        )?;
+        let symbols = if workspace.kind == crate::routes::workspaces::WorkspaceKind::All {
+            state2
+                .store
+                .symbols_by_pagerank(Some(limit))
+                .map_err(|e| ApiError::from_ranking(e.into()))?
+        } else {
+            crate::routes::workspaces::symbols_page(&state2.store, &workspace, None, limit)?.items
+        };
         let json = serde_json::to_value(&symbols)?;
         Ok(Json(json).into_response())
     })
@@ -144,7 +157,16 @@ mod tests {
         std::fs::write(format!("{}.index-dirty", db_path.display()), b"dirty").unwrap();
         let state = AppState::new(store, None, db_path);
 
-        let error = match symbols_top(State(state), Query(TopParams { limit: None })).await {
+        let error = match symbols_top(
+            State(state),
+            Query(TopParams {
+                limit: None,
+                workspace: None,
+                scope: None,
+            }),
+        )
+        .await
+        {
             Ok(_) => panic!("a dirty publication must not render a successful top-symbols list"),
             Err(error) => error,
         };

@@ -385,6 +385,15 @@ pub async fn brain_search(
     State(state): State<Arc<AppState>>,
     Query(params): Query<BrainSearchParams>,
 ) -> Result<Response, ApiError> {
+    let state2 = state.clone();
+    crate::rank_events::with_rank_event(&state, move || brain_search_response(&state2, params))
+        .await
+}
+
+fn brain_search_response(
+    state: &Arc<AppState>,
+    params: BrainSearchParams,
+) -> Result<Response, ApiError> {
     let q = params.q.unwrap_or_default();
     if q.is_empty() {
         return Err(ApiError::bad_request("query parameter 'q' is required"));
@@ -394,7 +403,7 @@ pub async fn brain_search(
         workspaces::workspace_param(params.workspace.as_deref(), params.scope.as_deref());
     if let Some(workspace_param) = workspace_param {
         let workspace = workspaces::resolve_workspace(&state.store, Some(workspace_param))?;
-        let search = scoped_brain_search(&state, &workspace, &q, limit)?;
+        let search = scoped_brain_search(state, &workspace, &q, limit)?;
         let meta = workspaces::p1_meta_for_result_set(
             &workspace,
             search.result_state,
