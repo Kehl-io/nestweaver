@@ -11536,9 +11536,20 @@ fn indexed_database_target_message(db: &Path) -> String {
         })
     };
     let selected = absolute(db);
-    let anchor = absolute(&nestweaver_engine::publication::instance_anchor_database(
-        db,
-    ));
+    let logical_anchor = nestweaver_engine::publication::instance_anchor_database(db);
+    // A publication namespace is derived from the logical final filename.
+    // Resolving an anchor symlink would select a different CURRENT namespace.
+    let anchor = if logical_anchor.as_path() != db {
+        if logical_anchor.is_absolute() {
+            logical_anchor
+        } else {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join(logical_anchor)
+        }
+    } else {
+        selected.clone()
+    };
     if anchor == selected {
         format!("Indexed database: {}", anchor.display())
     } else {
@@ -11553,6 +11564,42 @@ fn indexed_database_target_message(db: &Path) -> String {
 #[cfg(test)]
 mod index_target_disclosure_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn index_target_disclosure_preserves_symlink_publication_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let original = root.join("original.lbug");
+        let alias = root.join("alias.lbug");
+        std::fs::write(&original, b"").unwrap();
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        let graph = nestweaver_engine::publication::default_publication_root(&alias)
+            .join("slots/00000000-0000-4000-8000-000000000001/graph.lbug");
+        let other_graph = nestweaver_engine::publication::default_publication_root(&original)
+            .join("slots/00000000-0000-4000-8000-000000000002/graph.lbug");
+        for path in [&graph, &other_graph] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"").unwrap();
+        }
+        assert_ne!(
+            graph, other_graph,
+            "the aliases have distinct publication namespaces"
+        );
+        let message = indexed_database_target_message(&graph);
+        let lines: Vec<_> = message.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                format!("Indexed database: {}", alias.display()),
+                format!(
+                    "Selected graph: {}",
+                    graph.canonicalize().unwrap().display()
+                )
+            ],
+            "the reusable target must retain the logical publication namespace"
+        );
+    }
 
     #[test]
     fn index_target_disclosure_keeps_publication_only_logical_anchor() {

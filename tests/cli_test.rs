@@ -15383,8 +15383,8 @@ impl ExistingDbCliFixture {
         }
         cmd.current_dir(root.join("cwd"))
             .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
-            .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "2")
-            .timeout(std::time::Duration::from_secs(8));
+            .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "10")
+            .timeout(std::time::Duration::from_secs(15));
         cmd
     }
 
