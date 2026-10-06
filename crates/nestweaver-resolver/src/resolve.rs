@@ -4125,9 +4125,9 @@ mod user_pain_reference_tests {
         for path in ["main.js", "main.ts"] {
             let files = parsed_files(&[(
                 path,
-                "function helper() {}\nconst work = async function() {\n  helper();\n};\nconst sync = function() { helper(); };\nconst arrow = async () => { helper(); };\n",
+                "function helper() {}\nconst work = async function() {\n  helper();\n};\nconst sync = function() { helper(); };\nconst arrow = async () => { helper(); };\nconst sync_arrow = () => { helper(); };\n",
             )]);
-            for name in ["work", "sync", "arrow"] {
+            for name in ["work", "sync", "arrow", "sync_arrow"] {
                 let hits: Vec<_> = files[0]
                     .1
                     .iter()
@@ -4136,6 +4136,16 @@ mod user_pain_reference_tests {
                 assert_eq!(hits.len(), 1, "{path} duplicate {name}: {hits:?}");
                 assert_eq!(hits[0].kind, SymbolKind::Function);
             }
+            let work = files[0]
+                .1
+                .iter()
+                .find(|symbol| symbol.name == "work")
+                .unwrap();
+            assert_eq!(
+                (work.start_line, work.end_line),
+                (2, 4),
+                "{path}: async expression span must include its body"
+            );
             let edges = resolve_references(
                 &files,
                 if path.ends_with(".ts") {
@@ -4145,12 +4155,25 @@ mod user_pain_reference_tests {
                 },
                 "repo:test:abc",
             );
-            assert!(
-                edges.iter().any(|edge| edge.edge_type == EdgeType::Calls
-                    && edge.source_uid == uid(&files, path, "work")
-                    && edge.target_uid == uid(&files, path, "helper")),
-                "{edges:#?}"
-            );
+            for name in ["work", "sync", "arrow", "sync_arrow"] {
+                let calls: Vec<_> = edges
+                    .iter()
+                    .filter(|edge| {
+                        edge.edge_type == EdgeType::Calls
+                            && edge.source_uid == uid(&files, path, name)
+                    })
+                    .collect();
+                assert_eq!(
+                    calls.len(),
+                    1,
+                    "{path}: {name} must own exactly its helper call: {calls:#?}"
+                );
+                assert_eq!(
+                    calls[0].target_uid,
+                    uid(&files, path, "helper"),
+                    "{path}: {name} helper target"
+                );
+            }
         }
     }
 
