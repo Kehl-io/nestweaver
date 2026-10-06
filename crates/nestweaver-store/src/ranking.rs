@@ -1713,7 +1713,7 @@ impl GraphStore {
         self.ensure_pagerank_loaded_locked()
     }
 
-    fn ensure_pagerank_loaded_locked(&self) -> Result<(), StoreError> {
+    pub(crate) fn ensure_pagerank_loaded_locked(&self) -> Result<(), StoreError> {
         if self.index_publication_blocks_ranking() {
             self.invalidate_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);

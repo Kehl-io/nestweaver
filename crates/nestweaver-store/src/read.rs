@@ -3950,6 +3950,68 @@ impl GraphStore {
         if limit == 0 || total == 0 {
             return Ok((Vec::new(), total));
         }
+        if query.is_none() {
+            self.ensure_pagerank_loaded_locked()?;
+            let mut stmt = conn
+                .prepare(&format!(
+                    "MATCH (s:Symbol){where_clause} RETURN s.uid, s.repo_uid, s.file_path"
+                ))
+                .map_err(|e| StoreError::Query(format!("prepare scoped rank metadata: {e}")))?;
+            let rows = conn
+                .execute(&mut stmt, params)
+                .map_err(|e| StoreError::Query(format!("scoped rank metadata: {e}")))?;
+            let scores = self
+                .pagerank_cache
+                .lock()
+                .map_err(|e| StoreError::Query(format!("rank cache lock: {e}")))?;
+            let Some(scores) = scores.as_ref() else {
+                return Ok((Vec::new(), total));
+            };
+            let activity = self
+                .git_activity_cache
+                .lock()
+                .ok()
+                .and_then(|cache| cache.clone());
+            let weight = self.git_activity_weight();
+            let mut ranked = Vec::new();
+            for row in rows {
+                let uid = extract_string(&row, 0)?;
+                if let Some(score) = scores.get(&uid) {
+                    let repo = extract_string(&row, 1)?;
+                    let path = extract_string(&row, 2)?;
+                    let recency = activity
+                        .as_ref()
+                        .and_then(|repos| repos.get(&repo))
+                        .and_then(|paths| paths.get(&path))
+                        .copied();
+                    ranked.push((
+                        uid,
+                        score * crate::ranking::git_activity_multiplier(recency, weight),
+                    ));
+                }
+            }
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            ranked.truncate(limit);
+            let mut symbols = self.batch_lookup_symbols(
+                &ranked
+                    .iter()
+                    .map(|(uid, _)| uid.as_str())
+                    .collect::<Vec<_>>(),
+            )?;
+            let ordered = ranked
+                .into_iter()
+                .map(|(uid, score)| {
+                    let mut symbol = symbols.remove(&uid).ok_or_else(|| {
+                        StoreError::Query(format!(
+                            "ranked scoped symbol disappeared during hydration: {uid}"
+                        ))
+                    })?;
+                    symbol.pagerank_score = Some(score);
+                    Ok(symbol)
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            return Ok((ordered, total));
+        }
         let match_order = if query.is_some() {
             "CASE WHEN lower(s.name) = $needle THEN 0 WHEN lower(s.name) STARTS WITH $needle THEN 1 WHEN lower(s.name) CONTAINS $needle THEN 2 ELSE 3 END ASC, "
         } else {

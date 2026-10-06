@@ -1211,6 +1211,20 @@ async fn symbols_top_scopes_before_limit_and_does_not_widen_legacy_membership() 
     store
         .insert_symbol(&symbol("sym:beta:global", "repo:beta", "global", 400.0))
         .unwrap();
+    // Rank this leader through actual graph structure; persisted fixture
+    // scores are not the authoritative cache that Top serves.
+    for caller in [
+        "sym:alpha:parse",
+        "sym:alpha:format",
+        "sym:alpha:unselected",
+    ] {
+        store
+            .insert_edge(&calls_edge(caller, "sym:alpha:unselected"))
+            .unwrap();
+    }
+    store
+        .compute_pagerank(0.85, 20, &GraphScope::code_only())
+        .unwrap();
     let state = AppState::new(store, None, "/tmp/scoped-top.lbug".into());
     let app = create_router(state);
     let (status, body) = get_json(
@@ -1315,4 +1329,84 @@ async fn scoped_top_deduplicates_repo_and_legacy_members_and_breaks_ties_by_uid(
     .await;
     assert_eq!(body["counts"]["symbol_count"], 3);
     assert_eq!(body["landmarks"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn scoped_top_uses_warmed_authoritative_rank_before_limit() {
+    let store = GraphStore::in_memory().unwrap();
+    store.insert_repo(&repo("repo:rank", "rank")).unwrap();
+    store.insert_project(&project("proj:rank", "Rank")).unwrap();
+    for (uid, name) in [("sym:rank:a", "caller"), ("sym:rank:z", "leader")] {
+        store
+            .insert_symbol(&symbol(uid, "repo:rank", name, 0.0))
+            .unwrap();
+    }
+    store
+        .insert_edge(&calls_edge("sym:rank:a", "sym:rank:z"))
+        .unwrap();
+    store
+        .insert_edge(&calls_edge("sym:rank:z", "sym:rank:z"))
+        .unwrap();
+    store
+        .batch_insert_project_symbol_edges(
+            "proj:rank",
+            &["sym:rank:a".into(), "sym:rank:z".into()],
+            1.0,
+        )
+        .unwrap();
+    store
+        .compute_pagerank(0.85, 20, &GraphScope::code_only())
+        .unwrap();
+    let app = create_router(AppState::new(
+        store,
+        None,
+        "/tmp/authoritative-top.lbug".into(),
+    ));
+    let (_, all) = get_json(&app, "/api/v1/symbols/top?limit=1").await;
+    assert_eq!(all[0]["uid"], "sym:rank:z");
+    let score = all[0]["pagerank_score"].as_f64().unwrap();
+    assert!(score > 0.0);
+    for workspace in ["repo:rank", "proj:rank"] {
+        let (status, scoped) = get_json(
+            &app,
+            &format!("/api/v1/symbols/top?workspace={workspace}&limit=1"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(scoped[0]["uid"], "sym:rank:z", "{scoped}");
+        assert!((scoped[0]["pagerank_score"].as_f64().unwrap() - score).abs() < 1e-12);
+    }
+}
+
+#[tokio::test]
+async fn scoped_top_preserves_repo_keyed_git_activity_scores() {
+    let store = GraphStore::in_memory().unwrap();
+    store.insert_repo(&repo("repo:rank", "rank")).unwrap();
+    for (uid, name) in [("sym:rank:a", "stale"), ("sym:rank:z", "fresh")] {
+        store
+            .insert_symbol(&symbol(uid, "repo:rank", name, 0.0))
+            .unwrap();
+    }
+    store
+        .insert_edge(&calls_edge("sym:rank:a", "sym:rank:z"))
+        .unwrap();
+    store
+        .insert_edge(&calls_edge("sym:rank:z", "sym:rank:a"))
+        .unwrap();
+    store
+        .compute_pagerank(0.85, 20, &GraphScope::code_only())
+        .unwrap();
+    store.load_git_activity_cache(std::collections::HashMap::from([(
+        "repo:rank".into(),
+        std::collections::HashMap::from([
+            ("src/stale.rs".into(), 0.0),
+            ("src/fresh.rs".into(), 1.0),
+        ]),
+    )]));
+    let app = create_router(AppState::new(store, None, "/tmp/activity-top.lbug".into()));
+    let (_, all) = get_json(&app, "/api/v1/symbols/top?limit=1").await;
+    assert_eq!(all[0]["uid"], "sym:rank:z");
+    let (_, scoped) = get_json(&app, "/api/v1/symbols/top?workspace=repo:rank&limit=1").await;
+    assert_eq!(scoped[0]["uid"], "sym:rank:z");
+    assert_eq!(scoped[0]["pagerank_score"], all[0]["pagerank_score"]);
 }
