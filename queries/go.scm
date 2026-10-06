@@ -113,3 +113,7 @@
 ; Selector expression: obj.Field
 (selector_expression
   field: (field_identifier) @name) @reference.read_access
+
+; Package identity keeps external package tests outside private sibling access.
+(package_clause
+  (package_identifier) @name) @reference.package

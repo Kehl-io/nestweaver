@@ -38,6 +38,10 @@ pub struct CodeWatcher {
     repo_root: PathBuf,
     instance_id: String,
     stop_flag: Arc<AtomicBool>,
+    /// Retain committed repair paths even if their durable debt cannot be
+    /// written. A running watcher retries them until complete reconciliation;
+    /// restart recovery additionally depends on successful durable persistence.
+    committed_replay_paths: std::sync::Mutex<Vec<PathBuf>>,
     mutation_lease_factory: Option<WatchMutationLeaseFactory>,
     debounce: Duration,
     limits: crate::index_limits::IndexLimits,
@@ -82,8 +86,16 @@ impl Drop for RelinkerThread {
 enum WatchBatchOutcome {
     Unchanged,
     ManifestPending,
-    Published { files_processed: usize },
-    Skipped { reason: anyhow::Error },
+    Published {
+        files_processed: usize,
+    },
+    PublishedPending {
+        files_processed: usize,
+        reason: anyhow::Error,
+    },
+    Skipped {
+        reason: anyhow::Error,
+    },
 }
 
 enum PreparedPath {
@@ -135,6 +147,7 @@ impl CodeWatcher {
             repo_root,
             instance_id: instance_id.into(),
             stop_flag: Arc::new(AtomicBool::new(false)),
+            committed_replay_paths: std::sync::Mutex::new(Vec::new()),
             mutation_lease_factory: None,
             debounce: Duration::from_secs(2),
             limits: crate::index_limits::IndexLimits::default(),
@@ -396,6 +409,7 @@ impl CodeWatcher {
         // watchable are cleared (no write when nothing changed).
         self.sync_unwatched_dirs(&repo_url, tree.unwatchable(), true);
         let mut subscribed_unwatchable = tree.unwatchable().to_vec();
+        let mut pending = None;
 
         // A contract plan is a whole-repo view and must never point at
         // unchanged controllers that a minimal watch-first graph omitted.
@@ -438,6 +452,16 @@ impl CodeWatcher {
                     WatchBatchOutcome::Published { .. }
                     | WatchBatchOutcome::Unchanged
                     | WatchBatchOutcome::ManifestPending => break,
+                    WatchBatchOutcome::PublishedPending { reason, .. } => {
+                        tracing::warn!(error = %reason, "initial watcher snapshot committed; evidence repair remains owed");
+                        pending = Some(crate::watcher::PendingReconciliation {
+                            paths: None,
+                            also_replay: Vec::new(),
+                            failures: 0,
+                            next_attempt: Instant::now(),
+                        });
+                        break;
+                    }
                     WatchBatchOutcome::Skipped { reason } => {
                         // A save racing the cold snapshot is expected to be
                         // queued because notification was registered first.
@@ -467,13 +491,14 @@ impl CodeWatcher {
         }
 
         // nw-664: replay what changed while no watcher was listening. A cold
-        // repo was just snapshotted whole, so only an indexed one needs it.
+        // repo was just snapshotted whole, so only an indexed one needs a drift
+        // scan here. Any committed cold evidence repair stays pending for the
+        // same retry loop below, even when no further source event arrives.
         // The notify subscription is already live, so a save racing this
         // scan is queued and replayed by the loop; overlap is harmless. Runs
         // before readiness so "ready" normally means the graph matches disk.
         // A failure does not stop live watching (a restart would only meet
         // the same failure): it is disclosed and retried below with backoff.
-        let mut pending = None;
         if !cold {
             if self.stop_flag.load(Ordering::Acquire) {
                 return Ok(());
@@ -618,6 +643,22 @@ impl CodeWatcher {
                     files_processed
                 }
                 WatchBatchOutcome::Unchanged | WatchBatchOutcome::ManifestPending => continue,
+                WatchBatchOutcome::PublishedPending {
+                    files_processed,
+                    reason,
+                } => {
+                    tracing::warn!(error = %reason, files_processed, "code watcher committed; evidence repair remains owed");
+                    self.record_debt(&batch, &[], Some(&format!("{reason:#}")));
+                    if pending.is_none() {
+                        pending = Some(crate::watcher::PendingReconciliation {
+                            paths: None,
+                            also_replay: Vec::new(),
+                            failures: 0,
+                            next_attempt: Instant::now(),
+                        });
+                    }
+                    files_processed
+                }
                 WatchBatchOutcome::Skipped { reason } => {
                     // nw-669: this used to be the whole handling — a warning,
                     // then the batch was gone. Nothing retried it and nothing
@@ -842,6 +883,7 @@ impl CodeWatcher {
             epilogue_io,
             None,
             true,
+            true,
             after_plan,
         )
     }
@@ -856,6 +898,7 @@ impl CodeWatcher {
         epilogue_io: &dyn crate::index::IndexEpilogueIo,
         prepared_contracts: Option<&crate::index::ContractDerivationPlan>,
         publish_contracts: bool,
+        validate_known_specs: bool,
         after_plan: F,
     ) -> Result<WatchBatchOutcome, anyhow::Error>
     where
@@ -920,14 +963,29 @@ impl CodeWatcher {
             });
         }
         // A partial walk cannot silently retract a known unreadable spec.
-        for contract in store.list_contracts(Some(r_uid))? {
-            let relative = Path::new(&contract.source_path);
-            if !crate::contracts::is_spec_file(&contract.source_path)
-                || !reader.accepts_path(relative)
-                || !manifest_path_not_gitignored(&self.repo_root, relative)?
-                || path_has_symlink(&self.repo_root, relative)?
-            {
-                continue;
+        let known_specs: HashSet<String> = if validate_known_specs {
+            store
+                .list_contracts(Some(r_uid))?
+                .into_iter()
+                .map(|contract| contract.source_path)
+                .filter(|path| crate::contracts::is_spec_file(path))
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        for source_path in known_specs {
+            #[cfg(test)]
+            known_spec_guard_witness::record(&source_path, false);
+            let relative = Path::new(&source_path);
+            let eligible = (|| -> anyhow::Result<bool> {
+                Ok(reader.accepts_path(relative)
+                    && manifest_path_not_gitignored(&self.repo_root, relative)?
+                    && !path_has_symlink(&self.repo_root, relative)?)
+            })();
+            match eligible {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
             }
             match std::fs::symlink_metadata(self.repo_root.join(relative)) {
                 Err(error)
@@ -943,8 +1001,22 @@ impl CodeWatcher {
                         reason: reason.into(),
                     });
                 }
-                Ok(_) => {
+                Ok(metadata) => {
+                    if metadata.len() > reader.max_source_file_bytes() {
+                        continue;
+                    }
+                    #[cfg(test)]
+                    known_spec_guard_witness::record(&source_path, true);
                     if let Err(reason) = reader.read_file(relative) {
+                        if reason
+                            .downcast_ref::<crate::content_reader::SourceTooLarge>()
+                            .is_some()
+                            || reason
+                                .downcast_ref::<crate::content_reader::BinarySource>()
+                                .is_some()
+                        {
+                            continue;
+                        }
                         return Ok(WatchBatchOutcome::Skipped { reason });
                     }
                 }
@@ -1237,53 +1309,81 @@ impl CodeWatcher {
         );
         self.finalize_graph_publication_with_io(publication, epilogue_io)
             .map_err(anyhow::Error::from)?;
-        if publish_contracts {
-            let mut specs = crate::index::FileMetaCache::new();
-            for (path, hash) in &contract_plan.observed_input_hashes {
-                if !crate::contracts::is_spec_file(path) {
-                    continue;
+        let evidence = (|| -> anyhow::Result<()> {
+            if publish_contracts {
+                let mut specs = crate::index::FileMetaCache::new();
+                for (path, hash) in &contract_plan.observed_input_hashes {
+                    if !crate::contracts::is_spec_file(path) {
+                        continue;
+                    }
+                    let (mtime_nanos, size_bytes) =
+                        reader.file_meta_nanos(Path::new(path))?.ok_or_else(|| {
+                            anyhow::anyhow!("published spec vanished before evidence save: {path}")
+                        })?;
+                    specs.insert(
+                        path.clone(),
+                        crate::index::CachedFileMeta {
+                            mtime_nanos,
+                            size_bytes,
+                            content_hash: hash.clone(),
+                        },
+                    );
                 }
-                let (mtime_nanos, size_bytes) =
-                    reader.file_meta_nanos(Path::new(path))?.ok_or_else(|| {
-                        anyhow::anyhow!("published spec vanished before evidence save: {path}")
-                    })?;
-                specs.insert(
-                    path.clone(),
-                    crate::index::CachedFileMeta {
-                        mtime_nanos,
-                        size_bytes,
-                        content_hash: hash.clone(),
-                    },
+                anyhow::ensure!(
+                    crate::index::watcher_contract_input_snapshot(&reader)?
+                        == contract_plan.observed_input_hashes,
+                    "contract inputs changed before watcher evidence save"
                 );
+                self.save_published_spec_evidence(r_uid, &specs)?;
             }
-            anyhow::ensure!(
-                crate::index::watcher_contract_input_snapshot(&reader)?
-                    == contract_plan.observed_input_hashes,
-                "contract inputs changed before watcher evidence save"
-            );
-            self.save_published_spec_evidence(r_uid, &specs)?;
-        }
 
-        // The batch's fresh parses join the parse cache (its log), so the
-        // whole-graph pass that follows re-reads none of these files.
-        let parses: Vec<(String, crate::parsed_cache::CachedParseResult)> = prepared_paths
-            .iter()
-            .filter_map(|path| match path {
-                PreparedPath::Replace(file) => Some((
-                    file.file.content_hash.clone(),
-                    crate::parsed_cache::CachedParseResult {
-                        symbols: file.raw_symbols.clone(),
-                        references: file.raw_references.clone(),
-                        type_bindings: file.type_bindings.clone(),
-                    },
-                )),
-                PreparedPath::Delete { .. } => None,
-            })
-            .collect();
-        crate::parsed_cache::append_entries(
-            &crate::sidecar_path(&self.db_path, ".parsed_cache.bin"),
-            parses.iter().map(|(hash, entry)| (hash.as_str(), entry)),
-        );
+            // The batch's fresh parses join the parse cache (its log), so the
+            // whole-graph pass that follows re-reads none of these files.
+            let parses: Vec<(String, crate::parsed_cache::CachedParseResult)> = prepared_paths
+                .iter()
+                .filter_map(|path| match path {
+                    PreparedPath::Replace(file) => Some((
+                        file.file.content_hash.clone(),
+                        crate::parsed_cache::CachedParseResult {
+                            symbols: file.raw_symbols.clone(),
+                            references: file.raw_references.clone(),
+                            type_bindings: file.type_bindings.clone(),
+                        },
+                    )),
+                    PreparedPath::Delete { .. } => None,
+                })
+                .collect();
+            crate::parsed_cache::append_entries_checked(
+                &crate::sidecar_path(&self.db_path, ".parsed_cache.bin"),
+                parses.iter().map(|(hash, entry)| (hash.as_str(), entry)),
+            )?;
+            Ok(())
+        })();
+        if let Err(reason) = evidence {
+            {
+                let mut replay = self
+                    .committed_replay_paths
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                replay.extend(relevant.iter().cloned());
+                replay.sort();
+                replay.dedup();
+            }
+            if let Err(error) = self.save_resolution_debt(r_uid, &relevant) {
+                tracing::warn!(%error, "persisting committed watcher replay paths failed");
+            }
+            if let Err(error) = store.set_contract_derivation_failed(
+                r_uid,
+                &format!("committed watcher evidence repair: {reason:#}"),
+            ) {
+                tracing::warn!(%error, "recording committed watcher repair marker failed");
+            }
+            self.record_debt(&relevant, &[], Some(&format!("{reason:#}")));
+            return Ok(WatchBatchOutcome::PublishedPending {
+                files_processed,
+                reason,
+            });
+        }
         Ok(WatchBatchOutcome::Published { files_processed })
     }
 
@@ -1297,8 +1397,10 @@ impl CodeWatcher {
         on_change: Option<&dyn Fn()>,
     ) -> Result<WatchBatchOutcome, anyhow::Error> {
         let outcome = self.process_batch_with_io(store, r_uid, repo_url, relevant, epilogue_io)?;
-        if matches!(outcome, WatchBatchOutcome::Published { .. })
-            && let Some(callback) = on_change
+        if matches!(
+            outcome,
+            WatchBatchOutcome::Published { .. } | WatchBatchOutcome::PublishedPending { .. }
+        ) && let Some(callback) = on_change
         {
             callback();
         }
@@ -1377,6 +1479,11 @@ impl CodeWatcher {
             .list_files()
             .context("list files for code watcher startup reconciliation")?;
         let max_bytes = reader.max_source_file_bytes();
+        let known_spec_paths: HashSet<String> = store
+            .list_contracts(Some(r_uid))?
+            .into_iter()
+            .map(|contract| contract.source_path)
+            .collect();
         let is_policy_skip = |error: &anyhow::Error| {
             error
                 .downcast_ref::<crate::content_reader::BinarySource>()
@@ -1395,9 +1502,22 @@ impl CodeWatcher {
             seen.insert(rel_str.clone());
             let abs_path = self.repo_root.join(&rel_path);
             if crate::contracts::is_spec_file(&abs_path.to_string_lossy()) {
-                let source = reader
-                    .read_file(&rel_path)
-                    .with_context(|| format!("read stopped-window spec {}", rel_path.display()))?;
+                let source = match reader.read_file(&rel_path) {
+                    Ok(source) => source,
+                    Err(error) if is_policy_skip(&error) => {
+                        drift.spec_changed |=
+                            filemeta.contains_key(&rel_str) || known_spec_paths.contains(&rel_str);
+                        if indexed.contains_key(&rel_str) {
+                            drift.replay.push(abs_path);
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("read stopped-window spec {}", rel_path.display())
+                        });
+                    }
+                };
                 let hash = crate::hash::blake3_hex(&source);
                 drift.spec_changed |= filemeta
                     .get(&rel_str)
@@ -1552,7 +1672,43 @@ impl CodeWatcher {
                 }
             }
         }
+        for path in self
+            .committed_replay_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+        {
+            let relative = path
+                .strip_prefix(&self.repo_root)
+                .context("committed watcher replay path escapes repository")?;
+            anyhow::ensure!(
+                relative
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_))),
+                "invalid committed watcher replay path"
+            );
+            if reader.accepts_path(relative) {
+                drift.replay.push(path.clone());
+            }
+        }
+        let resolution_debt = self.resolution_debt_path(r_uid);
+        if resolution_debt.exists() {
+            let paths: Vec<String> = serde_json::from_slice(&std::fs::read(&resolution_debt)?)?;
+            for path in paths {
+                let relative = Path::new(&path);
+                anyhow::ensure!(
+                    relative
+                        .components()
+                        .all(|component| matches!(component, std::path::Component::Normal(_))),
+                    "invalid watcher resolution debt path"
+                );
+                if reader.accepts_path(relative) {
+                    drift.replay.push(self.repo_root.join(relative));
+                }
+            }
+        }
         drift.replay.sort();
+        drift.replay.dedup();
         drift.unreadable.sort();
         Ok(drift)
     }
@@ -1583,6 +1739,10 @@ impl CodeWatcher {
         // owed nothing. The batch would re-create its Repo node (the cold
         // path's `insert_initial_repo`) and rewrite the debt removal cleared.
         if matches!(store.lookup_repo(r_uid), Ok(None)) {
+            self.committed_replay_paths
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
             tracing::info!(
                 repo = %self.repo_root.display(),
                 "CodeWatcher: repo no longer in the graph; dropping its startup reconciliation"
@@ -1612,7 +1772,14 @@ impl CodeWatcher {
                     Ok(WatchBatchOutcome::Skipped { reason }) => {
                         (Some(drift.replay), drift.unreadable, reason)
                     }
+                    Ok(WatchBatchOutcome::PublishedPending { reason, .. }) => {
+                        (Some(drift.replay), drift.unreadable, reason)
+                    }
                     Ok(_) => {
+                        self.committed_replay_paths
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clear();
                         self.record_unindexable_after_replay(store, r_uid, repo_url, &drift.replay);
                         self.record_debt(&[], &drift.unreadable, None);
                         return Ok(None);
@@ -1742,8 +1909,13 @@ impl CodeWatcher {
         }
         let manifest_revision = crate::manifest::manifest_debt_revision(&self.db_path)?;
         let chunks = drift.replay.len().div_ceil(128).max(1);
+        // Once all targets exist, repeat bounded source replacement/resolution
+        // so imports from an earlier chunk can reach new later-chunk symbols.
+        // Persist the whole replay set before its first commit: content hashes
+        // alone cannot recover those edges after interruption between chunks.
+        let total_chunks = if chunks > 1 { chunks * 2 } else { chunks };
         let mut processed = 0;
-        for index in 0..chunks {
+        for index in 0..total_chunks {
             if self.stop_flag.load(Ordering::Acquire) {
                 return Err(WatchMutationRefused.into());
             }
@@ -1752,15 +1924,16 @@ impl CodeWatcher {
             if store.lookup_repo(r_uid)?.is_none() {
                 return Ok(WatchBatchOutcome::Unchanged);
             }
-            let last = index + 1 == chunks;
+            let last = index + 1 == total_chunks;
             if index == 0 && chunks > 1 && contract_plan.is_some() {
+                self.save_resolution_debt(r_uid, &drift.replay)?;
                 store.set_contract_derivation_failed(
                     r_uid,
                     "bounded startup source replay is in progress",
                 )?;
             }
             if let Some(plan) = &contract_plan {
-                let start = (index * 128).min(drift.replay.len());
+                let start = ((index % chunks) * 128).min(drift.replay.len());
                 let end = (start + 128).min(drift.replay.len());
                 match self.process_batch_with_plan(
                     store,
@@ -1770,6 +1943,7 @@ impl CodeWatcher {
                     &crate::index::FileSystemIndexEpilogueIo,
                     Some(plan),
                     last,
+                    index == 0,
                     || {},
                 )? {
                     WatchBatchOutcome::Published { files_processed } => {
@@ -1778,6 +1952,12 @@ impl CodeWatcher {
                     WatchBatchOutcome::Skipped { reason } => {
                         return Ok(WatchBatchOutcome::Skipped { reason });
                     }
+                    pending @ WatchBatchOutcome::PublishedPending { .. } => {
+                        if let Some(callback) = on_change {
+                            callback();
+                        }
+                        return Ok(pending);
+                    }
                     other => return Ok(other),
                 }
             } else {
@@ -1785,6 +1965,11 @@ impl CodeWatcher {
                 let publication = self.establish_graph_publication_with_io(store, &io)?;
                 reject_recovered_publication(&publication)?;
                 self.finalize_graph_publication_with_io(publication, &io)?;
+            }
+            // The source generation is already committed and finalized. Later
+            // manifest evidence may fail, but must not suppress this event.
+            if let Some(callback) = on_change {
+                callback();
             }
             if last && let (Some(captured), Some(predecessor)) = (&manifest_capture, &predecessor) {
                 let strict_reader = self.reader_for(repo_url)?.strict_enumeration();
@@ -1830,14 +2015,48 @@ impl CodeWatcher {
                     )?;
                 }
             }
-            if let Some(callback) = on_change {
-                callback();
-            }
             // The lease drops here; shutdown is checked before the next chunk.
         }
+        nestweaver_store::durable_sidecar::remove_file_durable_if_exists(
+            &self.resolution_debt_path(r_uid),
+        )?;
         Ok(WatchBatchOutcome::Published {
             files_processed: processed,
         })
+    }
+
+    fn resolution_debt_path(&self, r_uid: &str) -> PathBuf {
+        crate::sidecar_path(
+            &self.db_path,
+            &format!(
+                ".watch-code-resolution-{}.json",
+                crate::hash::blake3_hex(r_uid)
+            ),
+        )
+    }
+
+    fn save_resolution_debt(&self, r_uid: &str, replay: &[PathBuf]) -> anyhow::Result<()> {
+        let path = self.resolution_debt_path(r_uid);
+        let mut paths: Vec<String> = if path.exists() {
+            serde_json::from_slice(&std::fs::read(&path)?)?
+        } else {
+            Vec::new()
+        };
+        paths.extend(
+            replay
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(&self.repo_root)
+                        .map(|relative| relative.to_string_lossy().into_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        paths.sort();
+        paths.dedup();
+        nestweaver_store::durable_sidecar::atomic_replace_file(&path, |file| {
+            serde_json::to_writer(file, &paths).map_err(std::io::Error::other)
+        })?;
+        Ok(())
     }
 
     fn save_published_spec_evidence(
@@ -2372,7 +2591,151 @@ fn reject_recovered_publication(
 }
 
 #[cfg(test)]
+mod known_spec_guard_witness {
+    use std::cell::RefCell;
+    thread_local! {
+        static COUNTS: RefCell<std::collections::HashMap<String, (usize, usize)>> = RefCell::new(std::collections::HashMap::new());
+    }
+    pub(super) fn record(path: &str, read: bool) {
+        COUNTS.with(|counts| {
+            let mut counts = counts.borrow_mut();
+            let row = counts.entry(path.to_owned()).or_default();
+            if read {
+                row.1 += 1;
+            } else {
+                row.0 += 1;
+            }
+        });
+    }
+    pub(super) fn reset() {
+        COUNTS.with(|counts| counts.borrow_mut().clear());
+    }
+    pub(super) fn counts(path: &str) -> (usize, usize) {
+        COUNTS.with(|counts| counts.borrow().get(path).copied().unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    struct EditSpecAfterCommitIo {
+        spec: PathBuf,
+    }
+    impl crate::index::IndexEpilogueIo for EditSpecAfterCommitIo {
+        fn establish_marker(&self, path: &Path) -> anyhow::Result<()> {
+            crate::index::FileSystemIndexEpilogueIo.establish_marker(path)
+        }
+        fn clear_marker(&self, path: &Path) -> anyhow::Result<()> {
+            crate::index::FileSystemIndexEpilogueIo.clear_marker(path)?;
+            std::fs::write(
+                &self.spec,
+                "openapi: 3.0.0\ninfo: { title: t, version: '1' }\npaths:\n  /after-commit:\n    post:\n      responses: { '200': { description: ok } }\n",
+            )?;
+            Ok(())
+        }
+        fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+            crate::index::FileSystemIndexEpilogueIo.remove_file(path)
+        }
+        fn rename_file(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            crate::index::FileSystemIndexEpilogueIo.rename_file(from, to)
+        }
+        fn save_generation(
+            &self,
+            store: &GraphStore,
+            path: &Path,
+            generation: u64,
+        ) -> anyhow::Result<()> {
+            crate::index::FileSystemIndexEpilogueIo.save_generation(store, path, generation)
+        }
+        fn compute_pagerank(
+            &self,
+            lease: &nestweaver_store::IndexPublicationLease<'_>,
+            scope: &nestweaver_store::GraphScope,
+        ) -> anyhow::Result<()> {
+            crate::index::FileSystemIndexEpilogueIo.compute_pagerank(lease, scope)
+        }
+        fn save_pagerank(
+            &self,
+            lease: &nestweaver_store::IndexPublicationLease<'_>,
+            path: &Path,
+        ) -> anyhow::Result<()> {
+            crate::index::FileSystemIndexEpilogueIo.save_pagerank(lease, path)
+        }
+    }
+
+    #[test]
+    fn postcommit_spec_race_notifies_publication_and_remains_recoverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, uid, repo_url, root) = index_contract_fixture(&dir);
+        let watcher = CodeWatcher::new(dir.path().join("watch.lbug"), &root, "test");
+        let controller = root.join("ItemsController.java");
+        std::fs::write(&controller, "@RestController\n@RequestMapping(\"/v1/items\")\npublic class ItemsController { @GetMapping public void committedEdit() {} }\n").unwrap();
+        let before = store.graph_generation();
+        let notifications = std::sync::atomic::AtomicUsize::new(0);
+        let result = watcher.process_batch_and_notify(
+            &store,
+            &uid,
+            &repo_url,
+            std::slice::from_ref(&controller),
+            &EditSpecAfterCommitIo {
+                spec: root.join("openapi.yaml"),
+            },
+            Some(&|| {
+                notifications.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+        assert!(
+            store.graph_generation() > before,
+            "fixture must race after actual commit"
+        );
+        assert!(!store.is_index_publication_dirty());
+        assert!(repo_symbol_names(&store, &uid).contains("committedEdit"));
+        assert!(
+            result.is_ok(),
+            "postcommit input race must not terminate the live batch: {result:?}"
+        );
+        assert_eq!(
+            notifications.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "clean committed graph gets exactly one event even while evidence repair is owed"
+        );
+        assert!(
+            watcher
+                .startup_drift(&store, &uid, &repo_url)
+                .unwrap()
+                .spec_changed,
+            "fresh spec remains owed rather than falsely stamped current"
+        );
+        assert!(
+            watcher
+                .attempt_reconciliation(&store, &uid, &repo_url, None, 0)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .list_contracts(Some(&uid))
+                .unwrap()
+                .iter()
+                .any(|c| c.uid.ends_with(":http:POST:/after-commit"))
+        );
+        std::fs::write(
+            &controller,
+            "public class ItemsController { public void nextEdit() {} }\n",
+        )
+        .unwrap();
+        let next = watcher
+            .process_batch_and_notify(
+                &store,
+                &uid,
+                &repo_url,
+                &[controller],
+                &crate::index::FileSystemIndexEpilogueIo,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(next, WatchBatchOutcome::Published { .. }));
+        assert!(repo_symbol_names(&store, &uid).contains("nextEdit"));
+    }
     use super::*;
 
     struct FailingGenerationPublicationIo;
@@ -4697,9 +5060,17 @@ mod tests {
         let watcher = CodeWatcher::new(&db, &root, "test");
         let repo_url = format!("file://{}", root.display());
         let drift = watcher.startup_drift(&store, &uid, &repo_url).unwrap();
+        assert!(!drift.spec_changed);
+        for (path, hash) in store.list_file_hashes_by_repo(&uid).unwrap() {
+            assert_eq!(
+                crate::hash::blake3_hex(&std::fs::read_to_string(root.join(&path)).unwrap()),
+                hash,
+                "no source content drift remains to trigger recovery: {path}"
+            );
+        }
         assert!(
-            drift.replay.is_empty() && !drift.spec_changed,
-            "no file edit remains to trigger recovery"
+            !drift.replay.is_empty(),
+            "durable resolution debt survives cancellation even with current content hashes"
         );
         assert!(
             watcher
@@ -4819,7 +5190,13 @@ mod tests {
                     std::fs::create_dir(&evidence).unwrap();
                 },
             )
-            .expect_err("only the post-commit evidence save is obstructed");
+            .expect("committed evidence failure must preserve the live watcher");
+        let WatchBatchOutcome::PublishedPending {
+            reason: failure, ..
+        } = failure
+        else {
+            panic!("obstructed postcommit evidence must remain explicitly owed");
+        };
         assert!(
             failure.to_string().contains("filemeta") || failure.to_string().contains("directory"),
             "{failure:#}"
@@ -4911,6 +5288,535 @@ mod tests {
             replayed > 0 && replayed <= 128,
             "one bounded lease may ingest at most 128 paths before stop: {replayed}"
         );
+    }
+
+    #[test]
+    fn startup_oversized_spec_does_not_block_unrelated_source_convergence() {
+        for previously_indexed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let spec = "openapi: 3.0.0\ninfo: { title: t, version: '1' }\npaths:\n  /old:\n    get:\n      responses: { '200': { description: ok } }\n";
+            let extras: Vec<(&str, &str)> = if previously_indexed {
+                vec![("openapi.yaml", spec)]
+            } else {
+                Vec::new()
+            };
+            let (db, root, uid) = index_fixture_repo_on_disk(&dir, &extras);
+            let store = Arc::new(GraphStore::open_or_create(&db).unwrap());
+            assert_eq!(
+                store
+                    .list_contracts(Some(&uid))
+                    .unwrap()
+                    .iter()
+                    .filter(|contract| contract.source_path == "openapi.yaml")
+                    .count(),
+                usize::from(previously_indexed),
+                "indexed case must start with a real spec contract"
+            );
+            std::fs::write(
+                root.join("openapi.yaml"),
+                "x".repeat(crate::index_limits::DEFAULT_MAX_SOURCE_FILE_BYTES as usize + 1),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("src/a.js"),
+                "export function helper() { return 99; }\n",
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("src/new.js"),
+                "export function addedAfterStop() {}\n",
+            )
+            .unwrap();
+            std::fs::remove_file(root.join("src/c.js")).unwrap();
+            let watcher = CodeWatcher::new(&db, &root, "test");
+            let pending = watcher
+                .attempt_reconciliation(
+                    &store,
+                    &uid,
+                    &format!("file://{}", root.display()),
+                    None,
+                    0,
+                )
+                .unwrap();
+            assert!(
+                pending.is_none(),
+                "policy-excluded spec must not keep all startup edits owed (indexed={previously_indexed})"
+            );
+            let names = repo_symbol_names(&store, &uid);
+            assert!(names.contains("addedAfterStop"));
+            assert!(!names.contains("gamma"));
+            assert!(
+                store
+                    .list_contracts(Some(&uid))
+                    .unwrap()
+                    .iter()
+                    .all(|contract| contract.source_path != "openapi.yaml"),
+                "policy-excluded spec must retract its old contracts"
+            );
+            let (_, fresh) = crate::index::index_directory_in_memory(
+                &root,
+                "test",
+                &format!("file://{}", root.display()),
+                "fresh",
+            )
+            .unwrap();
+            let helper = store
+                .lookup_symbol(&uid_of(&store, &uid, "helper"))
+                .unwrap();
+            let expected = fresh
+                .lookup_symbol(&uid_of(&fresh, &uid, "helper"))
+                .unwrap();
+            assert_eq!(
+                helper.content_hash, expected.content_hash,
+                "stopped-window edit must match fresh indexing"
+            );
+            assert_eq!(
+                code_startup_batches(&db, &root, &store),
+                0,
+                "excluded spec must not cause perpetual replay"
+            );
+        }
+    }
+
+    #[test]
+    fn known_spec_guard_checks_each_unique_input_once_and_retries_git_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut spec = String::from("openapi: 3.0.0\ninfo: { title: t, version: '1' }\npaths:\n");
+        for i in 0..400 {
+            spec.push_str(&format!(
+                "  /operation/{i}:\n    get:\n      responses: {{ '200': {{ description: ok }} }}\n"
+            ));
+        }
+        std::fs::write(root.join("openapi.yaml"), spec).unwrap();
+        std::fs::write(
+            root.join("helper.js"),
+            "export function helper() { return 1; }\n",
+        )
+        .unwrap();
+        let root = root.canonicalize().unwrap();
+        let repo_url = format!("file://{}", root.display());
+        let (_, store) =
+            crate::index::index_directory_in_memory(&root, "test", &repo_url, "initial").unwrap();
+        let uid = nestweaver_schema::repo_uid("test", &repo_url);
+        assert_eq!(
+            store.list_contracts(Some(&uid)).unwrap().len(),
+            400,
+            "actual contract population precondition"
+        );
+        let watcher = CodeWatcher::new(dir.path().join("watch.lbug"), &root, "test");
+        let reader = watcher.reader_for(&repo_url).unwrap();
+        for prepared in [false, true] {
+            std::fs::write(
+                root.join("helper.js"),
+                format!(
+                    "export function helper() {{ return {}; }}\n",
+                    if prepared { 3 } else { 2 }
+                ),
+            )
+            .unwrap();
+            let plan = crate::index::prepare_watcher_contract_derivation(&reader, &uid, &repo_url)
+                .unwrap();
+            known_spec_guard_witness::reset();
+            let outcome = watcher
+                .process_batch_with_plan(
+                    &store,
+                    &uid,
+                    &repo_url,
+                    &[root.join("helper.js")],
+                    &crate::index::FileSystemIndexEpilogueIo,
+                    prepared.then_some(&plan),
+                    true,
+                    true,
+                    || {},
+                )
+                .unwrap();
+            assert!(matches!(outcome, WatchBatchOutcome::Published { .. }));
+            assert_eq!(
+                known_spec_guard_witness::counts("openapi.yaml"),
+                (1, 1),
+                "one unique spec admission/read, including shared prepared plan"
+            );
+        }
+        // An incomplete Git directory represents a transiently unavailable
+        // repository boundary without altering PATH or another test's environment.
+        std::fs::create_dir(root.join(".git")).unwrap();
+        let outcome = watcher
+            .process_batch_with_io(
+                &store,
+                &uid,
+                &repo_url,
+                &[root.join("helper.js")],
+                &crate::index::FileSystemIndexEpilogueIo,
+            )
+            .expect("Git admission failure must remain a retryable batch outcome");
+        assert!(matches!(outcome, WatchBatchOutcome::Skipped { .. }));
+    }
+
+    #[test]
+    fn postcommit_parse_cache_failure_notifies_and_replays_after_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+        let store = Arc::new(GraphStore::open_or_create(&db).unwrap());
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        let cache = crate::sidecar_path(&db, ".parsed_cache.bin");
+        let log = crate::parsed_cache::log_path(&cache);
+        if log.exists() {
+            std::fs::remove_file(&log).unwrap();
+        }
+        crate::parsed_cache::forget_log_length(&cache);
+        std::fs::create_dir(&log).unwrap();
+        let helper = root.join("src/a.js");
+        let source = "export function helper() { return 101; }\n";
+        std::fs::write(&helper, source).unwrap();
+        let notifications = std::sync::atomic::AtomicUsize::new(0);
+        let outcome = watcher
+            .process_batch_and_notify(
+                &store,
+                &uid,
+                &format!("file://{}", root.display()),
+                &[helper],
+                &crate::index::FileSystemIndexEpilogueIo,
+                Some(&|| {
+                    notifications.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            WatchBatchOutcome::PublishedPending { .. }
+        ));
+        assert!(!store.is_index_publication_dirty());
+        assert_eq!(notifications.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(watcher.resolution_debt_path(&uid).exists());
+        std::fs::remove_dir(&log).unwrap();
+        assert!(
+            watcher
+                .attempt_reconciliation(
+                    &store,
+                    &uid,
+                    &format!("file://{}", root.display()),
+                    None,
+                    0
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(!watcher.resolution_debt_path(&uid).exists());
+        let parsed = crate::parsed_cache::ParsedCache::load(&cache);
+        assert!(
+            parsed.get(&crate::hash::blake3_hex(source)).is_some(),
+            "recovery must repair missing parse evidence despite current graph content hash"
+        );
+    }
+
+    #[test]
+    fn postcommit_evidence_debt_persistence_failure_keeps_retry_paths_after_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+        let store = Arc::new(GraphStore::open_or_create(&db).unwrap());
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        let cache = crate::sidecar_path(&db, ".parsed_cache.bin");
+        let log = crate::parsed_cache::log_path(&cache);
+        if log.exists() {
+            std::fs::remove_file(&log).unwrap();
+        }
+        crate::parsed_cache::forget_log_length(&cache);
+        std::fs::create_dir(&log).unwrap();
+        let debt = watcher.resolution_debt_path(&uid);
+        std::fs::create_dir(&debt).unwrap();
+        let helper = root.join("src/a.js");
+        let source = "export function helper() { return 202; }\n";
+        std::fs::write(&helper, source).unwrap();
+        let repo_url = format!("file://{}", root.display());
+        let notifications = std::sync::atomic::AtomicUsize::new(0);
+        let outcome = watcher
+            .process_batch_and_notify(
+                &store,
+                &uid,
+                &repo_url,
+                &[helper],
+                &crate::index::FileSystemIndexEpilogueIo,
+                Some(&|| {
+                    notifications.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            WatchBatchOutcome::PublishedPending { .. }
+        ));
+        assert!(!store.is_index_publication_dirty());
+        assert_eq!(notifications.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            store
+                .list_file_hashes_by_repo(&uid)
+                .unwrap()
+                .into_iter()
+                .find(|(path, _)| path == "src/a.js")
+                .unwrap()
+                .1,
+            crate::hash::blake3_hex(source),
+            "committed content hash precondition"
+        );
+        assert!(
+            watcher
+                .attempt_reconciliation(&store, &uid, &repo_url, None, 0)
+                .unwrap()
+                .is_some(),
+            "actual obstruction must keep repair owed across a retry"
+        );
+        std::fs::remove_dir(&log).unwrap();
+        std::fs::remove_dir(&debt).unwrap();
+        assert!(
+            watcher
+                .attempt_reconciliation(&store, &uid, &repo_url, None, 1)
+                .unwrap()
+                .is_none()
+        );
+        let parsed = crate::parsed_cache::ParsedCache::load(&cache);
+        assert!(
+            parsed.get(&crate::hash::blake3_hex(source)).is_some(),
+            "retry memory must repair parse evidence after persistence failure despite current source hash"
+        );
+        assert!(
+            watcher
+                .startup_drift(&store, &uid, &repo_url)
+                .unwrap()
+                .replay
+                .is_empty(),
+            "successful repair clears both durable and in-memory replay debt"
+        );
+    }
+
+    #[test]
+    fn cold_watcher_repairs_committed_cache_debt_without_another_source_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let source = "export function coldHelper() { return 303; }\n";
+        std::fs::write(root.join("helper.js"), source).unwrap();
+        let db = dir.path().join("graph.lbug");
+        let store = Arc::new(GraphStore::open_or_create(&db).unwrap());
+        let cache = crate::sidecar_path(&db, ".parsed_cache.bin");
+        let log = crate::parsed_cache::log_path(&cache);
+        std::fs::create_dir(&log).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let watcher = CodeWatcher::new(&db, &root, "test")
+            .with_reconcile_retry_base(Duration::from_millis(20))
+            .with_ready_callback(move || {
+                let _ = ready_tx.send(());
+            });
+        let stop = watcher.shutdown_handle();
+        let notifications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let published_generations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_generations = Arc::clone(&published_generations);
+        let observed_store = Arc::clone(&store);
+        let count = Arc::clone(&notifications);
+        let running = Arc::clone(&store);
+        let handle = std::thread::spawn(move || {
+            watcher.run_with_store(
+                running,
+                Some(Box::new(move || {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    observed_generations
+                        .lock()
+                        .unwrap()
+                        .push(observed_store.graph_generation());
+                })),
+            )
+        });
+        let ready = ready_rx.recv_timeout(Duration::from_secs(10));
+        if ready.is_err() {
+            stop.stop();
+            let result = handle.join();
+            panic!("cold watcher never became ready: {ready:?}, {result:?}");
+        }
+        let uid = nestweaver_schema::repo_uid("test", &format!("file://{}", root.display()));
+        let committed = repo_symbol_names(&store, &uid).contains("coldHelper");
+        // The obstruction is outside the subscribed source tree. Its removal
+        // cannot supply the source event that formerly hid this retry hole.
+        std::fs::remove_dir(&log).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let hash = crate::hash::blake3_hex(source);
+        let mut repaired = false;
+        while Instant::now() < deadline && !handle.is_finished() {
+            if crate::parsed_cache::ParsedCache::load(&cache)
+                .get(&hash)
+                .is_some()
+            {
+                repaired = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        stop.stop();
+        let result = handle.join().unwrap();
+        assert!(
+            committed,
+            "initial graph must really commit before readiness"
+        );
+        assert!(notifications.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        let generations = published_generations.lock().unwrap();
+        let first = generations.first().unwrap();
+        assert_eq!(
+            generations
+                .iter()
+                .filter(|generation| *generation == first)
+                .count(),
+            1,
+            "initial clean publication is notified exactly once, independently of subsequent repair commits"
+        );
+        assert!(
+            result.is_ok(),
+            "watcher remains alive until explicit stop: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("helper.js")).unwrap(),
+            source
+        );
+        assert!(
+            repaired,
+            "cold committed evidence debt must retry while idle, without another source edit"
+        );
+    }
+
+    #[test]
+    fn startup_manifest_save_failure_still_notifies_its_committed_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+        let store = Arc::new(GraphStore::open_or_create(&db).unwrap());
+        assert!(
+            crate::manifest::current_manifest_snapshot(&store, &db).is_ok(),
+            "real valid manifest predecessor precondition"
+        );
+        std::fs::write(
+            root.join("src/a.js"),
+            "export function helper() { return 404; }\n",
+        )
+        .unwrap();
+        let manifest = crate::manifest::manifest_cache_path(&db);
+        let mut watcher = CodeWatcher::new(&db, &root, "test");
+        watcher.contract_plan_observer = Some(Arc::new(move || {
+            std::fs::remove_file(&manifest).unwrap();
+            std::fs::create_dir(&manifest).unwrap();
+        }));
+        let before = store.graph_generation();
+        let notifications = std::sync::atomic::AtomicUsize::new(0);
+        let pending = watcher
+            .attempt_reconciliation(
+                &store,
+                &uid,
+                &format!("file://{}", root.display()),
+                Some(&|| {
+                    notifications.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }),
+                0,
+            )
+            .unwrap();
+        assert!(
+            pending.is_some(),
+            "actual manifest obstruction remains owed"
+        );
+        assert!(
+            store.graph_generation() > before,
+            "source graph really committed before failing manifest save"
+        );
+        assert!(!store.is_index_publication_dirty());
+        assert_eq!(
+            notifications.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "fallible manifest epilogue must not suppress the clean committed graph event"
+        );
+    }
+
+    #[test]
+    fn startup_cross_chunk_new_imports_match_fresh_graph_without_duplicate_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+        let store = Arc::new(GraphStore::open_or_create(&db).unwrap());
+        std::fs::write(root.join("src/000_caller.js"), "import { lateTarget } from './zzz_target.js';\nexport function earlyCaller() { return lateTarget(); }\n").unwrap();
+        for i in 0..128 {
+            std::fs::write(
+                root.join(format!("src/filler_{i:03}.js")),
+                format!("export function filler_{i}() {{ return {i}; }}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(root.join("src/zzz_target.js"), "import { earlyCaller } from './000_caller.js';\nexport function lateTarget() { return earlyCaller(); }\n").unwrap();
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        let repo_url = format!("file://{}", root.display());
+        let drift = watcher.startup_drift(&store, &uid, &repo_url).unwrap();
+        assert!(drift.replay.len() > 128);
+        assert!(drift.replay[0].ends_with("000_caller.js"));
+        assert!(drift.replay.last().unwrap().ends_with("zzz_target.js"));
+        struct StopAfterLease(ShutdownHandle);
+        impl Drop for StopAfterLease {
+            fn drop(&mut self) {
+                self.0.stop();
+            }
+        }
+        let paused = CodeWatcher::new(&db, &root, "test");
+        let stop = paused.shutdown_handle();
+        let factory: WatchMutationLeaseFactory = Arc::new(move |_| {
+            Ok(Box::new(StopAfterLease(stop.clone())) as Box<dyn WatchMutationLease>)
+        });
+        let paused = paused.with_mutation_lease_factory(factory);
+        assert!(
+            paused
+                .attempt_reconciliation(&store, &uid, &repo_url, None, 0)
+                .is_err()
+        );
+        assert!(
+            repo_symbol_names(&store, &uid).contains("earlyCaller"),
+            "first bounded chunk really committed before stop"
+        );
+        assert_eq!(
+            store
+                .callees_of(&uid_of(&store, &uid, "earlyCaller"))
+                .unwrap()
+                .iter()
+                .filter(|symbol| symbol.name == "lateTarget")
+                .count(),
+            0
+        );
+        let resumed = watcher.startup_drift(&store, &uid, &repo_url).unwrap();
+        assert!(
+            resumed
+                .replay
+                .iter()
+                .any(|path| path.ends_with("000_caller.js")),
+            "durable resolution debt restores earlier caller despite current source hash"
+        );
+        assert!(
+            watcher
+                .attempt_reconciliation(&store, &uid, &repo_url, None, 0)
+                .unwrap()
+                .is_none()
+        );
+        let (_, fresh) =
+            crate::index::index_directory_in_memory(&root, "test", &repo_url, "fresh").unwrap();
+        for (caller, target) in [("earlyCaller", "lateTarget"), ("lateTarget", "earlyCaller")] {
+            let expected = fresh.callees_of(&uid_of(&fresh, &uid, caller)).unwrap();
+            assert_eq!(
+                expected.iter().filter(|s| s.name == target).count(),
+                1,
+                "fresh graph precondition"
+            );
+            let actual = store.callees_of(&uid_of(&store, &uid, caller)).unwrap();
+            assert_eq!(
+                actual.iter().filter(|s| s.name == target).count(),
+                1,
+                "cross-chunk edge must exist exactly once: {caller}->{target}"
+            );
+            assert_eq!(
+                actual.into_iter().map(|s| s.uid).collect::<HashSet<_>>(),
+                expected.into_iter().map(|s| s.uid).collect::<HashSet<_>>()
+            );
+        }
+        assert_eq!(code_startup_batches(&db, &root, &store), 0);
     }
 
     fn repo_symbol_names(store: &GraphStore, r_uid: &str) -> HashSet<String> {

@@ -118,7 +118,8 @@ pub enum ReferenceKind {
     /// specifier — `isEmpty` in `import { isEmpty } from 'lodash'` or
     /// `const { isEmpty } = require('lodash')`. `name` is the local binding,
     /// `context` the specifier. Resolution ignores it; the cross-repo name
-    /// matcher uses it to leave npm-package calls unattributed.
+    /// matcher uses it to leave npm-package calls unattributed. Go uses this
+    /// fact for the declared package name, distinguishing external test packages.
     PackageBinding,
     Extends,
     Implements,
@@ -161,8 +162,21 @@ pub struct RawSymbol {
     pub scope_chain: Option<String>,
 }
 
+/// Byte positions for JS/TS lexical binding selection, including same-line scopes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexicalScope {
+    pub start: usize,
+    pub end: usize,
+    pub position: usize,
+    pub initialized_at: usize,
+    #[serde(default)]
+    pub hoisted_var: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawReference {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<LexicalScope>,
     pub name: String,
     pub kind: ReferenceKind,
     pub start_line: u32,
@@ -182,6 +196,8 @@ pub enum AstBindingKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AstTypeBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<LexicalScope>,
     pub var_name: String,
     pub type_name: String,
     pub line: u32,
@@ -724,9 +740,10 @@ fn expand_rust_use_tree(
 ) {
     let text = node.utf8_text(source).unwrap_or("").trim();
     match node.kind() {
-        "identifier" | "scoped_identifier" | "crate" => {
+        "identifier" | "scoped_identifier" | "crate" | "super" => {
             if !text.is_empty() {
                 references.push(RawReference {
+                    scope: None,
                     name: format!("{prefix}{text}"),
                     kind: ReferenceKind::Import,
                     start_line: node.start_position().row as u32 + 1,
@@ -738,6 +755,7 @@ fn expand_rust_use_tree(
         // `use a::b::{self, c};` — `self` imports the path `a::b` itself.
         "self" if !prefix.is_empty() => {
             references.push(RawReference {
+                scope: None,
                 name: prefix.trim_end_matches("::").to_string(),
                 kind: ReferenceKind::Import,
                 start_line: node.start_position().row as u32 + 1,
@@ -761,6 +779,7 @@ fn expand_rust_use_tree(
                     if !alias_text.is_empty() {
                         let specifier = references[before].name.clone();
                         references.push(RawReference {
+                            scope: None,
                             name: alias_text.to_string(),
                             kind: ReferenceKind::ImportAlias,
                             start_line: node.start_position().row as u32 + 1,
@@ -844,7 +863,21 @@ fn infer_visibility(name: &str, node_text: &str, lang: Language, exported: bool)
         | Language::Svelte
         | Language::Astro => {
             let sig = first_line(node_text);
-            if exported || sig.contains("export ") {
+            if (matches!(
+                sig.split_whitespace().next(),
+                Some("private" | "protected" | "static")
+            ) && sig
+                .split('(')
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .rev()
+                .skip(1)
+                .any(|token| matches!(token, "private" | "protected")))
+                || name.starts_with('#')
+            {
+                Visibility::Private
+            } else if exported || sig.contains("export ") {
                 Visibility::Public
             } else {
                 Visibility::Private
@@ -1261,6 +1294,17 @@ fn find_parent_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
                     .map(|s| s.to_string());
             }
             // JS/TS/Java/C#/Dart/PHP/Python/Ruby: class Name { ... }
+            "object" => {
+                if let Some(declaration) = parent
+                    .parent()
+                    .filter(|node| node.kind() == "variable_declarator")
+                {
+                    return declaration
+                        .child_by_field_name("name")
+                        .and_then(|name| name.utf8_text(source).ok())
+                        .map(str::to_string);
+                }
+            }
             "class_declaration" | "class_definition" => {
                 return parent
                     .child_by_field_name("name")
@@ -1680,9 +1724,16 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 // JS/TS test-runner block (test/it/describe). The calls inside its
                 // callback attach to this symbol; mark it a test entry point so it
                 // is reachable by regression-test selection regardless of filename.
-                let ep_kind = if exported_locals.contains(name.as_str())
+                let ep_kind = if (exported_locals.contains(name.as_str())
+                    || has_export_ancestor(&node))
                     && is_local_runtime_declaration(node)
-                {
+                    || (is_commonjs_export_assignment(lang, node, source_bytes)
+                        && node.parent().is_some_and(|parent| {
+                            parent.kind() == "expression_statement"
+                                && parent
+                                    .parent()
+                                    .is_some_and(|module| module.kind() == "program")
+                        })) {
                     Some(EntryPointKind::Main)
                 } else if node.kind() == "call_expression" {
                     Some(EntryPointKind::TestEntry)
@@ -1755,6 +1806,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 let kind = match kind_str {
                     "call" => ReferenceKind::Call,
                     "import" => ReferenceKind::Import,
+                    "package" => ReferenceKind::PackageBinding,
                     "extends" => ReferenceKind::Extends,
                     "implements" => ReferenceKind::Implements,
                     "includes" => ReferenceKind::Includes,
@@ -1963,6 +2015,11 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 };
 
                 references.push(RawReference {
+                    scope: if matches!(lang, Language::JavaScript | Language::TypeScript) {
+                        lexical_scope(node)
+                    } else {
+                        None
+                    },
                     name,
                     kind,
                     start_line,
@@ -1977,6 +2034,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     // Preserve exact import bindings as well as package exclusions.
     if matches!(lang, Language::JavaScript | Language::TypeScript) {
         collect_js_import_bindings(tree.root_node(), source_bytes, &mut references);
+        annotate_js_export_receivers(tree.root_node(), source_bytes, &references, &mut symbols);
     }
     if lang == Language::Python {
         collect_python_import_bindings(tree.root_node(), source_bytes, &mut references);
@@ -1988,7 +2046,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     }
 
     // nw-724: parameters and local declarations shadow same-named symbols.
-    collect_local_bindings(tree.root_node(), source_bytes, &mut references);
+    collect_local_bindings(tree.root_node(), source_bytes, &mut references, lang);
 
     // nw-291 follow-up: recover constant/static reads written as a bare name.
     if let Some(rules) = constant_read_rules(lang) {
@@ -2658,6 +2716,7 @@ fn collect_calls_in_token_tree(
                 // bare call. The receiver is the tokens before the `.` or
                 // `::`, so the resolver can refuse an unrelated `fn len`.
                 references.push(RawReference {
+                    scope: None,
                     name: name.to_string(),
                     kind: if macro_call {
                         ReferenceKind::Macro
@@ -2698,7 +2757,9 @@ fn token_tree_receiver(
         return None;
     }
     let separator = children[index - 1].kind();
-    let method = separator == "." || separator == "::" || separator == ":";
+    let method = separator == "."
+        || separator == "::"
+        || (separator == ":" && index >= 2 && children[index - 2].kind() == ":");
     if !method {
         return None;
     }
@@ -2745,11 +2806,12 @@ fn collect_local_bindings(
     root: tree_sitter::Node<'_>,
     source_bytes: &[u8],
     references: &mut Vec<RawReference>,
+    lang: Language,
 ) {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if is_local_binding_site(node.kind()) {
-            emit_binding_names(node, source_bytes, references);
+            emit_binding_names(node, source_bytes, references, lang);
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
@@ -2762,6 +2824,7 @@ fn is_local_binding_site(kind: &str) -> bool {
     matches!(
         kind,
         "parameter"
+            | "parameters"
             | "formal_parameters"
             | "formal_parameter"
             | "required_parameter"
@@ -2782,6 +2845,7 @@ fn emit_binding_names(
     node: tree_sitter::Node<'_>,
     source_bytes: &[u8],
     references: &mut Vec<RawReference>,
+    lang: Language,
 ) {
     let root = match node.kind() {
         "let_declaration" | "for_expression" => node.child_by_field_name("pattern"),
@@ -2800,9 +2864,18 @@ fn emit_binding_names(
         // pattern on the left so helper() in `arg = helper()` remains a use.
         if matches!(
             current.kind(),
-            "assignment_pattern" | "object_assignment_pattern"
+            "assignment_pattern"
+                | "object_assignment_pattern"
+                | "required_parameter"
+                | "optional_parameter"
+                | "default_parameter"
+                | "typed_default_parameter"
         ) {
-            if let Some(left) = current.child_by_field_name("left") {
+            if let Some(left) = current
+                .child_by_field_name("left")
+                .or_else(|| current.child_by_field_name("pattern"))
+                .or_else(|| current.child_by_field_name("name"))
+            {
                 stack.push(left);
             }
             continue;
@@ -2812,6 +2885,11 @@ fn emit_binding_names(
             && is_bindable_name(name)
         {
             references.push(RawReference {
+                scope: if matches!(lang, Language::JavaScript | Language::TypeScript) {
+                    lexical_scope(current)
+                } else {
+                    None
+                },
                 name: name.to_string(),
                 kind: ReferenceKind::LocalBinding,
                 start_line: current.start_position().row as u32 + 1,
@@ -2825,6 +2903,52 @@ fn emit_binding_names(
             stack.push(child);
         }
     }
+}
+
+fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
+    let mut current = Some(node);
+    let mut function_scoped = false;
+    let mut hoisted_var = false;
+    let mut initialized_at = node.start_byte();
+    while let Some(parent) = current {
+        if parent.kind() == "variable_declarator" {
+            initialized_at = parent.end_byte();
+        }
+        if parent.kind() == "variable_declaration" {
+            function_scoped = true;
+            hoisted_var = true;
+        }
+        if matches!(
+            parent.kind(),
+            "formal_parameters" | "required_parameter" | "optional_parameter"
+        ) {
+            function_scoped = true;
+        }
+        if matches!(
+            parent.kind(),
+            "function_declaration" | "function_expression" | "arrow_function" | "method_definition"
+        ) && function_scoped
+        {
+            return Some(LexicalScope {
+                start: parent.start_byte(),
+                end: parent.end_byte(),
+                position: node.start_byte(),
+                initialized_at,
+                hoisted_var,
+            });
+        }
+        if parent.kind() == "statement_block" && !function_scoped || parent.kind() == "program" {
+            return Some(LexicalScope {
+                start: parent.start_byte(),
+                end: parent.end_byte(),
+                position: node.start_byte(),
+                initialized_at,
+                hoisted_var,
+            });
+        }
+        current = parent.parent();
+    }
+    None
 }
 
 fn is_type_node(kind: &str) -> bool {
@@ -2958,6 +3082,7 @@ fn collect_constant_reads(
             && !is_own_definition_name(current, rules.definition_sites)
         {
             references.push(RawReference {
+                scope: None,
                 name: name.to_string(),
                 kind: ReferenceKind::ReadAccess,
                 start_line: current.start_position().row as u32 + 1,
@@ -3089,6 +3214,7 @@ fn extract_types_from_tree(
         let mut var_type: Option<String> = None;
         let mut var_line: u32 = 0;
         let mut kind = AstBindingKind::Annotation;
+        let mut binding_scope = None;
 
         for capture in m.captures() {
             let name = &capture_names[capture.index as usize];
@@ -3097,6 +3223,11 @@ fn extract_types_from_tree(
 
             match name.as_str() {
                 "var.name" => {
+                    binding_scope = if matches!(lang, Language::JavaScript | Language::TypeScript) {
+                        lexical_scope(capture.node)
+                    } else {
+                        None
+                    };
                     var_name = Some(text.to_string());
                     var_line = line;
                     kind = AstBindingKind::Annotation;
@@ -3105,6 +3236,11 @@ fn extract_types_from_tree(
                     var_type = Some(extract_base_type(text));
                 }
                 "ctor.name" => {
+                    binding_scope = if matches!(lang, Language::JavaScript | Language::TypeScript) {
+                        lexical_scope(capture.node)
+                    } else {
+                        None
+                    };
                     var_name = Some(text.to_string());
                     var_line = line;
                     kind = AstBindingKind::Constructor;
@@ -3119,6 +3255,11 @@ fn extract_types_from_tree(
                     }
                 }
                 "return.name" => {
+                    binding_scope = if matches!(lang, Language::JavaScript | Language::TypeScript) {
+                        lexical_scope(capture.node)
+                    } else {
+                        None
+                    };
                     var_name = Some(text.to_string());
                     var_line = line;
                     kind = AstBindingKind::ReturnType;
@@ -3127,6 +3268,11 @@ fn extract_types_from_tree(
                     var_type = Some(extract_base_type(text));
                 }
                 "param.name" => {
+                    binding_scope = if matches!(lang, Language::JavaScript | Language::TypeScript) {
+                        lexical_scope(capture.node)
+                    } else {
+                        None
+                    };
                     var_name = Some(text.to_string());
                     var_line = line;
                     kind = AstBindingKind::Parameter;
@@ -3143,6 +3289,7 @@ fn extract_types_from_tree(
             && !type_name.is_empty()
         {
             bindings.push(AstTypeBinding {
+                scope: binding_scope,
                 var_name: name,
                 type_name,
                 line: var_line,
@@ -3293,6 +3440,7 @@ fn collect_js_import_bindings(
         {
             let mut push_export = |exported: String, local: tree_sitter::Node<'_>| {
                 references.push(RawReference {
+                    scope: None,
                     name: exported,
                     kind: ReferenceKind::ExportAlias,
                     start_line: local.start_position().row as u32 + 1,
@@ -3355,6 +3503,21 @@ fn collect_js_import_bindings(
                     }
                 }
             }
+            let mut cursor = statement.walk();
+            if statement
+                .children(&mut cursor)
+                .any(|child| child.kind() == "*")
+                && let Some(source) = statement.child_by_field_name("source")
+            {
+                references.push(RawReference {
+                    scope: None,
+                    name: "*".into(),
+                    kind: ReferenceKind::ExportAlias,
+                    start_line: statement.start_position().row as u32 + 1,
+                    context: "*".into(),
+                    receiver: Some(strip_quotes(&text(source))),
+                });
+            }
             continue;
         }
         if statement.kind() == "expression_statement"
@@ -3377,6 +3540,7 @@ fn collect_js_import_bindings(
                 )
             {
                 references.push(RawReference {
+                    scope: None,
                     name: text(key),
                     kind: ReferenceKind::ExportAlias,
                     start_line: key.start_position().row as u32 + 1,
@@ -3390,6 +3554,7 @@ fn collect_js_import_bindings(
             }
             for (exported, local) in commonjs_object_exports(assignment, source) {
                 references.push(RawReference {
+                    scope: None,
                     name: exported,
                     kind: ReferenceKind::ExportAlias,
                     start_line: local.start_position().row as u32 + 1,
@@ -3508,6 +3673,7 @@ fn collect_js_import_bindings(
                 let specifier = strip_quotes(&text(spec));
                 if function.kind() == "import" {
                     references.push(RawReference {
+                        scope: None,
                         name: specifier.clone(),
                         kind: ReferenceKind::Import,
                         start_line: value.start_position().row as u32 + 1,
@@ -3523,6 +3689,7 @@ fn collect_js_import_bindings(
             let name = text(local);
             let start_line = local.start_position().row as u32 + 1;
             references.push(RawReference {
+                scope: lexical_scope(local),
                 name: name.clone(),
                 kind: ReferenceKind::ImportAlias,
                 start_line,
@@ -3531,12 +3698,112 @@ fn collect_js_import_bindings(
             });
             if !specifier.is_empty() && !specifier.starts_with('.') && !specifier.starts_with('/') {
                 references.push(RawReference {
+                    scope: None,
                     name,
                     kind: ReferenceKind::PackageBinding,
                     start_line,
                     context: specifier.clone(),
                     receiver: None,
                 });
+            }
+        }
+    }
+}
+
+/// Exact module-level object literals and constructor instances expose their own
+/// public methods. Unknown factory results supply no receiver type evidence.
+fn annotate_js_export_receivers(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    references: &[RawReference],
+    symbols: &mut [RawSymbol],
+) {
+    let exported: std::collections::HashSet<_> = references
+        .iter()
+        .filter(|reference| {
+            reference.kind == ReferenceKind::ExportAlias && reference.receiver.is_none()
+        })
+        .map(|reference| reference.context.as_str())
+        .collect();
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        let declaration = if statement.kind() == "export_statement" {
+            statement.child_by_field_name("declaration")
+        } else {
+            Some(statement)
+        };
+        let Some(declaration) = declaration
+            .filter(|node| matches!(node.kind(), "lexical_declaration" | "variable_declaration"))
+        else {
+            continue;
+        };
+        let mut cursor = declaration.walk();
+        for variable in declaration
+            .named_children(&mut cursor)
+            .filter(|node| node.kind() == "variable_declarator")
+        {
+            let (Some(name), Some(value)) = (
+                variable.child_by_field_name("name"),
+                variable.child_by_field_name("value"),
+            ) else {
+                continue;
+            };
+            let Ok(name) = name.utf8_text(source) else {
+                continue;
+            };
+            if !exported.contains(name) {
+                continue;
+            }
+            let receiver_type = if value.kind() == "object" {
+                let mut cursor = value.walk();
+                let exact = value.named_children(&mut cursor).all(|member| {
+                    member.kind() != "spread_element"
+                        && member
+                            .child_by_field_name("name")
+                            .or_else(|| member.child_by_field_name("key"))
+                            .is_none_or(|name| name.kind() != "computed_property_name")
+                });
+                exact.then_some("object")
+            } else if value.kind() == "new_expression" {
+                value
+                    .child_by_field_name("constructor")
+                    .filter(|node| matches!(node.kind(), "identifier" | "type_identifier"))
+                    .and_then(|node| node.utf8_text(source).ok())
+            } else {
+                None
+            };
+            let Some(receiver_type) = receiver_type else {
+                continue;
+            };
+            if let Some(symbol) = symbols.iter_mut().find(|symbol| {
+                symbol.name == name
+                    && symbol.start_line == declaration.start_position().row as u32 + 1
+            }) {
+                symbol.type_info = Some(TypeInfo {
+                    declared_type: Some(receiver_type.into()),
+                    parameter_types: Vec::new(),
+                    return_type: None,
+                });
+            }
+            if exported.contains(name) {
+                let parent = if receiver_type == "object" {
+                    name
+                } else {
+                    receiver_type
+                };
+                for member in symbols.iter_mut().filter(|symbol| {
+                    symbol.kind == SymbolKind::Method
+                        && symbol.parent_name.as_deref() == Some(parent)
+                }) {
+                    let prefix = member.signature.split('(').next().unwrap_or("");
+                    if !prefix.split_whitespace().rev().skip(1).any(|token| {
+                        matches!(token, "private" | "protected" | "static" | "get" | "set")
+                    }) && !member.name.starts_with('#')
+                    {
+                        member.is_entry_point = true;
+                        member.entry_point_kind = Some(EntryPointKind::Main);
+                    }
+                }
             }
         }
     }
@@ -3572,6 +3839,7 @@ fn collect_python_import_bindings(
                 (binding, binding)
             };
             references.push(RawReference {
+                scope: None,
                 name: local.utf8_text(source).unwrap_or("").into(),
                 kind: ReferenceKind::ImportAlias,
                 start_line: local.start_position().row as u32 + 1,
@@ -11566,5 +11834,40 @@ mod attribute_string_reference_tests {
             calls(r#"struct A { #[serde(default = "default_timeout")] t: u64 }"#),
             vec!["default_timeout"],
         );
+    }
+}
+
+#[cfg(test)]
+mod review_macro_mapping_tests {
+    use super::*;
+    #[test]
+    fn review_macro_single_colon_separates_value_not_receiver() {
+        let parsed = parse_source(
+            std::path::Path::new("src/user.rs"),
+            r#"fn user() {
+    json!({
+        "key": helper(),
+        "method": worker.run(),
+        "path": module::helper()
+    });
+}"#,
+        )
+        .unwrap();
+        for (name, line, receiver) in [
+            ("helper", 3, None),
+            ("run", 4, Some("worker")),
+            ("helper", 5, Some("module")),
+        ] {
+            let call = parsed
+                .references
+                .iter()
+                .find(|reference| {
+                    reference.kind == ReferenceKind::Call
+                        && reference.name == name
+                        && reference.start_line == line
+                })
+                .expect("macro value call captured");
+            assert_eq!(call.receiver.as_deref(), receiver, "{call:#?}");
+        }
     }
 }

@@ -109,7 +109,8 @@ nestweaver context processPayment --db ./nestweaver.lbug
 nestweaver watch ./my-project --db ./nestweaver.lbug
 ```
 
-Index prints its selected database target on success. When querying from another
+Index reports its selected database target on stderr unless `--quiet` is set;
+the target is not a field in the `--json` payload. When querying from another
 directory, pass the same absolute database path with `--db`.
 
 ```sh
@@ -127,7 +128,7 @@ Run `nestweaver --help` for the full command list. Most commands support `--json
 
 ## Upgrading — re-index before you trust a ranking
 
-**`RESOLVER_GENERATION` is 8. Every graph indexed by an earlier release must be
+**`RESOLVER_GENERATION` is 9. Every graph indexed by another generation must be
 re-indexed.** Compatibility is an EXACT MATCH, not a floor, so a graph written
 by any other generation — older or newer — is treated as untrustworthy.
 
@@ -137,7 +138,11 @@ POINTS, which is what `dead-code` walks from. Generation 7 (nw-687) adds
 missing CALLS/definition edges for CommonJS `module.exports.X`/`exports.X`
 function definitions, which a stale graph is missing entirely. Generation 8
 (nw-688) renames JS/TS test-runner blocks so `describe('getTier')` no longer
-shadows the real `getTier`. Both kinds of
+shadows the real `getTier`. Generation 9 replaces file-level import proxies with
+actual binding users, corrects receiver and export resolution, and persists
+exported executable roots. Upgrading from generation 8 requires a forced
+re-index of every repository; `stale-check` exits 2 and `dead-code` refuses
+until the graph matches. All these kinds of
 staleness have the same remedy and the same symptom list. Until you re-index:
 
 - **Rankings are stale.** `hubs`, `bridges`, `repo-map`, `clusters`, and every
@@ -246,6 +251,7 @@ Also changing behaviour in this release, in ways a script may notice:
 
 | Change | What to do |
 | --- | --- |
+| A code watcher keeps running when a committed batch's evidence cannot be saved. It notifies the committed graph and discloses the outstanding repair, retaining replay paths in memory across retries. Successfully persisted replay debt also survives restart; startup repairs imports across bounded source batches. | Restore access to the reported evidence files and let the watcher retry. If replay debt itself could not be persisted, keep the watcher running until repair completes; after interruption, run `nestweaver index --repo <path> --force` to rebuild missing evidence and relationships. |
 | **Rebuild required.** LadybugDB 0.21 (this release ships 0.21.1) changes how text keys are hashed and its on-disk format marker did not change, so NestWeaver now refuses a database built by an earlier version before opening it: exit **1**, `nestweaver::db_rebuild_required`, the exact rebuild command, no daemon started, no byte changed. Snapshot format is now **4**; older snapshots are refused, and `backup restore` of a pre-upgrade archive warns that the result needs a rebuild | Stop the daemon, run `nestweaver backup save <file>` (it reads the old database read-only and marks the archive as pre-upgrade), then `nestweaver publication rebuild --config <instance.toml>`; the old database stays in place until the new one validates. To roll back, reinstall the previous version and restore your backup. Do not open a rebuilt database with an older NestWeaver. See `docs/guide/publication-rebuild.md` |
 | A daemon killed by a fatal signal (SIGSEGV, SIGBUS, SIGABRT, SIGILL) while answering is now named. A database with damaged index pages can open under LadybugDB 0.21 and fault on a later lookup; the command used to print a bare `transport error … broken pipe`, and the respawned daemon reported a healthy `brain status`. The command now exits **1** with `nestweaver::daemon_engine_crashed` and the recovery, MCP tool calls return the same message with `isError: true`, and `brain status` prints a warning (`--json`: a `warnings[]` entry of kind `daemon_unclean_exit` with `exit`, `signal`, `at_unix`, `pid`, `count`). A daemon killed from outside (`kill -9`, the OOM killer) is reported as `exited_unexpectedly`, with no claim about the storage engine. `daemon stop` (with or without `--force`), Ctrl-C on a foreground `daemon run` and an idle exit leave no warning, and the warning clears when a daemon next shuts down cleanly. Nothing in the database is changed | Restore the most recent backup with `nestweaver backup restore <archive>`, or rebuild with `nestweaver publication rebuild --config <instance.toml>`. Do not retry the request that crashed: it will crash the daemon again. See [Troubleshooting](docs/server-mode.md#the-daemon-crashed-while-answering) |
 | Renaming a registered vault with `--name` (`brain add <root> --name X`, `brain refresh <root> --name X`, `brain watch`, MCP `brain_add_source`) is now refused, exit 1, when another root's vault already holds that name (case-insensitively), with the same message and remedy as registering a new root under it. It used to succeed and leave two vaults answering to one name. Without `--name`, `brain refresh`, `brain watch`, `brain add` and MCP `brain_add_source` now keep a registered vault's stored name instead of renaming it to its directory's (a new vault is still named after its directory) | Pick a free `--name`, or remove the other vault first |

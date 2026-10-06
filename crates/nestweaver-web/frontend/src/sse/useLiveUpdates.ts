@@ -52,15 +52,49 @@ export function useLiveUpdates() {
         }
       }, 400);
     };
-    const handleUpdate = () => { graphPending = true; scheduleRefresh(); };
-    const handleRanksRecomputed = () => { ranksPending = true; scheduleRefresh(); };
+    let generation: string | null = null;
+    let rankGeneration: string | null = null;
+    const readGenerations = (event?: Event) => {
+      if (!(event instanceof MessageEvent)) return null;
+      try {
+        const payload = JSON.parse(event.data) as { graph_generation?: unknown; pagerank_generation?: unknown };
+        return typeof payload.graph_generation === "string" && /^\d+$/.test(payload.graph_generation) &&
+          typeof payload.pagerank_generation === "string" && /^\d+$/.test(payload.pagerank_generation)
+          ? { graph: payload.graph_generation, ranks: payload.pagerank_generation } : null;
+      } catch { return null; }
+    };
+    const handleGeneration = (event: Event) => {
+      const snapshot = readGenerations(event);
+      if (!snapshot) return;
+      const graphChanged = generation !== snapshot.graph;
+      const ranksChanged = rankGeneration !== snapshot.ranks;
+      generation = snapshot.graph;
+      rankGeneration = snapshot.ranks;
+      graphPending ||= graphChanged;
+      ranksPending ||= ranksChanged;
+      if (graphChanged || ranksChanged) scheduleRefresh();
+    };
+    const handleUpdate = (event: Event) => {
+      handleGeneration(event);
+      graphPending = true;
+      scheduleRefresh();
+    };
+    const handleRanksRecomputed = (event: Event) => {
+      handleGeneration(event);
+      ranksPending = true;
+      scheduleRefresh();
+    };
 
+    es.addEventListener("graph:generation", handleGeneration);
     es.addEventListener("graph:updated", handleUpdate);
     es.addEventListener("pagerank:recomputed", handleRanksRecomputed);
     es.addEventListener("watcher:status", () =>
       setLastEventTimestamp(Date.now()),
     );
-    es.addEventListener("full_refresh", handleUpdate);
+    es.addEventListener("full_refresh", (event) => {
+      handleUpdate(event);
+      ranksPending = true;
+    });
 
     return () => {
       if (refreshTimer !== null) clearTimeout(refreshTimer);

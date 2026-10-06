@@ -3,6 +3,11 @@ source: crates/nestweaver-parser/src/parse.rs
 assertion_line: 6295
 expression: "parsed_references(\"simple.go\", &source)"
 ---
+- name: main
+  kind: PackageBinding
+  start_line: 1
+  context: package main
+  receiver: ~
 - name: fmt
   kind: Import
   start_line: 4

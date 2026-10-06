@@ -145,6 +145,7 @@ export function FilesTab() {
   const selectedKind = useStore((s) => s.selectedNodeKind);
 
   const loadedWorkspace = useRef<string | null>(null);
+  const errorWorkspace = useRef<string | null>(null);
   const [repos, setRepos] = useState<Repo[]>([]);
   const [symbols, setSymbols] = useState<SymbolCandidate[]>([]);
   const [loading, setLoading] = useState(true);
@@ -162,7 +163,7 @@ export function FilesTab() {
         setRepos(r);
         setSymbols(s);
       })
-      .catch((e) => { if (current()) setError(e.message ?? "Failed to load files"); })
+      .catch((e) => { if (current()) { errorWorkspace.current = workspaceId; setError(e.message ?? "Failed to load files"); } })
       .finally(() => { if (current()) setLoading(false); });
     return () => { cancelled = true; };
   }, [workspaceId, graphEpoch]);
@@ -191,7 +192,7 @@ export function FilesTab() {
     selectNode(path, "file");
   };
 
-  if (loading && loadedWorkspace.current !== workspaceId) {
+  if (loadedWorkspace.current !== workspaceId && !(error && errorWorkspace.current === workspaceId)) {
     return (
       <div className="flex h-full items-center justify-center text-sm text-[var(--color-text-muted)]">
         Loading files...
@@ -199,7 +200,7 @@ export function FilesTab() {
     );
   }
 
-  if (error) {
+  if (error && errorWorkspace.current === workspaceId && loadedWorkspace.current !== workspaceId) {
     return (
       <div className="flex h-full items-center justify-center p-4 text-sm text-red-500">
         {error}
@@ -216,12 +217,15 @@ export function FilesTab() {
   }
 
   return (
+    <div aria-busy={loading} className="h-full">
+    {error && errorWorkspace.current === workspaceId && <div role="alert" className="p-2 text-xs text-red-500">{error}</div>}
     <FileTree
       key={workspaceId}
       repoTrees={repoTrees}
       selectedPath={selectedKind === "file" ? selectedNodeId : null}
       onSelect={handleSelect}
     />
+    </div>
   );
 }
 

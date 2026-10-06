@@ -8,6 +8,7 @@ use crate::type_extractors::{BindingSource, TypeBinding, extract_bindings, extra
 
 /// A variable binding key: (variable_name, line_number).
 type BindingKey = (String, u32);
+type ScopedBindingKey = (String, usize, usize, usize);
 
 /// An assignment pair: (target_key, source_key).
 type Assignment = (BindingKey, BindingKey);
@@ -84,6 +85,7 @@ pub fn propagate_types(
 /// Built by running all four inference tiers, then the fixpoint loop.
 pub struct TypeEnvironment {
     bindings: HashMap<(String, u32), TypeBinding>,
+    scoped_bindings: HashMap<ScopedBindingKey, (usize, TypeBinding)>,
 }
 
 impl TypeEnvironment {
@@ -99,6 +101,7 @@ impl TypeEnvironment {
         ast_bindings: &[nestweaver_parser::AstTypeBinding],
     ) -> Self {
         let mut bindings = HashMap::new();
+        let mut scoped_bindings = HashMap::new();
 
         // Tier 0: AST-extracted annotations (highest quality — from tree-sitter walk)
         for ab in ast_bindings {
@@ -108,6 +111,19 @@ impl TypeEnvironment {
                 nestweaver_parser::AstBindingKind::ReturnType => BindingSource::ReturnType,
                 nestweaver_parser::AstBindingKind::Parameter => BindingSource::Annotation,
             };
+            if let Some(scope) = ab.scope {
+                scoped_bindings
+                    .entry((ab.var_name.clone(), scope.position, scope.start, scope.end))
+                    .or_insert((
+                        scope.initialized_at,
+                        TypeBinding {
+                            type_name: ab.type_name.clone(),
+                            line: ab.line,
+                            confidence: 0.95,
+                            source: source_kind,
+                        },
+                    ));
+            }
             bindings.entry((ab.var_name.clone(), ab.line)).or_insert(
                 crate::type_extractors::TypeBinding {
                     type_name: ab.type_name.clone(),
@@ -134,7 +150,10 @@ impl TypeEnvironment {
         let assignments = extract_assignments(source);
         propagate_assignments(&mut bindings, &assignments, 10);
 
-        Self { bindings }
+        Self {
+            bindings,
+            scoped_bindings,
+        }
     }
 
     /// Look up the type of a variable at a given scope.
@@ -149,6 +168,25 @@ impl TypeEnvironment {
             .iter()
             .filter(|((name, line), _)| name == variable && *line <= at_line)
             .max_by_key(|((_, line), _)| *line)
+            .map(|(_, binding)| binding)
+    }
+
+    /// A selected lexical declaration must supply its own initialized type;
+    /// another same-named binding in the file cannot donate one.
+    pub fn lookup_declaration(
+        &self,
+        variable: &str,
+        declaration: nestweaver_parser::LexicalScope,
+        at: usize,
+    ) -> Option<&TypeBinding> {
+        self.scoped_bindings
+            .get(&(
+                variable.to_string(),
+                declaration.position,
+                declaration.start,
+                declaration.end,
+            ))
+            .filter(|(initialized_at, _)| *initialized_at <= at)
             .map(|(_, binding)| binding)
     }
 
@@ -208,7 +246,10 @@ impl TypeEnvironment {
         for (name, line, binding) in entries {
             bindings.insert((name, line), binding);
         }
-        Self { bindings }
+        Self {
+            bindings,
+            scoped_bindings: HashMap::new(),
+        }
     }
 }
 
@@ -549,6 +590,7 @@ mod tests {
 
         let source = "let store: GraphStore = GraphStore::new();\n";
         let ast_bindings = vec![AstTypeBinding {
+            scope: None,
             var_name: "store".to_string(),
             type_name: "GraphStore".to_string(),
             line: 1,

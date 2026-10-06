@@ -16,7 +16,7 @@ type WorkerOutMessage = WorkerTickMessage | WorkerEndMessage;
 export interface ForceLayoutControls {
   start: (graphOverride?: Graph) => void;
   stop: () => void;
-  kill: () => void;
+  kill: () => boolean;
   isRunning: boolean;
 }
 
@@ -24,6 +24,7 @@ export function useForceLayout(): ForceLayoutControls {
   const forceParams = useStore((s) => s.forceParams);
   const setGraphData = useStore((s) => s.setGraphData);
 
+  const runningRef = useRef(false);
   const workerRef = useRef<Worker | null>(null);
   const [isRunning, setIsRunning] = useState(false);
 
@@ -41,15 +42,19 @@ export function useForceLayout(): ForceLayoutControls {
     if (workerRef.current) {
       workerRef.current.postMessage({ type: "stop" });
     }
+    runningRef.current = false;
     setIsRunning(false);
   }, []);
 
   const kill = useCallback(() => {
+    const interrupted = runningRef.current;
     if (workerRef.current) {
       workerRef.current.terminate();
       workerRef.current = null;
     }
+    runningRef.current = false;
     setIsRunning(false);
+    return interrupted;
   }, []);
 
   const start = useCallback((graphOverride?: Graph) => {
@@ -100,6 +105,7 @@ export function useForceLayout(): ForceLayoutControls {
       }
 
       if (msg.type === "end") {
+        runningRef.current = false;
         setIsRunning(false);
         // Re-frame the settled layout — settling expands scenes past the
         // initial fit, and topology-keyed fitting won't re-run on its own
@@ -109,6 +115,7 @@ export function useForceLayout(): ForceLayoutControls {
 
     worker.onerror = (err) => {
       console.error("[useForceLayout] worker error:", err);
+      runningRef.current = false;
       setIsRunning(false);
     };
 
@@ -123,6 +130,7 @@ export function useForceLayout(): ForceLayoutControls {
       },
     });
 
+    runningRef.current = true;
     setIsRunning(true);
   }, [forceParams, getOrCreateWorker, setGraphData]);
 

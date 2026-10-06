@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 
 use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
 
-use nestweaver_federation::dispatch::{dispatch_json_rpc, dispatch_json_rpc_authed};
+use nestweaver_federation::dispatch::dispatch_json_rpc_authed_profile;
 use nestweaver_federation::health::{
     MaintenanceProbe, code_is_down, effective_timeout, eject_with_cap, is_upstream_down,
     local_sha_for_server_repo,
@@ -92,6 +92,7 @@ const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// mode (fallback/merge/primary).
 pub struct HybridClient {
     local: DaemonClient,
+    delivery_profile: nestweaver_schema::ToolDeliveryProfile,
     upstreams: Vec<UpstreamHandle>,
     /// Cached list of repo URLs where the local index is behind an upstream.
     /// Written by the background maintenance task (RFC 5861
@@ -193,6 +194,7 @@ impl HybridClient {
             stale_verdict: Arc::new(Mutex::new(Vec::new())),
             ejection_guard: Arc::new(Mutex::new(())),
             maintenance: None,
+            delivery_profile: nestweaver_schema::ToolDeliveryProfile::FullCli,
         })
     }
 
@@ -204,6 +206,7 @@ impl HybridClient {
             stale_verdict: Arc::new(Mutex::new(Vec::new())),
             ejection_guard: Arc::new(Mutex::new(())),
             maintenance: None,
+            delivery_profile: nestweaver_schema::ToolDeliveryProfile::FullCli,
         }
     }
 
@@ -216,7 +219,12 @@ impl HybridClient {
             stale_verdict: Arc::new(Mutex::new(Vec::new())),
             ejection_guard: Arc::new(Mutex::new(())),
             maintenance: None,
+            delivery_profile: nestweaver_schema::ToolDeliveryProfile::FullCli,
         }
+    }
+
+    pub fn set_delivery_profile(&mut self, profile: nestweaver_schema::ToolDeliveryProfile) {
+        self.delivery_profile = profile;
     }
 
     /// Access the underlying `DaemonClient`.
@@ -528,6 +536,7 @@ impl HybridClient {
             let token = u.auth_token().map(|t| t.to_string());
             let tool = tool_name.to_string();
             let p = params.clone();
+            let profile = self.delivery_profile;
             // Clone the EWMA cell — the future can't borrow `u` because the
             // local query borrows `self.local` mutably for `tokio::join!`.
             let latency = u.latency_ewma_ref();
@@ -535,7 +544,13 @@ impl HybridClient {
                 let started = Instant::now();
                 let res = tokio::time::timeout(
                     timeout,
-                    dispatch_json_rpc_authed(&mut client, &tool, &p, token.as_deref()),
+                    dispatch_json_rpc_authed_profile(
+                        &mut client,
+                        &tool,
+                        &p,
+                        token.as_deref(),
+                        profile,
+                    ),
                 )
                 .await;
                 if let Ok(Ok(_)) = &res {
@@ -552,7 +567,13 @@ impl HybridClient {
         };
 
         // Now borrow self.local mutably for the local query.
-        let local_fut = dispatch_json_rpc(self.local.inner_mut(), tool_name, params);
+        let local_fut = dispatch_json_rpc_authed_profile(
+            self.local.inner_mut(),
+            tool_name,
+            params,
+            None,
+            self.delivery_profile,
+        );
 
         let (local_result, server_result) = tokio::join!(local_fut, server_fut);
         let local = match local_result {
@@ -716,6 +737,10 @@ impl HybridClient {
             if upstream.is_healthy() {
                 let mut client = upstream.client();
                 let mut req = tonic::Request::new(nestweaver_proto::RepoStatesRequest {});
+                req.metadata_mut().insert(
+                    nestweaver_schema::ToolDeliveryProfile::METADATA_KEY,
+                    MetadataValue::from_static(self.delivery_profile.wire_value()),
+                );
                 upstream.inject_auth(&mut req);
 
                 if let Ok(resp) = client.repo_states(req).await {
@@ -751,7 +776,14 @@ impl HybridClient {
     }
 
     async fn query_local(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
-        dispatch_json_rpc(self.local.inner_mut(), tool_name, params).await
+        dispatch_json_rpc_authed_profile(
+            self.local.inner_mut(),
+            tool_name,
+            params,
+            None,
+            self.delivery_profile,
+        )
+        .await
     }
 
     /// The set of `repo_uid`s the LOCAL daemon has indexed.
@@ -795,7 +827,13 @@ impl HybridClient {
         let started = Instant::now();
         match tokio::time::timeout(
             timeout,
-            dispatch_json_rpc_authed(&mut client, tool_name, params, token.as_deref()),
+            dispatch_json_rpc_authed_profile(
+                &mut client,
+                tool_name,
+                params,
+                token.as_deref(),
+                self.delivery_profile,
+            ),
         )
         .await
         {
@@ -1013,6 +1051,23 @@ pub async fn query_configured_upstreams_only(
     tool_name: &str,
     params: &Value,
 ) -> Result<Value> {
+    query_configured_upstreams_only_profile(
+        config_path,
+        start_dir,
+        tool_name,
+        params,
+        nestweaver_schema::ToolDeliveryProfile::FullCli,
+    )
+    .await
+}
+
+pub async fn query_configured_upstreams_only_profile(
+    config_path: Option<&Path>,
+    start_dir: &Path,
+    tool_name: &str,
+    params: &Value,
+    profile: nestweaver_schema::ToolDeliveryProfile,
+) -> Result<Value> {
     if tool_routing(tool_name) == ToolRouting::LocalOnly {
         anyhow::bail!("{tool_name} requires the local daemon");
     }
@@ -1041,7 +1096,7 @@ pub async fn query_configured_upstreams_only(
     let started = Instant::now();
     let mut result = tokio::time::timeout(
         timeout,
-        dispatch_json_rpc_authed(&mut client, tool_name, params, token.as_deref()),
+        dispatch_json_rpc_authed_profile(&mut client, tool_name, params, token.as_deref(), profile),
     )
     .await
     .with_context(|| format!("upstream query timed out after {}ms", timeout.as_millis()))??;
@@ -1202,6 +1257,10 @@ pub async fn flow_trace_with_stitching(
                 .max(1),
             visited_canonical_ids: all_visited.clone(),
         });
+        req.metadata_mut().insert(
+            nestweaver_schema::ToolDeliveryProfile::METADATA_KEY,
+            MetadataValue::from_static(client.delivery_profile.wire_value()),
+        );
         upstream.inject_auth(&mut req);
 
         let started = Instant::now();
@@ -1334,12 +1393,13 @@ pub async fn two_tier_query(
             }
         }
     };
-    Ok(nestweaver_federation::two_tier::two_tier_query(
+    Ok(nestweaver_federation::two_tier::two_tier_query_profile(
         local_result,
         &client.upstreams,
         &client.ejection_guard,
         tool_name,
         params,
+        client.delivery_profile,
     )
     .await)
 }

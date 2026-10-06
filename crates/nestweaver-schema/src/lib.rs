@@ -32,3 +32,28 @@ pub use uid::{
     tag_uid, truncated_hash, vault_uid,
 };
 pub use version::{core_schema_hash, describe_version_skew, effective_schema_hash};
+
+/// Response construction policy, independent of authorization and traversal
+/// depth. Unmarked native clients retain the complete CLI response contract.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolDeliveryProfile {
+    #[default]
+    FullCli,
+    BoundedMcp,
+}
+impl ToolDeliveryProfile {
+    pub const METADATA_KEY: &'static str = "x-nestweaver-delivery";
+    pub fn wire_value(self) -> &'static str {
+        match self {
+            Self::FullCli => "cli-full",
+            Self::BoundedMcp => "mcp-bounded",
+        }
+    }
+    pub fn parse_wire(value: &str) -> Option<Self> {
+        match value {
+            "cli-full" => Some(Self::FullCli),
+            "mcp-bounded" => Some(Self::BoundedMcp),
+            _ => None,
+        }
+    }
+}

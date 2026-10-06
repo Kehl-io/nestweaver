@@ -21,6 +21,7 @@ export function NoteDetail({ uid }: NoteDetailProps) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const navigationSeq = useRef(0);
   const loadedNote = useRef<string | null>(null);
+  const errorNote = useRef<string | null>(null);
   const destination = useStore((s) => s.noteHeadingDestination);
   const setDestination = useStore((s) => s.setNoteHeadingDestination);
   const [linkError, setLinkError] = useState<string | null>(null);
@@ -37,9 +38,9 @@ export function NoteDetail({ uid }: NoteDetailProps) {
     const controller = new AbortController();
     setLinkError(null);
     navigationSeq.current += 1;
-    const revalidating = loadedNote.current === uid;
-    loadedNote.current = uid;
-    if (!revalidating) { setDetail(null); setBacklinks([]); setUnlinked([]); }
+    const noteKey = JSON.stringify([workspaceId, uid]);
+    const revalidating = loadedNote.current === noteKey;
+    if (!revalidating) { loadedNote.current = null; setDetail(null); setBacklinks([]); setUnlinked([]); }
     setLoading(!revalidating);
     setError(null);
 
@@ -51,13 +52,14 @@ export function NoteDetail({ uid }: NoteDetailProps) {
     ])
       .then(([note, bl, um]) => {
         if (!controller.signal.aborted && useStore.getState().graphEpoch === graphEpoch && useStore.getState().activeWorkspaceId === workspaceId) {
+          loadedNote.current = noteKey;
           setDetail(note);
           setBacklinks(bl);
           setUnlinked(um);
         }
       })
       .catch((e) => {
-        if (!controller.signal.aborted && useStore.getState().graphEpoch === graphEpoch && useStore.getState().activeWorkspaceId === workspaceId) setError(e.message ?? "Failed to load note");
+        if (!controller.signal.aborted && useStore.getState().graphEpoch === graphEpoch && useStore.getState().activeWorkspaceId === workspaceId) { errorNote.current = noteKey; setError(e.message ?? "Failed to load note"); }
       })
       .finally(() => {
         if (!controller.signal.aborted && useStore.getState().graphEpoch === graphEpoch && useStore.getState().activeWorkspaceId === workspaceId) setLoading(false);
@@ -85,7 +87,8 @@ export function NoteDetail({ uid }: NoteDetailProps) {
     }
   }, [uid, graphEpoch, workspaceId, exploreNode, setDestination]);
 
-  if (loading) {
+  const visibleNoteKey = JSON.stringify([workspaceId, uid]);
+  if (loading || (loadedNote.current !== visibleNoteKey && !(error && errorNote.current === visibleNoteKey))) {
     return (
       <div className="flex h-full items-center justify-center text-sm text-[var(--color-text-muted)]">
         Loading note...
@@ -93,7 +96,7 @@ export function NoteDetail({ uid }: NoteDetailProps) {
     );
   }
 
-  if (error) {
+  if (error && errorNote.current === visibleNoteKey) {
     return (
       <div className="flex h-full items-center justify-center p-4 text-sm text-red-500">
         {error}

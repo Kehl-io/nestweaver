@@ -50,7 +50,7 @@ export function useOverviewMode() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestIdRef = useRef(0);
-  const previousOverviewGraphRef = useRef<{ key: string; graph: Graph } | null>(null);
+  const previousOverviewGraphRef = useRef<{ key: string; graph: Graph; interrupted?: boolean } | null>(null);
   const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { start, stop, kill } = useForceLayout();
 
@@ -114,10 +114,11 @@ export function useOverviewMode() {
       });
       setSceneMetadata(result._meta ?? null);
       setGraphData(graph);
-      previousOverviewGraphRef.current = { key: requestKey, graph };
+      previousOverviewGraphRef.current = { key: requestKey, graph, interrupted: previousOverviewGraphRef.current?.interrupted };
       // Settle fresh constellations organically; preserved layouts stay frozen
       // (object constancy), and reduced-effects users keep the static seed layout.
-      if (!hasPreviousLayout && !useStore.getState().reducedEffects) {
+      if ((!hasPreviousLayout || previousOverviewGraphRef.current?.interrupted) && !useStore.getState().reducedEffects) {
+        if (previousOverviewGraphRef.current) previousOverviewGraphRef.current.interrupted = false;
         start(graph);
         if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
         stopTimerRef.current = setTimeout(() => stop(), MAX_LAYOUT_MS);
@@ -163,7 +164,8 @@ export function useOverviewMode() {
     return () => {
       requestIdRef.current += 1;
       if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
-      kill();
+      const interrupted = kill();
+      if (previousOverviewGraphRef.current) previousOverviewGraphRef.current.interrupted ||= interrupted;
     };
   }, [loadOverview, kill]);
 

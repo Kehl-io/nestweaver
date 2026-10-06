@@ -6,7 +6,6 @@ use std::io::{self, Write};
 pub const LOGICAL_BYTES: usize = 20_000;
 pub const RESULT_BYTES: usize = 40_000;
 pub const CATALOGUE_BYTES: usize = 32_000;
-pub const CATALOGUE_TOOLS: usize = 8;
 
 #[derive(Default)]
 struct Size(usize);
@@ -278,7 +277,8 @@ fn shrink(value: &mut Value, omitted: &mut BTreeMap<String, Value>) -> Result<bo
             let counters: &[&str] = match key.as_str() {
                 "candidates" | "candidate_uids" => &["candidates_returned", "candidate_returned"],
                 "members" => &["returned_members"],
-                "impact_nodes" | "nodes" | "clusters" | "tags" | "results" => &["returned"],
+                "impact_nodes" | "nodes" | "results" => &["returned", "count"],
+                "clusters" | "tags" => &["returned"],
                 "affected_symbols" => &["returned_affected_symbol_count"],
                 "unreachable_symbols" | "broken_links" => &["returned"],
                 "backlinks" => &["count"],
@@ -645,6 +645,23 @@ mod tests {
             assert_eq!(payload["total_available"], 100);
         }
     }
+    #[test]
+    fn review_budget_results_and_impact_count_aliases_follow_late_prefix() {
+        quality_count_case("results", &["count", "returned"]);
+        let rows: Vec<_> = (0..50)
+            .map(|index| json!({"uid":format!("sym:{index}"),"name":"\\".repeat(600)}))
+            .collect();
+        let payload = quality_wrapped(
+            json!({"nodes":rows,"impact_nodes":rows,"count":50,"returned":50,"total":100}),
+        );
+        let retained = payload["nodes"].as_array().unwrap().len();
+        assert!(retained < 50, "exercise coupled array cut");
+        assert_eq!(payload["nodes"], payload["impact_nodes"]);
+        assert_eq!(payload["count"], retained);
+        assert_eq!(payload["returned"], retained);
+        assert_eq!(payload["total"], 100);
+    }
+
     #[test]
     fn quality_budget_backlinks_count_follows_late_prefix() {
         quality_count_case("backlinks", &["count"]);

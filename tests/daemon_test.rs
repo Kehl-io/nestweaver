@@ -6,6 +6,9 @@
 //! Run with:
 //!   cargo test --test daemon_test -- --test-threads=1
 
+#[path = "helpers/catalogue_contract.rs"]
+mod catalogue_contract;
+
 use assert_cmd::Command;
 use nestweaver_engine::{load_filemeta_sidecar, save_filemeta_sidecar, sidecar_path};
 use predicates::prelude::PredicateBooleanExt;
@@ -690,57 +693,17 @@ fn direct_mcp_fails_closed_on_config_and_exposes_only_read_tools() {
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(frames.len(), 2);
-    let mut page = frames[0].clone();
-    let mut tools = Vec::new();
-    let mut names = std::collections::HashSet::new();
-    let mut cursors = std::collections::HashSet::new();
-    let mut complete = false;
-    for index in 0..100 {
-        let id = if index == 0 { 1 } else { index + 2 };
-        assert_eq!(page["id"], id);
-        assert_eq!(page["jsonrpc"], "2.0");
-        assert!(page.get("error").is_none(), "{page}");
-        let result = &page["result"];
-        assert!(
-            nestweaver_mcp::output_budget::escaped_size(result)
-                <= nestweaver_mcp::output_budget::CATALOGUE_BYTES
-        );
-        let entries = result["tools"].as_array().unwrap();
-        assert!(!entries.is_empty());
-        assert!(entries.len() <= nestweaver_mcp::output_budget::CATALOGUE_TOOLS);
-        for tool in entries {
-            assert!(
-                names.insert(tool["name"].as_str().unwrap().to_owned()),
-                "duplicate tool: {tool}"
-            );
-            tools.push(tool.clone());
-        }
-        let Some(cursor) = result.get("nextCursor") else {
-            complete = true;
-            break;
-        };
-        let cursor = cursor.as_str().unwrap().to_owned();
-        assert!(
-            cursors.insert(cursor.clone()),
-            "catalogue cursor did not advance"
-        );
-        let request = serde_json::json!({"jsonrpc":"2.0","id":index+3,"method":"tools/list","params":{"cursor":cursor}});
-        let output = mcp_raw_in_mode(&db_path, &format!("{request}\n"), McpMode::Direct);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let replies: Vec<serde_json::Value> = String::from_utf8(output.stdout)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(replies.len(), 1);
-        page = replies.into_iter().next().unwrap();
-    }
-    assert!(complete, "catalogue exceeded the page bound");
-    let expected: Vec<_> = nestweaver_mcp::tools::tool_list(false)["tools"]
+    let page = &frames[0];
+    assert_eq!(page["id"], 1);
+    assert_eq!(page["jsonrpc"], "2.0");
+    assert!(page.get("error").is_none(), "{page}");
+    let full = nestweaver_mcp::tools::tool_list(false);
+    assert_eq!(
+        full["tools"].as_array().unwrap().len(),
+        43,
+        "complete default profile"
+    );
+    let expected: Vec<_> = full["tools"]
         .as_array()
         .unwrap()
         .iter()
@@ -749,7 +712,8 @@ fn direct_mcp_fails_closed_on_config_and_exposes_only_read_tools() {
         })
         .cloned()
         .collect();
-    assert_eq!(tools, expected, "direct catalogue profile diverged");
+    catalogue_contract::assert_complete_catalogue_page(&page["result"], &expected);
+    let tools = page["result"]["tools"].as_array().unwrap();
     for mutator in nestweaver_mcp::http::MUTATING_TOOLS {
         assert!(
             tools.iter().all(|tool| tool["name"] != *mutator),

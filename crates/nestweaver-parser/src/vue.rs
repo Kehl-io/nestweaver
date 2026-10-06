@@ -218,6 +218,7 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
             // Import statements
             if let Some(cap) = RE_IMPORT.captures(trimmed) {
                 references.push(RawReference {
+                    scope: None,
                     name: cap[1].to_string(),
                     kind: ReferenceKind::Import,
                     start_line: line_no,
@@ -226,6 +227,7 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
                 });
             } else if let Some(cap) = RE_IMPORT_SIDE.captures(trimmed) {
                 references.push(RawReference {
+                    scope: None,
                     name: cap[1].to_string(),
                     kind: ReferenceKind::Import,
                     start_line: line_no,
@@ -243,6 +245,7 @@ pub fn parse_vue(path: &Path, source: &str) -> ParsedFile {
                         && name != component_name
                     {
                         references.push(RawReference {
+                            scope: None,
                             name,
                             kind: ReferenceKind::Call,
                             start_line: line_no,

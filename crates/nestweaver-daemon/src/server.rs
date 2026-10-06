@@ -3964,8 +3964,17 @@ impl DaemonService {
         extensions: &tonic::Extensions,
     ) -> Result<Response<JsonResponse>, Status> {
         let visible = self.state.visible_repos_for(extensions)?;
-        self.dispatch_json_tool_with_ownership(tool_name, args_json, visible, None)
-            .await
+        self.dispatch_json_tool_with_ownership(
+            tool_name,
+            args_json,
+            visible,
+            None,
+            extensions
+                .get::<nestweaver_schema::ToolDeliveryProfile>()
+                .copied()
+                .unwrap_or_default(),
+        )
+        .await
     }
 
     /// Mutating JSON dispatch whose admission guard is transferred to the
@@ -3979,8 +3988,17 @@ impl DaemonService {
     ) -> Result<Response<JsonResponse>, Status> {
         let visible = self.state.visible_repos_for(extensions)?;
         let guard = ConnectionGuard::write(&self.state)?;
-        self.dispatch_json_tool_with_ownership(tool_name, args_json, visible, Some((guard, label)))
-            .await
+        self.dispatch_json_tool_with_ownership(
+            tool_name,
+            args_json,
+            visible,
+            Some((guard, label)),
+            extensions
+                .get::<nestweaver_schema::ToolDeliveryProfile>()
+                .copied()
+                .unwrap_or_default(),
+        )
+        .await
     }
 
     async fn dispatch_json_tool_with_ownership(
@@ -3989,6 +4007,7 @@ impl DaemonService {
         args_json: &str,
         visible: nestweaver_engine::authz::VisibleRepos,
         mutation: Option<(ConnectionGuard, &'static str)>,
+        profile: nestweaver_schema::ToolDeliveryProfile,
     ) -> Result<Response<JsonResponse>, Status> {
         let started = std::time::Instant::now();
         // Increment gRPC request counter for this tool/method.
@@ -4003,8 +4022,14 @@ impl DaemonService {
         // `with_safeguard_cancellable` on timeout and observed by the
         // `spawn_blocking` dispatch (e.g. brain_context's vector fan-out).
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let handler =
-            self.dispatch_json_tool_inner(tool_name, args_json, cancel.clone(), visible, mutation);
+        let handler = self.dispatch_json_tool_inner(
+            tool_name,
+            args_json,
+            cancel.clone(),
+            visible,
+            mutation,
+            profile,
+        );
 
         let response = if self.state.server_mode {
             with_safeguard_cancellable(&tool, safeguards, None, cancel, handler).await
@@ -4037,6 +4062,7 @@ impl DaemonService {
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
         visible: nestweaver_engine::authz::VisibleRepos,
         mutation: Option<(ConnectionGuard, &'static str)>,
+        profile: nestweaver_schema::ToolDeliveryProfile,
     ) -> Result<Response<JsonResponse>, Status> {
         let t0 = std::time::Instant::now();
         // Read dispatches retain their historical request-scoped accounting.
@@ -4061,6 +4087,7 @@ impl DaemonService {
 
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || -> Result<String, Status> {
+            let _delivery = nestweaver_mcp::tools::scoped_tool_delivery(profile);
             crash_if_test_seam_names(&tool_name);
             let has_authoritative_writer = mutation.is_some();
             let _mutation_scope = mutation.map(|(guard, label)| MutationWorkerOwnership {
@@ -4271,7 +4298,12 @@ impl DaemonService {
         let tool = tool_name.to_string();
         let timeout = safeguards.effective_timeout(&tool, None);
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let handler = self.dispatch_tool_json_inner(tool_name, args, cancel.clone(), visible);
+        let profile = extensions
+            .get::<nestweaver_schema::ToolDeliveryProfile>()
+            .copied()
+            .unwrap_or_default();
+        let handler =
+            self.dispatch_tool_json_inner(tool_name, args, cancel.clone(), visible, profile);
 
         let response = if self.state.server_mode {
             with_safeguard_cancellable(&tool, safeguards, None, cancel, handler).await
@@ -4302,6 +4334,7 @@ impl DaemonService {
         args: serde_json::Value,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
         visible: nestweaver_engine::authz::VisibleRepos,
+        profile: nestweaver_schema::ToolDeliveryProfile,
     ) -> Result<serde_json::Value, Status> {
         let t0 = std::time::Instant::now();
         let _guard = ConnectionGuard::read(&self.state);
@@ -4320,6 +4353,7 @@ impl DaemonService {
 
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, Status> {
+            let _delivery = nestweaver_mcp::tools::scoped_tool_delivery(profile);
             crash_if_test_seam_names(&tool_name);
             nestweaver_mcp::tools::set_current_db_path(state.db_path.clone());
             nestweaver_mcp::tools::set_lite_mode(false);
@@ -7717,16 +7751,21 @@ impl NestWeaverDaemon for DaemonService {
         if let Some(watcher) = stale_watcher {
             stop_and_drain_watcher(&self.state, watcher.id).await;
         }
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
-            return Ok(Response::new(ServeUiResponse {
-                ok: false,
-                message: format!(
-                    "port {port} is already in use by another process — pick another --port"
-                ),
-                port: 0,
-                error: "port_in_use".to_string(),
-            }));
-        }
+        // Retain the bound listener through task startup; success must prove
+        // this daemon owns the port, not merely that it was briefly available.
+        let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => listener,
+            Err(_) => {
+                return Ok(Response::new(ServeUiResponse {
+                    ok: false,
+                    message: format!(
+                        "port {port} is already in use by another process — pick another --port"
+                    ),
+                    port: 0,
+                    error: "port_in_use".to_string(),
+                }));
+            }
+        };
 
         // Build web UI router, mounting the admin API when available so the
         // admin dashboard SPA can reach its backend on the same origin.
@@ -7784,7 +7823,7 @@ impl NestWeaverDaemon for DaemonService {
         // is tracked so `stop_ui` can abort it and release the listen port
         // (LOW: ui port leak).
         let handle = tokio::spawn(async move {
-            let serve = nestweaver_web::start_server_with_router(web_router, port, open_browser);
+            let serve = nestweaver_web::serve_bound_router(web_router, listener, open_browser);
             tokio::pin!(serve);
             let mut changed = manifest_runtime.changed.subscribe();
             // This poll lives in the retained UI task. Aborting StopUI cancels
@@ -10130,13 +10169,19 @@ impl NestWeaverDaemon for DaemonService {
         request: Request<FlowTraceContinueRequest>,
     ) -> Result<Response<FlowTraceContinueResponse>, Status> {
         let _guard = ConnectionGuard::read(&self.state);
+        let profile = request
+            .extensions()
+            .get::<nestweaver_schema::ToolDeliveryProfile>()
+            .copied()
+            .unwrap_or_default();
         let req = request.into_inner();
         let state = self.state.clone();
 
-        let result =
-            tokio::task::spawn_blocking(move || flow_trace_continue_impl(&state.store, req))
-                .await
-                .map_err(|e| Status::internal(format!("task panicked: {e}")))?;
+        let result = tokio::task::spawn_blocking(move || {
+            flow_trace_continue_impl(&state.store, req, profile)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task panicked: {e}")))?;
 
         result.map(Response::new)
     }
@@ -16756,6 +16801,7 @@ fn crash_if_test_seam_names(_tool_name: &str) {}
 fn flow_trace_continue_impl(
     store: &nestweaver_store::GraphStore,
     req: FlowTraceContinueRequest,
+    profile: nestweaver_schema::ToolDeliveryProfile,
 ) -> Result<FlowTraceContinueResponse, Status> {
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicU64, Ordering as AtomOrd};
@@ -16814,6 +16860,45 @@ fn flow_trace_continue_impl(
         boundaries: Vec<BoundarySymbolProto>,
         truncated: bool,
         make_span_id: Box<dyn Fn() -> String>,
+        bounded: bool,
+        spans_remaining: usize,
+        edges_remaining: usize,
+        reads_remaining: usize,
+    }
+
+    impl TraceCtx<'_> {
+        fn read_callees(&mut self, uid: &str) -> Vec<nestweaver_schema::Symbol> {
+            if !self.bounded {
+                return match self.store.callees_of(uid) {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        tracing::warn!("walk_trace: callees_of failed: {error}");
+                        self.truncated = true;
+                        Vec::new()
+                    }
+                };
+            }
+            if self.reads_remaining == 0 {
+                self.truncated = true;
+                return Vec::new();
+            }
+            self.reads_remaining -= 1;
+            match self
+                .store
+                .flow_callees_bounded(uid, self.edges_remaining, None)
+            {
+                Ok((rows, _, cut)) => {
+                    self.edges_remaining = self.edges_remaining.saturating_sub(rows.len());
+                    self.truncated |= cut;
+                    rows.into_iter().map(|(symbol, _)| symbol).collect()
+                }
+                Err(error) => {
+                    tracing::warn!("walk_trace: bounded callees failed: {error}");
+                    self.truncated = true;
+                    Vec::new()
+                }
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -16829,6 +16914,7 @@ fn flow_trace_continue_impl(
         depth: usize,
         max_depth: usize,
     ) -> String {
+        ctx.spans_remaining = ctx.spans_remaining.saturating_sub(1);
         let span_id = (ctx.make_span_id)();
 
         // Mark this canonical_id as visited.
@@ -16839,14 +16925,7 @@ fn flow_trace_continue_impl(
         if depth < max_depth {
             // On a DB read error, mark the trace truncated (incomplete) rather than
             // silently pruning this branch as if it had no callees.
-            let callees = match ctx.store.callees_of(uid) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("walk_trace: callees_of failed: {e}");
-                    ctx.truncated = true;
-                    Vec::new()
-                }
-            };
+            let callees = ctx.read_callees(uid);
             for callee in &callees {
                 let callee_cid = callee.canonical_id.as_deref().unwrap_or("");
 
@@ -16858,6 +16937,11 @@ fn flow_trace_continue_impl(
                 if callee_cid.is_empty() {
                     // Symbol without canonical_id — skip as boundary.
                     continue;
+                }
+
+                if ctx.spans_remaining == 0 {
+                    ctx.truncated = true;
+                    break;
                 }
 
                 // Resolve the callee's repo URL from its repo_uid. If
@@ -16886,14 +16970,7 @@ fn flow_trace_continue_impl(
             // Check if there are callees we didn't follow due to depth limit.
             // On a DB read error, mark the trace truncated (incomplete) rather than
             // silently pruning this branch as if it had no callees.
-            let callees = match ctx.store.callees_of(uid) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("walk_trace: callees_of failed: {e}");
-                    ctx.truncated = true;
-                    Vec::new()
-                }
-            };
+            let callees = ctx.read_callees(uid);
             if !callees.is_empty() {
                 ctx.truncated = true;
             }
@@ -16929,6 +17006,14 @@ fn flow_trace_continue_impl(
         boundaries: Vec::new(),
         truncated: false,
         make_span_id: Box::new(make_span_id),
+        bounded: profile == nestweaver_schema::ToolDeliveryProfile::BoundedMcp,
+        spans_remaining: if profile == nestweaver_schema::ToolDeliveryProfile::BoundedMcp {
+            64
+        } else {
+            usize::MAX
+        },
+        edges_remaining: 96,
+        reads_remaining: 64,
     };
 
     walk_trace(
@@ -25093,6 +25178,281 @@ repos = ["alpha"]
             !state.store.has_git_activity(),
             "a refresh must not leave the previous slice loaded"
         );
+    }
+
+    #[tokio::test]
+    async fn continuation_delivery_profile_reaches_worker_and_bounds_wide_frontier() {
+        use nestweaver_schema::ToolDeliveryProfile::{BoundedMcp, FullCli};
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+        let state = test_state_with_writer();
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:continuation",
+                "https://example.test/continuation",
+                None,
+            ))
+            .unwrap();
+        for index in 0..101 {
+            let uid = format!("continuation:{index:03}");
+            state
+                .store
+                .insert_symbol(&Symbol {
+                    uid: uid.clone(),
+                    name: uid.clone(),
+                    kind: SymbolKind::Function,
+                    repo_uid: "repo:continuation".into(),
+                    file_path: "src/flow.rs".into(),
+                    start_line: 1,
+                    end_line: 2,
+                    signature: String::new(),
+                    summary: None,
+                    content_hash: "h".into(),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Public,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: Some(format!("canonical:{uid}")),
+                })
+                .unwrap();
+            if index > 0 {
+                state
+                    .store
+                    .insert_edge(&ResolvedEdge {
+                        source_uid: "continuation:000".into(),
+                        target_uid: uid,
+                        edge_type: EdgeType::Calls,
+                        confidence: 1.0,
+                        link_type: None,
+                        evidence: vec![],
+                    })
+                    .unwrap();
+            }
+        }
+        let service = DaemonService::new(state);
+        let request = |profile| {
+            let mut request = Request::new(FlowTraceContinueRequest {
+                trace_id: "profile-fixture".into(),
+                entry_canonical_id: "canonical:continuation:000".into(),
+                parent_span_id: String::new(),
+                remaining_depth: 1,
+                visited_canonical_ids: vec![],
+            });
+            request.extensions_mut().insert(profile);
+            request
+        };
+        let full = service
+            .flow_trace_continue(request(FullCli))
+            .await
+            .unwrap()
+            .into_inner();
+        let bounded = service
+            .flow_trace_continue(request(BoundedMcp))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(full.spans.len(), 101, "native frontier remains complete");
+        assert!(!full.truncated);
+        assert!(
+            !bounded.spans.is_empty(),
+            "bounded continuation retains useful actual spans"
+        );
+        assert!(
+            bounded.spans.len() <= 64,
+            "MCP spans bounded before construction: {}",
+            bounded.spans.len()
+        );
+        assert!(bounded.truncated, "a work cut must be disclosed");
+        let retained: std::collections::HashSet<_> = bounded
+            .spans
+            .iter()
+            .map(|span| span.span_id.as_str())
+            .collect();
+        assert!(
+            bounded
+                .spans
+                .iter()
+                .flat_map(|span| span.callee_span_ids.iter())
+                .all(|id| retained.contains(id.as_str())),
+            "no reference to an omitted span"
+        );
+        assert!(
+            bounded.spans.iter().all(|span| full
+                .spans
+                .iter()
+                .any(|candidate| candidate.canonical_id == span.canonical_id)),
+            "retained identity belongs to native population"
+        );
+        // A subsequent legacy request has no profile metadata; retain FullCLI compatibility.
+        let legacy = service
+            .flow_trace_continue(Request::new(request(FullCli).into_inner()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(legacy.spans.len(), 101);
+        assert!(!legacy.truncated);
+    }
+
+    #[tokio::test]
+    async fn continuation_delivery_profile_small_complete_trace_and_cycle_counterweight() {
+        use nestweaver_schema::ToolDeliveryProfile::{BoundedMcp, FullCli};
+        use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+        let state = test_state_with_writer();
+        state
+            .store
+            .insert_repo(&test_repo(
+                "repo:small-continuation",
+                "https://example.test/small",
+                None,
+            ))
+            .unwrap();
+        for uid in ["small:A", "small:B"] {
+            state
+                .store
+                .insert_symbol(&Symbol {
+                    uid: uid.into(),
+                    name: uid.into(),
+                    kind: SymbolKind::Function,
+                    repo_uid: "repo:small-continuation".into(),
+                    file_path: "src/flow.rs".into(),
+                    start_line: 1,
+                    end_line: 2,
+                    signature: String::new(),
+                    summary: None,
+                    content_hash: "h".into(),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Public,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: Some(format!("canonical:{uid}")),
+                })
+                .unwrap();
+        }
+        for (source, target) in [("small:A", "small:B"), ("small:B", "small:A")] {
+            state
+                .store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: source.into(),
+                    target_uid: target.into(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 1.0,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+        let service = DaemonService::new(state);
+        for profile in [FullCli, BoundedMcp] {
+            let mut request = Request::new(FlowTraceContinueRequest {
+                trace_id: "small-fixture".into(),
+                entry_canonical_id: "canonical:small:A".into(),
+                parent_span_id: String::new(),
+                remaining_depth: 10,
+                visited_canonical_ids: vec![],
+            });
+            request.extensions_mut().insert(profile);
+            let response = service
+                .flow_trace_continue(request)
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(response.spans.len(), 2);
+            assert!(!response.truncated);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delivery_profiles_keep_daemon_typed_and_json_notes_independent() {
+        use nestweaver_schema::ToolDeliveryProfile::{BoundedMcp, FullCli};
+        let state = test_state_with_writer();
+        let root = tempfile::tempdir().unwrap();
+        state
+            .store
+            .insert_vault(&nestweaver_schema::Vault {
+                uid: "vlt:delivery".into(),
+                name: "delivery".into(),
+                root_path: root.path().to_string_lossy().into_owned(),
+                instance_id: "test".into(),
+            })
+            .unwrap();
+        state
+            .store
+            .insert_note(&nestweaver_schema::Note {
+                uid: "note:delivery".into(),
+                vault_uid: "vlt:delivery".into(),
+                file_path: "delivery.md".into(),
+                title: "Delivery".into(),
+                note_kind: nestweaver_schema::NoteKind::General,
+                word_count: 6000,
+                content_hash: "delivery".into(),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        let body = "private fixture 雪 \\\"\n".repeat(2200) + "DAEMON_END_SENTINEL";
+        assert!(body.len() > 37_000);
+        std::fs::write(root.path().join("delivery.md"), &body).unwrap();
+        let service = DaemonService::new(state);
+        let make_request = |profile| {
+            let mut req = Request::new(NoteGetRequest {
+                uid: Some("note:delivery".into()),
+                title: None,
+                include_body: Some(true),
+                sections: vec![],
+            });
+            req.extensions_mut().insert(profile);
+            req
+        };
+        let (full, bounded) = tokio::join!(
+            service.get_note(make_request(FullCli)),
+            service.get_note(make_request(BoundedMcp))
+        );
+        let full: serde_json::Value =
+            serde_json::from_str(&full.unwrap().into_inner().result_json).unwrap();
+        let bounded: serde_json::Value =
+            serde_json::from_str(&bounded.unwrap().into_inner().result_json).unwrap();
+        assert_eq!(full["body"], body);
+        assert_eq!(full["truncated"], false);
+        assert!(
+            nestweaver_mcp::tools::wrap_tool_result(bounded.clone())
+                .to_string()
+                .len()
+                <= 40_000
+        );
+        assert_eq!(bounded["truncated"], true);
+        assert!(
+            !bounded["body"]
+                .as_str()
+                .unwrap()
+                .contains("DAEMON_END_SENTINEL")
+        );
+        for profile in [BoundedMcp, FullCli, BoundedMcp] {
+            let mut extensions = tonic::Extensions::new();
+            extensions.insert(profile);
+            let response = service
+                .dispatch_json_tool("note_get", r#"{"uid":"note:delivery"}"#, &extensions)
+                .await
+                .unwrap()
+                .into_inner();
+            let value: serde_json::Value = serde_json::from_str(&response.result_json).unwrap();
+            assert_eq!(
+                value["body"]
+                    .as_str()
+                    .unwrap()
+                    .contains("DAEMON_END_SENTINEL"),
+                profile == FullCli
+            );
+        }
     }
 
     /// Build a minimal `DaemonState` with a writer-mode Tantivy index for

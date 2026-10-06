@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::State;
@@ -113,6 +114,32 @@ fn map_context_engine_error(err: anyhow::Error) -> ApiError {
     ApiError::from_context_read(err)
 }
 
+/// Read/render budget, not a hard HTTP wall-clock timeout. Vault derivation
+/// admission may publish graph changes and must finish outside this scope.
+/// Native reads inherit the absolute deadline; Rust stages cooperatively check
+/// between phases and after actual response serialization.
+const CONTEXT_READ_BUDGET: Duration = Duration::from_secs(5);
+
+fn context_read_checkpoint() -> Result<(), ApiError> {
+    nestweaver_store::GraphStore::check_read_deadline()
+        .map_err(|error| ApiError::from_context_read(error.into()))
+}
+
+fn context_read_boundary<T>(
+    store: &nestweaver_store::GraphStore,
+    deadline: Instant,
+    read: impl FnOnce() -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    store.with_read_deadline(deadline, || {
+        context_read_checkpoint()?;
+        let result = read();
+        // Check even after an error: actual deadline evidence classifies native
+        // expiry without guessing from an unrelated Query error's message.
+        context_read_checkpoint()?;
+        result
+    })
+}
+
 pub async fn code_context(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ContextRequest>,
@@ -121,14 +148,20 @@ pub async fn code_context(
     let read_state = state.clone();
     crate::rank_events::with_rank_event(&state, move || {
         let state = read_state;
-        reject_unresolved_http_seeds(&state.store, &body.seeds)?;
+        // Admission can write; never interrupt it with the read deadline.
         state.admit_vault_derivation()?;
-        let result = nestweaver_engine::build_context(&state.store, &body.seeds)
-            .map_err(map_context_engine_error)?;
-        let mut json = serde_json::to_value(&result)?;
-        crate::bridge::annotate_context_payload(&state, &mut json);
-        stamp_http_watcher_batch_disclosure(&state, &mut json);
-        Ok(Json(json).into_response())
+        context_read_boundary(&state.store, Instant::now() + CONTEXT_READ_BUDGET, || {
+            reject_unresolved_http_seeds(&state.store, &body.seeds)?;
+            context_read_checkpoint()?;
+            let result = nestweaver_engine::build_context(&state.store, &body.seeds)
+                .map_err(map_context_engine_error)?;
+            context_read_checkpoint()?;
+            let mut json = serde_json::to_value(&result)?;
+            crate::bridge::annotate_context_payload(&state, &mut json);
+            context_read_checkpoint()?;
+            stamp_http_watcher_batch_disclosure(&state, &mut json);
+            Ok(Json(json).into_response())
+        })
     })
     .await
 }
@@ -152,90 +185,100 @@ pub async fn brain_context(
     let read_state = state.clone();
     crate::rank_events::with_rank_event(&state, move || {
         let state = read_state;
-        let generation = state.store.graph_generation();
-        nestweaver_engine::context_graph::ensure_context_generation(&state.store, generation)
-            .map_err(ApiError::from_context_read)?;
-        reject_unresolved_http_seeds(&state.store, &body.seeds)?;
+        // Complete any derivation publication before starting cancellable reads.
         state.admit_vault_derivation()?;
-        let workspace = resolve_context_workspace(
-            &state.store,
-            workspaces::workspace_param(body.workspace.as_deref(), body.scope.as_deref()),
-        )?;
-        let config = nestweaver_engine::HybridSearchConfig::default();
-        let mut result = match nestweaver_engine::build_brain_context_hybrid(
-            &state.store,
-            &body.seeds,
-            state.tantivy.as_deref(),
-            &config,
-            None,
-            None,
-        ) {
-            Ok(result) => result,
-            // Vault workspaces do not admit code results. An unresolved `sym:`
-            // seed would 404 before the vault filter can return the documented
-            // empty no-match body.
-            Err(err)
-                if workspace.kind == WorkspaceKind::Vault
-                    && err
-                        .chain()
-                        .any(|cause| cause.to_string().contains("No seeds resolved")) =>
-            {
-                nestweaver_engine::BrainContextResult {
-                    unresolved_seeds: body.seeds.clone(),
-                    ..Default::default()
+        context_read_boundary(&state.store, Instant::now() + CONTEXT_READ_BUDGET, || {
+            let generation = state.store.graph_generation();
+            nestweaver_engine::context_graph::ensure_context_generation(&state.store, generation)
+                .map_err(ApiError::from_context_read)?;
+            reject_unresolved_http_seeds(&state.store, &body.seeds)?;
+            context_read_checkpoint()?;
+            let workspace = resolve_context_workspace(
+                &state.store,
+                workspaces::workspace_param(body.workspace.as_deref(), body.scope.as_deref()),
+            )?;
+            context_read_checkpoint()?;
+            let config = nestweaver_engine::HybridSearchConfig::default();
+            let mut result = match nestweaver_engine::build_brain_context_hybrid(
+                &state.store,
+                &body.seeds,
+                state.tantivy.as_deref(),
+                &config,
+                None,
+                None,
+            ) {
+                Ok(result) => result,
+                // Vault workspaces do not admit code results. An unresolved `sym:`
+                // seed would 404 before the vault filter can return the documented
+                // empty no-match body.
+                Err(err)
+                    if workspace.kind == WorkspaceKind::Vault
+                        && err
+                            .chain()
+                            .any(|cause| cause.to_string().contains("No seeds resolved")) =>
+                {
+                    nestweaver_engine::BrainContextResult {
+                        unresolved_seeds: body.seeds.clone(),
+                        ..Default::default()
+                    }
                 }
-            }
-            Err(err) => return Err(map_context_engine_error(err)),
-        };
-        filter_brain_context_result(&state, &workspace, &mut result)?;
-        // This router is the existing trusted loopback UI, not a remote policy
-        // boundary. Remote callers must supply their own resolved VisibleRepos.
-        let graph = nestweaver_engine::context_graph::attach_context_graph(
-            &state.store,
-            &mut result,
-            &nestweaver_engine::authz::VisibleRepos::All,
-            generation,
-        )
-        .map_err(ApiError::from_context_read)?;
-        // This surface supplies no embedder. Describe the route capability,
-        // regardless of a healthy model/vector pipeline available elsewhere.
-        result.semantic_applied = false;
-        result.semantic_unavailable = Some(serde_json::json!({
-            "component": "semantic", "reason": "web_surface_unsupported",
-            "stage": "route_capability",
-            "remediation": "Use a configured CLI or MCP surface for semantic context."
-        }));
-        if !result.degraded_components.iter().any(|component| component == "semantic") {
-            result.degraded_components.push("semantic".into());
-        }
-        let empty_result = result.seeds.is_empty() && result.connected.is_empty();
-        let mut meta = brain_context_meta(&workspace, body.token_budget, empty_result);
-        if graph.meta.truncated {
-            meta.trust.partial = true;
-            meta.trust.result = "partial".to_string();
-            meta.trust.message.push_str(" Context graph limits omitted nodes or relationships; graph_meta describes their populations.");
-            meta.truncation.truncated = true;
-            // Nodes and edges are different populations. Do not combine their
-            // counts or describe a lower-bound edge count as an exact total.
-            meta.truncation.limit = None;
-            meta.truncation.omitted_count = None;
-            meta.continuation.has_more = false;
-            meta.continuation.reason =
-                Some("Narrow the context seeds to inspect omitted relationships.".to_string());
-        }
-        let mut json = serde_json::to_value(&result)?;
-        // Scene-level bridge emphasis: seeds + connected form one scene, so
-        // the top-12 cap and 0..=1 normalization span the whole response.
-        crate::bridge::annotate_context_payload(&state, &mut json);
-        if let serde_json::Value::Object(ref mut object) = json {
-            object.insert("edges".to_string(), serde_json::to_value(graph.edges)?);
-            object.insert("graph_meta".to_string(), serde_json::to_value(graph.meta)?);
-            object.insert("_meta".to_string(), serde_json::to_value(meta)?);
-        }
-        nestweaver_engine::context_graph::ensure_context_generation(&state.store, generation)
+                Err(err) => return Err(map_context_engine_error(err)),
+            };
+            context_read_checkpoint()?;
+            filter_brain_context_result(&state, &workspace, &mut result)?;
+            // This router is the existing trusted loopback UI, not a remote policy
+            // boundary. Remote callers must supply their own resolved VisibleRepos.
+            context_read_checkpoint()?;
+            let graph = nestweaver_engine::context_graph::attach_context_graph(
+                &state.store,
+                &mut result,
+                &nestweaver_engine::authz::VisibleRepos::All,
+                generation,
+            )
             .map_err(ApiError::from_context_read)?;
-        stamp_http_watcher_batch_disclosure(&state, &mut json);
-        Ok(Json(json).into_response())
+            // This surface supplies no embedder. Describe the route capability,
+            // regardless of a healthy model/vector pipeline available elsewhere.
+            result.semantic_applied = false;
+            result.semantic_unavailable = Some(serde_json::json!({
+                "component": "semantic", "reason": "web_surface_unsupported",
+                "stage": "route_capability",
+                "remediation": "Use a configured CLI or MCP surface for semantic context."
+            }));
+            if !result.degraded_components.iter().any(|component| component == "semantic") {
+                result.degraded_components.push("semantic".into());
+            }
+            context_read_checkpoint()?;
+            let empty_result = result.seeds.is_empty() && result.connected.is_empty();
+            let mut meta = brain_context_meta(&workspace, body.token_budget, empty_result);
+            if graph.meta.truncated {
+                meta.trust.partial = true;
+                meta.trust.result = "partial".to_string();
+                meta.trust.message.push_str(" Context graph limits omitted nodes or relationships; graph_meta describes their populations.");
+                meta.truncation.truncated = true;
+                // Nodes and edges are different populations. Do not combine their
+                // counts or describe a lower-bound edge count as an exact total.
+                meta.truncation.limit = None;
+                meta.truncation.omitted_count = None;
+                meta.continuation.has_more = false;
+                meta.continuation.reason =
+                    Some("Narrow the context seeds to inspect omitted relationships.".to_string());
+            }
+            context_read_checkpoint()?;
+            let mut json = serde_json::to_value(&result)?;
+            // Scene-level bridge emphasis: seeds + connected form one scene, so
+            // the top-12 cap and 0..=1 normalization span the whole response.
+            crate::bridge::annotate_context_payload(&state, &mut json);
+            if let serde_json::Value::Object(ref mut object) = json {
+                object.insert("edges".to_string(), serde_json::to_value(graph.edges)?);
+                object.insert("graph_meta".to_string(), serde_json::to_value(graph.meta)?);
+                object.insert("_meta".to_string(), serde_json::to_value(meta)?);
+            }
+            context_read_checkpoint()?;
+            nestweaver_engine::context_graph::ensure_context_generation(&state.store, generation)
+                .map_err(ApiError::from_context_read)?;
+            stamp_http_watcher_batch_disclosure(&state, &mut json);
+            Ok(Json(json).into_response())
+        })
     })
     .await
 }
@@ -290,6 +333,7 @@ fn filter_brain_context_result(
     for nodes in [&mut result.seeds, &mut result.connected] {
         let mut retained = Vec::with_capacity(nodes.len());
         for node in nodes.drain(..) {
+            context_read_checkpoint()?;
             if brain_node_in_workspace(&state.store, workspace, &node.uid, &project_membership)? {
                 retained.push(node);
             }
@@ -405,28 +449,20 @@ mod timeout_tests {
 
     #[tokio::test]
     async fn context_deadlines_are_retryable_coded_http_errors() {
-        for error in [
-            nestweaver_store::StoreError::Cancelled(nestweaver_store::CancelReason::Timeout),
-            nestweaver_store::StoreError::Query(
-                "context edges: Runtime exception: Query interrupted.".into(),
-            ),
-            nestweaver_store::StoreError::Query(
-                "context edges ACCESSES: Query execution failed: Interrupted.".into(),
-            ),
-        ] {
-            let response =
-                map_context_engine_error(anyhow::Error::new(error).context("context graph read"))
-                    .into_response();
-            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
-            assert_eq!(response.headers().get("retry-after").unwrap(), "1");
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(payload["error"], "context_timeout");
-            assert_eq!(payload["retryable"], true);
-            assert!(payload["message"].as_str().unwrap().contains("retry"));
-        }
+        let error =
+            nestweaver_store::StoreError::Cancelled(nestweaver_store::CancelReason::Timeout);
+        let response =
+            map_context_engine_error(anyhow::Error::new(error).context("context graph read"))
+                .into_response();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(response.headers().get("retry-after").unwrap(), "1");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"], "context_timeout");
+        assert_eq!(payload["retryable"], true);
+        assert!(payload["message"].as_str().unwrap().contains("retry"));
     }
 
     #[tokio::test]
@@ -514,6 +550,12 @@ mod timeout_tests {
     #[test]
     fn context_query_failures_are_not_mistaken_for_deadlines() {
         for error in [
+            nestweaver_store::StoreError::Query(
+                "context edges: Runtime exception: Query interrupted.".into(),
+            ),
+            nestweaver_store::StoreError::Query(
+                "context edges ACCESSES: Query execution failed: Interrupted.".into(),
+            ),
             nestweaver_store::StoreError::Query("Binder exception: missing schema".into()),
             nestweaver_store::StoreError::Query("checkpoint failed: timeout".into()),
             nestweaver_store::StoreError::Query(
@@ -526,5 +568,112 @@ mod timeout_tests {
                 StatusCode::INTERNAL_SERVER_ERROR
             );
         }
+    }
+
+    async fn assert_context_timeout(error: ApiError) {
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(response.headers().get("retry-after").unwrap(), "1");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"], "context_timeout");
+        assert_eq!(payload["retryable"], true);
+    }
+
+    #[tokio::test]
+    async fn context_read_boundary_times_out_workspace_work_before_edges() {
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let mut workspace_reads = 0;
+        let mut edge_reads = 0;
+        let result =
+            context_read_boundary(&store, Instant::now() + Duration::from_millis(1), || {
+                // Inject actual elapsed work before any edge query, with a finite
+                // short test budget. No fabricated native timeout string is used.
+                std::thread::sleep(Duration::from_millis(5));
+                workspace_reads += 1;
+                resolve_context_workspace(&store, Some("project:fixture"))?;
+                edge_reads += 1;
+                store
+                    .context_edges(&[])
+                    .map_err(|error| ApiError::from_context_read(error.into()))?;
+                Ok(())
+            });
+        assert_eq!(workspace_reads, 1);
+        assert_eq!(edge_reads, 0);
+        assert_context_timeout(
+            result.expect_err("pre-edge workspace work must share the deadline"),
+        )
+        .await;
+        assert!(
+            store
+                .with_read_deadline(Instant::now() + Duration::from_secs(5), || {
+                    resolve_context_workspace(&store, None)
+                })
+                .is_ok(),
+            "deadline scope must restore after timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_read_boundary_catches_late_rust_render_and_error_with_actual_expiry() {
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        for fail in [false, true] {
+            let mut serialized = false;
+            let result =
+                context_read_boundary(&store, Instant::now() + Duration::from_millis(1), || {
+                    let response =
+                        Json(serde_json::json!({"seeds": [], "connected": [], "edges": []}))
+                            .into_response();
+                    serialized = true;
+                    // Emulate a finite slow Rust-only presentation phase. It has
+                    // no database query for a native timer to interrupt.
+                    std::thread::sleep(Duration::from_millis(5));
+                    if fail {
+                        Err(ApiError::internal("unrelated query failure"))
+                    } else {
+                        Ok(response)
+                    }
+                });
+            assert!(serialized);
+            assert_context_timeout(
+                result.expect_err("expired render cannot publish a successful response"),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn context_read_boundary_returns_actual_response_within_budget_and_keeps_unrelated_errors()
+     {
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let response = context_read_boundary(&store, Instant::now() + CONTEXT_READ_BUDGET, || {
+            resolve_context_workspace(&store, None)?;
+            Ok(Json(serde_json::json!({"read": "within-budget"})).into_response())
+        })
+        .ok()
+        .expect("a small real workspace read fits the read budget");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["read"],
+            "within-budget"
+        );
+        let result: Result<(), ApiError> =
+            context_read_boundary(&store, Instant::now() + CONTEXT_READ_BUDGET, || {
+                Err(ApiError::from_context_read(
+                    nestweaver_store::StoreError::Query(
+                        "context edges: Runtime exception: Query interrupted.".into(),
+                    )
+                    .into(),
+                ))
+            });
+        assert_eq!(
+            result.err().unwrap().status,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

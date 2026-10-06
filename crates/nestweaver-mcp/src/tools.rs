@@ -1300,10 +1300,181 @@ pub fn tool_list(lite: bool) -> Value {
 
 /// Wire-only catalogue page. Internal documentation/validation callers keep
 /// the complete catalogue returned by `tool_list`.
+/// Remove documentation annotations only from JSON Schema positions. Literal
+/// defaults/examples and property names are data, not schema keyword maps.
+fn compact_schema_documentation(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    object.remove("description");
+    for key in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+    ] {
+        if let Some(map) = object.get_mut(key).and_then(Value::as_object_mut) {
+            for child in map.values_mut() {
+                compact_schema_documentation(child);
+            }
+        }
+    }
+    for key in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+        if let Some(items) = object.get_mut(key).and_then(Value::as_array_mut) {
+            for child in items {
+                compact_schema_documentation(child);
+            }
+        }
+    }
+    for key in [
+        "items",
+        "additionalProperties",
+        "unevaluatedProperties",
+        "additionalItems",
+        "not",
+        "if",
+        "then",
+        "else",
+        "contains",
+        "propertyNames",
+        "unevaluatedItems",
+    ] {
+        if let Some(child) = object.get_mut(key) {
+            if let Some(items) = child.as_array_mut() {
+                for item in items {
+                    compact_schema_documentation(item);
+                }
+            } else {
+                compact_schema_documentation(child);
+            }
+        }
+    }
+    // Draft-07 dependencies may be either schemas or literal property arrays.
+    if let Some(map) = object
+        .get_mut("dependencies")
+        .and_then(Value::as_object_mut)
+    {
+        for child in map.values_mut() {
+            if child.is_object() {
+                compact_schema_documentation(child);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn assert_wire_tool_contract(wire: &Value, full: &Value) {
+    fn schema(wire: &Value, full: &Value) {
+        let Some(expected) = full.as_object() else {
+            assert_eq!(wire, full);
+            return;
+        };
+        let actual = wire.as_object().expect("schema object");
+        assert_eq!(
+            actual.len(),
+            expected.len() - usize::from(expected.contains_key("description"))
+        );
+        for (key, value) in expected {
+            if key == "description" {
+                assert!(!actual.contains_key(key));
+                continue;
+            }
+            let got = actual
+                .get(key)
+                .unwrap_or_else(|| panic!("schema constraint removed: {key}"));
+            match key.as_str() {
+                "properties" | "patternProperties" | "$defs" | "definitions"
+                | "dependentSchemas" => {
+                    let names = value.as_object().unwrap();
+                    let observed = got.as_object().unwrap();
+                    assert_eq!(observed.len(), names.len());
+                    for (name, child) in names {
+                        schema(
+                            observed.get(name).expect("property/definition retained"),
+                            child,
+                        );
+                    }
+                }
+                "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
+                    let items = value.as_array().unwrap();
+                    let observed = got.as_array().unwrap();
+                    assert_eq!(items.len(), observed.len());
+                    for (child, expected) in observed.iter().zip(items) {
+                        schema(child, expected);
+                    }
+                }
+                "items"
+                | "additionalProperties"
+                | "unevaluatedProperties"
+                | "additionalItems"
+                | "not"
+                | "if"
+                | "then"
+                | "else"
+                | "contains"
+                | "propertyNames"
+                | "unevaluatedItems" => {
+                    if let Some(items) = value.as_array() {
+                        let observed = got.as_array().unwrap();
+                        assert_eq!(observed.len(), items.len());
+                        for (child, expected) in observed.iter().zip(items) {
+                            schema(child, expected);
+                        }
+                    } else {
+                        schema(got, value);
+                    }
+                }
+                "dependencies" => {
+                    let expected = value.as_object().unwrap();
+                    let actual = got.as_object().unwrap();
+                    assert_eq!(actual.len(), expected.len());
+                    for (name, child) in expected {
+                        let observed = actual.get(name).expect("dependency retained");
+                        if child.is_object() {
+                            schema(observed, child);
+                        } else {
+                            assert_eq!(observed, child);
+                        }
+                    }
+                }
+                _ => assert_eq!(got, value, "literal/constraint fidelity: {key}"),
+            }
+        }
+    }
+    assert_eq!(
+        wire.as_object().unwrap().len(),
+        full.as_object().unwrap().len()
+    );
+    for (key, value) in full.as_object().unwrap() {
+        match key.as_str() {
+            "inputSchema" => schema(&wire[key], value),
+            "description" => assert!(wire[key].as_str().unwrap().len() <= 200),
+            _ => assert_eq!(&wire[key], value),
+        }
+    }
+}
+
+fn compact_wire_tool(mut tool: Value) -> Value {
+    if let Some(schema) = tool.get_mut("inputSchema") {
+        compact_schema_documentation(schema);
+    }
+    if let Some(description) = tool.get("description").and_then(Value::as_str) {
+        tool["description"] = json!(truncate_utf8_bytes(description, 200));
+    }
+    tool
+}
+
 pub fn tool_list_page(lite: bool, cursor: Option<&str>) -> Result<Value, String> {
     use std::hash::{Hash, Hasher};
     let catalogue = tool_list(lite);
-    let tools = catalogue["tools"].as_array().expect("catalogue tools");
+    let tools: Vec<_> = catalogue["tools"]
+        .as_array()
+        .expect("catalogue tools")
+        .iter()
+        .cloned()
+        .map(compact_wire_tool)
+        .collect();
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     catalogue.to_string().hash(&mut hash);
     let profile = format!("{:016x}", hash.finish());
@@ -1326,11 +1497,7 @@ pub fn tool_list_page(lite: bool, cursor: Option<&str>) -> Result<Value, String>
         0
     };
     let mut page = json!({"tools":[]});
-    for tool in tools
-        .iter()
-        .skip(offset)
-        .take(crate::output_budget::CATALOGUE_TOOLS)
-    {
+    for tool in tools.iter().skip(offset) {
         let mut candidate = page.clone();
         candidate["tools"]
             .as_array_mut()
@@ -1405,6 +1572,99 @@ mod tool_schema_validation_tests {
     use std::collections::BTreeSet;
 
     #[test]
+    fn review_schema_compaction_preserves_literal_descriptions_and_constraints() {
+        let mut schema = json!({"type":"object","description":"annotation","required":["description"],
+            "properties":{"description":{"type":"string","description":"annotation","maxLength":12,
+                "default":{"description":"literal"},"examples":[{"description":"example"}]}},
+            "$defs":{"choice":{"oneOf":[{"type":"integer","minimum":1,"description":"annotation"}]}}});
+        let before = schema.clone();
+        compact_schema_documentation(&mut schema);
+        assert!(schema.get("description").is_none());
+        assert_eq!(schema["required"], before["required"]);
+        assert_eq!(
+            schema["properties"]["description"]["default"],
+            before["properties"]["description"]["default"]
+        );
+        assert_eq!(
+            schema["properties"]["description"]["examples"],
+            before["properties"]["description"]["examples"]
+        );
+        assert_eq!(schema["properties"]["description"]["maxLength"], 12);
+        assert_eq!(schema["$defs"]["choice"]["oneOf"][0]["minimum"], 1);
+        assert!(
+            schema["properties"]["description"]
+                .get("description")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn review_discovery_first_page_contains_complete_visible_catalogue() {
+        let full = tool_list(false);
+        let page = tool_list_page(false, None).unwrap();
+        let full_names: BTreeSet<_> = full["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        let page_names: BTreeSet<_> = page["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            page_names, full_names,
+            "clients that ignore nextCursor must discover every visible tool"
+        );
+        assert!(crate::output_budget::escaped_size(&page) <= 32_000);
+        assert!(page.get("nextCursor").is_none_or(Value::is_null));
+    }
+
+    #[test]
+    fn review_not_found_wrapper_bounds_both_representations() {
+        let result = wrap_tool_not_found(
+            json!({"status":"not_found", "target":"missing-symbol", "message":"retry ".repeat(12_000)}),
+        );
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["status"], "not_found");
+        assert!(crate::output_budget::escaped_size(&result) <= 40_000);
+        assert!(crate::output_budget::escaped_size(&result["structuredContent"]) <= 20_000);
+        assert_eq!(
+            serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+            result["structuredContent"]
+        );
+    }
+
+    #[test]
+    fn review_not_found_escaped_unicode_identity_gets_bounded_refusal() {
+        let target = "雪\\\"".repeat(20_000);
+        let result = wrap_tool_not_found(
+            json!({"status":"not_found","target":target,"message":"No such symbol"}),
+        );
+        assert!(crate::output_budget::escaped_size(&result) <= 40_000);
+        assert_eq!(result["isError"], true);
+        let payload = &result["structuredContent"];
+        assert_eq!(payload["status"], "refused");
+        assert_eq!(payload["original_status"], "not_found");
+        assert_eq!(payload["targets"]["target"]["identity_truncated"], true);
+        assert_eq!(
+            payload["targets"]["target"]["serialized_bytes"],
+            crate::output_budget::escaped_size(&json!(target))
+        );
+        assert!(
+            payload["targets"]["target"]["hash"]
+                .as_str()
+                .is_some_and(|hash| !hash.is_empty())
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+            *payload
+        );
+    }
+
+    #[test]
     fn wire_catalogue_filters_before_pagination_and_binds_cursors_to_profile() {
         struct Reset;
         impl Drop for Reset {
@@ -1425,13 +1685,19 @@ mod tool_schema_validation_tests {
         ] {
             set_direct_read_only(readonly);
             ALLOWED_TOOLS.with(|slot| *slot.borrow_mut() = allowed);
-            let expected = tool_list(lite)["tools"].as_array().unwrap().clone();
+            let expected: Vec<_> = tool_list(lite)["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(compact_wire_tool)
+                .collect();
             let mut actual = Vec::new();
             let mut cursor = None;
             for _ in 0..100 {
                 let page = tool_list_page(lite, cursor.as_deref()).unwrap();
                 assert!(crate::output_budget::escaped_size(&page) <= 32_000);
-                assert!(page["tools"].as_array().unwrap().len() <= 8);
+                assert_eq!(page["tools"].as_array().unwrap().len(), expected.len());
                 actual.extend(page["tools"].as_array().unwrap().iter().cloned());
                 cursor = page
                     .get("nextCursor")
@@ -1445,7 +1711,8 @@ mod tool_schema_validation_tests {
         }
         ALLOWED_TOOLS.with(|slot| *slot.borrow_mut() = None);
         let page = tool_list_page(false, None).unwrap();
-        let cursor = page["nextCursor"].as_str().unwrap();
+        assert!(page.get("nextCursor").is_none());
+        let cursor = "nw-tools-v1:invalid-profile:1";
         set_direct_read_only(true);
         assert!(tool_list_page(false, Some(cursor)).is_err());
     }
@@ -3270,6 +3537,57 @@ mod provenance_seam {
 
 use provenance_seam::Unstamped;
 
+thread_local! {
+    static TOOL_DELIVERY: std::cell::Cell<nestweaver_schema::ToolDeliveryProfile> =
+        const { std::cell::Cell::new(nestweaver_schema::ToolDeliveryProfile::BoundedMcp) };
+}
+
+pub struct ToolDeliveryGuard {
+    previous: nestweaver_schema::ToolDeliveryProfile,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl Drop for ToolDeliveryGuard {
+    fn drop(&mut self) {
+        TOOL_DELIVERY.with(|profile| profile.set(self.previous));
+    }
+}
+pub fn scoped_tool_delivery(profile: nestweaver_schema::ToolDeliveryProfile) -> ToolDeliveryGuard {
+    ToolDeliveryGuard {
+        previous: TOOL_DELIVERY.with(|current| current.replace(profile)),
+        _not_send: std::marker::PhantomData,
+    }
+}
+fn bounded_delivery() -> bool {
+    TOOL_DELIVERY
+        .with(|current| current.get() == nestweaver_schema::ToolDeliveryProfile::BoundedMcp)
+}
+fn delivery_limit(limit: usize) -> usize {
+    if bounded_delivery() {
+        limit
+    } else {
+        (i64::MAX as usize).saturating_sub(1)
+    }
+}
+
+pub fn dispatch_cli(
+    store: &GraphStore,
+    tantivy: Option<&TantivyIndex>,
+    name: &str,
+    args: Value,
+    embed_model: Option<&dyn EmbedQueryFn>,
+) -> Result<Value, anyhow::Error> {
+    let _delivery = scoped_tool_delivery(nestweaver_schema::ToolDeliveryProfile::FullCli);
+    dispatch(store, tantivy, name, args, embed_model)
+}
+
+#[cfg(feature = "daemon")]
+fn profiled_daemon_request<T>(value: T) -> tonic::Request<T> {
+    nestweaver_federation::dispatch::profiled_request(
+        value,
+        TOOL_DELIVERY.with(|profile| profile.get()),
+    )
+}
+
 pub fn dispatch(
     store: &GraphStore,
     tantivy: Option<&TantivyIndex>,
@@ -3929,9 +4247,8 @@ fn response_cache_key(
 ) -> u64 {
     // Fold the caller's repo-visibility in so a redacted blast_radius result is
     // never served across identities (R9b). A `None`/`All` visibility (the
-    // unconfigured single-trust-domain default) contributes salt 0, so the key
-    // is byte-identical to before and existing entries still hit — zero
-    // behavior change when no `[authz]` policy is set. A restricting
+    // unconfigured single-trust-domain default) contributes salt 0, so authorization isolation remains unchanged when no `[authz]` policy is set.
+    // The independent delivery-profile salt below separates response contracts. A restricting
     // `Only(set)` mixes a stable digest of its sorted repo_uids, giving each
     // visibility scope its own cache slot.
     let key = mix_visibility_cache_key(
@@ -3939,6 +4256,14 @@ fn response_cache_key(
         visibility_cache_salt(visible),
     );
     let key = mix_visibility_cache_key(key, semantic_cache_salt(name, embed_model));
+    let key = mix_visibility_cache_key(
+        key,
+        if bounded_delivery() {
+            0x4d43505f424f554e
+        } else {
+            0x434c495f46554c4c
+        },
+    );
     // nw-372: the rest of the key covers the GRAPH (`graph_generation`) and the
     // FILES (`whole_db_scope_digest`), and the resolver-generation sidecar is
     // neither. Downgrading it — exactly what bumping `RESOLVER_GENERATION` does
@@ -4830,7 +5155,7 @@ fn resolve_repo_for_spec(store: &GraphStore, spec: &str) -> Option<String> {
 fn tool_schema_read_symbols() -> Value {
     json!({
         "name": "read_symbols",
-        "description": "Read a symbol's source code span (start_line..end_line) without loading the entire file.\n\nGuidelines:\n- Accepts UIDs (sym:...), bare names, or FQNs; ambiguous names return candidate UIDs to disambiguate\n- Use include_neighbors to also return adjacent symbols in the same file\n- Use token_budget to cap combined output size\n\nLimitations:\n- Only reads indexed code symbols, not markdown notes (use note_get for those)\n- When `root` is omitted, file paths resolve from the owning repo's `local_root` in the graph, then the server working directory\n- Refused for repository-scoped identities because a caller-selected filesystem root cannot prove the source bytes belong to the authorized repository\n\nIn server mode (bare clones), bodies may be empty with a server_note explaining the limitation.",
+        "description": "Read indexed symbol source spans. MCP output is bounded to 20KB logical / 40KB escaped; read truncation metadata and narrow targets or sections to continue.\n\nGuidelines:\n- Accepts UIDs (sym:...), bare names, or FQNs; ambiguous names return candidate UIDs to disambiguate\n- Use include_neighbors to also return adjacent symbols in the same file\n- Use token_budget to cap combined output size\n\nLimitations:\n- Only reads indexed code symbols, not markdown notes (use note_get for those)\n- When `root` is omitted, file paths resolve from the owning repo's `local_root` in the graph, then the server working directory\n- Refused for repository-scoped identities because a caller-selected filesystem root cannot prove the source bytes belong to the authorized repository\n\nIn server mode (bare clones), bodies may be empty with a server_note explaining the limitation.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4868,7 +5193,7 @@ fn tool_schema_read_symbols() -> Value {
                 },
                 "token_budget": {
                     "type": "integer",
-                    "description": "Approximate token cap for the combined output. The first requested symbol is always returned in full; subsequent symbols are dropped once the budget is exceeded. Omit for no cap; a budget of 0 therefore returns just the first symbol."
+                    "description": "Approximate requested token cap for combined source. Native CLI retains the first symbol in full and drops later symbols after this budget. Omission removes that token cap; 0 requests only the first symbol. MCP independently applies its 20KB logical / 40KB escaped wire bound, which may truncate even the first symbol; inspect output_budget and retry narrowly."
                 },
                 "root": {
                     "type": "string",
@@ -4941,6 +5266,9 @@ fn bounded_metadata<T: serde::Serialize>(
     value: &T,
     max_bytes: usize,
 ) -> Result<Option<Value>, anyhow::Error> {
+    if !bounded_delivery() {
+        return Ok(Some(serde_json::to_value(value)?));
+    }
     struct Writer {
         bytes: Vec<u8>,
         cap: usize,
@@ -5009,6 +5337,15 @@ fn bounded_mapped_rows<T>(
     bytes: usize,
     map: impl Fn(&T, usize) -> Result<Option<Value>, anyhow::Error>,
 ) -> Result<Vec<Value>, anyhow::Error> {
+    if !bounded_delivery() {
+        return rows
+            .iter()
+            .map(|row| {
+                map(row, i64::MAX as usize)?
+                    .ok_or_else(|| anyhow!("CLI row mapping unexpectedly omitted a row"))
+            })
+            .collect();
+    }
     let mut remaining = bytes.saturating_sub(2);
     let mut values = Vec::new();
     for row in rows.iter().take(2000) {
@@ -5033,6 +5370,9 @@ fn bounded_mapped_rows<T>(
 }
 
 fn bounded_source_text(text: &str, bytes: usize) -> String {
+    if !bounded_delivery() {
+        return text.to_owned();
+    }
     let mut end = text.len().min(bytes);
     while !text.is_char_boundary(end) {
         end -= 1;
@@ -5050,6 +5390,12 @@ fn bounded_typed_rows<T: serde::Serialize>(
     rows: &[T],
     bytes: usize,
 ) -> Result<Vec<Value>, anyhow::Error> {
+    if !bounded_delivery() {
+        return rows
+            .iter()
+            .map(|row| serde_json::to_value(row).map_err(anyhow::Error::from))
+            .collect();
+    }
     let mut remaining = bytes.saturating_sub(2);
     let mut values = Vec::new();
     for row in rows.iter().take(2000) {
@@ -5066,6 +5412,9 @@ fn retain_serialized_prefix<T: serde::Serialize>(
     rows: &mut Vec<T>,
     bytes: usize,
 ) -> Result<usize, anyhow::Error> {
+    if !bounded_delivery() {
+        return Ok(0);
+    }
     let total = rows.len();
     let mut remaining = bytes;
     let mut keep = 0;
@@ -5114,10 +5463,10 @@ fn tool_regex_search(
             pattern,
             path_prefix,
             kinds.as_deref(),
-            Some(limit.min(configured_result_limit())),
+            Some(limit),
             max_millis,
             cancel,
-            2000,
+            if bounded_delivery() { 2000 } else { 200_000 },
         )
         .map_err(|e| anyhow!("regex_search: {e}"))?;
     // nw-097: the note now rides on RegexSearchResult itself, attached by the
@@ -5371,7 +5720,34 @@ fn tool_brain_tag_graph(store: &GraphStore, args: Value) -> Result<Value, anyhow
         Some(Value::String(tag)) => Some(tag.as_str()),
         Some(_) => return Err(anyhow!("'tag' must be a string")),
     };
-    nestweaver_engine::brain_docgraph::tag_graph_bounded(store, focus, limit)
+    if bounded_delivery() {
+        return nestweaver_engine::brain_docgraph::tag_graph_bounded(store, focus, limit);
+    }
+    let render =
+        |graph: nestweaver_engine::brain_docgraph::TagGraph| -> Result<Value, anyhow::Error> {
+            let neighbors = graph.co_occurring.len();
+            let descendants = graph.descendants.len();
+            let mut value = serde_json::to_value(graph)?;
+            value["co_occurring_total"] = json!(neighbors);
+            value["descendants_total"] = json!(descendants);
+            value["truncated"] = json!(false);
+            value["count_relation"] = json!("eq");
+            value["population_complete"] = json!(true);
+            Ok(value)
+        };
+    if let Some(tag) = focus {
+        return render(nestweaver_engine::brain_docgraph::tag_graph(store, tag)?);
+    }
+    let graphs = nestweaver_engine::brain_docgraph::tag_graph_all(store)?;
+    let total = graphs.len();
+    let tags = graphs
+        .into_iter()
+        .take(limit)
+        .map(render)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(
+        json!({"total":total,"returned":tags.len(),"truncated":total>tags.len(),"total_relation":"eq","population_complete":true,"tags":tags,"retry_guidance":null}),
+    )
 }
 
 fn tool_schema_brain_tag_graph() -> Value {
@@ -6082,11 +6458,11 @@ pub fn envelope_from_status_details(details: &[u8]) -> Option<Value> {
 /// Wrap a not-found envelope as the one MCP miss contract.
 pub fn wrap_tool_not_found(envelope: Value) -> Value {
     let pretty = serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| envelope.to_string());
-    json!({
+    crate::output_budget::finalize(json!({
         "content": [{ "type": "text", "text": pretty }],
         "structuredContent": envelope,
         "isError": true,
-    })
+    }))
 }
 
 /// Wrap a failed dispatch: a lookup miss becomes the not-found envelope,
@@ -8818,7 +9194,7 @@ mod brain_search_total_contract_tests {
 fn tool_schema_note_get() -> Value {
     json!({
         "name": "note_get",
-        "description": "Fetch a vault note's full markdown body or specific sections, plus structural metadata (frontmatter, heading outline, tags).\n\nRequires either 'uid' or 'title' (at least one must be provided).\n\nGuidelines:\n- Use after brain_search or brain_context identifies a relevant note\n- Pass uid or a vault-relative path for unambiguous lookup; duplicate titles refuse with candidate UIDs\n- Use sections parameter to retrieve only specific heading sections — much more token-efficient for large notes\n\nLimitations:\n- Markdown notes only — for code symbols use read_symbols\n- Not a discovery tool — use brain_search or brain_context to find notes first",
+        "description": "Fetch note body/sections and metadata. MCP applies 20KB logical / 40KB escaped output bounds; inspect truncation and narrow to sections. Native CLI retains the full requested body.\n\nRequires either 'uid' or 'title' (at least one must be provided).\n\nGuidelines:\n- Use after brain_search or brain_context identifies a relevant note\n- Pass uid or a vault-relative path for unambiguous lookup; duplicate titles refuse with candidate UIDs\n- Use sections parameter to retrieve only specific heading sections — much more token-efficient for large notes\n\nLimitations:\n- Markdown notes only — for code symbols use read_symbols\n- Not a discovery tool — use brain_search or brain_context to find notes first",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -8827,7 +9203,7 @@ fn tool_schema_note_get() -> Value {
                 "title": { "type": "string", "description": "Note title (case-insensitive). Ambiguous titles refuse with candidate UIDs; pass a UID or vault-relative path to pin one note." },
                 "include_body": {
                     "type": "boolean",
-                    "description": "Include the full markdown body. Default true. Set to false to get only metadata (outline, frontmatter, section count).",
+                    "description": "Include the note body (default true). Native CLI returns the full requested body; MCP may truncate within its independent wire bound. False returns metadata only (outline, frontmatter, section count).",
                     "default": true
                 },
                 "sections": {
@@ -8865,7 +9241,11 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
 
     let frontmatter_complete = std::cell::Cell::new(true);
     let hydrate = |uid: &str| {
-        let (note, complete) = store.lookup_note_for_delivery(uid, 4000)?;
+        let (note, complete) = if bounded_delivery() {
+            store.lookup_note_for_delivery(uid, 4000)?
+        } else {
+            (store.lookup_note(uid)?, true)
+        };
         frontmatter_complete.set(complete);
         Ok::<_, nestweaver_store::StoreError>(note)
     };
@@ -8915,45 +9295,74 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
             note.frontmatter_raw.as_ref().map_or(0, String::len),
         );
     }
-    const BODY_BYTES: usize = 12_000;
+    let body_bytes = delivery_limit(12_000);
     let (outline_total, section_count) = store
         .note_structure_counts(&note.uid)
         .map_err(|e| anyhow!("note_structure_counts: {e}"))?;
-    let headings_raw = store
-        .headings_in_note_bounded(&note.uid, 50)
-        .map_err(|e| anyhow!("headings_in_note: {e}"))?;
+    let mut headings_raw = if bounded_delivery() {
+        store.headings_in_note_bounded(&note.uid, 50)
+    } else {
+        store.headings_in_note(&note.uid)
+    }
+    .map_err(|e| anyhow!("headings_in_note: {e}"))?;
+    headings_raw.sort_by(|a, b| {
+        a.start_line
+            .cmp(&b.start_line)
+            .then_with(|| a.uid.cmp(&b.uid))
+    });
     let mut body_truncated = false;
     // Resolve body: either filtered sections or full file contents.
     let body = if let Some(ref names) = section_filter {
         // Section-filter mode: return only the text_content of sections whose
         // heading matches one of the requested names (case-insensitive).
-        if names.len() > 50 {
+        if bounded_delivery() && names.len() > 50 {
             return Err(anyhow!(
                 "note_get accepts at most 50 selected sections per bounded read; narrow the section list"
             ));
         }
-        let selected = store
-            .selected_headings_bounded(&note.uid, names, 51)
-            .map_err(|e| anyhow!("selected_headings: {e}"))?;
-        body_truncated |= selected.len() > 50;
+        let selected = if bounded_delivery() {
+            store.selected_headings_bounded(&note.uid, names, 51)?
+        } else {
+            headings_raw
+                .iter()
+                .filter(|heading| {
+                    names
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&heading.text))
+                })
+                .cloned()
+                .collect()
+        };
+        body_truncated |= bounded_delivery() && selected.len() > 50;
+        let full_sections = if bounded_delivery() {
+            None
+        } else {
+            Some(store.sections_in_note(&note.uid)?)
+        };
         let mut parts = String::new();
-        for heading in selected.iter().take(50) {
+        for heading in selected.iter().take(delivery_limit(50)) {
             if !parts.is_empty() {
-                if BODY_BYTES.saturating_sub(parts.len()) < 2 {
+                if body_bytes.saturating_sub(parts.len()) < 2 {
                     body_truncated = true;
                     break;
                 }
                 parts.push_str("\n\n");
             }
-            let remaining = BODY_BYTES.saturating_sub(parts.len());
+            let remaining = body_bytes.saturating_sub(parts.len());
             if remaining == 0 {
                 body_truncated = true;
                 break;
             }
-            if let Some(section) = store
-                .section_for_heading_bounded(&heading.uid, remaining + 1)
-                .map_err(|e| anyhow!("section_for_heading: {e}"))?
-            {
+            if let Some(section) = if bounded_delivery() {
+                store.section_for_heading_bounded(&heading.uid, remaining + 1)?
+            } else {
+                full_sections
+                    .as_ref()
+                    .expect("full CLI sections hydrated")
+                    .iter()
+                    .find(|section| section.heading_uid.as_deref() == Some(heading.uid.as_str()))
+                    .cloned()
+            } {
                 let text = format!(
                     "{} {}\n\n{}",
                     "#".repeat(heading.level as usize),
@@ -8989,11 +9398,11 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
                 } else {
                     use std::io::Read;
                     match std::fs::File::open(&path).and_then(|file| {
-                        let mut bytes = Vec::with_capacity(BODY_BYTES + 1);
-                        file.take((BODY_BYTES + 1) as u64).read_to_end(&mut bytes)?;
-                        body_truncated = bytes.len() > BODY_BYTES;
+                        let mut bytes = Vec::with_capacity((body_bytes + 1).min(12_001));
+                        file.take((body_bytes + 1) as u64).read_to_end(&mut bytes)?;
+                        body_truncated = bytes.len() > body_bytes;
                         if body_truncated {
-                            bytes.truncate(BODY_BYTES);
+                            bytes.truncate(body_bytes);
                         }
                         while body_truncated
                             && std::str::from_utf8(&bytes)
@@ -9020,11 +9429,11 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
     };
 
     let mut headings = Vec::new();
-    let mut outline_bytes = 3000usize;
+    let mut outline_bytes = delivery_limit(3000);
     let mut outline_text_truncated = false;
     for heading in headings_raw {
-        outline_text_truncated |=
-            heading.text.chars().count() >= 256 || heading.slug.chars().count() >= 256;
+        outline_text_truncated |= bounded_delivery()
+            && (heading.text.chars().count() >= 256 || heading.slug.chars().count() >= 256);
         let row = json!({"uid":heading.uid,"level":heading.level,"text":heading.text,"slug":heading.slug,"line":heading.start_line});
         let bytes = crate::output_budget::escaped_size(&row) + 1;
         if bytes > outline_bytes {
@@ -9046,7 +9455,7 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
                 ch if ch < ' ' => 6,
                 ch => ch.len_utf8(),
             };
-            if used + bytes > 7000 {
+            if bounded_delivery() && used + bytes > 7000 {
                 body_truncated = true;
                 break;
             }
@@ -9056,11 +9465,12 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         text[..end].to_owned()
     });
 
-    let frontmatter_truncated = !frontmatter_complete.get()
-        || note
-            .frontmatter
-            .as_ref()
-            .is_some_and(|text| text.len() > 4_000);
+    let frontmatter_truncated = bounded_delivery()
+        && (!frontmatter_complete.get()
+            || note
+                .frontmatter
+                .as_ref()
+                .is_some_and(|text| text.len() > 4_000));
     let frontmatter: Value = if frontmatter_truncated {
         Value::Null
     } else {
@@ -11883,7 +12293,7 @@ fn tool_flow_trace(
         if !has_visible_direct_callee {
             const MAX_METHODS: usize = 20;
             let (methods, methods_total) = store
-                .flow_methods_bounded(&root, MAX_METHODS, visibility)
+                .flow_methods_bounded(&root, delivery_limit(MAX_METHODS), visibility)
                 .map_err(|e| anyhow!("members_of: {e}"))?;
             let roots: Vec<_> = methods.iter().map(|method| method.uid.as_str()).collect();
             let frontier = flow_frontier(store, &roots, &blocked, &opts)?;
@@ -11983,9 +12393,9 @@ struct FlowBudget {
 impl Default for FlowBudget {
     fn default() -> Self {
         Self {
-            edges: 96,
-            reads: 64,
-            render_bytes: 14_000,
+            edges: delivery_limit(96),
+            reads: delivery_limit(64),
+            render_bytes: delivery_limit(14_000),
             expanded: HashSet::new(),
             cut: false,
         }
@@ -12137,7 +12547,7 @@ fn flow_frontier(
             if depths.contains_key(&callee.uid) {
                 continue;
             }
-            if depths.len() >= 64 || queue.len() >= 64 {
+            if depths.len() >= delivery_limit(64) || queue.len() >= delivery_limit(64) {
                 opts.budget.borrow_mut().cut = true;
                 *cut.entry(uid.clone()).or_default() += 1;
                 continue;
@@ -12255,6 +12665,18 @@ fn build_flow_tree(
             budget.render_bytes -= cost;
             let expanded = budget.expanded.contains(&callee.uid);
             drop(budget);
+            if !frontier.depths.contains_key(&callee.uid) {
+                let mut stub = json!({"uid":callee.uid,"name":callee.name,"children":[],
+                    "truncated":true,"truncation_reason":"work_budget",
+                    "retry_guidance":"Trace this UID directly to continue.","edge_type":edge_type});
+                if !opts.concise {
+                    stub["file_path"] = json!(callee.file_path);
+                    stub["repo_uid"] = json!(callee.repo_uid);
+                    stub["depth"] = json!(depth + 1);
+                }
+                children.push(stub);
+                continue;
+            }
             if frontier.depths.get(&callee.uid) != Some(&(depth + 1)) || expanded {
                 // nw-390, THE non-monotonicity. The traversal's visited set
                 // was GLOBAL, so a callee claimed by an earlier branch was
@@ -13163,7 +13585,7 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
     let preview_members = if requested_members == 0 {
         20
     } else {
-        requested_members.min(200)
+        requested_members.min(delivery_limit(200))
     };
     let offset = read_limit(&args, "member_offset", 0, 0, 1_000_000_000)?;
     if args
@@ -14043,7 +14465,7 @@ fn tool_brain_diff(
 fn tool_schema_project_context() -> Value {
     json!({
         "name": "project_context",
-        "description": "Retrieve context for a named project: notes, symbols, and sections ranked by PPR within strict project membership, bounded by token budget. Each result reports in_project, source_project, and membership_basis; linked foreign content is excluded.\n\nGuidelines:\n- Use when you know the project name — for ad-hoc topics use brain_context with seeds instead\n- Returns a CONCISE orientation by default (~1000 tokens: kind/title/location per node); pass response_format:'detailed' for full metadata (uid + relevance, ~3000 tokens)\n- Narrow with repos, path_prefix, tags/exclude_tags, kinds, since, recency_weight — carry the same filter names over to brain_context when drilling in\n- For composite projects, include_components pulls in sub-project content\n\nLimitations:\n- Requires projects to be defined in the graph (via vault taxonomy or instance config)\n- If you don't know the project name, use brain_search to find it first\n- A `brain watcher batch` publication no longer fails this call closed: it SUCCEEDS and discloses the open window on the response with `publication_in_progress: true`, `marker_age_s`, `in_flight_note_paths` (max 20) and `in_flight_note_paths_truncated`. Read those before trusting the result — the answer came from a graph still being written to, and the named notes are mid-publication. KNOWN GAP: those keys reach every MCP route, but CLI `--json` verbs that reshape the response into a typed struct (e.g. `nestweaver hubs --json`) drop them silently\n- A full `index` publication still fails CLOSED with 'index publication TRANSIENT/WEDGED', and so does a WEDGED watcher marker. This refers to INDEX PUBLICATION, not a dirty git working tree: editing files in a repo does NOT cause it, and NestWeaver is fully usable while you work. TRANSIENT resolves on its own — retry. WEDGED means a prior indexer died mid-publication; ASK THE OPERATOR to run the `nestweaver repair` command named in the error — repair is a destructive publication recovery with no MCP tool, so it cannot be done from here — or check brain_status.index_publication.",
+        "description": "Retrieve strictly scoped project context ranked by PPR. Requested token budgets do not override MCP 20KB logical / 40KB escaped output bounds; inspect truncation and narrow the scope to continue. Each result reports in_project, source_project, and membership_basis; linked foreign content is excluded.\n\nGuidelines:\n- Use when you know the project name — for ad-hoc topics use brain_context with seeds instead\n- Returns a CONCISE orientation by default (~1000 tokens: kind/title/location per node); pass response_format:'detailed' for full metadata (uid + relevance, ~3000 tokens)\n- Narrow with repos, path_prefix, tags/exclude_tags, kinds, since, recency_weight — carry the same filter names over to brain_context when drilling in\n- For composite projects, include_components pulls in sub-project content\n\nLimitations:\n- Requires projects to be defined in the graph (via vault taxonomy or instance config)\n- If you don't know the project name, use brain_search to find it first\n- A `brain watcher batch` publication no longer fails this call closed: it SUCCEEDS and discloses the open window on the response with `publication_in_progress: true`, `marker_age_s`, `in_flight_note_paths` (max 20) and `in_flight_note_paths_truncated`. Read those before trusting the result — the answer came from a graph still being written to, and the named notes are mid-publication. KNOWN GAP: those keys reach every MCP route, but CLI `--json` verbs that reshape the response into a typed struct (e.g. `nestweaver hubs --json`) drop them silently\n- A full `index` publication still fails CLOSED with 'index publication TRANSIENT/WEDGED', and so does a WEDGED watcher marker. This refers to INDEX PUBLICATION, not a dirty git working tree: editing files in a repo does NOT cause it, and NestWeaver is fully usable while you work. TRANSIENT resolves on its own — retry. WEDGED means a prior indexer died mid-publication; ASK THE OPERATOR to run the `nestweaver repair` command named in the error — repair is a destructive publication recovery with no MCP tool, so it cannot be done from here — or check brain_status.index_publication.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -17484,7 +17906,7 @@ fn dispatch_via_daemon_inner(
         // and silently deleted nothing (a no-op reported as success). Fetch the
         // repo list from the daemon and match with the same logic the CLI uses.
         let repos: Vec<nestweaver_schema::Repo> = {
-            let req = tonic::Request::new(nestweaver_proto::JsonRequest {
+            let req = profiled_daemon_request(nestweaver_proto::JsonRequest {
                 args_json: "{}".to_string(),
             });
             let resp = rt
@@ -17522,7 +17944,7 @@ fn dispatch_via_daemon_inner(
 
         // Not a repo — resolve as a vault (by uid, name, or root path).
         let vaults: Vec<nestweaver_schema::Vault> = {
-            let req = tonic::Request::new(nestweaver_proto::JsonRequest {
+            let req = profiled_daemon_request(nestweaver_proto::JsonRequest {
                 args_json: "{}".to_string(),
             });
             let resp = rt.block_on(client.list_vaults_json(req)).map_err(|e| {
@@ -17617,7 +18039,7 @@ fn dispatch_via_daemon_inner(
             // ── Typed hot-path RPCs ──────────────────────────────────
             "brain_search" => {
                 use nestweaver_proto::BrainSearchRequest;
-                let req = tonic::Request::new(BrainSearchRequest {
+                let req = profiled_daemon_request(BrainSearchRequest {
                     query: str_field("query"),
                     limit: i32_field("limit"),
                     response_format: opt_str_field("response_format"),
@@ -17634,7 +18056,7 @@ fn dispatch_via_daemon_inner(
             }
             "brain_context" => {
                 use nestweaver_proto::BrainContextRequest;
-                let req = tonic::Request::new(BrainContextRequest {
+                let req = profiled_daemon_request(BrainContextRequest {
                     limit: args
                         .get("limit")
                         .and_then(Value::as_u64)
@@ -17686,7 +18108,7 @@ fn dispatch_via_daemon_inner(
             }
             "project_context" => {
                 use nestweaver_proto::ProjectContextRequest;
-                let req = tonic::Request::new(ProjectContextRequest {
+                let req = profiled_daemon_request(ProjectContextRequest {
                     project: str_field("project"),
                     token_budget: i32_field("token_budget"),
                     kinds: str_array("kinds"),
@@ -17720,7 +18142,7 @@ fn dispatch_via_daemon_inner(
             }
             "note_get" => {
                 use nestweaver_proto::NoteGetRequest;
-                let req = tonic::Request::new(NoteGetRequest {
+                let req = profiled_daemon_request(NoteGetRequest {
                     uid: opt_str_field("uid"),
                     title: opt_str_field("title"),
                     // nw-316: preserve absence; see `include_components`.
@@ -17737,7 +18159,7 @@ fn dispatch_via_daemon_inner(
                 // instance_id), warnings[], and any other engine-side fields
                 // round-trip intact. The typed BrainStatusResponse only
                 // carries the scalar totals.
-                let req = tonic::Request::new(JsonRequest {
+                let req = profiled_daemon_request(JsonRequest {
                     args_json: args_json.clone(),
                 });
                 let resp = client
@@ -17748,7 +18170,7 @@ fn dispatch_via_daemon_inner(
             }
             "hub_nodes" => {
                 use nestweaver_proto::HubNodesRequest;
-                let req = tonic::Request::new(HubNodesRequest {
+                let req = profiled_daemon_request(HubNodesRequest {
                     // The schema advertises 'limit'; 'top_n' kept as a
                     // backward-compat alias (and it is the proto field name).
                     top_n: args
@@ -17786,7 +18208,7 @@ fn dispatch_via_daemon_inner(
             // `every_registered_tool_routes_to_a_real_arm_on_the_daemon_seam`,
             // which found this one.
             "compact_embeddings" => {
-                let req = tonic::Request::new(nestweaver_proto::CompactEmbeddingsRequest {
+                let req = profiled_daemon_request(nestweaver_proto::CompactEmbeddingsRequest {
                     dry_run: args
                         .get("dry_run")
                         .and_then(|value| value.as_bool())
@@ -17810,7 +18232,7 @@ fn dispatch_via_daemon_inner(
             }
             // ── JSON pass-through RPCs ───────────────────────────────
             other => {
-                let req = tonic::Request::new(JsonRequest {
+                let req = profiled_daemon_request(JsonRequest {
                     args_json: args_json.clone(),
                 });
                 let resp = match other {
@@ -21411,6 +21833,32 @@ mod cache_dispatch_tests {
     }
 
     #[test]
+    fn delivery_profiles_keep_native_tag_neighbors_complete() {
+        let store = remaining_budget_tags();
+        let args = json!({"tag":"budget-0","limit":3});
+        let full = dispatch_cli(&store, None, "brain_tag_graph", args.clone(), None).unwrap();
+        let bounded = dispatch(&store, None, "brain_tag_graph", args, None).unwrap();
+        assert_eq!(full["co_occurring"].as_array().unwrap().len(), 24);
+        assert_eq!(full["co_occurring_total"], 24);
+        assert_eq!(full["count"], bounded["count"]);
+        assert_eq!(full["truncated"], false);
+        assert_eq!(bounded["co_occurring"].as_array().unwrap().len(), 3);
+        assert_eq!(bounded["truncated"], true);
+        let all = dispatch_cli(&store, None, "brain_tag_graph", json!({"limit":3}), None).unwrap();
+        assert_eq!(all["total"], 25);
+        assert_eq!(all["tags"].as_array().unwrap().len(), 3);
+        assert_eq!(all["truncated"], true, "explicit top-tag limit retained");
+        assert!(
+            all["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tag| tag["co_occurring"].as_array().unwrap().len() == 24
+                    && tag["truncated"] == false)
+        );
+    }
+
+    #[test]
     fn remaining_budget_focus_tag_bounds_neighbors() {
         let result = tool_brain_tag_graph(
             &remaining_budget_tags(),
@@ -21806,6 +22254,87 @@ mod cache_dispatch_tests {
             observed.iter().all(|(_, bytes)| *bytes <= 4000),
             "native hydrated fields: {observed:?}"
         );
+    }
+
+    #[test]
+    fn delivery_profiles_preserve_cli_long_note_and_bound_mcp_afterward() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::in_memory().unwrap();
+        let mut vault = vault_fixture();
+        vault.root_path = dir.path().to_string_lossy().into_owned();
+        store.insert_vault(&vault).unwrap();
+        let mut note = note_fixture("note:delivery-policy");
+        note.file_path = "delivery.md".into();
+        note.frontmatter = Some(json!({"description":"完整".repeat(4000)}).to_string());
+        store.insert_note(&note).unwrap();
+        let body = "Unicode 雪 quoted \\\" line\n".repeat(1800) + "CLI_END_SENTINEL";
+        assert!(body.len() > 37_000);
+        std::fs::write(dir.path().join(&note.file_path), &body).unwrap();
+        let args = json!({"uid":note.uid});
+        let full = dispatch_cli(&store, None, "note_get", args.clone(), None).unwrap();
+        assert_eq!(full["body"], body);
+        assert_eq!(full["frontmatter"]["description"], "完整".repeat(4000));
+        assert_eq!(full["truncated"], false);
+        assert!(
+            bounded_delivery(),
+            "CLI dispatch restores the caller profile"
+        );
+        let bounded =
+            wrap_tool_result(dispatch(&store, None, "note_get", args.clone(), None).unwrap());
+        assert!(crate::output_budget::escaped_size(&bounded) <= 40_000);
+        assert!(crate::output_budget::escaped_size(&bounded["structuredContent"]) <= 20_000);
+        assert_eq!(bounded["structuredContent"]["truncated"], true);
+        assert!(
+            !bounded["structuredContent"]["body"]
+                .as_str()
+                .unwrap()
+                .contains("CLI_END_SENTINEL")
+        );
+        assert_eq!(
+            dispatch_cli(&store, None, "note_get", args, None).unwrap()["body"],
+            body
+        );
+    }
+
+    #[test]
+    fn delivery_profile_cache_keys_and_concurrent_flights_cannot_cross() {
+        use nestweaver_schema::ToolDeliveryProfile::{BoundedMcp, FullCli};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("profile-cache.lbug");
+        let args = json!({"seeds":["same"],"token_budget":2000});
+        let keys: Vec<_> = [FullCli, BoundedMcp]
+            .into_iter()
+            .map(|profile| {
+                let _guard = scoped_tool_delivery(profile);
+                response_cache_key("brain_context", &args, &path, None, None)
+            })
+            .collect();
+        assert_ne!(
+            keys[0], keys[1],
+            "cache and flight keys separate full and bounded construction"
+        );
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let computed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handles:Vec<_> = [FullCli,BoundedMcp].into_iter().zip(keys).map(|(profile,key)| {
+            let start = start.clone(); let computed = computed.clone(); let path = path.clone();
+            std::thread::spawn(move || {
+                let guard = scoped_tool_delivery(profile);
+                start.wait();
+                let value = coalesce_in_flight((path,key,1,0),None,|| {
+                    computed.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                    let rows = vec![json!({"body":"x".repeat(3000)});3];
+                    Ok(json!({"profile":profile.wire_value(),"rows":bounded_typed_rows(&rows,1000)?}))
+                }).unwrap();
+                assert_eq!(value["profile"],profile.wire_value());
+                assert_eq!(value["rows"].as_array().unwrap().len(),if profile==FullCli {3}else{0});
+                drop(guard);
+                assert!(bounded_delivery(),"worker profile restored");
+            })
+        }).collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(computed.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -24065,7 +24594,7 @@ mod cache_dispatch_tests {
 mod configured_limit_tests {
     use super::*;
 
-    fn test_config(limit: usize) -> nestweaver_engine::InstanceConfig {
+    pub(super) fn test_config(limit: usize) -> nestweaver_engine::InstanceConfig {
         serde_json::from_value(serde_json::json!({
             "instance_id": "test",
             "repos": [],
@@ -29204,6 +29733,90 @@ mod flow_trace_truncation_tests {
             None,
         )
         .expect("flow_trace")
+    }
+
+    #[test]
+    fn review_regex_explicit_limit_overrides_only_the_operator_default() {
+        struct Restore(Option<std::sync::Arc<nestweaver_engine::InstanceConfig>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                set_current_instance_config(self.0.take());
+            }
+        }
+        let _restore = Restore(current_instance_config());
+        set_current_instance_config(Some(std::sync::Arc::new(
+            super::configured_limit_tests::test_config(1),
+        )));
+        let rows: Vec<_> = (0..3)
+            .map(|n| {
+                symbol(
+                    &format!("sym:limit:{n}"),
+                    "needle",
+                    SymbolKind::Function,
+                    n + 1,
+                )
+            })
+            .collect();
+        let store = store_with(&rows, &[]);
+        for (limit, expected) in [(None, 1), (Some(3), 3), (Some(0), 0)] {
+            let mut args = json!({"pattern":"needle","kinds":["Symbol"]});
+            if let Some(limit) = limit {
+                args["limit"] = json!(limit);
+            }
+            let result = tool_regex_search(&store, args, None).unwrap();
+            assert_eq!(result["results"].as_array().unwrap().len(), expected);
+        }
+    }
+
+    #[test]
+    fn review_flow_unadmitted_work_frontier_is_not_a_canonical_reference() {
+        let mut rows = vec![symbol("sym:root", "rootFn", SymbolKind::Function, 1)];
+        rows.extend(
+            (0..70).map(|n| symbol(&format!("sym:{n:02}"), "child", SymbolKind::Function, n + 2)),
+        );
+        let edges: Vec<_> = rows[1..]
+            .iter()
+            .map(|row| ("sym:root", row.uid.as_str(), EdgeType::Calls))
+            .collect();
+        let store = store_with(&rows, &edges);
+        let opts = FlowTraceOpts {
+            max_depth: 2,
+            concise: false,
+            cancel: None,
+            visible: None,
+            budget: std::cell::RefCell::new(FlowBudget::default()),
+        };
+        let mut frontier = flow_frontier(&store, &["sym:root"], &HashSet::new(), &opts).unwrap();
+        let omitted = frontier.callees["sym:root"]
+            .iter()
+            .find(|(row, _)| !frontier.depths.contains_key(&row.uid))
+            .unwrap()
+            .clone();
+        assert!(
+            opts.budget.borrow().cut,
+            "actual bounded frontier omitted a target"
+        );
+        // Isolate that actual omitted edge from independent render-size cuts.
+        frontier
+            .callees
+            .insert("sym:root".into(), vec![omitted.clone()]);
+        let tree = build_flow_tree(
+            &store,
+            "sym:root",
+            "rootFn",
+            "src/lib.rs",
+            0,
+            &frontier,
+            &opts,
+        )
+        .unwrap();
+        let child = &tree["children"][0];
+        assert_eq!(child["uid"], omitted.0.uid);
+        assert_eq!(child["truncation_reason"], "work_budget");
+        assert!(
+            child.get("deduped_ref").is_none(),
+            "no canonical expansion exists for this UID"
+        );
     }
 
     #[test]

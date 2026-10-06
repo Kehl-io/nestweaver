@@ -237,12 +237,13 @@ pub async fn federate_two_tier(
     }
 
     debug!(tool = %tool_name, "federating two-tier query at /mcp boundary");
-    let mut response = nestweaver_federation::two_tier::two_tier_query(
+    let mut response = nestweaver_federation::two_tier::two_tier_query_profile(
         local,
         &fed.upstreams,
         &fed.ejection_guard,
         tool_name,
         arguments,
+        nestweaver_schema::ToolDeliveryProfile::BoundedMcp,
     )
     .await;
 

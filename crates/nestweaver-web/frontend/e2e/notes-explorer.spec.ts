@@ -1,4 +1,5 @@
 import { expect, test, type Route } from "@playwright/test";
+import { decodedReplyCount, installDeliveryReceipts, waitForDecodedReply } from "./deliveryBarriers";
 
 // nw-648: the live brain had two vaults and ~1918 notes, but the Notes
 // explorer showed "BRAIN 991" and never listed the second vault — it loaded
@@ -218,6 +219,11 @@ test("a failed page can be retried, including a failed first page", async ({ pag
 test("a page shortened by a dropped corrupt row is not the end of the vault", async ({
   page,
 }) => {
+  // This fixture models a stable vault cursor scan. Committed refresh and
+  // reconnect races have separate tests; no publication occurs during paging.
+  await page.route("**/api/v1/events", (route) => route.fulfill({
+    status: 200, contentType: "text/event-stream", body: "retry: 200\n\n",
+  }));
   const dropped = new Set(["note:brain:0500"]);
   await page.route("**/api/v1/brain/vaults", (route) => fulfillVaults(route, [BRAIN]));
   await page.route("**/api/v1/brain/tags", (route) =>
@@ -267,8 +273,9 @@ test("a single small vault lists all its notes with no truncation disclosure", a
 });
 
 // nw-751: only markdown text wikilinks become navigation controls. Resolution
-// returns a real UID, while heading navigation must actually focus its target.
-test("wikilinks resolve aliases and encoded punctuation and focus the requested heading", async ({ page }) => {
+// is mocked here: these tests cover UI request encoding, refusal, and focus.
+// release-wikilinks.spec.ts separately exercises the owned real backend.
+test("UI handles mocked wikilink resolution with encoded punctuation and heading focus", async ({ page }) => {
   const source = note(BRAIN, 0);
   const target = { ...note(BRAIN, 1), title: "Destination", file_path: "team/A & B %20.md", pagerank_score: 0 };
   let resolvedTarget = "";
@@ -303,7 +310,7 @@ test("wikilinks resolve aliases and encoded punctuation and focus the requested 
   await expect(detail).toContainText("Reached destination.");
 });
 
-test("unresolved wikilinks announce refusal and preserve the selected source note", async ({ page }) => {
+test("UI handles mocked wikilink refusal and preserves the selected source note", async ({ page }) => {
   const source = { ...note(DOCS, 1), pagerank_score: 0 };
   await page.route("**/api/v1/brain/note/**", (route) => route.fulfill({ json: {
     note: source, headings: [], sections: [], body: "[[Missing]] [[Shared alias]] [[Target#Missing heading]]",
@@ -321,6 +328,7 @@ test("unresolved wikilinks announce refusal and preserve the selected source not
 });
 
 test("committed catalog refresh discards a delayed load-more cursor response", async ({ page }) => {
+  await installDeliveryReceipts(page);
   let refreshed = false;
   let releaseMore: (() => void) | undefined;
   let morePending = false;
@@ -353,9 +361,158 @@ test("committed catalog refresh discards a delayed load-more cursor response", a
   refreshed = true;
   events.pending = "event: graph:updated\ndata: {}\n\n";
   await expect(brain).toContainText("Committed catalog note");
+  const params = { vault: BRAIN.uid, after: note(BRAIN, PAGE - 1).uid };
+  const beforeRelease = await decodedReplyCount(page, "/api/v1/brain/notes", params);
   releaseMore!();
   await expect.poll(() => obsoleteDelivered).toBe(true);
-  await page.waitForTimeout(100); // allow the delivered old page to reach the component
+  await waitForDecodedReply(page, "/api/v1/brain/notes", params, beforeRelease);
   await expect(brain.getByRole("listitem")).toHaveCount(1);
   await expect(brain.getByText("brain note 1000")).toHaveCount(0);
+});
+
+
+test("committed refresh keeps loaded note extent and focused filter while pages revalidate", async ({ page }) => {
+  const events = { pending: "" };
+  await page.route("**/api/v1/events", (route) => {
+    const body = `retry: 200\n${events.pending}\n`;
+    events.pending = "";
+    return route.fulfill({ status: 200, contentType: "text/event-stream", body });
+  });
+  await page.route("**/api/v1/brain/vaults", (route) => fulfillVaults(route, [BRAIN]));
+  await page.route("**/api/v1/brain/tags", (route) => route.fulfill({ json: [] }));
+  let hold = false;
+  let pending = false;
+  let release: (() => void) | undefined;
+  let restoredPage = false;
+  await page.route("**/api/v1/brain/notes?**", async (route) => {
+    const after = new URL(route.request().url()).searchParams.get("after");
+    if (hold && after === null) {
+      pending = true;
+      await new Promise<void>((resolve) => { release = resolve; });
+    }
+    if (hold && after !== null) restoredPage = true;
+    await fulfillNotes(route);
+  });
+  await page.goto("/");
+  const explorer = page.getByTestId("explorer-panel");
+  await explorer.getByRole("tab", { name: "Notes", exact: true }).click();
+  const brain = explorer.getByTestId("notes-vault-brain");
+  await brain.getByRole("button", { name: "Load more" }).click();
+  await expect(brain.getByRole("listitem")).toHaveCount(2 * PAGE);
+  const filter = explorer.getByPlaceholder("Filter notes...");
+  await filter.focus();
+  hold = true;
+  events.pending = "event: graph:updated\ndata: {}\n\n";
+  await expect.poll(() => pending).toBe(true);
+  await expect(filter).toBeFocused();
+  await expect(brain.getByRole("listitem")).toHaveCount(2 * PAGE);
+  release!();
+  await expect.poll(() => restoredPage).toBe(true);
+  await expect(brain.getByRole("listitem")).toHaveCount(2 * PAGE);
+  await expect(filter).toBeFocused();
+  await expect(brain.locator('[data-note-uid="note:brain:1999"]')).toHaveCount(1);
+});
+
+
+test("an epoch interrupt before the first note response keeps an honest loading state", async ({ page }) => {
+  let committed = false;
+  await page.route("**/api/v1/workspaces", async (route) => {
+    const committedRequest = committed;
+    const response = await route.fetch();
+    const body = await response.json();
+    body.workspaces = body.workspaces.map((workspace: { id: string; label: string }) => ({ ...workspace,
+      label: committedRequest && workspace.id === "all" ? "Epoch loading witness" : workspace.label }));
+    await route.fulfill({ response, json: body });
+  });
+  const events = { pending: "" };
+  await page.route("**/api/v1/events", (route) => {
+    const body = `retry: 200\n${events.pending}\n`;
+    events.pending = "";
+    return route.fulfill({ status: 200, contentType: "text/event-stream", body });
+  });
+  await page.route("**/api/v1/brain/vaults", (route) => fulfillVaults(route, [DOCS]));
+  await page.route("**/api/v1/brain/tags", (route) => route.fulfill({ json: [] }));
+  await page.route("**/api/v1/brain/notes?**", (route) => fulfillNotes(route));
+  const chosen = { ...note(DOCS, 1), pagerank_score: 0 };
+  let phase = 0;
+  const requests = [0, 0];
+  const released = [false, false];
+  const releases: (() => void)[][] = [[], []];
+  await page.route("**/api/v1/brain/note/**", async (route) => {
+    const requestPhase = phase;
+    requests[requestPhase] += 1;
+    if (!released[requestPhase]) await new Promise<void>((resolve) => { releases[requestPhase].push(resolve); });
+    await route.fulfill({ json: { note: chosen, headings: [], sections: [], body: "Loading witness completed" } }).catch(() => {});
+  });
+  await page.goto("/");
+  const explorer = page.getByTestId("explorer-panel");
+  await explorer.getByRole("tab", { name: "Notes", exact: true }).click();
+  await explorer.getByText(chosen.title, { exact: true }).click();
+  const detail = page.getByTestId("detail-panel");
+  await expect.poll(() => requests[0]).toBeGreaterThan(0);
+  await expect(detail).toContainText("Loading note...");
+  phase = 1;
+  committed = true;
+  events.pending = "event: graph:updated\ndata: {}\n\n";
+  await expect(page.getByLabel("Workspace", { exact: true })).toContainText("Epoch loading witness");
+  await expect.poll(() => requests[1]).toBeGreaterThan(0);
+  await expect(detail).toContainText("Loading note...");
+  await expect(detail).not.toContainText("Note not found.");
+  released[1] = true;
+  for (const release of releases[1]) release();
+  await expect(detail).toContainText("Loading witness completed");
+  released[0] = true;
+  for (const release of releases[0]) release(); // Include hover/preview/context consumers in the obsolete batch.
+  await expect(detail).toContainText("Loading witness completed");
+});
+
+
+test("catalogue failure after an epoch interrupts load-more retains rows and allows retry", async ({ page }) => {
+  await installDeliveryReceipts(page);
+  let failCatalog = false;
+  let heldMore = false;
+  let releaseMore: (() => void) | undefined;
+  let moreRequests = 0;
+  const events = { pending: "" };
+  await page.route("**/api/v1/events", (route) => {
+    const body = `retry: 200\n${events.pending}\n`;
+    events.pending = "";
+    return route.fulfill({ status: 200, contentType: "text/event-stream", body });
+  });
+  await page.route("**/api/v1/brain/vaults", (route) => failCatalog
+    ? route.fulfill({ status: 503, json: { error: "catalogue_fixture_failure", message: "Catalogue retry witness" } })
+    : fulfillVaults(route, [BRAIN]));
+  await page.route("**/api/v1/brain/tags", (route) => route.fulfill({ json: [] }));
+  await page.route("**/api/v1/brain/notes?**", async (route) => {
+    if (new URL(route.request().url()).searchParams.has("after")) {
+      moreRequests += 1;
+      if (moreRequests === 1) {
+        heldMore = true;
+        await new Promise<void>((resolve) => { releaseMore = resolve; });
+      }
+    }
+    return fulfillNotes(route);
+  });
+  await page.goto("/");
+  const explorer = page.getByTestId("explorer-panel");
+  await explorer.getByRole("tab", { name: "Notes", exact: true }).click();
+  const brain = explorer.getByTestId("notes-vault-brain");
+  await expect(brain.getByRole("listitem")).toHaveCount(PAGE);
+  await brain.getByRole("button", { name: "Load more", exact: true }).click();
+  await expect.poll(() => heldMore).toBe(true);
+  failCatalog = true;
+  events.pending = "event: graph:updated\ndata: {}\n\n";
+  await expect(explorer.getByRole("alert")).toContainText("Catalogue retry witness");
+  await expect(brain.getByRole("listitem")).toHaveCount(PAGE);
+  const params = { vault: BRAIN.uid, after: note(BRAIN, PAGE - 1).uid };
+  const beforeRelease = await decodedReplyCount(page, "/api/v1/brain/notes", params);
+  releaseMore!();
+  await waitForDecodedReply(page, "/api/v1/brain/notes", params, beforeRelease);
+  await expect(brain.getByRole("listitem")).toHaveCount(PAGE);
+  const retry = brain.getByRole("button", { name: "Load more", exact: true });
+  await expect(retry).toHaveAttribute("aria-disabled", "false");
+  await retry.click();
+  await expect.poll(() => moreRequests).toBe(2);
+  await expect(brain.getByRole("listitem")).toHaveCount(2 * PAGE);
+  await expect(brain.locator('[data-note-uid="note:brain:1999"]')).toHaveCount(1);
 });

@@ -5,12 +5,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusMenuItem: NSMenuItem?
     var daemonProcess: Process?
     var uiProcess: Process?
+    var uiReadiness: UIChildReadiness?
     var sigTermSource: DispatchSourceSignal?
     var childPids: [pid_t] = []
     var isQuitting = false
     var restartCount = 0
     let maxRestarts = 3
-    let port = 9377
+    var port = 9377
     var databaseSelection: DatabaseSelection?
 
     private static let socketDir = NSHomeDirectory() + "/.local/state/nestweaver"
@@ -63,21 +64,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupMenuBar()
 
         if isDaemonSocketPresent() {
-            startWebUI(selection: selection)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                self.openWebUI()
-                self.updateStatus("Running (external daemon)")
-            }
+            startWebUI(selection: selection, runningStatus: "Running (external daemon)")
         } else {
             startDaemon(selection: selection)
             waitForDaemonSocket { [weak self] in
                 guard let self = self else { return }
                 self.startWebUI(selection: selection)
                 self.scheduleHealthyReset(for: self.daemonProcess)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                    self.openWebUI()
-                    self.updateStatus("Running")
-                }
             }
         }
     }
@@ -199,7 +192,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func startWebUI(selection: DatabaseSelection) {
+    func startWebUI(selection: DatabaseSelection, runningStatus: String = "Running") {
         if let old = uiProcess, old.isRunning {
             kill(old.processIdentifier, SIGTERM)
         }
@@ -208,12 +201,34 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         process.executableURL = URL(fileURLWithPath: binaryPath)
         process.arguments = selection.uiArguments(port: port)
         process.environment = ProcessInfo.processInfo.environment
+        let readiness = UIChildReadiness()
+        uiReadiness = readiness
+        uiProcess = process
+        updateStatus("Starting Web UI…")
         do {
-            try process.run()
-            uiProcess = process
+            try readiness.launch(process, probe: { UIChildReadiness.healthy(port: $0) },
+                onReady: { [weak self, weak process] actualPort in
+                    DispatchQueue.main.async {
+                        guard let self = self, let process = process,
+                              self.uiProcess === process, !self.isQuitting,
+                              readiness.permitsReady(process)
+                              else { return }
+                        self.port = actualPort
+                        self.openWebUI()
+                        self.updateStatus(runningStatus)
+                    }
+                }, onFailure: { [weak self, weak process] diagnostic in
+                    DispatchQueue.main.async {
+                        guard let self = self, let process = process,
+                              self.uiProcess === process, !self.isQuitting else { return }
+                        self.updateStatus("Web UI failed")
+                        FileHandle.standardError.write(Data((diagnostic + "\n").utf8))
+                    }
+                })
             childPids.append(process.processIdentifier)
         } catch {
             updateStatus("Web UI failed to start")
+            FileHandle.standardError.write(Data((error.localizedDescription + "\n").utf8))
         }
     }
 

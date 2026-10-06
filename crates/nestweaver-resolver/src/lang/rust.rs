@@ -57,7 +57,16 @@ pub fn resolve_import(
             for _ in 1..ups {
                 base = parent_dir(&base).to_string();
             }
-            resolve_module_path(&base, &rest[ups - 1..], known_files)
+            let remaining = &rest[ups - 1..];
+            resolve_module_path(&base, remaining, known_files).or_else(|| {
+                if !remaining.is_empty() {
+                    return None;
+                }
+                [format!("{base}/mod.rs"), format!("{base}.rs")]
+                    .into_iter()
+                    .find(|file| known_files.contains(file.as_str()))
+                    .or_else(|| crate_root_file(&base, known_files))
+            })
         }
         crate_name => {
             // Rust built-in libraries are never workspace crates — resolve
@@ -585,6 +594,19 @@ mod tests {
         // …and it must not reach ACROSS crates for a same-named module.
         assert_eq!(
             resolve_import("crates/other/src/lib.rs", "hubs::HubNode", &known),
+            None
+        );
+    }
+
+    #[test]
+    fn review_super_missing_module_does_not_fall_back_to_parent() {
+        let known = HashSet::from(["src/lib.rs", "src/tests.rs"]);
+        assert_eq!(
+            resolve_import("src/tests.rs", "super", &known),
+            Some("src/lib.rs".into())
+        );
+        assert_eq!(
+            resolve_import("src/tests.rs", "super::missing", &known),
             None
         );
     }

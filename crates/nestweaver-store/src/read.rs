@@ -4270,12 +4270,12 @@ impl GraphStore {
         query: Option<&str>,
         limit: usize,
     ) -> Result<(Vec<Symbol>, usize), StoreError> {
-        let _flight = (limit > 0).then(|| {
+        let _flight = (limit > 0 && query.is_none()).then(|| {
             self.pagerank_compute_lock
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
         });
-        if limit > 0 && self.index_publication_blocks_ranking() {
+        if limit > 0 && query.is_none() && self.index_publication_blocks_ranking() {
             self.invalidate_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);
         }
@@ -4400,7 +4400,7 @@ impl GraphStore {
             ""
         };
         let mut stmt = conn.prepare(&format!(
-            "MATCH (s:Symbol){where_clause} RETURN s.uid ORDER BY {match_order}coalesce(s.pagerank_score, 0.0) DESC, s.uid ASC LIMIT $limit"
+            "MATCH (s:Symbol){where_clause} RETURN s.uid ORDER BY {match_order}s.uid ASC LIMIT $limit"
         )).map_err(|e| StoreError::Query(format!("prepare scoped symbol page: {e}")))?;
         params.push(("limit", Value::Int64(limit.min(i64::MAX as usize) as i64)));
         let uids = conn
@@ -5932,6 +5932,39 @@ mod project_symbol_pagerank_scope_tests {
             framework_hint: None,
             canonical_id: None,
         }
+    }
+
+    #[test]
+    fn review_scoped_lexical_lookup_ignores_dirty_ranking_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(&temp.path().join("graph.lbug")).unwrap();
+        let mut row = scoped_symbol("sym:exact", "repo:scope", "src/exact.rs", 100.0);
+        row.name = "exact".into();
+        store.insert_symbol(&row).unwrap();
+        // An active index publication must block ranked reads, while lexical
+        // lookup depends only on the committed symbol population.
+        std::fs::write(
+            store.index_publication_marker_path().unwrap(),
+            format!("{}:1", std::process::id()).as_bytes(),
+        )
+        .unwrap();
+        assert!(store.index_publication_blocks_ranking());
+        assert!(matches!(
+            store.workspace_symbol_page(Some("repo:scope"), None, None, 1),
+            Err(StoreError::RankingUnavailable)
+        ));
+        let (matches, total) = store
+            .workspace_symbol_page(Some("repo:scope"), None, Some("exact"), 1)
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(matches[0].uid, "sym:exact");
+        assert!(
+            store
+                .workspace_symbol_page(Some("repo:other"), None, Some("exact"), 1)
+                .unwrap()
+                .0
+                .is_empty()
+        );
     }
 
     /// Fixture: a project with 120 high-PageRank symbols under `crates/a/`

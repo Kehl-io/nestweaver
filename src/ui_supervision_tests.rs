@@ -11,6 +11,58 @@ use std::task::{Context as TaskContext, Poll};
 use tonic::body::Body;
 use tonic::codegen::{Service, http};
 
+// Keep socket and log writes inside a short private tree, including on panic.
+struct PrivateSupervisorEnvironment {
+    previous: [(&'static str, Option<std::ffi::OsString>); 2],
+    _directory: tempfile::TempDir,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+impl PrivateSupervisorEnvironment {
+    fn new() -> Self {
+        let lock = crate::XDG_RUNTIME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let directory = tempfile::Builder::new()
+            .prefix("nw-ui-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let previous =
+            ["XDG_RUNTIME_DIR", "XDG_STATE_HOME"].map(|key| (key, std::env::var_os(key)));
+        let variables = [
+            ("XDG_RUNTIME_DIR", directory.path().join("r")),
+            ("XDG_STATE_HOME", directory.path().join("s")),
+        ];
+        for (_, path) in &variables {
+            std::fs::create_dir(path).unwrap();
+        }
+        let guard = Self {
+            previous,
+            _directory: directory,
+            _lock: lock,
+        };
+        for (key, path) in variables {
+            // SAFETY: all environment-changing tests in this binary share this lock.
+            unsafe {
+                std::env::set_var(key, path);
+            }
+        }
+        guard
+    }
+}
+impl Drop for PrivateSupervisorEnvironment {
+    fn drop(&mut self) {
+        for (key, previous) in &self.previous {
+            // SAFETY: the guard still owns the shared environment lock.
+            unsafe {
+                match previous {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Reply<T>(T);
 impl<R, T: Clone + Send + 'static> tonic::server::UnaryService<R> for Reply<T> {
@@ -116,9 +168,7 @@ fn mismatched_repair_endpoint_cleans_up() {
 fn supervisor_error_cleans_up(mismatch: bool) {
     // Read-only consumers also coordinate with tests that change XDG: the
     // supervisor resolves its socket again on every health probe.
-    let _environment = crate::XDG_RUNTIME_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _environment = PrivateSupervisorEnvironment::new();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("fixture.lbug");
@@ -214,9 +264,7 @@ fn ui_port_parser_accepts_sentinel_and_boundaries_but_not_overflow() {
 #[test]
 fn repeated_ui_health_timeouts_preserve_live_owned_listener() {
     use std::os::unix::io::AsRawFd;
-    let _environment = crate::XDG_RUNTIME_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _environment = PrivateSupervisorEnvironment::new();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("fixture.lbug");
@@ -280,9 +328,7 @@ fn repeated_ui_health_timeouts_preserve_live_owned_listener() {
 
 #[test]
 fn dead_ui_daemon_without_an_owner_enters_degraded_service() {
-    let _environment = crate::XDG_RUNTIME_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _environment = PrivateSupervisorEnvironment::new();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("dead.lbug");
@@ -397,9 +443,7 @@ fn ui_absence_actual_held_pidfile_retains_listener() {
 fn ui_absence_pidfile_fixture(
     check: impl FnOnce(&tokio::runtime::Runtime, &Path, &Path, &std::net::TcpListener),
 ) {
-    let _environment = crate::XDG_RUNTIME_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _environment = PrivateSupervisorEnvironment::new();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("ownership.lbug");
@@ -418,9 +462,7 @@ fn ui_absence_pidfile_fixture(
 
 #[test]
 fn slow_watcher_health_does_not_terminate_controller() {
-    let _environment = crate::XDG_RUNTIME_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _environment = PrivateSupervisorEnvironment::new();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("slow-watcher.lbug");
@@ -482,9 +524,7 @@ fn slow_watcher_health_does_not_terminate_controller() {
 
 #[test]
 fn watcher_controller_terminates_on_actual_death_and_explicit_displacement() {
-    let _environment = crate::XDG_RUNTIME_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let _environment = PrivateSupervisorEnvironment::new();
     for died in [false, true] {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mut peer_runtime = Some(tokio::runtime::Runtime::new().unwrap());

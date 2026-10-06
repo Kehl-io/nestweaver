@@ -93,6 +93,7 @@ fn arb_symbol() -> impl Strategy<Value = RawSymbol> {
 fn arb_reference() -> impl Strategy<Value = RawReference> {
     ("[a-zA-Z_][a-zA-Z0-9_]{0,19}", arb_ref_kind(), 1..1000u32).prop_map(
         |(name, kind, start_line)| RawReference {
+            scope: None,
             name,
             kind,
             start_line,

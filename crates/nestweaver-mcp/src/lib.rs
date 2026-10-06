@@ -446,6 +446,8 @@ fn dispatch_method_daemon_cancellable(
             // read loop and kill the session (mirrors the HTTP path).
             // A session outlives many requests: restart the crash-attribution clock.
             nestweaver_store::daemon_exit::note_request_start();
+            let _delivery =
+                tools::scoped_tool_delivery(nestweaver_schema::ToolDeliveryProfile::BoundedMcp);
             let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 tools::dispatch_via_daemon_cancellable(client, rt, &name, arguments.clone(), cancel)
             }));
@@ -727,6 +729,8 @@ fn dispatch_method_cancellable(
             // error result for THIS request instead of unwinding the stdio read
             // loop and killing the whole session (mirrors the HTTP path, which
             // maps a dispatch panic to an isError result via spawn_blocking).
+            let _delivery =
+                tools::scoped_tool_delivery(nestweaver_schema::ToolDeliveryProfile::BoundedMcp);
             let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 tools::dispatch_cancellable(
                     store,
@@ -989,7 +993,11 @@ mod tests {
                         wire.len()
                     );
                     let listed = resp.result["tools"].as_array().expect("tools array");
-                    assert!(listed.len() <= 8);
+                    assert_eq!(
+                        listed.len(),
+                        expected.len(),
+                        "complete visible catalogue on first page"
+                    );
                     actual.extend(listed.iter().cloned());
                     cursor = resp
                         .result
@@ -1006,10 +1014,10 @@ mod tests {
                 Frame::Error(e) => panic!("tools/list should succeed: {}", e.error.message),
             }
         }
-        assert_eq!(
-            actual, expected,
-            "paged schemas and annotations must be intact and exhaustive"
-        );
+        assert_eq!(actual.len(), expected.len());
+        for (wire, full) in actual.iter().zip(&expected) {
+            tools::assert_wire_tool_contract(wire, full);
+        }
         assert_eq!(actual.len(), 43);
     }
 

@@ -181,16 +181,21 @@ pub fn resolve_references_with_file_languages(
             }
             let mut local_edges = Vec::new();
             let language = language_for(file_path);
-            let local_bindings: Vec<(&str, u32)> = references
+            let local_bindings: Vec<&RawReference> = references
                 .iter()
                 .filter(|reference| {
                     reference.kind == ReferenceKind::LocalBinding
                         && !graph.bindings_of(file_path).iter().any(|binding| {
                             binding.local_name == reference.name
-                                && binding.start_line == reference.start_line
+                                && if let Some(scope) = reference.scope {
+                                    binding
+                                        .scope
+                                        .is_some_and(|import| import.position == scope.position)
+                                } else {
+                                    binding.start_line == reference.start_line
+                                }
                         })
                 })
-                .map(|reference| (reference.name.as_str(), reference.start_line))
                 .collect();
             for reference in references {
                 if let Some(edge) = resolve_single_reference(
@@ -300,7 +305,7 @@ pub fn resolve_references_with_file_languages(
 fn resolve_single_reference(
     file_path: &str,
     reference: &RawReference,
-    local_bindings: &[(&str, u32)],
+    local_bindings: &[&RawReference],
     sorted_syms: &[&RawSymbol],
     symbol_map: &std::collections::HashMap<String, Vec<(&str, &RawSymbol)>>,
     extends_map: &std::collections::HashMap<String, Vec<String>>,
@@ -343,7 +348,8 @@ fn resolve_single_reference(
 
     // nw-724: a parameter, let, or lambda binding is the target. Do not
     // continue on to a same-named function in this file or another.
-    if name_is_locally_bound(local_bindings, sorted_syms, reference) {
+    if reference.receiver.is_none() && name_is_locally_bound(local_bindings, sorted_syms, reference)
+    {
         return Some(unresolved_edge(source_uid, &reference.name, edge_type));
     }
 
@@ -358,18 +364,31 @@ fn resolve_single_reference(
         } else {
             // A member or call chain has its own result type. The first
             // segment's binding cannot establish the complete receiver's type.
-            env.lookup(receiver, reference.start_line)
+            if let Some(call_scope) = reference.scope {
+                active_lexical_binding(local_bindings, reference, receiver).and_then(
+                    |declaration| {
+                        env.lookup_declaration(receiver, declaration.scope?, call_scope.position)
+                    },
+                )
+            } else {
+                env.lookup(receiver, reference.start_line)
+            }
         };
 
-        if let Some(binding) = receiver_type {
+        if let Some(binding) = receiver_type.filter(|binding| {
+            reference.scope.is_some()
+                || !name_is_locally_bound(local_bindings, sorted_syms, reference)
+                || binding.line >= source_sym.start_line
+        }) {
             let method_name = &reference.name;
             let type_name = &binding.type_name;
 
             // Direct match on the receiver type
             if let Some(candidates) = symbol_map.get(method_name.as_str())
-                && let Some((candidate_file, sym)) = candidates
-                    .iter()
-                    .find(|(_, s)| s.parent_name.as_deref() == Some(type_name.as_str()))
+                && let Some((candidate_file, sym)) = candidates.iter().find(|(file, s)| {
+                    s.parent_name.as_deref() == Some(type_name.as_str())
+                        && typed_member_accessible(file_path, file, source_sym, s, language, graph)
+                })
             {
                 let target_uid = symbol_uid(repo_uid, candidate_file, &sym.name, sym.start_line);
                 let confidence = binding.confidence.min(0.95);
@@ -405,8 +424,11 @@ fn resolve_single_reference(
                                 visited.insert(parent.clone());
 
                                 if let Some(candidates) = symbol_map.get(method_name.as_str())
-                                    && let Some((cf, sym)) = candidates.iter().find(|(_, s)| {
+                                    && let Some((cf, sym)) = candidates.iter().find(|(file, s)| {
                                         s.parent_name.as_deref() == Some(parent.as_str())
+                                            && typed_member_accessible(
+                                                file_path, file, source_sym, s, language, graph,
+                                            )
                                     })
                                 {
                                     let target_uid =
@@ -443,20 +465,32 @@ fn resolve_single_reference(
         }
     }
 
+    if name_is_locally_bound(local_bindings, sorted_syms, reference) {
+        return Some(unresolved_edge(source_uid, &reference.name, edge_type));
+    }
+
     let name = &reference.name;
 
     // Aliased import (`use path::to::original as name;`): the binding records
     // the original name and the file it was imported from.
     let binding = graph.bindings_of(file_path).iter().find(|binding| {
         let owner = find_enclosing_symbol(sorted_syms, binding.start_line).symbol();
-        let in_scope = owner.is_none_or(|owner| {
-            owner.start_line == source_sym.start_line && owner.name == source_sym.name
-        });
+        let in_scope =
+            if let (Some(binding_scope), Some(call_scope)) = (binding.scope, reference.scope) {
+                binding_scope.start <= call_scope.position
+                    && call_scope.position < binding_scope.end
+                    && binding_scope.initialized_at <= call_scope.position
+            } else {
+                owner.is_none_or(|owner| {
+                    owner.start_line == source_sym.start_line && owner.name == source_sym.name
+                })
+            };
         in_scope
             && if binding.original_name == "*" {
                 reference.receiver.as_deref() == Some(binding.local_name.as_str())
             } else {
-                binding.local_name == *name && reference.receiver.is_none()
+                (binding.local_name == *name && reference.receiver.is_none())
+                    || reference.receiver.as_deref() == Some(binding.local_name.as_str())
             }
     });
     if binding.is_some_and(|binding| binding.source_file.is_none()) {
@@ -467,9 +501,9 @@ fn resolve_single_reference(
     // same name, so this check runs on the reference's own name, before any
     // alias rewriting.
     if let Some(syms) = symbol_map.get(name.as_str())
-        && let Some((_, sym)) = syms
-            .iter()
-            .find(|(f, sym)| *f == file_path && candidate_matches(reference, file_path, f, sym))
+        && let Some((_, sym)) = syms.iter().find(|(f, sym)| {
+            *f == file_path && candidate_matches(reference, file_path, f, sym, language, graph)
+        })
     {
         let target_uid = symbol_uid(repo_uid, file_path, &sym.name, sym.start_line);
         let confidence = confidence_score(MatchType::SameFileExact, language);
@@ -506,23 +540,120 @@ fn resolve_single_reference(
         } else {
             (source_file, original, 0)
         };
-        if let Some(symbols) = symbol_map.get(original) {
-            let mut targets = symbols.iter().filter(|(file, symbol)| {
-                *file == target_file
-                    && symbol.visibility != Visibility::Private
-                    && candidate_matches(
-                        &RawReference {
-                            name: original.into(),
-                            receiver: None,
-                            ..reference.clone()
-                        },
-                        file_path,
-                        file,
-                        symbol,
-                    )
-            });
-            if let Some((file, symbol)) = targets.next() {
-                if targets.next().is_some() {
+        let member_parent = if binding.original_name != "*" && reference.receiver.is_some() {
+            Some(original)
+        } else {
+            None
+        };
+        let receiver_declarations: Vec<_> = symbol_map
+            .get(original)
+            .into_iter()
+            .flatten()
+            .filter(|(file, symbol)| *file == target_file && symbol.parent_name.is_none())
+            .collect();
+        let member_receiver = if member_parent.is_some() && receiver_declarations.len() == 1 {
+            let symbol = receiver_declarations[0].1;
+            if symbol.kind == SymbolKind::Class {
+                Some((original, true))
+            } else {
+                symbol
+                    .type_info
+                    .as_ref()
+                    .and_then(|info| info.declared_type.as_deref())
+                    .and_then(|receiver_type| {
+                        if receiver_type == "object" {
+                            Some((original, false))
+                        } else if symbol_map.get(receiver_type).is_some_and(|types| {
+                            types
+                                .iter()
+                                .filter(|(file, symbol)| {
+                                    *file == target_file && symbol.kind == SymbolKind::Class
+                                })
+                                .count()
+                                == 1
+                        }) {
+                            Some((receiver_type, false))
+                        } else {
+                            None
+                        }
+                    })
+            }
+        } else {
+            None
+        };
+        if member_parent.is_some() && member_receiver.is_none() {
+            return Some(unresolved_edge(source_uid, name, edge_type));
+        }
+        let target_name = member_parent.map_or(original, |_| name.as_str());
+        if let Some(symbols) = symbol_map.get(target_name) {
+            let explicit_private = language == Language::Python
+                || (language == Language::Rust && graph.resolves_parent(file_path, target_file));
+            let targets: Vec<_> = symbols
+                .iter()
+                .filter(|(file, symbol)| {
+                    *file == target_file
+                        && (symbol.visibility != Visibility::Private
+                            || explicit_private
+                            || member_receiver.is_some_and(|(_, class)| !class))
+                        && member_receiver.is_none_or(|(parent, class)| {
+                            let prefix = symbol.signature.split('(').next().unwrap_or("");
+                            symbol.kind == SymbolKind::Method
+                                && symbol.parent_name.as_deref() == Some(parent)
+                                && !prefix.split_whitespace().rev().skip(1).any(|token| {
+                                    matches!(token, "private" | "protected" | "get" | "set")
+                                })
+                                && !symbol.name.starts_with('#')
+                                && prefix
+                                    .split_whitespace()
+                                    .rev()
+                                    .skip(1)
+                                    .any(|token| token == "static")
+                                    == class
+                        })
+                        && candidate_matches(
+                            &RawReference {
+                                name: target_name.into(),
+                                receiver: None,
+                                ..reference.clone()
+                            },
+                            if explicit_private || member_receiver.is_some_and(|(_, class)| !class)
+                            {
+                                target_file
+                            } else {
+                                file_path
+                            },
+                            file,
+                            symbol,
+                            language,
+                            graph,
+                        )
+                })
+                .collect();
+            let selected = if targets.len() == 1 {
+                targets.first().copied()
+            } else if language == Language::TypeScript
+                && targets.iter().all(|(_, symbol)| {
+                    symbol.kind == SymbolKind::Function && symbol.parent_name.is_none()
+                })
+            {
+                let implementations: Vec<_> = targets
+                    .iter()
+                    .copied()
+                    .filter(|(_, symbol)| {
+                        symbol.kind == SymbolKind::Function
+                            && !symbol.signature.trim_end().ends_with(';')
+                    })
+                    .collect();
+                if implementations.len() == 1 {
+                    implementations.first().copied()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some((file, symbol)) = selected {
+                if targets.len() > 1 && language != Language::TypeScript {
                     return Some(unresolved_edge(source_uid, name, edge_type));
                 }
                 {
@@ -603,7 +734,7 @@ fn resolve_single_reference(
         let mut qualified: Vec<_> = syms
             .iter()
             .filter(|(candidate_file, sym)| {
-                candidate_matches(reference, file_path, candidate_file, sym)
+                candidate_matches(reference, file_path, candidate_file, sym, language, graph)
                     && candidate_file
                         .rsplit('/')
                         .next()
@@ -654,7 +785,19 @@ fn resolve_single_reference(
     for (_, imported_file) in &imports {
         if let Some(syms) = &candidates
             && let Some((_, sym)) = syms.iter().find(|(f, sym)| {
-                f == imported_file && candidate_matches(reference, file_path, f, sym)
+                f == imported_file
+                    && candidate_matches(
+                        reference,
+                        if language == Language::Rust && graph.resolves_parent(file_path, f) {
+                            f
+                        } else {
+                            file_path
+                        },
+                        f,
+                        sym,
+                        language,
+                        graph,
+                    )
             })
         {
             let target_uid = symbol_uid(repo_uid, imported_file, &sym.name, sym.start_line);
@@ -702,7 +845,7 @@ fn resolve_single_reference(
             if let Some(syms) = &candidates
                 && let Some((_, sym)) = syms.iter().find(|(f, sym)| {
                     *f == transitive_file.as_str()
-                        && candidate_matches(reference, file_path, f, sym)
+                        && candidate_matches(reference, file_path, f, sym, language, graph)
                 })
             {
                 let target_uid = symbol_uid(repo_uid, transitive_file, &sym.name, sym.start_line);
@@ -753,7 +896,7 @@ fn resolve_single_reference(
                 *candidate_file != file_path && parent_dir(candidate_file) == same_dir
             })
             .filter(|(candidate_file, sym)| {
-                candidate_matches(reference, file_path, candidate_file, sym)
+                candidate_matches(reference, file_path, candidate_file, sym, language, graph)
             })
             .collect();
         same_pkg.sort_by_key(|(path, _)| *path);
@@ -788,13 +931,51 @@ fn resolve_single_reference(
 /// `Err(...)` to `type Err = String`. A method call (`items.len()`) does not
 /// name a free function in a file the caller happens to import. A field
 /// access may still name a field in the same file; it may not name a function.
+fn typed_member_accessible(
+    source_file: &str,
+    target_file: &str,
+    source: &RawSymbol,
+    target: &RawSymbol,
+    language: Language,
+    graph: &ImportGraph,
+) -> bool {
+    if target.kind != SymbolKind::Method {
+        return false;
+    }
+    let prefix = target.signature.split('(').next().unwrap_or("");
+    if prefix
+        .split_whitespace()
+        .rev()
+        .skip(1)
+        .any(|token| matches!(token, "private" | "protected"))
+        || target.name.starts_with('#')
+    {
+        return source_file == target_file
+            && source.parent_name.is_some()
+            && source.parent_name == target.parent_name;
+    }
+    target.visibility != Visibility::Private
+        || source_file == target_file
+        || (language == Language::Go
+            && parent_dir(source_file) == parent_dir(target_file)
+            && graph.same_go_package(source_file, target_file))
+        || (language == Language::Rust && graph.resolves_parent(source_file, target_file))
+}
+
 fn candidate_matches(
     reference: &RawReference,
     source_file: &str,
     candidate_file: &str,
     sym: &RawSymbol,
+    language: Language,
+    graph: &ImportGraph,
 ) -> bool {
-    if source_file != candidate_file && sym.visibility == Visibility::Private {
+    if source_file != candidate_file
+        && sym.visibility == Visibility::Private
+        && !(language == Language::Go
+            && parent_dir(source_file) == parent_dir(candidate_file)
+            && graph.same_go_package(source_file, candidate_file))
+    {
         return false;
     }
     match reference.kind {
@@ -869,27 +1050,76 @@ fn path_denotes(candidate_file: &str, sym: &RawSymbol, qualifier: &str) -> bool 
 /// A local binding shadows `reference` when it sits in the same enclosing
 /// symbol at or before the use, and it is not the declaration of a graph
 /// symbol of that name (a `const len = ...` that IS the symbol).
+fn active_lexical_binding<'a>(
+    bindings: &[&'a RawReference],
+    reference: &RawReference,
+    name: &str,
+) -> Option<&'a RawReference> {
+    let at = reference.scope?.position;
+    bindings
+        .iter()
+        .copied()
+        .filter(|binding| {
+            binding.name == name
+                && binding
+                    .scope
+                    .is_some_and(|scope| scope.start <= at && at < scope.end)
+        })
+        .min_by_key(|binding| {
+            let scope = binding.scope.expect("filtered scoped binding");
+            (
+                scope.end - scope.start,
+                scope.hoisted_var && scope.position > at,
+                std::cmp::Reverse(if scope.hoisted_var && scope.position > at {
+                    0
+                } else {
+                    scope.position
+                }),
+            )
+        })
+}
+
 fn name_is_locally_bound(
-    bindings: &[(&str, u32)],
+    bindings: &[&RawReference],
     sorted_syms: &[&RawSymbol],
     reference: &RawReference,
 ) -> bool {
+    if reference.scope.is_some() {
+        let name = reference
+            .receiver
+            .as_deref()
+            .and_then(|receiver| receiver.split('.').next())
+            .unwrap_or(&reference.name);
+        return active_lexical_binding(bindings, reference, name).is_some_and(|binding| {
+            !binding.scope.is_some_and(|scope| {
+                scope.initialized_at > scope.position
+                    && reference
+                        .scope
+                        .is_some_and(|call| call.position >= scope.initialized_at)
+                    && sorted_syms.iter().any(|symbol| {
+                        symbol.name == reference.name && symbol.start_line == binding.start_line
+                    })
+            })
+        });
+    }
     let enclosing = match find_enclosing_symbol(sorted_syms, reference.start_line) {
         Enclosing::Exact(symbol) | Enclosing::Degenerate(symbol) => symbol,
         Enclosing::ModuleScope => return false,
     };
-    bindings.iter().any(|(name, line)| {
-        (*name == reference.name
+    bindings.iter().any(|binding| {
+        let name = binding.name.as_str();
+        let line = binding.start_line;
+        (name == reference.name
             || reference
                 .receiver
                 .as_deref()
-                .is_some_and(|receiver| receiver.split('.').next() == Some(*name)))
-            && *line <= reference.start_line
-            && *line >= enclosing.start_line
-            && *line <= enclosing.end_line
+                .is_some_and(|receiver| receiver.split('.').next() == Some(name)))
+            && line <= reference.start_line
+            && line >= enclosing.start_line
+            && line <= enclosing.end_line
             && !sorted_syms
                 .iter()
-                .any(|symbol| symbol.name == reference.name && symbol.start_line == *line)
+                .any(|symbol| symbol.name == reference.name && symbol.start_line == line)
     })
 }
 
@@ -1142,6 +1372,7 @@ mod tests {
 
     fn make_ref(name: &str, kind: ReferenceKind, line: u32) -> RawReference {
         RawReference {
+            scope: None,
             name: name.to_string(),
             kind,
             start_line: line,
@@ -1152,6 +1383,7 @@ mod tests {
 
     fn make_binding(local: &str, original: &str, specifier: &str, line: u32) -> RawReference {
         RawReference {
+            scope: None,
             name: local.into(),
             kind: ReferenceKind::ImportAlias,
             start_line: line,
@@ -1162,6 +1394,7 @@ mod tests {
 
     fn make_export(public: &str, local: &str, source: Option<&str>, line: u32) -> RawReference {
         RawReference {
+            scope: None,
             name: public.into(),
             kind: ReferenceKind::ExportAlias,
             start_line: line,
@@ -2097,6 +2330,7 @@ mod tests {
                     make_ref("./helper", ReferenceKind::Import, 1),
                     make_ref("helperFn", ReferenceKind::Call, 10),
                     RawReference {
+                        scope: None,
                         name: "helperFn".into(),
                         kind: ReferenceKind::ImportAlias,
                         start_line: 1,
@@ -2977,7 +3211,7 @@ mod tests {
         // File A: class Foo with method bar
         let mut foo_bar = make_symbol("bar", 5);
         foo_bar.parent_name = Some("Foo".to_string());
-        foo_bar.kind = SymbolKind::Function;
+        foo_bar.kind = SymbolKind::Method;
 
         let foo_class = RawSymbol {
             name: "Foo".to_string(),
@@ -2996,6 +3230,7 @@ mod tests {
 
         // File B: class Baz with method bar (different parent)
         let mut baz_bar = make_symbol("bar", 5);
+        baz_bar.kind = SymbolKind::Method;
         baz_bar.parent_name = Some("Baz".to_string());
 
         let baz_class = RawSymbol {
@@ -3016,6 +3251,7 @@ mod tests {
         // File C: caller that does foo_instance.bar()
         let caller = make_symbol("caller", 1);
         let bar_call = RawReference {
+            scope: None,
             name: "bar".to_string(),
             kind: ReferenceKind::Call,
             start_line: 3,
@@ -3090,6 +3326,7 @@ mod tests {
         do_work.parent_name = Some("MyClass".to_string());
 
         let this_call = RawReference {
+            scope: None,
             name: "helper".to_string(),
             kind: ReferenceKind::Call,
             start_line: 12,
@@ -3168,6 +3405,7 @@ mod tests {
 
         // BaseClass has method "save" at line 5
         let mut save_method = make_symbol("save", 5);
+        save_method.kind = SymbolKind::Method;
         save_method.parent_name = Some("BaseClass".to_string());
 
         let base_class = RawSymbol {
@@ -3202,6 +3440,7 @@ mod tests {
         };
 
         let extends_ref = RawReference {
+            scope: None,
             name: "BaseClass".to_string(),
             kind: ReferenceKind::Extends,
             start_line: 30,
@@ -3212,6 +3451,7 @@ mod tests {
         // Caller file: child_instance.save()
         let caller = make_symbol("caller", 1);
         let save_call = RawReference {
+            scope: None,
             name: "save".to_string(),
             kind: ReferenceKind::Call,
             start_line: 5,
@@ -3290,6 +3530,7 @@ mod tests {
 
         let caller = make_symbol("caller", 1);
         let bar_call = RawReference {
+            scope: None,
             name: "bar".to_string(),
             kind: ReferenceKind::Call,
             start_line: 3,
@@ -3510,6 +3751,7 @@ mod tests {
         handle_method.parent_name = Some("MyService".to_string());
 
         let chained_call = RawReference {
+            scope: None,
             name: "query".to_string(),
             kind: ReferenceKind::Call,
             start_line: 12,
@@ -3583,6 +3825,7 @@ mod tests {
 
     fn make_alias_ref(alias: &str, specifier: &str, line: u32) -> RawReference {
         RawReference {
+            scope: None,
             name: alias.to_string(),
             kind: ReferenceKind::ImportAlias,
             start_line: line,
@@ -3728,10 +3971,13 @@ mod user_pain_reference_tests {
     #[test]
     fn actual_embedding_base_contains_has_only_explicit_callers() {
         let path = "crates/nestweaver-store/src/search.rs";
-        let source = include_str!("../../nestweaver-store/src/search.rs");
-        let parsed = parse_source(Path::new(path), source).unwrap();
+        let source = format!(
+            "{}\nfn review_typed_embedding_base_contains(base: &EmbeddingBase, uid: &str) -> bool {{\n base.contains(uid)\n}}\n",
+            include_str!("../../nestweaver-store/src/search.rs")
+        );
+        let parsed = parse_source(Path::new(path), &source).unwrap();
         let env = crate::types::TypeEnvironment::build(
-            source,
+            &source,
             Language::Rust,
             &parsed.symbols,
             &parsed.type_bindings,
@@ -3784,34 +4030,37 @@ mod user_pain_reference_tests {
             None,
         );
         let target = uid(&files, path, "contains");
-        let allowed: Vec<_> = [
-            "replay_journal_v2",
-            "tombstone_uids",
-            "occupancy",
-            "retain_uids",
-        ]
-        .iter()
-        .map(|name| uid(&files, path, name))
-        .collect();
+        // Closure and field-chain typing remains unsupported; prove the known
+        // parameter case while retaining all real string-result counterweights.
+        let allowed = std::collections::BTreeSet::from([uid(
+            &files,
+            path,
+            "review_typed_embedding_base_contains",
+        )]);
         let incoming: Vec<_> = edges
             .iter()
             .filter(|edge| edge.edge_type == EdgeType::Calls && edge.target_uid == target)
             .collect();
-        assert!(
-            incoming
-                .iter()
-                .all(|edge| allowed.contains(&edge.source_uid)),
-            "actual EmbeddingBase::contains acquired false callers: {incoming:#?}"
+        let actual: std::collections::BTreeSet<_> = incoming
+            .iter()
+            .map(|edge| edge.source_uid.clone())
+            .collect();
+        assert_eq!(
+            actual, allowed,
+            "EmbeddingBase::contains must retain exactly its supported typed caller: {incoming:#?}"
         );
     }
 
     #[test]
     fn actual_regex_reader_pool_len_has_only_its_explicit_caller() {
         let path = "crates/nestweaver-store/src/regex_index.rs";
-        let source = include_str!("../../nestweaver-store/src/regex_index.rs");
-        let parsed = parse_source(Path::new(path), source).unwrap();
+        let source = format!(
+            "{}\nfn review_typed_regex_reader_pool_len(pool: &RegexReaderPool) -> usize {{\n pool.len()\n}}\n",
+            include_str!("../../nestweaver-store/src/regex_index.rs")
+        );
+        let parsed = parse_source(Path::new(path), &source).unwrap();
         let env = crate::types::TypeEnvironment::build(
-            source,
+            &source,
             Language::Rust,
             &parsed.symbols,
             &parsed.type_bindings,
@@ -3869,18 +4118,19 @@ mod user_pain_reference_tests {
             None,
         );
         let target = uid(&files, path, "len");
-        let allowed = uid(
-            &files,
-            path,
-            "reader_pool_evicts_under_many_scope_descriptor_pressure",
-        );
+        let allowed = uid(&files, path, "review_typed_regex_reader_pool_len");
         let incoming: Vec<_> = edges
             .iter()
             .filter(|edge| edge.edge_type == EdgeType::Calls && edge.target_uid == target)
             .collect();
-        assert!(
-            incoming.iter().all(|edge| edge.source_uid == allowed),
-            "actual RegexReaderPool::len acquired false callers; macro metadata: {macro_chain:#?}; incoming: {incoming:#?}"
+        let actual: std::collections::BTreeSet<_> = incoming
+            .iter()
+            .map(|edge| edge.source_uid.clone())
+            .collect();
+        assert_eq!(
+            actual,
+            std::collections::BTreeSet::from([allowed]),
+            "RegexReaderPool::len must retain its supported typed caller; macro metadata: {macro_chain:#?}; incoming: {incoming:#?}"
         );
     }
 
@@ -4714,5 +4964,609 @@ fn known() -> usize {
                 && edge.target_uid == uid(&files, "src/qrec/coredata.py", "load")),
             "{edges:#?}"
         );
+    }
+
+    type ReviewParsedFiles = Vec<(String, Vec<RawSymbol>, Vec<RawReference>)>;
+
+    fn review_edges(
+        inputs: &[(&str, &str)],
+        language: Language,
+    ) -> (ReviewParsedFiles, Vec<ResolvedEdge>) {
+        let mut files = Vec::new();
+        let mut envs = std::collections::HashMap::new();
+        for (path, source) in inputs {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            envs.insert(
+                (*path).to_string(),
+                crate::types::TypeEnvironment::build(
+                    source,
+                    language,
+                    &parsed.symbols,
+                    &parsed.type_bindings,
+                ),
+            );
+            files.push(((*path).to_string(), parsed.symbols, parsed.references));
+        }
+        let edges = resolve_references_with_context(
+            &files,
+            language,
+            "repo:test:abc",
+            &WorkspaceContext::default(),
+            Some(&envs),
+            None,
+        );
+        (files, edges)
+    }
+
+    fn review_callers(
+        files: &[(String, Vec<RawSymbol>, Vec<RawReference>)],
+        edges: &[ResolvedEdge],
+        path: &str,
+        name: &str,
+    ) -> std::collections::BTreeSet<String> {
+        let target = uid(files, path, name);
+        edges
+            .iter()
+            .filter(|edge| edge.edge_type == EdgeType::Calls && edge.target_uid == target)
+            .map(|edge| edge.source_uid.clone())
+            .collect()
+    }
+
+    #[test]
+    fn review_commonjs_export_calls_local_private_helper() {
+        let (files, edges) = review_edges(
+            &[
+                ("index.js", "const h = require('./helpers');\nh.listen();\n"),
+                (
+                    "helpers.js",
+                    "module.exports.listen = function listen() {\n return context();\n};\nfunction context() {}\nfunction unused() {}\n",
+                ),
+            ],
+            Language::JavaScript,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "helpers.js", "context"),
+            std::collections::BTreeSet::from([uid(&files, "helpers.js", "listen")]),
+            "files={files:#?} edges={edges:#?}"
+        );
+        assert!(review_callers(&files, &edges, "helpers.js", "unused").is_empty());
+        assert!(
+            files[1]
+                .1
+                .iter()
+                .any(|symbol| symbol.name == "listen" && symbol.is_entry_point),
+            "exported executable must root its private helper: {files:#?}"
+        );
+    }
+
+    #[test]
+    fn review_parsed_typed_receiver_reaches_inherited_method() {
+        let (files, edges) = review_edges(
+            &[(
+                "src/main.ts",
+                "class Base {\n run() { return 1; }\n}\nclass Child extends Base {}\nfunction user() {\n const child = new Child();\n return child.run();\n}\nfunction shadow(child: unknown) { return child.run(); }\n",
+            )],
+            Language::TypeScript,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/main.ts", "run"),
+            std::collections::BTreeSet::from([uid(&files, "src/main.ts", "user")]),
+            "files={files:#?} edges={edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review_go_lowercase_sibling_is_visible_only_within_package() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "pkg/helper.go",
+                    "package sample\nfunc helper() int { return 1 }\n",
+                ),
+                (
+                    "pkg/user.go",
+                    "package sample\nfunc user() int {\n return helper()\n}\n",
+                ),
+                (
+                    "other/user.go",
+                    "package other\nfunc outsider() int {\n return helper()\n}\n",
+                ),
+                (
+                    "pkg/external_test.go",
+                    "package sample_test\nfunc external() int {\n return helper()\n}\n",
+                ),
+            ],
+            Language::Go,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "pkg/helper.go", "helper"),
+            std::collections::BTreeSet::from([uid(&files, "pkg/user.go", "user")]),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review_rust_child_glob_can_call_parent_private_helper() {
+        let (files, edges) = review_edges(
+            &[
+                ("src/lib.rs", "mod tests;\nfn helper() -> usize { 1 }\n"),
+                (
+                    "src/tests.rs",
+                    "use super::*;\nfn user() {\n helper();\n}\n",
+                ),
+                ("other/outsider.rs", "fn outsider() {\n helper();\n}\n"),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/lib.rs", "helper"),
+            std::collections::BTreeSet::from([uid(&files, "src/tests.rs", "user")]),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review_python_explicit_private_import_and_shadow_counterweight() {
+        let (files, edges) = review_edges(
+            &[
+                ("pkg/helper.py", "def _helper():\n    return 1\n"),
+                (
+                    "pkg/user.py",
+                    "from .helper import _helper\ndef user():\n    return _helper()\ndef shadow(_helper):\n    return _helper()\n",
+                ),
+                ("other/user.py", "def outsider():\n    return _helper()\n"),
+            ],
+            Language::Python,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "pkg/helper.py", "_helper"),
+            std::collections::BTreeSet::from([uid(&files, "pkg/user.py", "user")]),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review_local_receiver_type_precedes_unknown_receiver_refusal() {
+        for (path, language, source, method) in [
+            (
+                "src/pool.rs",
+                Language::Rust,
+                "struct Pool;\nimpl Pool {\n fn len(&self) -> usize { 1 }\n}\nfn typed(pool: &Pool) -> usize {\n pool.len()\n}\nfn unrelated(items: Vec<u8>) -> usize {\n items.len()\n}\n",
+                "len",
+            ),
+            (
+                "src/service.ts",
+                Language::TypeScript,
+                "class Service {\n run() { return 1; }\n}\nfunction typed() {\n const svc = new Service();\n return svc.run();\n}\nfunction unrelated(svc: unknown) {\n return svc.run();\n}\n",
+                "run",
+            ),
+        ] {
+            let (files, edges) = review_edges(&[(path, source)], language);
+            assert_eq!(
+                review_callers(&files, &edges, path, method),
+                std::collections::BTreeSet::from([uid(&files, path, "typed")]),
+                "{path}: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_named_and_default_imported_static_receivers() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "src/logger.js",
+                    "export class Logger {\n static write() { return 1; }\n}\n",
+                ),
+                (
+                    "src/db.js",
+                    "export default class Database {\n static query() { return 2; }\n}\n",
+                ),
+                (
+                    "src/user.js",
+                    "import { Logger } from './logger.js';\nimport db from './db.js';\nfunction user() {\n Logger.write();\n db.query();\n}\nfunction shadow(Logger, db) {\n Logger.write();\n db.query();\n}\n",
+                ),
+            ],
+            Language::JavaScript,
+        );
+        for (path, method) in [("src/logger.js", "write"), ("src/db.js", "query")] {
+            assert_eq!(
+                review_callers(&files, &edges, path, method),
+                std::collections::BTreeSet::from([uid(&files, "src/user.js", "user")]),
+                "{edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_unrelated_import_preserves_same_file_calls_only() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "src/other.js",
+                    "export function spare() { return 0; }\nexport function helper() { return 0; }\n",
+                ),
+                (
+                    "src/user.js",
+                    "import { spare } from './other.js';\nfunction helper() { return 1; }\nfunction user() {\n return helper();\n}\nfunction unrelated(items) {\n return items.helper();\n}\n",
+                ),
+            ],
+            Language::JavaScript,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/user.js", "helper"),
+            std::collections::BTreeSet::from([uid(&files, "src/user.js", "user")]),
+            "{edges:#?}"
+        );
+        assert!(
+            review_callers(&files, &edges, "src/other.js", "helper").is_empty(),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review_star_barrels_follow_named_exports_without_default_or_private_leaks() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "src/helper.ts",
+                    "export function helper() { return 1; }\nfunction hidden() { return 2; }\nexport default function fallback() { return 3; }\n",
+                ),
+                ("src/middle.ts", "export * from './helper';\n"),
+                ("src/index.ts", "export * from './middle';\n"),
+                (
+                    "src/user.ts",
+                    "import { helper, hidden } from './index';\nimport fallback from './index';\nfunction user() {\n helper();\n hidden();\n fallback();\n}\n",
+                ),
+            ],
+            Language::TypeScript,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/helper.ts", "helper"),
+            std::collections::BTreeSet::from([uid(&files, "src/user.ts", "user")]),
+            "{edges:#?}"
+        );
+        for name in ["hidden", "fallback"] {
+            assert!(
+                review_callers(&files, &edges, "src/helper.ts", name).is_empty(),
+                "{edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_conflicting_star_exports_do_not_select_arbitrary_target() {
+        let (files, edges) = review_edges(
+            &[
+                ("src/a.ts", "export function helper() { return 1; }\n"),
+                ("src/b.ts", "export function helper() { return 2; }\n"),
+                (
+                    "src/index.ts",
+                    "export * from './a';\nexport * from './b';\n",
+                ),
+                (
+                    "src/user.ts",
+                    "import { helper } from './index';\nfunction user() {\n helper();\n}\n",
+                ),
+            ],
+            Language::TypeScript,
+        );
+        for path in ["src/a.ts", "src/b.ts"] {
+            assert!(
+                review_callers(&files, &edges, path, "helper").is_empty(),
+                "{edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_typescript_overload_declarations_select_one_implementation() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "src/helper.ts",
+                    "export function pick(value: string): string;\nexport function pick(value: number): number;\nexport function pick(value: string | number): string | number {\n return value;\n}\n",
+                ),
+                (
+                    "src/user.ts",
+                    "import { pick } from './helper';\nfunction user() {\n return pick('text');\n}\nfunction shadow(pick: () => string) {\n return pick();\n}\n",
+                ),
+            ],
+            Language::TypeScript,
+        );
+        let implementation = files[0]
+            .1
+            .iter()
+            .find(|symbol| symbol.name == "pick" && symbol.end_line > symbol.start_line)
+            .expect("parsed overload implementation");
+        let target = symbol_uid(
+            "repo:test:abc",
+            "src/helper.ts",
+            "pick",
+            implementation.start_line,
+        );
+        let actual: std::collections::BTreeSet<_> = edges
+            .iter()
+            .filter(|edge| edge.edge_type == EdgeType::Calls && edge.target_uid == target)
+            .map(|edge| edge.source_uid.clone())
+            .collect();
+        assert_eq!(
+            actual,
+            std::collections::BTreeSet::from([uid(&files, "src/user.ts", "user")]),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review_default_parameter_initializers_are_uses_in_typescript_and_python() {
+        for (language, helper_path, user_path, helper, source) in [
+            (
+                Language::TypeScript,
+                "src/helper.ts",
+                "src/user.ts",
+                "export function helper() { return 1; }\n",
+                "import { helper } from './helper';\nfunction consume(fallback: number = helper()) {\n return fallback;\n}\nfunction shadow(helper: () => number) {\n return helper();\n}\n",
+            ),
+            (
+                Language::Python,
+                "pkg/helper.py",
+                "pkg/user.py",
+                "def helper():\n    return 1\n",
+                "from .helper import helper\ndef consume(fallback=helper()):\n    return fallback\ndef shadow(helper):\n    return helper()\n",
+            ),
+        ] {
+            let (files, edges) =
+                review_edges(&[(helper_path, helper), (user_path, source)], language);
+            assert_eq!(
+                review_callers(&files, &edges, helper_path, "helper"),
+                std::collections::BTreeSet::from([uid(&files, user_path, "consume")]),
+                "{user_path}: {edges:#?}"
+            );
+        }
+    }
+    #[test]
+    fn review_receiver_shadow_scopes_restore_outer_types() {
+        let path = "src/scopes.ts";
+        let source = r#"class Service {
+ run() { return 1; }
+}
+class Other {
+ run() { return 2; }
+}
+function before() {
+ const svc = new Service();
+ return svc.run();
+}
+function inside() {
+ const svc = new Service();
+ { const svc = unknownFactory();
+   return svc.run(); }
+}
+function after() {
+ const svc = new Service();
+ { const svc = unknownFactory(); }
+ return svc.run();
+}
+function sibling() {
+ const svc = new Service();
+ { const svc = unknownFactory(); }
+ { return svc.run(); }
+}
+function knownInner() {
+ const svc = new Service();
+ { const svc = new Other();
+   return svc.run(); }
+}
+function afterKnownInner() {
+ const svc = new Service();
+ { const svc = new Other(); }
+ return svc.run();
+}
+function sameLineInside() { const svc = new Service(); { const svc = unknownFactory(); return svc.run(); } }
+function sameLineAfter() { const svc = new Service(); { const svc = unknownFactory(); } return svc.run(); }
+function sameLineKnownInner() { const svc = new Service(); { const svc = new Other(); return svc.run(); } }
+function parameterShadow(svc: unknown) { return svc.run(); }
+function temporalDeadZone() {
+ const svc = new Service();
+ { svc.run(); const svc = unknownFactory(); }
+}
+function varBeforeInitialization() { svc.run(); var svc = new Service(); }
+function varAfterInitialization() { var svc = new Service(); return svc.run(); }
+"#;
+        let (files, edges) = review_edges(&[(path, source)], Language::TypeScript);
+        let target = |parent: &str| {
+            let symbol = files[0]
+                .1
+                .iter()
+                .find(|symbol| {
+                    symbol.name == "run" && symbol.parent_name.as_deref() == Some(parent)
+                })
+                .unwrap();
+            symbol_uid("repo:test:abc", path, "run", symbol.start_line)
+        };
+        let callers = |target: String| {
+            edges
+                .iter()
+                .filter(|edge| edge.edge_type == EdgeType::Calls && edge.target_uid == target)
+                .map(|edge| edge.source_uid.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(
+            callers(target("Service")),
+            [
+                "before",
+                "after",
+                "sibling",
+                "afterKnownInner",
+                "sameLineAfter",
+                "varAfterInitialization"
+            ]
+            .into_iter()
+            .map(|name| uid(&files, path, name))
+            .collect(),
+            "{files:#?} {edges:#?}"
+        );
+        assert_eq!(
+            callers(target("Other")),
+            ["knownInner", "sameLineKnownInner"]
+                .into_iter()
+                .map(|name| uid(&files, path, name))
+                .collect(),
+            "{files:#?} {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review_unresolved_exports_cannot_prove_a_star_target() {
+        let mut failures = Vec::new();
+        for (barrel, expected) in [
+            ("export * from './known';\n", true),
+            (
+                "export { helper } from './missing';\nexport * from './known';\n",
+                false,
+            ),
+            (
+                "export * from './known';\nexport * from './missing';\n",
+                false,
+            ),
+            (
+                "export * from './missing';\nexport * from './known';\n",
+                false,
+            ),
+        ] {
+            let (files, edges) = review_edges(
+                &[
+                    ("src/known.ts", "export function helper() { return 1; }\n"),
+                    ("src/index.ts", barrel),
+                    (
+                        "src/user.ts",
+                        "import { helper } from './index';\nfunction user() { return helper(); }\nfunction shadow(helper: () => number) { return helper(); }\n",
+                    ),
+                ],
+                Language::TypeScript,
+            );
+            let expected = if expected {
+                std::collections::BTreeSet::from([uid(&files, "src/user.ts", "user")])
+            } else {
+                std::collections::BTreeSet::new()
+            };
+            let actual = review_callers(&files, &edges, "src/known.ts", "helper");
+            if actual != expected {
+                failures.push(format!(
+                    "{barrel}: expected={expected:?} actual={actual:?} edges={edges:#?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn review_imported_receiver_shape_preserves_exposed_members_only() {
+        let mut failures = Vec::new();
+        for (provider, member, call, expected) in [
+            (
+                "export class Logger {\n static write() { return 1; }\n}\n",
+                "write",
+                "api.write()",
+                true,
+            ),
+            (
+                "export class Logger {\n write() { return 1; }\n}\n",
+                "write",
+                "api.write()",
+                false,
+            ),
+            (
+                "export class Logger {\n private static write() { return 1; }\n}\n",
+                "write",
+                "api.write()",
+                false,
+            ),
+            (
+                "export default class Logger {\n static write() { return 1; }\n}\n",
+                "write",
+                "api.write()",
+                true,
+            ),
+            (
+                "const db = {\n query() { return 1; }\n};\nexport default db;\n",
+                "query",
+                "api.query()",
+                true,
+            ),
+            (
+                "class Database {\n query() { return 1; }\n}\nconst db = new Database();\nexport default db;\n",
+                "query",
+                "api.query()",
+                true,
+            ),
+            (
+                "class Database {\n private query() { return 1; }\n}\nconst db = new Database();\nexport default db;\n",
+                "query",
+                "api.query()",
+                false,
+            ),
+            (
+                "class Database {\n query() { return 1; }\n}\nconst db = unknownFactory();\nexport default db;\n",
+                "query",
+                "api.query()",
+                false,
+            ),
+            (
+                "const db = {\n query() { return 1; },\n ...unknownMembers\n};\nexport default db;\n",
+                "query",
+                "api.query()",
+                false,
+            ),
+            (
+                "const db = {\n query() { return 1; },\n [unknownKey]() { return 2; }\n};\nexport default db;\n",
+                "query",
+                "api.query()",
+                false,
+            ),
+        ] {
+            let import = if provider.starts_with("export class") {
+                "import { Logger as api } from './provider';"
+            } else {
+                "import api from './provider';"
+            };
+            let user = format!(
+                "{import}\nfunction user() {{ return {call}; }}\nfunction shadow(api: unknown) {{ return {call}; }}\n"
+            );
+            let (files, edges) = review_edges(
+                &[
+                    ("src/provider.ts", provider),
+                    ("src/user.ts", &user),
+                    (
+                        "src/unrelated.ts",
+                        "export class Database {\n query() { return 3; }\n}\nexport class Logger {\n static write() { return 3; }\n}\n",
+                    ),
+                ],
+                Language::TypeScript,
+            );
+            let expected = if expected {
+                std::collections::BTreeSet::from([uid(&files, "src/user.ts", "user")])
+            } else {
+                std::collections::BTreeSet::new()
+            };
+            if provider.contains("export default db") {
+                let exposed = files[0]
+                    .1
+                    .iter()
+                    .find(|symbol| symbol.name == member)
+                    .unwrap();
+                assert_eq!(
+                    exposed.is_entry_point,
+                    !expected.is_empty(),
+                    "only proven public exported instance/object methods are roots: {provider}: {exposed:#?}"
+                );
+            }
+            let actual = review_callers(&files, &edges, "src/provider.ts", member);
+            let unrelated = review_callers(&files, &edges, "src/unrelated.ts", member);
+            if actual != expected || !unrelated.is_empty() {
+                failures.push(format!("{provider}: expected={expected:?} actual={actual:?} unrelated={unrelated:?} files={files:#?} edges={edges:#?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }

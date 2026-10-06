@@ -485,12 +485,33 @@ fn text_hash(text: &str) -> String {
     blake3::hash(text.as_bytes()).to_hex().to_string()
 }
 
+fn candidate_path(candidate: &Candidate) -> String {
+    if candidate.kind == "Note" {
+        candidate.location.clone()
+    } else {
+        file_of(&candidate.location)
+    }
+}
+
+fn candidate_document_hash(candidate: &Candidate) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for value in [
+        &candidate.text_hash,
+        &candidate.kind,
+        &candidate_path(candidate),
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update(&[0]);
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 fn candidate_digest(candidates: &[Candidate]) -> String {
     let mut hasher = blake3::Hasher::new();
     for candidate in candidates {
         hasher.update(candidate.uid.as_bytes());
         hasher.update(&[0]);
-        hasher.update(candidate.text_hash.as_bytes());
+        hasher.update(candidate_document_hash(candidate).as_bytes());
         hasher.update(&[0xff]);
     }
     hasher.finalize().to_hex().to_string()
@@ -999,7 +1020,7 @@ impl GraphStore {
                 .unwrap_or_default();
             let desired_documents: HashMap<_, _> = candidates
                 .iter()
-                .map(|candidate| (candidate.uid.clone(), candidate.text_hash.clone()))
+                .map(|candidate| (candidate.uid.clone(), candidate_document_hash(candidate)))
                 .collect();
             stats.nodes_added += desired_documents
                 .keys()
@@ -1038,7 +1059,10 @@ impl GraphStore {
                 .map(|(candidate, trigrams)| RegexShardDocument {
                     uid: &candidate.uid,
                     kind: &candidate.kind,
-                    text_hash: &candidate.text_hash,
+                    path: candidate_path(candidate),
+                    text_hash: desired_documents
+                        .get(&candidate.uid)
+                        .expect("candidate document hash"),
                     trigrams,
                 })
                 .collect();
@@ -1858,6 +1882,30 @@ impl GraphStore {
         candidate_cap: usize,
         bounded_prefix: bool,
     ) -> Result<Option<TrigramPrefilterPlan>, StoreError> {
+        self.regex_v3_candidate_uids_scoped(
+            clauses,
+            start,
+            deadline_ms,
+            cancel,
+            candidate_cap,
+            bounded_prefix,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn regex_v3_candidate_uids_scoped(
+        &self,
+        clauses: &[HashSet<String>],
+        start: Instant,
+        deadline_ms: u64,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        candidate_cap: usize,
+        bounded_prefix: bool,
+        path_prefix: Option<&str>,
+        kinds: Option<&[String]>,
+    ) -> Result<Option<TrigramPrefilterPlan>, StoreError> {
         let interrupted = || -> Result<bool, StoreError> {
             if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 return Err(StoreError::Cancelled(CancelReason::Timeout));
@@ -1942,10 +1990,12 @@ impl GraphStore {
             #[cfg(test)]
             planning_allocation_witness::record("posting", 1);
             let candidates = if bounded_prefix {
-                index.candidate_uids_bounded(
+                index.candidate_uids_bounded_scoped(
                     &metadata,
                     clauses,
                     candidate_cap.saturating_sub(matching_ready_uids.len()),
+                    path_prefix,
+                    kinds,
                 )
             } else {
                 // Exact counts retain the original per-scope allowance and
@@ -2082,13 +2132,15 @@ impl GraphStore {
         let clauses = required_trigram_clauses(pattern);
         let (plan, mut planning_deadline) = match &clauses {
             Some(clauses) => {
-                match self.regex_v3_candidate_uids(
+                match self.regex_v3_candidate_uids_scoped(
                     clauses,
                     start,
                     deadline_ms,
                     cancel,
                     candidate_cap,
                     true,
+                    path_prefix,
+                    kinds,
                 )? {
                     Some(plan) => (Some(plan), false),
                     None => (None, true),
@@ -3493,6 +3545,149 @@ mod tests {
         let uids: HashSet<&str> = res.results.iter().map(|m| m.uid.as_str()).collect();
         assert!(uids.contains("sec:v:1:a"), "should match the section body");
         assert!(uids.contains("sym:1"), "should match the symbol signature");
+    }
+
+    #[test]
+    fn review_scoped_regex_unicode_punctuation_and_same_uid_move_refresh() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
+        let store = store_with_text();
+        let mut row = store.lookup_symbol("sym:1").unwrap();
+        row.uid = "sym:path-sensitive".into();
+        row.name = "pathNeedle".into();
+        row.signature = "fn pathNeedle()".into();
+        row.file_path = "雪/[a]+(b).rs".into();
+        store.insert_symbol(&row).unwrap();
+        store.build_trigram_index().unwrap();
+        let kinds = vec!["Symbol".to_string()];
+        let query = |prefix| {
+            store
+                .regex_search_cancellable_with_candidate_cap(
+                    "pathNeedle",
+                    Some(prefix),
+                    Some(&kinds),
+                    Some(1),
+                    Some(5000),
+                    None,
+                    2,
+                )
+                .unwrap()
+        };
+        assert!(
+            query("雪/[a]+")
+                .results
+                .iter()
+                .any(|hit| hit.uid == row.uid)
+        );
+        assert!(
+            query("雪/a").results.is_empty(),
+            "punctuation is literal, not an automaton operator"
+        );
+        let before = RegexIndex::new(store.regex_sidecar_root().unwrap())
+            .metadata(&row.repo_uid)
+            .unwrap()
+            .unwrap();
+        let conn = store.conn().unwrap();
+        let mut stmt = conn
+            .prepare("MATCH (s:Symbol {uid:$uid}) SET s.file_path=$path")
+            .unwrap();
+        conn.execute(
+            &mut stmt,
+            vec![
+                ("uid", Value::String(row.uid.clone())),
+                ("path", Value::String("moved/雪.rs".into())),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        store.mark_regex_scope_dirty(&row.repo_uid, false).unwrap();
+        store.refresh_trigram_index(false).unwrap();
+        let after = RegexIndex::new(store.regex_sidecar_root().unwrap())
+            .metadata(&row.repo_uid)
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            before.candidate_digest, after.candidate_digest,
+            "same UID/text but changed eligibility must refresh metadata"
+        );
+        assert!(query("雪/[a]+").results.is_empty());
+        let moved = query("moved/");
+        assert!(!moved.scanned_fallback, "repaired scoped shard is trusted");
+        assert!(moved.results.iter().any(|hit| hit.uid == row.uid));
+    }
+
+    #[test]
+    fn review_regex_candidate_cap_applies_after_path_and_kind_scope() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
+        let store = store_with_text();
+        let prototype = store.lookup_symbol("sym:1").unwrap();
+        let candidates = [
+            ("sym:scope:a", "unique-a/a.rs"),
+            ("sym:scope:b", "unique-b/b.rs"),
+            ("sym:scope:c", "unique-c/c.rs"),
+        ];
+        let kinds = vec!["Symbol".to_string()];
+        for (uid, path) in candidates {
+            let mut candidate = prototype.clone();
+            candidate.uid = uid.into();
+            candidate.file_path = path.into();
+            candidate.name = "boundNeedle".into();
+            candidate.signature = "fn boundNeedle()".into();
+            store.insert_symbol(&candidate).unwrap();
+            let fallback = store
+                .regex_search_cancellable_with_candidate_cap(
+                    "boundNeedle",
+                    Some(path),
+                    Some(&kinds),
+                    Some(1),
+                    Some(5000),
+                    None,
+                    2,
+                )
+                .unwrap();
+            assert!(
+                fallback.results.iter().any(|hit| hit.uid == uid),
+                "fallback scope counterweight"
+            );
+        }
+        store.build_trigram_index().unwrap();
+        let prefix = store
+            .regex_search_cancellable_with_candidate_cap(
+                "boundNeedle",
+                None,
+                Some(&kinds),
+                Some(2),
+                Some(5000),
+                None,
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            prefix.results.len(),
+            2,
+            "exercise an actually saturated posting prefix"
+        );
+        // Tantivy tie order is not a UID-order contract. Select an actual
+        // omitted candidate, without rewriting the index and changing that order.
+        let (target, path) = candidates
+            .into_iter()
+            .find(|(uid, _)| !prefix.results.iter().any(|hit| hit.uid == *uid))
+            .unwrap();
+        let indexed = store
+            .regex_search_cancellable_with_candidate_cap(
+                "boundNeedle",
+                Some(path),
+                Some(&kinds),
+                Some(1),
+                Some(5000),
+                None,
+                2,
+            )
+            .unwrap();
+        assert!(!indexed.scanned_fallback, "exercise ready posting path");
+        assert!(
+            indexed.results.iter().any(|hit| hit.uid == target),
+            "out-of-scope posting prefix must not starve eligible candidate: target={target} prefix={prefix:?}"
+        );
     }
 
     #[test]

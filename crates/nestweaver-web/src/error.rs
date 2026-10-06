@@ -58,24 +58,18 @@ impl ApiError {
         }
     }
 
-    /// Deadline classification is confined to context's read boundary. Native
-    /// context-edge queries retain Ladybug's interruption message inside a
-    /// typed Query error; unrelated query/database failures remain internal.
+    /// Only typed cancellation is deadline evidence. Context's read boundary
+    /// converts actual scoped expiry to this variant, including Rust rendering;
+    /// unrelated native interruption text remains an internal error.
     pub fn from_context_read(err: anyhow::Error) -> Self {
-        let timed_out =
-            err.chain().any(
-                |cause| match cause.downcast_ref::<nestweaver_store::StoreError>() {
-                    Some(nestweaver_store::StoreError::Cancelled(
-                        nestweaver_store::CancelReason::Timeout,
-                    )) => true,
-                    Some(nestweaver_store::StoreError::Query(message)) => {
-                        message.starts_with("context edges")
-                            && (message.ends_with("Runtime exception: Query interrupted.")
-                                || message.ends_with("Query execution failed: Interrupted."))
-                    }
-                    _ => false,
-                },
-            );
+        let timed_out = err.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<nestweaver_store::StoreError>(),
+                Some(nestweaver_store::StoreError::Cancelled(
+                    nestweaver_store::CancelReason::Timeout
+                ))
+            )
+        });
         if timed_out {
             tracing::info!(error = %err, "context read deadline exceeded");
             let message =

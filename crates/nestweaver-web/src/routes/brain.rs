@@ -493,19 +493,13 @@ struct ScopedBrainSearch {
     total_count: Option<usize>,
 }
 
-/// Cap on the Tantivy over-fetch used to fill scoped searches: hits are
-/// fetched beyond the requested limit so that post-filtering by workspace
-/// membership can still fill the page, without letting a large limit fan
-/// out into an unbounded fetch.
-const SCOPED_SEARCH_OVERFETCH_CAP: usize = 1000;
-
 struct TantivyScopedNotes {
     results: Vec<serde_json::Value>,
-    /// In-scope hit count; `None` when the over-fetch saturated and the
-    /// true total is therefore unknown.
+    /// Matching in-scope document count; absent when graph validation drops
+    /// stale documents and the current graph population is unknown.
     total_count: Option<usize>,
-    /// True when in-scope hits were cut to the limit or the over-fetch
-    /// saturated (coverage beyond the returned hits is uncertain).
+    /// True when matching documents exceed the returned prefix or graph
+    /// validation found stale search documents.
     truncated: bool,
     saturated: bool,
 }
@@ -522,19 +516,6 @@ fn tantivy_scoped_note_search(
     q: &str,
     limit: usize,
 ) -> Result<Option<TantivyScopedNotes>, ApiError> {
-    let fetch_limit = limit
-        .saturating_mul(4)
-        .clamp(limit.max(1), SCOPED_SEARCH_OVERFETCH_CAP);
-    let hits = match tantivy.search(q, fetch_limit) {
-        Ok(hits) => hits,
-        Err(e) => {
-            tracing::warn!(error = %e, "tantivy search failed, falling back to scoped title lookup");
-            return Ok(None);
-        }
-    };
-    let saturated = hits.len() >= fetch_limit;
-    let hits = retain_graph_backed_search_hits(&state.store, hits);
-
     let project_note_uids: Option<HashSet<String>> = if workspace.kind == WorkspaceKind::Project {
         Some(
             state
@@ -546,25 +527,38 @@ fn tantivy_scoped_note_search(
     } else {
         None
     };
-    let mut in_scope = Vec::new();
-    for hit in hits {
-        if hit_in_workspace(state, workspace, project_note_uids.as_ref(), &hit) {
-            in_scope.push(hit);
+    let vault_uid = (workspace.kind == WorkspaceKind::Vault)
+        .then_some(workspace.uid.as_deref().unwrap_or_default());
+    let selected_notes = project_note_uids
+        .as_ref()
+        .map(|uids| uids.iter().cloned().collect::<Vec<_>>());
+    let (hits, total) = match tantivy.search_note_scope(
+        q,
+        limit,
+        vault_uid,
+        selected_notes.as_deref(),
+    ) {
+        Ok(page) => page,
+        Err(error) => {
+            tracing::warn!(error = %error, "scoped tantivy search failed, falling back to scoped title lookup");
+            return Ok(None);
         }
-    }
-
-    let total_in_scope = in_scope.len();
-    let results: Vec<serde_json::Value> = in_scope
+    };
+    let returned_before_graph_check = hits.len();
+    let hits = retain_graph_backed_search_hits(&state.store, hits);
+    let results: Vec<_> = hits
         .into_iter()
-        .take(limit)
+        .filter(|hit| hit_in_workspace(state, workspace, project_note_uids.as_ref(), hit))
         .map(|hit| serde_json::to_value(hit).unwrap_or(serde_json::Value::Null))
         .collect();
-    let truncated = saturated || total_in_scope > results.len();
+    // A stale search document is not a graph-backed result. Do not present its
+    // document count as an exact current graph population.
+    let graph_mismatch = results.len() != returned_before_graph_check;
     Ok(Some(TantivyScopedNotes {
+        truncated: total > results.len() || graph_mismatch,
+        total_count: (!graph_mismatch).then_some(total),
+        saturated: graph_mismatch || (results.is_empty() && total > 0),
         results,
-        total_count: (!saturated).then_some(total_in_scope),
-        truncated,
-        saturated,
     }))
 }
 
@@ -806,6 +800,83 @@ mod tests {
     use super::*;
     use nestweaver_schema::{Note, NoteKind, Vault};
     use nestweaver_store::GraphStore;
+
+    #[test]
+    fn review_vault_search_filters_before_global_top_hits() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:selected".into(),
+                name: "Selected".into(),
+                root_path: temp.path().display().to_string(),
+                instance_id: "review".into(),
+            })
+            .unwrap();
+        let note = Note {
+            uid: "note:selected:target".into(),
+            vault_uid: "vlt:selected".into(),
+            file_path: "target.md".into(),
+            title: "Target".into(),
+            note_kind: NoteKind::General,
+            word_count: 1,
+            content_hash: "h".into(),
+            frontmatter: None,
+            frontmatter_raw: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        };
+        store.insert_note(&note).unwrap();
+        let index = TantivyIndex::open_or_create(&temp.path().join("search")).unwrap();
+        for n in 0..8 {
+            index
+                .update_note(
+                    &format!("note:foreign:{n}"),
+                    "needle",
+                    "vlt:foreign",
+                    &["needle".into()],
+                    &[],
+                    &[],
+                    &[],
+                )
+                .unwrap();
+        }
+        index
+            .update_note(
+                &note.uid,
+                &note.title,
+                &note.vault_uid,
+                &["needle".into()],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert!(
+            !index
+                .search("needle", 4)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.uid == note.uid),
+            "precondition: global top hits exclude the selected vault"
+        );
+        let state = AppState::new(store, None, temp.path().join("graph.lbug"));
+        let workspace = workspaces::ResolvedWorkspace {
+            id: "vault:selected".into(),
+            kind: WorkspaceKind::Vault,
+            uid: Some("vlt:selected".into()),
+            label: "Selected".into(),
+        };
+        let result = tantivy_scoped_note_search(&state, &index, &workspace, "needle", 1)
+            .unwrap_or_else(|error| panic!("{}", error.message))
+            .unwrap();
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0]["uid"], note.uid);
+        assert_eq!(result.total_count, Some(1));
+        assert!(!result.truncated);
+    }
 
     fn hit(uid: &str, kind: &str) -> SearchHit {
         SearchHit {

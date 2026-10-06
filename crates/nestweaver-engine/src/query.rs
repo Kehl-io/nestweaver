@@ -2157,6 +2157,7 @@ pub fn build_brain_context_hybrid(
 fn ensure_brain_context_not_cancelled(
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(), anyhow::Error> {
+    GraphStore::check_read_deadline()?;
     if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
         return Err(anyhow::Error::new(nestweaver_store::StoreError::Cancelled(
             nestweaver_store::CancelReason::Timeout,
@@ -7571,5 +7572,26 @@ mod vault_seed_tests {
         let result = run(&store, "tag:a:x").unwrap();
         let seeds: Vec<&str> = result.seeds.iter().map(|n| n.uid.as_str()).collect();
         assert_eq!(seeds, ["tag:a:x"]);
+    }
+}
+
+#[cfg(test)]
+mod context_deadline_boundary_tests {
+    use super::*;
+    #[test]
+    fn context_cancel_guard_honors_deadline_without_cancel_flag() {
+        let store = GraphStore::in_memory().unwrap();
+        let result = store.with_read_deadline(std::time::Instant::now(), || {
+            ensure_brain_context_not_cancelled(None)
+        });
+        assert!(matches!(
+            result
+                .unwrap_err()
+                .downcast_ref::<nestweaver_store::StoreError>(),
+            Some(nestweaver_store::StoreError::Cancelled(
+                nestweaver_store::CancelReason::Timeout
+            ))
+        ));
+        ensure_brain_context_not_cancelled(None).unwrap();
     }
 }

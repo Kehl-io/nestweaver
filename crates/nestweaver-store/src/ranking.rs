@@ -1207,10 +1207,24 @@ impl GraphStore {
         intent: Option<QueryIntent>,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<Vec<(String, f64)>, StoreError> {
-        let _flight = self
-            .pagerank_compute_lock
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let ensure_active = || -> Result<(), StoreError> {
+            Self::check_read_deadline()?;
+            if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+                return Err(StoreError::Cancelled(crate::CancelReason::Timeout));
+            }
+            Ok(())
+        };
+        let _flight = loop {
+            ensure_active()?;
+            match self.pagerank_compute_lock.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::park_timeout(std::time::Duration::from_millis(2));
+                }
+            }
+        };
+        ensure_active()?;
         if self.index_publication_blocks_ranking() {
             self.invalidate_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);
@@ -1252,13 +1266,17 @@ impl GraphStore {
             hasher.finish()
         };
 
+        ensure_active()?;
         {
             let mut cache = self
                 .ppr_result_cache
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cache.get(&ppr_cache_key) {
-                return Ok(cached.clone());
+                ensure_active()?;
+                let result = cached.clone();
+                ensure_active()?;
+                return Ok(result);
             }
         }
 
@@ -1280,10 +1298,12 @@ impl GraphStore {
         // Step 2: on miss, build the graph (no mutex held during DB I/O).
         if !cache_hit {
             let (uids, uid_to_idx, incoming, out_weight) = self.load_ppr_graph(scope, intent)?;
+            ensure_active()?;
             let mut guard = self
                 .ppr_graph_cache
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            ensure_active()?;
             *guard = Some(std::sync::Arc::new(PprGraphCached {
                 generation: current_gen,
                 scope_hash: s_hash,
@@ -1328,26 +1348,28 @@ impl GraphStore {
             interaction_bias_weight: 0.05,
         };
 
-        let cancelled = cancel.map(|flag| move || flag.load(std::sync::atomic::Ordering::Acquire));
+        let cancelled = || ensure_active().is_err();
         let results = nestweaver_algorithms::ppr::forward_push_ppr_cancellable(
             &cached.uids,
             &cached.adjacency,
             seed_uids,
             &config,
-            cancelled
-                .as_ref()
-                .map(|predicate| predicate as &dyn Fn() -> bool),
+            Some(&cancelled as &dyn Fn() -> bool),
         )
         .ok_or(StoreError::Cancelled(crate::error::CancelReason::Timeout))?;
+        let cache_result = results.clone();
+        ensure_active()?;
 
         {
             let mut cache = self
                 .ppr_result_cache
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            cache.put(ppr_cache_key, results.clone());
+            ensure_active()?;
+            cache.put(ppr_cache_key, cache_result);
         }
 
+        ensure_active()?;
         Ok(results)
     }
 
@@ -2472,6 +2494,89 @@ mod tests {
                 && scores_after.contains_key("B")
                 && scores_after.contains_key("C"),
             "surviving repo-1 symbols must still be ranked"
+        );
+    }
+
+    #[test]
+    fn scoped_ppr_deadline_expires_while_waiting_for_compute_lock() {
+        let store = std::sync::Arc::new(test_store());
+        store.insert_symbol(&make_symbol("A", "fn_a")).unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder_store = store.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = holder_store.pagerank_compute_lock.lock().unwrap();
+            held_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        });
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let request_store = store.clone();
+        let request = std::thread::spawn(move || {
+            let result = request_store.with_read_deadline(
+                std::time::Instant::now() + std::time::Duration::from_millis(50),
+                || {
+                    request_store.personalized_pagerank(
+                        &["A".into()],
+                        0.85,
+                        20,
+                        &GraphScope::code_only(),
+                    )
+                },
+            );
+            done_tx.send(result).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(1));
+        // Always release and join owned threads before asserting the deadline.
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        request.join().unwrap();
+        assert!(
+            matches!(
+                result,
+                Ok(Err(StoreError::Cancelled(crate::CancelReason::Timeout)))
+            ),
+            "deadline must finish before compute lock release: {result:?}"
+        );
+        assert!(store.ppr_graph_cache.lock().unwrap().is_none());
+        assert!(store.ppr_result_cache.lock().unwrap().is_empty());
+        let healthy = store
+            .personalized_pagerank(&["A".into()], 0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        assert!(healthy.iter().any(|(uid, _)| uid == "A"));
+    }
+
+    #[test]
+    fn scoped_ppr_expired_warm_result_cache_refuses_and_restores() {
+        let store = test_store();
+        store.insert_symbol(&make_symbol("A", "fn_a")).unwrap();
+        let seeds = vec!["A".to_owned()];
+        let healthy = store
+            .personalized_pagerank(&seeds, 0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        assert!(
+            !store.ppr_result_cache.lock().unwrap().is_empty(),
+            "fixture must reach warm result cache"
+        );
+        let expired = store.with_read_deadline(std::time::Instant::now(), || {
+            store.personalized_pagerank(&seeds, 0.85, 20, &GraphScope::code_only())
+        });
+        assert!(
+            matches!(
+                expired,
+                Err(StoreError::Cancelled(crate::CancelReason::Timeout))
+            ),
+            "expired scope cannot return a warm response"
+        );
+        assert_eq!(
+            store
+                .personalized_pagerank(&seeds, 0.85, 20, &GraphScope::code_only())
+                .unwrap(),
+            healthy
         );
     }
 

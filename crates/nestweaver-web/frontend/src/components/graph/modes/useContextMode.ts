@@ -58,7 +58,7 @@ export function useContextMode() {
   const setSceneMetadata = useStore((s) => s.setSceneMetadata);
   const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const requestIdRef = useRef(0);
-  const previousLayoutRef = useRef<{ key: string; graph: Graph } | null>(null);
+  const previousLayoutRef = useRef<{ key: string; graph: Graph; interrupted?: boolean } | null>(null);
 
   const { start, stop, kill, isRunning } = useForceLayout();
 
@@ -179,8 +179,9 @@ export function useContextMode() {
       // (or another analysis) while it is pending; completing graph data must
       // not select the old lens again and clear that newer analysis state.
       setSceneMetadata(result._meta ?? null);
-      previousLayoutRef.current = { key: layoutKey, graph };
-      if (!existingScene && !useStore.getState().reducedEffects) {
+      previousLayoutRef.current = { key: layoutKey, graph, interrupted: previousLayoutRef.current?.interrupted };
+      if ((!existingScene || previousLayoutRef.current?.interrupted) && !useStore.getState().reducedEffects) {
+        if (previousLayoutRef.current) previousLayoutRef.current.interrupted = false;
         start(graph);
         // Stop after MAX_LAYOUT_MS as a safety ceiling.
         if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
@@ -233,7 +234,8 @@ export function useContextMode() {
     return () => {
       requestIdRef.current += 1;
       if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
-      kill();
+      const interrupted = kill();
+      if (previousLayoutRef.current) previousLayoutRef.current.interrupted ||= interrupted;
     };
   }, [loadContextData, kill]);
 

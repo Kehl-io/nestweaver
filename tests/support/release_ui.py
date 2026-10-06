@@ -23,6 +23,7 @@ class UiDaemon(IsolatedDaemon):
         self.ui_child = None
         self.ui_log = None
         self.browser_child = None
+        self.wikilink_fixture = False
 
     def create_repository(self):
         source = Path(__file__).resolve().parents[2] / "testdata" / "js"
@@ -47,6 +48,24 @@ class UiDaemon(IsolatedDaemon):
                             "-c", "commit.gpgSign=false", "-c", "tag.gpgSign=false", *args],
                            cwd=self.repo, env=self.env, stdin=subprocess.DEVNULL,
                            capture_output=True, check=True, timeout=30)
+
+    def create_wikilink_vault(self):
+        self.assert_owner()
+        vault = self.root / "release-wikilinks"
+        team = vault / "team"
+        team.mkdir(parents=True)
+        (team / "Source.md").write_text(
+            "---\ntitle: Release Wiki Source\n---\n\n"
+            "[[Release Wiki Alias#Usage & examples|Read real alias]]\n\n"
+            "[[team/A & B %20#Usage & examples|Read real punctuation]]\n\n"
+            "[[Release Wiki Missing|Read real missing]]\n", encoding="utf-8")
+        (team / "A & B %20.md").write_text(
+            "---\ntitle: Release Wiki Destination\naliases: [Release Wiki Alias]\n---\n\n"
+            "## Usage & examples\n\nReal indexed destination witness.\n", encoding="utf-8")
+        self.run("brain", "add", vault, "--name", "release-wikilinks", "--db", self.db)
+        self.assert_owner()
+        self.wikilink_fixture = True
+        self.record(kind="wikilink_fixture", path=str(vault), vault_name="release-wikilinks")
 
     def assert_owner(self):
         if self.child.poll() is not None or int(self.pidfile.read_text()) != self.child.pid:
@@ -104,6 +123,8 @@ class UiDaemon(IsolatedDaemon):
         env.update(NESTWEAVER_UI_FIXTURE_URL=url,
                    NESTWEAVER_UI_RESULTS_DIR=str(self.root / "browser-results"),
                    NESTWEAVER_UI_BROWSER_EXECUTABLE=str(browser))
+        if self.wikilink_fixture:
+            env["NESTWEAVER_UI_WIKILINK_FIXTURE"] = "1"
         command = [str(node), str(frontend / "node_modules/@playwright/test/cli.js"),
                    "test", *specs, "--workers=1", "--retries=0"]
         if grep:
@@ -149,6 +170,8 @@ def main():
     parser.add_argument("--node", required=True)
     parser.add_argument("--browser", required=True)
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--wikilink-fixture", action="store_true",
+                        help="Index a tiny private vault for real wikilink browser acceptance")
     parser.add_argument("--grep", help="Run only tests matching this Playwright title regex")
     parser.add_argument("spec", nargs="*", help="Optional specs; default runs the full suite")
     args = parser.parse_args()
@@ -159,6 +182,8 @@ def main():
     print(f"UI evidence: {fixture.root}", flush=True)
     with fixture:
         fixture.bootstrap()
+        if args.wikilink_fixture:
+            fixture.create_wikilink_vault()
         code = fixture.run_browser(frontend, node, browser, args.spec, args.grep)
     raise SystemExit(code)
 

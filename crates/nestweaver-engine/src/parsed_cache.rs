@@ -38,7 +38,9 @@ use serde::{Deserialize, Serialize};
 /// 2 — nw-688: JS/TS test blocks are named `<runner> <title>`, `require()` is
 ///     the only call-shaped import, and package bindings are recorded.
 /// 3 — exact import bindings, Swift receivers, async function values.
-const CACHE_VERSION: u32 = 3;
+/// 4 — star exports, parameter defaults, macro mapping receivers, and lexical
+///     declaration byte scopes. These changes share one unreleased cache version.
+const CACHE_VERSION: u32 = 4;
 
 /// A log larger than this (and than the base) is folded into the base.
 const LOG_COMPACT_MIN_BYTES: u64 = 64 * 1024 * 1024;
@@ -293,7 +295,9 @@ fn write_base(
         version: CACHE_VERSION,
         entries,
     };
-    let data = rmp_serde::to_vec(&file).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
+    // Optional parser fields may be omitted. Named fields keep that omission
+    // from shifting the remaining fields in MessagePack's positional encoding.
+    let data = rmp_serde::to_vec_named(&file).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
     nestweaver_store::durable_sidecar::atomic_replace_file(path, |out| out.write_all(&data))
         .map_err(|e| anyhow::anyhow!("write: {e}"))?;
     Ok(())
@@ -331,6 +335,15 @@ pub fn append_entries<'a>(
     path: &Path,
     entries: impl IntoIterator<Item = (&'a str, &'a CachedParseResult)>,
 ) {
+    if let Err(error) = append_entries_checked(path, entries) {
+        tracing::warn!(%error, "could not append to the parse cache log");
+    }
+}
+
+pub(crate) fn append_entries_checked<'a>(
+    path: &Path,
+    entries: impl IntoIterator<Item = (&'a str, &'a CachedParseResult)>,
+) -> Result<(), anyhow::Error> {
     let mut buffer = Vec::new();
     for (hash, entry) in entries {
         let record = LogRecord {
@@ -338,7 +351,7 @@ pub fn append_entries<'a>(
             hash: std::borrow::Cow::Borrowed(hash),
             entry: std::borrow::Cow::Borrowed(entry),
         };
-        match rmp_serde::to_vec(&record) {
+        match rmp_serde::to_vec_named(&record) {
             Ok(body) if body.len() <= MAX_LOG_RECORD_BYTES as usize => {
                 buffer.extend_from_slice(&(body.len() as u32).to_le_bytes());
                 buffer.extend_from_slice(&body);
@@ -348,7 +361,7 @@ pub fn append_entries<'a>(
         }
     }
     if buffer.is_empty() {
-        return;
+        return Ok(());
     }
     let _lock = write_lock();
     let log = log_path(path);
@@ -379,7 +392,7 @@ pub fn append_entries<'a>(
                 .and_then(|file| file.set_len(valid))
         {
             tracing::warn!(%error, "could not cut a torn parse cache log");
-            return;
+            return Err(error.into());
         }
     }
     let written = std::fs::OpenOptions::new()
@@ -393,7 +406,7 @@ pub fn append_entries<'a>(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&log);
-        return;
+        return Err(error.into());
     }
     VALID_LOG_LEN
         .lock()
@@ -413,6 +426,7 @@ pub fn append_entries<'a>(
             Err(error) => tracing::warn!(%error, "could not compact the parse cache log"),
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -438,6 +452,7 @@ mod tests {
                 scope_chain: None,
             }],
             references: vec![RawReference {
+                scope: None,
                 name: "world".into(),
                 kind: nestweaver_parser::ReferenceKind::Call,
                 start_line: 2,
@@ -445,6 +460,7 @@ mod tests {
                 receiver: None,
             }],
             type_bindings: vec![AstTypeBinding {
+                scope: None,
                 var_name: "x".into(),
                 type_name: "i32".into(),
                 line: 1,
@@ -485,54 +501,90 @@ mod tests {
     #[test]
     fn old_import_receiver_parse_cache_is_rejected_and_reparsed() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("test.parsed_cache.bin");
-        let source = "const work = async function() { helper(); };\n";
-        let hash = "unchanged-source";
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let source = "function helper() {}\nconst work = async function() { helper(); };\nmodule.exports.work = work;\n";
+        std::fs::write(repo.join("main.js"), source).unwrap();
+        let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
+        let db = tmp.path().join("graph.lbug");
+        let index = |database: &Path| {
+            crate::index::index_directory_with_options(
+                &repo,
+                database,
+                "review",
+                "file:///review/cache",
+                "unchanged",
+                true,
+                None,
+            )
+            .unwrap();
+        };
+        index(&db);
+        let path = crate::sidecar_path(&db, ".parsed_cache.bin");
+        assert!(ParsedCache::load(&path).get(&hash).is_some());
         let mut stale = sample_result();
         stale.symbols[0].name = "old_proxy".into();
         let file = ParsedCacheFile {
-            version: 2,
-            entries: HashMap::from([(hash.to_string(), stale)]),
+            version: 3,
+            entries: HashMap::from([(hash.clone(), stale.clone())]),
         };
         std::fs::write(&path, rmp_serde::to_vec(&file).unwrap()).unwrap();
-        let mut cache = ParsedCache::load(&path);
-        let parsed = match cache.get(hash) {
-            Some(hit) => hit.clone(),
-            None => {
-                let fresh =
-                    nestweaver_parser::parse_source(std::path::Path::new("main.js"), source)
-                        .unwrap();
-                CachedParseResult {
-                    symbols: fresh.symbols,
-                    references: fresh.references,
-                    type_bindings: fresh.type_bindings,
-                }
-            }
+        let record = LogRecord {
+            version: 3,
+            hash: std::borrow::Cow::Borrowed(&hash),
+            entry: std::borrow::Cow::Borrowed(&stale),
         };
+        let encoded = rmp_serde::to_vec(&record).unwrap();
+        let mut log = (encoded.len() as u32).to_le_bytes().to_vec();
+        log.extend(encoded);
+        std::fs::write(log_path(&path), log).unwrap();
+        // Run the real index pipeline with identical source bytes, not a test
+        // reconstruction of its cache-miss branch.
+        index(&db);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("main.js")).unwrap(),
+            source
+        );
+        let rewritten: ParsedCacheFile =
+            rmp_serde::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(rewritten.version, CACHE_VERSION);
+        let cached = rewritten.entries.get(&hash).unwrap();
         assert!(
-            !parsed
+            !cached
                 .symbols
                 .iter()
                 .any(|symbol| symbol.name == "old_proxy")
         );
-        assert_eq!(
-            parsed
-                .symbols
-                .iter()
-                .filter(|symbol| symbol.name == "work")
-                .count(),
-            1
-        );
-        cache.insert(hash.into(), parsed);
-        cache.save(&path).unwrap();
         assert!(
-            ParsedCache::load(&path)
-                .get(hash)
-                .unwrap()
+            cached
                 .symbols
                 .iter()
                 .any(|symbol| symbol.name == "work" && symbol.kind == SymbolKind::Function)
         );
+        let graph = |database: &Path| {
+            let store = nestweaver_store::GraphStore::open(database).unwrap();
+            let symbols = store.list_all_symbols().unwrap();
+            let work = symbols.iter().find(|symbol| symbol.name == "work").unwrap();
+            let helper = symbols
+                .iter()
+                .find(|symbol| symbol.name == "helper")
+                .unwrap();
+            let edges = store.load_typed_edges().unwrap();
+            assert!(
+                edges
+                    .iter()
+                    .any(|edge| edge.0 == work.uid && edge.1 == helper.uid && edge.2 == "CALLS")
+            );
+            let mut normalized: Vec<_> = edges
+                .into_iter()
+                .map(|edge| (edge.0, edge.1, edge.2, edge.3.to_bits(), edge.4))
+                .collect();
+            normalized.sort();
+            normalized
+        };
+        let fresh = tmp.path().join("fresh.lbug");
+        index(&fresh);
+        assert_eq!(graph(&db), graph(&fresh));
     }
 
     #[test]

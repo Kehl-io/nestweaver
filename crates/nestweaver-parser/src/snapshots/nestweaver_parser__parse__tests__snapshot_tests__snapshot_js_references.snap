@@ -1,14 +1,25 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 8843
 expression: "parsed_references(\"simple.js\", &source)"
 ---
-- name: fs
+- scope:
+    start: 0
+    end: 438
+    position: 11
+    initialized_at: 24
+    hoisted_var: false
+  name: fs
   kind: Import
   start_line: 1
   context: "fs = require('fs')"
   receiver: ~
-- name: fs
+- scope:
+    start: 0
+    end: 438
+    position: 6
+    initialized_at: 24
+    hoisted_var: false
+  name: fs
   kind: ImportAlias
   start_line: 1
   context: fs
@@ -18,12 +29,24 @@ expression: "parsed_references(\"simple.js\", &source)"
   start_line: 1
   context: fs
   receiver: ~
-- name: require
+- scope:
+    start: 0
+    end: 438
+    position: 11
+    initialized_at: 24
+    hoisted_var: false
+  name: require
   kind: Call
   start_line: 1
   context: "fs = require('fs')"
   receiver: ~
-- name: EventEmitter
+- scope:
+    start: 0
+    end: 438
+    position: 36
+    initialized_at: 36
+    hoisted_var: false
+  name: EventEmitter
   kind: ImportAlias
   start_line: 3
   context: events
@@ -33,42 +56,90 @@ expression: "parsed_references(\"simple.js\", &source)"
   start_line: 3
   context: events
   receiver: ~
-- name: events
+- scope:
+    start: 0
+    end: 438
+    position: 27
+    initialized_at: 27
+    hoisted_var: false
+  name: events
   kind: Import
   start_line: 3
   context: "import { EventEmitter } from 'events';"
   receiver: ~
-- name: name
+- scope:
+    start: 189
+    end: 222
+    position: 199
+    initialized_at: 199
+    hoisted_var: false
+  name: name
   kind: ReadAccess
   start_line: 13
   context: this.name = name
   receiver: this
-- name: name
+- scope:
+    start: 236
+    end: 289
+    position: 253
+    initialized_at: 253
+    hoisted_var: false
+  name: name
   kind: ReadAccess
   start_line: 17
   context: "this.name + ' makes a noise.'"
   receiver: this
-- name: name
+- scope:
+    start: 332
+    end: 377
+    position: 349
+    initialized_at: 349
+    hoisted_var: false
+  name: name
   kind: ReadAccess
   start_line: 23
   context: "this.name + ' barks.'"
   receiver: this
-- name: Dog
+- scope:
+    start: 0
+    end: 438
+    position: 393
+    initialized_at: 407
+    hoisted_var: false
+  name: Dog
   kind: Call
   start_line: 27
   context: "dog = new Dog('Rex')"
   receiver: ~
-- name: greet
+- scope:
+    start: 0
+    end: 438
+    position: 409
+    initialized_at: 409
+    hoisted_var: false
+  name: greet
   kind: Call
   start_line: 28
   context: "greet('world');"
   receiver: ~
-- name: speak
+- scope:
+    start: 0
+    end: 438
+    position: 425
+    initialized_at: 425
+    hoisted_var: false
+  name: speak
   kind: Call
   start_line: 29
   context: dog.speak();
   receiver: dog
-- name: speak
+- scope:
+    start: 0
+    end: 438
+    position: 425
+    initialized_at: 425
+    hoisted_var: false
+  name: speak
   kind: ReadAccess
   start_line: 29
   context: dog.speak()

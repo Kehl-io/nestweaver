@@ -21,7 +21,7 @@ export function useContextGraphMode(mode: "local" | "features", seeds: string[])
   const graphEpoch = useStore((s) => s.graphEpoch);
   const workspaceId = useStore((s) => s.activeWorkspaceId);
   const seedRefresh = useStore((s) => s.seeds);
-  const previousLayout = useRef<{ key: string; graph: Graph } | null>(null);
+  const previousLayout = useRef<{ key: string; graph: Graph; interrupted?: boolean } | null>(null);
   const requestIdRef = useRef(0);
   const [state, setState] = useState<ContextGraphState>({ status: "idle", message: "" });
   const [revision, setRevision] = useState(0);
@@ -79,7 +79,7 @@ export function useContextGraphMode(mode: "local" | "features", seeds: string[])
           graph.setNodeAttribute(selectedSeeds[0], "y", 0);
         }
         preserveGraphLayout(graph, existingScene ? previousLayout.current?.graph ?? null : null);
-        previousLayout.current = { key: layoutKey, graph };
+        previousLayout.current = { key: layoutKey, graph, interrupted: previousLayout.current?.interrupted };
         const active = useStore.getState();
         active.setGraphData(graph);
         active.setSceneMetadata(result._meta ?? null);
@@ -95,7 +95,8 @@ export function useContextGraphMode(mode: "local" | "features", seeds: string[])
               ? "No stored relationships were found among these context nodes."
               : `${graph.order} nodes · ${graph.size} stored relationships`) + omissions,
         });
-        if (graph.order > 0 && !existingScene && !active.reducedEffects) {
+        if (graph.order > 0 && (!existingScene || previousLayout.current?.interrupted) && !active.reducedEffects) {
+          if (previousLayout.current) previousLayout.current.interrupted = false;
           start(graph);
           stopTimer = setTimeout(stop, 10_000);
         }
@@ -109,7 +110,8 @@ export function useContextGraphMode(mode: "local" | "features", seeds: string[])
       requestIdRef.current += 1;
       controller.abort();
       if (stopTimer) clearTimeout(stopTimer);
-      kill();
+      const interrupted = kill();
+      if (previousLayout.current) previousLayout.current.interrupted ||= interrupted;
     };
   }, [graphMode, mode, seedKey, seedRefresh, workspaceId, graphEpoch, revision, start, stop, kill]);
 

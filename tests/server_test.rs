@@ -3,6 +3,8 @@
 //! Run with:
 //!   cargo test --test server_test -- --test-threads=1
 
+#[path = "helpers/catalogue_contract.rs"]
+mod catalogue_contract;
 mod helpers;
 
 use std::process::Command as StdCommand;
@@ -928,57 +930,21 @@ async fn server_mcp_http_tools_list() {
     let mcp_addr = guard.mcp_addr();
 
     let client = reqwest::Client::new();
-    let mut params = json!({});
-    let mut tools = Vec::new();
-    let mut names = std::collections::HashSet::new();
-    let mut cursors = std::collections::HashSet::new();
-    let mut complete = false;
-    for index in 0..100 {
-        let resp = client
-            .post(format!("{mcp_addr}/mcp"))
-            .json(&json!({"jsonrpc":"2.0","id":index+2,"method":"tools/list","params":params}))
-            .send()
-            .await
-            .expect("MCP HTTP request failed");
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["id"], index + 2);
-        assert_eq!(body["jsonrpc"], "2.0");
-        assert!(body.get("error").is_none(), "{body}");
-        let result = &body["result"];
-        assert!(
-            nestweaver_mcp::output_budget::escaped_size(result)
-                <= nestweaver_mcp::output_budget::CATALOGUE_BYTES
-        );
-        let entries = result["tools"].as_array().unwrap();
-        assert!(!entries.is_empty());
-        assert!(entries.len() <= nestweaver_mcp::output_budget::CATALOGUE_TOOLS);
-        for tool in entries {
-            assert!(
-                names.insert(tool["name"].as_str().unwrap().to_owned()),
-                "duplicate tool: {tool}"
-            );
-            tools.push(tool.clone());
-        }
-        let Some(cursor) = result.get("nextCursor") else {
-            complete = true;
-            break;
-        };
-        let cursor = cursor.as_str().unwrap().to_owned();
-        assert!(
-            cursors.insert(cursor.clone()),
-            "catalogue cursor did not advance"
-        );
-        params = json!({"cursor":cursor});
-    }
-    assert!(complete, "catalogue exceeded the page bound");
-    assert_eq!(
-        tools,
-        *nestweaver_mcp::tools::tool_list(false)["tools"]
-            .as_array()
-            .unwrap(),
-        "HTTP catalogue profile diverged"
-    );
+    let resp = client
+        .post(format!("{mcp_addr}/mcp"))
+        .json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+        .send()
+        .await
+        .expect("MCP HTTP request failed");
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["id"], 2);
+    assert_eq!(body["jsonrpc"], "2.0");
+    assert!(body.get("error").is_none(), "{body}");
+    let full = nestweaver_mcp::tools::tool_list(false);
+    let expected = full["tools"].as_array().unwrap();
+    assert_eq!(expected.len(), 43, "complete default HTTP profile");
+    catalogue_contract::assert_complete_catalogue_page(&body["result"], expected);
 }
 
 #[tokio::test]

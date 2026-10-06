@@ -43,11 +43,22 @@ enum DatabaseSelector {
         let explicitConfig = environment["NESTWEAVER_CONFIG"].flatMap { $0.isEmpty ? nil : $0 }
         let candidateConfig = resolve(explicitConfig ?? home + "/.nestweaver/instance.toml",
                                       relativeTo: fileManager.currentDirectoryPath)
-        let config = fileManager.fileExists(atPath: candidateConfig) ? candidateConfig : nil
+        // An explicit path is intentional, including a typo that the CLI must report.
+        let config = explicitConfig != nil || fileManager.fileExists(atPath: candidateConfig)
+            ? candidateConfig : nil
+        let configuredDatabase: String? = config.flatMap { path in
+            guard let contents = try? String(contentsOfFile: path, encoding: .utf8),
+                  let db = topLevelDatabase(contents) else { return nil }
+            return resolve(db, relativeTo: (path as NSString).deletingLastPathComponent,
+                           preservePublicationName: true)
+        }
+        func associatedConfig(_ logical: String) -> String? {
+            explicitConfig != nil || configuredDatabase == logical ? config : nil
+        }
         if let db = environment["NESTWEAVER_DB"], !db.isEmpty {
-            return DatabaseSelection(databasePath: resolve(db, relativeTo: fileManager.currentDirectoryPath,
-                                                           preservePublicationName: true),
-                                     configPath: config)
+            let logical = resolve(db, relativeTo: fileManager.currentDirectoryPath,
+                                  preservePublicationName: true)
+            return DatabaseSelection(databasePath: logical, configPath: associatedConfig(logical))
         }
         if let config = config,
            let contents = try? String(contentsOfFile: config, encoding: .utf8),
@@ -61,7 +72,9 @@ enum DatabaseSelector {
             for dir in dirs.sorted() {
                 let logical = resolve(nestDir + "/" + dir + "/brain.lbug", relativeTo: home,
                                       preservePublicationName: true)
-                if exists(logical) { return DatabaseSelection(databasePath: logical, configPath: config) }
+                if exists(logical) {
+                    return DatabaseSelection(databasePath: logical, configPath: associatedConfig(logical))
+                }
             }
         }
         return nil

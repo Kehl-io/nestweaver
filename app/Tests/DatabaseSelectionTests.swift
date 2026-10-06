@@ -53,7 +53,15 @@ struct DatabaseSelectionTests {
         check(select(fallbackHome)?.databasePath == fallbackDB, "publication glob fallback keeps logical path")
         check(select(try home("empty")) == nil, "no DB returns nil")
         check(select(globalHome, ["NESTWEAVER_DB": "~/override.lbug"])?.databasePath == globalHome + "/override.lbug", "explicit DB override and injected tilde home")
-        check(select(globalHome, ["NESTWEAVER_DB": "~/override.lbug"])?.configPath == config, "DB override retains existing global config")
+        check(select(globalHome, ["NESTWEAVER_DB": "~/override.lbug"])?.configPath == nil, "unrelated implicit config omitted from DB override")
+        check(select(globalHome, ["NESTWEAVER_DB": db])?.configPath == config,
+              "matching override retains implicit config")
+        check(select(globalHome, ["NESTWEAVER_DB": "~/override.lbug", "NESTWEAVER_CONFIG": config])?.configPath == config,
+              "explicit config intent survives different DB override")
+        try write(fallbackHome + "/.nestweaver/instance.toml", "db = 'missing.lbug'\n")
+        check(select(fallbackHome)?.configPath == nil, "glob fallback omits unrelated implicit config")
+        check(select(fallbackHome, ["NESTWEAVER_CONFIG": fallbackHome + "/.nestweaver/instance.toml"])?.configPath != nil,
+              "glob fallback preserves explicit config intent")
         let aliasHome = (try home("publication-alias") as NSString).resolvingSymlinksInPath
         let aliasDB = aliasHome + "/alias.lbug"
         let aliasConfig = aliasHome + "/.nestweaver/instance.toml"
@@ -93,7 +101,7 @@ struct DatabaseSelectionTests {
         try write(explicit, "db = '~/brain.lbug' # comment\n")
         check(select(globalHome, ["NESTWEAVER_CONFIG": "~/selected.toml"])?.configPath == explicit, "explicit config wins over global")
         check(select(globalHome, ["NESTWEAVER_CONFIG": "~/selected.toml"])?.databasePath == db, "config DB tilde and trailing comment")
-        check(select(ordinaryHome, ["NESTWEAVER_CONFIG": "~/missing.toml"])?.configPath == nil, "nonexistent explicit config omitted")
+        check(select(ordinaryHome, ["NESTWEAVER_CONFIG": "~/missing.toml"])?.configPath == ordinaryHome + "/missing.toml", "nonexistent explicit config forwarded for CLI diagnostic")
         let target = globalHome + "/actual/config.toml"
         let relativeDB = globalHome + "/actual/relative.lbug"
         try write(relativeDB + ".publications/CURRENT", "slot-a")

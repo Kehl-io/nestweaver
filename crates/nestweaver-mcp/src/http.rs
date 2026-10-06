@@ -1213,6 +1213,9 @@ async fn handle_mcp(
             let work = tokio::time::timeout(
                 timeout,
                 tokio::task::spawn_blocking(move || {
+                    let _delivery = tools::scoped_tool_delivery(
+                        nestweaver_schema::ToolDeliveryProfile::BoundedMcp,
+                    );
                     tools::set_current_db_path(db_path);
                     tools::set_lite_mode(lite);
                     tools::set_current_instance_config(instance_cfg);
@@ -1938,7 +1941,11 @@ mod tests {
             let result = &parsed["result"];
             assert!(serde_json::to_vec(result).unwrap().len() <= 32_000);
             let listed = result["tools"].as_array().unwrap();
-            assert!(listed.len() <= 8);
+            assert_eq!(
+                listed.len(),
+                expected.len(),
+                "complete visible catalogue on first page"
+            );
             actual.extend(listed.iter().cloned());
             cursor = result
                 .get("nextCursor")
@@ -1949,7 +1956,10 @@ mod tests {
             }
             assert!(!listed.is_empty());
         }
-        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), expected.len());
+        for (wire, full) in actual.iter().zip(&expected) {
+            tools::assert_wire_tool_contract(wire, full);
+        }
     }
 
     #[tokio::test]

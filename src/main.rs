@@ -1729,6 +1729,10 @@ const ENV_REGISTRY: &[EnvVar] = &[
         role: EnvRole::Configures,
     },
     EnvVar {
+        name: "NESTWEAVER_LAUNCHER_READY_TOKEN",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
         name: "NESTWEAVER_LBUG_AUTO_CHECKPOINT",
         role: EnvRole::Configures,
     },
@@ -16879,7 +16883,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Ok(Some(value)) => Ok(Some(value)),
                 Ok(None) => {
                     let store = open_store(Some(&db_path))?;
-                    nestweaver_mcp::tools::dispatch(
+                    nestweaver_mcp::tools::dispatch_cli(
                         &store,
                         None,
                         "cross_repo_contracts",
@@ -16998,7 +17002,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Ok(Some(value)) => Ok(Some(value)),
                 Ok(None) => {
                     let store = open_store(Some(&db_path))?;
-                    nestweaver_mcp::tools::dispatch(&store, None, "backlinks", args, None).map(Some)
+                    nestweaver_mcp::tools::dispatch_cli(&store, None, "backlinks", args, None)
+                        .map(Some)
                 }
                 Err(error) => Err(error),
             };
@@ -17078,7 +17083,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Ok(Some(value)) => Ok(Some(value)),
                 Ok(None) => {
                     let store = open_store(Some(&db_path))?;
-                    nestweaver_mcp::tools::dispatch(&store, None, "note_get", args, None).map(Some)
+                    nestweaver_mcp::tools::dispatch_cli(&store, None, "note_get", args, None)
+                        .map(Some)
                 }
                 Err(error) => Err(error),
             };
@@ -17190,7 +17196,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Ok(Some(value)) => Ok(Some(value)),
                 Ok(None) => {
                     let store = open_store(Some(&db_path))?;
-                    nestweaver_mcp::tools::dispatch(
+                    nestweaver_mcp::tools::dispatch_cli(
                         &store,
                         None,
                         "cross_repo_contracts",
@@ -19075,7 +19081,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             direct_store = Some(open_store(Some(&db_path))?);
                         }
                         nestweaver_mcp::tools::set_current_db_path(db_path.clone());
-                        Ok(Some(nestweaver_mcp::tools::dispatch(
+                        Ok(Some(nestweaver_mcp::tools::dispatch_cli(
                             direct_store.as_ref().unwrap(),
                             None,
                             "clusters",
@@ -19653,8 +19659,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // the `cochange-unavailable` disclosure, so the direct path
                     // would answer with LESS honesty than the daemon (nw-062).
                     nestweaver_mcp::tools::set_current_db_path(db_path.clone());
-                    match nestweaver_mcp::tools::dispatch(&store, None, "blast_radius", args, None)
-                    {
+                    match nestweaver_mcp::tools::dispatch_cli(
+                        &store,
+                        None,
+                        "blast_radius",
+                        args,
+                        None,
+                    ) {
                         Err(error) if error_is_unresolved_repo_filter(&error) => {
                             return Ok((report_unresolved_repo_filter(&error, json), None));
                         }
@@ -19716,7 +19727,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // daemon sets it; without it here the direct route would drop
                     // the cluster risk boost and disagree with `blast-radius`.
                     nestweaver_mcp::tools::set_current_db_path(db_path.clone());
-                    nestweaver_mcp::tools::dispatch(&store, None, "detect_changes", args, None)?
+                    nestweaver_mcp::tools::dispatch_cli(&store, None, "detect_changes", args, None)?
                 }
             };
             if json {
@@ -19791,7 +19802,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Ok(None) => {
                     let store = open_store(Some(&db_path))?;
                     nestweaver_mcp::tools::set_current_db_path(db_path.clone());
-                    nestweaver_mcp::tools::dispatch(&store, None, "flow_trace", args, None)
+                    nestweaver_mcp::tools::dispatch_cli(&store, None, "flow_trace", args, None)
                         .map(Some)
                 }
                 Err(error) => Err(error),
@@ -21262,6 +21273,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // the ACTUAL running port (resp.port), not the one they
                         // requested, instead of printing a dead URL.
                         let actual_port = served_ui_port(&resp)?;
+                        nestweaver_web::announce_launcher_ready(
+                            actual_port,
+                            nestweaver_web::LauncherUiMode::Attached,
+                        );
                         println!("NestWeaver UI: http://127.0.0.1:{actual_port}");
                         println!("{}", resp.message);
                         return Ok((EXIT_SUCCESS, None));
@@ -21269,6 +21284,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok(resp) => {
                         let port = served_ui_port(&resp)?;
                         daemon_ok = true;
+                        nestweaver_web::announce_launcher_ready(
+                            port,
+                            nestweaver_web::LauncherUiMode::Supervised,
+                        );
                         println!("NestWeaver UI: http://127.0.0.1:{port}");
                         if watch {
                             println!("Watch mode enabled — changes auto-reindex.");
@@ -23268,7 +23287,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // no model can be loaded.
             let embed_model =
                 load_direct_semantic_model(&store, direct_instance_cfg.as_ref(), no_embed);
-            let response = nestweaver_mcp::tools::dispatch(
+            let response = nestweaver_mcp::tools::dispatch_cli(
                 &store,
                 tantivy.as_ref(),
                 "project_context",
@@ -30777,10 +30796,9 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
             json,
         } => {
             let db = if explicit_root.is_none() {
-                let selected = resolve_db_with_config(db, None)?;
-                require_openable_db(&selected)?;
+                let (base, _) = resolve_base_db_with_config(db, None)?;
                 Some(nestweaver_engine::publication::instance_anchor_database(
-                    &selected,
+                    &base,
                 ))
             } else {
                 db
@@ -34102,9 +34120,12 @@ credential_method = "gh"
             identity_bound_config(dir.path(), &db, &identity.brain_uuid),
         )
         .unwrap();
+        let configured_db = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join(db.file_name().unwrap());
         assert_eq!(
             resolve_db_with_config(None, Some(&config_path)).unwrap(),
-            db
+            configured_db
         );
         assert_eq!(
             resolve_db_with_config(Some(db.clone()), Some(&config_path)).unwrap(),
@@ -39142,9 +39163,17 @@ mod clusters_forwarding_tests {
                 args,
                 |args| {
                     calls += 1;
+                    let bounded = nestweaver_mcp::tools::dispatch(
+                        &store,
+                        None,
+                        "clusters",
+                        args.clone(),
+                        None,
+                    )?;
+                    assert!(serde_json::to_vec(&bounded).unwrap().len() <= 20_000);
                     let page =
-                        nestweaver_mcp::tools::dispatch(&store, None, "clusters", args, None)?;
-                    assert!(serde_json::to_vec(&page).unwrap().len() <= 20_000);
+                        nestweaver_mcp::tools::dispatch_cli(&store, None, "clusters", args, None)?;
+                    assert_eq!(page["total"], bounded["total"]);
                     Ok(Some(page))
                 },
                 true,
@@ -39229,7 +39258,7 @@ mod clusters_forwarding_tests {
             |args| {
                 calls += 1;
                 let mut page =
-                    nestweaver_mcp::tools::dispatch(&store, None, "clusters", args, None)?;
+                    nestweaver_mcp::tools::dispatch_cli(&store, None, "clusters", args, None)?;
                 if calls > 1 {
                     page["graph_generation"] = serde_json::json!(u64::MAX);
                 }
@@ -41097,5 +41126,68 @@ mod cross_repo_debt_on_early_exit_tests {
             armed: true,
         });
         assert!(pending(), "an early return records the debt");
+    }
+}
+
+#[cfg(test)]
+mod publication_status_recovery_tests {
+    use super::*;
+    #[test]
+    fn status_reads_journal_without_opening_legacy_or_current_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("damaged.lbug");
+        std::fs::write(&db, b"not a graph").unwrap();
+        let root = nestweaver_engine::publication::default_publication_root(&db);
+        std::fs::create_dir_all(&root).unwrap();
+        let operation = "22222222-2222-4222-8222-222222222222";
+        nestweaver_engine::publication_operation::create_operation(
+            &root,
+            nestweaver_engine::publication_operation::PublicationOperationPlan {
+                operation_uuid: operation.into(),
+                brain_uuid: "33333333-3333-4333-8333-333333333333".into(),
+                target_publication_uuid: "44444444-4444-4444-8444-444444444444".into(),
+                expected_current_publication_uuid: None,
+                input_fingerprint: "fixture".into(),
+                producer_version: "fixture".into(),
+                publication_format_version: 1,
+                created_unix_millis: 0,
+            },
+        )
+        .unwrap();
+        let journal =
+            nestweaver_engine::publication_operation::operation_state_path(&root, operation)
+                .unwrap();
+        let original_journal = std::fs::read(&journal).unwrap();
+        for marker in ["invalid marker", "11111111-1111-4111-8111-111111111111\n"] {
+            std::fs::write(root.join("CURRENT"), marker).unwrap();
+            assert_eq!(
+                run_publication(PublicationCommands::Status {
+                    operation: Some(operation.into()),
+                    root: None,
+                    db: Some(db.clone()),
+                    json: true,
+                })
+                .unwrap(),
+                0
+            );
+            assert_eq!(std::fs::read(&db).unwrap(), b"not a graph");
+            assert_eq!(
+                std::fs::read_to_string(root.join("CURRENT")).unwrap(),
+                marker
+            );
+            assert_eq!(std::fs::read(&journal).unwrap(), original_journal);
+            assert!(resolve_db_with_config(Some(db.clone()), None).is_err());
+        }
+        std::fs::remove_file(root.join("CURRENT")).unwrap();
+        assert_eq!(
+            run_publication(PublicationCommands::Status {
+                operation: None,
+                root: None,
+                db: Some(db),
+                json: true,
+            })
+            .unwrap(),
+            0
+        );
     }
 }

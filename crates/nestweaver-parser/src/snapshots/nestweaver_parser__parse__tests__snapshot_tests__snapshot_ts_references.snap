@@ -1,9 +1,14 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 8857
 expression: "parsed_references(\"simple.ts\", &source)"
 ---
-- name: EventEmitter
+- scope:
+    start: 0
+    end: 753
+    position: 9
+    initialized_at: 9
+    hoisted_var: false
+  name: EventEmitter
   kind: ImportAlias
   start_line: 1
   context: events
@@ -13,77 +18,167 @@ expression: "parsed_references(\"simple.ts\", &source)"
   start_line: 1
   context: events
   receiver: ~
-- name: events
+- scope:
+    start: 0
+    end: 753
+    position: 0
+    initialized_at: 0
+    hoisted_var: false
+  name: events
   kind: Import
   start_line: 1
   context: "import { EventEmitter } from 'events';"
   receiver: ~
-- name: Greeter
+- scope:
+    start: 0
+    end: 753
+    position: 207
+    initialized_at: 207
+    hoisted_var: false
+  name: Greeter
   kind: Implements
   start_line: 12
   context: "implements Greeter, Logger"
   receiver: ~
-- name: Logger
+- scope:
+    start: 0
+    end: 753
+    position: 207
+    initialized_at: 207
+    hoisted_var: false
+  name: Logger
   kind: Implements
   start_line: 12
   context: "implements Greeter, Logger"
   receiver: ~
-- name: log
+- scope:
+    start: 422
+    end: 459
+    position: 432
+    initialized_at: 432
+    hoisted_var: false
+  name: log
   kind: Call
   start_line: 22
   context: console.log(message);
   receiver: console
-- name: log
+- scope:
+    start: 422
+    end: 459
+    position: 432
+    initialized_at: 432
+    hoisted_var: false
+  name: log
   kind: ReadAccess
   start_line: 22
   context: console.log(message)
   receiver: console
-- name: ConsoleGreeter
+- scope:
+    start: 0
+    end: 753
+    position: 484
+    initialized_at: 484
+    hoisted_var: false
+  name: ConsoleGreeter
   kind: Extends
   start_line: 26
   context: "class VerboseGreeter extends ConsoleGreeter {"
   receiver: ~
-- name: log
+- scope:
+    start: 541
+    end: 620
+    position: 551
+    initialized_at: 551
+    hoisted_var: false
+  name: log
   kind: Call
   start_line: 28
   context: "this.log(`Greeting ${name}`);"
   receiver: this
-- name: log
+- scope:
+    start: 541
+    end: 620
+    position: 551
+    initialized_at: 551
+    hoisted_var: false
+  name: log
   kind: ReadAccess
   start_line: 28
   context: "this.log(`Greeting ${name}`)"
   receiver: this
-- name: greet
+- scope:
+    start: 541
+    end: 620
+    position: 596
+    initialized_at: 596
+    hoisted_var: false
+  name: greet
   kind: Call
   start_line: 29
   context: return super.greet(name);
   receiver: super
-- name: greet
+- scope:
+    start: 541
+    end: 620
+    position: 596
+    initialized_at: 596
+    hoisted_var: false
+  name: greet
   kind: ReadAccess
   start_line: 29
   context: super.greet(name)
   receiver: super
-- name: Greeter
+- scope:
+    start: 0
+    end: 753
+    position: 624
+    initialized_at: 624
+    hoisted_var: false
+  name: Greeter
   kind: TypeRef
   start_line: 33
   context: "function createGreeter(): Greeter {"
   receiver: ~
-- name: ConsoleGreeter
+- scope:
+    start: 658
+    end: 694
+    position: 671
+    initialized_at: 671
+    hoisted_var: false
+  name: ConsoleGreeter
   kind: Call
   start_line: 34
   context: return new ConsoleGreeter();
   receiver: ~
-- name: createGreeter
+- scope:
+    start: 0
+    end: 753
+    position: 712
+    initialized_at: 727
+    hoisted_var: false
+  name: createGreeter
   kind: Call
   start_line: 37
   context: greeter = createGreeter()
   receiver: ~
-- name: greet
+- scope:
+    start: 0
+    end: 753
+    position: 729
+    initialized_at: 729
+    hoisted_var: false
+  name: greet
   kind: Call
   start_line: 38
   context: "greeter.greet('world');"
   receiver: greeter
-- name: greet
+- scope:
+    start: 0
+    end: 753
+    position: 729
+    initialized_at: 729
+    hoisted_var: false
+  name: greet
   kind: ReadAccess
   start_line: 38
   context: "greeter.greet('world')"
