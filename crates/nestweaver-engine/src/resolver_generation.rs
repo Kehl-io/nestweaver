@@ -263,6 +263,8 @@ use std::path::Path;
 ///     fanout; src-layout Python imports and Swift static receivers resolve.
 ///     Composed receivers no longer inherit the first segment's type, removing
 ///     false method edges such as a lock-result `len()` calling its enclosing `len`.
+///     Rust macro call-result receivers retain their syntax instead of becoming
+///     bare calls that bind unrelated same-named methods.
 ///     Re-index existing repositories with `nestweaver index --repo <path> --force`.
 pub const RESOLVER_GENERATION: u32 = 9;
 

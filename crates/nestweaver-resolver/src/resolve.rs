@@ -3726,6 +3726,165 @@ mod user_pain_reference_tests {
     use std::path::Path;
 
     #[test]
+    fn actual_embedding_base_contains_has_only_explicit_callers() {
+        let path = "crates/nestweaver-store/src/search.rs";
+        let source = include_str!("../../nestweaver-store/src/search.rs");
+        let parsed = parse_source(Path::new(path), source).unwrap();
+        let env = crate::types::TypeEnvironment::build(
+            source,
+            Language::Rust,
+            &parsed.symbols,
+            &parsed.type_bindings,
+        );
+        let files = vec![(path.to_string(), parsed.symbols, parsed.references)];
+        for witness in [
+            "binary_v2_round_trip_binds_identity_pipeline_and_payload",
+            "an_implausible_embedding_count_is_rejected_not_allocated",
+            "binary_atomic_replace_cleans_partial_temp_after_write_error",
+            "binary_save_reports_parent_sync_failure_and_reopens_complete_replacement",
+            "binary_load_rejects_bad_magic",
+        ] {
+            let symbol = files[0]
+                .1
+                .iter()
+                .find(|symbol| symbol.name == witness)
+                .expect("actual error-string witness");
+            let calls: Vec<_> = files[0]
+                .2
+                .iter()
+                .filter(|reference| {
+                    reference.kind == ReferenceKind::Call
+                        && reference.name == "contains"
+                        && reference.start_line >= symbol.start_line
+                        && reference.start_line <= symbol.end_line
+                })
+                .collect();
+            assert!(
+                !calls.is_empty(),
+                "actual witness {witness} must retain its calls"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .all(|reference| reference
+                        .receiver
+                        .as_deref()
+                        .is_some_and(|receiver| receiver.contains("to_string()")
+                            || receiver.contains("format!"))),
+                "actual string-result receivers must retain their syntax: {witness}: {calls:#?}"
+            );
+        }
+        let envs = std::collections::HashMap::from([(path.to_string(), env)]);
+        let edges = resolve_references_with_context(
+            &files,
+            Language::Rust,
+            "repo:test:abc",
+            &WorkspaceContext::default(),
+            Some(&envs),
+            None,
+        );
+        let target = uid(&files, path, "contains");
+        let allowed: Vec<_> = [
+            "replay_journal_v2",
+            "tombstone_uids",
+            "occupancy",
+            "retain_uids",
+        ]
+        .iter()
+        .map(|name| uid(&files, path, name))
+        .collect();
+        let incoming: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.edge_type == EdgeType::Calls && edge.target_uid == target)
+            .collect();
+        assert!(
+            incoming
+                .iter()
+                .all(|edge| allowed.contains(&edge.source_uid)),
+            "actual EmbeddingBase::contains acquired false callers: {incoming:#?}"
+        );
+    }
+
+    #[test]
+    fn actual_regex_reader_pool_len_has_only_its_explicit_caller() {
+        let path = "crates/nestweaver-store/src/regex_index.rs";
+        let source = include_str!("../../nestweaver-store/src/regex_index.rs");
+        let parsed = parse_source(Path::new(path), source).unwrap();
+        let env = crate::types::TypeEnvironment::build(
+            source,
+            Language::Rust,
+            &parsed.symbols,
+            &parsed.type_bindings,
+        );
+        let files = vec![(path.to_string(), parsed.symbols, parsed.references)];
+        let saturated = files[0]
+            .1
+            .iter()
+            .find(|symbol| {
+                symbol.name == "saturated_candidate_query_widens_instead_of_dropping_matches"
+            })
+            .expect("actual saturated candidate witness");
+        let macro_chain_line = source
+            .lines()
+            .enumerate()
+            .find_map(|(index, line)| {
+                let line_number = index as u32 + 1;
+                (line_number >= saturated.start_line
+                    && line_number <= saturated.end_line
+                    && line.trim() == ".len(),")
+                    .then_some(line_number)
+            })
+            .expect("actual multiline macro-result len witness");
+        let macro_chain = files[0]
+            .2
+            .iter()
+            .find(|reference| {
+                reference.kind == ReferenceKind::Call
+                    && reference.name == "len"
+                    && reference.start_line == macro_chain_line
+            })
+            .expect("parser must retain the actual chained macro call");
+        let source_lines = source.lines().collect::<Vec<_>>();
+        let preceding = source_lines[..(macro_chain_line - 1) as usize]
+            .iter()
+            .rev()
+            .take(2)
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            preceding,
+            vec!["                .unwrap()", "                .unwrap()"]
+        );
+        assert!(
+            macro_chain.receiver.is_some(),
+            "a method on a macro call result must retain receiver evidence: {macro_chain:#?}"
+        );
+        let envs = std::collections::HashMap::from([(path.to_string(), env)]);
+        let edges = resolve_references_with_context(
+            &files,
+            Language::Rust,
+            "repo:test:abc",
+            &WorkspaceContext::default(),
+            Some(&envs),
+            None,
+        );
+        let target = uid(&files, path, "len");
+        let allowed = uid(
+            &files,
+            path,
+            "reader_pool_evicts_under_many_scope_descriptor_pressure",
+        );
+        let incoming: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.edge_type == EdgeType::Calls && edge.target_uid == target)
+            .collect();
+        assert!(
+            incoming.iter().all(|edge| edge.source_uid == allowed),
+            "actual RegexReaderPool::len acquired false callers; macro metadata: {macro_chain:#?}; incoming: {incoming:#?}"
+        );
+    }
+
+    #[test]
     fn parsed_multiline_lock_chain_does_not_call_its_enclosing_len() {
         let path = "src/regex_index.rs";
         let source = r#"struct RegexReaderPool { shards: Mutex<Vec<Reader>> }

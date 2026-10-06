@@ -2686,6 +2686,8 @@ fn collect_calls_in_token_tree(
 /// the same with `::` (one token, or two `:` tokens). The returned text is
 /// the last segment before the separator (`items`, `Vec`), which is what the
 /// resolver's receiver gate compares to a file stem or a declaring type.
+/// Nonidentifier operands retain their expression text because their result
+/// type is unknown; they must not become receiver-less calls.
 /// A bare `helper()` has no separator and returns `None`.
 fn token_tree_receiver(
     children: &[tree_sitter::Node<'_>],
@@ -2699,6 +2701,23 @@ fn token_tree_receiver(
     let method = separator == "." || separator == "::" || separator == ":";
     if !method {
         return None;
+    }
+    if index >= 2 && !matches!(children[index - 2].kind(), "identifier" | ":" | "::") {
+        // Call results, groups, literals, tuple fields, and postfix operands
+        // are still receivers. Keep their source expression instead of letting
+        // an unknown result type turn `.method()` into a bare call.
+        let mut start = index - 2;
+        while start > 0
+            && (children[start - 1].is_named()
+                || matches!(children[start - 1].kind(), "." | ":" | "::" | "!" | "?"))
+        {
+            start -= 1;
+        }
+        return std::str::from_utf8(
+            &source_bytes[children[start].start_byte()..children[index - 1].start_byte()],
+        )
+        .ok()
+        .map(|text| text.trim().to_string());
     }
     let mut cursor = index - 1;
     while cursor > 0 {
@@ -10210,6 +10229,75 @@ fn main() {
 mod macro_call_tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn macro_literal_and_tuple_field_methods_keep_receiver_evidence() {
+        let source = r#"fn witness() {
+    assert!(error.1.contains("real committed admin mutation failure"));
+    assert!("message".contains("mess"));
+    assert!(123.to_string().contains("12"));
+    assert!(1.5.is_finite());
+    assert!('x'.is_ascii());
+    assert!(make_items()?.len() > 0);
+}"#;
+        let parsed = parse_source(Path::new("src/witness.rs"), source).unwrap();
+        for (name, line, receiver) in [
+            ("contains", 2, "error.1"),
+            ("contains", 3, "\"message\""),
+            ("to_string", 4, "123"),
+            ("contains", 4, "123.to_string()"),
+            ("is_finite", 5, "1.5"),
+            ("is_ascii", 6, "'x'"),
+            ("len", 7, "make_items()?"),
+        ] {
+            let call = parsed
+                .references
+                .iter()
+                .find(|reference| {
+                    reference.kind == ReferenceKind::Call
+                        && reference.name == name
+                        && reference.start_line == line
+                })
+                .expect("actual macro call must be captured");
+            assert_eq!(call.receiver.as_deref(), Some(receiver), "{call:#?}");
+        }
+    }
+
+    #[test]
+    fn macro_call_result_and_grouped_methods_keep_receiver_evidence() {
+        let source = r#"fn witness() {
+    assert!(helper());
+    assert!(worker.run());
+    assert!(make_items().unwrap().len());
+    assert!((items).len());
+    assert!(format!("{error}").contains("message"));
+}"#;
+        let parsed = parse_source(Path::new("src/witness.rs"), source).unwrap();
+        for (name, line, receiver) in [
+            ("helper", 2, None),
+            ("run", 3, Some("worker")),
+            ("len", 4, Some("make_items().unwrap()")),
+            ("len", 5, Some("(items)")),
+            ("contains", 6, Some("format!(\"{error}\")")),
+        ] {
+            let call = parsed
+                .references
+                .iter()
+                .find(|reference| {
+                    reference.kind == ReferenceKind::Call
+                        && reference.name == name
+                        && reference.start_line == line
+                })
+                .expect("actual macro call must be captured");
+            assert_eq!(call.receiver.as_deref(), receiver, "{call:#?}");
+        }
+        assert!(
+            parsed.references.iter().any(|reference| {
+                reference.name == "format" && reference.kind == ReferenceKind::Macro
+            }),
+            "nested format invocation must remain a macro"
+        );
+    }
 
     /// nw-151: assertions are the dominant call site in Rust test suites, and
     /// tree-sitter parses macro arguments as an opaque token_tree, so calls
