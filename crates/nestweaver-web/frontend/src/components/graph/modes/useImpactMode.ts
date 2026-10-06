@@ -132,7 +132,7 @@ export function useImpactMode() {
       if (!isCurrentRequest()) return;
 
       setGraphData(graph);
-      setActiveLens({
+      if (!existingScene) setActiveLens({
         lens: "impact",
         label: `Impact: ${result.target?.name ?? targetNodeId}`,
         targetUid: targetNodeId,

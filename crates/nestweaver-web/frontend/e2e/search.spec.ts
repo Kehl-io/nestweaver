@@ -509,3 +509,67 @@ for (const mode of ["local", "impact"] as const) {
     }
   });
 }
+
+test("committed Impact refresh publishes graph data while preserving the Related lens", async ({ page, request }) => {
+  const response = await request.get("/api/v1/search?q=releaseA&limit=8");
+  expect(response.ok()).toBe(true);
+  const rows = await response.json() as { uid: string; name: string; kind: string }[];
+  const anchor = rows.find((row) => row.name === "releaseA");
+  expect(anchor, "real fixture has the Impact target").toBeDefined();
+  let committed = false;
+  let deliveredRefreshes = 0;
+  const refreshedName = "releaseA committed Impact publication";
+  await page.route("**/api/v1/impact/**", async (route) => {
+    const actual = await route.fetch();
+    expect(actual.ok()).toBe(true);
+    const body = await actual.json() as { target: { uid: string; name: string }; nodes: { uid: string; name: string }[] };
+    expect(body.target.uid).toBe(anchor!.uid);
+    if (committed) {
+      // Keep the real backend topology; the marker proves the refreshed reply was published.
+      body.target.name = refreshedName;
+      body.nodes = body.nodes.map((node) => node.uid === anchor!.uid ? { ...node, name: refreshedName } : node);
+      await route.fulfill({ response: actual, json: body });
+      deliveredRefreshes += 1;
+    } else {
+      await route.fulfill({ response: actual });
+    }
+  });
+  const events = { pending: "" };
+  await page.route("**/api/v1/events", (route) => {
+    const body = `retry: 200\n${events.pending}\n`;
+    events.pending = "";
+    return route.fulfill({ status: 200, contentType: "text/event-stream", body });
+  });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto(`/?mode=impact&node=${encodeURIComponent(anchor!.uid)}&kind=${anchor!.kind}&representation=json&depth=2&confidence=0.5`);
+  const json = page.getByRole("region", { name: "JSON result", exact: true }).locator("code");
+  await expect(json).toBeVisible({ timeout: 15_000 });
+  const read = async () => JSON.parse((await json.textContent()) ?? "{}");
+  await expect.poll(async () => {
+    const scene = await read();
+    return scene.active_lens.lens === "impact" && scene.active_lens.targetUid === anchor!.uid &&
+      scene.graph.nodes.some((node: { uid: string }) => node.uid === anchor!.uid);
+  }, { timeout: 15_000 }).toBe(true);
+  const impact = await read();
+  await page.getByTestId("detail-panel").getByRole("group", { name: "Node actions", exact: true }).first().getByRole("button", { name: "Related", exact: true }).click();
+  await expect.poll(async () => (await read()).active_lens.label).toMatch(/^Related to /);
+  const related = await read();
+  expect(related.active_lens.lens).toBe("search");
+  expect(related.selected_node.uid).toBe(anchor!.uid);
+  expect(related.graph.nodes.map((node: { uid: string }) => node.uid).sort()).toEqual(impact.graph.nodes.map((node: { uid: string }) => node.uid).sort());
+  expect(related.graph.edges).toEqual(impact.graph.edges);
+  expect(new URL(page.url()).searchParams.get("mode")).toBe("impact");
+
+  committed = true;
+  events.pending = "event: graph:updated\ndata: {}\n\n";
+  await expect.poll(() => deliveredRefreshes).toBeGreaterThan(0);
+  await expect.poll(async () => (await read()).graph.nodes.some((node: { uid: string; label: string }) =>
+    node.uid === anchor!.uid && node.label === refreshedName), { timeout: 15_000 }).toBe(true);
+  const after = await read();
+  expect(after.active_lens).toEqual(related.active_lens);
+  expect(after.selected_node).toEqual(related.selected_node);
+  expect(after.representation).toBe(related.representation);
+  expect(after.graph.nodes.map((node: { uid: string }) => node.uid).sort()).toEqual(related.graph.nodes.map((node: { uid: string }) => node.uid).sort());
+  expect(after.graph.edges).toEqual(related.graph.edges);
+  expect(new URL(page.url()).searchParams.get("mode")).toBe("impact");
+});
