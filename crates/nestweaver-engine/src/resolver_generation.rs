@@ -261,6 +261,8 @@ use std::path::Path;
 ///     the wrong edges until re-indexed.
 /// 9 — actual binding-user imports replace first-symbol proxies and module
 ///     fanout; src-layout Python imports and Swift static receivers resolve.
+///     Composed receivers no longer inherit the first segment's type, removing
+///     false method edges such as a lock-result `len()` calling its enclosing `len`.
 ///     Re-index existing repositories with `nestweaver index --repo <path> --force`.
 pub const RESOLVER_GENERATION: u32 = 9;
 

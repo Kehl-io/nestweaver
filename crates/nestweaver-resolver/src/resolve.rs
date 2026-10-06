@@ -355,14 +355,9 @@ fn resolve_single_reference(
     {
         let receiver_type = if receiver == "self" || receiver == "this" || receiver == "$this" {
             env.lookup_self(reference.start_line)
-        } else if receiver.contains('.') {
-            let first = receiver.split('.').next().unwrap_or(receiver);
-            if first == "self" || first == "this" || first == "$this" {
-                env.lookup_self(reference.start_line)
-            } else {
-                env.lookup(first, reference.start_line)
-            }
         } else {
+            // A member or call chain has its own result type. The first
+            // segment's binding cannot establish the complete receiver's type.
             env.lookup(receiver, reference.start_line)
         };
 
@@ -3729,6 +3724,98 @@ mod user_pain_reference_tests {
     use super::*;
     use nestweaver_parser::parse_source;
     use std::path::Path;
+
+    #[test]
+    fn parsed_multiline_lock_chain_does_not_call_its_enclosing_len() {
+        let path = "src/regex_index.rs";
+        let source = r#"struct RegexReaderPool { shards: Mutex<Vec<Reader>> }
+static POOL: RegexReaderPool = todo!();
+impl RegexReaderPool {
+    fn len(&self) -> usize {
+        self.shards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+    fn direct(&self) -> usize {
+        self.len()
+    }
+}
+fn known() -> usize {
+    POOL.len()
+}
+"#;
+        let parsed = parse_source(Path::new(path), source).unwrap();
+        let env = crate::types::TypeEnvironment::build(
+            source,
+            Language::Rust,
+            &parsed.symbols,
+            &parsed.type_bindings,
+        );
+        let files = vec![(path.to_string(), parsed.symbols, parsed.references)];
+        let chain = files[0]
+            .2
+            .iter()
+            .find(|reference| {
+                reference.kind == ReferenceKind::Call
+                    && reference.name == "len"
+                    && reference
+                        .receiver
+                        .as_deref()
+                        .is_some_and(|receiver| receiver.contains("lock()"))
+            })
+            .expect("parser must capture the actual multiline chain");
+        assert!(
+            chain.receiver.as_deref().is_some_and(|receiver| {
+                receiver.contains("lock()") && receiver.contains("unwrap_or_else")
+            }),
+            "{chain:?}"
+        );
+        let known = files[0]
+            .2
+            .iter()
+            .find(|reference| {
+                reference.kind == ReferenceKind::Call
+                    && reference.name == "len"
+                    && reference.receiver.as_deref() == Some("POOL")
+            })
+            .expect("parser must capture the typed direct receiver");
+        assert_eq!(
+            env.lookup("POOL", known.start_line)
+                .map(|binding| binding.type_name.as_str()),
+            Some("RegexReaderPool"),
+            "the positive witness needs an actual receiver type binding"
+        );
+        let envs = std::collections::HashMap::from([(path.to_string(), env)]);
+        let edges = resolve_references_with_context(
+            &files,
+            Language::Rust,
+            "repo:test:abc",
+            &WorkspaceContext::default(),
+            Some(&envs),
+            None,
+        );
+        let len = uid(&files, path, "len");
+        assert!(
+            !edges.iter().any(|edge| {
+                edge.edge_type == EdgeType::Calls
+                    && edge.source_uid == len
+                    && edge.target_uid == len
+            }),
+            "lock result must not inherit the enclosing self type: {edges:#?}"
+        );
+        for caller in ["direct", "known"] {
+            assert!(
+                edges.iter().any(|edge| {
+                    edge.edge_type == EdgeType::Calls
+                        && edge.source_uid == uid(&files, path, caller)
+                        && edge.target_uid == len
+                        && edge.evidence.iter().any(|e| e.kind == "type_aware")
+                }),
+                "known direct receiver {caller} must still resolve: {edges:#?}"
+            );
+        }
+    }
 
     fn parsed_files(inputs: &[(&str, &str)]) -> Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> {
         inputs
