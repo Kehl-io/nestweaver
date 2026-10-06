@@ -98,15 +98,19 @@ Opt-in usage tracking that learns from agent query patterns to improve PPR ranki
 # From a source checkout (requires Rust 1.85+)
 cargo install --locked --path .
 
-# Index a repository (auto-detects repo root from .git)
-nestweaver index
+# Index a repository into an explicit database
+nestweaver index --repo ./my-project --db ./nestweaver.lbug
 
-# Get task-focused context for a symbol
-nestweaver context processPayment
+# Search and get task-focused context using the same database
+nestweaver search "main" --db ./nestweaver.lbug
+nestweaver context processPayment --db ./nestweaver.lbug
 
 # Live re-indexing as you code
-nestweaver watch
+nestweaver watch ./my-project --db ./nestweaver.lbug
 ```
+
+Index prints its selected database target on success. When querying from another
+directory, pass the same absolute database path with `--db`.
 
 ```sh
 # Configure for your AI tool (16 supported: Claude Code, Cursor, Codex, Gemini CLI, and more)

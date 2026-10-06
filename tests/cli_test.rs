@@ -15320,3 +15320,730 @@ fn cross_repo_refs_repo_filter_keeps_its_failure_class() {
         owned(&["cross-repo-refs", "shared_fn", "--json", "--repo", repo])
     });
 }
+
+// nw-735: ordinary CLI invocations must reject invalid targets before autostart.
+// The private persisted config also prevents a pre-fix embed RPC from downloading.
+struct ExistingDbCliFixture {
+    dir: Option<tempfile::TempDir>,
+    db: std::path::PathBuf,
+    config: std::path::PathBuf,
+}
+
+impl ExistingDbCliFixture {
+    fn new() -> Self {
+        let dir = tempfile::Builder::new()
+            .prefix("nw-cli-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        for name in [
+            "home", "config", "cache", "data", "state", "run", "sock", "cwd",
+        ] {
+            std::fs::create_dir(root.join(name)).unwrap();
+        }
+        let db = root.join("target.lbug");
+        let config = root.join("instance.toml");
+        std::fs::write(&config, format!(
+            "instance_id = \"cli-existing\"\ndb = \"{}\"\nrepos = []\n[snapshot_storage]\nbackend = \"local\"\npath = \"{}\"\n[workspace]\nbackend = \"local\"\npath = \"{}\"\n[inference]\nendpoint = \"http://127.0.0.1:1\"\nembedding_model = \"unused\"\nsummary_model = \"unused\"\n[embedding]\ncache_dir = \"{}\"\nauto_repair_cache = false\nexternal_endpoint = \"http://127.0.0.1:1\"\nexternal_model = \"unused\"\n[limits]\ndefault_result_limit = 1\n[git]\ncredential_method = \"gh\"\n",
+            toml_basic_string(&db), toml_basic_string(&root.join("snapshots")),
+            toml_basic_string(&root.join("workspace")), toml_basic_string(&root.join("cache"))
+        )).unwrap();
+        nestweaver_engine::config::InstanceConfig::from_file(&config).unwrap();
+        Self {
+            dir: Some(dir),
+            db,
+            config,
+        }
+    }
+
+    fn command(&self) -> Command {
+        let root = self.db.parent().unwrap();
+        let mut cmd = Command::cargo_bin("nestweaver").unwrap();
+        for (name, _) in std::env::vars_os() {
+            let key = name.to_string_lossy();
+            if key.starts_with("NESTWEAVER_")
+                || key.starts_with("GIT_")
+                || key.starts_with("GITHUB_")
+                || key.starts_with("RUNNER_")
+                || key == "CI"
+            {
+                cmd.env_remove(name);
+            }
+        }
+        for (key, folder) in [
+            ("HOME", "home"),
+            ("XDG_CONFIG_HOME", "config"),
+            ("XDG_CACHE_HOME", "cache"),
+            ("XDG_DATA_HOME", "data"),
+            ("XDG_STATE_HOME", "state"),
+            ("XDG_RUNTIME_DIR", "run"),
+            ("NESTWEAVER_SOCK_FALLBACK_DIR", "sock"),
+        ] {
+            cmd.env(key, root.join(folder));
+        }
+        cmd.current_dir(root.join("cwd"))
+            .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
+            .env("NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS", "2")
+            .timeout(std::time::Duration::from_secs(8));
+        cmd
+    }
+
+    fn persist_private_config(&self) {
+        // Construct the real durable record without changing this parallel test
+        // process's global environment or touching the developer's state root.
+        let record =
+            nestweaver_daemon::lifecycle::LastSuccessfulConfig::new(&self.db, &self.config)
+                .unwrap();
+        let parent = self
+            .db
+            .parent()
+            .unwrap()
+            .join("state/nestweaver/config-intent")
+            .join(&record.database_fingerprint);
+        std::fs::create_dir_all(&parent).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = parent.join("last-successful-config.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    fn tree(&self) -> std::collections::BTreeMap<std::path::PathBuf, (String, Vec<u8>)> {
+        fn walk(
+            root: &std::path::Path,
+            path: &std::path::Path,
+            result: &mut std::collections::BTreeMap<std::path::PathBuf, (String, Vec<u8>)>,
+        ) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                let kind = std::fs::symlink_metadata(&path).unwrap().file_type();
+                let directory = kind.is_dir();
+                result.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    if directory {
+                        ("directory".into(), vec![])
+                    } else if kind.is_file() {
+                        ("file".into(), std::fs::read(&path).unwrap())
+                    } else if kind.is_symlink() {
+                        (
+                            "symlink".into(),
+                            std::fs::read_link(&path)
+                                .unwrap()
+                                .to_string_lossy()
+                                .as_bytes()
+                                .to_vec(),
+                        )
+                    } else {
+                        ("special".into(), vec![])
+                    },
+                );
+                if directory {
+                    walk(root, &path, result);
+                }
+            }
+        }
+        let root = self.db.parent().unwrap();
+        let mut result = std::collections::BTreeMap::new();
+        walk(root, root, &mut result);
+        result
+    }
+}
+
+impl Drop for ExistingDbCliFixture {
+    fn drop(&mut self) {
+        // Only reap a process whose command proves ownership of this unique
+        // fixture. Never trust an arbitrary PID file or shared daemon instance.
+        let Ok(output) = StdCommand::new("ps")
+            .args(["-axo", "pid=,command="])
+            .output()
+        else {
+            if let Some(dir) = self.dir.take() {
+                eprintln!(
+                    "preserved uninspected daemon fixture: {}",
+                    dir.keep().display()
+                );
+            }
+            return;
+        };
+        let root = self.db.parent().unwrap().to_string_lossy();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let line = line.trim();
+            let Some((pid, command)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            if pid.parse::<u32>().is_ok()
+                && command.contains(root.as_ref())
+                && command.contains("nestweaver")
+                && command.contains("daemon")
+                && command.split_whitespace().any(|word| word == "run")
+            {
+                let _ = StdCommand::new("kill").args(["-TERM", pid]).status();
+            }
+        }
+        // Wait for a graceful owned shutdown before removing its graph.
+        // Preserve evidence rather than unlink files from a still-live daemon.
+        for _ in 0..20 {
+            let output = StdCommand::new("ps").args(["-axo", "command="]).output();
+            let alive = output.as_ref().map_or(true, |out| {
+                String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+                    line.contains(root.as_ref())
+                        && line.contains("nestweaver")
+                        && line.contains("daemon")
+                        && line.split_whitespace().any(|word| word == "run")
+                })
+            });
+            if !alive {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if let Some(dir) = self.dir.take() {
+            eprintln!("preserved owned daemon fixture: {}", dir.keep().display());
+        }
+    }
+}
+
+#[test]
+fn cli_existing_db_routes_refuse_invalid_targets_without_artifacts() {
+    let mut failures = Vec::new();
+    for shape in ["absent", "directory", "text", "empty"] {
+        for args in [
+            vec!["embed"],
+            vec!["brain", "reindex-search"],
+            vec!["watch-stop"],
+            vec!["mcp"],
+            vec!["interactions", "forget", "note:missing"],
+            vec!["publication", "status", "--json"],
+            vec!["repair", "--dry-run"],
+            vec!["extensions", "list", "--json"],
+        ] {
+            let fixture = ExistingDbCliFixture::new();
+            match shape {
+                "directory" => std::fs::create_dir(&fixture.db).unwrap(),
+                "text" => std::fs::write(&fixture.db, b"important user notes\n").unwrap(),
+                "empty" => std::fs::write(&fixture.db, b"").unwrap(),
+                _ => {}
+            }
+            fixture.persist_private_config();
+            let before = fixture.tree();
+            let mut command = fixture.command();
+            command.args(&args).arg("--db").arg(&fixture.db);
+            if args[0] == "mcp" {
+                command.write_stdin("{\"jsonrpc\":\"2.0\",\"id\":\"cli-invalid-target\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\"}}\n");
+            }
+            let output = command.output();
+            let after = fixture.tree();
+            if before != after {
+                failures.push(format!(
+                    "{shape} {args:?}: fixture tree/bytes changed; before={:?}, after={:?}",
+                    before.keys().collect::<Vec<_>>(),
+                    after.keys().collect::<Vec<_>>()
+                ));
+            }
+            match output {
+                Err(error) => failures.push(format!(
+                    "{shape} {args:?}: bounded invocation failed: {error}"
+                )),
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if output.status.code() != Some(1)
+                        || !stderr.contains(&fixture.db.display().to_string())
+                    {
+                        failures.push(format!("{shape} {args:?}: expected exit 1 and target cause; exit={:?}, stderr={stderr}", output.status.code()));
+                    }
+                    if args[0] == "mcp" {
+                        let frame = String::from_utf8_lossy(&output.stdout)
+                            .lines()
+                            .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok());
+                        if !frame.as_ref().is_some_and(|frame| {
+                            frame["jsonrpc"] == "2.0"
+                                && frame["id"] == "cli-invalid-target"
+                                && frame["error"].is_object()
+                        }) {
+                            failures.push(format!(
+                                "{shape} MCP: missing correlated JSON-RPC boot error: {:?}",
+                                output.stdout
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn cli_operator_siblings_honor_pinned_config_and_db_precedence() {
+    let fixture = ExistingDbCliFixture::new();
+    let root = fixture.db.parent().unwrap();
+    let repo = root.join("configured-repo");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(
+        repo.join("main.js"),
+        "export function configuredNeedle() {}\n",
+    )
+    .unwrap();
+    for args in [
+        vec!["init"],
+        vec!["config", "user.email", "fixture@example.test"],
+        vec!["config", "user.name", "Fixture"],
+        vec!["add", "main.js"],
+        vec!["commit", "-m", "Initial fixture"],
+    ] {
+        let mut git = StdCommand::new("git");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                git.env_remove(key);
+            }
+        }
+        let output = git
+            .args(&args)
+            .current_dir(&repo)
+            .env("HOME", root.join("home"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fixture
+        .command()
+        .timeout(std::time::Duration::from_secs(30))
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--config")
+        .arg(&fixture.config)
+        .assert()
+        .success();
+    let env_db = root.join("environment.lbug");
+    let explicit_db = root.join("explicit.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&env_db).unwrap());
+    let explicit = nestweaver_store::GraphStore::open_or_create(&explicit_db).unwrap();
+    for i in 0..2 {
+        explicit
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: format!("repo:cli:explicit-{i}"),
+                url: format!("file://{}/missing-explicit-{i}", root.display()),
+                indexed_sha: "old".into(),
+                staleness_commits_behind: 0,
+                instance_id: "cli-existing".into(),
+                name: Some(format!("explicit-{i}")),
+                root_path: Some(
+                    root.join(format!("missing-explicit-{i}"))
+                        .display()
+                        .to_string(),
+                ),
+            })
+            .unwrap();
+    }
+    drop(explicit);
+    // Both stale-check spellings must use config.db before the environment,
+    // and explicit --db before config.db. Repo counts distinguish all targets.
+    for args in [
+        vec!["stale-check", "--json"],
+        vec!["brain", "stale-check", "--json"],
+    ] {
+        let output = fixture
+            .command()
+            .args(&args)
+            .arg("--config")
+            .arg(&fixture.config)
+            .env("NESTWEAVER_DB", &env_db)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["repo_count"], 1, "{json}");
+        let output = fixture
+            .command()
+            .args(&args)
+            .arg("--config")
+            .arg(&fixture.config)
+            .arg("--db")
+            .arg(&explicit_db)
+            .env("NESTWEAVER_DB", &env_db)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["repo_count"], 2, "{json}");
+    }
+    for args in [
+        vec!["dead-code", "--json", "--repo", "configured-repo"],
+        vec!["contracts", "drift", "--json", "--repo", "configured-repo"],
+    ] {
+        let output = fixture
+            .command()
+            .args(&args)
+            .arg("--config")
+            .arg(&fixture.config)
+            .env("NESTWEAVER_DB", &env_db)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            json["limit"], 1,
+            "the pinned config must reach the operator RPC: {json}"
+        );
+        let output = fixture
+            .command()
+            .args(&args)
+            .arg("--config")
+            .arg(&fixture.config)
+            .arg("--db")
+            .arg(&explicit_db)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fixture
+        .command()
+        .args(["watch-stop", "--config"])
+        .arg(&fixture.config)
+        .assert()
+        .success();
+    fixture
+        .command()
+        .args(["interactions", "forget", "note:absent", "--config"])
+        .arg(&fixture.config)
+        .assert()
+        .code(2);
+    for args in [
+        vec!["stale-check", "--json"],
+        vec!["brain", "stale-check", "--json"],
+        vec!["dead-code", "--json"],
+        vec!["contracts", "drift", "--json"],
+    ] {
+        let bad = root.join("malformed.toml");
+        std::fs::write(&bad, "not = [valid").unwrap();
+        fixture
+            .command()
+            .args(&args)
+            .arg("--config")
+            .arg(&bad)
+            .assert()
+            .code(1)
+            .stderr(contains(bad.display().to_string()));
+        let wrong = root.join("foreign.toml");
+        let config = std::fs::read_to_string(&fixture.config).unwrap();
+        std::fs::write(
+            &wrong,
+            format!("expected_brain_uuid = \"00000000-0000-4000-8000-000000000001\"\n{config}"),
+        )
+        .unwrap();
+        fixture
+            .command()
+            .args(&args)
+            .arg("--config")
+            .arg(&wrong)
+            .assert()
+            .code(1)
+            .stderr(contains("identity"));
+    }
+}
+
+#[test]
+fn cli_index_reports_selected_target_and_searches_from_unrelated_cwd() {
+    let fixture = ExistingDbCliFixture::new();
+    let repo = fixture.db.parent().unwrap().join("quickstart-repo");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(
+        repo.join("main.js"),
+        "export function quickstartNeedle() {}\n",
+    )
+    .unwrap();
+    fixture.persist_private_config();
+    let output = fixture
+        .command()
+        .timeout(std::time::Duration::from_secs(30))
+        .args(["index", "--repo"])
+        .arg(&repo)
+        .arg("--db")
+        .arg(&fixture.db)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains(&fixture.db.display().to_string()),
+        "successful index must name its database target: {text}"
+    );
+    for cwd in [&repo, &fixture.db.parent().unwrap().join("cwd")] {
+        fixture
+            .command()
+            .current_dir(cwd)
+            .args(["search", "quickstartNeedle", "--json", "--db"])
+            .arg(&fixture.db)
+            .assert()
+            .success()
+            .stdout(contains("quickstartNeedle"));
+    }
+}
+
+#[test]
+fn cli_publication_status_explicit_root_remains_journal_only() {
+    let fixture = ExistingDbCliFixture::new();
+    let journal = fixture.db.parent().unwrap().join("journal");
+    std::fs::create_dir(&journal).unwrap();
+    fixture
+        .command()
+        .args(["publication", "status", "--json", "--root"])
+        .arg(&journal)
+        .assert()
+        .success();
+    assert!(!fixture.db.exists());
+}
+
+fn cli_sealed_selection_fixture(
+    base: &std::path::Path,
+    identity: &nestweaver_store::PublicationIdentity,
+    name: &str,
+) -> std::path::PathBuf {
+    use nestweaver_engine::publication::*;
+    let root = default_publication_root(base);
+    let slot = slot_path(&root, &identity.publication_uuid).unwrap();
+    std::fs::create_dir_all(&slot).unwrap();
+    let graph = slot.join(PUBLICATION_GRAPH_FILE);
+    let store =
+        nestweaver_store::GraphStore::create_with_publication_identity(&graph, identity).unwrap();
+    let uid = format!("repo:cli:{name}");
+    store
+        .insert_repo(&nestweaver_schema::Repo {
+            uid: uid.clone(),
+            url: format!("file://{}/missing-{name}", base.parent().unwrap().display()),
+            indexed_sha: "old".into(),
+            staleness_commits_behind: 0,
+            instance_id: "cli-existing".into(),
+            name: Some(name.into()),
+            root_path: Some(
+                base.parent()
+                    .unwrap()
+                    .join(format!("missing-{name}"))
+                    .display()
+                    .to_string(),
+            ),
+        })
+        .unwrap();
+    let generation = store.graph_generation();
+    drop(store);
+    nestweaver_engine::resolver_generation::record_strict(&graph, &uid).unwrap();
+    let engine = format!(
+        "{PUBLICATION_GRAPH_FILE}{}",
+        nestweaver_store::engine_format::ENGINE_FORMAT_SIDECAR_SUFFIX
+    );
+    let artifacts = [
+        (
+            PUBLICATION_GRAPH_FILE.to_string(),
+            ArtifactKind::Graph,
+            "ladybugdb-graph-v1",
+        ),
+        (
+            engine,
+            ArtifactKind::CompatibilityStamp,
+            "nestweaver-engine-format-v1",
+        ),
+    ]
+    .into_iter()
+    .map(|(path, kind, fingerprint)| {
+        let bytes = std::fs::read(slot.join(&path)).unwrap();
+        ArtifactDescriptor {
+            path,
+            kind,
+            artifact_schema_version: 1,
+            byte_size: bytes.len() as u64,
+            blake3: nestweaver_engine::hash::blake3_hex_bytes(&bytes),
+            brain_uuid: identity.brain_uuid.clone(),
+            publication_uuid: identity.publication_uuid.clone(),
+            producer_version: env!("CARGO_PKG_VERSION").into(),
+            source_graph_generation: generation,
+            algorithm_fingerprint: fingerprint.into(),
+        }
+    })
+    .collect();
+    let bundle = PublicationBundleV3 {
+        format_version: nestweaver_engine::snapshot::SNAPSHOT_FORMAT_VERSION,
+        brain_uuid: identity.brain_uuid.clone(),
+        publication_uuid: identity.publication_uuid.clone(),
+        producer_version: env!("CARGO_PKG_VERSION").into(),
+        source_graph_generation: generation,
+        artifacts,
+    };
+    let bytes = serde_json::to_vec_pretty(&bundle).unwrap();
+    std::fs::write(slot.join(PUBLICATION_MANIFEST_FILE), &bytes).unwrap();
+    let pointer = CurrentPublicationPointer::new(
+        identity,
+        None,
+        nestweaver_engine::hash::blake3_hex_bytes(&bytes),
+    )
+    .unwrap();
+    std::fs::write(
+        current_pointer_path(&root),
+        serde_json::to_vec_pretty(&pointer).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(resolve_selected_database(base).unwrap(), graph);
+    graph
+}
+
+#[test]
+fn cli_operator_config_follows_current_on_each_invocation() {
+    let fixture = ExistingDbCliFixture::new();
+    let base = nestweaver_store::GraphStore::open_or_create(&fixture.db).unwrap();
+    let identity = base.publication_identity().unwrap().unwrap();
+    drop(base);
+    let next = identity.next_publication().unwrap();
+    for (identity, name) in [(&identity, "first-slot"), (&next, "second-slot")] {
+        cli_sealed_selection_fixture(&fixture.db, identity, name);
+        for args in [
+            vec!["stale-check", "--json"],
+            vec!["brain", "stale-check", "--json"],
+        ] {
+            let output = fixture
+                .command()
+                .args(&args)
+                .arg("--config")
+                .arg(&fixture.config)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(json["repo_count"], 1);
+            assert!(
+                json.to_string().contains(name),
+                "must follow the new CURRENT: {json}"
+            );
+        }
+        for args in [
+            vec!["dead-code", "--json", "--repo", name],
+            vec!["contracts", "drift", "--json", "--repo", name],
+        ] {
+            fixture
+                .command()
+                .args(args)
+                .arg("--config")
+                .arg(&fixture.config)
+                .assert()
+                .success();
+        }
+        // Status administration derives the logical root, rather than appending
+        // .publications to the selected graph. This route intentionally has no --config.
+        let output = fixture
+            .command()
+            .args(["publication", "status"])
+            .env("NESTWEAVER_DB", &fixture.db)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains(
+                &nestweaver_engine::publication::default_publication_root(&fixture.db)
+                    .display()
+                    .to_string()
+            ),
+            "{text}"
+        );
+        if name == "second-slot" {
+            let repo = fixture.db.parent().unwrap().join("selected-index-repo");
+            std::fs::create_dir(&repo).unwrap();
+            std::fs::write(
+                repo.join("main.js"),
+                "export function selectedIndexNeedle() {}\n",
+            )
+            .unwrap();
+            let output = fixture
+                .command()
+                .args(["index", "--repo"])
+                .arg(&repo)
+                .arg("--config")
+                .arg(&fixture.config)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                text.contains(&format!("Indexed database: {}", fixture.db.display())),
+                "stable target: {text}"
+            );
+            let selected =
+                nestweaver_engine::publication::resolve_selected_database(&fixture.db).unwrap();
+            assert!(
+                text.contains(&format!("Selected graph: {}", selected.display())),
+                "actual slot: {text}"
+            );
+            fixture
+                .command()
+                .args(["search", "selectedIndexNeedle", "--json", "--db"])
+                .arg(&fixture.db)
+                .assert()
+                .success()
+                .stdout(contains("selectedIndexNeedle"));
+        }
+        // Stop the owned daemon before constructing the next publication fixture.
+        fixture
+            .command()
+            .args(["daemon", "--db"])
+            .arg(&fixture.db)
+            .arg("stop")
+            .assert()
+            .success();
+    }
+}

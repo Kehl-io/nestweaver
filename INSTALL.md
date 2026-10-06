@@ -257,9 +257,12 @@ nestweaver setup
 ## Index and verify
 
 ```sh
-nestweaver index --repo .
-nestweaver search "main"
+nestweaver index --repo . --db ./nestweaver.lbug
+nestweaver search "main" --db ./nestweaver.lbug
 ```
+
+Index prints its selected database target on success. From another directory,
+use that same absolute path with `--db` for search and MCP.
 
 ## Start the MCP server
 

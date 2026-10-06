@@ -1924,11 +1924,11 @@ const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
                   to AI agents through query commands. Index a repo, then search symbols,\n\
                   trace dependencies, and generate context-window-sized summaries.\n\n\
                   Quick start:\n  \
-                  nestweaver index --repo ./my-project\n  \
-                  nestweaver context processPayment CheckoutService\n  \
-                  nestweaver search \"UserService\"\n  \
-                  nestweaver symbol \"processPayment\"\n  \
-                  nestweaver repo-map --token-budget 2000",
+                  nestweaver index --repo ./my-project --db ./nestweaver.lbug\n  \
+                  nestweaver context processPayment CheckoutService --db ./nestweaver.lbug\n  \
+                  nestweaver search \"UserService\" --db ./nestweaver.lbug\n  \
+                  nestweaver symbol \"processPayment\" --db ./nestweaver.lbug\n  \
+                  nestweaver repo-map --token-budget 2000 --db ./nestweaver.lbug",
     // nw-399: the exit-code mapping lives HERE, in `nestweaver --help`, because
     // the audience for it is a script author and that is the one place they will
     // look without being told to. The item's defect was not only the zero-byte
@@ -6144,6 +6144,8 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
     /// Measure affected-tests selection quality against full-suite outcomes:
     /// record ground truth from CI, report rolling recall.
@@ -7731,6 +7733,8 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
 
     /// Assess blast radius for a set of changed files
@@ -8804,6 +8808,8 @@ enum BrainCommands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
     /// Watch a vault directory for changes and keep the brain in sync.
     /// Runs in the foreground; Ctrl-C stops it cleanly. On each .md save
@@ -9873,6 +9879,8 @@ enum ContractCommands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
     /// Diff two OpenAPI spec files (base vs head) at the endpoint AND
     /// request/response field/type level, classifying each change as
@@ -11515,6 +11523,74 @@ fn uninstall_pre_push_hook(cwd: &Path) -> anyhow::Result<i32> {
         );
     }
     Ok(EXIT_SUCCESS)
+}
+
+fn indexed_database_target_message(db: &Path) -> String {
+    let absolute = |path: &Path| {
+        path.canonicalize().unwrap_or_else(|_| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir().unwrap_or_default().join(path)
+            }
+        })
+    };
+    let selected = absolute(db);
+    let anchor = absolute(&nestweaver_engine::publication::instance_anchor_database(
+        db,
+    ));
+    if anchor == selected {
+        format!("Indexed database: {}", anchor.display())
+    } else {
+        format!(
+            "Indexed database: {}\nSelected graph: {}",
+            anchor.display(),
+            selected.display()
+        )
+    }
+}
+
+#[cfg(test)]
+mod index_target_disclosure_tests {
+    use super::*;
+
+    #[test]
+    fn index_target_disclosure_keeps_publication_only_logical_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("brain.lbug");
+        let graph = nestweaver_engine::publication::default_publication_root(&base)
+            .join("slots/00000000-0000-4000-8000-000000000001/graph.lbug");
+        std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
+        std::fs::write(&graph, b"").unwrap();
+        assert!(!base.exists());
+        let message = indexed_database_target_message(&graph);
+        assert!(
+            message.contains(&format!("Indexed database: {}", base.display())),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "Selected graph: {}",
+                graph.canonicalize().unwrap().display()
+            )),
+            "{message}"
+        );
+
+        let relative = Path::new(
+            "relative-brain.lbug.publications/slots/00000000-0000-4000-8000-000000000001/graph.lbug",
+        );
+        let message = indexed_database_target_message(relative);
+        assert!(
+            message.contains(&format!(
+                "Indexed database: {}",
+                std::env::current_dir()
+                    .unwrap()
+                    .join("relative-brain.lbug")
+                    .display()
+            )),
+            "{message}"
+        );
+    }
 }
 
 /// Resolve the DB path for repository-scoped commands (`index` and code
@@ -13976,13 +14052,12 @@ const LBUG_FILE_MAGIC: &[u8; 4] = b"LBUG";
 /// Deliberately a cheap header probe and NOT an open: an open is what costs,
 /// and this runs before every daemon-routed read.
 ///
-/// nw-385: this is a READ guard, and every one of its callers is a read —
-/// `open_store` (which only ever performs `open_read_only`) and
-/// `try_hybrid_json_rpc_checked` (the daemon-routed read funnel, which `index`
-/// deliberately does not route through). It used to exempt a zero-byte file
-/// "because the store initialises it", which is a statement about the CREATE
-/// path and was therefore an exemption for a caller that has never existed.
-/// See the `Ok(0)` arm for what that cost.
+/// nw-385: read routes must not initialise an empty file. nw-735 also applies
+/// this admission guard to commands that mutate an EXISTING database, before
+/// daemon autostart or writer authority can create artifacts. Documented create
+/// routes (`index`, `brain add`, restore) retain their own store admission.
+/// The old zero-byte exemption confused an existing-database operation with a
+/// create path; see the `Ok(0)` arm for what that cost.
 ///
 /// This does NOT claim to detect corruption. A `.lbug` whose header is intact
 /// and whose index region is not still passes here, by construction; see
@@ -15961,7 +16036,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // `--db` like its 36 siblings, rather than reading a sidecar beside
             // a database that does not exist and reporting "0 annotated
             // node(s)". A typo'd `--db` is not an empty store.
-            require_existing_db(&db_path)?;
+            require_openable_db(&db_path)?;
             // nw-257: `load_extensions` folds a corrupt or unreadable sidecar
             // into an empty map, which in THIS command would print
             // "0 annotated node(s)" and exit 0 — an audit reporting nothing
@@ -16319,7 +16394,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             force,
         } => {
             let db_path = selected_db_path(&db.unwrap_or_else(default_db_path))?;
-            require_existing_db(&db_path)?;
+            require_openable_db(&db_path)?;
             let code = run_repair_index_publication(&db_path, json, dry_run, force)?;
             Ok((code, None))
         }
@@ -19317,6 +19392,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // pinned config cannot delete out of a different instance's graph.
             InteractionCommands::Forget { uid, db, config } => {
                 let db_path = resolve_db_with_config(db, config.as_deref())?;
+                require_openable_db(&db_path)?;
                 // nw-462: same gate, same reasoning as `extensions unset`. Both
                 // delete verbs shipped in one commit calling the engine
                 // directly; both now route through the daemon.
@@ -19427,9 +19503,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Config { command } => run_config(command),
         Commands::Brain { command } => run_brain(*command, out, t0, use_daemon),
         Commands::RtsEval { command } => run_rts_eval(command),
-        Commands::StaleCheck { json, db } => {
-            run_brain(BrainCommands::StaleCheck { json, db }, out, t0, use_daemon)
-        }
+        Commands::StaleCheck { json, db, config } => run_brain(
+            BrainCommands::StaleCheck { json, db, config },
+            out,
+            t0,
+            use_daemon,
+        ),
         Commands::Memory { command } => run_memory(*command, t0, use_daemon),
         Commands::Ranking { command } => run_ranking(command, t0, use_daemon),
         Commands::Eval { command } => run_eval_cmd(command, use_daemon).map(|c| (c, None)),
@@ -19733,17 +19812,26 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             generation,
             page_token,
             db,
+            config,
         } => {
             use nestweaver_engine::dead_code::{
                 DeadCodePageRequest, dead_code_database_identity, dead_code_page_guard,
                 dead_code_page_malformed_token_refusal, is_well_formed_page_token,
                 serialize_dead_code_page,
             };
-            let db_path = db.clone().unwrap_or_else(default_db_path);
             if let Err((code, message)) = reject_oversized_repo_selectors(&repos) {
                 eprintln!("{message}");
                 return Ok((code, None));
             }
+            // Malformed continuation tokens keep their refusal before DB/config admission.
+            let malformed_token = page_token
+                .as_deref()
+                .is_some_and(|token| !is_well_formed_page_token(token));
+            let db_path = if malformed_token {
+                db.clone().unwrap_or_else(default_db_path)
+            } else {
+                resolve_db_with_config(db, config.as_deref())?
+            };
             let mut args =
                 serde_json::json!({ "min_confidence": min_confidence, "offset": offset });
             if let Some(n) = limit {
@@ -19774,12 +19862,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             } else if use_daemon {
                 // A reproducible page belongs to the selected database. Never
                 // substitute or merge an upstream population for this route.
-                require_existing_db(&db_path)?;
+                require_openable_db(&db_path)?;
                 let runtime = tokio::runtime::Runtime::new()?;
                 let answer = runtime.block_on(async {
                     let query = async {
                         let mut client =
-                            nestweaver_client::DaemonClient::connect(&db_path, None).await?;
+                            nestweaver_client::DaemonClient::connect(&db_path, config.as_deref())
+                                .await?;
                         let response = client
                             .inner_mut()
                             .dead_code(nestweaver_proto::JsonRequest {
@@ -19804,7 +19893,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     other => other?,
                 }
             } else {
-                let store = open_store(db.as_deref())?;
+                let store = open_store(Some(&db_path))?;
                 let all_repos = store.list_repos(None)?;
                 if let Some(refusal) =
                     nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(
@@ -19834,7 +19923,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let request = DeadCodePageRequest {
                     min_confidence: DeadCodeConfidence::from_str_loose(&min_confidence)
                         .ok_or_else(|| anyhow::anyhow!("invalid dead-code confidence"))?,
-                    limit: limit.unwrap_or(nestweaver_engine::config::DEFAULT_RESULT_LIMIT),
+                    limit: resolve_limit(
+                        limit,
+                        load_instance_config_opt(config.as_deref()).as_ref(),
+                        nestweaver_engine::config::DEFAULT_RESULT_LIMIT,
+                    ),
                     offset,
                     expected_generation: generation,
                     page_token: page_token.as_deref(),
@@ -20573,6 +20666,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // ignoring it is exactly what the config-DB inventory contract
             // exists to catch, and it caught this.
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            require_openable_db(&db_path)?;
             let rt = tokio::runtime::Runtime::new()?;
             let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
                 &db_path,
@@ -20950,6 +21044,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 lite,
                 !use_daemon_mcp,
             )?;
+            if let Err(error) = require_openable_db(&db_path) {
+                eprintln!("Error: {error:#}");
+                let _ = nestweaver_mcp::answer_stdio_boot_failure(format!("{error:#}"));
+                return Ok((EXIT_ERROR, None));
+            }
             if let Some(ref allowed) = tool_allowlist {
                 nestweaver_mcp::tools::set_allowed_tools(allowed.clone());
             }
@@ -23860,6 +23959,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     }
                 }
 
+                if !fail_on_skip || terminal.skipped_count == 0 {
+                    out.status(&indexed_database_target_message(&db_path));
+                }
                 // nw-023: setup is client-side (config files + marker, no DB access); give
                 // daemon-mode users the same gated first-index convenience as the direct path.
                 maybe_run_auto_setup(&db_path, &repo_path, out, setup);
@@ -24207,6 +24309,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 );
             }
 
+            if !fail_on_skip || skipped_files.is_empty() {
+                out.status(&indexed_database_target_message(&db_path));
+            }
             let stats = format!(
                 "{} files, {} symbols, {} edges in {}",
                 files_count,
@@ -27985,6 +28090,7 @@ mod cli_help_contract_tests {
             // a decision about.
             "nestweaver brain remove",
             "nestweaver brain search",
+            "nestweaver brain stale-check",
             "nestweaver brain status",
             "nestweaver brain tag-graph",
             "nestweaver brain topic-clusters",
@@ -27992,8 +28098,10 @@ mod cli_help_contract_tests {
             "nestweaver bridges",
             "nestweaver clusters",
             "nestweaver context",
+            "nestweaver contracts drift",
             "nestweaver count-patterns",
             "nestweaver cross-repo-contracts",
+            "nestweaver dead-code",
             "nestweaver detect-changes",
             // nw-229: added deliberately. It reads the extension sidecar
             // beside the database, so it resolves the pair through the same
@@ -28041,6 +28149,7 @@ mod cli_help_contract_tests {
             "nestweaver search",
             "nestweaver server backup save",
             "nestweaver snapshot build",
+            "nestweaver stale-check",
             "nestweaver suggest-links",
             // nw-414: `summary` joined this inventory. It took `--db` and no
             // `--config`, so it could not resolve an instance, could not take
@@ -30620,6 +30729,10 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
             db,
             json,
         } => {
+            if explicit_root.is_none() {
+                let selected = resolve_db_with_config(db.clone(), None)?;
+                require_openable_db(&selected)?;
+            }
             let root = root(explicit_root, db)?;
             if let Some(operation) = operation {
                 let state =
