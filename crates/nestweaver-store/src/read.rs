@@ -1889,6 +1889,126 @@ impl GraphStore {
         Ok(counts)
     }
 
+    /// Count note structure without hydrating section text.
+    pub fn note_structure_counts(&self, note_uid: &str) -> Result<(usize, usize), StoreError> {
+        let conn = self.conn()?;
+        let mut counts = Vec::new();
+        for (table, alias) in [("Heading", "h"), ("Section", "s")] {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "MATCH ({alias}:{table}) WHERE {alias}.note_uid = $nid RETURN count({alias})"
+                ))
+                .map_err(|e| StoreError::Query(e.to_string()))?;
+            let mut result = conn
+                .execute(&mut stmt, vec![("nid", Value::String(note_uid.to_owned()))])
+                .map_err(|e| StoreError::Query(e.to_string()))?;
+            counts.push(match result.next() {
+                Some(row) => usize::try_from(extract_i64(&row, 0)?).unwrap_or(0),
+                None => 0,
+            });
+        }
+        Ok((counts[0], counts[1]))
+    }
+    /// A bounded document-order outline; no section bodies are loaded.
+    pub fn headings_in_note_bounded(
+        &self,
+        note_uid: &str,
+        limit: usize,
+    ) -> Result<Vec<Heading>, StoreError> {
+        let conn = self.conn()?;
+        let cols = HEADING_COLUMNS
+            .replace("h.text", "substring(h.text,1,256)")
+            .replace("h.slug", "substring(h.slug,1,256)");
+        let mut stmt = conn.prepare(&format!("MATCH (h:Heading) WHERE h.note_uid = $nid RETURN {cols} ORDER BY h.start_line,h.uid LIMIT {limit}")).map_err(|e| StoreError::Query(e.to_string()))?;
+        let result = conn
+            .execute(&mut stmt, vec![("nid", Value::String(note_uid.to_owned()))])
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        result.map(|row| row_to_heading(&row)).collect()
+    }
+    /// Selection happens against complete heading text before the bounded
+    /// prefix is hydrated, so later or long headings remain addressable.
+    pub fn selected_headings_bounded(
+        &self,
+        note_uid: &str,
+        names: &[String],
+        limit: usize,
+    ) -> Result<Vec<Heading>, StoreError> {
+        let conn = self.conn()?;
+        let cols = HEADING_COLUMNS
+            .replace("h.text", "substring(h.text,1,256)")
+            .replace("h.slug", "substring(h.slug,1,256)");
+        let mut stmt = conn.prepare(&format!("MATCH (h:Heading) WHERE h.note_uid=$nid AND lower(h.text) IN $names RETURN {cols} ORDER BY h.start_line,h.uid LIMIT {limit}")).map_err(|e| StoreError::Query(e.to_string()))?;
+        let names = Value::List(
+            lbug::LogicalType::String,
+            names
+                .iter()
+                .map(|name| Value::String(name.to_lowercase()))
+                .collect(),
+        );
+        conn.execute(
+            &mut stmt,
+            vec![
+                ("nid", Value::String(note_uid.to_owned())),
+                ("names", names),
+            ],
+        )
+        .map_err(|e| StoreError::Query(e.to_string()))?
+        .map(|row| row_to_heading(&row))
+        .collect()
+    }
+
+    /// Fetch just one selected section with a bounded text prefix.
+    pub fn section_for_heading_bounded(
+        &self,
+        heading_uid: &str,
+        bytes: usize,
+    ) -> Result<Option<Section>, StoreError> {
+        let conn = self.conn()?;
+        let cols = SECTION_COLUMNS.replace(
+            "s.text_content",
+            &format!("substring(s.text_content,1,{bytes})"),
+        );
+        let mut stmt = conn.prepare(&format!("MATCH (s:Section) WHERE s.heading_uid = $hid RETURN {cols} ORDER BY s.start_line,s.uid LIMIT 1")).map_err(|e| StoreError::Query(e.to_string()))?;
+        let mut result = conn
+            .execute(
+                &mut stmt,
+                vec![("hid", Value::String(heading_uid.to_owned()))],
+            )
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        result.next().map(|row| row_to_section(&row)).transpose()
+    }
+    /// Strict lightweight lookup population. Ambiguity previews never hydrate
+    /// frontmatter/raw YAML for every matching note.
+    pub fn note_lookup_metadata(&self) -> Result<Vec<Note>, StoreError> {
+        self.note_lookup_metadata_matching(None)
+    }
+    pub fn note_lookup_metadata_by_title(&self, title: &str) -> Result<Vec<Note>, StoreError> {
+        self.note_lookup_metadata_matching(Some(title))
+    }
+    fn note_lookup_metadata_matching(&self, title: Option<&str>) -> Result<Vec<Note>, StoreError> {
+        let conn = self.conn()?;
+        let cols = NOTE_COLUMNS
+            .replace("n.frontmatter_raw", "''")
+            .replace("n.frontmatter", "''");
+        let predicate = if title.is_some() {
+            " WHERE lower(n.title)=$title"
+        } else {
+            ""
+        };
+        let mut stmt = conn
+            .prepare(&format!(
+                "MATCH (n:Note){predicate} RETURN {cols} ORDER BY n.file_path,n.uid"
+            ))
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        let params = title
+            .map(|title| vec![("title", Value::String(title.to_lowercase()))])
+            .unwrap_or_default();
+        let result = conn
+            .execute(&mut stmt, params)
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        result.map(|row| row_to_note(&row)).collect()
+    }
+
     /// Return all headings in a given note, in document order (by start_line).
     pub fn headings_in_note(&self, note_uid: &str) -> Result<Vec<Heading>, StoreError> {
         let conn = self.conn()?;
@@ -3359,6 +3479,196 @@ impl GraphStore {
         Ok(all)
     }
 
+    /// Visible forward adjacency bounded before symbol hydration. The extra
+    /// row is a work-stop witness, not a claim of the complete omitted total.
+    pub fn flow_callees_bounded(
+        &self,
+        uid: &str,
+        limit: usize,
+        visible: Option<&HashSet<String>>,
+    ) -> Result<(Vec<(Symbol, String)>, usize, bool), StoreError> {
+        let conn = self.conn()?;
+        let cols = SYMBOL_COLUMNS
+            .replace("s.", "t.")
+            .replace("t.signature", "''")
+            .replace("t.summary", "''");
+        let mut all = Vec::new();
+        let mut seen = HashSet::new();
+        let mut redacted = 0;
+        let mut cut = false;
+        if let Some(repos) = visible {
+            let repos = Value::List(
+                lbug::LogicalType::String,
+                repos.iter().cloned().map(Value::String).collect(),
+            );
+            let mut stmt = conn.prepare("MATCH (s:Symbol {uid:$uid})-[:CALLS|IMPORTS|CROSS_REPO_LINK]->(t:Symbol) WHERE NOT t.repo_uid IN $visible RETURN count(DISTINCT t.uid)").map_err(|e| StoreError::Query(e.to_string()))?;
+            if let Some(row) = conn
+                .execute(
+                    &mut stmt,
+                    vec![("uid", Value::String(uid.to_owned())), ("visible", repos)],
+                )
+                .map_err(|e| StoreError::Query(e.to_string()))?
+                .next()
+            {
+                redacted = usize::try_from(extract_i64(&row, 0)?).unwrap_or(0);
+            }
+        }
+        for et in ["CALLS", "IMPORTS", "CROSS_REPO_LINK"] {
+            let visibility = if visible.is_some() {
+                " AND t.repo_uid IN $visible"
+            } else {
+                ""
+            };
+            let mut params = vec![("uid", Value::String(uid.to_owned()))];
+            if let Some(repos) = visible {
+                let mut repos: Vec<_> = repos.iter().cloned().collect();
+                repos.sort();
+                params.push((
+                    "visible",
+                    Value::List(
+                        lbug::LogicalType::String,
+                        repos.into_iter().map(Value::String).collect(),
+                    ),
+                ));
+            }
+            let mut excluded: Vec<_> = seen.iter().cloned().collect();
+            excluded.sort();
+            params.push((
+                "seen",
+                Value::List(
+                    lbug::LogicalType::String,
+                    excluded.into_iter().map(Value::String).collect(),
+                ),
+            ));
+            let remaining = limit.saturating_sub(all.len());
+            let mut stmt = conn.prepare(&format!("MATCH (s:Symbol {{uid:$uid}})-[:{et}]->(t:Symbol) WHERE NOT t.uid IN $seen{visibility} RETURN {cols} ORDER BY t.uid LIMIT {}",remaining + 1)).map_err(|e| StoreError::Query(e.to_string()))?;
+            let result = conn
+                .execute(&mut stmt, params)
+                .map_err(|e| StoreError::Query(e.to_string()))?;
+            for row in result {
+                let symbol = row_to_symbol(&row)?;
+                if !seen.insert(symbol.uid.clone()) {
+                    continue;
+                }
+                if all.len() == limit {
+                    cut = true;
+                    break;
+                }
+                all.push((symbol, et.to_owned()));
+            }
+            if cut {
+                break;
+            }
+        }
+        Ok((all, redacted, cut))
+    }
+
+    /// Bounded class method selection with a count-only complete population.
+    pub fn flow_methods_bounded(
+        &self,
+        root: &Symbol,
+        limit: usize,
+        visible: Option<&HashSet<String>>,
+    ) -> Result<(Vec<Symbol>, usize), StoreError> {
+        let conn = self.conn()?;
+        let mut params = vec![
+            ("uid", Value::String(root.uid.clone())),
+            ("path", Value::String(root.file_path.clone())),
+            ("repo", Value::String(root.repo_uid.clone())),
+        ];
+        let visibility = if let Some(repos) = visible {
+            let mut repos: Vec<_> = repos.iter().cloned().collect();
+            repos.sort();
+            params.push((
+                "visible",
+                Value::List(
+                    lbug::LogicalType::String,
+                    repos.into_iter().map(Value::String).collect(),
+                ),
+            ));
+            " AND t.repo_uid IN $visible"
+        } else {
+            ""
+        };
+        let members = format!(
+            "MATCH (t:Symbol)-[:MEMBER_OF]->(s:Symbol {{uid:$uid}}) WHERE true{visibility}"
+        );
+        let mut stmt = conn
+            .prepare(&format!("{members} RETURN count(t)"))
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        let member_count = match conn
+            .execute(
+                &mut stmt,
+                params
+                    .iter()
+                    .filter(|(name, _)| *name != "path" && *name != "repo")
+                    .cloned()
+                    .collect(),
+            )
+            .map_err(|e| StoreError::Query(e.to_string()))?
+            .next()
+        {
+            Some(row) => extract_i64(&row, 0)?,
+            None => 0,
+        };
+        let prefix = if member_count > 0 {
+            format!("{members} AND (t.kind = 'Method' OR t.kind = 'Function')")
+        } else {
+            let mut stmt = conn.prepare(&format!("MATCH (t:Symbol) WHERE t.file_path=$path AND t.repo_uid=$repo AND t.kind='Class' AND t.uid<>$uid AND t.start_line>{} AND t.end_line<{}{visibility} RETURN t.start_line,t.end_line ORDER BY t.uid LIMIT 65",root.start_line,root.end_line)).map_err(|e| StoreError::Query(e.to_string()))?;
+            let ranges: Vec<_> = conn
+                .execute(&mut stmt, params.clone())
+                .map_err(|e| StoreError::Query(e.to_string()))?
+                .map(|row| Ok((extract_i64(&row, 0)?, extract_i64(&row, 1)?)))
+                .collect::<Result<_, StoreError>>()?;
+            if ranges.len() > 64 {
+                return Err(StoreError::Query("flow_trace class fallback exceeded the nested-container work budget; trace a specific method UID".into()));
+            }
+            let exclude: String = ranges
+                .iter()
+                .map(|(start, end)| {
+                    format!(" AND NOT (t.start_line>={start} AND t.start_line<={end})")
+                })
+                .collect();
+            format!(
+                "MATCH (t:Symbol) WHERE t.file_path=$path AND t.repo_uid=$repo AND t.uid<>$uid AND (t.kind='Method' OR t.kind='Function') AND t.start_line>{} AND t.start_line<={}{visibility}{exclude}",
+                root.start_line, root.end_line
+            )
+        };
+        let params: Vec<_> = params
+            .into_iter()
+            .filter(|(name, _)| {
+                (*name != "path" || prefix.contains("$path"))
+                    && (*name != "repo" || prefix.contains("$repo"))
+            })
+            .collect();
+        let mut stmt = conn
+            .prepare(&format!("{prefix} RETURN count(t)"))
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        let total = match conn
+            .execute(&mut stmt, params.clone())
+            .map_err(|e| StoreError::Query(e.to_string()))?
+            .next()
+        {
+            Some(row) => usize::try_from(extract_i64(&row, 0)?).unwrap_or(0),
+            None => 0,
+        };
+        let cols = SYMBOL_COLUMNS
+            .replace("s.", "t.")
+            .replace("t.signature", "''")
+            .replace("t.summary", "''");
+        let mut stmt = conn
+            .prepare(&format!(
+                "{prefix} RETURN {cols} ORDER BY t.start_line,t.uid LIMIT {limit}"
+            ))
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        let methods = conn
+            .execute(&mut stmt, params)
+            .map_err(|e| StoreError::Query(e.to_string()))?
+            .map(|row| row_to_symbol(&row))
+            .collect::<Result<_, _>>()?;
+        Ok((methods, total))
+    }
+
     /// Returns direct members of a class/container via MEMBER_OF edges.
     pub fn members_of(&self, uid: &str) -> Result<Vec<Symbol>, StoreError> {
         let conn = self.conn()?;
@@ -4708,6 +5018,65 @@ impl GraphStore {
                 (note, v)
             })
             .collect())
+    }
+
+    /// Bounded MCP tag membership read. A cut is a lower-bound population,
+    /// never proof that a tag or relationship is absent.
+    pub fn note_tag_sets_bounded(
+        &self,
+        edge_limit: usize,
+    ) -> Result<(Vec<(String, Vec<String>)>, bool), StoreError> {
+        let conn = self.conn()?;
+        let mut by_note: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        let mut remaining = edge_limit;
+        let mut cut = false;
+        let mut remaining_bytes = 14_000usize;
+        for pattern in [
+            "(n:Note)-[:NOTE_TAGGED_WITH]->(t:Tag)",
+            "(n:Note)-[:NOTE_HAS_SECTION]->(:Section)-[:SECTION_TAGGED_WITH]->(t:Tag)",
+        ] {
+            let oversized = conn
+                .query(&format!(
+                    "MATCH {pattern} WHERE size(n.uid)>512 OR size(t.name)>512 RETURN count(*)"
+                ))
+                .map_err(|e| StoreError::Query(format!("tag metadata size check: {e}")))?;
+            for row in oversized {
+                if extract_i64(&row, 0)? > 0 {
+                    cut = true;
+                }
+            }
+            let query = format!(
+                "MATCH {pattern} WHERE size(n.uid)<=512 AND size(t.name)<=512 RETURN DISTINCT n.uid, t.name ORDER BY n.uid, t.name LIMIT {}",
+                remaining.saturating_add(1)
+            );
+            let rows = conn
+                .query(&query)
+                .map_err(|error| StoreError::Query(format!("bounded tag membership: {error}")))?;
+            for row in rows {
+                if remaining == 0 {
+                    cut = true;
+                    break;
+                }
+                let note = extract_string(&row, 0)?;
+                let tag = extract_string(&row, 1)?;
+                let bytes = note.len().saturating_add(tag.len());
+                if bytes > remaining_bytes {
+                    cut = true;
+                    break;
+                }
+                remaining_bytes -= bytes;
+                by_note.entry(note).or_default().insert(tag);
+                remaining -= 1;
+            }
+        }
+        Ok((
+            by_note
+                .into_iter()
+                .map(|(uid, tags)| (uid, tags.into_iter().collect()))
+                .collect(),
+            cut,
+        ))
     }
 
     // ── DB-level metadata ───────────────────────────────────────────────────

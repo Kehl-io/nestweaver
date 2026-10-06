@@ -18937,30 +18937,37 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if !repos.is_empty() {
                 let mut args = clusters_tool_args(limit, members, resolution);
                 args["repos"] = serde_json::json!(repos);
-                let payload = match try_hybrid_json_rpc_checked(
-                    use_daemon,
-                    &db_path,
-                    config_opt.as_deref(),
-                    "clusters",
-                    args.clone(),
-                ) {
+                let mut direct_store = None;
+                let mut fetch =
+                    |args: serde_json::Value| -> anyhow::Result<Option<serde_json::Value>> {
+                        if let Some(value) = try_hybrid_json_rpc_checked(
+                            use_daemon,
+                            &db_path,
+                            config_opt.as_deref(),
+                            "clusters",
+                            args.clone(),
+                        )? {
+                            return Ok(Some(strip_hybrid_meta(value)));
+                        }
+                        if direct_store.is_none() {
+                            direct_store = Some(open_store(Some(&db_path))?);
+                        }
+                        nestweaver_mcp::tools::set_current_db_path(db_path.clone());
+                        Ok(Some(nestweaver_mcp::tools::dispatch(
+                            direct_store.as_ref().unwrap(),
+                            None,
+                            "clusters",
+                            args,
+                            None,
+                        )?))
+                    };
+                let payload = match collect_cluster_tool_pages(args, &mut fetch, true) {
                     Err(error) if error_is_unresolved_repo_filter(&error) => {
                         return Ok((report_unresolved_repo_filter(&error, json), None));
                     }
                     Err(error) => return Err(error),
-                    Ok(Some(value)) => strip_hybrid_meta(value),
-                    Ok(None) => {
-                        let store = open_store(Some(&db_path))?;
-                        nestweaver_mcp::tools::set_current_db_path(db_path.clone());
-                        match nestweaver_mcp::tools::dispatch(&store, None, "clusters", args, None)
-                        {
-                            Err(error) if error_is_unresolved_repo_filter(&error) => {
-                                return Ok((report_unresolved_repo_filter(&error, json), None));
-                            }
-                            Err(error) => return Err(error),
-                            Ok(value) => value,
-                        }
-                    }
+                    Ok(Some(value)) => value,
+                    Ok(None) => unreachable!("direct scoped fallback always returns a page"),
                 };
                 if json {
                     print_json_payload(&payload)?;
@@ -18995,12 +19002,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // trusted from here: a comment cannot notice when it stops
                 // being true, and this one would have had to notice twice.
                 let args = clusters_tool_args(limit, members, resolution);
-                if let Some(value) = try_hybrid_json_rpc_checked(
-                    true,
-                    &db_path,
-                    config_opt.as_deref(),
-                    "clusters",
+                if let Some(value) = collect_cluster_tool_pages(
                     args,
+                    |args| {
+                        Ok(try_hybrid_json_rpc_checked(
+                            true,
+                            &db_path,
+                            config_opt.as_deref(),
+                            "clusters",
+                            args,
+                        )?
+                        .map(strip_hybrid_meta))
+                    },
+                    false,
                 )? {
                     // The tool returns {clusters: [...]} with `size` where
                     // the direct path's ClusteringOutput uses `communities` and
@@ -38706,6 +38720,174 @@ mod since_boundary_tests {
     }
 }
 
+/// Reassemble CLI cluster bounds from ordinary bounded tool pages. Each
+/// continuation uses the first page's generation, scope, and resolution.
+fn collect_cluster_tool_pages(
+    original: serde_json::Value,
+    mut fetch: impl FnMut(serde_json::Value) -> anyhow::Result<Option<serde_json::Value>>,
+    include_members: bool,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    use serde_json::{Value, json};
+    let requested_limit = original["limit"].as_u64().unwrap_or(50) as usize;
+    let requested_members = original["members"].as_u64().unwrap_or(20) as usize;
+    let mut request = original.clone();
+    request["members"] = json!(if requested_members == 0 {
+        20
+    } else {
+        requested_members
+    });
+    let Some(mut envelope) = fetch(request.clone())? else {
+        return Ok(None);
+    };
+    let generation = envelope["graph_generation"].as_u64().ok_or_else(|| {
+        anyhow::anyhow!("cluster page missing graph_generation; update daemon and retry")
+    })?;
+    let token = envelope["page_token"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("cluster page missing page_token; update daemon and retry"))?
+        .to_string();
+    let scope = envelope["scope"].clone();
+    let resolution = envelope["resolution"].clone();
+    let total = envelope["total"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("cluster page missing total"))? as usize;
+    let wanted = if requested_limit == 0 {
+        total
+    } else {
+        requested_limit.min(total)
+    };
+    request["resolution"] = resolution.clone();
+    request["expected_generation"] = json!(generation);
+    request["page_token"] = json!(token);
+    let validate = |page: &Value| -> anyhow::Result<()> {
+        anyhow::ensure!(
+            page["graph_generation"] == generation
+                && page["scope"] == scope
+                && page["resolution"] == resolution
+                && page["page_token"] == token,
+            "cluster continuation generation/scope/resolution changed; restart command"
+        );
+        Ok(())
+    };
+    let mut page = envelope.clone();
+    let mut rows = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    while rows.len() < wanted {
+        validate(&page)?;
+        let page_rows = page["clusters"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("malformed cluster page"))?;
+        anyhow::ensure!(
+            !page_rows.is_empty(),
+            "cluster continuation made no progress; narrow scope and retry"
+        );
+        for row in page_rows.iter().take(wanted - rows.len()) {
+            let mut row = row.clone();
+            let id = row["id"]
+                .as_i64()
+                .ok_or_else(|| anyhow::anyhow!("cluster page missing id"))?;
+            anyhow::ensure!(
+                seen.insert(id),
+                "cluster continuation repeated a cluster; restart command"
+            );
+            if include_members {
+                let size = row["size"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("cluster page missing size"))?
+                    as usize;
+                let target = if requested_members == 0 {
+                    size
+                } else {
+                    requested_members.min(size)
+                };
+                let mut members = row["members"]
+                    .as_array()
+                    .ok_or_else(|| anyhow::anyhow!("cluster page missing members"))?
+                    .clone();
+                members.truncate(target);
+                let mut seen_members: std::collections::HashSet<String> = members
+                    .iter()
+                    .filter_map(|m| m["uid"].as_str().map(str::to_owned))
+                    .collect();
+                while members.len() < target {
+                    let offset = row["next_member_offset"].as_u64().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "cluster member page cannot progress; narrow scope and retry"
+                        )
+                    })? as usize;
+                    anyhow::ensure!(
+                        offset == members.len(),
+                        "cluster member continuation offset changed; restart command"
+                    );
+                    let mut member_request = request.clone();
+                    member_request
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("cluster_offset");
+                    member_request["cluster_id"] = json!(id);
+                    member_request["member_offset"] = json!(offset);
+                    member_request["members"] = json!((target - members.len()).min(200));
+                    let member_page = fetch(member_request)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "daemon disappeared during cluster continuation; retry command"
+                        )
+                    })?;
+                    validate(&member_page)?;
+                    let next = member_page["clusters"]
+                        .as_array()
+                        .and_then(|r| r.first())
+                        .ok_or_else(|| anyhow::anyhow!("empty cluster member continuation"))?;
+                    anyhow::ensure!(
+                        next["id"] == id && next["size"] == size,
+                        "cluster membership changed; restart command"
+                    );
+                    let new_members = next["members"]
+                        .as_array()
+                        .ok_or_else(|| anyhow::anyhow!("malformed cluster member page"))?;
+                    anyhow::ensure!(
+                        !new_members.is_empty(),
+                        "cluster member continuation made no progress; narrow scope and retry"
+                    );
+                    for member in new_members.iter().take(target - members.len()) {
+                        let uid = member["uid"]
+                            .as_str()
+                            .ok_or_else(|| anyhow::anyhow!("cluster member missing uid"))?;
+                        anyhow::ensure!(
+                            seen_members.insert(uid.to_owned()),
+                            "cluster member continuation repeated a UID; restart command"
+                        );
+                        members.push(member.clone());
+                    }
+                    row["next_member_offset"] = next["next_member_offset"].clone();
+                }
+                row["members"] = json!(members);
+                row["returned_members"] = json!(members.len());
+                row["members_truncated"] = json!(members.len() < size);
+            }
+            rows.push(row);
+        }
+        if rows.len() < wanted {
+            let offset = page["next_cluster_offset"].as_u64().ok_or_else(|| {
+                anyhow::anyhow!("cluster listing cannot progress; narrow scope and retry")
+            })? as usize;
+            anyhow::ensure!(
+                offset == rows.len(),
+                "cluster listing repeated/changed offset; restart command"
+            );
+            request["cluster_offset"] = json!(offset);
+            page = fetch(request.clone())?.ok_or_else(|| {
+                anyhow::anyhow!("daemon disappeared during cluster continuation; retry command")
+            })?;
+        }
+    }
+    envelope["clusters"] = json!(rows);
+    envelope["returned"] = json!(rows.len());
+    envelope["limit"] = original["limit"].clone();
+    envelope["truncated"] = json!(rows.len() < total);
+    envelope["next_cluster_offset"] = Value::Null;
+    Ok(Some(envelope))
+}
+
 /// nw-299(b): the CLI must never construct `clusters` arguments the tool will
 /// reject. Under `additionalProperties: false` plus declared bounds, a bad
 /// value is not ignored — it fails the whole call, so the daemon route would
@@ -38713,6 +38895,142 @@ mod since_boundary_tests {
 #[cfg(test)]
 mod clusters_forwarding_tests {
     use super::*;
+
+    fn cluster_collector_store() -> nestweaver_store::GraphStore {
+        use nestweaver_schema::{EdgeType, Repo, ResolvedEdge, Symbol, SymbolKind, Visibility};
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&Repo {
+                uid: "repo:pages".into(),
+                url: "https://example.test/pages".into(),
+                indexed_sha: String::new(),
+                staleness_commits_behind: 0,
+                instance_id: "default".into(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        for index in 0..150 {
+            let uid = format!("symbol:{index:03}");
+            store
+                .insert_symbol(&Symbol {
+                    uid: uid.clone(),
+                    name: uid.clone(),
+                    kind: SymbolKind::Function,
+                    repo_uid: "repo:pages".into(),
+                    file_path: format!("src/{index}.rs"),
+                    start_line: 1,
+                    end_line: 2,
+                    signature: String::new(),
+                    summary: None,
+                    content_hash: "h".into(),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Inferred,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+            if index > 0 && index < 80 {
+                for (a, b) in [("symbol:000", uid.as_str()), (uid.as_str(), "symbol:000")] {
+                    store
+                        .insert_edge(&ResolvedEdge {
+                            source_uid: a.into(),
+                            target_uid: b.into(),
+                            edge_type: EdgeType::Calls,
+                            confidence: 1.0,
+                            link_type: None,
+                            evidence: vec![],
+                        })
+                        .unwrap();
+                }
+            }
+        }
+        store
+    }
+
+    #[test]
+    fn cluster_collector_actual_dispatch_preserves_cli_zero_and_explicit_bounds() {
+        let store = cluster_collector_store();
+        for (limit, members) in [(0, 0), (70, 3)] {
+            let mut args = clusters_tool_args(limit, members, None);
+            args["repos"] = serde_json::json!(["repo:pages"]);
+            let mut calls = 0;
+            let result = collect_cluster_tool_pages(
+                args,
+                |args| {
+                    calls += 1;
+                    let page =
+                        nestweaver_mcp::tools::dispatch(&store, None, "clusters", args, None)?;
+                    assert!(serde_json::to_vec(&page).unwrap().len() <= 20_000);
+                    Ok(Some(page))
+                },
+                true,
+            )
+            .unwrap()
+            .unwrap();
+            let rows = result["clusters"].as_array().unwrap();
+            assert!(
+                result["total"].as_u64().unwrap() > 50,
+                "fixture must span listing pages"
+            );
+            assert_eq!(
+                rows.len(),
+                if limit == 0 {
+                    result["total"].as_u64().unwrap() as usize
+                } else {
+                    70
+                }
+            );
+            assert!(calls > 1);
+            if members == 0 {
+                assert_eq!(
+                    rows.iter()
+                        .map(|row| row["members"].as_array().unwrap().len())
+                        .sum::<usize>(),
+                    150
+                );
+                assert!(rows.iter().all(|row| row["members_truncated"] == false));
+            } else {
+                for row in rows {
+                    assert_eq!(
+                        row["members"].as_array().unwrap().len(),
+                        3.min(row["size"].as_u64().unwrap() as usize)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cluster_collector_rejects_generation_drift_during_actual_dispatch() {
+        let store = cluster_collector_store();
+        let mut args = clusters_tool_args(0, 0, None);
+        args["repos"] = serde_json::json!(["repo:pages"]);
+        let mut calls = 0;
+        let error = collect_cluster_tool_pages(
+            args,
+            |args| {
+                calls += 1;
+                let mut page =
+                    nestweaver_mcp::tools::dispatch(&store, None, "clusters", args, None)?;
+                if calls > 1 {
+                    page["graph_generation"] = serde_json::json!(u64::MAX);
+                }
+                Ok(Some(page))
+            },
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("generation/scope/resolution changed")
+        );
+    }
 
     #[test]
     fn every_cli_reachable_bound_produces_arguments_the_tool_accepts() {

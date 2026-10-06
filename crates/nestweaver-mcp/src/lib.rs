@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 #[cfg(feature = "daemon")]
 pub mod federation;
 pub mod http;
+pub mod output_budget;
 pub mod protocol;
 pub mod session;
 pub mod tools;
@@ -411,7 +412,15 @@ fn dispatch_method_daemon_cancellable(
 
         "tools/list" => {
             let lite = tools::is_lite_mode();
-            Frame::Success(success(id, tools::tool_list(lite)))
+            let cursor = req
+                .params
+                .as_ref()
+                .and_then(|params| params.get("cursor"))
+                .and_then(Value::as_str);
+            match tools::tool_list_page(lite, cursor) {
+                Ok(page) => Frame::Success(success(id, page)),
+                Err(message) => Frame::Error(error(id, error_code::INVALID_PARAMS, message)),
+            }
         }
 
         "tools/call" => {
@@ -680,7 +689,15 @@ fn dispatch_method_cancellable(
 
         "tools/list" => {
             let lite = tools::is_lite_mode();
-            Frame::Success(success(id, tools::tool_list(lite)))
+            let cursor = req
+                .params
+                .as_ref()
+                .and_then(|params| params.get("cursor"))
+                .and_then(Value::as_str);
+            match tools::tool_list_page(lite, cursor) {
+                Ok(page) => Frame::Success(success(id, page)),
+                Err(message) => Frame::Error(error(id, error_code::INVALID_PARAMS, message)),
+            }
         }
 
         "tools/call" => {
@@ -950,65 +967,62 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_all_tools() {
+    fn tools_list_returns_all_tools_in_bounded_intact_pages() {
         let store = GraphStore::in_memory().unwrap();
-        let req = make_request("tools/list", 2, json!({}));
-        let frame = dispatch_method(&store, None, &req, None);
-        match frame {
-            Frame::Success(resp) => {
-                let tools = resp.result["tools"].as_array().expect("tools array");
-                let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-                for expected in [
-                    "brain_context",
-                    "brain_search",
-                    "note_get",
-                    "backlinks",
-                    "brain_status",
-                    "brain_add_source",
-                    "cross_repo_contracts",
-                    "brain_impact",
-                    "brain_guide",
-                    "flow_trace",
-                    "detect_changes",
-                    "clusters",
-                    "stale_check",
-                    "set_extension",
-                    "query_extensions",
-                    "brain_diff",
-                    "project_context",
-                    "dead_code",
-                    "hub_nodes",
-                    "bridge_nodes",
-                    "blast_radius",
-                    "get_summary",
-                    "read_symbols",
-                    "regex_search",
-                    "count_patterns",
-                    "brain_broken_links",
-                    "brain_orphan_documents",
-                    "brain_topic_clusters",
-                    "brain_tag_graph",
-                    "brain_doc_stats",
-                    "affected_tests",
-                    "investigate",
-                    "investigate_expand",
-                    "investigate_hydrate",
-                    "contract_drift",
-                    "brain_memory_lint",
-                    "brain_memory_consolidate",
-                    "brain_memory_related",
-                    "code_context",
-                ] {
-                    assert!(names.contains(&expected), "missing tool: {expected}");
+        let expected = tools::tool_list(false)["tools"].as_array().unwrap().clone();
+        let mut actual = Vec::new();
+        let mut cursor = None;
+        let mut cursors = std::collections::BTreeSet::new();
+        for page in 0..100 {
+            let params = cursor.as_ref().map_or(json!({}), |c| json!({"cursor":c}));
+            let req = make_request("tools/list", page + 2, params);
+            match dispatch_method(&store, None, &req, None) {
+                Frame::Success(resp) => {
+                    assert_eq!(resp.id, json!(page + 2));
+                    let wire = serde_json::to_string(&resp.result)
+                        .unwrap()
+                        .replace('\u{2028}', "\\u2028")
+                        .replace('\u{2029}', "\\u2029");
+                    assert!(
+                        wire.len() <= 32_000,
+                        "catalogue page has {} bytes",
+                        wire.len()
+                    );
+                    let listed = resp.result["tools"].as_array().expect("tools array");
+                    assert!(listed.len() <= 8);
+                    actual.extend(listed.iter().cloned());
+                    cursor = resp
+                        .result
+                        .get("nextCursor")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    if let Some(next) = &cursor {
+                        assert!(!listed.is_empty());
+                        assert!(cursors.insert(next.clone()), "repeated cursor");
+                    } else {
+                        break;
+                    }
                 }
-                assert_eq!(tools.len(), 43, "expected 43 tools, got {}", tools.len());
-                // Every tool has a description leading with usage guidance.
-                for tool in tools {
-                    let desc = tool["description"].as_str().expect("description");
-                    assert!(!desc.is_empty(), "empty description");
-                }
+                Frame::Error(e) => panic!("tools/list should succeed: {}", e.error.message),
             }
-            Frame::Error(e) => panic!("tools/list should succeed: {}", e.error.message),
+        }
+        assert_eq!(
+            actual, expected,
+            "paged schemas and annotations must be intact and exhaustive"
+        );
+        assert_eq!(actual.len(), 43);
+    }
+
+    #[test]
+    fn tools_list_rejects_invalid_cursor_with_correlated_id() {
+        let store = GraphStore::in_memory().unwrap();
+        let req = make_request("tools/list", 77, json!({"cursor":"invalid-page"}));
+        match dispatch_method(&store, None, &req, None) {
+            Frame::Error(error) => {
+                assert_eq!(error.id, json!(77));
+                assert_eq!(error.error.code, error_code::INVALID_PARAMS);
+            }
+            Frame::Success(_) => panic!("invalid cursor must fail"),
         }
     }
 

@@ -438,6 +438,7 @@ fn regex_shard_trusted(
 }
 
 struct TrigramPrefilterPlan {
+    candidate_cap_reached: bool,
     matching_ready_uids: HashSet<String>,
     ready_scopes: HashSet<String>,
     dirty_scopes: HashSet<String>,
@@ -1723,6 +1724,8 @@ impl GraphStore {
         start: Instant,
         deadline_ms: u64,
         cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        candidate_cap: usize,
+        bounded_prefix: bool,
     ) -> Result<Option<TrigramPrefilterPlan>, StoreError> {
         let interrupted = || -> Result<bool, StoreError> {
             if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
@@ -1740,6 +1743,7 @@ impl GraphStore {
             }
             return Ok(Some(TrigramPrefilterPlan {
                 matching_ready_uids: HashSet::new(),
+                candidate_cap_reached: false,
                 ready_scopes: HashSet::new(),
                 dirty_scopes,
                 error_scopes: HashSet::new(),
@@ -1757,6 +1761,7 @@ impl GraphStore {
         let mut dirty_scopes = HashSet::new();
         let mut error_scopes = HashSet::new();
         let mut matching_ready_uids = HashSet::new();
+        let mut candidate_cap_reached = false;
         for scope_uid in active_scopes {
             if interrupted()? {
                 return Ok(None);
@@ -1785,10 +1790,24 @@ impl GraphStore {
                 dirty_scopes.insert(scope_uid);
                 continue;
             }
-            match index.candidate_uids(&metadata, clauses, CANDIDATE_CAP) {
-                Ok(Some(uids)) => {
+            let candidates = if bounded_prefix {
+                index.candidate_uids_bounded(
+                    &metadata,
+                    clauses,
+                    candidate_cap.saturating_sub(matching_ready_uids.len()),
+                )
+            } else {
+                // Exact counts retain the original per-scope allowance and
+                // widen saturated scopes to a complete graph scan.
+                index
+                    .candidate_uids(&metadata, clauses, candidate_cap)
+                    .map(|uids| uids.map(|uids| (uids, false)))
+            };
+            match candidates {
+                Ok(Some((uids, cut))) => {
                     ready_scopes.insert(scope_uid);
                     matching_ready_uids.extend(uids);
+                    candidate_cap_reached |= cut;
                 }
                 Ok(None) => {
                     dirty_scopes.insert(scope_uid);
@@ -1822,6 +1841,7 @@ impl GraphStore {
         }
         Ok(Some(TrigramPrefilterPlan {
             matching_ready_uids,
+            candidate_cap_reached,
             ready_scopes,
             dirty_scopes,
             error_scopes,
@@ -1871,20 +1891,12 @@ impl GraphStore {
         )
     }
 
-    /// `regex_search_cancellable` with the candidate cap parameterized
-    /// instead of hardcoded to [`CANDIDATE_CAP`]. The public entry point above
-    /// always passes the real constant; this seam exists so a unit test can
-    /// force `hydration_stop = Some(CandidateCap)` on a small, fast in-memory
-    /// store (nw-427) rather than needing 200,000 real rows to hit the
-    /// production cap — `CandidateCap` and `Deadline` both flow through the
-    /// identical `hydration_stop` -> verification-loop path this item fixes,
-    /// so exercising one deterministically exercises the other.
-    // One parameter more than the public entry point it mirrors, which is the
-    // whole point of the seam: the signature is deliberately identical so the
-    // test and production paths cannot drift. Bundling the arguments here would
-    // make them differ.
+    /// Regex search with a caller-specific work allowance, used by bounded
+    /// MCP delivery. The ordinary CLI entry keeps its 200000-candidate budget.
+    /// Planning posting collectors and hydration share this allowance; cuts
+    /// retain the same candidate-cap/deadline/cancellation disclosure.
     #[allow(clippy::too_many_arguments)]
-    fn regex_search_cancellable_with_candidate_cap(
+    pub fn regex_search_cancellable_with_candidate_cap(
         &self,
         pattern: &str,
         path_prefix: Option<&str>,
@@ -1918,7 +1930,14 @@ impl GraphStore {
         let clauses = required_trigram_clauses(pattern);
         let (plan, mut planning_deadline) = match &clauses {
             Some(clauses) => {
-                match self.regex_v3_candidate_uids(clauses, start, deadline_ms, cancel)? {
+                match self.regex_v3_candidate_uids(
+                    clauses,
+                    start,
+                    deadline_ms,
+                    cancel,
+                    candidate_cap,
+                    true,
+                )? {
                     Some(plan) => (Some(plan), false),
                     None => (None, true),
                 }
@@ -1968,7 +1987,7 @@ impl GraphStore {
                         deadline_ms,
                         CandidateLimits {
                             cancel,
-                            max_candidates: candidate_cap,
+                            max_candidates: candidate_cap.saturating_sub(candidates.len()),
                         },
                     )?;
                     hydration_stop = stronger_truncation(fallback_stop, hydrated_stop);
@@ -2031,6 +2050,10 @@ impl GraphStore {
         // planning_deadline { (Vec::new(), 0) }` above) — there is nothing to
         // lose by skipping it. Whether collection was complete is folded back
         // in AFTER the loop runs, not before.
+        if plan.as_ref().is_some_and(|plan| plan.candidate_cap_reached) {
+            hydration_stop =
+                stronger_truncation(hydration_stop, Some(RegexTruncationReason::CandidateCap));
+        }
         let collection_incomplete = hydration_stop.is_some() || elapsed_deadline;
         let mut truncated = planning_deadline;
         let mut truncation_reason = planning_deadline.then_some(RegexTruncationReason::Deadline);
@@ -2216,6 +2239,17 @@ impl GraphStore {
         path_prefix: Option<&str>,
         kinds: Option<&[String]>,
     ) -> Result<Vec<PatternCount>, StoreError> {
+        self.count_patterns_with_planning_cap(patterns, path_prefix, kinds, CANDIDATE_CAP)
+    }
+
+    // Small-budget regression seam; public behavior keeps the original cap.
+    fn count_patterns_with_planning_cap(
+        &self,
+        patterns: &[String],
+        path_prefix: Option<&str>,
+        kinds: Option<&[String]>,
+        planning_cap: usize,
+    ) -> Result<Vec<PatternCount>, StoreError> {
         let mut out = Vec::new();
         for pattern in patterns {
             let started = Instant::now();
@@ -2225,7 +2259,14 @@ impl GraphStore {
             let planning_started = Instant::now();
             let clauses = required_trigram_clauses(pattern);
             let plan = match &clauses {
-                Some(clauses) => self.regex_v3_candidate_uids(clauses, started, u64::MAX, None)?,
+                Some(clauses) => self.regex_v3_candidate_uids(
+                    clauses,
+                    started,
+                    u64::MAX,
+                    None,
+                    planning_cap,
+                    false,
+                )?,
                 None => None,
             };
             let planning_ms = elapsed_millis(planning_started);
@@ -3325,6 +3366,57 @@ mod tests {
         );
         // It still matches every text-bearing node.
         assert!(!res.results.is_empty());
+    }
+
+    #[test]
+    fn exact_count_planning_cap_saturation_preserves_occurrences() {
+        let store = store_with_text();
+        for uid in ["sym:extra:a", "sym:extra:b"] {
+            let mut symbol = store.lookup_symbol("sym:1").unwrap();
+            symbol.uid = uid.into();
+            symbol.name = uid.into();
+            store.insert_symbol(&symbol).unwrap();
+        }
+        store.build_trigram_index().unwrap();
+        let patterns = ["authenticateUser".to_string()];
+        let exhaustive = store.count_patterns(&patterns, None, None).unwrap();
+        assert_eq!(
+            exhaustive[0].total_matches, 4,
+            "manual section + three symbol occurrences"
+        );
+        let bounded_plan = store
+            .count_patterns_with_planning_cap(&patterns, None, None, 1)
+            .unwrap();
+        assert_eq!(
+            bounded_plan[0].total_matches, 4,
+            "posting saturation must widen to complete counts"
+        );
+        assert_eq!(bounded_plan[0].files_matched, exhaustive[0].files_matched);
+        assert_eq!(bounded_plan[0].top_files, exhaustive[0].top_files);
+    }
+
+    #[test]
+    fn exact_count_planning_cap_is_per_scope_for_multiple_ready_scopes() {
+        let store = store_with_text();
+        store.build_trigram_index().unwrap();
+        let patterns = ["authenticateUser".to_string()];
+        let exhaustive = store.count_patterns(&patterns, None, None).unwrap();
+        assert_eq!(
+            exhaustive[0].ready_scopes, 2,
+            "fixture has a ready vault and repo"
+        );
+        assert_eq!(
+            exhaustive[0].total_matches, 2,
+            "one section and one symbol occurrence"
+        );
+        let bounded_plan = store
+            .count_patterns_with_planning_cap(&patterns, None, None, 1)
+            .unwrap();
+        assert_eq!(
+            bounded_plan[0].total_matches, 2,
+            "exact counts cannot use a shared search UID allowance"
+        );
+        assert_eq!(bounded_plan[0].files_matched, exhaustive[0].files_matched);
     }
 
     #[test]

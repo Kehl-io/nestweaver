@@ -22,8 +22,8 @@ use nestweaver_engine::{
     generate_skill_with_tools, generate_summaries, get_all_properties, get_last_indexed_at,
     investigate, investigate_expand, investigate_hydrate, load_alias_sidecar, load_clusters,
     load_extensions, memory_consolidate, memory_lint, memory_related, orphan_documents,
-    parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text, tag_graph,
-    tag_graph_all, topic_clusters, truncate_to_budget_keeping_first,
+    parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text, topic_clusters,
+    truncate_to_budget_keeping_first,
 };
 use nestweaver_schema::SymbolKind;
 use nestweaver_store::tantivy_index::{SearchTotal, SearchTotalRelation};
@@ -109,17 +109,11 @@ fn note_found(note: nestweaver_schema::Note) -> StrictNoteResolve {
 }
 
 fn candidates_json(candidates: &[nestweaver_schema::Symbol]) -> Value {
-    json!(
-        candidates
-            .iter()
-            .map(|s| json!({
-                "uid": s.uid,
-                "name": s.name,
-                "file_path": s.file_path,
-                "start_line": s.start_line,
-            }))
-            .collect::<Vec<_>>()
-    )
+    let mut ordered: Vec<_> = candidates.iter().collect();
+    ordered.sort_by(|a, b| {
+        (&a.file_path, a.start_line, &a.uid).cmp(&(&b.file_path, b.start_line, &b.uid))
+    });
+    json!(ordered.into_iter().take(50).map(|symbol| json!({"uid":symbol.uid,"name":symbol.name,"file_path":symbol.file_path,"start_line":symbol.start_line})).collect::<Vec<_>>())
 }
 
 fn name_lookup_ambiguous_payload(
@@ -127,11 +121,15 @@ fn name_lookup_ambiguous_payload(
     repo_filter: Option<&str>,
     candidates: &[nestweaver_schema::Symbol],
 ) -> Value {
-    nestweaver_schema::responses::name_lookup_ambiguous(
+    let mut payload = nestweaver_schema::responses::name_lookup_ambiguous(
         name,
         repo_filter,
         candidates_json(candidates),
-    )
+    );
+    payload["candidate_total"] = json!(candidates.len());
+    payload["candidates_returned"] = json!(candidates.len().min(50));
+    payload["truncated"] = json!(candidates.len() > 50);
+    payload
 }
 
 fn notes_ambiguous_payload(title: &str, notes: &[nestweaver_schema::Note]) -> Value {
@@ -141,6 +139,7 @@ fn notes_ambiguous_payload(title: &str, notes: &[nestweaver_schema::Note]) -> Va
         json!(
             notes
                 .iter()
+                .take(50)
                 .map(|n| json!({
                     "uid": n.uid,
                     "name": n.title,
@@ -158,6 +157,9 @@ fn notes_ambiguous_payload(title: &str, notes: &[nestweaver_schema::Note]) -> Va
     for candidate in payload["candidates"].as_array_mut().into_iter().flatten() {
         candidate["kind"] = json!("Note");
     }
+    payload["candidate_total"] = json!(notes.len());
+    payload["candidates_returned"] = json!(notes.len().min(50));
+    payload["truncated"] = json!(notes.len() > 50);
     payload
 }
 
@@ -906,7 +908,7 @@ const MAX_VALIDATION_ITEM_BYTES: usize = 192;
 const MAX_VALIDATION_ERROR_BYTES: usize = 1024;
 const MAX_TOOL_NAME_IN_ERROR_BYTES: usize = 96;
 
-fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+pub(crate) fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value.to_string();
     }
@@ -1296,6 +1298,61 @@ pub fn tool_list(lite: bool) -> Value {
     json!({ "tools": tools })
 }
 
+/// Wire-only catalogue page. Internal documentation/validation callers keep
+/// the complete catalogue returned by `tool_list`.
+pub fn tool_list_page(lite: bool, cursor: Option<&str>) -> Result<Value, String> {
+    use std::hash::{Hash, Hasher};
+    let catalogue = tool_list(lite);
+    let tools = catalogue["tools"].as_array().expect("catalogue tools");
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    catalogue.to_string().hash(&mut hash);
+    let profile = format!("{:016x}", hash.finish());
+    let offset = if let Some(cursor) = cursor {
+        let parts: Vec<_> = cursor.split(':').collect();
+        if parts.len() != 3 || parts[0] != "nw-tools-v1" || parts[1] != profile {
+            return Err(
+                "invalid or stale tools/list cursor; restart catalogue discovery for this profile"
+                    .into(),
+            );
+        }
+        let offset = parts[2]
+            .parse::<usize>()
+            .map_err(|_| "invalid tools/list cursor")?;
+        if offset == 0 || offset >= tools.len() {
+            return Err("tools/list cursor is outside this catalogue".into());
+        }
+        offset
+    } else {
+        0
+    };
+    let mut page = json!({"tools":[]});
+    for tool in tools
+        .iter()
+        .skip(offset)
+        .take(crate::output_budget::CATALOGUE_TOOLS)
+    {
+        let mut candidate = page.clone();
+        candidate["tools"]
+            .as_array_mut()
+            .unwrap()
+            .push(tool.clone());
+        let next = offset + candidate["tools"].as_array().unwrap().len();
+        if next < tools.len() {
+            candidate["nextCursor"] = json!(format!("nw-tools-v1:{profile}:{next}"));
+        } else {
+            candidate.as_object_mut().unwrap().remove("nextCursor");
+        }
+        if crate::output_budget::escaped_size(&candidate) > crate::output_budget::CATALOGUE_BYTES {
+            break;
+        }
+        page = candidate;
+    }
+    if page["tools"].as_array().unwrap().is_empty() && offset < tools.len() {
+        return Err("a tool schema exceeds the intact catalogue page budget".into());
+    }
+    Ok(page)
+}
+
 /// Validate an explicit CLI tool selection against the selected transport.
 /// This runs before the MCP loop starts so a typo or unavailable direct-mode
 /// mutator cannot silently produce a zero-tool server.
@@ -1346,6 +1403,52 @@ pub fn validate_tool_selection(
 mod tool_schema_validation_tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn wire_catalogue_filters_before_pagination_and_binds_cursors_to_profile() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                set_direct_read_only(false);
+                ALLOWED_TOOLS.with(|allowed| *allowed.borrow_mut() = None);
+            }
+        }
+        let _reset = Reset;
+        for (lite, readonly, allowed) in [
+            (true, false, None),
+            (false, true, None),
+            (
+                false,
+                false,
+                Some(vec!["brain_search".into(), "flow_trace".into()]),
+            ),
+        ] {
+            set_direct_read_only(readonly);
+            ALLOWED_TOOLS.with(|slot| *slot.borrow_mut() = allowed);
+            let expected = tool_list(lite)["tools"].as_array().unwrap().clone();
+            let mut actual = Vec::new();
+            let mut cursor = None;
+            for _ in 0..100 {
+                let page = tool_list_page(lite, cursor.as_deref()).unwrap();
+                assert!(crate::output_budget::escaped_size(&page) <= 32_000);
+                assert!(page["tools"].as_array().unwrap().len() <= 8);
+                actual.extend(page["tools"].as_array().unwrap().iter().cloned());
+                cursor = page
+                    .get("nextCursor")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(actual, expected);
+        }
+        ALLOWED_TOOLS.with(|slot| *slot.borrow_mut() = None);
+        let page = tool_list_page(false, None).unwrap();
+        let cursor = page["nextCursor"].as_str().unwrap();
+        set_direct_read_only(true);
+        assert!(tool_list_page(false, Some(cursor)).is_err());
+    }
 
     fn assert_valid(name: &str, args: Value) {
         validate_tool_arguments(name, &args)
@@ -4832,6 +4935,108 @@ pub fn is_blank_query(value: &str) -> bool {
     value.trim().is_empty()
 }
 
+/// Serialize a secondary field under a byte reservation before allocating
+/// its JSON tree. Oversized metadata is explicitly unavailable, never empty.
+fn bounded_metadata<T: serde::Serialize>(
+    value: &T,
+    max_bytes: usize,
+) -> Result<Option<Value>, anyhow::Error> {
+    struct Writer {
+        bytes: Vec<u8>,
+        cap: usize,
+        cut: bool,
+    }
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.cap.saturating_sub(self.bytes.len()) {
+                self.cut = true;
+                return Err(std::io::Error::other("metadata byte reservation exhausted"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = Writer {
+        bytes: Vec::new(),
+        cap: max_bytes,
+        cut: false,
+    };
+    if let Err(error) = serde_json::to_writer(&mut writer, value) {
+        if writer.cut {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    let value: Value = serde_json::from_slice(&writer.bytes)?;
+    Ok((crate::output_budget::escaped_size(&value) <= max_bytes).then_some(value))
+}
+
+fn bounded_mapped_rows<T>(rows: &[T], bytes: usize, map: impl Fn(&T) -> Value) -> Vec<Value> {
+    let mut remaining = bytes.saturating_sub(2);
+    let mut values = Vec::new();
+    for row in rows.iter().take(2000) {
+        let value = map(row);
+        let cost = crate::output_budget::escaped_size(&value).saturating_add(1);
+        if cost > remaining {
+            break;
+        }
+        remaining -= cost;
+        values.push(value);
+    }
+    values
+}
+
+fn bounded_source_text(text: &str, bytes: usize) -> String {
+    let mut end = text.len().min(bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    while crate::output_budget::escaped_size(&json!(&text[..end])) > bytes && end > 0 {
+        end -= 1;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+    }
+    text[..end].to_string()
+}
+
+fn bounded_typed_rows<T: serde::Serialize>(
+    rows: &[T],
+    bytes: usize,
+) -> Result<Vec<Value>, anyhow::Error> {
+    let mut remaining = bytes.saturating_sub(2);
+    let mut values = Vec::new();
+    for row in rows.iter().take(2000) {
+        let Some(value) = bounded_metadata(row, remaining.saturating_sub(1))? else {
+            break;
+        };
+        remaining = remaining.saturating_sub(crate::output_budget::escaped_size(&value) + 1);
+        values.push(value);
+    }
+    Ok(values)
+}
+
+fn retain_serialized_prefix<T: serde::Serialize>(
+    rows: &mut Vec<T>,
+    bytes: usize,
+) -> Result<usize, anyhow::Error> {
+    let total = rows.len();
+    let mut remaining = bytes;
+    let mut keep = 0;
+    for row in rows.iter().take(2000) {
+        let Some(value) = bounded_metadata(row, remaining)? else {
+            break;
+        };
+        remaining = remaining.saturating_sub(crate::output_budget::escaped_size(&value) + 1);
+        keep += 1;
+    }
+    rows.truncate(keep);
+    Ok(total - keep)
+}
+
 fn tool_regex_search(
     store: &GraphStore,
     args: Value,
@@ -4857,29 +5062,43 @@ fn tool_regex_search(
     let limit = args
         .get("limit")
         .and_then(|v| v.as_u64())
-        .map(|n| n as usize);
+        .map(|n| n as usize)
+        .unwrap_or_else(configured_result_limit);
     let max_millis = args.get("max_millis").and_then(|v| v.as_u64());
 
     let res = store
-        .regex_search_cancellable(
+        .regex_search_cancellable_with_candidate_cap(
             pattern,
             path_prefix,
             kinds.as_deref(),
-            limit,
+            Some(limit.min(configured_result_limit())),
             max_millis,
             cancel,
+            2000,
         )
         .map_err(|e| anyhow!("regex_search: {e}"))?;
     // nw-097: the note now rides on RegexSearchResult itself, attached by the
     // store, so the CLI and daemon paths carry it too. This tool used to bolt it
     // on here, which is exactly why only MCP had it.
-    Ok(serde_json::to_value(res)?)
+    let mut res = res;
+    let original_rows = std::mem::take(&mut res.results);
+    let rows = bounded_typed_rows(&original_rows, 14_000)?;
+    let mut payload = serde_json::to_value(&res)?;
+    payload["results"] = json!(rows);
+    if rows.len() < original_rows.len() {
+        payload["truncated"] = json!(true);
+        payload["output_rows_omitted"] = json!(original_rows.len() - rows.len());
+        payload["output_omission_relation"] = json!("gte");
+        payload["retry_guidance"] =
+            json!("Output byte budget reached; narrow pattern, kinds, or path_prefix and retry.");
+    }
+    Ok(payload)
 }
 
 fn tool_schema_regex_search() -> Value {
     json!({
         "name": "regex_search",
-        "description": "Run a Rust regex against indexed text (section bodies, note titles, symbol signatures) with database-bound, per-scope acceleration and final Rust-regex verification.\n\nGuidelines:\n- Use for exact pattern matching; for fuzzy/semantic lookup use brain_search instead\n- Output names ready/dirty/error scopes, posting hits, hydrated and verified candidate counts, exact truncation reason, and planning/hydration/verification timings\n- scanned_fallback means one or more scopes were safely scanned; stale_index means an existing shard was unavailable or stale, never that matches were dropped\n\nLimitations:\n- Candidate cap of 200000 or time budget (default 2000ms) may truncate results; truncation_reason distinguishes the bound\n- Does not search binary files or unindexed content",
+        "description": "Run a Rust regex against indexed text (section bodies, note titles, symbol signatures) with database-bound, per-scope acceleration and final Rust-regex verification.\n\nGuidelines:\n- Use for exact pattern matching; for fuzzy/semantic lookup use brain_search instead\n- Output names ready/dirty/error scopes, posting hits, hydrated and verified candidate counts, exact truncation reason, and planning/hydration/verification timings\n- scanned_fallback means one or more scopes were safely scanned; stale_index means an existing shard was unavailable or stale, never that matches were dropped\n\nLimitations:\n- MCP candidate cap of 2000 or time budget (default 2000ms) may truncate results; truncation_reason distinguishes the bound\n- Does not search binary files or unindexed content",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4891,7 +5110,7 @@ fn tool_schema_regex_search() -> Value {
                     "items": { "type": "string" },
                     "description": "Restrict to these node kinds: Section, Note, Symbol (case-insensitive)."
                 },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Maximum results to return (1-10000; the candidate cap is 200000). Default: unlimited (capped by the candidate budget)." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Maximum results to return (1-10000; MCP presentation remains bounded by 50 rows and output bytes). Default: 50; MCP candidate work is capped at 2000." },
                 "max_millis": { "type": "integer", "minimum": 1, "maximum": 600000, "description": "Wall-clock time budget in milliseconds (1-600000). Default 2000." },
                 "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
                 "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
@@ -5104,21 +5323,12 @@ fn tool_brain_tag_graph(store: &GraphStore, args: Value) -> Result<Value, anyhow
     )?;
     // `tag` is optional. When present we accept only a string (reject other
     // JSON types); when absent we return the whole tag co-occurrence graph.
-    match args.get("tag") {
-        Some(Value::Null) | None => {
-            let all_tags = tag_graph_all(store)?;
-            let total = all_tags.len();
-            let tags: Vec<_> = all_tags.into_iter().take(limit).collect();
-            Ok(
-                json!({ "tags": serde_json::to_value(&tags)?, "total": total, "returned": tags.len() }),
-            )
-        }
-        Some(Value::String(tag)) => {
-            let tg = tag_graph(store, tag)?;
-            Ok(serde_json::to_value(&tg)?)
-        }
-        Some(_) => Err(anyhow!("'tag' must be a string")),
-    }
+    let focus = match args.get("tag") {
+        Some(Value::Null) | None => None,
+        Some(Value::String(tag)) => Some(tag.as_str()),
+        Some(_) => return Err(anyhow!("'tag' must be a string")),
+    };
+    nestweaver_engine::brain_docgraph::tag_graph_bounded(store, focus, limit)
 }
 
 fn tool_schema_brain_tag_graph() -> Value {
@@ -5131,7 +5341,7 @@ fn tool_schema_brain_tag_graph() -> Value {
             "properties": {
                 "tag": { "type": "string", "description": "Optional focus tag (with or without leading #). When omitted, returns the full tag co-occurrence graph for all tags." },
                 "limit": limit_schema(
-                    "Max tags to return in the all-tags listing (1-1000, default 50). Ignored when a specific tag is queried.",
+                    "Max tags to return in the all-tags listing (1-1000, default 50). Also caps co-occurring and descendant tags for each focus; membership work is bounded and lower-bound counts are disclosed.",
                     DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             }
         }
@@ -5453,12 +5663,148 @@ pub fn wrap_tool_result(value: Value) -> Value {
     // `brain_memory_related`, `read_symbols` with every target missing) is
     // the same failed lookup as one that raises `ToolTargetNotFound`.
     let not_found = value.get("status").and_then(Value::as_str) == Some("not_found");
-    let pretty = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
-    json!({
-        "content": [{ "type": "text", "text": pretty }],
+    crate::output_budget::finalize(json!({
+        "content": [],
         "structuredContent": value,
         "isError": not_found,
-    })
+    }))
+}
+
+#[cfg(test)]
+mod output_budget_tests {
+    use super::*;
+
+    fn escaped_bytes(value: &Value) -> usize {
+        serde_json::to_string(value)
+            .unwrap()
+            .replace('\u{2028}', "\\u2028")
+            .replace('\u{2029}', "\\u2029")
+            .len()
+    }
+
+    #[test]
+    fn wrapper_compact_text_matches_structured_content() {
+        let value = json!({"nodes":[{"uid":"symbol:a","body":"quote \" slash \\ newline\n λ"}],
+            "_meta":{"scope":"hybrid","sources":["local","server"]}});
+        let wrapped = wrap_tool_result(value.clone());
+        assert_eq!(
+            wrapped["content"][0]["text"],
+            serde_json::to_string(&value).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(wrapped["content"][0]["text"].as_str().unwrap()).unwrap(),
+            wrapped["structuredContent"]
+        );
+        assert_eq!(wrapped["isError"], false);
+    }
+
+    #[test]
+    fn escaped_dual_result_is_capped_and_discloses_omission() {
+        for body in [
+            "plain ".repeat(20_000),
+            "\"\\\n\t\r\u{0001}λ\u{2028}\u{2029}".repeat(10_000),
+        ] {
+            let wrapped = wrap_tool_result(
+                json!({"status":"ok","nodes":[{"uid":"symbol:a","body":body}],
+                "_meta":{"scope":"hybrid","sources":["local","server"]}}),
+            );
+            assert!(
+                escaped_bytes(&wrapped) <= 40_000,
+                "dual result has {} escaped bytes",
+                escaped_bytes(&wrapped)
+            );
+            let payload = &wrapped["structuredContent"];
+            assert_eq!(
+                serde_json::from_str::<Value>(wrapped["content"][0]["text"].as_str().unwrap())
+                    .unwrap(),
+                *payload
+            );
+            assert_eq!(payload["_meta"]["scope"], "hybrid");
+            assert_eq!(payload["_meta"]["sources"], json!(["local", "server"]));
+            assert_eq!(payload["truncated"], true, "output cut must be disclosed");
+        }
+    }
+
+    #[test]
+    fn completed_federated_shapes_are_bounded_after_amplification() {
+        let rows: Vec<Value> = (0..1500)
+            .map(|i| {
+                json!({"uid":format!("symbol:{i}"),
+            "body":"\"\\\u{2028}\u{2029}".repeat(30)})
+            })
+            .collect();
+        for payload in [
+            json!({"nodes":rows,"_meta":{"scope":"hybrid","sources":["local","server"]}}),
+            json!({"local":{"nodes":rows},"upstream":{"nodes":rows},"_meta":{"scope":"hybrid","sources":["local","server"]}}),
+            json!({"matches":rows,"sources":[{"name":"local","matches":rows},{"name":"server","matches":rows}],"_meta":{"scope":"hybrid","sources":["local","server"]}}),
+            json!({"local":{"impact_nodes":rows},"org":{"impact_nodes":rows},"coverage":{"traversal_truncated":true},"_meta":{"scope":"hybrid","sources":["local","server"]}}),
+            json!({"tree":{"uid":"symbol:start","children":rows},"continuations":rows,"_meta":{"scope":"hybrid","sources":["local","server"]}}),
+        ] {
+            let wrapped = wrap_tool_result(payload);
+            assert!(escaped_bytes(&wrapped) <= 40_000);
+            let bounded = &wrapped["structuredContent"];
+            assert_eq!(bounded["_meta"]["sources"], json!(["local", "server"]));
+            assert_eq!(bounded["truncated"], true);
+            assert_eq!(
+                serde_json::from_str::<Value>(wrapped["content"][0]["text"].as_str().unwrap())
+                    .unwrap(),
+                *bounded
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_payload_decisions_and_generic_plain_errors_remain_intact() {
+        let value = json!({"status":"partial","refused":false,"verdict":"review", "reason":"coverage",
+            "coverage":{"traversal_truncated":true,"visible_nodes":12},"uid":"sym:a",
+            "_meta":{"scope":"local","sources":["local"]}, "nodes":[{"uid":"sym:b","body":"x".repeat(8_000)}]});
+        let result = wrap_tool_result(value.clone());
+        assert_eq!(result["structuredContent"], value);
+        assert_eq!(
+            wrap_tool_error("ordinary failure")["content"][0]["text"],
+            "ordinary failure"
+        );
+        let error = wrap_tool_error(&"\u{0001}\u{2028}\u{2029}".repeat(30_000));
+        assert!(escaped_bytes(&error) <= 40_000);
+        assert_eq!(error["isError"], true);
+        assert!(
+            error["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("truncated")
+        );
+    }
+
+    #[test]
+    fn impossible_mandatory_identity_is_an_explicit_error_refusal() {
+        let result =
+            wrap_tool_result(json!({"status":"ok","uid":"sym:enormous".repeat(10_000),"nodes":[]}));
+        assert!(escaped_bytes(&result) <= 40_000);
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["status"], "refused");
+        assert_eq!(result["structuredContent"]["original_status"], "ok");
+        assert_eq!(
+            result["structuredContent"]["targets"]["uid"]["identity_truncated"],
+            true
+        );
+    }
+
+    #[test]
+    fn oversized_not_found_preserves_error_and_target() {
+        let wrapped = wrap_tool_result(
+            json!({"status":"not_found","error":"not found", "uid":"symbol:missing",
+            "message":"lookup failed ".repeat(20_000), "did_you_mean":["symbol:a"],
+            "_meta":{"scope":"local","sources":["local"]}}),
+        );
+        assert!(escaped_bytes(&wrapped) <= 40_000);
+        assert_eq!(wrapped["isError"], true);
+        assert_eq!(wrapped["structuredContent"]["status"], "not_found");
+        assert_eq!(wrapped["structuredContent"]["uid"], "symbol:missing");
+        assert_eq!(
+            serde_json::from_str::<Value>(wrapped["content"][0]["text"].as_str().unwrap()).unwrap(),
+            wrapped["structuredContent"]
+        );
+    }
 }
 
 /// A lookup-by-identifier tool could not find its target (nw-557).
@@ -5705,10 +6051,10 @@ pub fn wrap_tool_failure(tool: &str, error: &anyhow::Error) -> Value {
 /// error indication (rather than a JSON-RPC-level error which terminates
 /// the call sequence).
 pub fn wrap_tool_error(message: &str) -> Value {
-    json!({
+    crate::output_budget::finalize(json!({
         "content": [{ "type": "text", "text": message }],
         "isError": true,
-    })
+    }))
 }
 
 /// Check whether the caller requested concise output. Returns `true` when
@@ -8471,37 +8817,56 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         return Err(anyhow!("provide either 'uid' or 'title'"));
     };
 
-    // Load all headings and sections (needed for both outline and section filter).
+    const BODY_BYTES: usize = 12_000;
+    let (outline_total, section_count) = store
+        .note_structure_counts(&note.uid)
+        .map_err(|e| anyhow!("note_structure_counts: {e}"))?;
     let headings_raw = store
-        .headings_in_note(&note.uid)
+        .headings_in_note_bounded(&note.uid, 50)
         .map_err(|e| anyhow!("headings_in_note: {e}"))?;
-    let sections_raw = store
-        .sections_in_note(&note.uid)
-        .map_err(|e| anyhow!("sections_in_note: {e}"))?;
-
+    let mut body_truncated = false;
     // Resolve body: either filtered sections or full file contents.
     let body = if let Some(ref names) = section_filter {
         // Section-filter mode: return only the text_content of sections whose
         // heading matches one of the requested names (case-insensitive).
-        let mut parts: Vec<String> = Vec::new();
-        for heading in &headings_raw {
-            if names.iter().any(|n| heading.text.eq_ignore_ascii_case(n)) {
-                // Find the section that belongs to this heading.
-                if let Some(sec) = sections_raw
-                    .iter()
-                    .find(|s| s.heading_uid.as_deref() == Some(&heading.uid))
-                {
-                    // Reconstruct the section with its heading prefix.
-                    let prefix = "#".repeat(heading.level as usize);
-                    parts.push(format!("{prefix} {}\n\n{}", heading.text, sec.text_content));
+        if names.len() > 50 {
+            return Err(anyhow!(
+                "note_get accepts at most 50 selected sections per bounded read; narrow the section list"
+            ));
+        }
+        let selected = store
+            .selected_headings_bounded(&note.uid, names, 51)
+            .map_err(|e| anyhow!("selected_headings: {e}"))?;
+        body_truncated |= selected.len() > 50;
+        let mut parts = String::new();
+        for heading in selected.iter().take(50) {
+            if !parts.is_empty() {
+                if BODY_BYTES.saturating_sub(parts.len()) < 2 {
+                    body_truncated = true;
+                    break;
                 }
+                parts.push_str("\n\n");
+            }
+            let remaining = BODY_BYTES.saturating_sub(parts.len());
+            if remaining == 0 {
+                body_truncated = true;
+                break;
+            }
+            if let Some(section) = store
+                .section_for_heading_bounded(&heading.uid, remaining + 1)
+                .map_err(|e| anyhow!("section_for_heading: {e}"))?
+            {
+                let text = format!(
+                    "{} {}\n\n{}",
+                    "#".repeat(heading.level as usize),
+                    heading.text,
+                    section.text_content
+                );
+                body_truncated |= text.len() > remaining;
+                parts.push_str(&truncate_utf8_bytes(&text, remaining));
             }
         }
-        if parts.is_empty() {
-            Some(String::new())
-        } else {
-            Some(parts.join("\n\n"))
-        }
+        Some(parts)
     } else if include_body {
         // Full body mode: load from disk.
         match store.lookup_vault(&note.vault_uid) {
@@ -8524,10 +8889,27 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
                     );
                     None
                 } else {
-                    match std::fs::read_to_string(&path) {
-                        Ok(s) => Some(s),
-                        Err(e) => {
-                            tracing::warn!("note_get: failed to read {}: {e}", path.display());
+                    use std::io::Read;
+                    match std::fs::File::open(&path).and_then(|file| {
+                        let mut bytes = Vec::with_capacity(BODY_BYTES + 1);
+                        file.take((BODY_BYTES + 1) as u64).read_to_end(&mut bytes)?;
+                        body_truncated = bytes.len() > BODY_BYTES;
+                        if body_truncated {
+                            bytes.truncate(BODY_BYTES);
+                        }
+                        while body_truncated
+                            && std::str::from_utf8(&bytes)
+                                .is_err_and(|error| error.error_len().is_none())
+                        {
+                            bytes.pop();
+                        }
+                        String::from_utf8(bytes).map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                        })
+                    }) {
+                        Ok(text) => Some(text),
+                        Err(error) => {
+                            tracing::warn!("note_get: failed to read {}: {error}", path.display());
                             None
                         }
                     }
@@ -8539,26 +8921,59 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         None
     };
 
-    let headings = headings_raw
-        .into_iter()
-        .map(|h| {
-            json!({
-                "uid": h.uid,
-                "level": h.level,
-                "text": h.text,
-                "slug": h.slug,
-                "line": h.start_line,
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut headings = Vec::new();
+    let mut outline_bytes = 3000usize;
+    let mut outline_text_truncated = false;
+    for heading in headings_raw {
+        outline_text_truncated |=
+            heading.text.chars().count() >= 256 || heading.slug.chars().count() >= 256;
+        let row = json!({"uid":heading.uid,"level":heading.level,"text":heading.text,"slug":heading.slug,"line":heading.start_line});
+        let bytes = crate::output_budget::escaped_size(&row) + 1;
+        if bytes > outline_bytes {
+            break;
+        }
+        outline_bytes -= bytes;
+        headings.push(row);
+    }
+    // Body allocation is capped at the reader; presentation additionally
+    // reserves escaped bytes before it enters the response JSON.
+    let body = body.map(|text| {
+        let mut used = 2usize;
+        let mut end = 0usize;
+        for (index, ch) in text.char_indices() {
+            let bytes = match ch {
+                '\"' | '\\' => 2,
+                '\u{2028}' | '\u{2029}' => 6,
+                '\n' | '\r' | '\t' => 2,
+                ch if ch < ' ' => 6,
+                ch => ch.len_utf8(),
+            };
+            if used + bytes > 7000 {
+                body_truncated = true;
+                break;
+            }
+            used += bytes;
+            end = index + ch.len_utf8();
+        }
+        text[..end].to_owned()
+    });
 
-    let section_count = sections_raw.len();
-
-    let frontmatter: Value = note
+    let frontmatter_truncated = note
         .frontmatter
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or(json!({}));
+        .as_ref()
+        .is_some_and(|text| text.len() > 4_000);
+    let frontmatter: Value = if frontmatter_truncated {
+        Value::Null
+    } else {
+        note.frontmatter
+            .as_deref()
+            .and_then(|text| serde_json::from_str(text).ok())
+            .unwrap_or(json!({}))
+    };
+    let truncated = body_truncated
+        || frontmatter_truncated
+        || outline_text_truncated
+        || outline_total > headings.len();
 
     Ok(json!({
         "uid": note.uid,
@@ -8570,6 +8985,13 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         "outline": headings,
         "section_count": section_count,
         "body": body,
+        "outline_total": outline_total,
+        "outline_text_truncated": outline_text_truncated,
+        "outline_returned": headings.len(),
+        "body_truncated": body_truncated,
+        "frontmatter_unavailable": if frontmatter_truncated { Some("output_budget") } else { None },
+        "truncated": truncated,
+        "retry": if truncated { Some("Request specific sections by heading or read the source file for the full body/frontmatter. The outline is a bounded document-order prefix.") } else { None },
     }))
 }
 
@@ -8677,14 +9099,29 @@ fn resolve_note_by_title_with(
 
     let hydrate_one =
         |uid: &str| hydrate(uid).with_context(|| format!("hydrate note '{uid}' matched by title"));
-    let hydrate_all = |uids: Vec<String>| -> Result<Vec<nestweaver_schema::Note>, anyhow::Error> {
-        uids.into_iter().map(|uid| hydrate_one(&uid)).collect()
+    let mut all_notes = if looks_like_note_path(trimmed) {
+        store.note_lookup_metadata()
+    } else {
+        store.note_lookup_metadata_by_title(title)
+    }
+    .with_context(|| format!("scan notes while resolving title '{title}'"))?;
+    let hydrate_all = |uids: Vec<String>,
+                       metadata: &[nestweaver_schema::Note]|
+     -> Result<Vec<nestweaver_schema::Note>, anyhow::Error> {
+        uids.iter()
+            .map(|uid| {
+                metadata
+                    .iter()
+                    .find(|note| &note.uid == uid)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow!("matched note '{uid}' vanished from metadata population")
+                    })
+            })
+            .collect()
     };
 
     if looks_like_note_path(trimmed) {
-        let all_notes = store
-            .list_notes_lite(None)
-            .with_context(|| format!("scan notes while resolving path '{trimmed}'"))?;
         let path_uids: Vec<String> = all_notes
             .iter()
             .filter(|n| note_path_matches(&n.file_path, trimmed))
@@ -8696,32 +9133,31 @@ fn resolve_note_by_title_with(
                 return Ok(note_found(hydrate_one(&path_uids[0])?));
             }
             _ => {
-                return Ok(StrictNoteResolve::Ambiguous(hydrate_all(path_uids)?));
+                return Ok(StrictNoteResolve::Ambiguous(hydrate_all(
+                    path_uids, &all_notes,
+                )?));
             }
         }
     }
 
-    let matches = store
-        .lookup_notes_by_title(title)
-        .with_context(|| format!("failed to look up notes with title '{title}'"))?;
+    let matches: Vec<_> = all_notes
+        .iter()
+        .filter(|note| note.title.to_lowercase() == title.to_lowercase())
+        .cloned()
+        .collect();
     match matches.len() {
         0 => {}
         1 => {
-            return Ok(note_found(matches.into_iter().next().unwrap()));
+            return Ok(note_found(hydrate_one(&matches[0].uid)?));
         }
         _ => return Ok(StrictNoteResolve::Ambiguous(matches)),
     }
 
-    // Uses list_notes_lite to avoid loading full note bodies during the scan.
-    //
-    // Propagated, not swallowed. `let Ok(..) else { return Ok(None) }` turned a
-    // failed scan into "no such note", so a store error reached the caller as a
-    // proven absence — and the caller renders that as
-    // "no note found with title '<title>'", which is a claim about the VAULT
-    // made on the strength of a failure to read it.
-    let all_notes = store
-        .list_notes_lite(None)
-        .with_context(|| format!("scan notes while resolving title '{title}'"))?;
+    if !looks_like_note_path(trimmed) {
+        all_notes = store
+            .note_lookup_metadata()
+            .with_context(|| format!("scan notes while resolving title '{title}'"))?;
+    }
     let needle = title.to_lowercase();
     let wanted_slug = slug_normalize(title);
     let stem_of = |path: &str| {
@@ -8737,7 +9173,11 @@ fn resolve_note_by_title_with(
     match title_uids.len() {
         0 => {}
         1 => return Ok(note_found(hydrate_one(&title_uids[0])?)),
-        _ => return Ok(StrictNoteResolve::Ambiguous(hydrate_all(title_uids)?)),
+        _ => {
+            return Ok(StrictNoteResolve::Ambiguous(hydrate_all(
+                title_uids, &all_notes,
+            )?));
+        }
     }
     let stem_uids: Vec<String> = all_notes
         .iter()
@@ -8750,7 +9190,9 @@ fn resolve_note_by_title_with(
     match stem_uids.len() {
         0 => Ok(StrictNoteResolve::NotFound),
         1 => Ok(note_found(hydrate_one(&stem_uids[0])?)),
-        _ => Ok(StrictNoteResolve::Ambiguous(hydrate_all(stem_uids)?)),
+        _ => Ok(StrictNoteResolve::Ambiguous(hydrate_all(
+            stem_uids, &all_notes,
+        )?)),
     }
 }
 
@@ -10976,11 +11418,15 @@ fn tool_brain_impact(
             ));
         }
         StrictNameResolve::Ambiguous(candidates) => {
-            return Ok(nestweaver_schema::responses::impact_ambiguous(
+            let mut payload = nestweaver_schema::responses::impact_ambiguous(
                 symbol,
                 repo,
                 candidates_json(&candidates),
-            ));
+            );
+            payload["candidate_total"] = json!(candidates.len());
+            payload["candidates_returned"] = json!(candidates.len().min(50));
+            payload["truncated"] = json!(candidates.len() > 50);
+            return Ok(payload);
         }
     };
 
@@ -11006,30 +11452,26 @@ fn tool_brain_impact(
     nodes.retain(|node| uid_is_visible(&node.uid));
     let total = nodes.len();
 
-    let rows: Vec<Value> = nodes
-        .iter()
-        .take(limit)
-        .map(|n| {
-            if concise {
-                json!({
-                    "name": n.name,
-                    "depth": n.depth,
-                    "impact_score": n.impact_score,
-                })
-            } else {
-                json!({
-                    "uid": n.uid,
-                    "name": n.name,
-                    "file_path": n.file_path,
-                    "start_line": n.start_line,
-                    "edge_type": n.edge_type,
-                    "confidence": n.confidence,
-                    "depth": n.depth,
-                    "impact_score": n.impact_score,
-                })
-            }
-        })
-        .collect();
+    let rows = bounded_mapped_rows(&nodes[..nodes.len().min(limit)], 8_000, |n| {
+        if concise {
+            json!({
+                "name": n.name,
+                "depth": n.depth,
+                "impact_score": n.impact_score,
+            })
+        } else {
+            json!({
+                "uid": n.uid,
+                "name": n.name,
+                "file_path": n.file_path,
+                "start_line": n.start_line,
+                "edge_type": n.edge_type,
+                "confidence": n.confidence,
+                "depth": n.depth,
+                "impact_score": n.impact_score,
+            })
+        }
+    });
 
     Ok(nestweaver_schema::responses::impact(json!({
         "status": "ok",
@@ -11296,6 +11738,7 @@ fn tool_flow_trace(
         concise,
         cancel,
         visible,
+        budget: std::cell::RefCell::new(FlowBudget::default()),
     };
 
     // Classes don't have CALLS edges — only their methods do. When the root
@@ -11306,94 +11749,38 @@ fn tool_flow_trace(
     // `SymbolKind::Class`. Without this, `flow` on an impl block would return
     // an empty tree instead of one per method.
     if matches!(root.kind, SymbolKind::Class | SymbolKind::Extension) {
-        let direct_callees = store
-            .callees_of(&root.uid)
-            .map_err(|e| anyhow!("callees_of: {e}"))?;
-        let has_visible_direct_callee = direct_callees
-            .iter()
-            .any(|callee| repo_is_visible(&callee.repo_uid, visible));
+        let visibility = match visible {
+            Some(nestweaver_engine::authz::VisibleRepos::Only(repos)) => Some(repos),
+            _ => None,
+        };
+        let has_visible_direct_callee = !store
+            .flow_callees_bounded(&root.uid, 1, visibility)
+            .map_err(|e| anyhow!("callees_of: {e}"))?
+            .0
+            .is_empty();
         if !has_visible_direct_callee {
-            // Prefer MEMBER_OF edges — these correctly scope inner-class methods.
-            let members = store
-                .members_of(&root.uid)
-                .map_err(|e| anyhow!("members_of: {e}"))?;
-
-            let is_method = |s: &nestweaver_schema::Symbol| {
-                s.kind == SymbolKind::Method || s.kind == SymbolKind::Function
-            };
-
-            // nw-390: the THIRD undisclosed cap. The response `note` explained
-            // the class-to-methods expansion and never mentioned that the
-            // expansion stops at 20, so a 60-method class reported 20 methods
-            // with no total and no flag. `methods_total` is captured on both
-            // branches below and published beside `methods`.
             const MAX_METHODS: usize = 20;
-            // Assigned on both branches below, so it is declared without an
-            // initialiser: a placeholder zero here would be a number nobody
-            // computed, which is the shape this fix exists to remove.
-            let methods_total: usize;
-            let method_trees: Vec<Value> = if !members.is_empty() {
-                let methods: Vec<_> = members
-                    .iter()
-                    .filter(|s| is_method(s) && repo_is_visible(&s.repo_uid, visible))
-                    .collect();
-                methods_total = methods.len();
-                methods
-                    .iter()
-                    .take(MAX_METHODS)
-                    .map(|s| {
-                        // Per-method frontier: the methods of one class are
-                        // independent traces and must not consume each other's
-                        // canonical expansions.
-                        let frontier = flow_frontier(store, &s.uid, &blocked, &opts)?;
-                        build_flow_tree(store, &s.uid, &s.name, &s.file_path, 0, &frontier, &opts)
-                    })
-                    .collect::<Result<Vec<Value>, _>>()?
-            } else {
-                // Fallback: line-range heuristic excluding methods inside nested classes.
-                let file_symbols = store
-                    .symbols_in_file(&root.file_path)
-                    .map_err(|e| anyhow!("symbols_in_file: {e}"))?;
-                let nested_class_ranges: Vec<(u32, u32)> = file_symbols
-                    .iter()
-                    .filter(|s| {
-                        s.kind == SymbolKind::Class
-                            && s.uid != root.uid
-                            && repo_is_visible(&s.repo_uid, visible)
-                            && s.start_line > root.start_line
-                            && s.end_line < root.end_line
-                    })
-                    .map(|s| (s.start_line, s.end_line))
-                    .collect();
-                let methods: Vec<_> = file_symbols
-                    .iter()
-                    .filter(|s| {
-                        s.uid != root.uid
-                            && repo_is_visible(&s.repo_uid, visible)
-                            && is_method(s)
-                            && s.start_line > root.start_line
-                            && s.start_line <= root.end_line
-                            && !nested_class_ranges
-                                .iter()
-                                .any(|&(start, end)| s.start_line >= start && s.start_line <= end)
-                    })
-                    .collect();
-                methods_total = methods.len();
-                methods
-                    .iter()
-                    .take(MAX_METHODS)
-                    .map(|s| {
-                        // Per-method frontier: the methods of one class are
-                        // independent traces and must not consume each other's
-                        // canonical expansions.
-                        let frontier = flow_frontier(store, &s.uid, &blocked, &opts)?;
-                        build_flow_tree(store, &s.uid, &s.name, &s.file_path, 0, &frontier, &opts)
-                    })
-                    .collect::<Result<Vec<Value>, _>>()?
-            };
-
+            let (methods, methods_total) = store
+                .flow_methods_bounded(&root, MAX_METHODS, visibility)
+                .map_err(|e| anyhow!("members_of: {e}"))?;
+            let roots: Vec<_> = methods.iter().map(|method| method.uid.as_str()).collect();
+            let frontier = flow_frontier(store, &roots, &blocked, &opts)?;
+            let method_trees: Vec<Value> = methods
+                .iter()
+                .map(|method| {
+                    build_flow_tree(
+                        store,
+                        &method.uid,
+                        &method.name,
+                        &method.file_path,
+                        0,
+                        &frontier,
+                        &opts,
+                    )
+                })
+                .collect::<Result<_, _>>()?;
             let methods_truncated = methods_total > method_trees.len();
-            return Ok(json!({
+            let mut payload = json!({
                 "root_uid": root.uid,
                 "root_name": root.name,
                 "root_kind": "class",
@@ -11417,14 +11804,16 @@ fn tool_flow_trace(
                 "methods_total": methods_total,
                 "methods_truncated": methods_truncated,
                 "methods": method_trees,
-            }));
+            });
+            flow_budget_metadata(&mut payload, &opts);
+            return Ok(payload);
         }
     }
 
     // nw-390: depths BEFORE rendering. See `FlowFrontier` — the render pass
     // can no longer decide which occurrence of a node is the canonical one,
     // because DFS order was exactly what made the answer non-monotone.
-    let frontier = flow_frontier(store, &root.uid, &blocked, &opts)?;
+    let frontier = flow_frontier(store, &[root.uid.as_str()], &blocked, &opts)?;
     let tree = build_flow_tree(
         store,
         &root.uid,
@@ -11435,12 +11824,14 @@ fn tool_flow_trace(
         &opts,
     )?;
 
-    Ok(json!({
+    let mut payload = json!({
         "root_uid": root.uid,
         "root_name": root.name,
         "max_depth": max_depth,
         "tree": tree,
-    }))
+    });
+    flow_budget_metadata(&mut payload, &opts);
+    Ok(payload)
 }
 
 /// Configuration for `build_flow_tree` to keep the argument count under
@@ -11457,6 +11848,32 @@ struct FlowTraceOpts<'a> {
     /// silently deleted subtree is `children: []`, which is exactly the
     /// "indistinguishable from a leaf" defect the rest of this function fixes.
     visible: Option<&'a nestweaver_engine::authz::VisibleRepos>,
+    budget: std::cell::RefCell<FlowBudget>,
+}
+
+struct FlowBudget {
+    edges: usize,
+    reads: usize,
+    render_bytes: usize,
+    expanded: HashSet<String>,
+    cut: bool,
+}
+impl Default for FlowBudget {
+    fn default() -> Self {
+        Self {
+            edges: 96,
+            reads: 64,
+            render_bytes: 14_000,
+            expanded: HashSet::new(),
+            cut: false,
+        }
+    }
+}
+fn flow_budget_metadata(payload: &mut Value, opts: &FlowTraceOpts<'_>) {
+    if opts.budget.borrow().cut {
+        payload["truncated"] = json!(true);
+        payload["work_budget"] = json!({"nodes":64,"edges":96,"adjacency_reads":64,"render_bytes":14_000,"omitted_count":"lower_bound_or_unknown","retry":"Trace a retained child UID to continue. Shared nodes expand once across all class methods."});
+    }
 }
 
 /// nw-390: the depth at which each reachable node is EXPANDED, computed
@@ -11503,6 +11920,8 @@ struct FlowFrontier {
     /// by construction: a concurrent write between them cannot hand the
     /// renderer an edge the depths were never computed over.
     callees: HashMap<String, Vec<(nestweaver_schema::Symbol, String)>>,
+    redacted: HashMap<String, usize>,
+    cut: HashMap<String, usize>,
 }
 
 /// One callee read, plus the cancellation check that must precede it.
@@ -11515,7 +11934,7 @@ fn read_flow_callees(
     store: &GraphStore,
     uid: &str,
     opts: &FlowTraceOpts<'_>,
-) -> Result<Vec<(nestweaver_schema::Symbol, String)>, anyhow::Error> {
+) -> Result<(Vec<(nestweaver_schema::Symbol, String)>, usize, bool, usize), anyhow::Error> {
     if opts
         .cancel
         .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
@@ -11527,12 +11946,20 @@ fn read_flow_callees(
             nestweaver_store::CancelReason::Timeout,
         )));
     }
-    store.callees_with_edge_types_of(uid).map_err(|error| {
-        anyhow::anyhow!(
-            "flow_trace: could not read the callees of {uid}: {error}. Refusing to \
-             report an empty call tree, which is indistinguishable from a leaf."
-        )
-    })
+    let mut budget = opts.budget.borrow_mut();
+    if budget.reads == 0 {
+        budget.cut = true;
+        return Ok((Vec::new(), 0, true, 0));
+    }
+    budget.reads -= 1;
+    let visible = match opts.visible {
+        Some(nestweaver_engine::authz::VisibleRepos::Only(repos)) => Some(repos),
+        _ => None,
+    };
+    let (rows,redacted,cut) = store.flow_callees_bounded(uid,budget.edges,visible).map_err(|error| anyhow!("flow_trace: could not read the callees of {uid}: {error}. Refusing to report an empty call tree, which is indistinguishable from a leaf."))?;
+    budget.edges = budget.edges.saturating_sub(rows.len());
+    budget.cut |= cut;
+    Ok((rows, redacted, cut, usize::from(cut)))
 }
 
 /// Compute the [`FlowFrontier`] for one trace root.
@@ -11544,15 +11971,22 @@ fn read_flow_callees(
 /// a re-descent, which is what seeding the old `visited` set did.
 fn flow_frontier(
     store: &GraphStore,
-    root_uid: &str,
+    root_uids: &[&str],
     blocked: &HashSet<String>,
     opts: &FlowTraceOpts<'_>,
 ) -> Result<FlowFrontier, anyhow::Error> {
     let mut depths: HashMap<String, usize> =
         blocked.iter().map(|uid| (uid.clone(), 0usize)).collect();
-    depths.insert(root_uid.to_string(), 0);
+    for root in root_uids {
+        depths.insert((*root).to_owned(), 0);
+    }
     let mut callees: HashMap<String, Vec<(nestweaver_schema::Symbol, String)>> = HashMap::new();
-    let mut queue = std::collections::VecDeque::from([(root_uid.to_string(), 0usize)]);
+    let mut queue: std::collections::VecDeque<_> = root_uids
+        .iter()
+        .map(|root| ((*root).to_owned(), 0usize))
+        .collect();
+    let mut redacted = HashMap::new();
+    let mut cut = HashMap::new();
     while let Some((uid, depth)) = queue.pop_front() {
         // A node ON the cap is rendered but not expanded, so its callees are
         // read by the render pass instead — where they are COUNTED into
@@ -11561,7 +11995,11 @@ fn flow_frontier(
         if depth >= opts.max_depth {
             continue;
         }
-        let rows = read_flow_callees(store, &uid, opts)?;
+        let (rows, hidden, stopped, lower_bound) = read_flow_callees(store, &uid, opts)?;
+        redacted.insert(uid.clone(), hidden);
+        if stopped {
+            cut.insert(uid.clone(), lower_bound);
+        }
         for (callee, _) in &rows {
             // nw-403: a callee in a repository this caller cannot see never
             // enters the frontier, so it can neither be expanded nor claim a
@@ -11575,12 +12013,22 @@ fn flow_frontier(
             if depths.contains_key(&callee.uid) {
                 continue;
             }
+            if depths.len() >= 64 || queue.len() >= 64 {
+                opts.budget.borrow_mut().cut = true;
+                *cut.entry(uid.clone()).or_default() += 1;
+                continue;
+            }
             depths.insert(callee.uid.clone(), depth + 1);
             queue.push_back((callee.uid.clone(), depth + 1));
         }
         callees.insert(uid, rows);
     }
-    Ok(FlowFrontier { depths, callees })
+    Ok(FlowFrontier {
+        depths,
+        callees,
+        redacted,
+        cut,
+    })
 }
 
 fn build_flow_tree(
@@ -11616,20 +12064,21 @@ fn build_flow_tree(
     // complaint — and it is the ONLY read this pass still performs, because
     // `flow_frontier` already read every node it expands. A node on the cap is
     // the one case the frontier pass deliberately skipped.
+    opts.budget.borrow_mut().expanded.insert(uid.to_owned());
     let fetched;
-    let rows: &[(nestweaver_schema::Symbol, String)] = match frontier.callees.get(uid) {
-        Some(rows) => rows,
+    let (rows, children_redacted, work_cut, cut_lower_bound) = match frontier.callees.get(uid) {
+        Some(rows) => (
+            rows.as_slice(),
+            frontier.redacted.get(uid).copied().unwrap_or(0),
+            frontier.cut.contains_key(uid),
+            frontier.cut.get(uid).copied().unwrap_or(0),
+        ),
         None => {
             fetched = read_flow_callees(store, uid, opts)?;
-            &fetched
+            (fetched.0.as_slice(), fetched.1, fetched.2, fetched.3)
         }
     };
-    // nw-403: attribute before anything is rendered or counted, so a hidden
-    // callee contributes to `children_redacted` and to nothing else.
-    let (callees, redacted): (Vec<_>, Vec<_>) = rows
-        .iter()
-        .partition(|(callee, _)| repo_is_visible(&callee.repo_uid, opts.visible));
-    let children_redacted = redacted.len();
+    let callees: Vec<_> = rows.iter().collect();
 
     if depth >= opts.max_depth {
         // The cap fired. Say so, and say how many callees it hid — previously
@@ -11637,8 +12086,22 @@ fn build_flow_tree(
         truncated_at_depth = !callees.is_empty();
         children_omitted = callees.len();
     } else {
-        for (callee, edge_type) in callees {
-            if frontier.depths.get(&callee.uid) != Some(&(depth + 1)) {
+        for (index, (callee, edge_type)) in callees.iter().enumerate() {
+            // Reserve the largest detailed/stub representation before adding
+            // another rendered node or descending into its subtree.
+            let cost = crate::output_budget::escaped_size(
+                &json!({"uid":callee.uid,"name":callee.name,"file_path":callee.file_path,"repo_uid":callee.repo_uid,"deduped_ref":callee.uid,"edge_type":edge_type,"depth":depth+1,"children":[]}),
+            ) + 160;
+            let mut budget = opts.budget.borrow_mut();
+            if cost > budget.render_bytes {
+                budget.cut = true;
+                children_omitted += callees.len() - index;
+                break;
+            }
+            budget.render_bytes -= cost;
+            let expanded = budget.expanded.contains(&callee.uid);
+            drop(budget);
+            if frontier.depths.get(&callee.uid) != Some(&(depth + 1)) || expanded {
                 // nw-390, THE non-monotonicity. The traversal's visited set
                 // was GLOBAL, so a callee claimed by an earlier branch was
                 // dropped from every later parent with no marker at all —
@@ -11711,10 +12174,17 @@ fn build_flow_tree(
         let Some(object) = node.as_object_mut() else {
             return;
         };
+        if work_cut {
+            object.insert(
+                "children_omitted_lower_bound".into(),
+                json!(cut_lower_bound + children_omitted),
+            );
+            object.insert("children_omitted_unknown".into(), json!(true));
+        }
         if truncated_at_depth {
             object.insert("truncated_at_depth".to_string(), json!(true));
         }
-        if children_omitted > 0 {
+        if children_omitted > 0 && !work_cut {
             object.insert("children_omitted".to_string(), json!(children_omitted));
         }
         if children_redacted > 0 {
@@ -12327,7 +12797,7 @@ pub const CLUSTERS_MEMBERS_MAX: usize = 200;
 fn tool_schema_clusters() -> Value {
     json!({
         "name": "clusters",
-        "description": "View the codebase's high-level architecture via Louvain-style local moving community detection. Groups tightly-connected symbols into named functional clusters.\n\nGuidelines:\n- Adjust resolution: higher = more smaller clusters, lower = fewer larger clusters (default 0.5)\n- Returns cluster name, cohesion score, key files, and a 20-member preview per cluster (full `size` reported)\n- Pass cluster_id to get ONE cluster's full member list (paging deep clusters); `members_truncated` flags when even that is capped\n- For specific symbol lookup use brain_search; for dependency analysis use brain_impact\n\nLimitations:\n- Clustering is recomputed on each call (the result is persisted to a sidecar cache that the CLI `cluster` command reads)\n- Quality depends on the density and accuracy of indexed call/import edges",
+        "description": "View the codebase's high-level architecture via Louvain-style local moving community detection. Groups tightly-connected symbols into named functional clusters.\n\nGuidelines:\n- Adjust resolution: higher = more smaller clusters, lower = fewer larger clusters (default 0.5)\n- Returns cluster name, cohesion score, key files, and a 20-member preview per cluster (full `size` reported)\n- Pass cluster_id for a bounded member page; follow next_member_offset with expected_generation and page_token. Listings use next_cluster_offset. `members_truncated` reports remaining membership\n- For specific symbol lookup use brain_search; for dependency analysis use brain_impact\n\nLimitations:\n- Clustering is recomputed on each call (the result is persisted to a sidecar cache that the CLI `cluster` command reads)\n- Quality depends on the density and accuracy of indexed call/import edges",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -12352,7 +12822,7 @@ fn tool_schema_clusters() -> Value {
                 // CLI twin's existing defaults, not new numbers; any others
                 // would be a THIRD set for one concept.
                 "limit": limit_schema(
-                    "Max clusters to return (0 = all, default 50). `total`/`returned`/`truncated` always report what was dropped.",
+                    "Max clusters to return (0 uses bounded default 50; explicit valid limits are honored within the page byte budget). `total`/`returned`/`truncated` always report what was dropped.",
                     50,
                     0,
                     CLUSTERS_LIMIT_MAX,
@@ -12362,14 +12832,18 @@ fn tool_schema_clusters() -> Value {
                 // extra steps. The documented way to page INTO one cluster is
                 // `cluster_id`, which this bound does not touch.
                 "members": limit_schema(
-                    "Max members previewed per cluster in the multi-cluster listing (0 = all, default 20). Ignored when `cluster_id` is set — that path returns the cluster's full member list, capped at 2000.",
+                    "Max members per cluster page (0 uses bounded default 20; maximum 200). Applies to cluster_id too; byte reservations may return fewer.",
                     20,
                     0,
                     CLUSTERS_MEMBERS_MAX,
                 ),
+                "cluster_offset":{"type":"integer","minimum":0,"description":"Listing page offset; use next_cluster_offset with expected_generation and page_token."},
+                "page_token":{"type":"string","description":"Scope/resolution binding from prior page; required with a nonzero cluster_offset or member_offset."},
+                "member_offset":{"type":"integer","minimum":0,"description":"Offset in UID-sorted membership of cluster_id. Use next_member_offset with identical repos/resolution and expected_generation."},
+                "expected_generation":{"type":"integer","minimum":0,"description":"Reject continuation when graph generation changed; use graph_generation from prior page."},
                 "cluster_id": {
                     "type": "integer",
-                    "description": "Return only this cluster (by its numeric `id`), with its FULL member list instead of the preview. Use the same resolution as the call that produced the id."
+                    "description": "Return only this cluster (by its numeric `id`), with a bounded member page. Use the same resolution as the call that produced the id."
                 },
                 // nw-479. Sibling of `hub_nodes`/`bridge_nodes`'s `repos`: an
                 // optional repo scope so an architecture question about ONE
@@ -12446,13 +12920,126 @@ fn cluster_community_json(
     })
 }
 
+fn mcp_cluster_page(
+    c: &nestweaver_engine::CommunityInfo,
+    members: usize,
+    offset: usize,
+) -> Result<Value, anyhow::Error> {
+    anyhow::ensure!(
+        offset <= c.members.len(),
+        "member_offset exceeds this cluster's membership; restart the listing"
+    );
+    let tail = &c.members[offset..];
+    let rows = bounded_typed_rows(&tail[..tail.len().min(members)], 3000)?;
+    let next = offset.saturating_add(rows.len());
+    Ok(
+        json!({"id":c.id,"name":c.name,"size":c.member_count,"cohesion":c.cohesion,
+            "key_files":bounded_typed_rows(&c.key_files,1000)?,"members":rows,
+            "returned_members":rows.len(),"members_truncated":next<c.members.len(),
+            "member_offset":offset,"next_member_offset":if next<c.members.len() && !rows.is_empty() {Some(next)} else {None},
+            "members_omitted":c.members.len().saturating_sub(rows.len()),
+            "retry_guidance":if next<c.members.len() {Some("Query this cluster_id with next_member_offset, the same repos/resolution, and expected_generation. If no member fits, narrow the scope.")} else {None},
+        }),
+    )
+}
+
+fn mcp_clusters_rows(
+    communities: &mut [nestweaver_engine::CommunityInfo],
+    id: Option<i64>,
+    limit: usize,
+    members: usize,
+    offset: usize,
+    cluster_offset: usize,
+) -> Result<(Vec<Value>, usize), anyhow::Error> {
+    let total = communities
+        .iter()
+        .filter(|c| id.is_none_or(|id| c.id as i64 == id))
+        .count();
+    let mut rows = Vec::new();
+    let mut remaining = 16_000usize;
+    for c in communities
+        .iter_mut()
+        .filter(|c| id.is_none_or(|id| c.id as i64 == id))
+        .skip(cluster_offset)
+        .take(limit)
+    {
+        // Sort owned analysis membership in place: no second full population
+        // allocation, stable pages across unchanged generation/scope/resolution.
+        c.members.sort_by(|a, b| a.uid.cmp(&b.uid));
+        let row = mcp_cluster_page(c, members, offset)?;
+        let cost = crate::output_budget::escaped_size(&row) + 1;
+        if cost > remaining {
+            break;
+        }
+        remaining -= cost;
+        rows.push(row);
+    }
+    Ok((rows, total))
+}
+
+fn bind_cluster_page(
+    payload: &mut Value,
+    args: &Value,
+    generation: u64,
+    continuation: bool,
+) -> Result<(), anyhow::Error> {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    generation.hash(&mut hash);
+    payload["resolution"].to_string().hash(&mut hash);
+    payload["scope"].to_string().hash(&mut hash);
+    let token = format!("nw-clusters-v1:{:016x}", hash.finish());
+    if continuation && args.get("page_token").and_then(Value::as_str) != Some(token.as_str()) {
+        anyhow::bail!(
+            "cluster continuation scope/resolution token changed or missing; restart the listing"
+        );
+    }
+    payload["page_token"] = json!(token);
+    Ok(())
+}
+
 fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    let limit = read_limit(&args, "limit", 50, 0, CLUSTERS_LIMIT_MAX)?;
-    let preview_members = read_limit(&args, "members", 20, 0, CLUSTERS_MEMBERS_MAX)?;
+    let requested_limit = read_limit(&args, "limit", 50, 0, CLUSTERS_LIMIT_MAX)?;
+    let limit = if requested_limit == 0 {
+        50
+    } else {
+        requested_limit
+    };
+    let requested_members = read_limit(&args, "members", 20, 0, CLUSTERS_MEMBERS_MAX)?;
+    let preview_members = if requested_members == 0 {
+        20
+    } else {
+        requested_members.min(200)
+    };
+    let offset = read_limit(&args, "member_offset", 0, 0, 1_000_000_000)?;
+    if args
+        .get("expected_generation")
+        .and_then(Value::as_u64)
+        .is_some_and(|g| g != store.graph_generation())
+    {
+        anyhow::bail!("cluster continuation generation changed; restart the listing");
+    }
     // nw-090: `cluster_id` pages the FULL membership of a single cluster. Without
     // it, every cluster returns a 20-member preview (`size` still reports the true
     // count), which made large clusters' membership unretrievable from the tool.
     let requested_id = args.get("cluster_id").and_then(|v| v.as_i64());
+    let cluster_offset = read_limit(&args, "cluster_offset", 0, 0, 1_000_000_000)?;
+    if (offset > 0 || cluster_offset > 0)
+        && args
+            .get("expected_generation")
+            .and_then(Value::as_u64)
+            .is_none()
+    {
+        anyhow::bail!(
+            "cluster continuation requires expected_generation; restart from the first page"
+        );
+    }
+    if cluster_offset > 0 && requested_id.is_some() {
+        anyhow::bail!("cluster_offset is for listings; use member_offset with cluster_id");
+    }
+    if offset > 0 && requested_id.is_none() {
+        anyhow::bail!("member_offset requires cluster_id");
+    }
     let resolution_arg = args.get("resolution").and_then(|v| v.as_f64());
 
     // nw-479: an explicit `repos` scope takes a COMPLETELY separate path —
@@ -12470,17 +13057,18 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         )?;
         // No `.context()`: the outermost message is what a client renders,
         // and wrapping here hid an unresolved repo's class and candidates.
-        let scoped = nestweaver_engine::compute_clusters_scoped(store, &selectors, resolution_arg)?;
+        let mut scoped =
+            nestweaver_engine::compute_clusters_scoped(store, &selectors, resolution_arg)?;
 
         require_cluster(requested_id, &scoped.communities)?;
-        let matching: Vec<&nestweaver_engine::CommunityInfo> = scoped
-            .communities
-            .iter()
-            .filter(|c| requested_id.is_none_or(|id| c.id as i64 == id))
-            .collect();
-        let bounded = Bounded::take(matching, limit)
-            .map(|c| cluster_community_json(c, requested_id, preview_members));
-
+        let (rows, total) = mcp_clusters_rows(
+            &mut scoped.communities,
+            requested_id,
+            limit,
+            preview_members,
+            offset,
+            cluster_offset,
+        )?;
         let symbol_count: usize = scoped.communities.iter().map(|c| c.member_count).sum();
         let mut payload = json!({
             "resolution": scoped.resolution,
@@ -12494,7 +13082,25 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
                 "id_space": scoped.scope.id_space,
             },
         });
-        bounded.merge_into(&mut payload, "clusters");
+        payload["clusters"] = json!(rows);
+        payload["total"] = json!(total);
+        payload["returned"] = json!(rows.len());
+        payload["truncated"] =
+            json!(rows.len() < total || rows.iter().any(|c| c["members_truncated"] == true));
+        payload["graph_generation"] = json!(store.graph_generation());
+        payload["cluster_offset"] = json!(cluster_offset);
+        payload["next_cluster_offset"] =
+            json!(if cluster_offset + rows.len() < total && !rows.is_empty() {
+                Some(cluster_offset + rows.len())
+            } else {
+                None
+            });
+        bind_cluster_page(
+            &mut payload,
+            &args,
+            store.graph_generation(),
+            offset > 0 || cluster_offset > 0,
+        )?;
         return Ok(payload);
     }
 
@@ -12506,7 +13112,7 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
     let resolution =
         resolution_arg.unwrap_or_else(|| nestweaver_engine::default_cluster_resolution(store));
 
-    let output = compute_clusters(store, resolution).context("compute_clusters")?;
+    let mut output = compute_clusters(store, resolution).context("compute_clusters")?;
 
     // Persist so hub_nodes/bridge_nodes can read the sidecar afterwards.
     // Deliberate exception to "reads don't write": `clusters` is not in
@@ -12524,14 +13130,26 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
     // nw-646 parity: this tool ALWAYS computes fresh (never reads the sidecar
     // back), so `cached` is always `false` here — only the CLI's own
     // cache-reuse gate can ever set it `true`.
-    Ok(clusters_payload(
-        &output,
+    let (rows, total) = mcp_clusters_rows(
+        &mut output.communities,
+        requested_id,
         limit,
         preview_members,
-        Some(store.graph_generation()),
-        false,
-        requested_id,
-    ))
+        offset,
+        cluster_offset,
+    )?;
+    let mut payload = json!({"resolution":output.resolution,"cluster_count":output.communities.len(),
+        "symbol_count":output.communities.iter().map(|c|c.member_count).sum::<usize>(),
+        "modularity":output.modularity,"limit":limit,"graph_generation":store.graph_generation(),"cached":false,
+        "clusters":rows,"total":total,"returned":rows.len(),"truncated":rows.len()<total || rows.iter().any(|c|c["members_truncated"]==true),
+        "cluster_offset":cluster_offset,"next_cluster_offset":if cluster_offset+rows.len()<total && !rows.is_empty() {Some(cluster_offset+rows.len())} else {None}});
+    bind_cluster_page(
+        &mut payload,
+        &args,
+        store.graph_generation(),
+        offset > 0 || cluster_offset > 0,
+    )?;
+    Ok(payload)
 }
 
 /// `cluster_id` is a lookup by identifier: an id no community has is a miss
@@ -14076,6 +14694,8 @@ fn tool_project_context(
     // concise drops the machine id (uid) and the relevance score in favor of the semantic
     // fields an agent orients with (kind/title/location); detailed keeps the full record.
     let render_node = |n: &nestweaver_engine::BrainNode| -> Value {
+        #[cfg(test)]
+        project_render_observer::rendered();
         let mut row = if concise {
             json!({
                 "kind": n.kind,
@@ -14204,84 +14824,129 @@ fn tool_project_context(
         })
     };
     if !has_category("Note") || !has_category("Symbol") {
-        let candidates: Vec<_> = result
-            .connected
-            .iter()
-            .filter(|node| node.kind.starts_with("Note") || node.kind.starts_with("Symbol"))
-            .map(|node| {
-                let row = render_node(node);
-                let bytes = serde_json::to_vec(&row)?.len();
-                Ok((
-                    node.kind.starts_with("Note"),
-                    render_cost(node, concise),
-                    row,
-                    bytes,
-                ))
-            })
-            .collect::<Result<Vec<_>, anyhow::Error>>()?;
-        if candidates.iter().any(|(note, _, _, _)| *note)
-            && candidates.iter().any(|(note, _, _, _)| !*note)
-        {
-            let mut pair_response = resp.clone();
-            // A smaller pair may recover an irreducible-overhead first attempt.
-            pair_response.as_object_mut().unwrap().remove("budget_note");
-            pair_response["connected"] = json!([]);
-            pair_response["tokens_used"] = json!(0);
-            pair_response["budget_exceeded"] = json!(false);
-            pair_response["more_available"] = json!(result.connected.len().saturating_sub(2));
-            pair_response["truncated"] = json!(result.connected.len() > 2);
-            pair_response["truncated_by"] = if result.connected.len() > 2 {
-                json!("token_budget")
-            } else {
-                Value::Null
-            };
-            let base_bytes = serde_json::to_vec(&pair_response)?.len();
-            let note_indices: Vec<_> = candidates
+        let check_cancel = || -> Result<(), anyhow::Error> {
+            if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+                return Err(nestweaver_store::StoreError::Cancelled(
+                    nestweaver_store::CancelReason::Timeout,
+                )
+                .into());
+            }
+            Ok(())
+        };
+        check_cancel()?;
+        let mut pair_response = resp.clone();
+        pair_response.as_object_mut().unwrap().remove("budget_note");
+        pair_response["connected"] = json!([]);
+        pair_response["tokens_used"] = json!(0);
+        pair_response["budget_exceeded"] = json!(false);
+        pair_response["more_available"] = json!(result.connected.len().saturating_sub(2));
+        pair_response["truncated"] = json!(result.connected.len() > 2);
+        pair_response["truncated_by"] = if result.connected.len() > 2 {
+            json!("token_budget")
+        } else {
+            Value::Null
+        };
+        let base_bytes = serde_json::to_vec(&pair_response)?.len();
+        let minimum = |category: &str| {
+            result
+                .connected
                 .iter()
-                .enumerate()
-                .filter(|(_, row)| row.0)
-                .map(|(index, _)| index)
-                .collect();
-            let code_indices: Vec<_> = candidates
+                .filter(|n| n.kind.starts_with(category))
+                .map(|n| {
+                    (
+                        render_cost(n, concise),
+                        n.title
+                            .len()
+                            .saturating_add(n.location.len())
+                            .saturating_add(n.kind.len()),
+                    )
+                })
+                .fold(None, |best: Option<(usize, usize)>, (cost, bytes)| {
+                    Some(best.map_or((cost, bytes), |(a, b)| (a.min(cost), b.min(bytes))))
+                })
+        };
+        let can_fit = match (minimum("Note"), minimum("Symbol")) {
+            (Some((note_cost, note_bytes)), Some((code_cost, code_bytes))) => {
+                note_cost.saturating_add(code_cost) <= remaining_budget
+                    && base_bytes
+                        .saturating_add(note_bytes)
+                        .saturating_add(code_bytes)
+                        .saturating_add(1)
+                        <= token_budget.saturating_mul(4)
+            }
+            _ => false,
+        };
+        if can_fit {
+            #[cfg(test)]
+            let _fallback_observer_phase = project_render_observer::Fallback::enter();
+            let candidates: Vec<_> = result
+                .connected
                 .iter()
-                .enumerate()
-                .filter(|(_, row)| !row.0)
-                .map(|(index, _)| index)
-                .collect();
-            let mut selected = None;
-            'pairs: for (first, (note, cost, _, bytes)) in candidates.iter().enumerate() {
-                if *cost > remaining_budget || *bytes > token_budget.saturating_mul(4) {
-                    continue;
-                }
-                let opposite = if *note { &code_indices } else { &note_indices };
-                for second in opposite.iter().copied().filter(|second| *second > first) {
-                    let (_, other_cost, _, other_bytes) = &candidates[second];
-                    if cost.saturating_add(*other_cost) > remaining_budget {
+                .filter(|node| node.kind.starts_with("Note") || node.kind.starts_with("Symbol"))
+                .map(|node| {
+                    check_cancel()?;
+                    let row = render_node(node);
+                    check_cancel()?;
+                    let bytes = serde_json::to_vec(&row)?.len();
+                    Ok((
+                        node.kind.starts_with("Note"),
+                        render_cost(node, concise),
+                        row,
+                        bytes,
+                    ))
+                })
+                .collect::<Result<Vec<_>, anyhow::Error>>()?;
+            if candidates.iter().any(|(note, _, _, _)| *note)
+                && candidates.iter().any(|(note, _, _, _)| !*note)
+            {
+                let note_indices: Vec<_> = candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| row.0)
+                    .map(|(index, _)| index)
+                    .collect();
+                let code_indices: Vec<_> = candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| !row.0)
+                    .map(|(index, _)| index)
+                    .collect();
+                let mut selected = None;
+                'pairs: for (first, (note, cost, _, bytes)) in candidates.iter().enumerate() {
+                    check_cancel()?;
+                    if *cost > remaining_budget || *bytes > token_budget.saturating_mul(4) {
                         continue;
                     }
-                    // [] becomes [row,row]; tokens_used replaces its initial 0.
-                    let payload_bytes = base_bytes
-                        .saturating_add(*bytes)
-                        .saturating_add(*other_bytes)
-                        .saturating_add(1);
-                    let mut tokens = payload_bytes.div_ceil(4);
-                    for _ in 0..4 {
-                        tokens = (payload_bytes - 1 + tokens.to_string().len()).div_ceil(4);
-                    }
-                    if tokens <= token_budget {
-                        selected = Some((first, second));
-                        break 'pairs;
+                    let opposite = if *note { &code_indices } else { &note_indices };
+                    for second in opposite.iter().copied().filter(|second| *second > first) {
+                        check_cancel()?;
+                        let (_, other_cost, _, other_bytes) = &candidates[second];
+                        if cost.saturating_add(*other_cost) > remaining_budget {
+                            continue;
+                        }
+                        // [] becomes [row,row]; tokens_used replaces its initial 0.
+                        let payload_bytes = base_bytes
+                            .saturating_add(*bytes)
+                            .saturating_add(*other_bytes)
+                            .saturating_add(1);
+                        let mut tokens = payload_bytes.div_ceil(4);
+                        for _ in 0..4 {
+                            tokens = (payload_bytes - 1 + tokens.to_string().len()).div_ceil(4);
+                        }
+                        if tokens <= token_budget {
+                            selected = Some((first, second));
+                            break 'pairs;
+                        }
                     }
                 }
-            }
-            if let Some((first, second)) = selected {
-                pair_response["connected"] = json!([candidates[first].2, candidates[second].2]);
-                finalize_project_budget(&mut pair_response)?;
-                resp = pair_response;
+                if let Some((first, second)) = selected {
+                    pair_response["connected"] = json!([candidates[first].2, candidates[second].2]);
+                    finalize_project_budget(&mut pair_response)?;
+                    resp = pair_response;
+                }
             }
         }
     }
-
     Ok(resp)
 }
 
@@ -15094,10 +15759,69 @@ fn tool_blast_radius(
         .and_then(|v| v.as_str())
         .unwrap_or("json");
     if format == "sarif" {
-        return Ok(nestweaver_engine::blast_radius_to_sarif(
-            &result,
-            env!("CARGO_PKG_VERSION"),
-        ));
+        // Bound the typed populations before SARIF allocates locations,
+        // messages, notification objects and namespaced metadata.
+        let mut omitted = serde_json::Map::new();
+        for (field, count) in [
+            (
+                "affected_symbols",
+                retain_serialized_prefix(&mut result.affected_symbols, 2000)?,
+            ),
+            (
+                "notifications",
+                retain_serialized_prefix(&mut result.notifications, 1000)?,
+            ),
+            (
+                "coverage.repos_in_scope",
+                retain_serialized_prefix(&mut result.coverage.repos_in_scope, 500)?,
+            ),
+            (
+                "coverage.repos_not_indexed",
+                retain_serialized_prefix(&mut result.coverage.repos_not_indexed, 500)?,
+            ),
+            (
+                "coverage.stale_repos",
+                retain_serialized_prefix(&mut result.coverage.stale_repos, 500)?,
+            ),
+            (
+                "blind_spots",
+                retain_serialized_prefix(&mut result.blind_spots, 1000)?,
+            ),
+        ] {
+            if count > 0 {
+                omitted.insert(field.into(), json!(count));
+            }
+        }
+        if bounded_metadata(&result.org_wide, 1000)?.is_none() {
+            result.org_wide = None;
+            omitted.insert("org_wide".into(), json!("unavailable"));
+        }
+        let direction = bounded_source_text(&result.analysis_direction, 1000);
+        if direction.len() < result.analysis_direction.len() {
+            omitted.insert(
+                "analysis_direction_bytes".into(),
+                json!(result.analysis_direction.len() - direction.len()),
+            );
+        }
+        result.analysis_direction = direction;
+        let summary = bounded_source_text(&result.summary, 1000);
+        if summary.len() < result.summary.len() {
+            omitted.insert(
+                "summary_bytes".into(),
+                json!(result.summary.len() - summary.len()),
+            );
+        }
+        result.summary = summary;
+        let mut sarif =
+            nestweaver_engine::blast_radius_to_sarif(&result, env!("CARGO_PKG_VERSION"));
+        if !omitted.is_empty() {
+            sarif["runs"][0]["properties"]["nestweaver/outputTruncated"] = json!(true);
+            sarif["runs"][0]["properties"]["nestweaver/outputOmitted"] = json!(omitted);
+            sarif["runs"][0]["properties"]["nestweaver/retryGuidance"] = json!(
+                "Narrow changed files and retry. Assessment status/gate are preserved; emitted locations and metadata are incomplete."
+            );
+        }
+        return Ok(sarif);
     }
 
     let risk_str = match result.risk_level {
@@ -15107,92 +15831,161 @@ fn tool_blast_radius(
         nestweaver_engine::RiskLevel::Unknown => "unknown",
     };
 
-    let changed_json: Vec<Value> = result
-        .changed_symbols
-        .iter()
-        .map(|s| {
-            json!({
-                "uid": s.uid,
-                "name": s.name,
-                "file_path": s.file_path,
-                "kind": s.kind,
-                "pagerank_score": s.pagerank_score,
-            })
+    let changed_json = bounded_mapped_rows(&result.changed_symbols, 2000, |s| {
+        json!({
+            "uid": s.uid,
+            "name": s.name,
+            "file_path": s.file_path,
+            "kind": s.kind,
+            "pagerank_score": s.pagerank_score,
         })
-        .collect();
+    });
 
-    let affected_json: Vec<Value> = result
-        .affected_symbols
-        .iter()
-        .map(|s| {
-            json!({
-                "uid": s.uid,
-                "name": s.name,
-                "file_path": s.file_path,
-                "depth": s.depth,
-                "edge_type": s.edge_type,
-                "confidence": s.confidence,
-                "impact_score": s.impact_score,
-            })
+    let affected_json = bounded_mapped_rows(&result.affected_symbols, 2000, |s| {
+        json!({
+            "uid": s.uid,
+            "name": s.name,
+            "file_path": s.file_path,
+            "depth": s.depth,
+            "edge_type": s.edge_type,
+            "confidence": s.confidence,
+            "impact_score": s.impact_score,
         })
-        .collect();
+    });
 
-    let clusters_json: Vec<Value> = result
-        .affected_clusters
-        .iter()
-        .map(|c| {
-            json!({
-                "id": c.id,
-                "name": c.name,
-                "affected_count": c.affected_count,
-                "total_count": c.total_count,
-                "cohesion": c.cohesion,
-            })
+    let clusters_json = bounded_mapped_rows(&result.affected_clusters, 1000, |c| {
+        json!({
+            "id": c.id,
+            "name": c.name,
+            "affected_count": c.affected_count,
+            "total_count": c.total_count,
+            "cohesion": c.cohesion,
         })
-        .collect();
+    });
 
     // Trust signals: whether the analysis ran to completion, the gate verdict
     // (never RiskFlagged from a degraded run), and machine-readable reasons.
-    let notifications_json: Vec<Value> = result
-        .notifications
-        .iter()
-        .map(|n| serde_json::to_value(n).unwrap_or(Value::Null))
-        .collect();
-    let status_json = serde_json::to_value(result.status).unwrap_or(Value::Null);
-    let gate_state_json = serde_json::to_value(result.gate_state).unwrap_or(Value::Null);
-
-    // Coverage & blind spots: which repos were in scope/stale/not-indexed,
-    // whether the traversal was truncated, and the static-analysis gaps — so a
-    // consumer can tell "no impact" from "incomplete coverage".
-    let coverage_json = serde_json::to_value(&result.coverage).unwrap_or(Value::Null);
-    let blind_spots_json = serde_json::to_value(&result.blind_spots).unwrap_or(Value::Null);
+    let notifications_json = bounded_typed_rows(&result.notifications, 1000)?;
+    let status_json = serde_json::to_value(result.status)?;
+    let gate_state_json = serde_json::to_value(result.gate_state)?;
+    let coverage_json = json!({
+        "repos_in_scope":bounded_typed_rows(&result.coverage.repos_in_scope,500)?,
+        "repos_not_indexed":bounded_typed_rows(&result.coverage.repos_not_indexed,500)?,
+        "stale_repos":bounded_typed_rows(&result.coverage.stale_repos,500)?,
+        "traversal_truncated":result.coverage.traversal_truncated,
+        "repos_in_scope_total":result.coverage.repos_in_scope.len(),
+        "repos_not_indexed_total":result.coverage.repos_not_indexed.len(),
+        "stale_repos_total":result.coverage.stale_repos.len(),
+    });
+    let blind_spots_json = bounded_typed_rows(&result.blind_spots, 1000)?;
+    let files_json = bounded_mapped_rows(&files, 2000, |f| json!(f.to_string_lossy()));
+    let cochanged_json = bounded_typed_rows(&result.cochanged_files, 1000)?;
+    let resolver_json = bounded_typed_rows(&result.resolver_stale_repos, 1000)?;
+    let org_json = bounded_metadata(&result.org_wide,1000)?.unwrap_or_else(||json!({"unavailable":"output_budget","retry_guidance":"Narrow changed files and retry org-wide metadata."}));
+    let summary = bounded_source_text(&result.summary, 1000);
+    let analysis_direction = bounded_source_text(&result.analysis_direction, 1000);
+    let mut omitted = serde_json::Map::new();
+    for (field, total, returned) in [
+        ("changed_files", files.len(), files_json.len()),
+        (
+            "changed_symbols",
+            result.changed_symbols.len(),
+            changed_json.len(),
+        ),
+        (
+            "affected_symbols",
+            result.affected_symbols.len(),
+            affected_json.len(),
+        ),
+        (
+            "affected_clusters",
+            result.affected_clusters.len(),
+            clusters_json.len(),
+        ),
+        (
+            "notifications",
+            result.notifications.len(),
+            notifications_json.len(),
+        ),
+        (
+            "blind_spots",
+            result.blind_spots.len(),
+            blind_spots_json.len(),
+        ),
+        (
+            "cochanged_files",
+            result.cochanged_files.len(),
+            cochanged_json.len(),
+        ),
+        (
+            "resolver_stale_repos",
+            result.resolver_stale_repos.len(),
+            resolver_json.len(),
+        ),
+        (
+            "coverage.repos_in_scope",
+            result.coverage.repos_in_scope.len(),
+            coverage_json["repos_in_scope"].as_array().unwrap().len(),
+        ),
+        (
+            "coverage.repos_not_indexed",
+            result.coverage.repos_not_indexed.len(),
+            coverage_json["repos_not_indexed"].as_array().unwrap().len(),
+        ),
+        (
+            "coverage.stale_repos",
+            result.coverage.stale_repos.len(),
+            coverage_json["stale_repos"].as_array().unwrap().len(),
+        ),
+    ] {
+        if total > returned {
+            omitted.insert(field.into(), json!(total - returned));
+        }
+    }
+    if org_json.get("unavailable").is_some() {
+        omitted.insert("org_wide".into(), json!("unavailable"));
+    }
+    if summary.len() < result.summary.len() {
+        omitted.insert(
+            "summary_bytes".into(),
+            json!(result.summary.len() - summary.len()),
+        );
+    }
+    if analysis_direction.len() < result.analysis_direction.len() {
+        omitted.insert(
+            "analysis_direction_bytes".into(),
+            json!(result.analysis_direction.len() - analysis_direction.len()),
+        );
+    }
 
     Ok(json!({
-        "changed_files": files.iter().map(|f| f.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        "changed_files": files_json,
         "max_depth": max_depth,
         "risk": risk_str,
-        "summary": result.summary,
+        "summary": summary,
         "status": status_json,
         "gate_state": gate_state_json,
         "notifications": notifications_json,
-        "resolver_stale_repos": result.resolver_stale_repos,
+        "resolver_stale_repos": resolver_json,
         "changed_symbols": changed_json,
-        "changed_symbol_count": changed_json.len(),
+        "changed_symbol_count": result.changed_symbols.len(),
         "affected_symbols": affected_json,
         "affected_symbol_count": result.affected_symbol_count,
         "returned_affected_symbol_count": affected_json.len(),
         "affected_symbols_truncated": affected_json.len() < result.affected_symbol_count,
         "affected_clusters": clusters_json,
-        "affected_cluster_count": clusters_json.len(),
+        "affected_cluster_count": result.affected_clusters.len(),
         // Always present so consumers can distinguish "no cross-repo impact"
         // (null) from the field being dropped; populated when a change reaches
         // another repo.
-        "org_wide": serde_json::to_value(&result.org_wide).unwrap_or(Value::Null),
+        "org_wide": org_json,
         "coverage": coverage_json,
         "blind_spots": blind_spots_json,
-        "cochanged_files": serde_json::to_value(&result.cochanged_files)
-            .unwrap_or(serde_json::Value::Array(Vec::new())),
-        "analysis_direction": result.analysis_direction,
+        "cochanged_files": cochanged_json,
+        "analysis_direction": analysis_direction,
+        "truncated": !omitted.is_empty() || affected_json.len()<result.affected_symbol_count,
+        "output_omitted":omitted,
+        "retry_guidance":if omitted.is_empty() {None} else {Some("Output byte budget reached. Narrow changed files or query a single symbol; assessment status and gate still describe the complete visible analysis.")},
     }))
 }
 
@@ -18002,6 +18795,67 @@ mod server_mode_tests {
 }
 
 #[cfg(test)]
+mod project_render_observer {
+    use std::cell::RefCell;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    #[derive(Default)]
+    struct State {
+        enabled: bool,
+        fallback: bool,
+        count: usize,
+        cancel: Option<Arc<AtomicBool>>,
+    }
+    thread_local! { static STATE:RefCell<State> = RefCell::new(State::default()); }
+    pub struct Observer;
+    impl Observer {
+        pub fn install(cancel: Option<Arc<AtomicBool>>) -> Self {
+            STATE.with(|state| {
+                *state.borrow_mut() = State {
+                    enabled: true,
+                    cancel,
+                    ..Default::default()
+                }
+            });
+            Self
+        }
+        pub fn count(&self) -> usize {
+            STATE.with(|state| state.borrow().count)
+        }
+    }
+    impl Drop for Observer {
+        fn drop(&mut self) {
+            STATE.with(|state| *state.borrow_mut() = State::default());
+        }
+    }
+    pub struct Fallback;
+    impl Fallback {
+        pub fn enter() -> Self {
+            STATE.with(|state| state.borrow_mut().fallback = true);
+            Self
+        }
+    }
+    impl Drop for Fallback {
+        fn drop(&mut self) {
+            STATE.with(|state| state.borrow_mut().fallback = false);
+        }
+    }
+    pub fn rendered() {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            if state.enabled && state.fallback {
+                state.count += 1;
+                if let Some(cancel) = &state.cancel {
+                    cancel.store(true, Ordering::Release);
+                }
+            }
+        });
+    }
+}
+
+#[cfg(test)]
 mod project_context_bug12_tests {
     use super::*;
     use nestweaver_schema::{
@@ -18449,6 +19303,86 @@ mod project_context_bug12_tests {
                 );
             }
         }
+    }
+
+    fn remaining_budget_pair_fixture() -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_project(&Project {
+                uid: "proj:p".into(),
+                name: "P".into(),
+                summary: None,
+                instance_id: "default".into(),
+            })
+            .unwrap();
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:v".into(),
+                name: "v".into(),
+                root_path: "/v".into(),
+                instance_id: "default".into(),
+            })
+            .unwrap();
+        store
+            .insert_note(&mk_note("note:a", "vlt:v", "a.md", &"x".repeat(1000)))
+            .unwrap();
+        store
+            .insert_note(&mk_note("note:b", "vlt:v", "b.md", "Short note"))
+            .unwrap();
+        store
+            .batch_insert_project_note_edges(&[("proj:p", "note:a"), ("proj:p", "note:b")])
+            .unwrap();
+        store
+            .insert_symbol(&mk_symbol("sym:c", "repo:r", "c.rs", "code"))
+            .unwrap();
+        store
+            .batch_insert_project_symbol_edges("proj:p", &["sym:c".into()], 1.0)
+            .unwrap();
+        store
+    }
+    #[test]
+    fn remaining_budget_impossible_pair_skips_fallback_render_work() {
+        let store = remaining_budget_pair_fixture();
+        let observer = project_render_observer::Observer::install(None);
+        let result = tool_project_context(
+            &store,
+            None,
+            json!({"project":"P","no_embed":true,"token_budget":16,"include_seeds":false}),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            observer.count(),
+            0,
+            "impossible mixed pair must stop before rendering fallback candidates"
+        );
+        assert_eq!(result["budget_exceeded"], true);
+    }
+    #[test]
+    fn remaining_budget_fallback_observed_work_cancels_cooperatively() {
+        let store = remaining_budget_pair_fixture();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observer = project_render_observer::Observer::install(Some(cancel.clone()));
+        let result = tool_project_context(
+            &store,
+            None,
+            json!({"project":"P","no_embed":true,"token_budget":400,"include_seeds":false}),
+            None,
+            Some(&cancel),
+            None,
+        );
+        assert!(
+            observer.count() > 0,
+            "fixture must observe real affordable fallback work"
+        );
+        let error = result.expect_err("fallback cancellation must not produce a complete answer");
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<nestweaver_store::StoreError>()
+                .is_some_and(|error| matches!(error, nestweaver_store::StoreError::Cancelled(_)))
+        }));
     }
 
     #[test]
@@ -20192,6 +21126,127 @@ mod cache_dispatch_tests {
         }
     }
 
+    fn remaining_budget_section(store: &GraphStore, index: usize, text: String) {
+        store
+            .insert_section(&nestweaver_schema::Section {
+                uid: format!("section:budget:{index}"),
+                note_uid: "note:budget".into(),
+                heading_uid: None,
+                start_line: index as u32,
+                end_line: index as u32 + 1,
+                text_hash: "h".into(),
+                text_content: text,
+                word_count: 1,
+                pagerank_score: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn remaining_budget_regex_default_bounds_occurrences() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault_fixture()).unwrap();
+        store.insert_note(&note_fixture("note:budget")).unwrap();
+        remaining_budget_section(&store, 0, "needle ".repeat(400));
+        let result = tool_regex_search(
+            &store,
+            json!({"pattern":"needle","kinds":["Section"]}),
+            None,
+        )
+        .unwrap();
+        assert!(
+            result["results"].as_array().unwrap().len() <= configured_result_limit(),
+            "{result}"
+        );
+        assert_eq!(result["truncated"], true);
+    }
+
+    #[test]
+    fn remaining_budget_regex_bounds_candidates_before_hydration() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault_fixture()).unwrap();
+        store.insert_note(&note_fixture("note:budget")).unwrap();
+        for index in 0..2200 {
+            remaining_budget_section(&store, index, "needle".into());
+        }
+        store.build_trigram_index().unwrap();
+        let result = tool_regex_search(
+            &store,
+            json!({"pattern":"needle","kinds":["Section"],"limit":1,"max_millis":600000}),
+            None,
+        )
+        .unwrap();
+        assert!(
+            result["hydrated_candidates"].as_u64().unwrap() <= 2000,
+            "{result}"
+        );
+        assert_eq!(result["truncated"], true);
+    }
+
+    fn remaining_budget_tags() -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault_fixture()).unwrap();
+        store.insert_note(&note_fixture("note:budget")).unwrap();
+        for index in 0..25 {
+            let uid = format!("tag:budget:{index}");
+            store
+                .insert_tag(&nestweaver_schema::Tag {
+                    uid: uid.clone(),
+                    vault_uid: "vlt:test".into(),
+                    name: format!("budget-{index}"),
+                })
+                .unwrap();
+            store
+                .batch_insert_note_tag_edges(&[("note:budget", uid.as_str())])
+                .unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn bounded_tag_counterweight_complete_focus_and_absent_tag() {
+        let store = remaining_budget_tags();
+        let complete = tool_brain_tag_graph(&store, json!({"tag":"budget-0","limit":30})).unwrap();
+        assert_eq!(complete["count"], 1);
+        assert_eq!(complete["exact_count"], 1);
+        assert_eq!(complete["co_occurring"].as_array().unwrap().len(), 24);
+        assert_eq!(complete["population_complete"], true);
+        assert_eq!(complete["count_relation"], "eq");
+        let absent = tool_brain_tag_graph(&store, json!({"tag":"absent","limit":3})).unwrap();
+        assert_eq!(absent["count"], 0);
+        assert_eq!(absent["truncated"], false);
+        assert_eq!(absent["population_complete"], true);
+        let (sets, cut) = store.note_tag_sets_bounded(3).unwrap();
+        assert!(cut);
+        assert!(sets.iter().map(|(_, tags)| tags.len()).sum::<usize>() <= 3);
+    }
+
+    #[test]
+    fn remaining_budget_focus_tag_bounds_neighbors() {
+        let result = tool_brain_tag_graph(
+            &remaining_budget_tags(),
+            json!({"tag":"budget-0","limit":3}),
+        )
+        .unwrap();
+        assert_eq!(result["count"], 1);
+        assert!(
+            result["co_occurring"].as_array().unwrap().len() <= 3,
+            "{result}"
+        );
+        assert_eq!(result["truncated"], true);
+    }
+
+    #[test]
+    fn remaining_budget_all_tags_bounds_each_neighbor_list() {
+        let result = tool_brain_tag_graph(&remaining_budget_tags(), json!({"limit":3})).unwrap();
+        assert_eq!(result["total"], 25);
+        assert_eq!(result["tags"].as_array().unwrap().len(), 3);
+        for tag in result["tags"].as_array().unwrap() {
+            assert!(tag["co_occurring"].as_array().unwrap().len() <= 3, "{tag}");
+        }
+        assert_eq!(result["truncated"], true);
+    }
+
     fn vault_fixture() -> nestweaver_schema::Vault {
         nestweaver_schema::Vault {
             uid: "vlt:test".to_string(),
@@ -20478,6 +21533,134 @@ mod cache_dispatch_tests {
         store.insert_note(&two).unwrap();
         store.insert_note(&unique).unwrap();
         store
+    }
+
+    #[test]
+    fn computation_budget_ambiguity_caps_candidate_objects_and_uid_list_together() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault_fixture()).unwrap();
+        for index in 0..250 {
+            let mut note = note_fixture(&format!("note:duplicate:{index:04}"));
+            note.title = "Duplicate".into();
+            store.insert_note(&note).unwrap();
+        }
+        let result = tool_note_get(&store, json!({"title":"Duplicate"})).unwrap();
+        assert_eq!(result["status"], "ambiguous");
+        assert!(result["candidates"].as_array().unwrap().len() <= 50);
+        assert_eq!(
+            result["candidate_uids"].as_array().unwrap().len(),
+            result["candidates"].as_array().unwrap().len()
+        );
+        assert_eq!(result["candidate_total"], 250);
+        assert_eq!(result["truncated"], true);
+    }
+
+    #[test]
+    fn computation_budget_note_body_and_frontmatter_are_bounded_before_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::in_memory().unwrap();
+        let mut vault = vault_fixture();
+        vault.root_path = dir.path().to_string_lossy().into_owned();
+        store.insert_vault(&vault).unwrap();
+        let mut note = note_fixture("note:huge");
+        note.file_path = "huge.md".into();
+        note.frontmatter = Some(json!({"description":"data".repeat(50_000)}).to_string());
+        store.insert_note(&note).unwrap();
+        std::fs::write(dir.path().join("huge.md"), "body text\n".repeat(30_000)).unwrap();
+        for include_body in [true, false] {
+            let result = tool_note_get(
+                &store,
+                json!({"uid":"note:huge","include_body":include_body}),
+            )
+            .unwrap();
+            assert_eq!(result["uid"], "note:huge");
+            assert!(crate::output_budget::escaped_size(&result) <= 20_000);
+            assert_eq!(result["truncated"], true);
+            if !include_body {
+                assert!(result["body"].is_null());
+            }
+        }
+    }
+
+    #[test]
+    fn computation_boundary_note_outline_and_later_selected_section_stay_retrievable() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault_fixture()).unwrap();
+        store.insert_note(&note_fixture("note:outline")).unwrap();
+        for index in 0..80u32 {
+            let heading_uid = format!("heading:{index}");
+            store
+                .insert_heading(&nestweaver_schema::Heading {
+                    uid: heading_uid.clone(),
+                    note_uid: "note:outline".into(),
+                    level: 2,
+                    text: format!("Section {index}"),
+                    slug: format!("section-{index}"),
+                    start_line: index * 10,
+                    end_line: index * 10 + 1,
+                    content_hash: "h".into(),
+                    embedding: None,
+                })
+                .unwrap();
+            store
+                .insert_section(&nestweaver_schema::Section {
+                    uid: format!("section:{index}"),
+                    note_uid: "note:outline".into(),
+                    heading_uid: Some(heading_uid),
+                    start_line: index * 10 + 1,
+                    end_line: index * 10 + 9,
+                    text_hash: "h".into(),
+                    text_content: format!("selected body {index}"),
+                    word_count: 3,
+                    pagerank_score: None,
+                })
+                .unwrap();
+        }
+        let result = tool_note_get(
+            &store,
+            json!({"uid":"note:outline","sections":["Section 79"]}),
+        )
+        .unwrap();
+        assert_eq!(result["section_count"], 80);
+        assert_eq!(result["outline_total"], 80);
+        assert!(result["outline"].as_array().unwrap().len() <= 50);
+        assert!(
+            result["body"]
+                .as_str()
+                .unwrap()
+                .contains("selected body 79")
+        );
+        assert_eq!(result["truncated"], true);
+        assert!(crate::output_budget::escaped_size(&result) <= 20_000);
+        let multiple = tool_note_get(
+            &store,
+            json!({"uid":"note:outline","sections":["Section 0","Section 1"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            multiple["body"],
+            "## Section 0\n\nselected body 0\n\n## Section 1\n\nselected body 1"
+        );
+    }
+    #[test]
+    fn computation_boundary_note_small_body_intact_and_utf8_cut_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::in_memory().unwrap();
+        let mut vault = vault_fixture();
+        vault.root_path = dir.path().to_string_lossy().into_owned();
+        store.insert_vault(&vault).unwrap();
+        let mut note = note_fixture("note:utf8");
+        note.file_path = "utf8.md".into();
+        store.insert_note(&note).unwrap();
+        std::fs::write(dir.path().join("utf8.md"), "small λ body").unwrap();
+        let small = tool_note_get(&store, json!({"uid":"note:utf8"})).unwrap();
+        assert_eq!(small["body"], "small λ body");
+        assert_eq!(small["truncated"], false);
+        std::fs::write(dir.path().join("utf8.md"), "λ".repeat(10_000)).unwrap();
+        let large = tool_note_get(&store, json!({"uid":"note:utf8"})).unwrap();
+        assert!(large["body"].as_str().unwrap().chars().all(|ch| ch == 'λ'));
+        assert_eq!(large["body_truncated"], true);
+        assert!(crate::output_budget::escaped_size(&large) <= 20_000);
     }
 
     #[test]
@@ -22817,6 +24000,61 @@ mod arg_alias_tests {
                 .unwrap();
         }
         store
+    }
+
+    #[test]
+    fn remaining_budget_cluster_zero_and_single_cluster_have_bounded_pages() {
+        let store = cluster_scope_store();
+        let template = store.lookup_symbol("a0").unwrap();
+        for index in 0..100 {
+            let mut peer = template.clone();
+            peer.uid = format!("peer:{index}");
+            peer.name = peer.uid.clone();
+            store.insert_symbol(&peer).unwrap();
+            for (source, target) in [("a0", peer.uid.as_str()), (peer.uid.as_str(), "a0")] {
+                store
+                    .insert_edge(&nestweaver_schema::ResolvedEdge {
+                        source_uid: source.into(),
+                        target_uid: target.into(),
+                        edge_type: nestweaver_schema::EdgeType::Calls,
+                        confidence: 1.0,
+                        link_type: None,
+                        evidence: vec![],
+                    })
+                    .unwrap();
+            }
+        }
+        let listed =
+            tool_clusters(&store, json!({"repos":["repo-a"],"limit":0,"members":0})).unwrap();
+        let largest = listed["clusters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .max_by_key(|c| c["size"].as_u64().unwrap())
+            .unwrap();
+        assert!(
+            largest["size"].as_u64().unwrap() > 20,
+            "star must exercise a wide community: {listed}"
+        );
+        assert!(
+            largest["members"].as_array().unwrap().len() <= 20,
+            "{largest}"
+        );
+        let first = tool_clusters(
+            &store,
+            json!({"repos":["repo-a"],"cluster_id":largest["id"],"members":20}),
+        )
+        .unwrap();
+        let next = tool_clusters(
+            &store,
+            json!({"repos":["repo-a"],"cluster_id":largest["id"],"members":20,"member_offset":20,"expected_generation":first["graph_generation"],"page_token":first["page_token"]}),
+        )
+        .unwrap();
+        let a = &first["clusters"][0]["members"];
+        let b = &next["clusters"][0]["members"];
+        assert!(a.as_array().unwrap().len() <= 20);
+        assert!(!b.as_array().unwrap().is_empty());
+        assert_ne!(a[0]["uid"], b[0]["uid"]);
     }
 
     /// A `repos` scope must return ONLY the scoped repo's members — never a
@@ -27397,6 +28635,77 @@ mod flow_trace_truncation_tests {
         store
     }
 
+    #[test]
+    fn remaining_budget_blast_bounds_secondary_changed_metadata() {
+        let symbols: Vec<_> = (0..100)
+            .map(|index| {
+                let mut row = symbol(
+                    &format!("sym:{index}"),
+                    &format!("function{index}"),
+                    SymbolKind::Function,
+                    1,
+                );
+                row.file_path = format!("src/{}/{index}.rs", "x".repeat(350));
+                row
+            })
+            .collect();
+        let store = store_with(&symbols, &[]);
+        let files: Vec<_> = symbols.iter().map(|s| s.file_path.clone()).collect();
+        let result = tool_blast_radius(
+            &store,
+            json!({"changed_files":files.clone(),"limit":1}),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(result.get("status").is_some() && result.get("gate_state").is_some());
+        assert!(result.get("coverage").is_some());
+        assert!(
+            crate::output_budget::escaped_size(&result) <= 20_000,
+            "raw source result bytes: {}",
+            crate::output_budget::escaped_size(&result)
+        );
+        assert_eq!(result["truncated"], true);
+        let sarif = tool_blast_radius(
+            &store,
+            json!({"changed_files":files,"limit":1,"format":"sarif"}),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(crate::output_budget::escaped_size(&sarif) <= 20_000);
+        assert!(sarif["runs"][0]["properties"]["nestweaver/gateState"].is_string());
+    }
+
+    #[test]
+    fn remaining_budget_impact_bounds_raw_dual_alias_payload() {
+        let mut symbols = vec![symbol("sym:root", "rootFn", SymbolKind::Function, 1)];
+        let names: Vec<_> = (0..100).map(|i| format!("sym:caller:{i}")).collect();
+        for (index, uid) in names.iter().enumerate() {
+            let mut row = symbol(
+                uid,
+                &format!("caller{index}"),
+                SymbolKind::Function,
+                index as u32 + 10,
+            );
+            row.file_path = format!("src/{}/{index}.rs", "x".repeat(350));
+            symbols.push(row);
+        }
+        let edges: Vec<_> = names
+            .iter()
+            .map(|uid| (uid.as_str(), "sym:root", EdgeType::Calls))
+            .collect();
+        let store = store_with(&symbols, &edges);
+        let result =
+            tool_brain_impact(&store, json!({"symbol":"rootFn","limit":100}), None, None).unwrap();
+        assert!(
+            crate::output_budget::escaped_size(&result) <= 20_000,
+            "raw source result bytes: {}",
+            crate::output_budget::escaped_size(&result)
+        );
+        assert_eq!(result["truncated"], true);
+    }
+
     /// `root -> a`, `root -> shared`, `a -> shared`.
     ///
     /// This is the minimal shape of the reported non-monotonicity. At
@@ -27518,6 +28827,185 @@ mod flow_trace_truncation_tests {
             None,
         )
         .expect("flow_trace")
+    }
+
+    #[test]
+    fn computation_budget_equal_depth_diamond_expands_uid_once() {
+        let store = store_with(
+            &[
+                symbol("sym:root", "rootFn", SymbolKind::Function, 1),
+                symbol("sym:a", "a", SymbolKind::Function, 10),
+                symbol("sym:b", "b", SymbolKind::Function, 20),
+                symbol("sym:shared", "shared", SymbolKind::Function, 30),
+                symbol("sym:end", "end", SymbolKind::Function, 40),
+            ],
+            &[
+                ("sym:root", "sym:a", EdgeType::Calls),
+                ("sym:root", "sym:b", EdgeType::Imports),
+                ("sym:a", "sym:shared", EdgeType::Calls),
+                ("sym:b", "sym:shared", EdgeType::Calls),
+                ("sym:shared", "sym:end", EdgeType::Calls),
+            ],
+        );
+        let result = trace(&store, 5);
+        let shared = occurrences(&result, "sym:shared");
+        assert_eq!(shared.len(), 2, "both incoming edges retained");
+        assert_eq!(
+            shared
+                .iter()
+                .filter(|node| !node["children"].as_array().unwrap().is_empty())
+                .count(),
+            1,
+            "one canonical child-bearing expansion per UID"
+        );
+        assert_eq!(
+            shared
+                .iter()
+                .filter(|node| node.get("deduped_ref").is_some())
+                .count(),
+            1
+        );
+        assert!(shared.iter().all(|node| node["edge_type"] == "CALLS"));
+    }
+
+    #[test]
+    fn computation_budget_layered_diamonds_do_not_repeat_subtrees() {
+        let mut symbols = vec![symbol("sym:root", "rootFn", SymbolKind::Function, 1)];
+        let mut edges = Vec::new();
+        let mut previous = vec!["sym:root".to_string()];
+        for layer in 0..8 {
+            let next: Vec<_> = (0..2).map(|side| format!("sym:l{layer}:{side}")).collect();
+            for uid in &next {
+                symbols.push(symbol(uid, uid, SymbolKind::Function, layer * 10 + 10));
+            }
+            for from in &previous {
+                for to in &next {
+                    edges.push((from.clone(), to.clone(), EdgeType::Calls));
+                }
+            }
+            previous = next;
+        }
+        let refs: Vec<_> = edges
+            .iter()
+            .map(|(from, to, kind)| (from.as_str(), to.as_str(), *kind))
+            .collect();
+        let store = store_with(&symbols, &refs);
+        let result = trace(&store, 10);
+        assert!(
+            crate::output_budget::escaped_size(&result) <= 20_000,
+            "raw computation result must be bounded before wrapper"
+        );
+        for symbol in &symbols {
+            assert!(
+                occurrences(&result, &symbol.uid)
+                    .iter()
+                    .filter(|node| !node["children"].as_array().unwrap().is_empty())
+                    .count()
+                    <= 1
+            );
+        }
+    }
+
+    #[test]
+    fn computation_budget_star_stops_before_render_growth_and_discloses_cut() {
+        let mut symbols = vec![symbol("sym:root", "rootFn", SymbolKind::Function, 1)];
+        for index in 0..400 {
+            symbols.push(symbol(
+                &format!("sym:child:{index:04}"),
+                "child",
+                SymbolKind::Function,
+                index + 10,
+            ));
+        }
+        let edges: Vec<_> = symbols
+            .iter()
+            .skip(1)
+            .map(|child| ("sym:root", child.uid.as_str(), EdgeType::Calls))
+            .collect();
+        let store = store_with(&symbols, &edges);
+        let result = trace(&store, 2);
+        assert!(crate::output_budget::escaped_size(&result) <= 20_000);
+        assert_eq!(result["truncated"], true);
+        assert!(
+            result["tree"].get("children_omitted").is_some()
+                || result["tree"].get("children_omitted_lower_bound").is_some()
+        );
+    }
+
+    #[test]
+    fn computation_budget_class_methods_share_canonical_expansion() {
+        let mut class = symbol("sym:class", "Class", SymbolKind::Class, 1);
+        class.end_line = 100;
+        let store = store_with(
+            &[
+                class,
+                symbol("sym:m1", "methodOne", SymbolKind::Method, 10),
+                symbol("sym:m2", "methodTwo", SymbolKind::Method, 20),
+                symbol("sym:shared", "shared", SymbolKind::Function, 200),
+                symbol("sym:end", "end", SymbolKind::Function, 210),
+            ],
+            &[
+                ("sym:m1", "sym:class", EdgeType::MemberOf),
+                ("sym:m2", "sym:class", EdgeType::MemberOf),
+                ("sym:m1", "sym:shared", EdgeType::Calls),
+                ("sym:m2", "sym:shared", EdgeType::Calls),
+                ("sym:shared", "sym:end", EdgeType::Calls),
+            ],
+        );
+        let result =
+            tool_flow_trace(&store, json!({"symbol":"Class","max_depth":5}), None, None).unwrap();
+        assert_eq!(result["methods_total"], 2);
+        assert_eq!(
+            occurrences(&result, "sym:shared")
+                .iter()
+                .filter(|node| !node["children"].as_array().unwrap().is_empty())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn computation_boundary_wide_class_counts_before_lightweight_method_selection() {
+        let mut class = symbol("sym:class", "Class", SymbolKind::Class, 1);
+        class.end_line = 10_000;
+        let mut symbols = vec![class.clone()];
+        for index in 0..100u32 {
+            let mut method = symbol(
+                &format!("sym:method:{index:04}"),
+                "method",
+                SymbolKind::Method,
+                index + 10,
+            );
+            method.signature = "heavy signature ".repeat(1000);
+            symbols.push(method);
+        }
+        let edges: Vec<_> = symbols
+            .iter()
+            .skip(1)
+            .map(|method| (method.uid.as_str(), "sym:class", EdgeType::MemberOf))
+            .collect();
+        let store = store_with(&symbols, &edges);
+        let (selected, total) = store.flow_methods_bounded(&class, 20, None).unwrap();
+        assert_eq!(total, 100);
+        assert_eq!(selected.len(), 20);
+        assert!(selected.iter().all(|method| method.signature.is_empty()));
+        let result = tool_flow_trace(&store, json!({"symbol":"Class"}), None, None).unwrap();
+        assert_eq!(result["methods_total"], 100);
+        assert_eq!(result["methods_returned"], 20);
+        assert!(crate::output_budget::escaped_size(&result) <= 20_000);
+    }
+
+    #[test]
+    fn computation_boundary_fallback_membership_stays_inside_root_repository() {
+        let mut class = symbol("sym:class", "Class", SymbolKind::Class, 1);
+        class.end_line = 100;
+        let local = symbol("sym:local", "localMethod", SymbolKind::Method, 10);
+        let mut foreign = symbol("sym:foreign", "foreignMethod", SymbolKind::Method, 20);
+        foreign.repo_uid = "repo:other".into();
+        let store = store_with(&[class.clone(), local, foreign], &[]);
+        let (methods, total) = store.flow_methods_bounded(&class, 20, None).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(methods[0].uid, "sym:local");
     }
 
     /// THE property nw-390 asks for: the callee set at depth N+1 is a superset

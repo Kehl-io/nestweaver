@@ -70,8 +70,32 @@ async fn probe(
         ensure!(initialized["protocolVersion"] == PROTOCOL, "unsupported negotiated MCP protocol");
         ensure!(initialized["capabilities"]["tools"].is_object(), "server does not advertise MCP tools");
         input.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n").await?;
-        let listed = response(&mut output, 2).await?;
-        let tools = listed["tools"].as_array().context("tools/list has no tools array")?;
+        let mut listed = response(&mut output, 2).await?;
+        let mut tools = Vec::new();
+        let mut names = std::collections::BTreeSet::new();
+        let mut cursors = std::collections::BTreeSet::new();
+        let mut id = 2u64;
+        loop {
+            let page = listed["tools"].as_array().context("tools/list has no tools array")?;
+            for tool in page {
+                let name = tool["name"].as_str().context("catalogue tool has no name")?;
+                ensure!(tool["inputSchema"].is_object(), "catalogue tool {name} has no input schema");
+                ensure!(names.insert(name.to_owned()), "duplicate catalogue tool {name}");
+                tools.push(tool.clone());
+            }
+            let next = match listed.get("nextCursor") {
+                None | Some(Value::Null) => break,
+                Some(Value::String(cursor)) if !cursor.is_empty() => cursor.clone(),
+                _ => anyhow::bail!("malformed tools/list continuation cursor"),
+            };
+            ensure!(!page.is_empty(), "empty catalogue continuation page");
+            ensure!(cursors.insert(next.clone()), "repeated tools/list continuation cursor");
+            ensure!(cursors.len() <= 100, "too many catalogue pages");
+            id += 1;
+            let request = json!({"jsonrpc":"2.0","id":id,"method":"tools/list","params":{"cursor":next}});
+            input.write_all(format!("{request}\n").as_bytes()).await?;
+            listed = response(&mut output, id).await?;
+        }
         let lite = args.iter().any(|arg| arg == "--lite");
         let catalogue = nestweaver_mcp::tools::tool_list(lite);
         let mut expected: Vec<String> = catalogue["tools"].as_array().context("invalid built-in catalogue")?
@@ -84,10 +108,7 @@ async fn probe(
         for required in &expected {
             ensure!(tools.iter().any(|tool| tool["name"] == required.as_str() && tool["inputSchema"].is_object()), "configured MCP profile is missing {required}");
         }
-        if lite || args.iter().any(|arg| arg == "--tools") {
-            ensure!(tools.len() == expected.len(), "MCP server did not honor the selected tool profile");
-        }
-        ensure!(listed.get("nextCursor").is_none_or(Value::is_null), "unexpected paginated NestWeaver tool catalogue");
+        ensure!(tools.len() == expected.len(), "MCP server did not honor the selected tool profile");
         Ok(tools.len())
     }).await.context("MCP server probe timed out").and_then(|result| result);
     // Always reap the exact child, including malformed/error/timeout paths.
@@ -426,6 +447,90 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    fn paged_mock(dir: &Path, pages: &[Value], stall: bool) -> Vec<String> {
+        fn quote(text: &str) -> String {
+            format!("'{}'", text.replace('\'', "'\\''"))
+        }
+        let path = dir.join("pages.sh");
+        let init = json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":PROTOCOL,"capabilities":{"tools":{}}}});
+        let mut script = format!(
+            "read -r init\nprintf '%s\\n' {}\nread -r notification\n",
+            quote(&init.to_string())
+        );
+        for (page, result) in pages.iter().enumerate() {
+            let response = json!({"jsonrpc":"2.0","id":page + 2,"result":result});
+            script.push_str(&format!(
+                "read -r request\ncase \"$request\" in *{}*) ;; *) exit 1;; esac\n",
+                quote(&format!("\"id\":{}", page + 2))
+            ));
+            if page > 0 {
+                let cursor = pages[page - 1]["nextCursor"].as_str().unwrap();
+                let cursor_field = format!("\"cursor\":{}", serde_json::to_string(cursor).unwrap());
+                script.push_str(&format!(
+                    "case \"$request\" in *{}*) ;; *) exit 1;; esac\n",
+                    quote(&cursor_field)
+                ));
+            }
+            script.push_str(&format!(
+                "printf '%s\\n' {}\n",
+                quote(&response.to_string())
+            ));
+        }
+        if stall {
+            script.push_str("exec sleep 20\n");
+        }
+        std::fs::write(&path, script).unwrap();
+        vec![path.to_string_lossy().to_string(), "--lite".into()]
+    }
+
+    #[tokio::test]
+    async fn probe_walks_catalogue_pages_and_rejects_bad_continuations() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalogue = nestweaver_mcp::tools::tool_list(true);
+        let tools = catalogue["tools"].as_array().unwrap();
+        let first = json!({"tools":&tools[..3],"nextCursor":"page-3"});
+        let last = json!({"tools":&tools[3..]});
+        let args = paged_mock(dir.path(), &[first.clone(), last.clone()], false);
+        assert_eq!(
+            probe("sh", &args, dir.path(), &[], Duration::from_secs(2))
+                .await
+                .unwrap(),
+            tools.len()
+        );
+        for bad in [
+            json!({"tools":&tools[3..],"nextCursor":"page-3"}),
+            json!({"tools":[tools[0].clone()]}),
+            json!({"tools":[]}),
+            json!({"tools":&tools[3..],"nextCursor":17}),
+            json!({"tools":"malformed"}),
+        ] {
+            let args = paged_mock(dir.path(), &[first.clone(), bad], false);
+            assert!(
+                probe("sh", &args, dir.path(), &[], Duration::from_secs(2))
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_stalled_later_page_obeys_original_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalogue = nestweaver_mcp::tools::tool_list(true);
+        let tools = catalogue["tools"].as_array().unwrap();
+        let args = paged_mock(
+            dir.path(),
+            &[json!({"tools":&tools[..3],"nextCursor":"later"})],
+            true,
+        );
+        let start = std::time::Instant::now();
+        let error = probe("sh", &args, dir.path(), &[], Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test]

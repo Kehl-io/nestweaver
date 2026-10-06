@@ -791,6 +791,61 @@ pub(crate) fn hybrid_search_candidates_from_value(
         .context("decode search candidates from the daemon")
 }
 
+/// Catalogue routing is independent of an established graph connection.
+/// Keep the request cursor and correlation at the actual hybrid wire seam.
+pub(crate) fn hybrid_catalogue_reply(
+    request: &nestweaver_mcp::protocol::Request,
+    lite: bool,
+) -> serde_json::Value {
+    let id = request.id.clone().unwrap_or(serde_json::Value::Null);
+    let cursor = request
+        .params
+        .as_ref()
+        .and_then(|params| params.get("cursor"))
+        .and_then(serde_json::Value::as_str);
+    match nestweaver_mcp::tools::tool_list_page(lite, cursor) {
+        Ok(page) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":page}),
+        Err(message) => {
+            serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":message}})
+        }
+    }
+}
+
+#[cfg(test)]
+mod hybrid_catalogue_tests {
+    use super::*;
+    use serde_json::{Value, json};
+    #[test]
+    fn request_cursor_pages_intact_hybrid_catalogue_and_errors_are_correlated() {
+        let expected = nestweaver_mcp::tools::tool_list(false)["tools"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let mut actual = Vec::new();
+        let mut params = json!({});
+        for index in 0..100 {
+            let request = nestweaver_mcp::protocol::validate_request(json!({"jsonrpc":"2.0","id":format!("page-{index}"),"method":"tools/list","params":params})).unwrap();
+            let reply = hybrid_catalogue_reply(&request, false);
+            assert_eq!(reply["id"], format!("page-{index}"));
+            let page = &reply["result"];
+            assert!(nestweaver_mcp::output_budget::escaped_size(page) <= 32_000);
+            let tools = page["tools"].as_array().unwrap();
+            assert!(tools.len() <= 8);
+            actual.extend(tools.iter().cloned());
+            if let Some(cursor) = page.get("nextCursor").and_then(Value::as_str) {
+                params = json!({"cursor":cursor});
+            } else {
+                break;
+            }
+        }
+        assert_eq!(actual, expected);
+        let request = nestweaver_mcp::protocol::validate_request(json!({"jsonrpc":"2.0","id":"bad-cursor","method":"tools/list","params":{"cursor":"broken"}})).unwrap();
+        let error = hybrid_catalogue_reply(&request, false);
+        assert_eq!(error["id"], "bad-cursor");
+        assert_eq!(error["error"]["code"], -32602);
+    }
+}
+
 /// Run the MCP stdio server using HybridClient for query routing.
 ///
 /// Read-only queries are dispatched through `HybridClient::query()` which
@@ -822,10 +877,7 @@ pub(crate) fn dispatch_hybrid_mcp_request(
         "notifications/initialized" | "initialized" => serde_json::json!({
             "jsonrpc": "2.0", "id": id, "result": null
         }),
-        "tools/list" => serde_json::json!({
-            "jsonrpc": "2.0", "id": id,
-            "result": nestweaver_mcp::tools::tool_list(lite),
-        }),
+        "tools/list" => hybrid_catalogue_reply(request, lite),
         "tools/call" => {
             let params = request.params.clone().unwrap_or(serde_json::Value::Null);
             let name = params

@@ -513,6 +513,126 @@ pub fn tag_graph(store: &GraphStore, tag: &str) -> Result<TagGraph> {
     Ok(tag_graph_from_sets(&focus, &sets))
 }
 
+/// Bounded MCP population and selection, leaving complete CLI analysis intact.
+/// Counts become lower bounds when membership work stops early.
+pub fn tag_graph_bounded(
+    store: &GraphStore,
+    focus: Option<&str>,
+    limit: usize,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+    let (sets, work_cut) = store.note_tag_sets_bounded(2000)?;
+    let render = |focus: &str| {
+        let mut graph = tag_graph_from_sets(focus, &sets);
+        let neighbors_total = graph.co_occurring.len();
+        let descendants_total = graph.descendants.len();
+        let mut bytes = 3000usize;
+        graph.co_occurring.truncate(limit);
+        let mut admitted = 0;
+        for neighbor in &graph.co_occurring {
+            let cost = serde_json::to_vec(neighbor)
+                .expect("co-occurrence serialization")
+                .len()
+                .saturating_add(1)
+                .saturating_add(
+                    neighbor
+                        .tag
+                        .chars()
+                        .filter(|c| matches!(c, '\u{2028}' | '\u{2029}'))
+                        .count()
+                        * 3,
+                );
+            if cost > bytes {
+                break;
+            }
+            bytes -= cost;
+            admitted += 1;
+        }
+        graph.co_occurring.truncate(admitted);
+        graph.descendants.truncate(limit);
+        let mut admitted = 0;
+        for tag in &graph.descendants {
+            let cost = serde_json::to_vec(tag)
+                .expect("descendant serialization")
+                .len()
+                .saturating_add(1)
+                .saturating_add(
+                    tag.chars()
+                        .filter(|c| matches!(c, '\u{2028}' | '\u{2029}'))
+                        .count()
+                        * 3,
+                );
+            if cost > bytes {
+                break;
+            }
+            bytes -= cost;
+            admitted += 1;
+        }
+        graph.descendants.truncate(admitted);
+        let returned_neighbors = graph.co_occurring.len();
+        let returned_descendants = graph.descendants.len();
+        let mut value = serde_json::to_value(graph).expect("tag graph serialization");
+        value["co_occurring_total"] = json!(neighbors_total);
+        value["descendants_total"] = json!(descendants_total);
+        value["truncated"] = json!(
+            work_cut
+                || neighbors_total > returned_neighbors
+                || descendants_total > returned_descendants
+        );
+        value["count_relation"] = json!(if work_cut { "gte" } else { "eq" });
+        value["population_complete"] = json!(!work_cut);
+        value
+    };
+    if let Some(focus) = focus {
+        let mut value = render(&focus.trim().trim_start_matches('#').to_lowercase());
+        if work_cut {
+            value["retry_guidance"] = json!(
+                "Tag membership work stopped; counts are lower bounds. Narrow the vault population and retry."
+            );
+        }
+        return Ok(value);
+    }
+    // Rank lightweight counts before building any neighbor graphs. Include
+    // descendant notes in each tag's count, matching the complete analysis.
+    let distinct: std::collections::BTreeSet<String> = sets
+        .iter()
+        .flat_map(|(_, tags)| {
+            tags.iter()
+                .map(|t| t.trim().trim_start_matches('#').to_lowercase())
+        })
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut ranked: Vec<_> = distinct
+        .iter()
+        .map(|tag| {
+            let prefix = format!("{tag}/");
+            let count = sets
+                .iter()
+                .filter(|(_, tags)| {
+                    tags.iter()
+                        .any(|t| t.to_lowercase() == *tag || t.to_lowercase().starts_with(&prefix))
+                })
+                .count();
+            (tag, count)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let mut tags = Vec::new();
+    let mut remaining = 14_000usize;
+    for (tag, _) in ranked.iter().take(limit) {
+        let graph = render(tag);
+        let cost = serde_json::to_vec(&graph)?.len().saturating_mul(2);
+        if cost > remaining {
+            break;
+        }
+        remaining -= cost;
+        tags.push(graph);
+    }
+    Ok(
+        json!({"total":ranked.len(),"returned":tags.len(),"truncated":work_cut || ranked.len()>tags.len() || tags.iter().any(|tag|tag["truncated"]==true),"total_relation":if work_cut {"gte"} else {"eq"},"population_complete":!work_cut,"tags":tags,"retry_guidance":if work_cut {Some("Tag membership work stopped; totals and counts are lower bounds. Narrow the vault population and retry.")} else {None}}),
+    )
+}
+
 /// Build a [`TagGraph`] for every distinct tag in the vault, sorted by note
 /// count descending then tag name ascending. This is the full tag
 /// co-occurrence graph in one call, intended for taxonomy-drift detection.

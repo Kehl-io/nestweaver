@@ -601,6 +601,29 @@ impl RegexIndex {
         clauses: &[HashSet<String>],
         cap: usize,
     ) -> Result<Option<HashSet<String>>, StoreError> {
+        Ok(self
+            .candidate_uids_policy(expected, clauses, cap, false)?
+            .and_then(|(uids, cut)| (!cut).then_some(uids)))
+    }
+
+    /// Retain a bounded posting prefix with explicit saturation. A ready
+    /// shard remains ready when a caller's work allowance is smaller.
+    pub fn candidate_uids_bounded(
+        &self,
+        expected: &RegexShardMetadata,
+        clauses: &[HashSet<String>],
+        cap: usize,
+    ) -> Result<Option<(HashSet<String>, bool)>, StoreError> {
+        self.candidate_uids_policy(expected, clauses, cap, true)
+    }
+
+    fn candidate_uids_policy(
+        &self,
+        expected: &RegexShardMetadata,
+        clauses: &[HashSet<String>],
+        cap: usize,
+        keep_prefix: bool,
+    ) -> Result<Option<(HashSet<String>, bool)>, StoreError> {
         let Some((index, fields, observed)) = self.open_current(&expected.scope_uid)? else {
             return Ok(None);
         };
@@ -649,15 +672,17 @@ impl RegexIndex {
         // matches existed. Probe one past the caller's budget so saturation is
         // explicit and the caller can conservatively widen this scope to the
         // graph instead of silently dropping regex matches.
-        let hits = searcher
+        let mut hits = searcher
             .search(
                 &*query,
                 &TopDocs::with_limit(cap.saturating_add(1)).order_by_score(),
             )
             .map_err(|error| StoreError::Query(format!("query regex shard: {error}")))?;
-        if hits.len() > cap {
+        let cut = hits.len() > cap;
+        if cut && !keep_prefix {
             return Ok(None);
         }
+        hits.truncate(cap);
         let mut uids = HashSet::with_capacity(hits.len());
         for (_, address) in hits {
             let document: TantivyDocument = searcher.doc(address).map_err(|error| {
@@ -668,7 +693,7 @@ impl RegexIndex {
                 uids.insert(uid);
             }
         }
-        Ok(Some(uids))
+        Ok(Some((uids, cut)))
     }
 
     pub fn metadata(&self, scope_uid: &str) -> Result<Option<RegexShardMetadata>, StoreError> {
@@ -1391,6 +1416,43 @@ mod tests {
                 .unwrap(),
             HashSet::from(["sym:two".to_string()])
         );
+    }
+
+    #[test]
+    fn bounded_candidate_prefix_reports_saturation_and_exact_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = RegexIndex::new(temp.path());
+        let trigrams = HashSet::from(["alp".to_string()]);
+        let documents: Vec<_> = ["one", "two", "three"]
+            .into_iter()
+            .map(|uid| RegexShardDocument {
+                uid,
+                kind: "Symbol",
+                text_hash: uid,
+                trigrams: &trigrams,
+            })
+            .collect();
+        let published = metadata(1, documents.len(), "bounded-three");
+        index.replace_scope(published.clone(), &documents).unwrap();
+        let clauses = [HashSet::from(["alp".to_string()])];
+        let (uids, cut) = index
+            .candidate_uids_bounded(&published, &clauses, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(uids.len(), 2);
+        assert!(cut);
+        let (uids, cut) = index
+            .candidate_uids_bounded(&published, &clauses, 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(uids.len(), 3);
+        assert!(!cut);
+        let (uids, cut) = index
+            .candidate_uids_bounded(&published, &clauses, 0)
+            .unwrap()
+            .unwrap();
+        assert!(uids.is_empty());
+        assert!(cut);
     }
 
     #[test]
