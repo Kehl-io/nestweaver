@@ -73,7 +73,7 @@
     (variable_declarator
       name: (identifier) @name
       value: (_) @_val)
-    (#not-match? @_val "^(\\(|function|class)")) @definition.const)
+    (#not-match? @_val "^(\\(|(async[ \t]+)?function|async[ \t]*\\(|async[ \t]+[A-Za-z_$][A-Za-z0-9_$]*[ \t]*=>|class)")) @definition.const)
 
 (export_statement
   (lexical_declaration
@@ -81,7 +81,7 @@
     (variable_declarator
       name: (identifier) @name
       value: (_) @_val)
-    (#not-match? @_val "^(\\(|function|class)")) @definition.const)
+    (#not-match? @_val "^(\\(|(async[ \t]+)?function|async[ \t]*\\(|async[ \t]+[A-Za-z_$][A-Za-z0-9_$]*[ \t]*=>|class)")) @definition.const)
 
 ; Test-runner blocks (Jest/Vitest/Mocha): test('name', fn), it('name', fn),
 ; describe('name', fn). Captured as a definition so the calls inside the

@@ -13605,7 +13605,7 @@ function hello(name) { return "Hello " + name; }
         fs::create_dir_all(&src).unwrap();
         fs::write(
             src.join("index.js"),
-            "const h = require('./helpers');\nh.listen();\n",
+            "const h = require('./helpers');\nfunction start() {\n  h.listen();\n}\n",
         )
         .unwrap();
         fs::write(
@@ -13620,7 +13620,7 @@ function hello(name) { return "Hello " + name; }
         let (_, store) =
             index_directory_in_memory(&src, "test", "https://example.com/mixed", "abc123").unwrap();
         let repo = repo_uid("test", "https://example.com/mixed");
-        let importer = symbol_uid(&repo, "index.js", "h", 1);
+        let importer = symbol_uid(&repo, "index.js", "start", 2);
         let exported = symbol_uid(&repo, "helpers.js", "listen", 1);
         let edges = store.load_typed_edges().unwrap();
         assert!(
@@ -13970,7 +13970,7 @@ module.exports = { check, plain };\n";
         fs::create_dir_all(&src).unwrap();
         fs::write(
             src.join("index.js"),
-            "const h = require('./helpers');\nh.listen();\n",
+            "const h = require('./helpers');\nfunction start() {\n  h.listen();\n}\n",
         )
         .unwrap();
         fs::write(
@@ -14001,7 +14001,7 @@ module.exports = { check, plain };\n";
             None,
         )
         .unwrap();
-        let importer = symbol_uid(&repo, "index.js", "h", 1);
+        let importer = symbol_uid(&repo, "index.js", "start", 2);
         let exported = symbol_uid(&repo, "helpers.js", "listen", 1);
         assert!(
             edges.iter().any(|edge| {
@@ -14402,6 +14402,116 @@ module.exports = { check, plain };\n";
     /// the touched-file set: the destination's re-inserted symbol must KEEP its
     /// place in the graph while the old path's UID disappears. That arm was
     /// untestable until the failure below was fixed.
+    #[test]
+    fn user_pain_python_src_layout_selects_actual_affected_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src/qrec")).unwrap();
+        fs::create_dir_all(repo.join("tests")).unwrap();
+        fs::write(
+            repo.join("src/qrec/coredata.py"),
+            "def load():\n    return 1\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("tests/test_coredata.py"),
+            "from qrec.coredata import load\ndef test_load():\n    load()\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("tests/test_other.py"),
+            "def test_other():\n    pass\n",
+        )
+        .unwrap();
+        let (_, store) =
+            index_directory_in_memory(&repo, "test", "https://example.com/src-layout", "abc123")
+                .unwrap();
+        let result =
+            crate::affected_tests::affected_tests(&store, &["src/qrec/coredata.py".into()])
+                .unwrap();
+        let selected: Vec<_> = result
+            .tier_1
+            .iter()
+            .chain(&result.tier_2)
+            .chain(&result.tier_3)
+            .map(|file| file.test_file.as_str())
+            .collect();
+        assert!(selected.contains(&"tests/test_coredata.py"), "{result:#?}");
+        assert!(!selected.contains(&"tests/test_other.py"), "{result:#?}");
+    }
+
+    #[test]
+    fn user_pain_rename_incoming_edges_match_fresh_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("Router.js"),
+            "export default function Router() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("App.js"),
+            "import Router from './Router.js';\nexport function app() {\n  return Router();\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("stable.js"),
+            "export function stable() { return 2; }\n",
+        )
+        .unwrap();
+        fs::write(repo.join("unchanged.js"), "import { stable } from './stable.js';\nexport function caller() {\n  return stable();\n}\n").unwrap();
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "initial"]);
+        let db = dir.path().join("incremental.lbug");
+        let url = "https://example.com/rename-incoming";
+        index_directory(&repo, &db, "test", url, &git(&["rev-parse", "HEAD"])).unwrap();
+        fs::rename(repo.join("Router.js"), repo.join("Navigator.js")).unwrap();
+        fs::write(repo.join("App.js"), "import Router from './Navigator.js';\nexport function app() {\n  return Router();\n}\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "rename router"]);
+        incremental_index(&repo, &db, "test", url).unwrap();
+        let incremental = GraphStore::open_or_create(&db).unwrap();
+        let fresh_db = dir.path().join("fresh.lbug");
+        index_directory(&repo, &fresh_db, "test", url, &git(&["rev-parse", "HEAD"])).unwrap();
+        let fresh = GraphStore::open_or_create(&fresh_db).unwrap();
+        let edge_set = |store: &GraphStore| {
+            store
+                .load_typed_edges()
+                .unwrap()
+                .into_iter()
+                .filter(|(_, _, kind, _, _)| kind == "CALLS" || kind == "IMPORTS")
+                .map(|(source, target, kind, _, _)| (source, target, kind))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(edge_set(&incremental), edge_set(&fresh));
+        let app = incremental.lookup_symbols_by_name("app").unwrap()[0]
+            .uid
+            .clone();
+        let route = incremental.lookup_symbols_by_name("Router").unwrap()[0]
+            .uid
+            .clone();
+        assert!(edge_set(&incremental).contains(&(app.clone(), route.clone(), "CALLS".into())));
+        assert!(edge_set(&incremental).contains(&(app, route, "IMPORTS".into())));
+        assert!(incremental.symbols_in_file("Router.js").unwrap().is_empty());
+    }
+
     #[test]
     fn incremental_index_survives_a_rename_between_parseable_paths() {
         let dir = tempfile::tempdir().unwrap();

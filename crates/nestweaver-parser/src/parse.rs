@@ -110,8 +110,9 @@ pub enum ReferenceKind {
     /// usual [`ReferenceKind::Import`] reference for `a::b` plus one
     /// `ImportAlias` reference whose `name` is the alias (`c`) and whose
     /// `context` is the full original import path (`a::b`). The resolver
-    /// turns these into named bindings so calls to the alias resolve to the
-    /// original item.
+    /// turns these into named bindings so calls resolve to the original item.
+    /// JS/TS/Python store the module in `context` and the original name (or
+    /// namespace `*`) in `receiver`.
     ImportAlias,
     /// nw-688: a local name a JS/TS file binds from a PACKAGE (non-relative)
     /// specifier — `isEmpty` in `import { isEmpty } from 'lodash'` or
@@ -133,6 +134,9 @@ pub enum ReferenceKind {
     /// A use of this name inside the enclosing symbol names the binding, not
     /// an unrelated symbol of the same name.
     LocalBinding,
+    /// Exact module-local export alias. `name` is the public name (including
+    /// `default`), `context` is the existing local declaration. Not an edge.
+    ExportAlias,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1898,12 +1902,30 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                         None
                     };
 
+                    // Swift has no `function` field on call_expression. The
+                    // navigation target is its first child, before the suffix.
+                    let from_swift_navigation = if lang == Language::Swift {
+                        let mut cursor = node.walk();
+                        node.named_children(&mut cursor)
+                            .find(|child| child.kind() == "navigation_expression")
+                            .and_then(|navigation| {
+                                navigation
+                                    .child_by_field_name("target")
+                                    .or_else(|| navigation.named_child(0))
+                            })
+                            .and_then(|target| target.utf8_text(source_bytes).ok())
+                            .map(|text| arena.alloc_str(text) as &str)
+                    } else {
+                        None
+                    };
+
                     // Convert the chosen arena-backed &str to an owned String only once,
                     // at the point where we need it for RawReference.
                     from_function_child
                         .or(from_direct_object)
                         .or(from_receiver_field)
                         .or(from_scoped_path)
+                        .or(from_swift_navigation)
                         .map(|s| s.to_string())
                 } else if matches!(kind, ReferenceKind::ReadAccess | ReferenceKind::WriteAccess) {
                     // nw-308: a FIELD ACCESS has a receiver too, and until this
@@ -1951,9 +1973,12 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         }
     }
 
-    // nw-688: names bound from package (non-relative) specifiers.
+    // Preserve exact import bindings as well as package exclusions.
     if matches!(lang, Language::JavaScript | Language::TypeScript) {
-        collect_js_package_bindings(tree.root_node(), source_bytes, &mut references);
+        collect_js_import_bindings(tree.root_node(), source_bytes, &mut references);
+    }
+    if lang == Language::Python {
+        collect_python_import_bindings(tree.root_node(), source_bytes, &mut references);
     }
 
     // nw-151: recover calls written inside Rust macro bodies.
@@ -2259,6 +2284,11 @@ fn collect_commonjs_reexport_names_from<'a>(
             {
                 return;
             }
+            for (_, local) in commonjs_object_exports(assignment, source_bytes) {
+                if let Ok(name) = local.utf8_text(source_bytes) {
+                    names.insert(name);
+                }
+            }
             if let Some(right) = assignment.child_by_field_name("right")
                 && right.kind() == "identifier"
                 && let Ok(name) = right.utf8_text(source_bytes)
@@ -2282,6 +2312,61 @@ fn collect_commonjs_reexport_names_from<'a>(
         }
         _ => {}
     }
+}
+
+/// Literal CommonJS object exports refer to existing local values. A property
+/// key alone (e.g. `bogus: 42`) is not evidence that a local `bogus` is exported.
+fn commonjs_object_exports<'a>(
+    assignment: tree_sitter::Node<'a>,
+    source: &[u8],
+) -> Vec<(String, tree_sitter::Node<'a>)> {
+    if assignment.kind() != "assignment_expression" {
+        return Vec::new();
+    }
+    let Some(left) = assignment
+        .child_by_field_name("left")
+        .filter(|node| node.kind() == "member_expression")
+    else {
+        return Vec::new();
+    };
+    let direct = left
+        .child_by_field_name("object")
+        .is_some_and(|node| node.kind() == "identifier" && node.utf8_text(source) == Ok("module"))
+        && left
+            .child_by_field_name("property")
+            .is_some_and(|node| node.utf8_text(source) == Ok("exports"));
+    if !direct {
+        return Vec::new();
+    }
+    let Some(object) = assignment
+        .child_by_field_name("right")
+        .filter(|node| node.kind() == "object")
+    else {
+        return Vec::new();
+    };
+    let mut exports = Vec::new();
+    let mut cursor = object.walk();
+    for property in object.named_children(&mut cursor) {
+        match property.kind() {
+            "shorthand_property_identifier" => {
+                exports.push((property.utf8_text(source).unwrap_or("").into(), property))
+            }
+            "pair" => {
+                if let (Some(key), Some(value)) = (
+                    property.child_by_field_name("key"),
+                    property.child_by_field_name("value"),
+                ) {
+                    if matches!(key.kind(), "property_identifier" | "string")
+                        && value.kind() == "identifier"
+                    {
+                        exports.push((strip_quotes(key.utf8_text(source).unwrap_or("")), value));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    exports
 }
 
 /// Rust macros that REGISTER functions as harness entry points, whose argument
@@ -2659,6 +2744,7 @@ fn is_local_binding_site(kind: &str) -> bool {
     matches!(
         kind,
         "parameter"
+            | "formal_parameters"
             | "formal_parameter"
             | "required_parameter"
             | "optional_parameter"
@@ -2690,6 +2776,17 @@ fn emit_binding_names(
     let mut stack = vec![root];
     while let Some(current) = stack.pop() {
         if is_type_node(current.kind()) {
+            continue;
+        }
+        // Defaults are expressions, not binding names. Traverse only the
+        // pattern on the left so helper() in `arg = helper()` remains a use.
+        if matches!(
+            current.kind(),
+            "assignment_pattern" | "object_assignment_pattern"
+        ) {
+            if let Some(left) = current.child_by_field_name("left") {
+                stack.push(left);
+            }
             continue;
         }
         if is_binding_identifier(current.kind())
@@ -2734,7 +2831,10 @@ fn is_type_node(kind: &str) -> bool {
 fn is_binding_identifier(kind: &str) -> bool {
     matches!(
         kind,
-        "identifier" | "simple_identifier" | "shorthand_field_identifier"
+        "identifier"
+            | "simple_identifier"
+            | "shorthand_field_identifier"
+            | "shorthand_property_identifier_pattern"
     )
 }
 
@@ -3156,133 +3256,268 @@ fn find_name_capture(
     None
 }
 
-/// nw-688: record each local name a JS/TS file binds from a PACKAGE specifier
-/// (anything not starting with `.` or `/`) as a
-/// [`ReferenceKind::PackageBinding`]. Covers module-level ES imports (default,
-/// namespace and named, including `as` renames) and module-level
-/// `const|let|var X = require('pkg')` / `const { a, b: c } = require('pkg')`.
-fn collect_js_package_bindings(
+/// Extract exact named/namespace bindings without interpreting import text.
+/// Package bindings remain separate so cross-repo inference retains its guard.
+fn collect_js_import_bindings(
     root: tree_sitter::Node<'_>,
     source: &[u8],
     references: &mut Vec<RawReference>,
 ) {
     let text = |node: tree_sitter::Node<'_>| node.utf8_text(source).unwrap_or("").to_string();
-    let package_specifier = |node: tree_sitter::Node<'_>| {
-        let spec = strip_quotes(&text(node));
-        (!spec.is_empty() && !spec.starts_with('.') && !spec.starts_with('/')).then_some(spec)
-    };
-    let mut push = |name: String, spec: &str, node: tree_sitter::Node<'_>| {
-        references.push(RawReference {
-            name,
-            kind: ReferenceKind::PackageBinding,
-            start_line: node.start_position().row as u32 + 1,
-            context: spec.to_string(),
-            receiver: None,
-        });
-    };
-    let mut cursor = root.walk();
-    for statement in root.named_children(&mut cursor) {
-        match statement.kind() {
+    let mut stack = vec![root];
+    while let Some(statement) = stack.pop() {
+        let mut cursor = statement.walk();
+        stack.extend(statement.named_children(&mut cursor));
+        if statement.kind() == "export_statement"
+            && statement
+                .parent()
+                .is_some_and(|parent| parent.kind() == "program")
+            && statement.child_by_field_name("source").is_none()
+        {
+            let mut push_export = |exported: String, local: tree_sitter::Node<'_>| {
+                references.push(RawReference {
+                    name: exported,
+                    kind: ReferenceKind::ExportAlias,
+                    start_line: local.start_position().row as u32 + 1,
+                    context: text(local),
+                    receiver: None,
+                });
+            };
+            let mut cursor = statement.walk();
+            let is_default = statement
+                .children(&mut cursor)
+                .any(|child| child.kind() == "default");
+            if is_default {
+                let local = statement
+                    .child_by_field_name("declaration")
+                    .and_then(|declaration| declaration.child_by_field_name("name"))
+                    .or_else(|| {
+                        statement
+                            .child_by_field_name("value")
+                            .filter(|value| value.kind() == "identifier")
+                    });
+                if let Some(local) = local {
+                    push_export("default".into(), local);
+                }
+            }
+            let mut cursor = statement.walk();
+            for clause in statement
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "export_clause")
+            {
+                let mut cursor = clause.walk();
+                for specifier in clause
+                    .named_children(&mut cursor)
+                    .filter(|child| child.kind() == "export_specifier")
+                {
+                    if let Some(local) = specifier.child_by_field_name("name") {
+                        let exported = specifier
+                            .child_by_field_name("alias")
+                            .map_or_else(|| text(local), text);
+                        push_export(strip_quotes(&exported), local);
+                    }
+                }
+            }
+            continue;
+        }
+        if statement.kind() == "expression_statement"
+            && statement
+                .parent()
+                .is_some_and(|parent| parent.kind() == "program")
+        {
+            if let Some(assignment) = statement.named_child(0) {
+                for (exported, local) in commonjs_object_exports(assignment, source) {
+                    references.push(RawReference {
+                        name: exported,
+                        kind: ReferenceKind::ExportAlias,
+                        start_line: local.start_position().row as u32 + 1,
+                        context: text(local),
+                        receiver: None,
+                    });
+                }
+            }
+        }
+        let (specifier, bindings): (String, Vec<(tree_sitter::Node<'_>, String)>) = match statement
+            .kind()
+        {
             "import_statement" => {
-                let Some(spec) = statement
-                    .child_by_field_name("source")
-                    .and_then(package_specifier)
-                else {
+                let Some(spec) = statement.child_by_field_name("source") else {
                     continue;
                 };
-                let mut c = statement.walk();
+                let mut cursor = statement.walk();
                 let Some(clause) = statement
-                    .named_children(&mut c)
-                    .find(|n| n.kind() == "import_clause")
+                    .named_children(&mut cursor)
+                    .find(|node| node.kind() == "import_clause")
                 else {
                     continue;
                 };
-                let mut c = clause.walk();
-                for part in clause.named_children(&mut c) {
+                let mut bindings = Vec::new();
+                let mut cursor = clause.walk();
+                for part in clause.named_children(&mut cursor) {
                     match part.kind() {
-                        "identifier" => push(text(part), &spec, part),
+                        "identifier" => bindings.push((part, "default".into())),
                         "namespace_import" => {
-                            let mut c = part.walk();
-                            if let Some(id) = part
-                                .named_children(&mut c)
-                                .find(|n| n.kind() == "identifier")
-                            {
-                                push(text(id), &spec, id);
+                            if let Some(local) = part.named_child(0) {
+                                bindings.push((local, "*".into()));
                             }
                         }
                         "named_imports" => {
-                            let mut c = part.walk();
-                            for specifier in part
-                                .named_children(&mut c)
-                                .filter(|n| n.kind() == "import_specifier")
+                            let mut cursor = part.walk();
+                            for binding in part
+                                .named_children(&mut cursor)
+                                .filter(|node| node.kind() == "import_specifier")
                             {
-                                if let Some(local) = specifier
-                                    .child_by_field_name("alias")
-                                    .or_else(|| specifier.child_by_field_name("name"))
-                                {
-                                    push(text(local), &spec, local);
+                                if let Some(original) = binding.child_by_field_name("name") {
+                                    let local =
+                                        binding.child_by_field_name("alias").unwrap_or(original);
+                                    bindings.push((local, text(original)));
                                 }
                             }
                         }
                         _ => {}
                     }
                 }
+                (strip_quotes(&text(spec)), bindings)
             }
-            "lexical_declaration" | "variable_declaration" => {
-                let mut c = statement.walk();
-                for declarator in statement
-                    .named_children(&mut c)
-                    .filter(|n| n.kind() == "variable_declarator")
+            "variable_declarator" => {
+                let Some(mut value) = statement.child_by_field_name("value") else {
+                    continue;
+                };
+                if value.kind() == "await_expression" {
+                    let Some(inner) = value.named_child(0) else {
+                        continue;
+                    };
+                    value = inner;
+                }
+                if value.kind() != "call_expression" {
+                    continue;
+                }
+                let Some(function) = value.child_by_field_name("function") else {
+                    continue;
+                };
+                if !((function.kind() == "identifier" && text(function) == "require")
+                    || function.kind() == "import")
                 {
-                    let Some(value) = declarator.child_by_field_name("value") else {
-                        continue;
-                    };
-                    if value.kind() != "call_expression"
-                        || value
-                            .child_by_field_name("function")
-                            .is_none_or(|f| f.kind() != "identifier" || text(f) != "require")
-                    {
-                        continue;
-                    }
-                    let Some(spec) = value.child_by_field_name("arguments").and_then(|args| {
-                        let mut c = args.walk();
-                        args.named_children(&mut c)
-                            .next()
-                            .filter(|a| a.kind() == "string")
-                            .and_then(package_specifier)
-                    }) else {
-                        continue;
-                    };
-                    let Some(target) = declarator.child_by_field_name("name") else {
-                        continue;
-                    };
-                    match target.kind() {
-                        "identifier" => push(text(target), &spec, target),
-                        "object_pattern" => {
-                            let mut c = target.walk();
-                            for prop in target.named_children(&mut c) {
-                                let local = match prop.kind() {
-                                    "shorthand_property_identifier_pattern" => Some(prop),
-                                    "pair_pattern" => prop
-                                        .child_by_field_name("value")
-                                        .filter(|v| v.kind() == "identifier"),
-                                    "object_assignment_pattern" => {
-                                        prop.child_by_field_name("left").filter(|l| {
-                                            l.kind() == "shorthand_property_identifier_pattern"
-                                        })
-                                    }
-                                    _ => None,
-                                };
-                                if let Some(local) = local {
-                                    push(text(local), &spec, local);
+                    continue;
+                }
+                let Some(spec) = value
+                    .child_by_field_name("arguments")
+                    .and_then(|args| args.named_child(0))
+                    .filter(|arg| arg.kind() == "string")
+                else {
+                    continue;
+                };
+                let Some(target) = statement.child_by_field_name("name") else {
+                    continue;
+                };
+                let mut bindings = Vec::new();
+                match target.kind() {
+                    "identifier" => bindings.push((target, "*".into())),
+                    "object_pattern" => {
+                        let mut cursor = target.walk();
+                        for property in target.named_children(&mut cursor) {
+                            match property.kind() {
+                                "shorthand_property_identifier_pattern" => {
+                                    bindings.push((property, text(property)))
                                 }
+                                "pair_pattern" => {
+                                    if let (Some(key), Some(local)) = (
+                                        property.child_by_field_name("key"),
+                                        property.child_by_field_name("value"),
+                                    ) {
+                                        if local.kind() == "identifier" {
+                                            bindings.push((local, text(key)));
+                                        }
+                                    }
+                                }
+                                "object_assignment_pattern" => {
+                                    if let Some(local) =
+                                        property.child_by_field_name("left").filter(|node| {
+                                            node.kind() == "shorthand_property_identifier_pattern"
+                                        })
+                                    {
+                                        bindings.push((local, text(local)));
+                                    }
+                                }
+                                _ => {}
                             }
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
+                let specifier = strip_quotes(&text(spec));
+                if function.kind() == "import" {
+                    references.push(RawReference {
+                        name: specifier.clone(),
+                        kind: ReferenceKind::Import,
+                        start_line: value.start_position().row as u32 + 1,
+                        context: text(value),
+                        receiver: None,
+                    });
+                }
+                (specifier, bindings)
             }
-            _ => {}
+            _ => continue,
+        };
+        for (local, original) in bindings {
+            let name = text(local);
+            let start_line = local.start_position().row as u32 + 1;
+            references.push(RawReference {
+                name: name.clone(),
+                kind: ReferenceKind::ImportAlias,
+                start_line,
+                context: specifier.clone(),
+                receiver: Some(original),
+            });
+            if !specifier.is_empty() && !specifier.starts_with('.') && !specifier.starts_with('/') {
+                references.push(RawReference {
+                    name,
+                    kind: ReferenceKind::PackageBinding,
+                    start_line,
+                    context: specifier.clone(),
+                    receiver: None,
+                });
+            }
+        }
+    }
+}
+
+fn collect_python_import_bindings(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    references: &mut Vec<RawReference>,
+) {
+    let mut stack = vec![root];
+    while let Some(statement) = stack.pop() {
+        let mut cursor = statement.walk();
+        stack.extend(statement.named_children(&mut cursor));
+        if statement.kind() != "import_from_statement" {
+            continue;
+        }
+        let Some(module) = statement.child_by_field_name("module_name") else {
+            continue;
+        };
+        let specifier = module.utf8_text(source).unwrap_or("");
+        let mut cursor = statement.walk();
+        for binding in statement.children_by_field_name("name", &mut cursor) {
+            let (original, local) = if binding.kind() == "aliased_import" {
+                let Some(original) = binding.child_by_field_name("name") else {
+                    continue;
+                };
+                let Some(local) = binding.child_by_field_name("alias") else {
+                    continue;
+                };
+                (original, local)
+            } else {
+                (binding, binding)
+            };
+            references.push(RawReference {
+                name: local.utf8_text(source).unwrap_or("").into(),
+                kind: ReferenceKind::ImportAlias,
+                start_line: local.start_position().row as u32 + 1,
+                context: specifier.into(),
+                receiver: Some(original.utf8_text(source).unwrap_or("").into()),
+            });
         }
     }
 }

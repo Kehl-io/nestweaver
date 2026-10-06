@@ -9,7 +9,7 @@ use crate::workspace::WorkspaceContext;
 /// Tracks an aliased import binding (e.g., `use a::b as c;`).
 ///
 /// Populated from [`ReferenceKind::ImportAlias`] references emitted by the
-/// parser (currently only Rust `use ... as ...` clauses produce them).
+/// parser for Rust paths and exact JS/TS/Python imported bindings.
 #[derive(Debug, Clone)]
 pub struct NamedBinding {
     /// The local alias used in the importing file.
@@ -18,6 +18,8 @@ pub struct NamedBinding {
     pub original_name: String,
     /// The file that exports the original name.
     pub source_file: String,
+    /// Import location, used to keep function-local bindings inside their owner.
+    pub start_line: u32,
 }
 
 /// Tracks what each file exports and what it imports.
@@ -28,6 +30,7 @@ pub struct ImportGraph {
     exports: HashMap<String, Vec<String>>,
     /// file → [named bindings (aliased imports)]
     named_bindings: HashMap<String, Vec<NamedBinding>>,
+    export_aliases: HashMap<String, HashMap<String, String>>,
 }
 
 impl ImportGraph {
@@ -53,11 +56,20 @@ impl ImportGraph {
     }
 
     /// Returns the named bindings (aliased imports) for the given file.
-    pub fn bindings_of(&self, file: &str) -> Vec<&NamedBinding> {
+    pub fn bindings_of(&self, file: &str) -> &[NamedBinding] {
         self.named_bindings
             .get(file)
-            .map(|v| v.iter().collect())
-            .unwrap_or_default()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Resolve an exact module-local public alias to its declaration name.
+    pub fn exported_local<'a>(&'a self, file: &str, name: &'a str) -> &'a str {
+        self.export_aliases
+            .get(file)
+            .and_then(|aliases| aliases.get(name))
+            .map(String::as_str)
+            .unwrap_or(name)
     }
 
     /// Returns all resolved imports across all files as (source_file, specifier, target_file) triples.
@@ -95,6 +107,7 @@ pub(crate) fn build_import_graph_with_languages(
     let mut exports: HashMap<String, Vec<String>> = HashMap::new();
     let mut resolved_imports: HashMap<String, Vec<(String, String)>> = HashMap::new();
     let mut named_bindings: HashMap<String, Vec<NamedBinding>> = HashMap::new();
+    let mut export_aliases = HashMap::new();
 
     for (file_path, symbols, references) in files {
         let language = file_languages
@@ -108,6 +121,14 @@ pub(crate) fn build_import_graph_with_languages(
             .map(|s| s.name.clone())
             .collect();
         exports.insert(file_path.clone(), exported_names);
+        export_aliases.insert(
+            file_path.clone(),
+            references
+                .iter()
+                .filter(|reference| reference.kind == ReferenceKind::ExportAlias)
+                .map(|reference| (reference.name.clone(), reference.context.clone()))
+                .collect(),
+        );
 
         // Resolve import references
         let mut imports: Vec<(String, String)> = Vec::new();
@@ -127,7 +148,9 @@ pub(crate) fn build_import_graph_with_languages(
                     workspace_ctx,
                 ) {
                     let original_name = reference
-                        .context
+                        .receiver
+                        .as_deref()
+                        .unwrap_or(&reference.context)
                         .rsplit("::")
                         .next()
                         .unwrap_or(reference.context.as_str())
@@ -136,6 +159,7 @@ pub(crate) fn build_import_graph_with_languages(
                         local_name: reference.name.clone(),
                         original_name,
                         source_file: resolved,
+                        start_line: reference.start_line,
                     });
                 }
                 continue;
@@ -163,6 +187,7 @@ pub(crate) fn build_import_graph_with_languages(
         resolved_imports,
         exports,
         named_bindings,
+        export_aliases,
     }
 }
 
@@ -395,12 +420,14 @@ mod tests {
                 local_name: "MyAlias".to_string(),
                 original_name: "OriginalName".to_string(),
                 source_file: "src/lib.js".to_string(),
+                start_line: 1,
             }],
         );
         let graph = ImportGraph {
             resolved_imports: HashMap::new(),
             exports: HashMap::new(),
             named_bindings: bindings,
+            export_aliases: HashMap::new(),
         };
         let result = graph.bindings_of("src/main.js");
         assert_eq!(result.len(), 1);

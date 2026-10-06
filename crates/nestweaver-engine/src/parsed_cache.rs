@@ -37,7 +37,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// 2 — nw-688: JS/TS test blocks are named `<runner> <title>`, `require()` is
 ///     the only call-shaped import, and package bindings are recorded.
-const CACHE_VERSION: u32 = 2;
+/// 3 — exact import bindings, Swift receivers, async function values.
+const CACHE_VERSION: u32 = 3;
 
 /// A log larger than this (and than the base) is folded into the base.
 const LOG_COMPACT_MIN_BYTES: u64 = 64 * 1024 * 1024;
@@ -479,6 +480,59 @@ mod tests {
         assert_eq!(result.references[0].name, "world");
         assert_eq!(result.type_bindings.len(), 1);
         assert_eq!(result.type_bindings[0].var_name, "x");
+    }
+
+    #[test]
+    fn old_import_receiver_parse_cache_is_rejected_and_reparsed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.parsed_cache.bin");
+        let source = "const work = async function() { helper(); };\n";
+        let hash = "unchanged-source";
+        let mut stale = sample_result();
+        stale.symbols[0].name = "old_proxy".into();
+        let file = ParsedCacheFile {
+            version: 2,
+            entries: HashMap::from([(hash.to_string(), stale)]),
+        };
+        std::fs::write(&path, rmp_serde::to_vec(&file).unwrap()).unwrap();
+        let mut cache = ParsedCache::load(&path);
+        let parsed = match cache.get(hash) {
+            Some(hit) => hit.clone(),
+            None => {
+                let fresh =
+                    nestweaver_parser::parse_source(std::path::Path::new("main.js"), source)
+                        .unwrap();
+                CachedParseResult {
+                    symbols: fresh.symbols,
+                    references: fresh.references,
+                    type_bindings: fresh.type_bindings,
+                }
+            }
+        };
+        assert!(
+            !parsed
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "old_proxy")
+        );
+        assert_eq!(
+            parsed
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.name == "work")
+                .count(),
+            1
+        );
+        cache.insert(hash.into(), parsed);
+        cache.save(&path).unwrap();
+        assert!(
+            ParsedCache::load(&path)
+                .get(hash)
+                .unwrap()
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "work" && symbol.kind == SymbolKind::Function)
+        );
     }
 
     #[test]
