@@ -101,6 +101,20 @@ fn bounded_local_git(root: &str, args: &[&str], deadline: Instant) -> Result<Opt
         return Err(());
     }
     let mut command = std::process::Command::new("git");
+    // The selected indexed root is authoritative for this local observation.
+    // Inherited Git routing and object stores must not substitute another repo.
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+    ] {
+        command.env_remove(key);
+    }
+    command.env("GIT_NO_LAZY_FETCH", "1");
     command.args(["-C", root]).args(args);
     let output =
         nestweaver_engine::git_cmd::run_git_with_timeout_and_output_limit(command, budget, 4096)

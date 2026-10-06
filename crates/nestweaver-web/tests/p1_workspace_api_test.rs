@@ -1522,3 +1522,269 @@ async fn local_git_freshness_is_shared_by_repo_workspace_and_overview() {
     assert_eq!(unknown[0]["freshness"]["status"], "unknown");
     assert!(unknown[0]["freshness"]["commits_behind"].is_null());
 }
+
+fn review_fixture_git(root: &std::path::Path, args: &[&str]) -> String {
+    let mut command = std::process::Command::new("git");
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_INDEX_FILE",
+        "GIT_NO_LAZY_FETCH",
+    ] {
+        command.env_remove(key);
+    }
+    let output = command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TEMPLATE_DIR", root.join("empty-template"))
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "tag.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn review_fixture_repo(root: &std::path::Path, body: &str) -> String {
+    std::fs::create_dir_all(root).unwrap();
+    review_fixture_git(root, &["init", "-q"]);
+    review_fixture_git(root, &["config", "user.name", "Fixture"]);
+    review_fixture_git(root, &["config", "user.email", "fixture@example.com"]);
+    std::fs::write(root.join("file.txt"), body).unwrap();
+    review_fixture_git(root, &["add", "."]);
+    review_fixture_git(root, &["commit", "-qm", body]);
+    review_fixture_git(root, &["rev-parse", "HEAD"])
+}
+
+fn review_freshness_child(
+    root: &std::path::Path,
+    sha: &str,
+    status: &str,
+) -> std::process::Command {
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--ignored",
+            "--exact",
+            "git_freshness_review_child",
+            "--nocapture",
+        ])
+        .env("NW_FRESHNESS_CHILD_ROOT", root)
+        .env("NW_FRESHNESS_CHILD_SHA", sha)
+        .env("NW_FRESHNESS_CHILD_STATUS", status)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_INDEX_FILE",
+        "GIT_NO_LAZY_FETCH",
+    ] {
+        child.env_remove(key);
+    }
+    child
+}
+
+// Environment contamination is confined to a separately owned test process;
+// parallel tests and the host process never mutate their environment.
+#[test]
+#[ignore]
+fn git_freshness_review_child() {
+    let root = std::env::var("NW_FRESHNESS_CHILD_ROOT").expect("owned fixture child only");
+    let sha = std::env::var("NW_FRESHNESS_CHILD_SHA").unwrap();
+    let expected = std::env::var("NW_FRESHNESS_CHILD_STATUS").unwrap();
+    let mut indexed = repo("repo:review", "review");
+    indexed.root_path = Some(root);
+    indexed.indexed_sha = sha;
+    let store = GraphStore::in_memory().unwrap();
+    store.insert_repo(&indexed).unwrap();
+    let state = AppState::new(store, None, std::path::PathBuf::from("unused.lbug"));
+    for _ in 0..2 {
+        let observation = state.repo_freshness(std::slice::from_ref(&indexed));
+        assert_eq!(
+            observation[&indexed.uid].status, expected,
+            "caller-local observation and cached repeat must use the selected repository"
+        );
+        if expected == "current" {
+            assert_eq!(
+                observation[&indexed.uid].current_sha.as_deref(),
+                Some(indexed.indexed_sha.as_str())
+            );
+        }
+        if expected == "different" {
+            assert!(observation[&indexed.uid].current_sha.is_some());
+            assert!(observation[&indexed.uid].commits_behind.is_none());
+            assert!(observation[&indexed.uid].commits_ahead.is_none());
+        }
+    }
+}
+
+#[test]
+fn d_quality_git_scrubs_inherited_repository_routing() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    let sha_a = review_fixture_repo(&a, "repository a");
+    let sha_b = review_fixture_repo(&b, "repository b");
+    assert_ne!(sha_a, sha_b);
+    let positive = review_freshness_child(&a, &sha_a, "current")
+        .output()
+        .unwrap();
+    assert!(
+        positive.status.success(),
+        "{}",
+        String::from_utf8_lossy(&positive.stdout)
+    );
+    for key in ["GIT_DIR", "GIT_COMMON_DIR"] {
+        let contaminated = review_freshness_child(&a, &sha_a, "current")
+            .env(key, b.join(".git"))
+            .env("GIT_WORK_TREE", &b)
+            .output()
+            .unwrap();
+        assert!(
+            contaminated.status.success(),
+            "{key} must not redirect A to B: {}",
+            String::from_utf8_lossy(&contaminated.stdout)
+        );
+    }
+    std::fs::write(a.join("file.txt"), "a second commit").unwrap();
+    review_fixture_git(&a, &["add", "."]);
+    review_fixture_git(&a, &["commit", "-qm", "second"]);
+    let objects = review_freshness_child(&a, &sha_a, "behind")
+        .env("GIT_OBJECT_DIRECTORY", b.join(".git/objects"))
+        .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", b.join(".git/objects"))
+        .output()
+        .unwrap();
+    assert!(
+        objects.status.success(),
+        "foreign object routing must not hide A's ancestry: {}",
+        String::from_utf8_lossy(&objects.stdout)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn d_quality_git_never_lazily_fetches_promisor_objects() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("partial");
+    let indexed = review_fixture_repo(&root, "first commit");
+    std::fs::write(root.join("file.txt"), "second commit").unwrap();
+    review_fixture_git(&root, &["add", "."]);
+    review_fixture_git(&root, &["commit", "-qm", "second"]);
+    let remote = dir.path().join("local-remote.git");
+    review_fixture_git(
+        &root,
+        &[
+            "clone",
+            "--bare",
+            "--no-local",
+            root.to_str().unwrap(),
+            remote.to_str().unwrap(),
+        ],
+    );
+    let log = dir.path().join("upload-pack.log");
+    let wrapper = dir.path().join("record-upload-pack");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf 'invoked\\n' >> '{}'\nexec git-upload-pack \"$@\"\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    review_fixture_git(
+        &root,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    review_fixture_git(&root, &["config", "remote.origin.promisor", "true"]);
+    review_fixture_git(
+        &root,
+        &["config", "remote.origin.partialclonefilter", "blob:none"],
+    );
+    review_fixture_git(&root, &["config", "extensions.partialClone", "origin"]);
+    review_fixture_git(&root, &["config", "core.repositoryformatversion", "1"]);
+    review_fixture_git(
+        &root,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            wrapper.to_str().unwrap(),
+        ],
+    );
+    let missing = root
+        .join(".git/objects")
+        .join(&indexed[..2])
+        .join(&indexed[2..]);
+    assert!(
+        missing.is_file(),
+        "fixture commit is initially a loose object"
+    );
+    std::fs::remove_file(&missing).unwrap();
+    let output = review_freshness_child(&root, &indexed, "different")
+        .output()
+        .unwrap();
+    assert!(
+        !log.exists(),
+        "freshness must not invoke even a local promisor upload-pack helper"
+    );
+    assert!(
+        !missing.exists(),
+        "missing indexed commit must not be recovered by an observation"
+    );
+    let mut inspect = std::process::Command::new("git");
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ] {
+        inspect.env_remove(key);
+    }
+    let object = inspect
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg("-C")
+        .arg(&root)
+        .args(["cat-file", "-e", &indexed])
+        .output()
+        .unwrap();
+    assert!(
+        !object.status.success(),
+        "the indexed commit must remain absent from every local object pack"
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    // Counterweight proves the local remote really can restore this exact
+    // missing object and the recording helper is connected to Git's fetch.
+    review_fixture_git(&root, &["cat-file", "-t", &indexed]);
+    assert!(
+        log.exists(),
+        "positive control must exercise the local promisor helper"
+    );
+}

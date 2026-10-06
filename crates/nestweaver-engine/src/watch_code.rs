@@ -58,6 +58,8 @@ pub struct CodeWatcher {
     /// Test seam: subscribe as inotify would fail on an unreadable subtree.
     #[cfg(test)]
     emulate_inotify_watch: bool,
+    #[cfg(test)]
+    contract_plan_observer: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// The watcher's cross-repo relinker thread: signalled and joined on drop,
@@ -145,6 +147,8 @@ impl CodeWatcher {
             ready_signal: None,
             #[cfg(test)]
             emulate_inotify_watch: false,
+            #[cfg(test)]
+            contract_plan_observer: None,
         }
     }
 
@@ -950,6 +954,10 @@ impl CodeWatcher {
         let contract_plan = match prepared_contracts {
             Some(plan) => plan,
             None => {
+                #[cfg(test)]
+                if let Some(observer) = &self.contract_plan_observer {
+                    observer();
+                }
                 owned_contract_plan = match crate::index::prepare_watcher_contract_derivation(
                     &reader, r_uid, repo_url,
                 ) {
@@ -1204,6 +1212,17 @@ impl CodeWatcher {
             .commit_transaction(&txn)
             .context("commit code watcher batch transaction")?;
         drop(txn);
+        // A committed replacement cascades away both note mentions and other
+        // repositories' inferred links. Record their owed repairs before any
+        // fallible publication or evidence stage can return early.
+        crate::code_links::mark_code_links_pending(
+            &self.db_path,
+            &format!("code watcher batch in {repo_url}"),
+        );
+        crate::cross_repo_links::mark_cross_repo_links_owed(
+            store,
+            &format!("code watcher batch in {repo_url}"),
+        );
         if publish_contracts && let Err(error) = store.clear_contract_derivation_failed(r_uid) {
             tracing::warn!("clearing watcher contract derivation marker failed: {error}");
         }
@@ -1245,20 +1264,6 @@ impl CodeWatcher {
             self.save_published_spec_evidence(r_uid, &specs)?;
         }
 
-        // nw-670 review M4: changed symbols change what notes' mentions
-        // resolve to (and the cascade dropped links into the changed files):
-        // owed to the code-link reconciler.
-        crate::code_links::mark_code_links_pending(
-            &self.db_path,
-            &format!("code watcher batch in {repo_url}"),
-        );
-        // The batch deleted the changed files' symbols, and the cascade took
-        // other repositories' inferred links into them; a whole-graph pass
-        // (the daemon's cross-repo relinker) restores them.
-        crate::cross_repo_links::mark_cross_repo_links_owed(
-            store,
-            &format!("code watcher batch in {repo_url}"),
-        );
         // The batch's fresh parses join the parse cache (its log), so the
         // whole-graph pass that follows re-reads none of these files.
         let parses: Vec<(String, crate::parsed_cache::CachedParseResult)> = prepared_paths
@@ -1687,7 +1692,12 @@ impl CodeWatcher {
             .ok()
             .filter(|manifests| live == manifests.keys().cloned().collect());
         let manifest_changed = manifest_changed || predecessor.is_none();
-        let source_publication = !drift.replay.is_empty() || drift.spec_changed;
+        // An interrupted bounded replay may have committed every remaining
+        // changed file while leaving the final contract pass owed. Recovery
+        // must consume that scoped debt even when disk has no new drift.
+        let source_publication = !drift.replay.is_empty()
+            || drift.spec_changed
+            || !store.contract_derivation_failures(Some(r_uid))?.is_empty();
         let manifest_capture = if (manifest_changed || source_publication) && predecessor.is_some()
         {
             let mut budget = 32 * 1024 * 1024;
@@ -1710,6 +1720,10 @@ impl CodeWatcher {
                 && (predecessor.is_some()
                     || crate::manifest::manifest_debt_revision(&self.db_path)?.is_none());
         let contract_plan = if source_publication {
+            #[cfg(test)]
+            if let Some(observer) = &self.contract_plan_observer {
+                observer();
+            }
             Some(crate::index::prepare_watcher_contract_derivation(
                 &reader, r_uid, repo_url,
             )?)
@@ -4600,6 +4614,266 @@ mod tests {
     }
 
     #[test]
+    fn d_quality_contract_debt_after_cancel_and_source_revert() {
+        let dir = tempfile::tempdir().unwrap();
+        let controller_get = "@RestController\n@RequestMapping(\"/items\")\npublic class ItemsController {\n @GetMapping public void list() {}\n}\n";
+        let controller_post = "@RestController\n@RequestMapping(\"/items\")\npublic class ItemsController {\n @PostMapping public void create() {}\n}\n";
+        let mut extra = vec![
+            ("ItemsController.java".to_owned(), controller_get.to_owned()),
+            ("openapi.yaml".to_owned(), "openapi: 3.0.0\ninfo: { title: t, version: \"1\" }\npaths:\n  /items:\n    get:\n      responses: { \"200\": { description: ok } }\n    post:\n      responses: { \"200\": { description: ok } }\n".to_owned()),
+        ];
+        for i in 0..130 {
+            extra.push((
+                format!("z{i:03}.js"),
+                format!("export function filler{i}() {{ return 1; }}\n"),
+            ));
+        }
+        let borrowed: Vec<_> = extra
+            .iter()
+            .map(|(path, body)| (path.as_str(), body.as_str()))
+            .collect();
+        let (db, root, uid) = index_fixture_repo_on_disk(&dir, &borrowed);
+        let store = Arc::new(GraphStore::open_or_create(&db).unwrap());
+        let repo_url = format!("file://{}", root.display());
+        let baseline = CodeWatcher::new(&db, &root, "test");
+        assert!(
+            baseline
+                .attempt_reconciliation(&store, &uid, &repo_url, None, 0)
+                .unwrap()
+                .is_none()
+        );
+        let settled = baseline.startup_drift(&store, &uid, &repo_url).unwrap();
+        assert!(
+            settled.replay.is_empty() && !settled.spec_changed,
+            "prime successful spec evidence before exercising cancellation"
+        );
+        std::fs::write(root.join("ItemsController.java"), controller_post).unwrap();
+        for i in 0..130 {
+            std::fs::write(
+                root.join(format!("z{i:03}.js")),
+                format!("export function filler{i}() {{ return 2; }}\n"),
+            )
+            .unwrap();
+        }
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        let stop = watcher.shutdown_handle();
+        struct StopOnDrop(ShutdownHandle);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.stop();
+            }
+        }
+        let watcher = watcher.with_mutation_lease_factory(Arc::new(move |_| {
+            Ok(Box::new(StopOnDrop(stop.clone())) as Box<dyn WatchMutationLease>)
+        }));
+        assert!(
+            watcher
+                .attempt_reconciliation(
+                    &store,
+                    &uid,
+                    &format!("file://{}", root.display()),
+                    None,
+                    0
+                )
+                .is_err()
+        );
+        let create_uid = uid_of(&store, &uid, "create");
+        assert!(
+            store
+                .contracts_implemented_by(&create_uid)
+                .unwrap()
+                .is_empty(),
+            "first chunk intentionally defers contract publication"
+        );
+        assert_eq!(
+            store.contract_derivation_failures(Some(&uid)).unwrap(),
+            vec![uid.clone()]
+        );
+        // Only the three unprocessed sorted paths revert; the controller and
+        // first 127 filler edits are already committed and remain on disk.
+        for i in 127..130 {
+            std::fs::write(
+                root.join(format!("z{i:03}.js")),
+                format!("export function filler{i}() {{ return 1; }}\n"),
+            )
+            .unwrap();
+        }
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        let repo_url = format!("file://{}", root.display());
+        let drift = watcher.startup_drift(&store, &uid, &repo_url).unwrap();
+        assert!(
+            drift.replay.is_empty() && !drift.spec_changed,
+            "no file edit remains to trigger recovery"
+        );
+        assert!(
+            watcher
+                .attempt_reconciliation(&store, &uid, &repo_url, None, 0)
+                .unwrap()
+                .is_none()
+        );
+        let implemented = store.contracts_implemented_by(&create_uid).unwrap();
+        assert!(
+            implemented
+                .iter()
+                .any(|(contract, _)| contract.ends_with(":http:POST:/items")),
+            "scoped contract debt must repair the committed controller: {implemented:?}"
+        );
+        assert!(
+            store
+                .contract_derivation_failures(Some(&uid))
+                .unwrap()
+                .is_empty()
+        );
+        let generation = store.graph_generation();
+        assert!(
+            watcher
+                .attempt_reconciliation(&store, &uid, &repo_url, None, 0)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.graph_generation(), generation);
+    }
+
+    #[test]
+    fn d_quality_evidence_failure_retains_note_and_cross_repo_repair_debts() {
+        let dir = tempfile::tempdir().unwrap();
+        let alpha = dir.path().join("alpha");
+        let beta = dir.path().join("beta");
+        let vault = dir.path().join("vault");
+        for root in [&alpha, &beta, &vault] {
+            std::fs::create_dir_all(root).unwrap();
+        }
+        let alpha = std::fs::canonicalize(alpha).unwrap();
+        let beta = std::fs::canonicalize(beta).unwrap();
+        std::fs::write(alpha.join("package.json"), "{\"name\":\"@org/alpha\"}").unwrap();
+        std::fs::write(beta.join("package.json"), "{\"name\":\"@org/beta\"}").unwrap();
+        let helper = alpha.join("helper.js");
+        std::fs::write(&helper, "export function alphaHelper() { return 1; }\n").unwrap();
+        std::fs::write(beta.join("caller.js"), "const { alphaHelper } = require('@org/alpha');\nexport function betaCaller() {\n return alphaHelper();\n}\n").unwrap();
+        std::fs::write(
+            vault.join("helper.md"),
+            "# Helper\n\nThe alphaHelper function returns a value.\n",
+        )
+        .unwrap();
+        let db = dir.path().join("graph.lbug");
+        crate::index_md::index_markdown_directory(&vault, &db, "test", "vault").unwrap();
+        for root in [&alpha, &beta] {
+            crate::index::index_directory(
+                root,
+                &db,
+                "test",
+                &format!("file://{}", root.display()),
+                "sha",
+            )
+            .unwrap();
+        }
+        let store = Arc::new(GraphStore::open_or_create(&db).unwrap());
+        crate::code_links::reconcile_code_links(
+            &store,
+            &crate::config::CrossDomainConfig::default(),
+        )
+        .unwrap();
+        crate::cross_repo_links::mark_cross_repo_links_pending(&db, "fixture");
+        crate::cross_repo_links::reconcile_cross_repo_links(
+            &store,
+            &db,
+            crate::index_limits::IndexLimits::default(),
+            None,
+            &|| false,
+        )
+        .unwrap();
+        let repo_url = format!("file://{}", alpha.display());
+        let uid = nestweaver_schema::repo_uid("test", &repo_url);
+        let target = uid_of(&store, &uid, "alphaHelper");
+        let note_links = || {
+            store
+                .list_references_code_edges()
+                .unwrap()
+                .into_iter()
+                .filter(|(_, to, _, _)| to == &target)
+                .count()
+        };
+        let cross_links = || {
+            store
+                .list_inferred_cross_repo_links()
+                .unwrap()
+                .into_iter()
+                .filter(|(_, to, _, _, _)| to == &target)
+                .count()
+        };
+        assert!(
+            note_links() > 0 && cross_links() > 0,
+            "actual incumbent links are required"
+        );
+        assert!(!crate::code_links::code_links_pending(&db));
+        assert!(!crate::cross_repo_links::cross_repo_links_pending(&db));
+        let evidence = crate::sidecar_path(&db, ".filemeta.json");
+        let original = std::fs::read(&evidence).unwrap();
+        std::fs::write(&helper, "export function alphaHelper() { return 9; }\n").unwrap();
+        let watcher = CodeWatcher::new(&db, &alpha, "test");
+        let failure = watcher
+            .process_batch_with_io_and_hook(
+                &store,
+                &uid,
+                &repo_url,
+                &[helper],
+                &crate::index::FileSystemIndexEpilogueIo,
+                || {
+                    std::fs::remove_file(&evidence).unwrap();
+                    std::fs::create_dir(&evidence).unwrap();
+                },
+            )
+            .expect_err("only the post-commit evidence save is obstructed");
+        assert!(
+            failure.to_string().contains("filemeta") || failure.to_string().contains("directory"),
+            "{failure:#}"
+        );
+        assert!(
+            !store.is_index_publication_dirty(),
+            "source commit finalized before evidence failure"
+        );
+        assert_eq!(note_links(), 0);
+        assert_eq!(cross_links(), 0);
+        assert!(
+            crate::code_links::code_links_pending(&db),
+            "committed source replacement owes note repairs despite evidence failure"
+        );
+        assert!(
+            crate::cross_repo_links::cross_repo_links_pending(&db),
+            "committed source replacement owes cross-repo repairs despite evidence failure"
+        );
+        std::fs::remove_dir(&evidence).unwrap();
+        std::fs::write(&evidence, original).unwrap();
+        assert!(
+            watcher
+                .attempt_reconciliation(&store, &uid, &repo_url, None, 0)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::code_links::code_links_pending(&db)
+                && crate::cross_repo_links::cross_repo_links_pending(&db)
+        );
+        crate::code_links::reconcile_code_links(
+            &store,
+            &crate::config::CrossDomainConfig::default(),
+        )
+        .unwrap();
+        crate::cross_repo_links::reconcile_cross_repo_links(
+            &store,
+            &db,
+            crate::index_limits::IndexLimits::default(),
+            None,
+            &|| false,
+        )
+        .unwrap();
+        assert!(
+            note_links() > 0 && cross_links() > 0,
+            "both actual link populations must heal"
+        );
+    }
+
+    #[test]
     fn code_startup_releases_lease_and_checks_stop_between_bounded_chunks() {
         let dir = tempfile::tempdir().unwrap();
         let (db, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
@@ -5587,16 +5861,14 @@ mod tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let batches = Arc::new(AtomicU32::new(0));
         let counted = Arc::clone(&batches);
-        let factory: WatchMutationLeaseFactory = Arc::new(move |label: &'static str| {
-            if label == "watch_code_batch" {
-                counted.fetch_add(1, Ordering::SeqCst);
-            }
-            Ok(Box::new(()) as Box<dyn WatchMutationLease>)
-        });
         let store = Arc::new(GraphStore::open_or_create(&db_path).unwrap());
-        let watcher = CodeWatcher::new(&db_path, &root, "test")
-            .with_mutation_lease_factory(factory)
+        let mut watcher = CodeWatcher::new(&db_path, &root, "test")
             .with_reconcile_retry_base(Duration::from_secs(600));
+        // Startup prepares before taking a write lease. Count the actual
+        // canonical attempts so a pre-lease failure still exercises backoff.
+        watcher.contract_plan_observer = Some(Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }));
         let (stop, handle) = spawn_live_code_watcher(watcher, store);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -5606,9 +5878,10 @@ mod tests {
             // One live batch, then the immediate reconciliation's replay:
             // both fail, and a retry is owed ten minutes out.
             wait_until("the first skipped edit to be disclosed as owed", || {
-                code_debt(&db_path)
-                    .iter()
-                    .any(|(path, reason)| path == &first_key && reason.contains("retrying"))
+                batches.load(Ordering::SeqCst) >= 2
+                    && code_debt(&db_path)
+                        .iter()
+                        .any(|(path, reason)| path == &first_key && reason.contains("retrying"))
             });
             let owed_once = batches.load(Ordering::SeqCst);
             assert_eq!(owed_once, 2, "one live batch plus one replay");
