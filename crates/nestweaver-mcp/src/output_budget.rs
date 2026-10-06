@@ -247,7 +247,7 @@ fn shrink(value: &mut Value, omitted: &mut BTreeMap<String, Value>) -> Result<bo
                     .and_then(Value::as_array)
                     .map_or(0, Vec::len);
                 let exhausted_smaller = broken_pair
-                    && other_len < keep + count
+                    && other_len <= keep
                     && parent["offset"]
                         .as_u64()
                         .unwrap_or(0)
@@ -688,6 +688,35 @@ mod tests {
             assert_eq!(payload["low_confidence_truncated"], true);
             assert!(payload["output_budget"]["retry"].is_string());
         }
+    }
+
+    #[test]
+    fn quality_budget_exhausted_primary_cannot_advance_past_cut_secondary() {
+        let broken: Vec<_> = (0..30).map(|index| json!({"source_note_uid":format!("note:broken:{index}"),"wikilink_text":format!("missing{index}"),"confidence":0.0})).collect();
+        let low: Vec<_> = (0..40).map(|index| json!({"source_note_uid":format!("note:low:{index}"),"wikilink_text":"\\".repeat(250),"confidence":0.8})).collect();
+        let payload = quality_wrapped(
+            json!({"offset":0,"broken_links":broken,"returned":30,"total":30,"unresolved":30,"ambiguous":0,"truncated":false,"low_confidence":low,"low_confidence_total":100,"low_confidence_truncated":false}),
+        );
+        let primary = payload["broken_links"].as_array().unwrap().len();
+        let secondary = payload["low_confidence"].as_array().unwrap().len();
+        assert!(
+            secondary > 0 && secondary < 40,
+            "actual secondary array cut required"
+        );
+        assert_eq!(payload["returned"], primary);
+        assert!(
+            primary <= secondary,
+            "offset + returned would skip secondary rows {secondary}..{primary}"
+        );
+        assert_eq!(payload["total"], 30);
+        assert_eq!(payload["low_confidence_total"], 100);
+        assert_eq!(payload["low_confidence_truncated"], true);
+        assert_eq!(payload["truncated"], true);
+        assert_eq!(payload["offset"], 0);
+        assert_eq!(
+            payload["output_budget"]["cuts"]["/broken_links"]["items_omitted"],
+            30 - primary
+        );
     }
 
     #[test]
