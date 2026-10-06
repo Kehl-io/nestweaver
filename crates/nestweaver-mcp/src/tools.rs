@@ -4974,11 +4974,54 @@ fn bounded_metadata<T: serde::Serialize>(
     Ok((crate::output_budget::escaped_size(&value) <= max_bytes).then_some(value))
 }
 
-fn bounded_mapped_rows<T>(rows: &[T], bytes: usize, map: impl Fn(&T) -> Value) -> Vec<Value> {
+#[cfg(test)]
+mod delivery_allocation_witness {
+    use std::{cell::RefCell, rc::Rc};
+    type Events = Rc<RefCell<Vec<(&'static str, usize)>>>;
+    thread_local! { static ACTIVE: RefCell<Option<Events>> = const { RefCell::new(None) }; }
+    pub struct Guard {
+        pub events: Events,
+        previous: Option<Events>,
+    }
+    impl Guard {
+        pub fn new() -> Self {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let previous = ACTIVE.with(|active| active.replace(Some(events.clone())));
+            Self { events, previous }
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| active.replace(self.previous.take()));
+        }
+    }
+    pub fn record(kind: &'static str, bytes: usize) {
+        ACTIVE.with(|active| {
+            if let Some(events) = active.borrow().as_ref() {
+                events.borrow_mut().push((kind, bytes));
+            }
+        });
+    }
+}
+
+fn bounded_mapped_rows<T>(
+    rows: &[T],
+    bytes: usize,
+    map: impl Fn(&T, usize) -> Result<Option<Value>, anyhow::Error>,
+) -> Result<Vec<Value>, anyhow::Error> {
     let mut remaining = bytes.saturating_sub(2);
     let mut values = Vec::new();
     for row in rows.iter().take(2000) {
-        let value = map(row);
+        let Some(value) = map(row, remaining.saturating_sub(1))? else {
+            #[cfg(test)]
+            delivery_allocation_witness::record("mapped_row", 0);
+            break;
+        };
+        #[cfg(test)]
+        delivery_allocation_witness::record(
+            "mapped_row",
+            crate::output_budget::escaped_size(&value),
+        );
         let cost = crate::output_budget::escaped_size(&value).saturating_add(1);
         if cost > remaining {
             break;
@@ -4986,7 +5029,7 @@ fn bounded_mapped_rows<T>(rows: &[T], bytes: usize, map: impl Fn(&T) -> Value) -
         remaining -= cost;
         values.push(value);
     }
-    values
+    Ok(values)
 }
 
 fn bounded_source_text(text: &str, bytes: usize) -> String {
@@ -5754,6 +5797,30 @@ mod output_budget_tests {
     }
 
     #[test]
+    fn correction_budget_plain_error_utf8_boundary_and_ordinary_text() {
+        let ordinary = "é".repeat(2000);
+        assert_eq!(wrap_tool_error(&ordinary)["content"][0]["text"], ordinary);
+        let result = wrap_tool_error(&"é".repeat(2500));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with(&ordinary));
+        assert!(text.contains("truncated"));
+        assert!(text.len() <= 4200);
+        assert!(escaped_bytes(&result) <= 40_000);
+    }
+
+    #[test]
+    fn correction_budget_plain_error_caps_raw_ascii_before_envelope() {
+        let message = "a".repeat(5000);
+        let result = wrap_tool_error(&message);
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.len() <= 4200, "raw error bytes: {}", text.len());
+        assert!(text.contains("truncated"));
+        assert!(text.starts_with(&"a".repeat(4000)));
+        assert!(escaped_bytes(&result) <= 40_000);
+    }
+
+    #[test]
     fn ordinary_payload_decisions_and_generic_plain_errors_remain_intact() {
         let value = json!({"status":"partial","refused":false,"verdict":"review", "reason":"coverage",
             "coverage":{"traversal_truncated":true,"visible_nodes":12},"uid":"sym:a",
@@ -6051,6 +6118,20 @@ pub fn wrap_tool_failure(tool: &str, error: &anyhow::Error) -> Value {
 /// error indication (rather than a JSON-RPC-level error which terminates
 /// the call sequence).
 pub fn wrap_tool_error(message: &str) -> Value {
+    let bounded;
+    let message = if message.len() > 4000 {
+        let mut end = 4000;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        bounded = format!(
+            "{}\n[Error text truncated; narrow the request and retry for further details.]",
+            &message[..end]
+        );
+        bounded.as_str()
+    } else {
+        message
+    };
     crate::output_budget::finalize(json!({
         "content": [{ "type": "text", "text": message }],
         "isError": true,
@@ -8782,8 +8863,14 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
                 .collect()
         });
 
+    let frontmatter_complete = std::cell::Cell::new(true);
+    let hydrate = |uid: &str| {
+        let (note, complete) = store.lookup_note_for_delivery(uid, 4000)?;
+        frontmatter_complete.set(complete);
+        Ok::<_, nestweaver_store::StoreError>(note)
+    };
     let note = if let Some(uid) = args.get("uid").and_then(|v| v.as_str()) {
-        match store.lookup_note(uid) {
+        match hydrate(uid) {
             Ok(note) => note,
             Err(nestweaver_store::StoreError::NotFound) => {
                 return Err(target_not_found(
@@ -8799,7 +8886,7 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
             }
         }
     } else if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
-        match resolve_note_by_title(store, title)? {
+        match resolve_note_by_title_with(store, title, hydrate)? {
             StrictNoteResolve::Found(n) => *n,
             StrictNoteResolve::NotFound => {
                 return Err(target_not_found(
@@ -8817,6 +8904,17 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         return Err(anyhow!("provide either 'uid' or 'title'"));
     };
 
+    #[cfg(test)]
+    {
+        delivery_allocation_witness::record(
+            "note_frontmatter",
+            note.frontmatter.as_ref().map_or(0, String::len),
+        );
+        delivery_allocation_witness::record(
+            "note_frontmatter_raw",
+            note.frontmatter_raw.as_ref().map_or(0, String::len),
+        );
+    }
     const BODY_BYTES: usize = 12_000;
     let (outline_total, section_count) = store
         .note_structure_counts(&note.uid)
@@ -8958,10 +9056,11 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         text[..end].to_owned()
     });
 
-    let frontmatter_truncated = note
-        .frontmatter
-        .as_ref()
-        .is_some_and(|text| text.len() > 4_000);
+    let frontmatter_truncated = !frontmatter_complete.get()
+        || note
+            .frontmatter
+            .as_ref()
+            .is_some_and(|text| text.len() > 4_000);
     let frontmatter: Value = if frontmatter_truncated {
         Value::Null
     } else {
@@ -11452,26 +11551,49 @@ fn tool_brain_impact(
     nodes.retain(|node| uid_is_visible(&node.uid));
     let total = nodes.len();
 
-    let rows = bounded_mapped_rows(&nodes[..nodes.len().min(limit)], 8_000, |n| {
+    let rows = bounded_mapped_rows(&nodes[..nodes.len().min(limit)], 8_000, |n, bytes| {
         if concise {
-            json!({
-                "name": n.name,
-                "depth": n.depth,
-                "impact_score": n.impact_score,
-            })
+            #[derive(serde::Serialize)]
+            struct Row<'a> {
+                name: &'a str,
+                depth: u32,
+                impact_score: f64,
+            }
+            bounded_metadata(
+                &Row {
+                    name: &n.name,
+                    depth: n.depth,
+                    impact_score: n.impact_score,
+                },
+                bytes,
+            )
         } else {
-            json!({
-                "uid": n.uid,
-                "name": n.name,
-                "file_path": n.file_path,
-                "start_line": n.start_line,
-                "edge_type": n.edge_type,
-                "confidence": n.confidence,
-                "depth": n.depth,
-                "impact_score": n.impact_score,
-            })
+            #[derive(serde::Serialize)]
+            struct Row<'a> {
+                uid: &'a str,
+                name: &'a str,
+                file_path: &'a str,
+                start_line: u32,
+                edge_type: &'a str,
+                confidence: f32,
+                depth: u32,
+                impact_score: f64,
+            }
+            bounded_metadata(
+                &Row {
+                    uid: &n.uid,
+                    name: &n.name,
+                    file_path: &n.file_path,
+                    start_line: n.start_line,
+                    edge_type: &n.edge_type,
+                    confidence: n.confidence,
+                    depth: n.depth,
+                    impact_score: n.impact_score,
+                },
+                bytes,
+            )
         }
-    });
+    })?;
 
     Ok(nestweaver_schema::responses::impact(json!({
         "status": "ok",
@@ -15831,37 +15953,70 @@ fn tool_blast_radius(
         nestweaver_engine::RiskLevel::Unknown => "unknown",
     };
 
-    let changed_json = bounded_mapped_rows(&result.changed_symbols, 2000, |s| {
-        json!({
-            "uid": s.uid,
-            "name": s.name,
-            "file_path": s.file_path,
-            "kind": s.kind,
-            "pagerank_score": s.pagerank_score,
-        })
-    });
-
-    let affected_json = bounded_mapped_rows(&result.affected_symbols, 2000, |s| {
-        json!({
-            "uid": s.uid,
-            "name": s.name,
-            "file_path": s.file_path,
-            "depth": s.depth,
-            "edge_type": s.edge_type,
-            "confidence": s.confidence,
-            "impact_score": s.impact_score,
-        })
-    });
-
-    let clusters_json = bounded_mapped_rows(&result.affected_clusters, 1000, |c| {
-        json!({
-            "id": c.id,
-            "name": c.name,
-            "affected_count": c.affected_count,
-            "total_count": c.total_count,
-            "cohesion": c.cohesion,
-        })
-    });
+    let changed_json = bounded_mapped_rows(&result.changed_symbols, 2000, |s, bytes| {
+        #[derive(serde::Serialize)]
+        struct Row<'a> {
+            uid: &'a str,
+            name: &'a str,
+            file_path: &'a str,
+            kind: &'a str,
+            pagerank_score: Option<f64>,
+        }
+        bounded_metadata(
+            &Row {
+                uid: &s.uid,
+                name: &s.name,
+                file_path: &s.file_path,
+                kind: &s.kind,
+                pagerank_score: s.pagerank_score,
+            },
+            bytes,
+        )
+    })?;
+    let affected_json = bounded_mapped_rows(&result.affected_symbols, 2000, |s, bytes| {
+        #[derive(serde::Serialize)]
+        struct Row<'a> {
+            uid: &'a str,
+            name: &'a str,
+            file_path: &'a str,
+            depth: u32,
+            edge_type: &'a str,
+            confidence: f32,
+            impact_score: f64,
+        }
+        bounded_metadata(
+            &Row {
+                uid: &s.uid,
+                name: &s.name,
+                file_path: &s.file_path,
+                depth: s.depth,
+                edge_type: &s.edge_type,
+                confidence: s.confidence,
+                impact_score: s.impact_score,
+            },
+            bytes,
+        )
+    })?;
+    let clusters_json = bounded_mapped_rows(&result.affected_clusters, 1000, |c, bytes| {
+        #[derive(serde::Serialize)]
+        struct Row<'a> {
+            id: u32,
+            name: &'a str,
+            affected_count: usize,
+            total_count: usize,
+            cohesion: f64,
+        }
+        bounded_metadata(
+            &Row {
+                id: c.id,
+                name: &c.name,
+                affected_count: c.affected_count,
+                total_count: c.total_count,
+                cohesion: c.cohesion,
+            },
+            bytes,
+        )
+    })?;
 
     // Trust signals: whether the analysis ran to completion, the gate verdict
     // (never RiskFlagged from a degraded run), and machine-readable reasons.
@@ -15878,7 +16033,9 @@ fn tool_blast_radius(
         "stale_repos_total":result.coverage.stale_repos.len(),
     });
     let blind_spots_json = bounded_typed_rows(&result.blind_spots, 1000)?;
-    let files_json = bounded_mapped_rows(&files, 2000, |f| json!(f.to_string_lossy()));
+    let files_json = bounded_mapped_rows(&files, 2000, |f, bytes| {
+        bounded_metadata(&f.to_string_lossy(), bytes)
+    })?;
     let cochanged_json = bounded_typed_rows(&result.cochanged_files, 1000)?;
     let resolver_json = bounded_typed_rows(&result.resolver_stale_repos, 1000)?;
     let org_json = bounded_metadata(&result.org_wide,1000)?.unwrap_or_else(||json!({"unavailable":"output_budget","retry_guidance":"Narrow changed files and retry org-wide metadata."}));
@@ -21553,6 +21710,70 @@ mod cache_dispatch_tests {
         );
         assert_eq!(result["candidate_total"], 250);
         assert_eq!(result["truncated"], true);
+    }
+
+    #[test]
+    fn correction_budget_note_ordinary_utf8_frontmatter_remains_complete() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault_fixture()).unwrap();
+        let mut note = note_fixture("note:native-small");
+        let frontmatter = json!({"description":"é".repeat(900)});
+        note.frontmatter = Some(frontmatter.to_string());
+        note.frontmatter_raw = Some("raw yaml".repeat(20_000));
+        store.insert_note(&note).unwrap();
+        let guard = delivery_allocation_witness::Guard::new();
+        let result = tool_note_get(&store, json!({"uid":note.uid,"include_body":false})).unwrap();
+        assert_eq!(result["frontmatter"], frontmatter);
+        assert!(result["frontmatter_unavailable"].is_null());
+        assert!(
+            guard
+                .events
+                .borrow()
+                .iter()
+                .any(|(kind, bytes)| *kind == "note_frontmatter_raw" && *bytes == 0)
+        );
+        assert_eq!(
+            store.lookup_note(&note.uid).unwrap().frontmatter_raw,
+            note.frontmatter_raw
+        );
+    }
+
+    #[test]
+    fn correction_budget_note_native_uid_and_title_hydration_is_bounded() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault_fixture()).unwrap();
+        let mut note = note_fixture("note:native-large");
+        note.title = "Native large unique".into();
+        note.frontmatter = Some(json!({"description":"x".repeat(100_000)}).to_string());
+        note.frontmatter_raw = Some("description: ".to_string() + &"y".repeat(100_000));
+        store.insert_note(&note).unwrap();
+        let full = store.lookup_note(&note.uid).unwrap();
+        assert_eq!(
+            full.frontmatter, note.frontmatter,
+            "generic CLI lookup remains complete"
+        );
+        assert_eq!(full.frontmatter_raw, note.frontmatter_raw);
+        let mut observed = Vec::new();
+        for selector in [
+            json!({"uid":note.uid,"include_body":false}),
+            json!({"title":note.title,"include_body":false}),
+        ] {
+            let guard = delivery_allocation_witness::Guard::new();
+            let result = tool_note_get(&store, selector).unwrap();
+            assert_eq!(result["uid"], note.uid);
+            assert_eq!(result["frontmatter_unavailable"], "output_budget");
+            assert_eq!(result["frontmatter"], Value::Null);
+            observed.extend(guard.events.borrow().iter().copied());
+        }
+        assert_eq!(
+            observed.len(),
+            4,
+            "both native UID and unique-title hydration fields observed"
+        );
+        assert!(
+            observed.iter().all(|(_, bytes)| *bytes <= 4000),
+            "native hydrated fields: {observed:?}"
+        );
     }
 
     #[test]
@@ -28633,6 +28854,51 @@ mod flow_trace_truncation_tests {
                 .unwrap();
         }
         store
+    }
+
+    #[test]
+    fn correction_budget_impact_and_blast_do_not_materialize_oversized_first_row() {
+        let root = symbol("sym:budget-root", "budgetRoot", SymbolKind::Function, 1);
+        let mut caller = symbol(
+            "sym:budget-caller",
+            "budgetCaller",
+            SymbolKind::Function,
+            10,
+        );
+        caller.name = "huge".repeat(500_000);
+        caller.file_path = "src/large-caller.rs".into();
+        let store = store_with(
+            &[root, caller.clone()],
+            &[("sym:budget-caller", "sym:budget-root", EdgeType::Calls)],
+        );
+        let mut observed = Vec::new();
+        {
+            let guard = delivery_allocation_witness::Guard::new();
+            let result =
+                tool_brain_impact(&store, json!({"symbol":"budgetRoot"}), None, None).unwrap();
+            assert_eq!(result["truncated"], true);
+            observed.extend(guard.events.borrow().iter().copied());
+        }
+        {
+            let guard = delivery_allocation_witness::Guard::new();
+            let result = tool_blast_radius(
+                &store,
+                json!({"changed_files":[caller.file_path]}),
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(result.get("status").is_some() && result.get("gate_state").is_some());
+            observed.extend(guard.events.borrow().iter().copied());
+        }
+        assert!(
+            !observed.is_empty(),
+            "actual mapped row construction must be exercised"
+        );
+        assert!(
+            observed.iter().all(|(_, bytes)| *bytes <= 8000),
+            "pre-admission materialized bytes: {observed:?}"
+        );
     }
 
     #[test]

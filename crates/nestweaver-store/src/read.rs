@@ -3015,6 +3015,40 @@ impl GraphStore {
         }
     }
 
+    /// Note-get delivery projection. Complete ordinary frontmatter is retained;
+    /// oversized frontmatter is unavailable, and raw YAML is not hydrated.
+    /// The generic lookup remains the full-content CLI/backlinks contract.
+    pub fn lookup_note_for_delivery(
+        &self,
+        uid: &str,
+        frontmatter_bytes: usize,
+    ) -> Result<(Note, bool), StoreError> {
+        let conn = self.conn()?;
+        let columns = NOTE_COLUMNS
+            .replace("n.frontmatter,", &format!("CASE WHEN size(n.frontmatter) <= {frontmatter_bytes} THEN n.frontmatter ELSE '' END,"))
+            .replace("n.frontmatter_raw", "''");
+        let q = format!(
+            "MATCH (n:Note {{uid: $uid}}) RETURN {columns}, CASE WHEN n.frontmatter IS NULL THEN true ELSE size(n.frontmatter) <= {frontmatter_bytes} END"
+        );
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare bounded note: {e}")))?;
+        let mut result = conn
+            .execute(&mut stmt, vec![("uid", Value::String(uid.into()))])
+            .map_err(|e| StoreError::Query(format!("bounded note: {e}")))?;
+        let row = result.next().ok_or(StoreError::NotFound)?;
+        let mut note = row_to_note(&row)?;
+        let complete = matches!(row.get(12), Some(Value::Bool(true)))
+            && note
+                .frontmatter
+                .as_ref()
+                .is_none_or(|text| text.len() <= frontmatter_bytes);
+        if !complete {
+            note.frontmatter = None;
+        }
+        Ok((note, complete))
+    }
+
     /// Read only direct seed identity and retrieval labels, avoiding note bodies and
     /// complete symbol records. Missing UIDs are absent; blank labels remain present.
     /// Callers bound batches and preserve their own input order and duplicates.

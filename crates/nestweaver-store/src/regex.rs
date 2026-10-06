@@ -437,7 +437,38 @@ fn regex_shard_trusted(
         && metadata.candidate_digest == state.candidate_digest
 }
 
+#[cfg(test)]
+mod planning_allocation_witness {
+    use std::{cell::RefCell, rc::Rc};
+    type Events = Rc<RefCell<Vec<(&'static str, usize)>>>;
+    thread_local! { static ACTIVE: RefCell<Option<Events>> = const { RefCell::new(None) }; }
+    pub struct Guard {
+        pub events: Events,
+        previous: Option<Events>,
+    }
+    impl Guard {
+        pub fn new() -> Self {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let previous = ACTIVE.with(|active| active.replace(Some(events.clone())));
+            Self { events, previous }
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| active.replace(self.previous.take()));
+        }
+    }
+    pub fn record(kind: &'static str, count: usize) {
+        ACTIVE.with(|active| {
+            if let Some(events) = active.borrow().as_ref() {
+                events.borrow_mut().push((kind, count));
+            }
+        });
+    }
+}
+
 struct TrigramPrefilterPlan {
+    scope_population_complete: bool,
     candidate_cap_reached: bool,
     matching_ready_uids: HashSet<String>,
     ready_scopes: HashSet<String>,
@@ -1100,6 +1131,8 @@ impl GraphStore {
                 );
             }
         }
+        #[cfg(test)]
+        planning_allocation_witness::record("states", states.len());
         Ok(states)
     }
 
@@ -1156,7 +1189,101 @@ impl GraphStore {
                 }));
             }
         }
+        #[cfg(test)]
+        planning_allocation_witness::record("inventory", scopes.len());
         Ok(scopes)
+    }
+
+    /// Bounded search inventory: lightweight deterministic UID projections,
+    /// including ownership fallback for imported graphs without source roots.
+    fn active_regex_scopes_bounded(&self, cap: usize) -> Result<(Vec<String>, bool), StoreError> {
+        let conn = self.conn()?;
+        let probe = cap.saturating_add(1);
+        let mut scopes = Vec::new();
+        for (table, field) in [("Repo", "uid"), ("Vault", "uid")] {
+            let rows = conn
+                .query(&format!(
+                    "MATCH (n:{table}) RETURN DISTINCT n.{field} ORDER BY n.{field} LIMIT {probe}"
+                ))
+                .map_err(|e| StoreError::Query(format!("bounded regex inventory: {e}")))?;
+            for row in rows {
+                if let Some(Value::String(uid)) = row.first() {
+                    scopes.push(uid.clone());
+                }
+            }
+        }
+        if scopes.is_empty() {
+            for (table, field) in [("Symbol", "repo_uid"), ("Note", "vault_uid")] {
+                let rows = conn.query(&format!("MATCH (n:{table}) WHERE n.{field} <> '' RETURN DISTINCT n.{field} ORDER BY n.{field} LIMIT {probe}"))
+                    .map_err(|e| StoreError::Query(format!("bounded regex ownership: {e}")))?;
+                for row in rows {
+                    if let Some(Value::String(uid)) = row.first() {
+                        scopes.push(uid.clone());
+                    }
+                }
+            }
+        }
+        scopes.sort();
+        scopes.dedup();
+        scopes.truncate(probe);
+        #[cfg(test)]
+        planning_allocation_witness::record("inventory", scopes.len());
+        let complete = scopes.len() <= cap;
+        scopes.truncate(cap);
+        Ok((scopes, complete))
+    }
+
+    fn read_regex_scope_states_selected(
+        &self,
+        scopes: &[String],
+        interrupted: impl Fn() -> Result<bool, StoreError>,
+    ) -> Result<HashMap<String, RegexGraphScopeState>, StoreError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare("UNWIND $uids AS wanted MATCH (s:RegexScopeState {uid: wanted}) RETURN s.uid, s.desired_epoch, s.acknowledged_epoch, s.candidate_count, s.candidate_digest, s.tombstone")
+            .map_err(|e| StoreError::Query(format!("prepare selected regex state: {e}")))?;
+        let mut states = HashMap::new();
+        for chunk in scopes.chunks(256) {
+            if interrupted()? {
+                break;
+            }
+            let rows = conn
+                .execute(
+                    &mut stmt,
+                    vec![(
+                        "uids",
+                        Value::List(
+                            lbug::LogicalType::String,
+                            chunk.iter().cloned().map(Value::String).collect(),
+                        ),
+                    )],
+                )
+                .map_err(|e| StoreError::Query(format!("selected regex state: {e}")))?;
+            for row in rows {
+                if let [
+                    Value::String(uid),
+                    Value::Int64(desired),
+                    Value::Int64(acknowledged),
+                    Value::Int64(count),
+                    Value::String(digest),
+                    Value::Bool(tombstone),
+                ] = row.as_slice()
+                {
+                    states.insert(
+                        uid.clone(),
+                        RegexGraphScopeState {
+                            desired_epoch: (*desired).max(0) as u64,
+                            acknowledged_epoch: (*acknowledged).max(0) as u64,
+                            candidate_count: (*count).max(0) as usize,
+                            candidate_digest: digest.clone(),
+                            tombstone: *tombstone,
+                        },
+                    );
+                }
+            }
+        }
+        #[cfg(test)]
+        planning_allocation_witness::record("states", states.len());
+        Ok(states)
     }
 
     /// Collect all searchable candidate nodes (Sections, Notes, Frontmatter,
@@ -1736,14 +1863,22 @@ impl GraphStore {
         if interrupted()? {
             return Ok(None);
         }
+        let (active_scopes, mut scope_population_complete) = if bounded_prefix {
+            self.active_regex_scopes_bounded(candidate_cap)?
+        } else {
+            let mut scopes: Vec<_> = self.active_regex_scopes()?.into_iter().collect();
+            scopes.sort();
+            (scopes, true)
+        };
         let Some(root) = self.regex_sidecar_root() else {
-            let dirty_scopes = self.active_regex_scopes()?;
+            let dirty_scopes = active_scopes.into_iter().collect();
             if interrupted()? {
                 return Ok(None);
             }
             return Ok(Some(TrigramPrefilterPlan {
                 matching_ready_uids: HashSet::new(),
-                candidate_cap_reached: false,
+                candidate_cap_reached: !scope_population_complete,
+                scope_population_complete,
                 ready_scopes: HashSet::new(),
                 dirty_scopes,
                 error_scopes: HashSet::new(),
@@ -1754,15 +1889,23 @@ impl GraphStore {
         let identity = self.publication_identity()?.ok_or_else(|| {
             StoreError::Query("regex v3 requires graph publication identity".to_string())
         })?;
-        let states = self.read_regex_scope_states()?;
-        let active_scopes = self.active_regex_scopes()?;
+        let states = if bounded_prefix {
+            self.read_regex_scope_states_selected(&active_scopes, &interrupted)?
+        } else {
+            self.read_regex_scope_states()?
+        };
         let has_index = index.root().join("scopes").is_dir();
         let mut ready_scopes = HashSet::new();
         let mut dirty_scopes = HashSet::new();
         let mut error_scopes = HashSet::new();
         let mut matching_ready_uids = HashSet::new();
-        let mut candidate_cap_reached = false;
+        let mut candidate_cap_reached = !scope_population_complete;
         for scope_uid in active_scopes {
+            if bounded_prefix && matching_ready_uids.len() >= candidate_cap {
+                scope_population_complete = false;
+                candidate_cap_reached = true;
+                break;
+            }
             if interrupted()? {
                 return Ok(None);
             }
@@ -1774,6 +1917,8 @@ impl GraphStore {
                 dirty_scopes.insert(scope_uid);
                 continue;
             }
+            #[cfg(test)]
+            planning_allocation_witness::record("metadata", 1);
             let metadata = match index.metadata(&scope_uid) {
                 Ok(Some(metadata)) => metadata,
                 Ok(None) => {
@@ -1790,6 +1935,8 @@ impl GraphStore {
                 dirty_scopes.insert(scope_uid);
                 continue;
             }
+            #[cfg(test)]
+            planning_allocation_witness::record("posting", 1);
             let candidates = if bounded_prefix {
                 index.candidate_uids_bounded(
                     &metadata,
@@ -1841,6 +1988,7 @@ impl GraphStore {
         }
         Ok(Some(TrigramPrefilterPlan {
             matching_ready_uids,
+            scope_population_complete,
             candidate_cap_reached,
             ready_scopes,
             dirty_scopes,
@@ -2202,7 +2350,7 @@ impl GraphStore {
         }
 
         // nw-097: attach the note at the source so no caller has to remember.
-        Ok(RegexSearchResult {
+        let mut response = RegexSearchResult {
             results,
             truncated,
             scanned_fallback,
@@ -2222,7 +2370,18 @@ impl GraphStore {
             },
             note: None,
         }
-        .with_scan_budget_note())
+        .with_scan_budget_note();
+        if plan
+            .as_ref()
+            .is_some_and(|plan| !plan.scope_population_complete)
+        {
+            let disclosure = "Scope planning budget reached: ready/dirty/error scope counts are lower bounds; total scope population is unknown. Use a scoped source graph or a CLI search with a larger work allowance and retry.";
+            response.note = Some(match response.note {
+                Some(note) => format!("{note} {disclosure}"),
+                None => disclosure.into(),
+            });
+        }
+        Ok(response)
     }
 
     /// Counts-only companion to `regex_search`. For each pattern, returns the
@@ -3366,6 +3525,114 @@ mod tests {
         );
         // It still matches every text-bearing node.
         assert!(!res.results.is_empty());
+    }
+
+    fn correction_many_scope_fixture() -> GraphStore {
+        let store = store_with_text();
+        for index in 0..8 {
+            let mut symbol = store.lookup_symbol("sym:1").unwrap();
+            symbol.uid = format!("sym:scope:{index}");
+            symbol.repo_uid = format!("repo:scope:{index}");
+            store.insert_symbol(&symbol).unwrap();
+        }
+        store.build_trigram_index().unwrap();
+        let mut symbol = store.lookup_symbol("sym:1").unwrap();
+        symbol.uid = "sym:scope:new".into();
+        symbol.repo_uid = "repo:scope:new".into();
+        store.insert_symbol(&symbol).unwrap();
+        store
+    }
+
+    #[test]
+    fn correction_budget_regex_scope_inventory_state_and_work_share_small_allowance() {
+        let store = correction_many_scope_fixture();
+        let clauses = required_trigram_clauses("authenticateUser").unwrap();
+        let full = store
+            .regex_v3_candidate_uids(&clauses, Instant::now(), 60_000, None, 200_000, false)
+            .unwrap()
+            .unwrap();
+        assert!(
+            full.ready_scopes.len() >= 8,
+            "actual native ready scope population"
+        );
+        assert!(
+            full.dirty_scopes.contains("repo:scope:new"),
+            "actual nonready scope must be present"
+        );
+        assert!(full.ready_scopes.len() + full.dirty_scopes.len() >= 10);
+        let guard = planning_allocation_witness::Guard::new();
+        let plan = store
+            .regex_v3_candidate_uids(&clauses, Instant::now(), 60_000, None, 2, true)
+            .unwrap()
+            .unwrap();
+        let events = guard.events.borrow();
+        assert!(events.iter().any(|(kind, _)| *kind == "inventory"));
+        assert!(events.iter().any(|(kind, _)| *kind == "states"));
+        assert!(events.iter().any(|(kind, _)| *kind == "metadata"));
+        assert!(events.iter().any(|(kind, _)| *kind == "posting"));
+        for kind in ["inventory", "states", "metadata", "posting"] {
+            let count: usize = events
+                .iter()
+                .filter(|(event, _)| *event == kind)
+                .map(|(_, n)| *n)
+                .sum();
+            let cap = if kind == "inventory" { 3 } else { 2 };
+            assert!(
+                count <= cap,
+                "native {kind} allocation/work {count} exceeds {cap}: {events:?}"
+            );
+        }
+        assert!(
+            plan.candidate_cap_reached,
+            "partial scope population must not imply complete search"
+        );
+        assert!(plan.ready_scopes.len() + plan.dirty_scopes.len() <= 2);
+    }
+
+    #[test]
+    fn correction_budget_regex_scope_order_and_incomplete_population_are_explicit() {
+        let store = correction_many_scope_fixture();
+        let first = store.active_regex_scopes_bounded(2).unwrap();
+        let second = store.active_regex_scopes_bounded(2).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.0, vec!["repo:1", "repo:scope:0"]);
+        assert!(!first.1);
+        let result = store
+            .regex_search_cancellable_with_candidate_cap(
+                "authenticateUser",
+                None,
+                None,
+                Some(50),
+                Some(60_000),
+                None,
+                2,
+            )
+            .unwrap();
+        assert!(
+            !result.results.is_empty(),
+            "admitted candidates survive scope work stop"
+        );
+        assert!(result.truncated);
+        let note = result.note.as_deref().unwrap();
+        assert!(note.contains("lower bounds") && note.contains("population is unknown"));
+    }
+
+    #[test]
+    fn correction_budget_regex_many_scope_exact_counts_remain_exhaustive() {
+        let store = correction_many_scope_fixture();
+        let patterns = ["authenticateUser".to_string()];
+        let complete = store.count_patterns(&patterns, None, None).unwrap();
+        assert_eq!(
+            complete[0].total_matches, 11,
+            "one section plus ten symbols"
+        );
+        assert!(complete[0].ready_scopes >= 8);
+        assert!(complete[0].dirty_scopes >= 1);
+        let small = store
+            .count_patterns_with_planning_cap(&patterns, None, None, 2)
+            .unwrap();
+        assert_eq!(small[0].total_matches, complete[0].total_matches);
+        assert_eq!(small[0].files_matched, complete[0].files_matched);
     }
 
     #[test]
