@@ -6646,11 +6646,9 @@ exclude = {exclude}
 // checked here only because it still exists and must not diverge; it is not
 // the reference implementation, and nothing below treats it as one.
 //
-// Top-level runtime ES exports are roots independently of manifests. Keep
-// `glueInit` and the orphan private, and first prove both unreachable without
-// a manifest. Adding `main` must make only the private entry-file function
-// live. The exported helper remains an independently live public API control;
-// it does not prove the manifest seeded a downstream walk.
+// ES export visibility does not seed execution. Without a manifest, the entry
+// function, its exported downstream helper, and the orphan must all be dead.
+// Adding `main` must reach the entry and helper while leaving the orphan dead.
 //
 // The `daemon_` prefix is load-bearing: the main Linux CI job runs
 // `--skip daemon_` and a separate job runs `-- daemon_`.
@@ -6762,18 +6760,12 @@ fn daemon_dead_code_honors_manifest_entry_files_on_every_route() {
     assert!(!repo_dir.join("packages/glue/package.json").exists());
     let without_manifest = collect_routes();
     for (route, unreachable) in &without_manifest {
-        for private in ["glueInit", "unreferencedOrphan"] {
+        for private in ["glueInit", "unreferencedOrphan", "helperCalledOnlyByEntry"] {
             assert!(
                 unreachable.iter().any(|name| name == private),
                 "{route}: without a manifest the private control {private} must be unreachable: {unreachable:?}"
             );
         }
-        assert!(
-            !unreachable
-                .iter()
-                .any(|name| name == "helperCalledOnlyByEntry"),
-            "{route}: the exported helper is an independent root even before the manifest: {unreachable:?}"
-        );
     }
     std::fs::write(
         repo_dir.join("packages/glue/package.json"),

@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { useStore } from "../stores";
 import { clearNodePreviews } from "../hooks/useNodePreview";
 import { clearSymbolQueries } from "../api/symbolQuery";
+import { establishInitialGraphBaseline, releaseInitialReadsWithoutBaseline } from "./initialReadBarrier";
 
 export function useLiveUpdates() {
   const setSseConnected = useStore((s) => s.setSseConnected);
@@ -19,7 +20,10 @@ export function useLiveUpdates() {
     const es = new EventSource("/api/v1/events");
 
     es.onopen = () => setSseConnected(true);
-    es.onerror = () => setSseConnected(false);
+    es.onerror = () => {
+      setSseConnected(false);
+      releaseInitialReadsWithoutBaseline();
+    };
 
     const refreshSeeds = () => {
       if (seedsRef.current.length > 0) {
@@ -66,6 +70,18 @@ export function useLiveUpdates() {
     const handleGeneration = (event: Event) => {
       const snapshot = readGenerations(event);
       if (!snapshot) return;
+      if (generation === null) {
+        // A verified snapshot releases initial reads without duplicating them.
+        // Error/timeout fallback reads need one catch-up when SSE returns.
+        generation = snapshot.graph;
+        rankGeneration = snapshot.ranks;
+        if (establishInitialGraphBaseline()) {
+          graphPending = true;
+          ranksPending = true;
+          scheduleRefresh();
+        }
+        return;
+      }
       const graphChanged = generation !== snapshot.graph;
       const ranksChanged = rankGeneration !== snapshot.ranks;
       generation = snapshot.graph;

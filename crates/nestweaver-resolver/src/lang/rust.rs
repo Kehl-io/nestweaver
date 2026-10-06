@@ -59,7 +59,10 @@ pub fn resolve_import(
             }
             let remaining = &rest[ups - 1..];
             resolve_module_path(&base, remaining, known_files).or_else(|| {
-                if !remaining.is_empty() {
+                // One remaining segment may name an item in the parent
+                // module itself (`use super::helper`). Longer unmatched paths
+                // must not silently bind to that parent.
+                if remaining.len() > 1 {
                     return None;
                 }
                 [format!("{base}/mod.rs"), format!("{base}.rs")]
@@ -606,7 +609,7 @@ mod tests {
             Some("src/lib.rs".into())
         );
         assert_eq!(
-            resolve_import("src/tests.rs", "super::missing", &known),
+            resolve_import("src/tests.rs", "super::missing::item", &known),
             None
         );
     }

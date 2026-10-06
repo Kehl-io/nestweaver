@@ -1,3 +1,4 @@
+import { fetchAfterInitialGraphBaseline } from "../../../sse/initialReadBarrier";
 import { useCallback, useEffect, useRef } from "react";
 import type Graph from "graphology";
 import { apiErrorFromBody } from "../../../api/errors";
@@ -34,7 +35,7 @@ async function loadScopedBrainContext(
   tokenBudget: number,
   workspaceId: string,
 ): Promise<ScopedBrainContextResult> {
-  const response = await fetch("/api/v1/brain/context", {
+  const response = await fetchAfterInitialGraphBaseline("/api/v1/brain/context", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(workspaceContextBody(seeds, tokenBudget, workspaceId)),

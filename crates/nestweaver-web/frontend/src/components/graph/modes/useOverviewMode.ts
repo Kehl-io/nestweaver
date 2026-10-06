@@ -1,3 +1,4 @@
+import { fetchAfterInitialGraphBaseline } from "../../../sse/initialReadBarrier";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type Graph from "graphology";
 import type { OverviewResponse } from "../../../api/types";
@@ -28,7 +29,7 @@ async function loadScopedOverview(
   // `kind` is applied server-side, before the per-kind caps (nw-595).
   const kindParam = kind ? `&kind=${encodeURIComponent(kind)}` : "";
   const url = appendWorkspaceParam(`/api/v1/overview?limit=${limit}${kindParam}`, workspaceId);
-  const response = await fetch(url);
+  const response = await fetchAfterInitialGraphBaseline(url);
   if (!response.ok) {
     const body = await response.json().catch(() => ({ error: response.statusText }));
     throw apiErrorFromBody(response.status, body, response.statusText);

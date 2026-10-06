@@ -3901,7 +3901,7 @@ fn prepare_index_resolution(
             file_ast_bindings,
         );
 
-        if env.binding_count() > 0 {
+        if env.binding_count() > 0 || env.has_scoped_call_assignments() {
             Some((file_path.clone(), env))
         } else {
             None

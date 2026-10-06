@@ -83,8 +83,12 @@ pub fn propagate_types(
 
 /// Per-file type environment: maps (variable_name, scope_line) → type_name.
 /// Built by running all four inference tiers, then the fixpoint loop.
+#[derive(Clone)]
 pub struct TypeEnvironment {
     bindings: HashMap<(String, u32), TypeBinding>,
+    pub(crate) call_assignments: Vec<nestweaver_parser::parse::ScopedCallAssignment>,
+    alias_assignments: Vec<nestweaver_parser::parse::ScopedAliasAssignment>,
+    local_declarations: Vec<nestweaver_parser::RawReference>,
     scoped_bindings: HashMap<ScopedBindingKey, (usize, TypeBinding)>,
 }
 
@@ -150,10 +154,21 @@ impl TypeEnvironment {
         let assignments = extract_assignments(source);
         propagate_assignments(&mut bindings, &assignments, 10);
 
-        Self {
+        let (call_assignments, alias_assignments, local_declarations) =
+            if language == Language::Rust {
+                nestweaver_parser::parse::scoped_rust_assignment_evidence(source)
+            } else {
+                Default::default()
+            };
+        let mut env = Self {
             bindings,
             scoped_bindings,
-        }
+            call_assignments,
+            alias_assignments,
+            local_declarations,
+        };
+        env.propagate_scoped_aliases();
+        env
     }
 
     /// Look up the type of a variable at a given scope.
@@ -188,6 +203,141 @@ impl TypeEnvironment {
             ))
             .filter(|(initialized_at, _)| *initialized_at <= at)
             .map(|(_, binding)| binding)
+    }
+
+    /// Only AST item annotations at a real constant/static declaration can
+    /// supply a type without a local binding. Scope bounds remain mandatory.
+    pub(crate) fn lookup_scoped_item(
+        &self,
+        variable: &str,
+        lines: &[u32],
+        at: usize,
+    ) -> Option<&TypeBinding> {
+        self.scoped_bindings
+            .iter()
+            .filter(|((name, _, start, end), (_, binding))| {
+                name == variable
+                    && *start <= at
+                    && at < *end
+                    && lines.contains(&binding.line)
+                    && binding.source == BindingSource::Annotation
+            })
+            .min_by_key(|((_, position, start, end), _)| {
+                (*end - *start, std::cmp::Reverse(*position))
+            })
+            .map(|(_, (_, binding))| binding)
+    }
+
+    pub fn has_scoped_call_assignments(&self) -> bool {
+        !self.call_assignments.is_empty()
+    }
+
+    pub(crate) fn ast_return_type(&self, name: &str, line: u32) -> Option<&TypeBinding> {
+        let binding = self.bindings.get(&(name.into(), line))?;
+        // Only the target declaration's AST return record, never an assignment
+        // or constructor record of a same-named local.
+        (binding.source == BindingSource::ReturnType
+            && self
+                .scoped_bindings
+                .iter()
+                .any(|((variable, _, _, _), (_, scoped))| {
+                    variable == name
+                        && scoped.line == line
+                        && scoped.source == BindingSource::ReturnType
+                }))
+        .then_some(binding)
+    }
+
+    pub(crate) fn seed_scoped_return(
+        &mut self,
+        assignment: &nestweaver_parser::parse::ScopedCallAssignment,
+        target_file: &str,
+        binding: &TypeBinding,
+    ) {
+        if !binding
+            .type_name
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || ch == '_')
+        {
+            return;
+        }
+        let scope = assignment.scope;
+        self.scoped_bindings
+            .entry((
+                assignment.variable.clone(),
+                scope.position,
+                scope.start,
+                scope.end,
+            ))
+            .or_insert((
+                scope.initialized_at,
+                TypeBinding {
+                    // Retain the exact callee's file for alias/import type-origin
+                    // resolution; this tag stays internal to the type environment.
+                    type_name: format!("{target_file}#{}", binding.type_name),
+                    line: assignment.line,
+                    confidence: binding.confidence.min(0.85),
+                    source: BindingSource::ReturnType,
+                },
+            ));
+    }
+
+    pub(crate) fn propagate_scoped_aliases(&mut self) {
+        // Select the actual initialized source declaration, including unknown
+        // inner shadows, before looking up its type. No line-global donation.
+        for _ in 0..10 {
+            let mut seeds = Vec::new();
+            for alias in &self.alias_assignments {
+                let at = alias.source_position;
+                let source = self
+                    .local_declarations
+                    .iter()
+                    .filter(|declaration| {
+                        declaration.name == alias.source
+                            && declaration.scope.is_some_and(|scope| {
+                                scope.start <= at && at < scope.end && scope.initialized_at <= at
+                            })
+                    })
+                    .min_by_key(|declaration| {
+                        let scope = declaration.scope.expect("filtered scope");
+                        (scope.end - scope.start, std::cmp::Reverse(scope.position))
+                    });
+                let Some(scope) = source.and_then(|declaration| declaration.scope) else {
+                    continue;
+                };
+                let Some(binding) = self.lookup_declaration(&alias.source, scope, at).cloned()
+                else {
+                    continue;
+                };
+                let target = alias.scope;
+                let key = (
+                    alias.variable.clone(),
+                    target.position,
+                    target.start,
+                    target.end,
+                );
+                if !self.scoped_bindings.contains_key(&key) {
+                    seeds.push((
+                        key,
+                        target.initialized_at,
+                        TypeBinding {
+                            type_name: binding.type_name,
+                            line: alias.line,
+                            confidence: binding.confidence * 0.95,
+                            source: BindingSource::Assignment,
+                        },
+                    ));
+                }
+            }
+            if seeds.is_empty() {
+                break;
+            }
+            for (key, initialized_at, binding) in seeds {
+                self.scoped_bindings
+                    .entry(key)
+                    .or_insert((initialized_at, binding));
+            }
+        }
     }
 
     /// Look up self/this type at a given line.
@@ -249,6 +399,9 @@ impl TypeEnvironment {
         Self {
             bindings,
             scoped_bindings: HashMap::new(),
+            call_assignments: Vec::new(),
+            alias_assignments: Vec::new(),
+            local_declarations: Vec::new(),
         }
     }
 }

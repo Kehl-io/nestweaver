@@ -15520,7 +15520,6 @@ fn cli_existing_db_routes_refuse_invalid_targets_without_artifacts() {
             vec!["watch-stop"],
             vec!["mcp"],
             vec!["interactions", "forget", "note:missing"],
-            vec!["publication", "status", "--json"],
             vec!["repair", "--dry-run"],
             vec!["extensions", "list", "--json"],
         ] {
@@ -15820,6 +15819,38 @@ fn cli_index_reports_selected_target_and_searches_from_unrelated_cwd() {
             .assert()
             .success()
             .stdout(contains("quickstartNeedle"));
+    }
+}
+
+#[test]
+fn cli_publication_status_diagnoses_unopenable_targets_without_artifacts() {
+    for shape in ["absent", "directory", "text", "empty"] {
+        let fixture = ExistingDbCliFixture::new();
+        match shape {
+            "directory" => std::fs::create_dir(&fixture.db).unwrap(),
+            "text" => std::fs::write(&fixture.db, b"important user notes\n").unwrap(),
+            "empty" => std::fs::write(&fixture.db, b"").unwrap(),
+            _ => {}
+        }
+        fixture.persist_private_config();
+        let before = fixture.tree();
+        let output = fixture
+            .command()
+            .args(["publication", "status", "--json", "--db"])
+            .arg(&fixture.db)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{shape}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            payload.is_object(),
+            "diagnostic must return JSON: {payload}"
+        );
+        assert_eq!(fixture.tree(), before, "{shape}: diagnostic changed files");
     }
 }
 

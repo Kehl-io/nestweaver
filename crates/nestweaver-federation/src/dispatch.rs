@@ -508,6 +508,13 @@ fn note_get_request(params: &Value) -> nestweaver_proto::NoteGetRequest {
         // nw-316: preserve absence; see `project_context_request`.
         include_body: params.get("include_body").and_then(|value| value.as_bool()),
         sections: json_str_array(params, "sections"),
+        body_offset: params
+            .get("body_offset")
+            .and_then(serde_json::Value::as_u64),
+        body_version: params
+            .get("body_version")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
     }
 }
 

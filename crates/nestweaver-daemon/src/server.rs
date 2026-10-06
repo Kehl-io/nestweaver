@@ -9793,6 +9793,12 @@ impl NestWeaverDaemon for DaemonService {
             args["sections"] = serde_json::json!(req.sections);
         }
 
+        if let Some(version) = req.body_version {
+            args["body_version"] = serde_json::json!(version);
+        }
+        if let Some(offset) = req.body_offset {
+            args["body_offset"] = serde_json::json!(offset);
+        }
         let value = self
             .dispatch_tool_json("note_get", args, &extensions)
             .await?;
@@ -25409,6 +25415,8 @@ repos = ["alpha"]
                 title: None,
                 include_body: Some(true),
                 sections: vec![],
+                body_offset: None,
+                body_version: None,
             });
             req.extensions_mut().insert(profile);
             req
@@ -28934,6 +28942,8 @@ external_model = "unavailable-test-model"
 
     fn nw415_note_request() -> NoteGetRequest {
         NoteGetRequest {
+            body_offset: None,
+            body_version: None,
             uid: Some("note:nw415".to_string()),
             title: None,
             sections: Vec::new(),

@@ -673,8 +673,8 @@ test("generation handshake catches a missed publish without reheating unchanged 
     return route.fulfill({ json: { workspaces: [workspace], _meta: workspace._meta } });
   });
   await openP1Workspace(page);
-  await expect.poll(() => catalogs).toBeGreaterThan(1);
   await expect.poll(() => connections).toBeGreaterThan(3);
+  expect(catalogs).toBe(1); // First snapshot is a baseline, not a second page load.
   const before = catalogs;
   const opens = connections;
   await expect.poll(() => connections).toBeGreaterThan(opens + 2);
@@ -788,8 +788,8 @@ test("rank generation handshake refreshes pinned context after a missed recomput
     await route.fulfill({ response, json: body });
   });
   await openP1Workspace(page);
-  await expect.poll(() => catalogs).toBeGreaterThan(1);
   await expect.poll(() => connections).toBeGreaterThan(3);
+  expect(catalogs).toBe(1);
   const results = await fillSearch(page, symbol.name);
   await results.getByRole("option").first().getByRole("button", { name: "Explore" }).click();
   await selectRepresentation(page, "JSON");
@@ -900,4 +900,90 @@ test("committed same-scene overview rebuild preserves hub and sibling edge ident
   expect(after.graph.nodes.map((node) => node.uid).sort()).toEqual(before.graph.nodes.map((node) => node.uid).sort());
   expect(after.active_lens).toEqual(before.active_lens);
   expect(after.representation).toBe("json");
+});
+
+test("initial scene reads wait for the first subscribed snapshot and load once", async ({ page }) => {
+  await installDeliveryReceipts(page);
+  await page.clock.install();
+  await page.clock.pauseAt(new Date());
+  let releaseStream: (() => void) | undefined;
+  const heldStream = new Promise<void>((resolve) => { releaseStream = resolve; });
+  let streamRequests = 0;
+  let committed = false;
+  let catalogs = 0;
+  let overviews = 0;
+  const workspace = deliveryWorkspace("all", "all", "Initial stream fixture");
+  await page.route("**/api/v1/events", async (route) => {
+    streamRequests += 1;
+    await heldStream;
+    await route.fulfill({ status: 200, contentType: "text/event-stream", body:
+      'retry: 200\nevent: graph:generation\ndata: {"graph_generation":"2","pagerank_generation":"0"}\n\n' });
+  });
+  await page.route("**/api/v1/workspaces", (route) => {
+    catalogs += 1;
+    return route.fulfill({ json: { workspaces: [workspace], _meta: workspace._meta } });
+  });
+  await page.route("**/api/v1/overview?**", (route) => {
+    overviews += 1;
+    const landmark = { uid: "note:initial-race", kind: "note", label: committed ? "Subscribed publication applied" : "Before subscription",
+      location: "initial.md", score: 1, reason: "fixture" };
+    return route.fulfill({ json: { counts: { ...workspace.counts, gap_count: 0 }, landmarks: [landmark],
+      start_here: [landmark], gaps: [], _meta: workspace._meta } });
+  });
+  await openP1Workspace(page);
+  await expect.poll(() => streamRequests).toBeGreaterThan(0);
+  // Current ungated code completes old HTTP reads before this subscription.
+  expect({ catalogs, overviews }).toEqual({ catalogs: 0, overviews: 0 });
+  await expect(page.getByLabel("Workspace", { exact: true })).toContainText("Loading...");
+  committed = true;
+  releaseStream!();
+  await selectRepresentation(page, "JSON");
+  await expect(jsonResultRegion(page)).toContainText("Subscribed publication applied");
+  expect({ catalogs, overviews }).toEqual({ catalogs: 1, overviews: 1 });
+  await page.clock.runFor(401);
+  expect({ catalogs, overviews }).toEqual({ catalogs: 1, overviews: 1 });
+});
+
+test("initial stream timeout releases reads and its later snapshot catches up once", async ({ page }) => {
+  await installDeliveryReceipts(page);
+  await page.clock.install();
+  await page.clock.pauseAt(new Date());
+  let releaseStream: (() => void) | undefined;
+  const heldStream = new Promise<void>((resolve) => { releaseStream = resolve; });
+  let streamRequests = 0;
+  let committed = false;
+  let catalogs = 0;
+  const workspace = deliveryWorkspace("all", "all", "Fallback fixture");
+  await page.route("**/api/v1/events", async (route) => {
+    streamRequests += 1;
+    await heldStream;
+    await route.fulfill({ status: 200, contentType: "text/event-stream", body:
+      'retry: 200\nevent: graph:generation\ndata: {"graph_generation":"2","pagerank_generation":"1"}\n\n' });
+  });
+  await page.route("**/api/v1/workspaces", (route) => {
+    catalogs += 1;
+    return route.fulfill({ json: { workspaces: [workspace], _meta: workspace._meta } });
+  });
+  await page.route("**/api/v1/overview?**", (route) => {
+    const landmark = { uid: "note:stream-fallback", kind: "note", label: committed ? "Late snapshot applied" : "Fallback loaded",
+      location: "fallback.md", score: 1, reason: "fixture" };
+    return route.fulfill({ json: { counts: { ...workspace.counts, gap_count: 0 }, landmarks: [landmark],
+      start_here: [landmark], gaps: [], _meta: workspace._meta } });
+  });
+  await openP1Workspace(page);
+  await expect.poll(() => streamRequests).toBeGreaterThan(0);
+  await page.clock.runFor(2001); // exhaust the production fallback, not a test delay
+  await selectRepresentation(page, "JSON");
+  await expect(jsonResultRegion(page)).toContainText("Fallback loaded");
+  expect(catalogs).toBe(1);
+  committed = true;
+  releaseStream!();
+  await expect.poll(() => eventCount(page, "graph:generation")).toBeGreaterThan(0);
+  await page.clock.runFor(401);
+  await expect(jsonResultRegion(page)).toContainText("Late snapshot applied");
+  expect(catalogs).toBe(2);
+  const opened = streamRequests;
+  await page.clock.runFor(1001);
+  await expect.poll(() => streamRequests).toBeGreaterThan(opened);
+  expect(catalogs).toBe(2);
 });

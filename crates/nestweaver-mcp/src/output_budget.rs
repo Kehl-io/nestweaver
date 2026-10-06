@@ -43,7 +43,8 @@ struct Cut {
     array: bool,
 }
 fn identity(key: &str) -> bool {
-    key == "uid"
+    key == "body_version"
+        || key == "uid"
         || key.ends_with("_uid")
         || key.ends_with("_uids")
         || key == "deduped_ref"
@@ -202,6 +203,19 @@ fn shrink(value: &mut Value, omitted: &mut BTreeMap<String, Value>) -> Result<bo
             shared_keep = Some(keep);
         }
     }
+    let body_window = if matches!(cut.path.last(), Some(Step::Key(key)) if key == "body") {
+        let mut parent = &*value;
+        for step in &cut.path[..cut.path.len() - 1] {
+            parent = match step {
+                Step::Key(key) => &parent[key],
+                Step::Index(i) => &parent[*i],
+            };
+        }
+        parent["body_offset"].as_u64().is_some()
+            && parent["body_offset_unit"] == "unicode_characters"
+    } else {
+        false
+    };
     let mut selected = &mut *value;
     for step in &cut.path {
         selected = match step {
@@ -341,12 +355,39 @@ fn shrink(value: &mut Value, omitted: &mut BTreeMap<String, Value>) -> Result<bo
     } else {
         let text = selected.as_str().unwrap();
         let previous_len = text.len();
-        let clipped = crate::tools::truncate_utf8_bytes(text, (text.len() / 2).max(64));
+        let clipped = if body_window {
+            // Continuation offsets count source characters. Never append the
+            // display ellipsis used for ordinary metadata truncation.
+            let mut end = (text.len() / 2).max(64).min(text.len());
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text[..end].to_owned()
+        } else {
+            crate::tools::truncate_utf8_bytes(text, (text.len() / 2).max(64))
+        };
         *selected = json!(clipped);
         let clipped_len = selected.as_str().unwrap().len();
+        let clipped_chars = selected.as_str().unwrap().chars().count();
+        let replacement = selected.clone();
+        if matches!(cut.path.last(), Some(Step::Key(key)) if key == "body") {
+            let mut parent = &mut *value;
+            for step in &cut.path[..cut.path.len() - 1] {
+                parent = match step {
+                    Step::Key(key) => &mut parent[key],
+                    Step::Index(i) => &mut parent[*i],
+                };
+            }
+            if let Some(offset) = parent["body_offset"].as_u64()
+                && parent["body_offset_unit"] == "unicode_characters"
+            {
+                parent["next_body_offset"] = json!(offset + clipped_chars as u64);
+                parent["body_truncated"] = json!(true);
+            }
+        }
         let mirror_label = mirror_path.as_ref().map(|path| cut_label(path));
         if let Some(path) = mirror_path {
-            let replacement = selected.clone();
+            let replacement = replacement.clone();
             let mut mirror = &mut *value;
             for step in &path {
                 mirror = match step {
@@ -565,6 +606,38 @@ fn refusal(result: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn review2_finalizer_body_cut_recomputes_character_cursor_and_preserves_version() {
+        let body = "雪 λ \\\"\n\u{2028}".repeat(9000);
+        let offset = 37u64;
+        let version = "v".repeat(300);
+        for already_has_more in [true, false] {
+            let result = finalize(json!({"content":[],"isError":false,"structuredContent":{
+                "uid":"note:late-cut","body":body,"body_offset":offset,"body_offset_unit":"unicode_characters",
+                "body_version":version,"body_truncated":already_has_more,
+                "next_body_offset":if already_has_more {Some(offset+body.chars().count() as u64)} else {None}
+            }}));
+            assert!(escaped_size(&result) <= RESULT_BYTES);
+            let page = &result["structuredContent"];
+            assert!(escaped_size(page) <= LOGICAL_BYTES);
+            let kept = page["body"].as_str().unwrap();
+            assert!(
+                !kept.is_empty() && kept.len() < body.len(),
+                "fixture must trigger actual finalizer body cut"
+            );
+            assert!(body.starts_with(kept));
+            assert_eq!(
+                page["next_body_offset"],
+                offset + kept.chars().count() as u64
+            );
+            assert_eq!(page["body_truncated"], true);
+            assert_eq!(page["body_version"], version);
+            let text: Value =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(&text, page);
+        }
+    }
+
     use super::*;
     fn quality_wrapped(payload: Value) -> Value {
         let result = crate::tools::wrap_tool_result(payload);

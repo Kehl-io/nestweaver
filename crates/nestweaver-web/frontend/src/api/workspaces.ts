@@ -1,3 +1,4 @@
+import { fetchAfterInitialGraphBaseline } from "../sse/initialReadBarrier";
 import { apiErrorFromBody } from "./errors";
 import type {
   ResultState,
@@ -8,7 +9,7 @@ import type {
 } from "./p1Types";
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init);
+  const res = await fetchAfterInitialGraphBaseline(url, init);
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
     throw apiErrorFromBody(res.status, body, res.statusText);

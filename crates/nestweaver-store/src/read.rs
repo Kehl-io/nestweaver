@@ -1963,6 +1963,64 @@ impl GraphStore {
         .collect()
     }
 
+    /// Bounded Unicode-character window over one indexed heading. Metadata
+    /// previews may truncate heading text; selected body rendering must not.
+    pub fn heading_text_window(
+        &self,
+        heading_uid: &str,
+        offset: u64,
+        limit: usize,
+    ) -> Result<(Option<String>, u64, String), StoreError> {
+        let start = offset
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Query("heading offset overflow".into()))?;
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(&format!("MATCH (h:Heading) WHERE h.uid=$hid RETURN substring(h.text,{start},{limit}),size(h.text),h.content_hash LIMIT 1")).map_err(|e|StoreError::Query(e.to_string()))?;
+        let mut result = conn
+            .execute(
+                &mut stmt,
+                vec![("hid", Value::String(heading_uid.to_owned()))],
+            )
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        match result.next() {
+            Some(row) => Ok((
+                Some(extract_string(&row, 0)?),
+                extract_i64(&row, 1)? as u64,
+                extract_string(&row, 2)?,
+            )),
+            None => Ok((None, 0, String::new())),
+        }
+    }
+
+    /// Bounded Unicode-character window over one indexed section. The exact
+    /// source character count permits continuation without hydrating its tail.
+    pub fn section_text_window(
+        &self,
+        heading_uid: &str,
+        offset: u64,
+        limit: usize,
+    ) -> Result<(Option<String>, u64, String), StoreError> {
+        let start = offset
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Query("section offset overflow".into()))?;
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(&format!("MATCH (s:Section) WHERE s.heading_uid=$hid RETURN substring(s.text_content,{start},{limit}),size(s.text_content),s.text_hash ORDER BY s.start_line,s.uid LIMIT 1")).map_err(|e|StoreError::Query(e.to_string()))?;
+        let mut result = conn
+            .execute(
+                &mut stmt,
+                vec![("hid", Value::String(heading_uid.to_owned()))],
+            )
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        match result.next() {
+            Some(row) => Ok((
+                Some(extract_string(&row, 0)?),
+                extract_i64(&row, 1)? as u64,
+                extract_string(&row, 2)?,
+            )),
+            None => Ok((None, 0, String::new())),
+        }
+    }
+
     /// Fetch just one selected section with a bounded text prefix.
     pub fn section_for_heading_bounded(
         &self,

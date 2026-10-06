@@ -1373,11 +1373,18 @@ pub(crate) fn assert_wire_tool_contract(wire: &Value, full: &Value) {
         let actual = wire.as_object().expect("schema object");
         assert_eq!(
             actual.len(),
-            expected.len() - usize::from(expected.contains_key("description"))
+            expected.len()
+                - usize::from(
+                    expected.contains_key("description") && !actual.contains_key("description")
+                )
         );
         for (key, value) in expected {
             if key == "description" {
-                assert!(!actual.contains_key(key));
+                if let Some(got) = actual.get(key) {
+                    let text = got.as_str().expect("description string");
+                    assert!(text.len() <= 100);
+                    assert!(!text.is_empty());
+                }
                 continue;
             }
             let got = actual
@@ -1460,7 +1467,16 @@ fn compact_wire_tool(mut tool: Value) -> Value {
         compact_schema_documentation(schema);
     }
     if let Some(description) = tool.get("description").and_then(Value::as_str) {
-        tool["description"] = json!(truncate_utf8_bytes(description, 200));
+        let compact = truncate_utf8_bytes(description, 35);
+        let compact = if compact.len() < description.len() {
+            compact
+                .rsplit_once(char::is_whitespace)
+                .map(|(words, _)| words)
+                .unwrap_or(&compact)
+        } else {
+            &compact
+        };
+        tool["description"] = json!(compact.trim_end());
     }
     tool
 }
@@ -1468,17 +1484,157 @@ fn compact_wire_tool(mut tool: Value) -> Value {
 pub fn tool_list_page(lite: bool, cursor: Option<&str>) -> Result<Value, String> {
     use std::hash::{Hash, Hasher};
     let catalogue = tool_list(lite);
-    let tools: Vec<_> = catalogue["tools"]
+    let mut tools: Vec<_> = catalogue["tools"]
         .as_array()
         .expect("catalogue tools")
         .iter()
         .cloned()
         .map(compact_wire_tool)
         .collect();
-    let mut hash = std::collections::hash_map::DefaultHasher::new();
-    catalogue.to_string().hash(&mut hash);
-    let profile = format!("{:016x}", hash.finish());
+    // Clients may ignore nextCursor. Preserve complete discovery, then spend
+    // remaining space on argument guidance; never remove validation keywords.
+    let full_tools = catalogue["tools"].as_array().expect("catalogue tools");
+    for (index, full) in full_tools.iter().enumerate() {
+        if let Some(properties) = full["inputSchema"]["properties"].as_object() {
+            for (name, property) in properties {
+                if let Some(description) = property["description"].as_str() {
+                    let concise = match (full["name"].as_str().unwrap_or(""), name.as_str()) {
+                        ("read_symbols", "include_neighbors") => "Adjacent symbol count",
+                        ("investigate_expand", "targets") => "Map asset_id/node UID",
+                        ("code_context", "seeds") => "Symbol name/sym: UID",
+                        ("cross_repo_contracts", "name") => "Symbol name",
+                        ("brain_add_source", "name") => "Vault display name",
+                        ("get_summary", "name") => "target alias",
+                        ("cross_repo_contracts", "uid") => "Symbol UID",
+                        ("note_get", "uid") => "Note UID",
+                        ("backlinks", "uid") => "Note UID",
+                        ("set_extension", "uid") => "Node UID",
+                        ("unset_extension", "uid") => "Node UID",
+                        ("query_extensions", "uid") => "Node UID; ignores key",
+                        ("brain_memory_related", "uid") => "Seed note UID",
+                        ("brain_search", "query") => "Free-text query",
+                        ("regex_search", "query") => "pattern alias",
+                        ("investigate", "query") => "Topic/feature query",
+                        ("get_summary", "target") => "Summary name/path filter",
+                        ("brain_remove_source", "target") => "Source name/path/UID",
+                        ("cross_repo_contracts", "repo") => "Other endpoint repo",
+                        ("brain_diff", "repo") => "Repo name/URL part",
+                        ("contract_drift", "repo") => "Repo UID",
+                        ("brain_search", "limit") => "Max results per kind",
+                        ("contract_drift", "limit") => "Max rows per bucket",
+                        ("brain_memory_lint", "limit") => "Max rows per category",
+                        ("detect_changes", "limit") => "Max symbols/processes",
+                        ("get_summary", "token_budget") => "Token cap; 0 unlimited",
+                        ("read_symbols", "token_budget") => "Token cap; first kept",
+                        ("project_context", "token_budget") => "Format-based token cap",
+                        ("brain_search", "include_bodies") => "Inline bodies; detailed",
+                        ("brain_search", "rerank") => "Rerank; detailed only",
+                        ("clusters", "repos") => "Repo-induced subgraph",
+                        ("investigate", "scope") => "project:/repo:; all noop",
+                        ("brain_guide", "format") => "markdown/agent format",
+                        ("blast_radius", "format") => "json or sarif",
+                        ("query_extensions", "key") => "Property name filter",
+                        ("unset_extension", "key") => "Property to remove",
+                        ("query_extensions", "value") => "Exact/member JSON match",
+                        ("cross_repo_contracts", "symbol") => "name alias",
+                        (_, argument) => match argument {
+                            "allowlist" => "Excluded note paths",
+                            "apply" => "Write promoted files",
+                            "base_ref" => "Git comparison ref",
+                            "bundle_id" => "Prior investigate ID",
+                            "cache" => "bypass skips cache",
+                            "changed_files" => "Repo-relative paths",
+                            "cluster_id" => "Cluster numeric ID",
+                            "cluster_offset" => "Cluster page offset",
+                            "confidence" => "Min edge confidence",
+                            "config" => "Unsupported; omit",
+                            "depth" => "Traversal depth",
+                            "dry_run" => "Report; do not write",
+                            "edge_types" => "Relation type filters",
+                            "exclude_tags" => "Excluded tags",
+                            "expected_generation" => "Prior graph version",
+                            "files" => "changed_files alias",
+                            "format" => "Output format",
+                            "guide_config" => "Guide section config",
+                            "include_bodies" => "Inline source bodies",
+                            "include_body" => "Include note body",
+                            "include_components" => "Include subprojects",
+                            "include_data_edges" => "Follow data edges",
+                            "include_neighbors" => "Neighbor count",
+                            "include_seeds" => "Return seed identities",
+                            "intent" => "Ranking intent hint",
+                            "key" => "Property name",
+                            "kinds" => "Node kind filters",
+                            "level" => "Summary granularity",
+                            "limit" => "Max result count",
+                            "max_depth" => "Max traversal depth",
+                            "max_millis" => "Work budget in ms",
+                            "max_suggestions" => "Targets per link",
+                            "max_summaries" => "Max cluster summaries",
+                            "member_offset" => "UID-sorted page offset",
+                            "members" => "Cluster page members",
+                            "min_confidence" => "Review confidence tier",
+                            "min_score" => "Min impact score",
+                            "name" => "Name or identifier",
+                            "name_repo" => "Disambiguation repo",
+                            "neighbors" => "Neighbors alias",
+                            "no_cache" => "Skip cache",
+                            "no_embed" => "Skip semantic ranking",
+                            "offset" => "Skip result rows",
+                            "page_token" => "Prior scope/resolution",
+                            "path" => "Source directory path",
+                            "path_prefix" => "File path prefix",
+                            "pattern" => "Rust regex pattern",
+                            "patterns" => "Rust regex patterns",
+                            "prf" => "Expand BM25 query",
+                            "project" => "Project UID/name/alias",
+                            "query" => "Search text or alias",
+                            "recency_half_life_days" => "Age half-life in days",
+                            "recency_weight" => "Age boost multiplier",
+                            "repo" => "Repo UID/name selector",
+                            "repos" => "Repo UID/name",
+                            "rerank" => "Rerank top candidates",
+                            "resolution" => "Cluster resolution",
+                            "response_format" => "concise or detailed",
+                            "root" => "Source filesystem root",
+                            "rules" => "Hard rule overrides",
+                            "scope" => "Project/repo scope",
+                            "sections" => "heading names",
+                            "seeds" => "symbol/note/tag seeds",
+                            "since" => "ISO 8601 modified since",
+                            "since_sha" => "Comparison Git SHA",
+                            "symbol" => "Symbol name or UID",
+                            "tag" => "Focus tag name",
+                            "tags" => "Included tags",
+                            "target" => "Source name/path/UID",
+                            "targets" => "Symbol UID/name/FQN",
+                            "title" => "Note title/path",
+                            "token_budget" => "Approx token budget",
+                            "top" => "limit alias",
+                            "top_n" => "limit alias",
+                            "top_tags_limit" => "Max top tag count",
+                            "uid" => "Note/node UID",
+                            "uids_or_fqns" => "targets alias",
+                            "value" => "JSON property value",
+                            "vault" => "Vault UID",
+                            "vaults" => "Vault UID/name",
+                            "weight_bm25" => "BM25 ranking weight",
+                            "weight_ppr" => "PPR ranking weight",
+                            "weight_semantic" => "Semantic ranking weight",
+                            "body_offset" => "Unicode character offset; use next_body_offset",
+                            "body_version" => "Prior page version; required on continuation",
+                            _ => description.split('.').next().unwrap_or(description),
+                        },
+                    };
+                    tools[index]["inputSchema"]["properties"][name]["description"] = json!(concise);
+                }
+            }
+        }
+    }
     let offset = if let Some(cursor) = cursor {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        catalogue.to_string().hash(&mut hash);
+        let profile = format!("{:016x}", hash.finish());
         let parts: Vec<_> = cursor.split(':').collect();
         if parts.len() != 3 || parts[0] != "nw-tools-v1" || parts[1] != profile {
             return Err(
@@ -1496,26 +1652,14 @@ pub fn tool_list_page(lite: bool, cursor: Option<&str>) -> Result<Value, String>
     } else {
         0
     };
-    let mut page = json!({"tools":[]});
-    for tool in tools.iter().skip(offset) {
-        let mut candidate = page.clone();
-        candidate["tools"]
-            .as_array_mut()
-            .unwrap()
-            .push(tool.clone());
-        let next = offset + candidate["tools"].as_array().unwrap().len();
-        if next < tools.len() {
-            candidate["nextCursor"] = json!(format!("nw-tools-v1:{profile}:{next}"));
-        } else {
-            candidate.as_object_mut().unwrap().remove("nextCursor");
-        }
-        if crate::output_budget::escaped_size(&candidate) > crate::output_budget::CATALOGUE_BYTES {
-            break;
-        }
-        page = candidate;
+    // Every client must discover the complete annotated catalogue on its
+    // first request. Check the entire catalogue once, never a growing prefix.
+    let mut page = json!({"tools":tools});
+    if crate::output_budget::escaped_size(&page) > crate::output_budget::CATALOGUE_BYTES {
+        return Err("complete annotated tool catalogue exceeds its wire budget".into());
     }
-    if page["tools"].as_array().unwrap().is_empty() && offset < tools.len() {
-        return Err("a tool schema exceeds the intact catalogue page budget".into());
+    if offset > 0 {
+        page["tools"].as_array_mut().unwrap().drain(..offset);
     }
     Ok(page)
 }
@@ -1706,6 +1850,9 @@ mod tool_schema_validation_tests {
                 if cursor.is_none() {
                     break;
                 }
+            }
+            for tool in &mut actual {
+                compact_schema_documentation(&mut tool["inputSchema"]);
             }
             assert_eq!(actual, expected);
         }
@@ -3673,7 +3820,15 @@ pub fn dispatch_cancellable(
 
     // F16: serve cacheable read tools from (or populate) the response cache.
     // Correctness rests on the cache KEY — see `maybe_cached`.
-    let result = if is_cacheable_tool(name) && !cache_bypassed(&args) {
+    let live_note_body = name == "note_get"
+        && (args
+            .get("include_body")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+            || args.get("sections").is_some()
+            || args.get("body_offset").is_some()
+            || args.get("body_version").is_some());
+    let result = if is_cacheable_tool(name) && !cache_bypassed(&args) && !live_note_body {
         maybe_cached(store, tantivy, name, args, embed_model, cancel, visible)
     } else {
         dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible)
@@ -6092,6 +6247,52 @@ pub fn wrap_tool_result(value: Value) -> Value {
 #[cfg(test)]
 mod output_budget_tests {
     use super::*;
+    #[test]
+    fn review2_discovery_retains_argument_guidance() {
+        let page = tool_list_page(false, None).unwrap();
+        assert_eq!(
+            page["tools"].as_array().unwrap().len(),
+            tool_list(false)["tools"].as_array().unwrap().len()
+        );
+        assert!(crate::output_budget::escaped_size(&page) <= 32_000);
+        for (name, argument, needle) in [
+            ("note_get", "sections", "heading"),
+            ("read_symbols", "targets", "UID"),
+            ("brain_context", "seeds", "symbol"),
+        ] {
+            let tool = page["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap();
+            assert!(
+                tool["inputSchema"]["properties"][argument]["description"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains(needle)
+            );
+        }
+        for original in tool_list(false)["tools"].as_array().unwrap() {
+            let wire = page["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == original["name"])
+                .unwrap();
+            for (name, property) in original["inputSchema"]["properties"].as_object().unwrap() {
+                if property.get("description").is_some() {
+                    assert!(
+                        wire["inputSchema"]["properties"][name]["description"]
+                            .as_str()
+                            .is_some_and(|text| !text.is_empty()),
+                        "{} {name}",
+                        original["name"]
+                    );
+                }
+            }
+        }
+    }
 
     fn escaped_bytes(value: &Value) -> usize {
         serde_json::to_string(value)
@@ -9194,7 +9395,7 @@ mod brain_search_total_contract_tests {
 fn tool_schema_note_get() -> Value {
     json!({
         "name": "note_get",
-        "description": "Fetch note body/sections and metadata. MCP applies 20KB logical / 40KB escaped output bounds; inspect truncation and narrow to sections. Native CLI retains the full requested body.\n\nRequires either 'uid' or 'title' (at least one must be provided).\n\nGuidelines:\n- Use after brain_search or brain_context identifies a relevant note\n- Pass uid or a vault-relative path for unambiguous lookup; duplicate titles refuse with candidate UIDs\n- Use sections parameter to retrieve only specific heading sections — much more token-efficient for large notes\n\nLimitations:\n- Markdown notes only — for code symbols use read_symbols\n- Not a discovery tool — use brain_search or brain_context to find notes first",
+        "description": "Fetch note body/sections and metadata. MCP applies 20KB logical / 40KB escaped output bounds; continue with next_body_offset as body_offset (Unicode characters); keep UID/sections unchanged. Native CLI retains the full requested body.\n\nRequires either 'uid' or 'title' (at least one must be provided).\n\nGuidelines:\n- Use after brain_search or brain_context identifies a relevant note\n- Pass uid or a vault-relative path for unambiguous lookup; duplicate titles refuse with candidate UIDs\n- Use sections parameter to retrieve only specific heading sections — much more token-efficient for large notes\n\nLimitations:\n- Markdown notes only — for code symbols use read_symbols\n- Not a discovery tool — use brain_search or brain_context to find notes first",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -9206,6 +9407,8 @@ fn tool_schema_note_get() -> Value {
                     "description": "Include the note body (default true). Native CLI returns the full requested body; MCP may truncate within its independent wire bound. False returns metadata only (outline, frontmatter, section count).",
                     "default": true
                 },
+                "body_version": { "type": "string", "description": "Pass body_version from the first page on every continuation; changed sources refuse. Unicode character offsets." },
+                "body_offset": { "type": "integer", "minimum": 0, "description": "Unicode character offset in body; continue using next_body_offset, with the same UID and sections." },
                 "sections": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -9225,7 +9428,309 @@ fn tool_schema_note_get() -> Value {
     })
 }
 
+/// Read at most 12,001 Unicode characters with bounded buffers. The extra
+/// character distinguishes exhaustion; the emitted offset is computed only
+/// after the escaped presentation bound has been applied.
+fn append_note_fixed_window(
+    text: &mut String,
+    chars: &mut usize,
+    offset: &mut u64,
+    piece: &str,
+    limit: usize,
+) {
+    let count = piece.chars().count() as u64;
+    if *offset >= count {
+        *offset -= count;
+        return;
+    }
+    if *chars < limit {
+        let part: String = piece
+            .chars()
+            .skip(*offset as usize)
+            .take(limit - *chars)
+            .collect();
+        *chars += part.chars().count();
+        text.push_str(&part);
+    }
+    *offset = 0;
+}
+
+fn note_body_window(
+    store: &GraphStore,
+    note: &nestweaver_schema::Note,
+    sections: Option<&[String]>,
+    include_body: bool,
+    offset: u64,
+    expected: Option<&str>,
+) -> Result<Option<(String, bool, String)>, anyhow::Error> {
+    const WINDOW: usize = 12_001;
+    if offset > 0 && expected.is_none() {
+        return Err(anyhow!(
+            "continuation requires body_version from the first page"
+        ));
+    }
+    let started = std::time::Instant::now();
+    let check_version = |version: &str| -> Result<(), anyhow::Error> {
+        if expected.is_some_and(|old| old != version) {
+            return Err(anyhow!(
+                "note body changed; restart at body_offset 0 without body_version"
+            ));
+        }
+        Ok(())
+    };
+    if let Some(names) = sections {
+        if names.len() > 50 {
+            return Err(anyhow!(
+                "note_get accepts at most 50 selected sections; narrow the section list"
+            ));
+        }
+        let selected = store.selected_headings_bounded(&note.uid, names, 51)?;
+        if selected.len() > 50 {
+            return Err(anyhow!(
+                "section selection matches more than 50 headings; narrow the section list"
+            ));
+        }
+        let mut remaining = offset;
+        let mut text = String::new();
+        let mut chars = 0usize;
+        let mut total = 0u64;
+        let mut first = true;
+        let mut version_data = String::new();
+        for heading in &selected {
+            let (section, count, hash) = store.section_text_window(&heading.uid, 0, 0)?;
+            if section.is_none() {
+                continue;
+            }
+            let (heading_text, heading_count, heading_hash) =
+                store.heading_text_window(&heading.uid, 0, 0)?;
+            if heading_text.is_none() || heading_hash != heading.content_hash {
+                return Err(anyhow!(
+                    "selected heading changed while reading; restart pagination"
+                ));
+            }
+            version_data.push_str(&format!(
+                "{}:{}:{}:{}:{}:{}:{};",
+                heading.uid,
+                heading.level,
+                heading.start_line,
+                heading_hash,
+                heading_count,
+                hash,
+                count
+            ));
+            let before = format!(
+                "{}{} ",
+                if first { "" } else { "\n\n" },
+                "#".repeat(heading.level as usize)
+            );
+            first = false;
+            let prefix_count = before.chars().count() as u64 + heading_count + 2;
+            total = total
+                .checked_add(prefix_count + count)
+                .ok_or_else(|| anyhow!("note body offset overflow"))?;
+            if remaining >= prefix_count + count {
+                remaining -= prefix_count + count;
+                continue;
+            }
+            append_note_fixed_window(&mut text, &mut chars, &mut remaining, &before, WINDOW);
+            if remaining >= heading_count {
+                remaining -= heading_count;
+            } else if chars < WINDOW {
+                let (piece, observed_count, observed_hash) =
+                    store.heading_text_window(&heading.uid, remaining, WINDOW - chars)?;
+                if observed_count != heading_count || observed_hash != heading_hash {
+                    return Err(anyhow!(
+                        "selected heading changed while reading; restart pagination"
+                    ));
+                }
+                let piece = piece.unwrap_or_default();
+                chars += piece.chars().count();
+                text.push_str(&piece);
+                remaining = 0;
+            }
+            append_note_fixed_window(&mut text, &mut chars, &mut remaining, "\n\n", WINDOW);
+            if chars < WINDOW {
+                let (piece, observed_count, observed_hash) =
+                    store.section_text_window(&heading.uid, remaining, WINDOW - chars)?;
+                if observed_count != count || observed_hash != hash {
+                    return Err(anyhow!(
+                        "selected section changed while reading; restart pagination"
+                    ));
+                }
+                let piece = piece.unwrap_or_default();
+                chars += piece.chars().count();
+                text.push_str(&piece);
+                remaining = 0;
+            }
+        }
+        // Recheck the complete selection and stamps, including portions read
+        // earlier in this call, before publishing a version-bound page.
+        let current = store.selected_headings_bounded(&note.uid, names, 51)?;
+        if current
+            .iter()
+            .map(|h| (&h.uid, h.level, h.start_line, &h.content_hash))
+            .ne(selected
+                .iter()
+                .map(|h| (&h.uid, h.level, h.start_line, &h.content_hash)))
+        {
+            return Err(anyhow!(
+                "selected headings changed while reading; restart pagination"
+            ));
+        }
+        let mut current_version = String::new();
+        for heading in &current {
+            let (section, count, hash) = store.section_text_window(&heading.uid, 0, 0)?;
+            if section.is_none() {
+                continue;
+            }
+            let (heading_text, heading_count, heading_hash) =
+                store.heading_text_window(&heading.uid, 0, 0)?;
+            if heading_text.is_none() {
+                return Err(anyhow!(
+                    "selected heading changed while reading; restart pagination"
+                ));
+            }
+            current_version.push_str(&format!(
+                "{}:{}:{}:{}:{}:{}:{};",
+                heading.uid,
+                heading.level,
+                heading.start_line,
+                heading_hash,
+                heading_count,
+                hash,
+                count
+            ));
+        }
+        if current_version != version_data {
+            return Err(anyhow!(
+                "selected note body changed while reading; restart pagination"
+            ));
+        }
+        if offset > total {
+            return Err(anyhow!("body_offset is beyond the selected body"));
+        }
+        use std::hash::{Hash, Hasher};
+        let mut stamp = std::collections::hash_map::DefaultHasher::new();
+        version_data.hash(&mut stamp);
+        let version = format!("sections-v1:{:016x}", stamp.finish());
+        check_version(&version)?;
+        return Ok(Some((text, offset + (chars as u64) < total, version)));
+    }
+    if !include_body {
+        return Ok(None);
+    }
+    let unavailable = || -> Result<Option<(String, bool, String)>, anyhow::Error> {
+        if offset > 0 || expected.is_some() {
+            Err(anyhow!(
+                "note body changed or became unavailable; restart pagination"
+            ))
+        } else {
+            Ok(None)
+        }
+    };
+    let vault = match store.lookup_vault(&note.vault_uid) {
+        Ok(vault) => vault,
+        Err(_) => return unavailable(),
+    };
+    let path = Path::new(&vault.root_path).join(&note.file_path);
+    let approved = match (
+        std::fs::canonicalize(&path),
+        std::fs::canonicalize(&vault.root_path),
+    ) {
+        (Ok(resolved), Ok(root)) if resolved.starts_with(&root) => resolved,
+        _ => return unavailable(),
+    };
+    use std::io::Read;
+    let file = match std::fs::File::open(&approved) {
+        Ok(file) => file,
+        Err(_) => return unavailable(),
+    };
+    let file_version = |metadata: &std::fs::Metadata| -> Result<String, anyhow::Error> {
+        let modified = metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            format!(
+                "{}:{}:{}:{}",
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec()
+            )
+        };
+        #[cfg(not(unix))]
+        let identity = String::new();
+        Ok(format!("file-v1:{}:{modified}:{identity}", metadata.len()))
+    };
+    let version = file_version(&file.metadata()?)?;
+    check_version(&version)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut position = 0u64;
+    let mut text = String::new();
+    let mut chars = 0usize;
+    loop {
+        let mut bytes = [0u8; 4];
+        if position.is_multiple_of(1024) && started.elapsed() > std::time::Duration::from_secs(2) {
+            return Err(anyhow!(
+                "note body seek/read exceeded 2-second work budget; use a narrower section"
+            ));
+        }
+        if reader.read(&mut bytes[..1])? == 0 {
+            break;
+        }
+        let length = match bytes[0] {
+            0..=127 => 1,
+            194..=223 => 2,
+            224..=239 => 3,
+            240..=244 => 4,
+            _ => return Err(anyhow!("note body is not UTF-8")),
+        };
+        reader.read_exact(&mut bytes[1..length])?;
+        let ch =
+            std::str::from_utf8(&bytes[..length]).map_err(|_| anyhow!("note body is not UTF-8"))?;
+        if position >= offset {
+            if chars == WINDOW {
+                if file_version(&reader.get_ref().metadata()?)? != version
+                    || file_version(&std::fs::metadata(&path)?)? != version
+                {
+                    return Err(anyhow!(
+                        "note body changed while reading; restart pagination"
+                    ));
+                }
+                return Ok(Some((text, true, version)));
+            }
+            text.push_str(ch);
+            chars += 1;
+        }
+        position += 1;
+    }
+    if offset > position {
+        return Err(anyhow!("body_offset is beyond the note body"));
+    }
+    if file_version(&reader.get_ref().metadata()?)? != version
+        || file_version(&std::fs::metadata(&path)?)? != version
+    {
+        return Err(anyhow!(
+            "note body changed while reading; restart pagination"
+        ));
+    }
+    Ok(Some((text, false, version)))
+}
+
 fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    // Multiple metadata/window queries must belong to one clean publication.
+    // A watcher may finish between stamp rereads; the epoch closes that gap.
+    let publication_generation = store.graph_generation();
+    if bounded_delivery()
+        && (!store.index_publication_lease_is_unowned() || store.is_index_publication_dirty())
+    {
+        return Err(anyhow!(
+            "note read overlaps index publication; retry after publication completes"
+        ));
+    }
     let include_body = args
         .get("include_body")
         .and_then(|v| v.as_bool())
@@ -9295,6 +9800,9 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
             note.frontmatter_raw.as_ref().map_or(0, String::len),
         );
     }
+    let body_offset = args.get("body_offset").and_then(Value::as_u64).unwrap_or(0);
+    let mut next_body_offset = None;
+    let mut body_version = None;
     let body_bytes = delivery_limit(12_000);
     let (outline_total, section_count) = store
         .note_structure_counts(&note.uid)
@@ -9311,121 +9819,144 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
             .then_with(|| a.uid.cmp(&b.uid))
     });
     let mut body_truncated = false;
-    // Resolve body: either filtered sections or full file contents.
-    let body = if let Some(ref names) = section_filter {
-        // Section-filter mode: return only the text_content of sections whose
-        // heading matches one of the requested names (case-insensitive).
-        if bounded_delivery() && names.len() > 50 {
-            return Err(anyhow!(
-                "note_get accepts at most 50 selected sections per bounded read; narrow the section list"
-            ));
-        }
-        let selected = if bounded_delivery() {
-            store.selected_headings_bounded(&note.uid, names, 51)?
-        } else {
-            headings_raw
-                .iter()
-                .filter(|heading| {
-                    names
-                        .iter()
-                        .any(|name| name.eq_ignore_ascii_case(&heading.text))
-                })
-                .cloned()
-                .collect()
-        };
-        body_truncated |= bounded_delivery() && selected.len() > 50;
-        let full_sections = if bounded_delivery() {
-            None
-        } else {
-            Some(store.sections_in_note(&note.uid)?)
-        };
-        let mut parts = String::new();
-        for heading in selected.iter().take(delivery_limit(50)) {
-            if !parts.is_empty() {
-                if body_bytes.saturating_sub(parts.len()) < 2 {
+    // MCP reads a bounded character window before JSON presentation. Unicode
+    // character offsets also match the indexed section substring operation.
+    let body = if bounded_delivery() || args.get("body_offset").is_some() {
+        let window = note_body_window(
+            store,
+            &note,
+            section_filter.as_deref(),
+            include_body,
+            body_offset,
+            args.get("body_version").and_then(Value::as_str),
+        )?;
+        body_truncated = window.as_ref().is_some_and(|(_, more, _)| *more);
+        window.map(|(text, _, version)| {
+            body_version = Some(version);
+            text
+        })
+    } else {
+        // Resolve body: either filtered sections or full file contents.
+        if let Some(ref names) = section_filter {
+            // Section-filter mode: return only the text_content of sections whose
+            // heading matches one of the requested names (case-insensitive).
+            if bounded_delivery() && names.len() > 50 {
+                return Err(anyhow!(
+                    "note_get accepts at most 50 selected sections per bounded read; narrow the section list"
+                ));
+            }
+            let selected = if bounded_delivery() {
+                store.selected_headings_bounded(&note.uid, names, 51)?
+            } else {
+                headings_raw
+                    .iter()
+                    .filter(|heading| {
+                        names
+                            .iter()
+                            .any(|name| name.eq_ignore_ascii_case(&heading.text))
+                    })
+                    .cloned()
+                    .collect()
+            };
+            body_truncated |= bounded_delivery() && selected.len() > 50;
+            let full_sections = if bounded_delivery() {
+                None
+            } else {
+                Some(store.sections_in_note(&note.uid)?)
+            };
+            let mut parts = String::new();
+            for heading in selected.iter().take(delivery_limit(50)) {
+                if !parts.is_empty() {
+                    if body_bytes.saturating_sub(parts.len()) < 2 {
+                        body_truncated = true;
+                        break;
+                    }
+                    parts.push_str("\n\n");
+                }
+                let remaining = body_bytes.saturating_sub(parts.len());
+                if remaining == 0 {
                     body_truncated = true;
                     break;
                 }
-                parts.push_str("\n\n");
-            }
-            let remaining = body_bytes.saturating_sub(parts.len());
-            if remaining == 0 {
-                body_truncated = true;
-                break;
-            }
-            if let Some(section) = if bounded_delivery() {
-                store.section_for_heading_bounded(&heading.uid, remaining + 1)?
-            } else {
-                full_sections
-                    .as_ref()
-                    .expect("full CLI sections hydrated")
-                    .iter()
-                    .find(|section| section.heading_uid.as_deref() == Some(heading.uid.as_str()))
-                    .cloned()
-            } {
-                let text = format!(
-                    "{} {}\n\n{}",
-                    "#".repeat(heading.level as usize),
-                    heading.text,
-                    section.text_content
-                );
-                body_truncated |= text.len() > remaining;
-                parts.push_str(&truncate_utf8_bytes(&text, remaining));
-            }
-        }
-        Some(parts)
-    } else if include_body {
-        // Full body mode: load from disk.
-        match store.lookup_vault(&note.vault_uid) {
-            Ok(vault) => {
-                let path = Path::new(&vault.root_path).join(&note.file_path);
-                // Defense-in-depth: verify the resolved path stays inside
-                // the vault root. Prevents exfiltration via symlinks even
-                // if one slipped past the indexer.
-                let safe = match (
-                    std::fs::canonicalize(&path),
-                    std::fs::canonicalize(&vault.root_path),
-                ) {
-                    (Ok(resolved), Ok(root)) => resolved.starts_with(&root),
-                    _ => false,
-                };
-                if !safe {
-                    tracing::warn!(
-                        "note_get: resolved path escapes vault root, refusing to read: {}",
-                        path.display()
-                    );
-                    None
+                if let Some(section) = if bounded_delivery() {
+                    store.section_for_heading_bounded(&heading.uid, remaining + 1)?
                 } else {
-                    use std::io::Read;
-                    match std::fs::File::open(&path).and_then(|file| {
-                        let mut bytes = Vec::with_capacity((body_bytes + 1).min(12_001));
-                        file.take((body_bytes + 1) as u64).read_to_end(&mut bytes)?;
-                        body_truncated = bytes.len() > body_bytes;
-                        if body_truncated {
-                            bytes.truncate(body_bytes);
-                        }
-                        while body_truncated
-                            && std::str::from_utf8(&bytes)
-                                .is_err_and(|error| error.error_len().is_none())
-                        {
-                            bytes.pop();
-                        }
-                        String::from_utf8(bytes).map_err(|error| {
-                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                    full_sections
+                        .as_ref()
+                        .expect("full CLI sections hydrated")
+                        .iter()
+                        .find(|section| {
+                            section.heading_uid.as_deref() == Some(heading.uid.as_str())
                         })
-                    }) {
-                        Ok(text) => Some(text),
-                        Err(error) => {
-                            tracing::warn!("note_get: failed to read {}: {error}", path.display());
-                            None
+                        .cloned()
+                } {
+                    let text = format!(
+                        "{} {}\n\n{}",
+                        "#".repeat(heading.level as usize),
+                        heading.text,
+                        section.text_content
+                    );
+                    body_truncated |= text.len() > remaining;
+                    parts.push_str(&truncate_utf8_bytes(&text, remaining));
+                }
+            }
+            Some(parts)
+        } else if include_body {
+            // Full body mode: load from disk.
+            match store.lookup_vault(&note.vault_uid) {
+                Ok(vault) => {
+                    let path = Path::new(&vault.root_path).join(&note.file_path);
+                    // Defense-in-depth: verify the resolved path stays inside
+                    // the vault root. Prevents exfiltration via symlinks even
+                    // if one slipped past the indexer.
+                    let safe = match (
+                        std::fs::canonicalize(&path),
+                        std::fs::canonicalize(&vault.root_path),
+                    ) {
+                        (Ok(resolved), Ok(root)) => resolved.starts_with(&root),
+                        _ => false,
+                    };
+                    if !safe {
+                        tracing::warn!(
+                            "note_get: resolved path escapes vault root, refusing to read: {}",
+                            path.display()
+                        );
+                        None
+                    } else {
+                        use std::io::Read;
+                        match std::fs::File::open(&path).and_then(|file| {
+                            let mut bytes = Vec::with_capacity((body_bytes + 1).min(12_001));
+                            file.take((body_bytes + 1) as u64).read_to_end(&mut bytes)?;
+                            body_truncated = bytes.len() > body_bytes;
+                            if body_truncated {
+                                bytes.truncate(body_bytes);
+                            }
+                            while body_truncated
+                                && std::str::from_utf8(&bytes)
+                                    .is_err_and(|error| error.error_len().is_none())
+                            {
+                                bytes.pop();
+                            }
+                            String::from_utf8(bytes).map_err(|error| {
+                                std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                            })
+                        }) {
+                            Ok(text) => Some(text),
+                            Err(error) => {
+                                tracing::warn!(
+                                    "note_get: failed to read {}: {error}",
+                                    path.display()
+                                );
+                                None
+                            }
                         }
                     }
                 }
+                Err(_) => None,
             }
-            Err(_) => None,
+        } else {
+            None
         }
-    } else {
-        None
     };
 
     let mut headings = Vec::new();
@@ -9455,7 +9986,7 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
                 ch if ch < ' ' => 6,
                 ch => ch.len_utf8(),
             };
-            if bounded_delivery() && used + bytes > 7000 {
+            if (bounded_delivery() || args.get("body_offset").is_some()) && used + bytes > 7000 {
                 body_truncated = true;
                 break;
             }
@@ -9464,6 +9995,10 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         }
         text[..end].to_owned()
     });
+
+    if body_truncated && let Some(text) = body.as_ref() {
+        next_body_offset = Some(body_offset + text.chars().count() as u64);
+    }
 
     let frontmatter_truncated = bounded_delivery()
         && (!frontmatter_complete.get()
@@ -9484,6 +10019,15 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         || outline_text_truncated
         || outline_total > headings.len();
 
+    if bounded_delivery()
+        && (!store.index_publication_lease_is_unowned()
+            || store.is_index_publication_dirty()
+            || store.graph_generation() != publication_generation)
+    {
+        return Err(anyhow!(
+            "note index changed while reading; restart pagination"
+        ));
+    }
     Ok(json!({
         "uid": note.uid,
         "title": note.title,
@@ -9498,9 +10042,13 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         "outline_text_truncated": outline_text_truncated,
         "outline_returned": headings.len(),
         "body_truncated": body_truncated,
+        "body_offset": body_offset,
+        "body_offset_unit": "unicode_characters",
+        "body_version": body_version,
+        "next_body_offset": next_body_offset,
         "frontmatter_unavailable": if frontmatter_truncated { Some("output_budget") } else { None },
         "truncated": truncated,
-        "retry": if truncated { Some("Request specific sections by heading or read the source file for the full body/frontmatter. The outline is a bounded document-order prefix.") } else { None },
+        "retry": if body_truncated { Some("Continue with next_body_offset as body_offset and returned body_version; keep UID/sections unchanged. Metadata and outline remain independently bounded.") } else if truncated { Some("Body is complete or omitted; only metadata/outline are bounded. Read the source file for complete metadata.") } else { None },
     }))
 }
 
@@ -15554,7 +16102,7 @@ fn tool_schema_dead_code() -> Value {
                     "description": "Max unreachable symbols to return (defaults to the configured result limit). The response reports the true total in 'unreachable_count' and sets 'truncated' when the cap applied."
                 },
                 "repos": { "type": "array", "items": { "type": "string" }, "maxItems": 100, "description": "Repository names or UIDs; restrict the result population before paging." },
-                "offset": { "type": "integer", "minimum": 0, "maximum": 1000000000, "default": 0 },
+                "offset": { "type": "integer", "minimum": 0, "maximum": 1000000000, "default": 0, "description": "Zero-based result row offset; continue after returned rows." },
                 "expected_generation": { "type": "integer", "minimum": 0, "description": "Required with page_token for offset greater than zero." },
                 "page_token": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$", "description": "Prior page token binding database, generation, repository scope, filter and ordered population." },
                 "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
@@ -18148,6 +18696,11 @@ fn dispatch_via_daemon_inner(
                     // nw-316: preserve absence; see `include_components`.
                     include_body: args.get("include_body").and_then(|value| value.as_bool()),
                     sections: str_array("sections"),
+                    body_offset: args.get("body_offset").and_then(Value::as_u64),
+                    body_version: args
+                        .get("body_version")
+                        .and_then(Value::as_str)
+                        .map(String::from),
                 });
                 let resp = client.get_note(req).await.map_err(grpc_status_err)?;
                 let value = nestweaver_proto::note_get_json(&resp.into_inner())
@@ -22253,6 +22806,414 @@ mod cache_dispatch_tests {
         assert!(
             observed.iter().all(|(_, bytes)| *bytes <= 4000),
             "native hydrated fields: {observed:?}"
+        );
+    }
+
+    #[test]
+    fn review2_note_body_ignores_prefilled_cache_after_filesystem_change() {
+        let (dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        let mut vault = vault_fixture();
+        vault.root_path = dir.path().to_string_lossy().into_owned();
+        store.insert_vault(&vault).unwrap();
+        let mut note = note_fixture("note:cache-file");
+        note.file_path = "cache-note.md".into();
+        store.insert_note(&note).unwrap();
+        let path = dir.path().join(&note.file_path);
+        let old_body = "old 雪 quoted\n".repeat(4000);
+        std::fs::write(&path, &old_body).unwrap();
+        let first = dispatch(&store, None, "note_get", json!({"uid":note.uid}), None).unwrap();
+        let offset = first["next_body_offset"]
+            .as_u64()
+            .expect("fixture requires continuation");
+        let continuation_args =
+            json!({"uid":note.uid,"body_offset":offset,"body_version":first["body_version"]});
+        let old_page = dispatch(&store, None, "note_get", continuation_args.clone(), None).unwrap();
+        let key = response_cache_key("note_get", &continuation_args, &db_path, None, None);
+        let generation = store.graph_generation();
+        let scope = whole_db_scope_digest(&db_path);
+        let bytes = serde_json::to_vec(&old_page).unwrap();
+        // Deliberately prefill the exact persistent cache entry. This does not
+        // rely on implementation behavior to decide whether the fixture warmed.
+        RESPONSE_CACHE.with(|map| {
+            let mut map = map.borrow_mut();
+            let cache = map.entry(db_path.clone()).or_insert_with(|| {
+                nestweaver_store::cache::ResponseCache::open(&db_path, 64, RESPONSE_SHAPE_VERSION)
+            });
+            cache.insert(key, "note_get", &bytes, generation, scope);
+            assert!(
+                cache.get(key, generation, scope).is_some(),
+                "actual old continuation cached"
+            );
+        });
+        std::fs::write(&path, old_body.replace("old", "new")).unwrap();
+        assert_eq!(
+            store.graph_generation(),
+            generation,
+            "filesystem edit must not change cache's graph key"
+        );
+        assert!(
+            dispatch(&store, None, "note_get", continuation_args, None).is_err(),
+            "cached old page must not bypass live source-version refusal"
+        );
+        let restarted = dispatch(&store, None, "note_get", json!({"uid":note.uid}), None).unwrap();
+        assert!(
+            restarted["body"].as_str().unwrap().starts_with("new"),
+            "restart must read current file, not cached first page"
+        );
+        let metadata_args = json!({"uid":note.uid,"include_body":false});
+        dispatch(&store, None, "note_get", metadata_args.clone(), None).unwrap();
+        let metadata_key = response_cache_key("note_get", &metadata_args, &db_path, None, None);
+        assert!(
+            RESPONSE_CACHE.with(|map| map
+                .borrow_mut()
+                .get_mut(&db_path)
+                .unwrap()
+                .get(metadata_key, generation, scope)
+                .is_some()),
+            "metadata-only reads retain caching"
+        );
+    }
+
+    #[test]
+    fn review2_paged_note_refuses_live_publication_even_without_disk_marker() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault_fixture()).unwrap();
+        let note = note_fixture("note:publication-paging");
+        store.insert_note(&note).unwrap();
+        let lease = store.acquire_index_publication_lease().unwrap();
+        assert!(!store.index_publication_lease_is_unowned());
+        assert!(
+            !store.is_index_publication_dirty(),
+            "in-memory fixture has no disk marker; exercise actual lease guard"
+        );
+        let result = tool_note_get(&store, json!({"uid":note.uid,"include_body":false}));
+        assert!(
+            result.is_err(),
+            "a paged read must not start across a live index publication"
+        );
+        drop(lease);
+        assert!(tool_note_get(&store, json!({"uid":note.uid,"include_body":false})).is_ok());
+        let _cli = scoped_tool_delivery(nestweaver_schema::ToolDeliveryProfile::FullCli);
+        let lease = store.acquire_index_publication_lease().unwrap();
+        assert!(
+            tool_note_get(&store, json!({"uid":note.uid,"include_body":false})).is_ok(),
+            "native CLI remains unchanged"
+        );
+        drop(lease);
+    }
+
+    #[test]
+    fn review2_whole_file_continuation_refuses_modified_deleted_or_unreadable_source() {
+        for mode in ["modified", "deleted", "unreadable"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = GraphStore::in_memory().unwrap();
+            let mut vault = vault_fixture();
+            vault.root_path = dir.path().to_string_lossy().into_owned();
+            store.insert_vault(&vault).unwrap();
+            let mut note = note_fixture("note:changed-file");
+            note.file_path = "changed.md".into();
+            store.insert_note(&note).unwrap();
+            let path = dir.path().join(&note.file_path);
+            let original = "雪 quoted \\\"\n".repeat(4000);
+            std::fs::write(&path, &original).unwrap();
+            let first = wrap_tool_result(
+                dispatch(&store, None, "note_get", json!({"uid":note.uid}), None).unwrap(),
+            );
+            let first = &first["structuredContent"];
+            let offset = first["next_body_offset"]
+                .as_u64()
+                .expect("must need continuation");
+            let version = first["body_version"].clone();
+            assert!(version.is_string());
+            match mode {
+                "modified" => {
+                    let changed = original.replace("quoted", "alterd");
+                    assert_eq!(changed.len(), original.len());
+                    std::fs::write(&path, changed).unwrap();
+                }
+                "deleted" => {
+                    std::fs::remove_file(&path).unwrap();
+                }
+                "unreadable" => {
+                    std::fs::remove_file(&path).unwrap();
+                    std::fs::create_dir(&path).unwrap();
+                    assert!(std::fs::read(&path).is_err());
+                }
+                _ => unreachable!(),
+            }
+            let continuation = dispatch(
+                &store,
+                None,
+                "note_get",
+                json!({"uid":note.uid,"body_offset":offset,"body_version":version}),
+                None,
+            );
+            assert!(
+                continuation.is_err(),
+                "{mode} source must refuse continuation rather than publish successful null/exhaustion"
+            );
+        }
+    }
+
+    #[test]
+    fn review2_section_continuation_refuses_level_only_heading_edit() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault_fixture()).unwrap();
+        let note = note_fixture("note:level-edit");
+        store.insert_note(&note).unwrap();
+        let mut heading = nestweaver_schema::Heading {
+            uid: "heading:level".into(),
+            note_uid: note.uid.clone(),
+            level: 1,
+            text: "Unchanged title".into(),
+            slug: "unchanged".into(),
+            start_line: 0,
+            end_line: 1000,
+            content_hash: "unchanged-title-hash".into(),
+            embedding: None,
+        };
+        let section = nestweaver_schema::Section {
+            uid: "section:level".into(),
+            note_uid: note.uid.clone(),
+            heading_uid: Some(heading.uid.clone()),
+            start_line: 1,
+            end_line: 1000,
+            text_hash: "unchanged-body-hash".into(),
+            text_content: "長いbody\n".repeat(4000),
+            word_count: 4000,
+            pagerank_score: None,
+        };
+        store.insert_heading(&heading).unwrap();
+        store.insert_section(&section).unwrap();
+        let first = dispatch(
+            &store,
+            None,
+            "note_get",
+            json!({"uid":note.uid,"sections":[heading.text]}),
+            None,
+        )
+        .unwrap();
+        let offset = first["next_body_offset"]
+            .as_u64()
+            .expect("fixture must require another page");
+        let version = first["body_version"].clone();
+        store.delete_note_cascade(&note.uid).unwrap();
+        store.insert_note(&note).unwrap();
+        heading.level = 2;
+        store.insert_heading(&heading).unwrap();
+        store.insert_section(&section).unwrap();
+        let continuation = dispatch(
+            &store,
+            None,
+            "note_get",
+            json!({"uid":note.uid,"sections":[heading.text],"body_offset":offset,"body_version":version}),
+            None,
+        );
+        assert!(
+            continuation.is_err(),
+            "level-only edit changed rendered prefix while text hashes stayed identical"
+        );
+    }
+
+    #[test]
+    fn review2_long_heading_and_section_reassemble_exact_cli_body() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault_fixture()).unwrap();
+        store
+            .insert_note(&note_fixture("note:long-heading"))
+            .unwrap();
+        let title = "長い雪 heading ".repeat(1200);
+        let content = "section λ \\\"\n\u{2028}".repeat(1500) + "END_SECTION";
+        store
+            .insert_heading(&nestweaver_schema::Heading {
+                uid: "heading:long".into(),
+                note_uid: "note:long-heading".into(),
+                level: 2,
+                text: title.clone(),
+                slug: "long".into(),
+                start_line: 0,
+                end_line: 1000,
+                content_hash: "long-heading-v1".into(),
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_section(&nestweaver_schema::Section {
+                uid: "section:long".into(),
+                note_uid: "note:long-heading".into(),
+                heading_uid: Some("heading:long".into()),
+                start_line: 1,
+                end_line: 1000,
+                text_hash: "long-section-v1".into(),
+                text_content: content.clone(),
+                word_count: 3000,
+                pagerank_score: None,
+            })
+            .unwrap();
+        let full = dispatch_cli(
+            &store,
+            None,
+            "note_get",
+            json!({"uid":"note:long-heading","sections":[title]}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(full["body"], format!("## {title}\n\n{content}"));
+        let mut offset = 0u64;
+        let mut version = Value::Null;
+        let mut rebuilt = String::new();
+        loop {
+            let mut args =
+                json!({"uid":"note:long-heading","sections":[title],"body_offset":offset});
+            if !version.is_null() {
+                args["body_version"] = version.clone();
+            }
+            let wrapped = wrap_tool_result(dispatch(&store, None, "note_get", args, None).unwrap());
+            assert!(crate::output_budget::escaped_size(&wrapped) <= 40_000);
+            let page = &wrapped["structuredContent"];
+            assert!(crate::output_budget::escaped_size(page) <= 20_000);
+            let body = page["body"].as_str().unwrap();
+            rebuilt.push_str(body);
+            version = page["body_version"].clone();
+            let Some(next) = page["next_body_offset"].as_u64() else {
+                break;
+            };
+            assert_eq!(next, offset + body.chars().count() as u64);
+            assert!(next > offset);
+            offset = next;
+        }
+        assert_eq!(rebuilt, full["body"].as_str().unwrap());
+    }
+
+    #[test]
+    fn review2_section_pages_reassemble_and_versions_refuse_changes() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault_fixture()).unwrap();
+        store
+            .insert_note(&note_fixture("note:section-pages"))
+            .unwrap();
+        store
+            .insert_heading(&nestweaver_schema::Heading {
+                uid: "heading:page".into(),
+                note_uid: "note:section-pages".into(),
+                level: 2,
+                text: "Long section".into(),
+                slug: "long-section".into(),
+                start_line: 0,
+                end_line: 1000,
+                content_hash: "first".into(),
+                embedding: None,
+            })
+            .unwrap();
+        let text = "雪 \\\"\n\u{2028}".repeat(9000) + "SECTION_TAIL";
+        store
+            .insert_section(&nestweaver_schema::Section {
+                uid: "section:page".into(),
+                note_uid: "note:section-pages".into(),
+                heading_uid: Some("heading:page".into()),
+                start_line: 1,
+                end_line: 1000,
+                text_hash: "first".into(),
+                text_content: text.clone(),
+                word_count: 9000,
+                pagerank_score: None,
+            })
+            .unwrap();
+        let mut offset = 0u64;
+        let mut version = Value::Null;
+        let mut rebuilt = String::new();
+        loop {
+            let mut args = json!({"uid":"note:section-pages","sections":["Long section"],"body_offset":offset});
+            if !version.is_null() {
+                args["body_version"] = version.clone();
+            }
+            let page = wrap_tool_result(dispatch(&store, None, "note_get", args, None).unwrap());
+            assert!(crate::output_budget::escaped_size(&page) <= 40_000);
+            let page = &page["structuredContent"];
+            assert!(crate::output_budget::escaped_size(page) <= 20_000);
+            rebuilt.push_str(page["body"].as_str().unwrap());
+            version = page["body_version"].clone();
+            let Some(next) = page["next_body_offset"].as_u64() else {
+                break;
+            };
+            assert!(next > offset);
+            offset = next;
+        }
+        assert_eq!(rebuilt, format!("## Long section\n\n{text}"));
+        store.delete_note_cascade("note:section-pages").unwrap();
+        store
+            .insert_note(&note_fixture("note:section-pages"))
+            .unwrap();
+        store
+            .insert_heading(&nestweaver_schema::Heading {
+                uid: "heading:page".into(),
+                note_uid: "note:section-pages".into(),
+                level: 2,
+                text: "Long section".into(),
+                slug: "long-section".into(),
+                start_line: 0,
+                end_line: 1000,
+                content_hash: "first".into(),
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_section(&nestweaver_schema::Section {
+                uid: "section:page".into(),
+                note_uid: "note:section-pages".into(),
+                heading_uid: Some("heading:page".into()),
+                start_line: 1,
+                end_line: 1000,
+                text_hash: "changed".into(),
+                text_content: text,
+                word_count: 9000,
+                pagerank_score: None,
+            })
+            .unwrap();
+        assert!(dispatch(&store,None,"note_get",json!({"uid":"note:section-pages","sections":["Long section"],"body_offset":1,"body_version":version}),None).is_err());
+    }
+
+    #[test]
+    fn review2_note_body_continuation_reassembles_escaped_unicode() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::in_memory().unwrap();
+        let mut vault = vault_fixture();
+        vault.root_path = dir.path().to_string_lossy().into_owned();
+        store.insert_vault(&vault).unwrap();
+        let mut note = note_fixture("note:review2-pages");
+        note.file_path = "pages.md".into();
+        store.insert_note(&note).unwrap();
+        let body = "雪 λ \"\\\n\u{2028}".repeat(9000) + "LONG_TAIL_SENTINEL";
+        std::fs::write(dir.path().join(&note.file_path), &body).unwrap();
+        let mut offset = 0usize;
+        let mut rebuilt = String::new();
+        let mut version = Value::Null;
+        loop {
+            let mut args = json!({"uid":note.uid,"body_offset":offset});
+            if !version.is_null() {
+                args["body_version"] = version.clone();
+            }
+            let result = wrap_tool_result(dispatch(&store, None, "note_get", args, None).unwrap());
+            assert!(crate::output_budget::escaped_size(&result) <= 40_000);
+            assert!(crate::output_budget::escaped_size(&result["structuredContent"]) <= 20_000);
+            let page = &result["structuredContent"];
+            version = page["body_version"].clone();
+            assert_eq!(page["body_offset"], offset);
+            let text = page["body"].as_str().unwrap();
+            rebuilt.push_str(text);
+            let Some(next) = page["next_body_offset"].as_u64() else {
+                break;
+            };
+            assert_eq!(next as usize, offset + text.chars().count());
+            assert!(next as usize > offset);
+            offset = next as usize;
+        }
+        assert_eq!(rebuilt, body);
+        assert_eq!(
+            dispatch_cli(&store, None, "note_get", json!({"uid":note.uid}), None).unwrap()["body"],
+            body
         );
     }
 

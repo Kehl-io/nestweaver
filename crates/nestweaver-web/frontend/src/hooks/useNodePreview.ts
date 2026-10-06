@@ -1,3 +1,4 @@
+import { fetchAfterInitialGraphBaseline } from "../sse/initialReadBarrier";
 import { useEffect, useRef, useState } from "react";
 import { ApiError, apiErrorFromBody } from "../api/errors";
 import { isFileSelection, isNoteSelection } from "../api/kinds";
@@ -31,7 +32,7 @@ function cacheSet(key: string, value: PreviewData) {
 }
 
 async function fetchJson<T>(url: string, signal: AbortSignal): Promise<T> {
-  const response = await fetch(url, { signal });
+  const response = await fetchAfterInitialGraphBaseline(url, { signal });
   if (!response.ok) {
     const body = await response.json().catch(() => ({ error: response.statusText }));
     throw apiErrorFromBody(response.status, body, response.statusText);

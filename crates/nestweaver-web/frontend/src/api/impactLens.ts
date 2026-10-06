@@ -1,3 +1,4 @@
+import { fetchAfterInitialGraphBaseline } from "../sse/initialReadBarrier";
 import { apiErrorFromBody } from "./errors";
 import type { SceneMetadata } from "./p1Types";
 
@@ -92,7 +93,7 @@ async function request<T>(url: string, signal?: AbortSignal): Promise<T> {
   const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
   let response: Response;
   try {
-    response = await fetch(url, { signal: combined });
+    response = await fetchAfterInitialGraphBaseline(url, { signal: combined });
   } catch (err) {
     // Distinguish our own timeout from a caller-initiated abort: the timeout
     // signal firing means the backend was still computing (e.g. cold-DB

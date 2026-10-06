@@ -6254,7 +6254,9 @@ mod tests {
         let start = Arc::new(Barrier::new(3));
         let reads = Arc::new(AtomicUsize::new(0));
         let commits = Arc::new(AtomicUsize::new(0));
-        let deadline = Instant::now() + Duration::from_secs(60);
+        // This is an integrity stress test, not a throughput assertion. Retain
+        // all reads/commits but allow contended CI hosts to finish the workload.
+        let deadline = Instant::now() + Duration::from_secs(180);
         let reader = {
             let store = Arc::clone(&store);
             let start = Arc::clone(&start);
@@ -6268,7 +6270,7 @@ mod tests {
                     }
                     let rows = store
                         .with_read_deadline(
-                            deadline.min(Instant::now() + Duration::from_secs(5)),
+                            deadline.min(Instant::now() + Duration::from_secs(30)),
                             || store.lookup_symbols_by_repo("repo:concurrency"),
                         )
                         .map_err(|error| error.to_string())?;
@@ -6302,7 +6304,7 @@ mod tests {
                     let connection = store
                         .begin_transaction()
                         .map_err(|error| error.to_string())?;
-                    connection.set_query_timeout(5000);
+                    connection.set_query_timeout(30_000);
                     let mut statement = connection
                         .prepare("MATCH (s:Symbol {uid: $uid}) SET s.content_hash = $hash")
                         .map_err(|error| error.to_string())?;

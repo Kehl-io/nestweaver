@@ -1,3 +1,4 @@
+import { fetchAfterInitialGraphBaseline } from "../sse/initialReadBarrier";
 import { get as idbGet, set as idbSet } from "idb-keyval";
 import { createWasmBridge, type WasmBridge } from "./wasm-bridge";
 
@@ -69,7 +70,7 @@ export function getWasmEngineState(): WasmEngineState {
 }
 
 async function serverGeneration(): Promise<number | null> {
-  const response = await fetch("/api/v1/version");
+  const response = await fetchAfterInitialGraphBaseline("/api/v1/version");
   if (!response.ok) return null;
   const body = (await response.json()) as { graph_generation?: number };
   return typeof body.graph_generation === "number" ? body.graph_generation : null;
@@ -88,7 +89,7 @@ async function snapshotFor(
       // IndexedDB can be unavailable (private windows); fall through to fetch.
     }
   }
-  const response = await fetch(SNAPSHOT_URL);
+  const response = await fetchAfterInitialGraphBaseline(SNAPSHOT_URL);
   if (!response.ok) {
     throw new Error(`Snapshot download failed: ${response.status}`);
   }

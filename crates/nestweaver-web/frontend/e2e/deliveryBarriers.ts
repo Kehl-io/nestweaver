@@ -23,7 +23,7 @@ export async function installDeliveryReceipts(page: Page) {
     window.EventSource = class extends NativeEventSource {
       constructor(url: string | URL, options?: EventSourceInit) {
         super(url, options);
-        for (const type of ["watcher:status", "graph:updated", "full_refresh"]) {
+        for (const type of ["watcher:status", "graph:updated", "full_refresh", "graph:generation"]) {
           this.addEventListener(type, () => receipts.events.push(type));
         }
       }
