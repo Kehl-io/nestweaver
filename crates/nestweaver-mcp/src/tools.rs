@@ -5801,10 +5801,11 @@ mod output_budget_tests {
         let ordinary = "é".repeat(2000);
         assert_eq!(wrap_tool_error(&ordinary)["content"][0]["text"], ordinary);
         let result = wrap_tool_error(&"é".repeat(2500));
+        assert_eq!(result["isError"], true);
         let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(text.starts_with(&ordinary));
+        assert!(text.starts_with(&"é".repeat(1900)));
         assert!(text.contains("truncated"));
-        assert!(text.len() <= 4200);
+        assert!(text.len() <= 4000, "raw error bytes: {}", text.len());
         assert!(escaped_bytes(&result) <= 40_000);
     }
 
@@ -5814,9 +5815,9 @@ mod output_budget_tests {
         let result = wrap_tool_error(&message);
         assert_eq!(result["isError"], true);
         let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(text.len() <= 4200, "raw error bytes: {}", text.len());
+        assert!(text.len() <= 4000, "raw error bytes: {}", text.len());
         assert!(text.contains("truncated"));
-        assert!(text.starts_with(&"a".repeat(4000)));
+        assert!(text.starts_with(&"a".repeat(3900)));
         assert!(escaped_bytes(&result) <= 40_000);
     }
 
@@ -6118,16 +6119,15 @@ pub fn wrap_tool_failure(tool: &str, error: &anyhow::Error) -> Value {
 /// error indication (rather than a JSON-RPC-level error which terminates
 /// the call sequence).
 pub fn wrap_tool_error(message: &str) -> Value {
+    const TRUNCATION_NOTICE: &str =
+        "\n[Error text truncated; narrow the request and retry for further details.]";
     let bounded;
     let message = if message.len() > 4000 {
-        let mut end = 4000;
+        let mut end = 4000 - TRUNCATION_NOTICE.len();
         while !message.is_char_boundary(end) {
             end -= 1;
         }
-        bounded = format!(
-            "{}\n[Error text truncated; narrow the request and retry for further details.]",
-            &message[..end]
-        );
+        bounded = format!("{}{TRUNCATION_NOTICE}", &message[..end]);
         bounded.as_str()
     } else {
         message
@@ -14049,7 +14049,7 @@ fn tool_schema_project_context() -> Value {
             "properties": {
                 "project": {
                     "type": "string",
-                    "description": "Project name (e.g. \"AuthService\"), alias, or UID. Resolved via name match, then alias match, then UID substring match."
+                    "description": "Exact project UID (case-sensitive), or an exact project name or alias (case-insensitive). Project names and aliases from extensions or the current instance config are matched together; ambiguous matches require an exact UID. UID substrings are not matched."
                 },
                 "token_budget": {
                     "type": "integer",
