@@ -189,6 +189,7 @@ export function SourceEvidencePanel({
         .symbolsInFile(path)
         .catch(() => [] as SymbolCandidate[])
         .then(async (allSymbols) => {
+          if (!isCurrent()) return null;
           const symbols = pickedRepo
             ? allSymbols.filter((s) => s.repo_uid === pickedRepo)
             : allSymbols;
@@ -200,8 +201,9 @@ export function SourceEvidencePanel({
             });
           return [symbols, source] as const;
         })
-        .then(([symbols, source]) => {
-          if (controller.signal.aborted) return;
+        .then((result) => {
+          if (!isCurrent() || !result) return;
+          const [symbols, source] = result;
           setFileSymbols(symbols);
           setFileSource(source);
           setError(null);
@@ -212,12 +214,12 @@ export function SourceEvidencePanel({
           }
         })
         .catch((e) => {
-          if (!controller.signal.aborted) {
+          if (isCurrent()) {
             setError(e instanceof Error ? e.message : "File evidence is unavailable.");
           }
         })
         .finally(() => {
-          if (!controller.signal.aborted) setLoading(false);
+          if (isCurrent()) setLoading(false);
         });
       return () => controller.abort();
     }

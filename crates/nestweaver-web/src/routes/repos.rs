@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::Json;
@@ -11,9 +12,40 @@ use crate::error::ApiError;
 use crate::rank_events::with_rank_event;
 use crate::state::AppState;
 
-pub async fn list_repos(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
+#[derive(Deserialize)]
+pub struct RepoListParams {
+    pub workspace: Option<String>,
+    pub scope: Option<String>,
+}
+
+pub async fn list_repos(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<RepoListParams>,
+) -> Result<Response, ApiError> {
     tokio::task::spawn_blocking(move || {
-        let repos = nestweaver_engine::list_repos(&state.store, None)?;
+        use crate::routes::workspaces::{WorkspaceKind, resolve_workspace, workspace_param};
+
+        let workspace = resolve_workspace(
+            &state.store,
+            workspace_param(params.workspace.as_deref(), params.scope.as_deref()),
+        )?;
+        let mut repos = nestweaver_engine::list_repos(&state.store, None)?;
+        match workspace.kind {
+            WorkspaceKind::All => {}
+            WorkspaceKind::Repo => {
+                repos.retain(|repo| workspace.uid.as_deref() == Some(repo.uid.as_str()));
+            }
+            WorkspaceKind::Project => {
+                let members: HashSet<String> = state
+                    .store
+                    .project_display_repo_uids(workspace.uid.as_deref().unwrap_or_default())?
+                    .into_iter()
+                    .collect();
+                repos.retain(|repo| members.contains(&repo.uid));
+            }
+            WorkspaceKind::Vault => repos.clear(),
+        }
+        // Scope cheap local membership reads before source freshness work.
         let freshness = state.repo_freshness(&repos);
         let payload = repos
             .iter()

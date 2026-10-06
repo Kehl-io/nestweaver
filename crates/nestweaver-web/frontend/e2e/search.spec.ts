@@ -386,3 +386,126 @@ test("committed refresh updates held evidence and search without reopening a dis
   await expect(dropdown).toContainText("Held committed name");
   await expect(dropdown).not.toContainText("Held previous name");
 });
+
+
+for (const mode of ["local", "impact"] as const) {
+  test(`Detail inspects evidence without reanchoring a held ${mode} scene`, async ({ page, request }) => {
+    const lookup = async (name: string) => {
+      const response = await request.get(`/api/v1/search?q=${name}&limit=8`);
+      expect(response.ok()).toBe(true);
+      const rows = await response.json() as { uid: string; name: string; kind: string }[];
+      const hit = rows.find((row) => row.name === name);
+      expect(hit, `real fixture has ${name}`).toBeDefined();
+      return hit!;
+    };
+    const anchor = await lookup("releaseA");
+    const inspected = await lookup("releaseB");
+    const added = await lookup("releaseC");
+    expect(inspected.uid).not.toBe(anchor.uid);
+    const detailResponse = await request.get(`/api/v1/symbol/${encodeURIComponent(inspected.uid)}`);
+    expect(detailResponse.ok()).toBe(true);
+    const detail = await detailResponse.json() as { symbol: { repo_uid: string } };
+    const catalogResponse = await request.get("/api/v1/workspaces");
+    expect(catalogResponse.ok()).toBe(true);
+    const catalog = await catalogResponse.json() as { workspaces: { id: string; uid?: string; type: string; label: string }[] };
+    const repo = catalog.workspaces.find((entry) => entry.type === "repo" && entry.uid === detail.symbol.repo_uid);
+    const all = catalog.workspaces.find((entry) => entry.id === "all");
+    expect(repo, "real workspace catalog contains the inspected symbol's repository").toBeDefined();
+    expect(all).toBeDefined();
+    const events = { pending: "" };
+    await page.route("**/api/v1/events", (route) => {
+      const body = `retry: 200\n${events.pending}\n`;
+      events.pending = "";
+      return route.fulfill({ status: 200, contentType: "text/event-stream", body });
+    });
+    const sceneCalls: { target: string; depth?: string | null; confidence?: string | null }[] = [];
+    await page.route("**/api/v1/brain/context", async (route) => {
+      if (mode === "local") sceneCalls.push({ target: (route.request().postDataJSON() as { seeds: string[] }).seeds[0] });
+      await route.continue();
+    });
+    await page.route("**/api/v1/impact/**", async (route) => {
+      const url = new URL(route.request().url());
+      if (mode === "impact") sceneCalls.push({ target: decodeURIComponent(url.pathname.slice("/api/v1/impact/".length)),
+        depth: url.searchParams.get("depth"), confidence: url.searchParams.get("confidence") });
+      await route.continue();
+    });
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto(`/?mode=${mode}&node=${encodeURIComponent(anchor.uid)}&kind=${anchor.kind}&seeds=${encodeURIComponent(anchor.uid)}&representation=json&depth=2&confidence=0.5`);
+    const json = page.getByRole("region", { name: "JSON result", exact: true }).locator("code");
+    await expect(json).toBeVisible({ timeout: 15_000 });
+    const read = async () => JSON.parse((await json.textContent()) ?? "{}");
+    await expect.poll(async () => {
+      const scene = await read();
+      return scene.active_lens.targetUid === anchor.uid && scene.graph.nodes.some((n: { uid: string }) => n.uid === anchor.uid);
+    }, { timeout: 15_000 }).toBe(true);
+    if (mode === "local") await expect(page.getByRole("status", { name: "Local result state", exact: true })).toContainText(/nodes/);
+    if (mode === "impact") expect(sceneCalls.at(-1)).toMatchObject({ target: anchor.uid, depth: "2", confidence: "0.5" });
+    const before = await read();
+    const initialCalls = sceneCalls.length;
+    await page.getByTestId("search-input").fill(inspected.name);
+    const results = page.getByRole("listbox", { name: "Search results" });
+    const option = results.getByRole("option").filter({ hasText: inspected.name }).first();
+    await expect(option).toBeVisible();
+    await option.getByRole("button", { name: "Detail", exact: true }).click();
+    await expect(results).toBeHidden();
+    await expect(page.getByRole("complementary", { name: "Source and note evidence" })).toContainText(inspected.name);
+    await expect.poll(async () => (await read()).selected_node.uid).toBe(inspected.uid);
+    const after = await read();
+    expect(after.graph.nodes.map((n: { uid: string }) => n.uid).sort()).toEqual(before.graph.nodes.map((n: { uid: string }) => n.uid).sort());
+    expect(after.graph.edges).toEqual(before.graph.edges);
+    expect(after.active_lens).toEqual(before.active_lens);
+    expect(after.representation).toBe("json");
+    expect(sceneCalls.slice(initialCalls).some((call) => call.target === inspected.uid)).toBe(false);
+
+    const refreshStart = sceneCalls.length;
+    const refreshed = page.waitForResponse((response) => mode === "local"
+      ? new URL(response.url()).pathname === "/api/v1/brain/context" && (response.request().postDataJSON() as { seeds: string[] }).seeds[0] === anchor.uid
+      : new URL(response.url()).pathname === `/api/v1/impact/${encodeURIComponent(anchor.uid)}`);
+    events.pending = "event: graph:updated\ndata: {}\n\n";
+    const refreshResponse = await refreshed;
+    expect(refreshResponse.ok()).toBe(true);
+    await refreshResponse.finished();
+    await expect.poll(async () => (await read()).graph.nodes.length).toBeGreaterThan(0);
+    const committed = await read();
+    expect(committed.active_lens).toEqual(before.active_lens);
+    expect(committed.selected_node.uid).toBe(inspected.uid);
+    expect(committed.graph.nodes.map((n: { uid: string }) => n.uid).sort()).toEqual(before.graph.nodes.map((n: { uid: string }) => n.uid).sort());
+    expect(sceneCalls.slice(refreshStart).every((call) => call.target === anchor.uid)).toBe(true);
+    if (mode === "impact") expect(sceneCalls.at(-1)).toMatchObject({ depth: "2", confidence: "0.5" });
+    await expect(results).toBeHidden();
+
+    // Workspace navigation discards the inspection exception, including on return to All.
+    for (const workspace of [repo!, all!]) {
+      await page.getByLabel("Workspace", { exact: true }).click();
+      await page.getByRole("option").filter({ has: page.getByText(workspace.label, { exact: true }) }).click();
+      await expect.poll(async () => {
+        const scene = await read();
+        return scene._meta.workspace_id === workspace.id && scene.active_lens.targetUid === inspected.uid &&
+          scene.graph.nodes.some((n: { uid: string }) => n.uid === inspected.uid);
+      }, { timeout: 15_000 }).toBe(true);
+      expect((await read()).selected_node.uid).toBe(inspected.uid);
+      expect(sceneCalls.at(-1)?.target).toBe(inspected.uid);
+    }
+
+    // Counterweights: navigation actions still replace or extend the context seeds.
+    await page.getByTestId("search-input").focus();
+    await expect(option).toBeVisible();
+    await option.getByRole("button", { name: "Explore", exact: true }).click();
+    await expect(results).toBeHidden();
+    await expect.poll(() => new URL(page.url()).searchParams.get("mode")).toBe("context");
+    await expect.poll(async () => (await read()).active_lens.targetUid).toBe(inspected.uid);
+    await page.getByTestId("search-input").fill(added.name);
+    await results.getByRole("option").filter({ hasText: added.name }).first().getByRole("button", { name: "Add", exact: true }).click();
+    await expect.poll(() => new URL(page.url()).searchParams.get("seeds")?.split(",")).toEqual([inspected.uid, added.uid]);
+    await expect.poll(async () => (await read()).graph.nodes.some((n: { uid: string }) => n.uid === added.uid)).toBe(true);
+
+    if (mode === "impact") {
+      // A fresh deep link must still apply the full target/depth/confidence query.
+      await page.goto(`/?mode=impact&node=${encodeURIComponent(inspected.uid)}&kind=${inspected.kind}&representation=json&depth=4&confidence=0.7`);
+      await expect(json).toBeVisible();
+      await expect.poll(async () => (await read()).active_lens.targetUid).toBe(inspected.uid);
+      await expect.poll(() => sceneCalls.at(-1)).toMatchObject({ target: inspected.uid, depth: "4", confidence: "0.7" });
+      await expect.poll(async () => (await read()).graph.nodes.some((n: { uid: string }) => n.uid === inspected.uid)).toBe(true);
+    }
+  });
+}

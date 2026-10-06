@@ -40,7 +40,10 @@ export function useContextGraphMode(mode: "local" | "features", seeds: string[])
     const label = mode === "local" ? "Local" : "Features";
     const current = () => {
       const store = useStore.getState();
-      const liveSeeds = mode === "local" ? (store.selectedNodeId ? [store.selectedNodeId] : []) : store.seeds;
+      const localTarget = store.inspectedSceneTarget?.mode === "local" &&
+        store.inspectedSceneTarget.workspaceId === store.activeWorkspaceId
+        ? store.inspectedSceneTarget.uid : store.selectedNodeId;
+      const liveSeeds = mode === "local" ? (localTarget ? [localTarget] : []) : store.seeds;
       return !controller.signal.aborted && requestId === requestIdRef.current &&
         store.graphMode === mode && store.activeWorkspaceId === workspaceId && store.graphEpoch === graphEpoch &&
         JSON.stringify(liveSeeds) === seedKey;

@@ -3081,3 +3081,146 @@ async fn wikilink_navigation_declines_missing_ambiguous_and_missing_heading() {
         );
     }
 }
+
+fn repos_workspace_fixture() -> (tempfile::TempDir, axum::Router) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = setup_test_store();
+    for uid in ["repo:member", "repo:empty", "repo:legacy"] {
+        store
+            .insert_repo(&Repo {
+                uid: uid.into(),
+                url: format!("https://example.test/{uid}.git"),
+                indexed_sha: "fixture".into(),
+                staleness_commits_behind: 0,
+                instance_id: "fixture".into(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+    }
+    store
+        .insert_symbol(&Symbol {
+            uid: "sym:legacy:only".into(),
+            name: "legacyOnly".into(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:legacy".into(),
+            file_path: "legacy.ts".into(),
+            start_line: 1,
+            end_line: 2,
+            signature: "function legacyOnly()".into(),
+            summary: None,
+            content_hash: "legacy".into(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        })
+        .unwrap();
+    store
+        .insert_project(&nestweaver_schema::Project {
+            uid: "proj:files".into(),
+            name: "Files project".into(),
+            summary: None,
+            instance_id: "fixture".into(),
+        })
+        .unwrap();
+    store
+        .replace_project_repo_edges(
+            &["proj:files".into()],
+            &[
+                ("proj:files".into(), "repo:member".into()),
+                ("proj:files".into(), "repo:empty".into()),
+            ],
+        )
+        .unwrap();
+    store
+        .batch_insert_project_symbol_edges("proj:files", &["sym:legacy:only".into()], 1.0)
+        .unwrap();
+    store
+        .insert_vault(&Vault {
+            uid: "vlt:files".into(),
+            name: "Files notes".into(),
+            root_path: dir.path().display().to_string(),
+            instance_id: "fixture".into(),
+        })
+        .unwrap();
+    // Membership preconditions use the real persisted relations, independently of the route.
+    assert_eq!(
+        store.project_member_repo_uids("proj:files").unwrap().len(),
+        2
+    );
+    assert_eq!(
+        store.project_legacy_symbol_repos("proj:files").unwrap(),
+        vec![("sym:legacy:only".into(), "repo:legacy".into())]
+    );
+    assert_eq!(store.list_repos(None).unwrap().len(), 4);
+    let app = create_router(AppState::new(store, None, dir.path().join("repos.lbug")));
+    (dir, app)
+}
+
+fn repos_workspace_uids(body: &Value) -> Vec<String> {
+    let mut uids = body
+        .as_array()
+        .expect("repository route returns an array")
+        .iter()
+        .map(|row| row["uid"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    uids.sort();
+    uids
+}
+
+#[tokio::test]
+async fn repos_workspace_all_and_exact_repo_use_real_router_scope() {
+    let (_dir, app) = repos_workspace_fixture();
+    for uri in ["/api/v1/repos", "/api/v1/repos?workspace=all"] {
+        let (status, body) = get_json(&app, uri).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            repos_workspace_uids(&body),
+            ["repo:empty", "repo:legacy", "repo:member", "repo:test"]
+        );
+    }
+    let (status, body) = get_json(&app, "/api/v1/repos?workspace=repo:repo:member").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(repos_workspace_uids(&body), ["repo:member"]);
+}
+
+#[tokio::test]
+async fn repos_workspace_project_includes_empty_and_legacy_member_without_control() {
+    let (_dir, app) = repos_workspace_fixture();
+    let (status, catalog) = get_json(&app, "/api/v1/workspaces").await;
+    assert_eq!(status, StatusCode::OK, "{catalog}");
+    let project = catalog["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == "project:proj:files")
+        .expect("real project is in workspace catalog");
+    assert_eq!(project["counts"]["repo_count"], 3, "{project}");
+    let (status, body) = get_json(&app, "/api/v1/repos?workspace=project:proj:files").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        repos_workspace_uids(&body),
+        ["repo:empty", "repo:legacy", "repo:member"]
+    );
+}
+
+#[tokio::test]
+async fn repos_workspace_vault_declares_no_code_repositories() {
+    let (_dir, app) = repos_workspace_fixture();
+    let (status, body) = get_json(&app, "/api/v1/repos?workspace=vault:vlt:files").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(repos_workspace_uids(&body).is_empty(), "{body}");
+}
+
+#[tokio::test]
+async fn repos_workspace_unknown_is_refused_without_global_fallback() {
+    let (_dir, app) = repos_workspace_fixture();
+    let (status, body) = get_json(&app, "/api/v1/repos?workspace=repo:unknown").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(error_message(&body).contains("not found"), "{body}");
+}

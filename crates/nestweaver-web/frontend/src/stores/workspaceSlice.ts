@@ -59,6 +59,7 @@ export const createWorkspaceSlice: StateCreator<
           (workspace) => workspace.id === s.activeWorkspaceId,
         )
       ) {
+        if (s.activeWorkspaceId !== "all") s.inspectedSceneTarget = null;
         s.activeWorkspaceId = "all";
       }
     }),
@@ -66,7 +67,10 @@ export const createWorkspaceSlice: StateCreator<
   setActiveWorkspaceId: (id) =>
     set((s) => {
       // Another workspace is another scene: drop a targeted camera fit.
-      if (s.activeWorkspaceId !== id) s.cameraFitUids = null;
+      if (s.activeWorkspaceId !== id) {
+        s.cameraFitUids = null;
+        s.inspectedSceneTarget = null;
+      }
       s.activeWorkspaceId = id;
     }),
 
@@ -99,6 +103,7 @@ export const createWorkspaceSlice: StateCreator<
             (workspace) => workspace.id === s.activeWorkspaceId,
           )
         ) {
+          if (s.activeWorkspaceId !== "all") s.inspectedSceneTarget = null;
           s.activeWorkspaceId = "all";
         }
       });

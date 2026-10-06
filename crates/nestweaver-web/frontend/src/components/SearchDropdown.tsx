@@ -30,6 +30,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
   const workspaces = useStore((s) => s.workspaces);
   const selectNode = useStore((s) => s.selectNode);
+  const inspectNode = useStore((s) => s.inspectNode);
   const setDetailFocus = useStore((s) => s.setDetailFocus);
   const setActiveLens = useStore((s) => s.setActiveLens);
   const setSearchOpen = useStore((s) => s.setSearchOpen);
@@ -121,7 +122,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
   }
 
   function openDetail(uid: string, kind: string) {
-    selectNode(uid, kind);
+    inspectNode(uid, kind);
     setDetailFocus("summary");
     // Detail is a terminal action on this dropdown (nw-532): leaving it open
     // afterward left it floating over the Graph/Table/Matrix/JSON views,

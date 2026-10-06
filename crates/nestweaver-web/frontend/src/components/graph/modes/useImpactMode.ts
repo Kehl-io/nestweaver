@@ -15,7 +15,9 @@ export function useImpactMode() {
   const setGraphData = useStore((s) => s.setGraphData);
   const clearGraphData = useStore((s) => s.clearGraphData);
   const notify = useStore((s) => s.notify);
-  const selectedNodeId = useStore((s) => s.selectedNodeId);
+  const sceneTargetId = useStore((s) => s.inspectedSceneTarget?.mode === "impact" &&
+    s.inspectedSceneTarget.workspaceId === s.activeWorkspaceId
+    ? s.inspectedSceneTarget.uid : s.selectedNodeId);
   const graphMode = useStore((s) => s.graphMode);
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
   const impactDepth = useStore((s) => s.impactDepth);
@@ -46,7 +48,7 @@ export function useImpactMode() {
     // don't leave a hung PageRank request running against a cold DB.
     abortRef.current?.abort();
 
-    if (graphMode !== "impact" || !selectedNodeId) {
+    if (graphMode !== "impact" || !sceneTargetId) {
       requestIdRef.current += 1;
       abortRef.current = null;
       // Leaving impact mode: forget the last query so re-entering always reads
@@ -59,7 +61,7 @@ export function useImpactMode() {
     abortRef.current = controller;
 
     const requestId = ++requestIdRef.current;
-    const targetNodeId = selectedNodeId;
+    const targetNodeId = sceneTargetId;
     const requestWorkspaceId = activeWorkspaceId || "all";
     const requestDepth = impactDepth;
     const requestConfidence = impactConfidence;
@@ -68,14 +70,15 @@ export function useImpactMode() {
     const existingScene = previousLayoutRef.current?.key === queryKey &&
       previousLayoutRef.current.graph === useStore.getState().graphInstance;
     const isNewQuery = queryKeyRef.current !== queryKey || !existingScene;
-    if (isNewQuery) setActiveLens({ lens: "impact", label: "Impact", targetUid: selectedNodeId, workspaceId: activeWorkspaceId || "all" });
+    if (isNewQuery) setActiveLens({ lens: "impact", label: "Impact", targetUid: sceneTargetId, workspaceId: activeWorkspaceId || "all" });
     queryKeyRef.current = queryKey;
     const isCurrentRequest = () => {
       const state = useStore.getState();
       return (
         requestId === requestIdRef.current &&
         state.graphMode === "impact" &&
-        state.selectedNodeId === targetNodeId &&
+        (state.inspectedSceneTarget?.mode === "impact" && state.inspectedSceneTarget.workspaceId === requestWorkspaceId
+          ? state.inspectedSceneTarget.uid : state.selectedNodeId) === targetNodeId &&
         state.activeWorkspaceId === requestWorkspaceId &&
         state.graphEpoch === graphEpoch &&
         state.impactDepth === requestDepth &&
@@ -186,7 +189,7 @@ export function useImpactMode() {
     notify,
     ranksGeneration,
     graphEpoch,
-    selectedNodeId,
+    sceneTargetId,
     setActiveLens,
     setGraphData,
     setSceneMetadata,
