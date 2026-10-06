@@ -108,8 +108,8 @@ export const api = {
     return loadImpactLens(uid, { depth, confidence, workspaceId });
   },
 
-  repos() {
-    return get<Repo[]>("/api/v1/repos");
+  repos(workspaceId?: string) {
+    return get<Repo[]>(appendWorkspaceParam("/api/v1/repos", workspaceId));
   },
 
   services() {
@@ -160,6 +160,11 @@ export const api = {
       total: total === null || Number.isNaN(total) ? null : total,
       nextAfter: next === null ? null : decodeURIComponent(next.replace(/\+/g, "%20")),
     };
+  },
+
+  resolveWikilink(sourceUid: string, target: string) {
+    return post<{ note_uid: string; heading_uid: string | null; heading_slug: string | null }>(
+      "/api/v1/brain/wikilink", { source_uid: sourceUid, target });
   },
 
   brainNote(uid: string, init?: RequestInit) {

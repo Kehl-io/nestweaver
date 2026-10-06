@@ -74,6 +74,9 @@ function errorMessage(e: unknown, fallback: string): string {
 }
 
 export function NotesTab() {
+  const graphEpoch = useStore((s) => s.graphEpoch);
+  const workspaceId = useStore((s) => s.activeWorkspaceId);
+  const catalogSeq = useRef(0);
   const exploreNode = useStore((s) => s.exploreNode);
   const selectNode = useStore((s) => s.selectNode);
 
@@ -96,7 +99,9 @@ export function NotesTab() {
   // each loads its own first page through the vault filter, and one vault's
   // failure is shown on that vault instead of blanking the tab.
   useEffect(() => {
+    const sequence = ++catalogSeq.current;
     let cancelled = false;
+    const current = () => !cancelled && sequence === catalogSeq.current && useStore.getState().graphEpoch === graphEpoch && useStore.getState().activeWorkspaceId === workspaceId;
     setLoading(true);
     setError(null);
     Promise.all([api.brainVaults(), api.brainTags()])
@@ -104,7 +109,7 @@ export function NotesTab() {
         const pages = await Promise.allSettled(
           v.map((vault) => api.brainNotesPage(vault.uid)),
         );
-        if (cancelled) return;
+        if (!current()) return;
         const loaded: Record<string, VaultNotes> = {};
         v.forEach((vault, i) => {
           const result = pages[i];
@@ -134,17 +139,19 @@ export function NotesTab() {
         setTags(t);
       })
       .catch((e) => {
-        if (!cancelled) setError(errorMessage(e, "Failed to load notes"));
+        if (current()) setError(errorMessage(e, "Failed to load notes"));
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (current()) setLoading(false);
       });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [graphEpoch, workspaceId]);
 
   const loadMore = (vaultUid: string) => {
+    const sequence = catalogSeq.current;
+    const isCurrent = () => sequence === catalogSeq.current && useStore.getState().graphEpoch === graphEpoch && useStore.getState().activeWorkspaceId === workspaceId;
     const current = byVault[vaultUid];
     if (!current || current.loadingMore) return;
     // No cursor yet (the first page failed) retries the first page.
@@ -156,6 +163,7 @@ export function NotesTab() {
     api
       .brainNotesPage(vaultUid, after)
       .then((page) => {
+        if (!isCurrent()) return;
         const exhausted = page.nextAfter === null;
         setByVault((prev) => ({
           ...prev,
@@ -174,7 +182,8 @@ export function NotesTab() {
           setFocusAfterLoad({ vaultUid, noteUid: first?.uid ?? null });
         }
       })
-      .catch((e) =>
+      .catch((e) => {
+        if (!isCurrent()) return;
         setByVault((prev) => ({
           ...prev,
           [vaultUid]: {
@@ -182,8 +191,8 @@ export function NotesTab() {
             loadingMore: false,
             error: errorMessage(e, "Failed to load more notes"),
           },
-        })),
-      );
+        }));
+      });
   };
 
   useEffect(() => {

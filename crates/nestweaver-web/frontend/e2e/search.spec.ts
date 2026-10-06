@@ -313,3 +313,76 @@ test.describe("Search Flow", () => {
     await expect(evidencePanel).toContainText("No selection");
   });
 });
+
+// nw-021: selecting evidence must not replace the current analysis scene.
+test("Detail preserves scene identities, lens and representation while Explore and Add navigate", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/?representation=json");
+  const json = page.getByRole("region", { name: "JSON result", exact: true }).locator("code");
+  await expect(json).toBeVisible({ timeout: 15_000 });
+  const read = async () => JSON.parse((await json.textContent()) ?? "{}");
+  await expect.poll(async () => (await read()).graph.nodes.length).toBeGreaterThan(0);
+  const before = await read();
+  await page.getByTestId("search-input").fill("greet");
+  const results = page.getByRole("listbox", { name: "Search results" });
+  const option = results.getByRole("option").first();
+  await expect(option).toBeVisible();
+  await option.getByRole("button", { name: "Detail" }).click();
+  await expect(results).toBeHidden();
+  await expect.poll(async () => (await read()).selected_node.uid).not.toBeNull();
+  const after = await read();
+  expect(after.graph.nodes.map((n: { uid: string }) => n.uid).sort()).toEqual(
+    before.graph.nodes.map((n: { uid: string }) => n.uid).sort(),
+  );
+  expect(after.graph.edges).toEqual(before.graph.edges);
+  expect(after.active_lens).toEqual(before.active_lens);
+  expect(after.representation).toBe("json");
+  await expect(page.getByRole("complementary", { name: "Source and note evidence" })).toContainText("greet");
+
+  await page.getByTestId("search-input").focus();
+  await expect(results).toBeVisible();
+  await option.getByRole("button", { name: "Explore" }).click();
+  await expect(results).toBeHidden();
+  await expect.poll(() => new URL(page.url()).searchParams.get("mode")).toBe("context");
+  await expect.poll(async () => (await read()).active_lens.lens).toBe("context");
+  await page.getByTestId("search-input").fill("releaseA");
+  await expect(option).toContainText("releaseA");
+  await option.getByRole("button", { name: "Add" }).click();
+  await expect(results).toBeVisible();
+  await expect.poll(async () => (await read()).active_lens.lens).toBe("search");
+  await expect.poll(async () => (await read()).graph.nodes.some((n: { label: string }) => n.label === "releaseA")).toBe(true);
+});
+
+test("committed refresh updates held evidence and search without reopening a dismissed dropdown", async ({ page }) => {
+  let committed = false;
+  const events = { pending: "" };
+  await page.route("**/api/v1/events", (route) => {
+    const body = `retry: 200\n${events.pending}\n`;
+    events.pending = "";
+    return route.fulfill({ contentType: "text/event-stream", body });
+  });
+  const hit = () => ({ uid: "sym:held:identity", name: committed ? "Held committed name" : "Held previous name",
+    kind: "Function", file_path: "held.ts", start_line: 12 });
+  await page.route("**/api/v1/search?**", (route) => route.fulfill({ json: [hit()] }));
+  await page.route("**/api/v1/brain/search?**", (route) => route.fulfill({ json: [] }));
+  await page.route("**/api/v1/symbol/**", (route) => route.fulfill({ json: symbolPayload(hit()) }));
+  await page.goto("/?representation=json");
+  const json = page.getByRole("region", { name: "JSON result", exact: true }).locator("code");
+  await expect(json).toBeVisible({ timeout: 15_000 });
+  await expect.poll(async () => JSON.parse((await json.textContent()) ?? "{}").graph.nodes.length).toBeGreaterThan(0);
+  await page.getByTestId("search-input").fill("Held");
+  const dropdown = page.getByRole("listbox", { name: "Search results" });
+  await expect(dropdown).toContainText("Held previous name");
+  await dropdown.getByRole("button", { name: "Detail", exact: true }).click();
+  const evidence = page.getByRole("complementary", { name: "Source and note evidence" });
+  await expect(evidence).toContainText("Held previous name");
+  committed = true;
+  events.pending = "event: graph:updated\ndata: {}\n\nevent: full_refresh\ndata: {}\n\n";
+  await expect(evidence).toContainText("Held committed name");
+  await expect(dropdown).toBeHidden();
+  await expect.poll(() => new URL(page.url()).searchParams.get("node")).toBe("sym:held:identity");
+  await expect(page.getByRole("tab", { name: "JSON representation", exact: true })).toHaveAttribute("aria-selected", "true");
+  await page.getByTestId("search-input").focus();
+  await expect(dropdown).toContainText("Held committed name");
+  await expect(dropdown).not.toContainText("Held previous name");
+});

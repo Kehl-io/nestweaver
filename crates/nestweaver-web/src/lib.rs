@@ -204,6 +204,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/brain/status", get(routes::brain::brain_status))
         .route("/api/v1/brain/vaults", get(routes::brain::list_vaults))
         .route("/api/v1/brain/tags", get(routes::brain::list_tags))
+        .route(
+            "/api/v1/brain/wikilink",
+            post(routes::brain::resolve_wikilink),
+        )
         .route("/api/v1/brain/notes", get(routes::brain::list_notes))
         .route("/api/v1/brain/note/{uid}", get(routes::brain::note_by_uid))
         .route(

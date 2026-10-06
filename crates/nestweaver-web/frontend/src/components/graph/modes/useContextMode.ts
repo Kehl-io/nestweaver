@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef } from "react";
 import type Graph from "graphology";
+import { apiErrorFromBody } from "../../../api/errors";
 import { useStore } from "../../../stores";
 import { useForceLayout } from "../../../hooks/useForceLayout";
 import { api } from "../../../api/client";
@@ -40,7 +41,7 @@ async function loadScopedBrainContext(
   });
   if (!response.ok) {
     const body = await response.json().catch(() => ({ error: response.statusText }));
-    throw new Error(body.error || response.statusText);
+    throw apiErrorFromBody(response.status, body, response.statusText);
   }
   return response.json() as Promise<ScopedBrainContextResult>;
 }
@@ -51,6 +52,7 @@ export function useContextMode() {
   const notify = useStore((s) => s.notify);
   const seeds = useStore((s) => s.seeds);
   const graphMode = useStore((s) => s.graphMode);
+  const graphEpoch = useStore((s) => s.graphEpoch);
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
   const setActiveLens = useStore((s) => s.setActiveLens);
   const setSceneMetadata = useStore((s) => s.setSceneMetadata);
@@ -75,7 +77,15 @@ export function useContextMode() {
       latest.diffActive || latest.activeLens.label.toLowerCase().startsWith("compare");
     // Search pinning and an in-flight Compare both own the lens. Reloading
     // the scene graph must not select Context and clear that analysis.
-    if (!searchPinned && !compareActive) {
+    const existingScene = previousLayoutRef.current?.key === `${activeWorkspaceId || "all"}:${contextLayoutKey(seeds)}` &&
+      previousLayoutRef.current.graph === latest.graphInstance;
+    if (!existingScene && !searchPinned && !compareActive) {
+      clearGraphData();
+      setSceneMetadata(seeds.length > 0 ? workspaceSceneMetadataWithResult(
+        latest.selectedWorkspace()?._meta,
+        "loading",
+        `Loading context for ${seeds[0]}.`,
+      ) : null);
       setActiveLens({ lens: "context", label: "Context", targetUid: seeds[0] ?? null, workspaceId: activeWorkspaceId || "all" });
     }
 
@@ -94,26 +104,12 @@ export function useContextMode() {
         requestId === requestIdRef.current &&
         state.graphMode === "context" &&
         state.activeWorkspaceId === requestWorkspaceId &&
+        state.graphEpoch === graphEpoch &&
         sameSeeds(state.seeds, requestSeeds)
       );
     };
 
     try {
-      const currentState = useStore.getState();
-      const previousWorkspaceId =
-        currentState.sceneMetadata?.workspace_id ??
-        currentState.activeLens.workspaceId ??
-        "all";
-      if (previousWorkspaceId !== requestWorkspaceId) {
-        clearGraphData();
-        setSceneMetadata(
-          workspaceSceneMetadataWithResult(
-            currentState.selectedWorkspace()?._meta,
-            "loading",
-            `Loading ${currentState.selectedWorkspace()?.label ?? requestWorkspaceId}.`,
-          ),
-        );
-      }
       const result = await loadScopedBrainContext(
         requestSeeds,
         2000,
@@ -174,7 +170,7 @@ export function useContextMode() {
       const previousLayout = previousLayoutRef.current;
       preserveGraphLayout(
         graph,
-        previousLayout?.key === layoutKey ? previousLayout.graph : null,
+        existingScene && previousLayout?.key === layoutKey ? previousLayout.graph : null,
       );
       if (!isCurrentRequest()) return;
 
@@ -184,16 +180,17 @@ export function useContextMode() {
       // not select the old lens again and clear that newer analysis state.
       setSceneMetadata(result._meta ?? null);
       previousLayoutRef.current = { key: layoutKey, graph };
-      start(graph);
-      // Stop after MAX_LAYOUT_MS as a safety ceiling
-      if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
-      stopTimerRef.current = setTimeout(() => stop(), MAX_LAYOUT_MS);
+      if (!existingScene && !useStore.getState().reducedEffects) {
+        start(graph);
+        // Stop after MAX_LAYOUT_MS as a safety ceiling.
+        if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
+        stopTimerRef.current = setTimeout(() => stop(), MAX_LAYOUT_MS);
+      }
     } catch (err) {
       if (!isCurrentRequest()) return;
 
       console.error("Failed to load context:", err);
       const message = loadErrorMessage(err, "Failed to load context graph");
-      clearGraphData();
       setSceneMetadata(
         workspaceSceneMetadataWithResult(
           useStore.getState().selectedWorkspace()?._meta,
@@ -209,6 +206,7 @@ export function useContextMode() {
     }
   }, [
     activeWorkspaceId,
+    graphEpoch,
     clearGraphData,
     graphMode,
     notify,

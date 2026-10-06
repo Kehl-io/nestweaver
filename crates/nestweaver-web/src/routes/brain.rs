@@ -233,6 +233,52 @@ pub async fn list_notes(
     Ok(response)
 }
 
+#[derive(Deserialize)]
+pub struct WikilinkRequest {
+    pub source_uid: String,
+    pub target: String,
+}
+
+pub async fn resolve_wikilink(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<WikilinkRequest>,
+) -> Result<Response, ApiError> {
+    let destination = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
+        let source = state
+            .store
+            .lookup_note(&request.source_uid)
+            .map_err(|error| match error {
+                nestweaver_store::StoreError::NotFound => {
+                    ApiError::not_found("Wikilink source note not found")
+                }
+                other => ApiError::from(other),
+            })?;
+        let notes = state.store.list_notes(Some(&source.vault_uid))?;
+        let headings = state.store.list_headings_by_vault(&source.vault_uid)?;
+        nestweaver_engine::index_md::resolve_note_wikilink(
+            &source,
+            &notes,
+            &headings,
+            &request.target,
+        )
+        .map_err(|code| {
+            let message = match code {
+                "wikilink_ambiguous" => {
+                    "Wikilink has multiple possible destinations in this vault."
+                }
+                "wikilink_heading_missing" => {
+                    "Wikilink heading was not found in its destination note."
+                }
+                _ => "Wikilink destination was not found in this vault.",
+            };
+            ApiError::conflict_with_body(message, json!({"error": code, "message": message}))
+        })
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Wikilink resolution failed: {error}")))??;
+    Ok(Json(destination).into_response())
+}
+
 pub async fn note_by_uid(
     State(state): State<Arc<AppState>>,
     Path(uid): Path<String>,

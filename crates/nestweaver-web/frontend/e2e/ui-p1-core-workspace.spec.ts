@@ -56,6 +56,8 @@ interface SceneJsonPayload {
   };
   representation: string;
   graph: {
+    nodes: { uid: string; label: string }[];
+    edges: unknown[];
     attributes?: {
       impact_states?: Record<string, unknown> | null;
       affected_tests?: Record<string, unknown> | null;
@@ -422,4 +424,218 @@ test.describe("P1 core workspace release gates", () => {
     );
     expect(restored.analysis.impact.states).toBeTruthy();
   });
+});
+
+// Scoped replies differ deliberately: a global fetch cannot impersonate a scoped Files tree.
+function deliveryWorkspace(id: string, type: WorkspaceEntry["type"], label: string) {
+  const counts = { project_count: 0, repo_count: type === "vault" ? 0 : 2, service_count: 0,
+    vault_count: type === "vault" ? 1 : 0, note_count: type === "vault" ? 1 : 0, symbol_count: 1 };
+  const _meta = { workspace_id: id, workspace_type: type,
+    trust: { data_scope: "local-only", federation: "local-only", freshness: "current", capability: "local-index",
+      result: "complete", source_confidence: "extracted", partial: false, unsupported: [], message: "" },
+    provenance: [{ source: "fixture", detail: "scoped fixture" }], truncation: { truncated: false }, continuation: { has_more: false } };
+  return { id, type, label, uid: id, counts, _meta };
+}
+
+async function deliveryEvents(page: Page) {
+  const events = { pending: "" };
+  await page.route("**/api/v1/events", (route) => {
+    const body = `retry: 200\n${events.pending}\n`;
+    events.pending = "";
+    return route.fulfill({ status: 200, contentType: "text/event-stream", body });
+  });
+  return events;
+}
+
+test("Files scopes repos before symbol limits and rejects an obsolete workspace reply", async ({ page }) => {
+  const events = await deliveryEvents(page);
+  let filesCommitted = false;
+  const workspaces = [deliveryWorkspace("all", "all", "All indexed content"),
+    deliveryWorkspace("project:files", "project", "Files project"),
+    deliveryWorkspace("repo:beta", "repo", "Beta repository"),
+    deliveryWorkspace("vault:files", "vault", "Files notes")];
+  await page.route("**/api/v1/workspaces", (route) => route.fulfill({ json: { workspaces, _meta: workspaces[0]._meta } }));
+  const repo = (uid: string) => ({ uid, url: `https://fixture/${uid.slice(5)}.git`, indexed_sha: "fixture",
+    staleness_commits_behind: 0, instance_id: "fixture", name: null, root_path: null });
+  let releaseProject: (() => void) | undefined;
+  let holdProject = false;
+  let projectPending = false;
+  let obsoleteDelivered = false;
+  await page.route(/\/api\/v1\/repos(?:\?|$)/, async (route) => {
+    const scope = new URL(route.request().url()).searchParams.get("workspace") ?? "all";
+    if (scope === "project:files" && holdProject) {
+      projectPending = true;
+      await new Promise<void>((resolve) => { releaseProject = resolve; });
+    }
+    const rows = scope === "vault:files" ? [] : scope === "repo:beta" ? [repo("repo:beta")]
+      : scope === "project:files" ? [repo("repo:alpha"), repo("repo:empty")] : [repo("repo:alpha"), repo("repo:beta"), repo("repo:empty")];
+    await route.fulfill({ json: rows });
+    if (scope === "project:files" && holdProject) obsoleteDelivered = true;
+  });
+  await page.route("**/api/v1/symbols/top?**", (route) => {
+    const scope = new URL(route.request().url()).searchParams.get("workspace") ?? "all";
+    const uid = scope === "repo:beta" ? "repo:beta" : "repo:alpha";
+    return route.fulfill({ json: scope === "vault:files" ? [] : [{ uid: `sym:${uid}:one`, repo_uid: uid,
+      name: "one", kind: "Function", file_path: `${uid === "repo:beta" ? "folder/nested/" : ""}${uid.slice(5)}${filesCommitted ? "-committed" : ""}.ts`, start_line: 1 }] });
+  });
+  await openP1Workspace(page);
+  const explorer = page.getByTestId("explorer-panel");
+  await explorer.getByRole("tab", { name: "Files", exact: true }).click();
+  const tree = explorer.getByRole("tree", { name: "Files" });
+  await expect(tree).toContainText("beta.git");
+  await selectWorkspace(page, workspaces[1]);
+  await expect(tree).toContainText("alpha.ts");
+  await expect(tree).toContainText("empty.git"); // membership does not come from returned symbols
+  await expect(tree).not.toContainText("beta.git");
+  await selectWorkspace(page, workspaces[2]);
+  await tree.getByText("nested", { exact: true }).click();
+  await expect(tree.getByText("beta.ts", { exact: true })).toBeVisible();
+  await expect(tree).not.toContainText("alpha.git");
+  filesCommitted = true;
+  events.pending = "event: graph:updated\ndata: {}\n\n";
+  await expect(tree.getByText("beta-committed.ts", { exact: true })).toBeVisible();
+  await expect(tree).not.toContainText("beta.ts");
+  holdProject = true;
+  await selectWorkspace(page, workspaces[1]);
+  await expect.poll(() => projectPending).toBe(true);
+  await selectWorkspace(page, workspaces[2]);
+  await tree.getByText("nested", { exact: true }).click();
+  await expect(tree.getByText("beta-committed.ts", { exact: true })).toBeVisible();
+  releaseProject!();
+  await expect.poll(() => obsoleteDelivered).toBe(true);
+  await page.waitForTimeout(100); // allow the obsolete reply to reach the component
+  await expect(tree).not.toContainText("alpha.git");
+  await selectWorkspace(page, workspaces[3]);
+  await expect(explorer).toContainText(/No (repos|code)/i);
+  await expect(tree).toHaveCount(0);
+  await selectWorkspace(page, workspaces[0]);
+  await expect(tree).toContainText("alpha.git");
+  await expect(tree).toContainText("beta.git");
+  await expect(tree).toContainText("empty.git");
+});
+
+test("committed event bursts refresh held catalogs and overview once, heartbeat stays quiet", async ({ page }) => {
+  const events = await deliveryEvents(page);
+  const workspace = deliveryWorkspace("all", "all", "Held catalog before");
+  let committed = false;
+  let catalogs = 0;
+  let overviews = 0;
+  await page.route("**/api/v1/workspaces", (route) => {
+    catalogs += 1;
+    return route.fulfill({ json: { workspaces: [{ ...workspace, label: committed ? "Held catalog after" : workspace.label }], _meta: workspace._meta } });
+  });
+  await page.route("**/api/v1/overview?**", (route) => {
+    overviews += 1;
+    const landmark = { uid: "note:held", kind: "note", label: committed ? "Committed note" : "Previous note",
+      location: "held.md", score: 1, reason: "fixture" };
+    return route.fulfill({ json: { counts: { ...workspace.counts, gap_count: 0 }, landmarks: [landmark],
+      start_here: [landmark], gaps: [], _meta: workspace._meta } });
+  });
+  await openP1Workspace(page);
+  await selectRepresentation(page, "JSON");
+  await expect(jsonResultRegion(page)).toContainText("Previous note");
+  const baseline = { catalogs, overviews };
+  events.pending = "event: watcher:status\ndata: {}\n\n";
+  await page.waitForTimeout(850); // longer than the event reconnect + quiet window
+  expect({ catalogs, overviews }).toEqual(baseline);
+  committed = true;
+  events.pending = "event: graph:updated\ndata: {}\n\nevent: full_refresh\ndata: {}\n\nevent: graph:updated\ndata: {}\n\n";
+  await expect(page.getByLabel("Workspace", { exact: true })).toContainText("Held catalog after");
+  await expect(jsonResultRegion(page)).toContainText("Committed note");
+  await page.waitForTimeout(650);
+  expect(catalogs).toBe(baseline.catalogs + 1);
+  expect(overviews).toBe(baseline.overviews + 1);
+  await expectUrlParam(page, "representation", "json");
+  expect((await jsonPayload(page)).active_lens.lens).toBe("overview");
+});
+
+test("context refresh failure retains the scene and announces the retryable API message", async ({ page, request }) => {
+  const symbol = await fetchFirstSymbol(request);
+  const events = await deliveryEvents(page);
+  let fail = false;
+  await page.route("**/api/v1/brain/context", (route) => fail
+    ? route.fulfill({ status: 503, json: { error: "route_capability", message: "Context is temporarily unavailable; retry with CLI brain context.", semantic_applied: false } })
+    : route.continue());
+  await openP1Workspace(page);
+  const results = await fillSearch(page, symbol.name);
+  await results.getByRole("option").first().getByRole("button", { name: "Explore" }).click();
+  await selectRepresentation(page, "JSON");
+  await waitForJsonPayload(page, (p) => p.active_lens.lens === "context" && p.graph.nodes.some((n) => n.uid === symbol.uid), "context loaded");
+  const before = await jsonPayload(page);
+  fail = true;
+  events.pending = "event: graph:updated\ndata: {}\n\n";
+  await expect(page.getByRole("region", { name: "Notifications", exact: true }).getByText("Context is temporarily unavailable; retry with CLI brain context.", { exact: true })).toBeVisible();
+  const after = await jsonPayload(page);
+  expect(after.graph.nodes.map((n) => n.uid).sort()).toEqual(before.graph.nodes.map((n) => n.uid).sort());
+  expect(after.graph.edges).toEqual(before.graph.edges);
+  await expectUrlParam(page, "node", symbol.uid);
+});
+
+test("workspace history clears the previous scope while the new overview is pending and fails", async ({ page }) => {
+  const workspaces = [deliveryWorkspace("all", "all", "Navigation scope A"),
+    deliveryWorkspace("repo:nav", "repo", "Navigation scope B")];
+  await page.route("**/api/v1/workspaces", (route) => route.fulfill({ json: { workspaces, _meta: workspaces[0]._meta } }));
+  let failScopeA = false;
+  let scopeAPending = false;
+  let failureDelivered = false;
+  let releaseScopeA: (() => void) | undefined;
+  await page.route("**/api/v1/overview?**", async (route) => {
+    const scope = new URL(route.request().url()).searchParams.get("workspace") ?? "all";
+    if (scope === "all" && failScopeA) {
+      scopeAPending = true;
+      await new Promise<void>((resolve) => { releaseScopeA = resolve; });
+      await route.fulfill({ status: 503, json: { error: "route_capability", message: "Scope A overview is temporarily unavailable. Retry." } });
+      failureDelivered = true;
+      return;
+    }
+    const workspace = scope === "all" ? workspaces[0] : workspaces[1];
+    const landmark = { uid: scope === "all" ? "note:nav-a" : "note:nav-b", kind: "note",
+      label: workspace.label, location: "navigation.md", score: 1, reason: "scoped fixture" };
+    await route.fulfill({ json: { counts: { ...workspace.counts, gap_count: 0 }, landmarks: [landmark],
+      start_here: [landmark], gaps: [], _meta: workspace._meta } });
+  });
+  await openP1Workspace(page);
+  await selectRepresentation(page, "JSON");
+  await waitForJsonPayload(page, (p) => p.graph.nodes.some((n) => n.uid === "note:nav-a"), "scope A rendered a nonempty overview");
+  await selectWorkspace(page, workspaces[1]);
+  await waitForJsonPayload(page, (p) => p.graph.nodes.some((n) => n.uid === "note:nav-b") && p._meta.workspace_id === "repo:nav", "scope B rendered its own overview");
+
+  failScopeA = true;
+  // Lens updates may also create history entries; follow history until the workspace changes.
+  for (let step = 0; step < 6 && !scopeAPending; step += 1) {
+    await page.getByRole("button", { name: "Undo scene navigation", exact: true }).click();
+    await page.waitForTimeout(100);
+  }
+  await expect.poll(() => scopeAPending, { message: "history requested the previous workspace overview" }).toBe(true);
+  await expect(page.getByLabel("Workspace", { exact: true })).toContainText(workspaces[0].label);
+  await selectRepresentation(page, "JSON");
+  const pending = await jsonPayload(page);
+  releaseScopeA!();
+  await expect.poll(() => failureDelivered).toBe(true);
+  await expect(jsonResultRegion(page)).toContainText("Scope A overview is temporarily unavailable. Retry.");
+  const failed = await jsonPayload(page);
+  expect(pending.graph.nodes.map((n) => n.uid)).not.toContain("note:nav-b");
+  expect(failed.graph.nodes.map((n) => n.uid)).not.toContain("note:nav-b");
+  expect(failed._meta.workspace_id).toBe("all");
+});
+
+test("Features with no seeds clears a rendered overview instead of relabeling its nodes", async ({ page }) => {
+  const workspace = deliveryWorkspace("all", "all", "Features origin scope");
+  await page.route("**/api/v1/workspaces", (route) => route.fulfill({ json: { workspaces: [workspace], _meta: workspace._meta } }));
+  await page.route("**/api/v1/overview?**", (route) => {
+    const landmark = { uid: "note:features-origin", kind: "note", label: "Overview-only landmark",
+      location: "origin.md", score: 1, reason: "fixture" };
+    return route.fulfill({ json: { counts: { ...workspace.counts, gap_count: 0 }, landmarks: [landmark],
+      start_here: [landmark], gaps: [], _meta: workspace._meta } });
+  });
+  await openP1Workspace(page);
+  await selectRepresentation(page, "JSON");
+  await waitForJsonPayload(page, (p) => p.graph.nodes.some((n) => n.uid === "note:features-origin"), "overview rendered before changing mode");
+  await page.getByRole("group", { name: "Graph mode", exact: true }).getByRole("button", { name: "Features", exact: true }).click();
+  await expect(page.getByRole("status", { name: "Features result state", exact: true })).toContainText("Add a context seed to explore its stored relationships.");
+  await expectUrlParam(page, "mode", "features");
+  const emptyFeatures = await jsonPayload(page);
+  expect(emptyFeatures.active_lens.label).toBe("Features");
+  expect(emptyFeatures.graph.nodes).toEqual([]);
+  expect(emptyFeatures.graph.edges).toEqual([]);
 });

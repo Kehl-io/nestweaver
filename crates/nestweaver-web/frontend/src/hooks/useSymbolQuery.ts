@@ -5,6 +5,7 @@ import {
   subscribeSymbolQueries,
   symbolQueryGeneration,
 } from "../api/symbolQuery";
+import { useStore } from "../stores";
 import type { SymbolDetail } from "../api/types";
 
 export type SymbolQueryStatus = "idle" | "loading" | "found" | "missing" | "error";
@@ -26,6 +27,8 @@ export function useSymbolQueryGeneration(): number {
 /** Symbol detail for `uid` through the shared query; `null` means no symbol. */
 export function useSymbolQuery(uid: string | null): SymbolQuery {
   const generation = useSymbolQueryGeneration();
+  const epoch = useStore((s) => s.graphEpoch);
+  const workspaceId = useStore((s) => s.activeWorkspaceId);
   const [result, setResult] = useState<{ uid: string | null; query: SymbolQuery }>({
     uid: null,
     query: IDLE,
@@ -34,12 +37,13 @@ export function useSymbolQuery(uid: string | null): SymbolQuery {
   useEffect(() => {
     if (!uid) return;
     let cancelled = false;
+    const current = () => !cancelled && useStore.getState().graphEpoch === epoch && useStore.getState().activeWorkspaceId === workspaceId;
     fetchSymbol(uid)
       .then((detail) => {
-        if (!cancelled) setResult({ uid, query: { status: "found", detail, error: null } });
+        if (current()) setResult({ uid, query: { status: "found", detail, error: null } });
       })
       .catch((error: unknown) => {
-        if (cancelled) return;
+        if (!current()) return;
         setResult({
           uid,
           query: isNotFoundError(error)
@@ -58,7 +62,7 @@ export function useSymbolQuery(uid: string | null): SymbolQuery {
     };
     // A new generation re-queries the same uid; the last result stays shown
     // until the fresh one lands.
-  }, [uid, generation]);
+  }, [uid, generation, epoch, workspaceId]);
 
   if (!uid) return IDLE;
   // A result for a previous uid is never shown for the current one.

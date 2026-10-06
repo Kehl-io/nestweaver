@@ -45,16 +45,16 @@ export function SymbolDetail({ uid }: SymbolDetailProps) {
   };
 
   return (
-    <div className="flex h-full flex-col overflow-y-auto p-4">
+    <div className="flex min-w-0 h-full flex-col overflow-x-hidden overflow-y-auto p-4">
       {/* Top: Identity */}
       <div className="mb-4">
-        <div className="mb-1 flex items-center gap-2">
+        <div className="mb-1 flex min-w-0 items-start gap-2">
           <KindBadge kind={symbol.kind} />
-          <span className="text-sm font-semibold text-[var(--color-text)]">
+          <span className="min-w-0 break-all text-sm font-semibold text-[var(--color-text)]">
             {symbol.name}
           </span>
         </div>
-        <div className="mb-2 text-xs text-[var(--color-text-muted)]">
+        <div className="mb-2 min-w-0 break-all text-xs text-[var(--color-text-muted)]">
           {symbol.file_path}:{symbol.start_line}
         </div>
         {symbol.signature && (

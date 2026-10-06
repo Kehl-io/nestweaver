@@ -6,6 +6,7 @@ import {
   appendWorkspaceParam,
   workspaceSceneMetadataWithResult,
 } from "../../../api/workspaces";
+import { apiErrorFromBody } from "../../../api/errors";
 import { useStore } from "../../../stores";
 import { useForceLayout } from "../../../hooks/useForceLayout";
 import { buildGraphFromOverview } from "../utils/buildGraphFromOverview";
@@ -30,7 +31,7 @@ async function loadScopedOverview(
   const response = await fetch(url);
   if (!response.ok) {
     const body = await response.json().catch(() => ({ error: response.statusText }));
-    throw new Error(body.error || response.statusText);
+    throw apiErrorFromBody(response.status, body, response.statusText);
   }
   return response.json() as Promise<ScopedOverviewResponse>;
 }
@@ -39,6 +40,7 @@ export function useOverviewMode() {
   const graphMode = useStore((s) => s.graphMode);
   const setGraphData = useStore((s) => s.setGraphData);
   const clearGraphData = useStore((s) => s.clearGraphData);
+  const graphEpoch = useStore((s) => s.graphEpoch);
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
   const overviewKind = useStore((s) => s.overviewKind);
   const setActiveLens = useStore((s) => s.setActiveLens);
@@ -48,7 +50,7 @@ export function useOverviewMode() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestIdRef = useRef(0);
-  const previousOverviewGraphRef = useRef<{ workspaceId: string; graph: Graph } | null>(null);
+  const previousOverviewGraphRef = useRef<{ key: string; graph: Graph } | null>(null);
   const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { start, stop, kill } = useForceLayout();
 
@@ -61,21 +63,23 @@ export function useOverviewMode() {
 
     const requestId = ++requestIdRef.current;
     const requestWorkspaceId = activeWorkspaceId || "all";
+    const requestKey = JSON.stringify([requestWorkspaceId, overviewKind]);
+    const existingScene = previousOverviewGraphRef.current?.key === requestKey &&
+      previousOverviewGraphRef.current.graph === useStore.getState().graphInstance;
     const isCurrentRequest = () =>
       requestId === requestIdRef.current &&
       useStore.getState().graphMode === "overview" &&
-      useStore.getState().activeWorkspaceId === requestWorkspaceId;
+      useStore.getState().activeWorkspaceId === requestWorkspaceId &&
+      useStore.getState().graphEpoch === graphEpoch &&
+      useStore.getState().overviewKind === overviewKind;
 
     setLoading(true);
     setError(null);
     const currentState = useStore.getState();
-    const previousWorkspaceId =
-      currentState.sceneMetadata?.workspace_id ??
-      currentState.activeLens.workspaceId ??
-      "all";
-    if (previousWorkspaceId !== requestWorkspaceId) {
+    if (!existingScene) {
       setOverview(null);
       clearGraphData();
+      setActiveLens({ lens: "overview", label: "Overview", targetUid: null, workspaceId: requestWorkspaceId });
       setSceneMetadata(
         workspaceSceneMetadataWithResult(
           currentState.selectedWorkspace()?._meta,
@@ -92,7 +96,7 @@ export function useOverviewMode() {
 
       const graph = buildGraphFromOverview(result);
       const previous = previousOverviewGraphRef.current;
-      const hasPreviousLayout = previous?.workspaceId === requestWorkspaceId;
+      const hasPreviousLayout = existingScene && previous?.key === requestKey;
       preserveGraphLayout(
         graph,
         hasPreviousLayout ? previous.graph : null,
@@ -102,7 +106,7 @@ export function useOverviewMode() {
       );
 
       setOverview(result);
-      setActiveLens({
+      if (!hasPreviousLayout) setActiveLens({
         lens: "overview",
         label: "Overview",
         targetUid: null,
@@ -110,7 +114,7 @@ export function useOverviewMode() {
       });
       setSceneMetadata(result._meta ?? null);
       setGraphData(graph);
-      previousOverviewGraphRef.current = { workspaceId: requestWorkspaceId, graph };
+      previousOverviewGraphRef.current = { key: requestKey, graph };
       // Settle fresh constellations organically; preserved layouts stay frozen
       // (object constancy), and reduced-effects users keep the static seed layout.
       if (!hasPreviousLayout && !useStore.getState().reducedEffects) {
@@ -123,8 +127,6 @@ export function useOverviewMode() {
 
       const message = loadErrorMessage(err, "Failed to load overview");
       setError(message);
-      setOverview(null);
-      clearGraphData();
       setSceneMetadata(
         workspaceSceneMetadataWithResult(
           useStore.getState().selectedWorkspace()?._meta,
@@ -145,6 +147,7 @@ export function useOverviewMode() {
   }, [
     activeWorkspaceId,
     clearGraphData,
+    graphEpoch,
     graphMode,
     notify,
     overviewKind,

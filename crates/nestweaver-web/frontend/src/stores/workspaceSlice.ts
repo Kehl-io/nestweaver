@@ -27,6 +27,8 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
+let catalogRequest = 0;
+
 export const createWorkspaceSlice: StateCreator<
   StoreState,
   [["zustand/immer", never]],
@@ -79,12 +81,15 @@ export const createWorkspaceSlice: StateCreator<
     }),
 
   loadWorkspaces: async () => {
+    const requestId = ++catalogRequest;
+    const epoch = get().graphEpoch;
     set((s) => {
       s.workspacesLoading = true;
       s.workspacesError = null;
     });
     try {
       const response = await fetchWorkspaces();
+      if (requestId !== catalogRequest || get().graphEpoch !== epoch) return;
       set((s) => {
         s.workspaces = response.workspaces;
         s.workspacesMeta = response._meta;
@@ -98,6 +103,7 @@ export const createWorkspaceSlice: StateCreator<
         }
       });
     } catch (error) {
+      if (requestId !== catalogRequest || get().graphEpoch !== epoch) return;
       set((s) => {
         s.workspacesLoading = false;
         s.workspacesError = errorMessage(error);

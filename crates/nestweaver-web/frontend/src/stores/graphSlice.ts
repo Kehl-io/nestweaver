@@ -45,6 +45,8 @@ export interface GraphSlice {
   toggleReducedEffects: () => void;
   viewMode: ViewMode;
   detailFocus: DetailFocus;
+  noteHeadingDestination: { uid: string; heading: string | null } | null;
+  setNoteHeadingDestination: (destination: { uid: string; heading: string | null } | null) => void;
   toggleViewMode: () => void;
   setViewMode: (mode: ViewMode) => void;
   setDetailFocus: (focus: DetailFocus) => void;
@@ -92,6 +94,8 @@ export const createGraphSlice: StateCreator<
   [],
   GraphSlice
 > = (set) => ({
+  noteHeadingDestination: null,
+  setNoteHeadingDestination: (destination) => set((s) => { s.noteHeadingDestination = destination; }),
   selectedNodeId: null,
   selectedNodeKind: null,
   hoveredNodeId: null,
@@ -191,6 +195,7 @@ export const createGraphSlice: StateCreator<
 
   selectNode: (id, kind) =>
     set((s) => {
+      s.noteHeadingDestination = null;
       s.selectedNodeId = id;
       s.selectedNodeKind = kind ?? null;
       s.detailFocus = "summary";
@@ -204,6 +209,7 @@ export const createGraphSlice: StateCreator<
 
   exploreNode: (id, kind) =>
     set((s) => {
+      s.noteHeadingDestination = null;
       s.selectedNodeId = id;
       s.selectedNodeKind = kind ?? null;
       s.seeds = [id];
@@ -227,6 +233,7 @@ export const createGraphSlice: StateCreator<
     set((s) => {
       s.previewNodeId = id;
       s.previewExpanded = expanded;
+      s.noteHeadingDestination = null;
       s.selectedNodeId = id;
       s.selectedNodeKind = kind ?? null;
     }),

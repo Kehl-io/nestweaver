@@ -24,6 +24,7 @@ export function useImpactMode() {
   const setSceneMetadata = useStore((s) => s.setSceneMetadata);
   // Re-run the current impact query once a debounced PageRank recompute lands,
   // so a timed-out/stale graph fills in when ranks are ready (nw-029).
+  const graphEpoch = useStore((s) => s.graphEpoch);
   const ranksGeneration = useStore((s) => s.ranksGeneration);
   const requestIdRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
@@ -57,17 +58,17 @@ export function useImpactMode() {
     const controller = new AbortController();
     abortRef.current = controller;
 
-    setActiveLens({ lens: "impact", label: "Impact", targetUid: selectedNodeId, workspaceId: activeWorkspaceId || "all" });
-
     const requestId = ++requestIdRef.current;
     const targetNodeId = selectedNodeId;
     const requestWorkspaceId = activeWorkspaceId || "all";
-    const layoutKey = `${requestWorkspaceId}:${targetNodeId}`;
     const requestDepth = impactDepth;
     const requestConfidence = impactConfidence;
     // Full query identity — a change in any of these is a genuinely new query.
     const queryKey = `${requestWorkspaceId}:${targetNodeId}:${requestDepth}:${requestConfidence}`;
-    const isNewQuery = queryKeyRef.current !== queryKey;
+    const existingScene = previousLayoutRef.current?.key === queryKey &&
+      previousLayoutRef.current.graph === useStore.getState().graphInstance;
+    const isNewQuery = queryKeyRef.current !== queryKey || !existingScene;
+    if (isNewQuery) setActiveLens({ lens: "impact", label: "Impact", targetUid: selectedNodeId, workspaceId: activeWorkspaceId || "all" });
     queryKeyRef.current = queryKey;
     const isCurrentRequest = () => {
       const state = useStore.getState();
@@ -76,6 +77,7 @@ export function useImpactMode() {
         state.graphMode === "impact" &&
         state.selectedNodeId === targetNodeId &&
         state.activeWorkspaceId === requestWorkspaceId &&
+        state.graphEpoch === graphEpoch &&
         state.impactDepth === requestDepth &&
         state.impactConfidence === requestConfidence
       );
@@ -119,7 +121,7 @@ export function useImpactMode() {
       const previousLayout = previousLayoutRef.current;
       preserveGraphLayout(
         graph,
-        previousLayout?.key === layoutKey ? previousLayout.graph : null,
+        existingScene && previousLayout?.key === queryKey ? previousLayout.graph : null,
         {
           keepExistingNewNodePositions: true,
         },
@@ -134,7 +136,7 @@ export function useImpactMode() {
         workspaceId: requestWorkspaceId,
       });
       setSceneMetadata(result._meta ?? null);
-      previousLayoutRef.current = { key: layoutKey, graph };
+      previousLayoutRef.current = { key: queryKey, graph };
     } catch (err) {
       // We aborted this request (superseded query or unmount) — stay silent.
       if (err instanceof DOMException && err.name === "AbortError") return;
@@ -161,7 +163,7 @@ export function useImpactMode() {
 
       console.error("Failed to load impact:", err);
       const message = loadErrorMessage(err, "Failed to load impact graph");
-      clearGraphData();
+      if (!existingScene) clearGraphData();
       setSceneMetadata(
         workspaceSceneMetadataWithResult(
           useStore.getState().selectedWorkspace()?._meta,
@@ -183,6 +185,7 @@ export function useImpactMode() {
     impactDepth,
     notify,
     ranksGeneration,
+    graphEpoch,
     selectedNodeId,
     setActiveLens,
     setGraphData,

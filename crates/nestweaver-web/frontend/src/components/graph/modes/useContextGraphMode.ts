@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "react";
+import type Graph from "graphology";
+import { preserveGraphLayout } from "../utils/preserveGraphLayout";
 import { useStore } from "../../../stores";
 import { api } from "../../../api/client";
 import { useForceLayout } from "../../../hooks/useForceLayout";
@@ -16,8 +18,10 @@ function compareOwnsLens(): boolean {
 
 export function useContextGraphMode(mode: "local" | "features", seeds: string[]) {
   const graphMode = useStore((s) => s.graphMode);
+  const graphEpoch = useStore((s) => s.graphEpoch);
   const workspaceId = useStore((s) => s.activeWorkspaceId);
   const seedRefresh = useStore((s) => s.seeds);
+  const previousLayout = useRef<{ key: string; graph: Graph } | null>(null);
   const requestIdRef = useRef(0);
   const [state, setState] = useState<ContextGraphState>({ status: "idle", message: "" });
   const [revision, setRevision] = useState(0);
@@ -38,13 +42,19 @@ export function useContextGraphMode(mode: "local" | "features", seeds: string[])
       const store = useStore.getState();
       const liveSeeds = mode === "local" ? (store.selectedNodeId ? [store.selectedNodeId] : []) : store.seeds;
       return !controller.signal.aborted && requestId === requestIdRef.current &&
-        store.graphMode === mode && store.activeWorkspaceId === workspaceId &&
+        store.graphMode === mode && store.activeWorkspaceId === workspaceId && store.graphEpoch === graphEpoch &&
         JSON.stringify(liveSeeds) === seedKey;
     };
     const store = useStore.getState();
-    store.clearGraphData();
-    store.setSceneMetadata(null);
-    store.setActiveLens({ lens: "context", label, targetUid: selectedSeeds[0] ?? null, workspaceId });
+
+    const layoutKey = `${mode}:${workspaceId}:${seedKey}`;
+    const existingScene = previousLayout.current?.key === layoutKey &&
+      previousLayout.current.graph === store.graphInstance;
+    if (!existingScene) {
+      store.clearGraphData();
+      store.setSceneMetadata(null);
+      store.setActiveLens({ lens: "context", label, targetUid: selectedSeeds[0] ?? null, workspaceId });
+    }
     if (selectedSeeds.length === 0) {
       setState({
         status: "empty",
@@ -65,6 +75,8 @@ export function useContextGraphMode(mode: "local" | "features", seeds: string[])
           graph.setNodeAttribute(selectedSeeds[0], "x", 0);
           graph.setNodeAttribute(selectedSeeds[0], "y", 0);
         }
+        preserveGraphLayout(graph, existingScene ? previousLayout.current?.graph ?? null : null);
+        previousLayout.current = { key: layoutKey, graph };
         const active = useStore.getState();
         active.setGraphData(graph);
         active.setSceneMetadata(result._meta ?? null);
@@ -80,14 +92,13 @@ export function useContextGraphMode(mode: "local" | "features", seeds: string[])
               ? "No stored relationships were found among these context nodes."
               : `${graph.order} nodes · ${graph.size} stored relationships`) + omissions,
         });
-        if (graph.order > 0) {
+        if (graph.order > 0 && !existingScene && !active.reducedEffects) {
           start(graph);
           stopTimer = setTimeout(stop, 10_000);
         }
       }).catch((error: unknown) => {
         if (!current() || compareOwnsLens()) return;
-        useStore.getState().clearGraphData();
-        useStore.getState().setSceneMetadata(null);
+
         setState({ status: "error", message: error instanceof Error ? error.message : "Context relationships could not be loaded." });
       });
     }
@@ -97,7 +108,7 @@ export function useContextGraphMode(mode: "local" | "features", seeds: string[])
       if (stopTimer) clearTimeout(stopTimer);
       kill();
     };
-  }, [graphMode, mode, seedKey, seedRefresh, workspaceId, revision, start, stop, kill]);
+  }, [graphMode, mode, seedKey, seedRefresh, workspaceId, graphEpoch, revision, start, stop, kill]);
 
   return { ...state, retry: () => setRevision((value) => value + 1) };
 }

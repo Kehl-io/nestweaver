@@ -123,12 +123,6 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
   function openDetail(uid: string, kind: string) {
     selectNode(uid, kind);
     setDetailFocus("summary");
-    setActiveLens({
-      lens: "search",
-      label: "Search results",
-      targetUid: uid,
-      workspaceId: activeWorkspaceId,
-    });
     // Detail is a terminal action on this dropdown (nw-532): leaving it open
     // afterward left it floating over the Graph/Table/Matrix/JSON views,
     // intercepting their clicks (nw-564) until a separate Escape closed it.
@@ -194,7 +188,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
       role="listbox"
       aria-label="Search results"
       aria-activedescendant={activeDescendant}
-      className="absolute top-full left-0 right-0 z-50 mt-1 max-h-80 min-h-[10rem] overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] shadow-lg pointer-events-auto"
+      className="absolute top-full left-0 right-0 max-[899px]:fixed max-[899px]:top-12 max-[899px]:left-4 max-[899px]:right-4 z-50 mt-1 max-h-80 min-h-[10rem] overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] shadow-lg pointer-events-auto"
     >
       {searchLoading && (
         <div className="px-3 py-2 text-sm text-[var(--color-text-muted)]">
@@ -270,7 +264,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
               aria-selected={activeDescendant === `search-option-${s.uid}`}
               onClick={() => onSelect(s.uid, s.kind)}
               onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect(s.uid, s.kind); } }}
-              className="flex w-full items-center gap-2 px-3 py-1.5 text-sm hover:bg-[var(--color-surface-alt)]"
+              className="flex min-w-0 w-full flex-col items-stretch gap-2 px-3 py-1.5 text-sm hover:bg-[var(--color-surface-alt)]"
             >
               <button
                 type="button"
@@ -278,20 +272,20 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
                   event.stopPropagation();
                   onSelect(s.uid, s.kind);
                 }}
-                className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-start gap-2 text-left"
               >
                 <KindBadge kind={s.kind} />
-                <span className="min-w-0 truncate font-medium" title={s.name}>
+                <span className="min-w-0 break-all font-medium" title={s.name}>
                   {s.name}
                 </span>
                 <span
-                  className="ml-auto hidden max-w-[38%] shrink-0 truncate text-xs text-[var(--color-text-muted)] md:inline"
+                  className="col-span-2 min-w-0 break-all text-xs text-[var(--color-text-muted)]"
                   title={s.file_path}
                 >
                   {s.file_path}
                 </span>
               </button>
-              <span className="ml-2 flex shrink-0 gap-1">
+              <span className="flex flex-wrap gap-1">
                 <button
                   type="button"
                   onClick={(event) => {
@@ -342,7 +336,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
               aria-selected={activeDescendant === `search-option-${n.uid}`}
               onClick={() => onSelect(n.uid, n.kind)}
               onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect(n.uid, n.kind); } }}
-              className="flex w-full items-center gap-2 px-3 py-1.5 text-sm hover:bg-[var(--color-surface-alt)]"
+              className="flex min-w-0 w-full flex-col items-stretch gap-2 px-3 py-1.5 text-sm hover:bg-[var(--color-surface-alt)]"
             >
               <button
                 type="button"
@@ -350,17 +344,17 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
                   event.stopPropagation();
                   onSelect(n.uid, n.kind);
                 }}
-                className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-start gap-2 text-left"
               >
                 <KindBadge kind={n.kind} />
-                <span className="min-w-0 truncate font-medium" title={n.title}>
+                <span className="min-w-0 break-all font-medium" title={n.title}>
                   {n.title}
                 </span>
                 <span className="ml-auto shrink-0 text-xs text-[var(--color-text-muted)]">
                   {n.score.toFixed(2)}
                 </span>
               </button>
-              <span className="ml-2 flex shrink-0 gap-1">
+              <span className="flex flex-wrap gap-1">
                 <button
                   type="button"
                   onClick={(event) => {

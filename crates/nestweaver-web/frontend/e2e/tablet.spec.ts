@@ -90,6 +90,8 @@ test.describe("Tablet width (nw-593)", () => {
     await expect(page.getByRole("complementary", { name: "Inspector" })).toBeVisible();
 
     await page.setViewportSize({ width: 1440, height: 1024 });
+    await expect(page.getByRole("button", { name: "Inspector", exact: true })).toBeHidden();
+    await expect(page.getByRole("complementary", { name: "Inspector" })).toHaveCount(0);
     await expect(page.getByTestId("detail-panel")).toBeVisible();
     await page.getByTestId("search-input").focus();
     await page.setViewportSize({ width: 768, height: 1024 });
@@ -187,4 +189,61 @@ test.describe("Tablet width (nw-593)", () => {
     await expect(page.getByRole("button", { name: "Inspector", exact: true })).toHaveCount(0);
     await expect(page.getByRole("complementary", { name: "Inspector" })).toHaveCount(0);
   });
+});
+
+// nw-755: containment must survive long identities, not only the short fixture names.
+test("long search identities and paths keep tablet actions operable without overflow", async ({ page }) => {
+  const name = "VeryLongWorkspaceSymbolIdentity".repeat(5);
+  const path = `src/${"long-folder-name/".repeat(9)}${name}.ts`;
+  await page.route("**/api/v1/workspaces", async (route) => {
+    const response = await route.fetch();
+    const catalog = await response.json();
+    catalog.workspaces = catalog.workspaces.map((w: { id: string; label: string }) =>
+      w.id === "all" ? { ...w, label: "VeryLongWorkspaceIdentity".repeat(6) } : w);
+    await route.fulfill({ json: catalog });
+  });
+  await page.route("**/api/v1/search?**", (route) => route.fulfill({ json: [
+    { uid: "sym:tablet:long", name, kind: "Function", file_path: path, start_line: 42 },
+  ] }));
+  await page.route("**/api/v1/brain/search?**", (route) => route.fulfill({ json: [] }));
+  await page.route("**/api/v1/symbol/**", (route) => route.fulfill({ json: {
+    symbol: { uid: "sym:tablet:long", name, kind: "Function", repo_uid: "repo:tablet", file_path: path,
+      start_line: 42, signature: null, summary: null, pagerank_score: 0 }, callers: [], callees: [],
+  } }));
+  await open(page, 768, "/");
+  await page.getByTestId("search-input").fill("long");
+  const option = page.getByRole("listbox", { name: "Search results" }).getByRole("option").first();
+  await expect(option).toContainText(name);
+  await expect(option).toContainText(path);
+  for (const title of [name, path]) {
+    const span = option.locator(`span[title=${JSON.stringify(title)}]`);
+    await expect(span).toHaveAttribute("title", title);
+    await expect(span).toBeVisible();
+    const box = await span.boundingBox();
+    expect(box, `${title} has a rendered box`).not.toBeNull();
+    expect(box!.width, `${title} must have visible width`).toBeGreaterThan(0);
+    expect(box!.height, `${title} must have visible height`).toBeGreaterThan(0);
+    expect(box!.x).toBeGreaterThanOrEqual(0);
+    expect(box!.x + box!.width).toBeLessThanOrEqual(768);
+  }
+  for (const action of ["Detail", "Explore", "Add"]) {
+    const button = option.getByRole("button", { name: action, exact: true });
+    await expect(button).toBeVisible();
+    const box = await button.boundingBox();
+    expect(box).not.toBeNull();
+    expect(box!.x).toBeGreaterThanOrEqual(0);
+    expect(box!.x + box!.width).toBeLessThanOrEqual(768);
+  }
+  expect(await option.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+  await option.getByRole("button", { name: "Detail", exact: true }).click();
+  await page.getByRole("button", { name: "Inspector", exact: true }).click();
+  await expect(page.getByTestId("detail-panel")).toContainText(name);
+  expect(await page.getByTestId("detail-panel").evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+  await page.setViewportSize({ width: 1440, height: 1024 });
+  await expect(page.getByRole("button", { name: "Inspector", exact: true })).toBeHidden();
+  await expect(page.getByRole("complementary", { name: "Inspector" })).toHaveCount(0);
+  await expect(page.getByTestId("detail-panel")).toBeVisible();
+  await page.setViewportSize({ width: 768, height: 1024 });
+  await expect(page.getByRole("button", { name: "Inspector", exact: true })).toHaveAttribute("aria-expanded", "false");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });

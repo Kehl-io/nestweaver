@@ -2910,3 +2910,174 @@ async fn brain_context_web_discloses_route_capability_without_blame_on_model() {
             .contains(&json!("semantic"))
     );
 }
+
+// nw-751: navigation resolves metadata in the originating vault through the
+// indexing resolver; raw titles are never treated as canonical note UIDs.
+fn wikilink_navigation_app() -> axum::Router {
+    let store = setup_test_store();
+    for uid in ["vlt:links", "vlt:other"] {
+        store
+            .insert_vault(&Vault {
+                uid: uid.into(),
+                name: uid.into(),
+                root_path: "/tmp/wikilink-fixture".into(),
+                instance_id: "fixture".into(),
+            })
+            .unwrap();
+    }
+    for (uid, vault, path, title, aliases) in [
+        (
+            "note:links:source",
+            "vlt:links",
+            "team/Source.md",
+            "Source",
+            vec![],
+        ),
+        (
+            "note:links:target",
+            "vlt:links",
+            "team/Target.md",
+            "Target",
+            vec!["Alias", "Shared alias"],
+        ),
+        (
+            "note:links:remote",
+            "vlt:links",
+            "elsewhere/Target.md",
+            "Target",
+            vec!["Shared alias"],
+        ),
+        (
+            "note:other:target",
+            "vlt:other",
+            "team/Target.md",
+            "Target",
+            vec!["Alias"],
+        ),
+        (
+            "note:links:punct",
+            "vlt:links",
+            "team/A & B %20.md",
+            "A & B %20",
+            vec![],
+        ),
+    ] {
+        store
+            .insert_note(&Note {
+                uid: uid.into(),
+                vault_uid: vault.into(),
+                file_path: path.into(),
+                title: title.into(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: uid.into(),
+                frontmatter: Some(json!({ "aliases": aliases }).to_string()),
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+    }
+    store
+        .insert_heading(&nestweaver_schema::Heading {
+            uid: "head:links:target:usage".into(),
+            note_uid: "note:links:target".into(),
+            level: 2,
+            text: "Usage & examples".into(),
+            slug: "usage-examples".into(),
+            start_line: 3,
+            end_line: 3,
+            content_hash: "usage".into(),
+            embedding: None,
+        })
+        .unwrap();
+    store
+        .batch_insert_note_heading_edges(&[("note:links:target", "head:links:target:usage")])
+        .unwrap();
+    create_router(AppState::new(
+        store,
+        None,
+        std::path::PathBuf::from("/tmp/wikilink-fixture.lbug"),
+    ))
+}
+
+#[tokio::test]
+async fn wikilink_navigation_resolves_origin_alias_path_heading_and_literal_percent() {
+    let app = wikilink_navigation_app();
+    let (status, source) = get_json(&app, "/api/v1/brain/note/note:links:source").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "source fixture must exist before resolution"
+    );
+    assert_eq!(source["note"]["vault_uid"], "vlt:links");
+    let (status, target) = get_json(&app, "/api/v1/brain/note/note:links:target").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(target["headings"][0]["uid"], "head:links:target:usage");
+    for (raw, uid, heading) in [
+        ("Target", "note:links:target", None),
+        ("Alias", "note:links:target", None),
+        ("elsewhere/Target", "note:links:remote", None),
+        (
+            "Target#Usage & examples",
+            "note:links:target",
+            Some("head:links:target:usage"),
+        ),
+        ("A & B %20", "note:links:punct", None),
+    ] {
+        let (status, resolved) = post_json(
+            &app,
+            "/api/v1/brain/wikilink",
+            json!({
+                "source_uid": "note:links:source", "target": raw,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}: {resolved}");
+        assert_eq!(
+            resolved["note_uid"], uid,
+            "{raw} must resolve in source vault"
+        );
+        assert_eq!(
+            resolved["heading_uid"],
+            json!(heading),
+            "heading identity must survive navigation"
+        );
+    }
+}
+
+#[tokio::test]
+async fn wikilink_navigation_declines_missing_ambiguous_and_missing_heading() {
+    let app = wikilink_navigation_app();
+    let (status, _) = get_json(&app, "/api/v1/brain/note/note:links:source").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "valid source is a refusal precondition"
+    );
+    for (raw, code) in [
+        ("Missing", "wikilink_unresolved"),
+        ("Shared alias", "wikilink_ambiguous"),
+        ("Target#Missing heading", "wikilink_heading_missing"),
+    ] {
+        let (status, refusal) = post_json(
+            &app,
+            "/api/v1/brain/wikilink",
+            json!({
+                "source_uid": "note:links:source", "target": raw,
+            }),
+        )
+        .await;
+        assert!(!status.is_success(), "{raw} must decline: {refusal}");
+        assert_eq!(
+            refusal["error"], code,
+            "{raw} must explain refusal, not guess"
+        );
+        assert!(
+            refusal.get("note_uid").is_none(),
+            "refusal must not navigate"
+        );
+    }
+}

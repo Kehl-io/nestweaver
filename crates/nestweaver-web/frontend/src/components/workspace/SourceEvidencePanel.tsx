@@ -47,6 +47,8 @@ export function SourceEvidencePanel({
   compact = false,
   className = "",
 }: SourceEvidencePanelProps) {
+  const graphEpoch = useStore((s) => s.graphEpoch);
+  const workspaceId = useStore((s) => s.activeWorkspaceId);
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
   const graphInstance = useStore((s) => s.graphInstance);
@@ -130,7 +132,8 @@ export function SourceEvidencePanel({
     const requestedUid = selectedNodeId;
     const isCurrent = () =>
       !controller.signal.aborted &&
-      useStore.getState().selectedNodeId === requestedUid;
+      useStore.getState().selectedNodeId === requestedUid &&
+      useStore.getState().graphEpoch === graphEpoch && useStore.getState().activeWorkspaceId === workspaceId;
 
     if (isSymbolLike(selectedNodeId, selectedNodeKind)) {
       startLoading();
@@ -221,7 +224,7 @@ export function SourceEvidencePanel({
 
     setLoading(false);
     return () => controller.abort();
-  }, [selectedNodeId, selectedNodeKind, pickedRepo, symbolGeneration]);
+  }, [selectedNodeId, selectedNodeKind, pickedRepo, symbolGeneration, graphEpoch, workspaceId]);
 
   const pickRepo = (uid: string, candidates: string[]) => {
     if (selectedNodeId) setRepoChoice({ path: selectedNodeId, candidates, repo: uid });

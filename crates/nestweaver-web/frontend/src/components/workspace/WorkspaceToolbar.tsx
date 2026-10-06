@@ -44,7 +44,7 @@ export function WorkspaceToolbar() {
   }
 
   return (
-    <header className="flex min-h-11 shrink-0 items-center gap-2 border-b border-[var(--color-border)] bg-[var(--color-surface)] px-2">
+    <header className="flex min-w-0 flex-wrap min-h-11 shrink-0 items-center gap-2 border-b border-[var(--color-border)] bg-[var(--color-surface)] px-2">
       <div className="min-w-0 flex-1">
         <SceneBreadcrumbs />
       </div>

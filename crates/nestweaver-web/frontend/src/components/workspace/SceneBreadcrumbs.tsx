@@ -64,7 +64,7 @@ export function SceneBreadcrumbs() {
   return (
     <nav
       aria-label="Scene breadcrumbs"
-      className="flex min-w-0 items-center gap-1 overflow-hidden text-[11px] text-[var(--color-text-muted)]"
+      className="flex min-w-0 items-center gap-1 flex-wrap text-[11px] text-[var(--color-text-muted)]"
     >
       <button
         type="button"
@@ -104,7 +104,7 @@ export function SceneBreadcrumbs() {
         <>
           <ChevronRight className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
           <span
-            className="shrink-0 truncate rounded px-1.5 py-1 font-medium text-[var(--color-text)]"
+            className="min-w-0 break-all rounded px-1.5 py-1 font-medium text-[var(--color-text)]"
             // Whole when it fits; otherwise capped to the room left after the
             // icon-only home crumb, both chevrons and a minimal lens crumb,
             // so a long name ends in an ellipsis instead of being clipped.

@@ -265,3 +265,97 @@ test("a single small vault lists all its notes with no truncation disclosure", a
   await expect(small.getByTestId("notes-vault-status")).toHaveText("");
   await expect(small.getByRole("button", { name: "Load more" })).toHaveCount(0);
 });
+
+// nw-751: only markdown text wikilinks become navigation controls. Resolution
+// returns a real UID, while heading navigation must actually focus its target.
+test("wikilinks resolve aliases and encoded punctuation and focus the requested heading", async ({ page }) => {
+  const source = note(BRAIN, 0);
+  const target = { ...note(BRAIN, 1), title: "Destination", file_path: "team/A & B %20.md", pagerank_score: 0 };
+  let resolvedTarget = "";
+  await page.route("**/api/v1/brain/note/**", (route) => {
+    const uid = decodeURIComponent(new URL(route.request().url()).pathname.split("/note/")[1]);
+    return route.fulfill({ json: { note: uid === target.uid ? target : { ...source, pagerank_score: 0 },
+      headings: uid === target.uid ? [{ uid: "head:brain:usage", note_uid: target.uid, level: 2,
+        text: "Usage & examples", slug: "usage-examples", start_line: 1, end_line: 1 }] : [], sections: [],
+      body: uid === target.uid ? "## Usage & examples\n\nReached destination." :
+        "[[team/A & B %20#Usage & examples|Read usage]]\n\n`[[literal inline]]`\n\n```md\n[[literal fence]]\n```\n\n[unsafe](javascript:alert(1))" } });
+  });
+  await page.route("**/api/v1/brain/backlinks/**", (route) => route.fulfill({ json: [] }));
+  await page.route("**/api/v1/brain/unlinked-mentions/**", (route) => route.fulfill({ json: [] }));
+  await page.route("**/api/v1/brain/wikilink", (route) => {
+    const body = route.request().postDataJSON();
+    resolvedTarget = body.target;
+    if (body.source_uid !== source.uid || body.target !== "team/A & B %20#Usage & examples") {
+      return route.fulfill({ status: 404, json: { error: "wikilink_unresolved", message: "Wrong origin or target" } });
+    }
+    return route.fulfill({ json: { note_uid: target.uid, heading_uid: "head:brain:usage", heading_slug: "usage-examples" } });
+  });
+  await page.goto(`/?node=${encodeURIComponent(source.uid)}&kind=note`);
+  const detail = page.getByTestId("detail-panel");
+  await expect(detail).toContainText("[[literal inline]]");
+  await expect(detail).toContainText("[[literal fence]]");
+  await expect(detail.getByRole("button", { name: /literal/ })).toHaveCount(0);
+  await expect(detail.locator('a[href^="javascript:"]')).toHaveCount(0);
+  await detail.getByRole("button", { name: "Read usage", exact: true }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.get("node")).toBe(target.uid);
+  expect(resolvedTarget).toBe("team/A & B %20#Usage & examples"); // decoded once, literal %20 survives
+  await expect(detail.getByRole("heading", { name: "Usage & examples", exact: true })).toBeFocused();
+  await expect(detail).toContainText("Reached destination.");
+});
+
+test("unresolved wikilinks announce refusal and preserve the selected source note", async ({ page }) => {
+  const source = { ...note(DOCS, 1), pagerank_score: 0 };
+  await page.route("**/api/v1/brain/note/**", (route) => route.fulfill({ json: {
+    note: source, headings: [], sections: [], body: "[[Missing]] [[Shared alias]] [[Target#Missing heading]]",
+  } }));
+  await page.route("**/api/v1/brain/backlinks/**", (route) => route.fulfill({ json: [] }));
+  await page.route("**/api/v1/brain/unlinked-mentions/**", (route) => route.fulfill({ json: [] }));
+  await page.route("**/api/v1/brain/wikilink", (route) => route.fulfill({ status: 409,
+    json: { error: "wikilink_unresolved", message: `Cannot resolve ${route.request().postDataJSON().target}` } }));
+  await page.goto(`/?node=${encodeURIComponent(source.uid)}&kind=note`);
+  for (const target of ["Missing", "Shared alias", "Target#Missing heading"]) {
+    await page.getByTestId("detail-panel").getByRole("button", { name: target, exact: true }).click();
+    await expect(page.getByRole("alert").filter({ hasText: `Cannot resolve ${target}` })).toBeVisible();
+    expect(new URL(page.url()).searchParams.get("node")).toBe(source.uid);
+  }
+});
+
+test("committed catalog refresh discards a delayed load-more cursor response", async ({ page }) => {
+  let refreshed = false;
+  let releaseMore: (() => void) | undefined;
+  let morePending = false;
+  let obsoleteDelivered = false;
+  const events = { pending: "" };
+  await page.route("**/api/v1/events", (route) => {
+    const body = `retry: 200\n${events.pending}\n`;
+    events.pending = "";
+    return route.fulfill({ status: 200, contentType: "text/event-stream", body });
+  });
+  await page.route("**/api/v1/brain/vaults", (route) => fulfillVaults(route, [{ ...BRAIN, total: refreshed ? 1 : BRAIN.total }]));
+  await page.route("**/api/v1/brain/tags", (route) => route.fulfill({ json: [] }));
+  await page.route("**/api/v1/brain/notes?**", async (route) => {
+    if (new URL(route.request().url()).searchParams.has("after")) {
+      morePending = true;
+      await new Promise<void>((resolve) => { releaseMore = resolve; });
+      await fulfillNotes(route);
+      obsoleteDelivered = true;
+      return;
+    }
+    return refreshed ? route.fulfill({ json: [{ ...note(BRAIN, 0), title: "Committed catalog note" }], headers: { "x-total-count": "1" } })
+      : fulfillNotes(route);
+  });
+  await page.goto("/");
+  const explorer = page.getByTestId("explorer-panel");
+  await explorer.getByRole("tab", { name: "Notes", exact: true }).click();
+  const brain = explorer.getByTestId("notes-vault-brain");
+  await brain.getByRole("button", { name: "Load more" }).click();
+  await expect.poll(() => morePending).toBe(true);
+  refreshed = true;
+  events.pending = "event: graph:updated\ndata: {}\n\n";
+  await expect(brain).toContainText("Committed catalog note");
+  releaseMore!();
+  await expect.poll(() => obsoleteDelivered).toBe(true);
+  await page.waitForTimeout(100); // allow the delivered old page to reach the component
+  await expect(brain.getByRole("listitem")).toHaveCount(1);
+  await expect(brain.getByText("brain note 1000")).toHaveCount(0);
+});

@@ -12,6 +12,7 @@ const MAX_VISIBLE = 100;
 export function SymbolsTab() {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const exploreNode = useStore((s) => s.exploreNode);
+  const graphEpoch = useStore((s) => s.graphEpoch);
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
 
   const [symbols, setSymbols] = useState<SymbolCandidate[]>([]);
@@ -21,14 +22,17 @@ export function SymbolsTab() {
   const [kindFilter, setKindFilter] = useState<string>("All");
 
   useEffect(() => {
+    let cancelled = false;
+    const current = () => !cancelled && useStore.getState().graphEpoch === graphEpoch && useStore.getState().activeWorkspaceId === activeWorkspaceId;
     setLoading(true);
     setError(null);
     api
       .symbolsTop(200, activeWorkspaceId)
-      .then(setSymbols)
-      .catch((e) => setError(e.message ?? "Failed to load symbols"))
-      .finally(() => setLoading(false));
-  }, [activeWorkspaceId]);
+      .then((rows) => { if (current()) setSymbols(rows); })
+      .catch((e) => { if (current()) setError(e.message ?? "Failed to load symbols"); })
+      .finally(() => { if (current()) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [activeWorkspaceId, graphEpoch]);
 
   const filtered = useMemo(() => {
     const lc = filter.toLowerCase();

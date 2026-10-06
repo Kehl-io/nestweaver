@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { ApiError, apiErrorFromBody } from "../api/errors";
 import { isFileSelection, isNoteSelection } from "../api/kinds";
 import { fetchSymbol, isNotFoundError } from "../api/symbolQuery";
+import { useStore } from "../stores";
 import { useSymbolQueryGeneration } from "./useSymbolQuery";
 import type {
   NoteDetail,
@@ -18,6 +19,8 @@ export type PreviewData =
 
 const cache = new Map<string, PreviewData>();
 const CACHE_MAX = 10;
+
+export function clearNodePreviews(): void { cache.clear(); }
 
 function cacheSet(key: string, value: PreviewData) {
   if (cache.size >= CACHE_MAX) {
@@ -62,6 +65,8 @@ export function useNodePreview(
   const [error, setError] = useState<string | null>(null);
   const [notFound, setNotFound] = useState(false);
   const requestSeqRef = useRef(0);
+  const graphEpoch = useStore((s) => s.graphEpoch);
+  const workspaceId = useStore((s) => s.activeWorkspaceId);
   const symbolGeneration = useSymbolQueryGeneration();
 
   useEffect(() => {
@@ -86,7 +91,7 @@ export function useNodePreview(
 
     const controller = new AbortController();
     const isCurrent = () =>
-      requestSeqRef.current === requestSeq && !controller.signal.aborted;
+      requestSeqRef.current === requestSeq && !controller.signal.aborted && useStore.getState().graphEpoch === graphEpoch && useStore.getState().activeWorkspaceId === workspaceId;
 
     setData(null);
     setLoading(true);
@@ -114,8 +119,7 @@ export function useNodePreview(
         if (isNote) {
           const detail = await fetchJson<NoteDetail>(noteUrl(nodeId), controller.signal);
           const result: PreviewData = { type: "note", detail };
-          cacheSet(nodeId, result);
-          if (isCurrent()) setData(result);
+          if (isCurrent()) { cacheSet(nodeId, result); setData(result); }
         } else if (isFile) {
           let symbols: SymbolCandidate[] = [];
           try {
@@ -145,8 +149,7 @@ export function useNodePreview(
             throw new Error("File evidence is unavailable.");
           }
           const result: PreviewData = { type: "file", path: nodeId, symbols, sourceLines };
-          cacheSet(nodeId, result);
-          if (isCurrent()) setData(result);
+          if (isCurrent()) { cacheSet(nodeId, result); setData(result); }
         } else {
           // Shared with Details/Evidence so one selection costs one request.
           const detail = await fetchSymbol(nodeId);
@@ -168,8 +171,7 @@ export function useNodePreview(
             // Source snippets can be unavailable while symbol metadata is still useful.
           }
           const result: PreviewData = { type: "symbol", detail, sourceLines };
-          cacheSet(nodeId, result);
-          if (isCurrent()) setData(result);
+          if (isCurrent()) { cacheSet(nodeId, result); setData(result); }
         }
       } catch (fetchError) {
         if (isCurrent()) {
@@ -188,7 +190,7 @@ export function useNodePreview(
 
     fetchData();
     return () => controller.abort();
-  }, [nodeId, nodeKind, symbolGeneration]);
+  }, [nodeId, nodeKind, symbolGeneration, graphEpoch, workspaceId]);
 
   return { data, loading, error, notFound };
 }

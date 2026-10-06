@@ -4450,6 +4450,145 @@ struct NoteContext {
     section_heading_text: Vec<Option<String>>,
 }
 
+/// A navigable destination resolved by the indexing wikilink policy.
+#[derive(Debug, serde::Serialize)]
+pub struct WikilinkDestination {
+    pub note_uid: String,
+    pub heading_uid: Option<String>,
+    pub heading_slug: Option<String>,
+}
+
+/// Resolve a UI reference using only the originating vault's metadata.
+/// Navigation requires a single canonical destination; indexing may retain
+/// multiple low-confidence edges, but a browser must never choose one for users.
+pub fn resolve_note_wikilink(
+    source: &Note,
+    notes: &[Note],
+    headings: &[Heading],
+    target: &str,
+) -> Result<WikilinkDestination, &'static str> {
+    let mut headings_by_note: HashMap<&str, Vec<&Heading>> = HashMap::new();
+    for heading in headings {
+        headings_by_note
+            .entry(heading.note_uid.as_str())
+            .or_default()
+            .push(heading);
+    }
+    let contexts: Vec<NoteContext> = notes
+        .iter()
+        .filter(|note| note.vault_uid == source.vault_uid)
+        .map(|note| {
+            let frontmatter: serde_json::Value = note
+                .frontmatter
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_default();
+            let aliases = match frontmatter
+                .get("aliases")
+                .or_else(|| frontmatter.get("alias"))
+            {
+                Some(serde_json::Value::Array(values)) => values
+                    .iter()
+                    .filter_map(|value| {
+                        value
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|alias| !alias.is_empty())
+                            .map(str::to_string)
+                    })
+                    .collect(),
+                Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+                    vec![value.trim().to_string()]
+                }
+                _ => Vec::new(),
+            };
+            let local_headings = headings_by_note
+                .get(note.uid.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let path = note.file_path.replace('\\', "/");
+            NoteContext {
+                note_uid: note.uid.clone(),
+                rel_path: path.clone(),
+                title: note.title.clone(),
+                folder: path
+                    .rsplit_once('/')
+                    .map_or("", |(folder, _)| folder)
+                    .to_string(),
+                aliases,
+                heading_uids: local_headings
+                    .iter()
+                    .map(|heading| heading.uid.clone())
+                    .collect(),
+                heading_slugs: local_headings
+                    .iter()
+                    .map(|heading| heading.slug.clone())
+                    .collect(),
+                section_uids: Vec::new(),
+                wikilinks: Vec::new(),
+                tags: Vec::new(),
+                frontmatter,
+                section_heading_text: Vec::new(),
+            }
+        })
+        .collect();
+    let lookup = WikilinkLookup::build(&contexts);
+    let (note_target, anchor) = target
+        .split_once('#')
+        .map_or((target, None), |(note, heading)| (note, Some(heading)));
+    let source_path = source.file_path.replace('\\', "/");
+    let folder = source_path
+        .rsplit_once('/')
+        .map_or("", |(folder, _)| folder);
+    let note_target = if note_target.trim().is_empty() {
+        source_path.as_str()
+    } else {
+        note_target.trim()
+    };
+    // Explicit cross-vault prefixes are outside this origin-scoped web route.
+    if note_target
+        .find(':')
+        .is_some_and(|colon| colon > 1 && colon < note_target.find('/').unwrap_or(usize::MAX))
+    {
+        return Err("wikilink_unresolved");
+    }
+    let ResolveOutcome::Resolved(candidates) = lookup.resolve(note_target, folder) else {
+        return Err("wikilink_unresolved");
+    };
+    if candidates.len() != 1 {
+        return Err("wikilink_ambiguous");
+    }
+    let resolved = lookup.resolve_wikilink(
+        &RawWikilink {
+            target: note_target.to_string(),
+            heading_anchor: anchor.map(str::to_string),
+            display: None,
+            transclude: false,
+            section_idx: 0,
+            line: 0,
+            vault_prefix: None,
+        },
+        folder,
+    );
+    if resolved.unresolved || resolved.targets.is_empty() {
+        return Err(if anchor.is_some() {
+            "wikilink_heading_missing"
+        } else {
+            "wikilink_unresolved"
+        });
+    }
+    let heading_uid = anchor.map(|_| resolved.targets[0].0.clone());
+    let heading_slug = heading_uid
+        .as_ref()
+        .and_then(|uid| headings.iter().find(|heading| &heading.uid == uid))
+        .map(|heading| heading.slug.clone());
+    Ok(WikilinkDestination {
+        note_uid: candidates[0].note_uid.clone(),
+        heading_uid,
+        heading_slug,
+    })
+}
+
 /// Candidate target of a wikilink resolution. Carries the priority-tier
 /// confidence so the caller can split it across ambiguous candidates.
 #[derive(Debug, Clone)]
