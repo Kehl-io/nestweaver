@@ -8382,15 +8382,50 @@ fn build_reresolve_edges(
                 };
                 parsed.references
             };
+            let exported_locals: std::collections::HashSet<&str> = references
+                .iter()
+                .filter(|reference| {
+                    reference.kind == nestweaver_parser::ReferenceKind::ExportAlias
+                        && reference.receiver.is_none()
+                })
+                .map(|reference| reference.context.as_str())
+                .collect();
+            let exported_bindings: Vec<&RawReference> = references
+                .iter()
+                .filter(|reference| {
+                    reference.kind == nestweaver_parser::ReferenceKind::ImportAlias
+                        && exported_locals.contains(reference.name.as_str())
+                        && !file_data[position].1.iter().any(|symbol| {
+                            matches!(
+                                symbol.kind,
+                                nestweaver_schema::SymbolKind::Function
+                                    | nestweaver_schema::SymbolKind::Method
+                                    | nestweaver_schema::SymbolKind::Class
+                            ) && symbol.start_line <= reference.start_line
+                                && reference.start_line <= symbol.end_line
+                        })
+                })
+                .collect();
             let forwarding_sources: std::collections::HashSet<&str> = references
                 .iter()
                 .filter(|reference| reference.kind == nestweaver_parser::ReferenceKind::ExportAlias)
                 .filter_map(|reference| reference.receiver.as_deref())
+                .chain(
+                    exported_bindings
+                        .iter()
+                        .map(|binding| binding.context.as_str()),
+                )
                 .collect();
             file_data[position].2 = references
                 .iter()
                 .filter(|reference| {
                     reference.kind == nestweaver_parser::ReferenceKind::ExportAlias
+                        || exported_bindings.iter().any(|binding| {
+                            binding.name == reference.name
+                                && binding.start_line == reference.start_line
+                                && binding.context == reference.context
+                                && reference.kind == nestweaver_parser::ReferenceKind::ImportAlias
+                        })
                         || (reference.kind == nestweaver_parser::ReferenceKind::Import
                             && forwarding_sources.contains(reference.name.as_str()))
                 })
@@ -14133,6 +14168,12 @@ module.exports = { check, plain };\n";
             "export function unrelated() {}\n",
         )
         .unwrap();
+        fs::write(root.join("barrel.js"), "import { secret as selected } from './target.js';\nexport { selected as publicName };\nexport function marker() {}\n").unwrap();
+        fs::write(
+            root.join("target.js"),
+            "export function secret() {}\nexport function unused() {}\n",
+        )
+        .unwrap();
         let (_, store) =
             index_directory_in_memory(root, "test", "https://example.com/hydrate", "sha").unwrap();
         let repo = repo_uid("test", "https://example.com/hydrate");
@@ -14208,6 +14249,55 @@ module.exports = { check, plain };\n";
                 .iter()
                 .any(|path| path.as_path() == Path::new("Router.js")
                     || path.as_path() == Path::new("unrelated.js"))
+        );
+        // An unchanged named barrel forwards the exact imported local binding.
+        fs::write(root.join("App.js"), "import { publicName as chosen } from './barrel.js';\nfunction app() {\n  chosen();\n}\n").unwrap();
+        reader.reads.lock().unwrap().clear();
+        let edges = build_reresolve_edges(
+            &reader,
+            &repo,
+            &changed,
+            &Default::default(),
+            &symbols,
+            None,
+        )
+        .unwrap();
+        for kind in [
+            nestweaver_schema::EdgeType::Calls,
+            nestweaver_schema::EdgeType::Imports,
+        ] {
+            assert!(
+                edges.iter().any(
+                    |edge| edge.source_uid == symbol_uid(&repo, "App.js", "app", 2)
+                        && edge.target_uid == symbol_uid(&repo, "target.js", "secret", 1)
+                        && edge.edge_type == kind
+                ),
+                "named local forwarding: {edges:#?}"
+            );
+        }
+        assert!(
+            !edges
+                .iter()
+                .any(|edge| edge.target_uid == symbol_uid(&repo, "target.js", "unused", 2)),
+            "{edges:#?}"
+        );
+        let reads = reader.reads.lock().unwrap().clone();
+        for target in ["barrel.js", "target.js"] {
+            assert_eq!(
+                reads
+                    .iter()
+                    .filter(|path| path.as_path() == Path::new(target))
+                    .count(),
+                1,
+                "{reads:?}"
+            );
+        }
+        assert!(
+            !reads
+                .iter()
+                .any(|path| path.as_path() == Path::new("unrelated.js")
+                    || path.as_path() == Path::new("Router.js")),
+            "{reads:?}"
         );
     }
 

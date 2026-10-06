@@ -144,17 +144,49 @@ pub(crate) fn build_import_graph_with_languages(
                 .iter()
                 .filter(|reference| reference.kind == ReferenceKind::ExportAlias)
                 .filter_map(|reference| {
-                    let source = match reference.receiver.as_deref() {
-                        Some(specifier) => Some(resolve_specifier(
-                            file_path,
-                            specifier,
-                            &known_files,
-                            language,
-                            workspace_ctx,
-                        )?),
-                        None => None,
+                    // A module-local exported name can itself be a precise
+                    // imported binding. Function-local imports cannot forward
+                    // an unrelated declaration exported at module scope.
+                    let imported = references.iter().find(|binding| {
+                        binding.kind == ReferenceKind::ImportAlias
+                            && binding.name == reference.context
+                            && !symbols.iter().any(|symbol| {
+                                matches!(
+                                    symbol.kind,
+                                    nestweaver_schema::SymbolKind::Function
+                                        | nestweaver_schema::SymbolKind::Method
+                                        | nestweaver_schema::SymbolKind::Class
+                                ) && symbol.start_line <= binding.start_line
+                                    && binding.start_line <= symbol.end_line
+                            })
+                    });
+                    let (local, source) = match reference.receiver.as_deref() {
+                        Some(specifier) => (
+                            reference.context.clone(),
+                            Some(resolve_specifier(
+                                file_path,
+                                specifier,
+                                &known_files,
+                                language,
+                                workspace_ctx,
+                            )?),
+                        ),
+                        None if imported.is_some() => {
+                            let imported = imported.expect("matched imported export");
+                            (
+                                imported.receiver.clone()?,
+                                Some(resolve_specifier(
+                                    file_path,
+                                    &imported.context,
+                                    &known_files,
+                                    language,
+                                    workspace_ctx,
+                                )?),
+                            )
+                        }
+                        None => (reference.context.clone(), None),
                     };
-                    Some((reference.name.clone(), (reference.context.clone(), source)))
+                    Some((reference.name.clone(), (local, source)))
                 })
                 .collect(),
         );

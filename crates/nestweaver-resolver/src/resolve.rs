@@ -3964,6 +3964,87 @@ mod user_pain_reference_tests {
     }
 
     #[test]
+    fn imported_local_reexport_preserves_exact_original_target() {
+        for (barrel, public) in [
+            (
+                "import { secret } from './target.js';\nexport { secret };\n",
+                "secret",
+            ),
+            (
+                "import { secret as selected } from './target.js';\nexport { selected as publicName };\n",
+                "publicName",
+            ),
+        ] {
+            let consumer = format!(
+                "import {{ {public} as chosen }} from './a.js';\nfunction user() {{\n  chosen();\n}}\n"
+            );
+            let files = parsed_files(&[
+                ("src/a.js", barrel),
+                (
+                    "src/target.js",
+                    "export function secret() {}\nexport function unused() {}\n",
+                ),
+                ("src/user.js", &consumer),
+            ]);
+            let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+            for kind in [EdgeType::Calls, EdgeType::Imports] {
+                assert!(
+                    edges
+                        .iter()
+                        .any(|edge| edge.source_uid == uid(&files, "src/user.js", "user")
+                            && edge.target_uid == uid(&files, "src/target.js", "secret")
+                            && edge.edge_type == kind),
+                    "{barrel}: {edges:#?}"
+                );
+            }
+            assert!(
+                !edges
+                    .iter()
+                    .any(|edge| edge.target_uid == uid(&files, "src/target.js", "unused")),
+                "{edges:#?}"
+            );
+        }
+        let files = parsed_files(&[
+            (
+                "src/a.js",
+                "function secret() {}\nasync function owner() {\n  const { secret } = await import('./target.js');\n  secret();\n}\nexport { secret };\n",
+            ),
+            ("src/target.js", "export function secret() {}\n"),
+            (
+                "src/user.js",
+                "import { secret as chosen } from './a.js';\nfunction user() {\n  chosen();\n}\n",
+            ),
+        ]);
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.source_uid == uid(&files, "src/user.js", "user")
+                    && edge.target_uid == uid(&files, "src/a.js", "secret")
+                    && edge.edge_type == EdgeType::Calls),
+            "function-local import must not replace the module export: {edges:#?}"
+        );
+        let files = parsed_files(&[
+            (
+                "src/a.js",
+                "import { secret as selected } from './missing.js';\nexport { selected as publicName };\n",
+            ),
+            ("src/target.js", "export function secret() {}\n"),
+            (
+                "src/user.js",
+                "import { publicName as chosen } from './a.js';\nfunction user() {\n  chosen();\n}\n",
+            ),
+        ]);
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        assert!(
+            !edges
+                .iter()
+                .any(|edge| edge.target_uid == uid(&files, "src/target.js", "secret")),
+            "missing forwarding source: {edges:#?}"
+        );
+    }
+
+    #[test]
     fn correction_failed_binding_never_rebinds_to_unrelated_import() {
         for a in [
             "function secret() {}\nexport function marker() {}\n",
