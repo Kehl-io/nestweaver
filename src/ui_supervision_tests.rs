@@ -328,3 +328,80 @@ fn dead_ui_daemon_without_an_owner_enters_degraded_service() {
         "verified absence must serve the degraded endpoint"
     );
 }
+
+#[test]
+fn ui_absence_unknown_pidfile_lock_error_preserves_listener() {
+    ui_absence_pidfile_fixture(|rt, db, pidfile, listener| {
+        std::fs::write(pidfile, "").unwrap();
+        for errno in [libc::EINTR, libc::EIO, libc::ENOLCK, libc::EOPNOTSUPP] {
+            let absent = ui_daemon_absence_verified_with_pidfile_probe(
+                rt,
+                db,
+                &anyhow::anyhow!("health endpoint refused"),
+                |_| Err(std::io::Error::from_raw_os_error(errno)),
+            );
+            assert!(
+                !absent,
+                "lock observation errno {errno} cannot authorize listener takeover"
+            );
+            assert!(ui_port_serving(listener.local_addr().unwrap().port()));
+        }
+    });
+}
+
+#[test]
+fn ui_absence_actual_free_and_missing_pidfiles_permit_recovery() {
+    ui_absence_pidfile_fixture(|rt, db, pidfile, _listener| {
+        std::fs::write(pidfile, "").unwrap();
+        assert!(ui_daemon_absence_verified(
+            rt,
+            db,
+            &anyhow::anyhow!("health endpoint refused")
+        ));
+        std::fs::remove_file(pidfile).unwrap();
+        assert!(ui_daemon_absence_verified(
+            rt,
+            db,
+            &anyhow::anyhow!("health endpoint refused")
+        ));
+    });
+}
+
+#[test]
+fn ui_absence_actual_held_pidfile_retains_listener() {
+    use std::os::fd::AsRawFd;
+    ui_absence_pidfile_fixture(|rt, db, pidfile, _listener| {
+        let holder = std::fs::File::create(pidfile).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert!(!ui_daemon_absence_verified(
+            rt,
+            db,
+            &anyhow::anyhow!("health endpoint refused")
+        ));
+    });
+}
+
+fn ui_absence_pidfile_fixture(
+    check: impl FnOnce(&tokio::runtime::Runtime, &Path, &Path, &std::net::TcpListener),
+) {
+    let _environment = crate::XDG_RUNTIME_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("ownership.lbug");
+    std::fs::write(&db, "fixture identity only").unwrap();
+    let instance = nestweaver_daemon::instance_id_from_db_path(&db);
+    let socket = nestweaver_daemon::socket_path(&instance);
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let _cleanup = SocketCleanup(socket.clone());
+    let stale_listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    drop(stale_listener);
+    let pidfile = nestweaver_daemon::pidfile_path(&instance);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    check(&rt, &db, &pidfile, &listener);
+    let _ = std::fs::remove_file(pidfile);
+}

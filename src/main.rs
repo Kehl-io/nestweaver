@@ -11970,27 +11970,64 @@ fn ui_daemon_absence_verified(
     db_path: &std::path::Path,
     probe_error: &anyhow::Error,
 ) -> bool {
+    ui_daemon_absence_verified_with_pidfile_probe(rt, db_path, probe_error, ui_pidfile_lock_held)
+}
+
+/// A failed lock observation is unknown, never evidence that the inode is
+/// free. A successful nonblocking acquisition must also be released before
+/// absence can be proven. This proof is local to UI listener supervision.
+fn ui_pidfile_lock_held(pidfile: &std::path::Path) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pidfile)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        return Ok(false);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(true)
+    } else {
+        Err(error)
+    }
+}
+
+fn ui_daemon_absence_verified_with_pidfile_probe(
+    rt: &tokio::runtime::Runtime,
+    db_path: &std::path::Path,
+    probe_error: &anyhow::Error,
+    pidfile_probe: impl Fn(&std::path::Path) -> std::io::Result<bool>,
+) -> bool {
     if probe_error
         .chain()
         .any(|cause| cause.is::<tokio::time::error::Elapsed>())
     {
         return false;
     }
+    if !nestweaver_daemon::lifecycle::db_write_lock(db_path).is_provably_free() {
+        return false;
+    }
     let instance = nestweaver_daemon::instance_id_from_db_path(db_path);
     for pidfile in nestweaver_daemon::lifecycle::pidfile_candidates(&instance) {
-        if unreachable_daemon_owner(db_path, &pidfile).is_some() {
-            return false;
+        match pidfile_probe(&pidfile) {
+            Ok(false) => {}
+            Ok(true) => return false,
+            Err(error) => {
+                tracing::debug!(pidfile = %pidfile.display(), error = %error, "UI daemon ownership observation is inconclusive");
+                return false;
+            }
         }
-        // Failure to inspect a present pidfile is unknown ownership. Its raw
-        // contents alone never identify an incumbent or a recycled PID.
-        if let Err(error) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&pidfile)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            return false;
-        }
+        // Raw pidfile contents alone never identify an incumbent or a
+        // recycled PID; command-line identity remains an independent guard.
         if nestweaver_client::autostart::read_pid(&pidfile)
             .is_some_and(|pid| daemon_identity_cmdline_ok(pid, db_path))
         {
