@@ -259,6 +259,27 @@ pub(crate) fn tolerate_missing_table<T: Default>(
     }
 }
 
+/// Compatibility for one absent project membership relation, never for a
+/// missing node table, property, function or failed hydration. The pinned
+/// database binder identifies the absent table explicitly in this diagnostic.
+fn tolerate_missing_project_relation<T: Default>(
+    result: Result<T, StoreError>,
+    relation: &str,
+) -> Result<T, StoreError> {
+    match result {
+        Err(StoreError::Query(message))
+            if message.contains(&format!("Table {relation} does not exist.")) =>
+        {
+            tracing::trace!(
+                relation,
+                "project membership relation is not in this database yet"
+            );
+            Ok(T::default())
+        }
+        other => other,
+    }
+}
+
 pub(crate) fn extract_string(row: &[Value], idx: usize) -> Result<String, StoreError> {
     let val = row
         .get(idx)
@@ -3854,7 +3875,7 @@ impl GraphStore {
                 .map(|row| Ok((extract_string(&row, 0)?, extract_string(&row, 1)?)))
                 .collect()
         })();
-        tolerate_missing_table(read)
+        tolerate_missing_project_relation(read, "PROJECT_INCLUDES_SYMBOL")
     }
 
     /// Scope and match before the database limits the result; hydrate only the
@@ -3890,7 +3911,7 @@ impl GraphStore {
                     .map(|row| extract_string(&row, 0).map(Value::String))
                     .collect()
             })();
-            let legacy = tolerate_missing_table(legacy)?;
+            let legacy = tolerate_missing_project_relation(legacy, "PROJECT_INCLUDES_SYMBOL")?;
             predicates.push("(s.repo_uid IN $repos OR s.uid IN $legacy)");
             params.push((
                 "repos",
@@ -3985,7 +4006,7 @@ impl GraphStore {
             .map(|row| extract_string(&row, 0))
             .collect()
         })();
-        tolerate_missing_table(read)
+        tolerate_missing_project_relation(read, "PROJECT_INCLUDES_NOTE")
     }
 
     /// Bounded note metadata selection for workspace title/path search and
@@ -4065,7 +4086,7 @@ impl GraphStore {
             Ok((ordered, total))
         })();
         if project_uid.is_some() {
-            tolerate_missing_table(read)
+            tolerate_missing_project_relation(read, "PROJECT_INCLUDES_NOTE")
         } else {
             read
         }
@@ -5619,5 +5640,62 @@ mod repos_indexing_file_tests {
         assert!(store.repos_indexing_file(".env").unwrap().is_empty());
         // Exact match only: no prefix/suffix matching.
         assert!(store.repos_indexing_file("src/App").unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod workspace_membership_error_tests {
+    use super::*;
+
+    #[test]
+    fn workspace_note_page_tolerates_only_missing_project_membership() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .conn()
+            .unwrap()
+            .query("DROP TABLE PROJECT_INCLUDES_NOTE")
+            .unwrap();
+        let (notes, total) = store
+            .workspace_note_page(Some("proj:legacy"), None, None, 10)
+            .unwrap();
+        assert!(notes.is_empty());
+        assert_eq!(total, 0);
+        assert!(
+            store
+                .project_note_vault_uids("proj:legacy")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn workspace_note_page_propagates_missing_note_schema() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .conn()
+            .unwrap()
+            .query("ALTER TABLE Note RENAME TO MissingNote")
+            .unwrap();
+        assert!(
+            store
+                .workspace_note_page(Some("proj:legacy"), None, None, 10)
+                .is_err(),
+            "a broken Note schema must not become an empty project"
+        );
+        assert!(store.project_note_vault_uids("proj:legacy").is_err());
+    }
+
+    #[test]
+    fn project_symbol_membership_propagates_missing_symbol_schema() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .conn()
+            .unwrap()
+            .query("ALTER TABLE Symbol RENAME TO MissingSymbol")
+            .unwrap();
+        assert!(
+            store.project_legacy_symbol_repos("proj:legacy").is_err(),
+            "a broken Symbol schema must not become empty legacy membership"
+        );
     }
 }
