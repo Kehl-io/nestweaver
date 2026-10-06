@@ -219,6 +219,16 @@ pub fn resolve_workspace(
     store: &GraphStore,
     workspace: Option<&str>,
 ) -> Result<ResolvedWorkspace, ApiError> {
+    resolve_workspace_with_store_error(store, workspace, ApiError::from)
+}
+
+/// Share workspace resolution while letting a read surface preserve typed
+/// store failures before the generic API conversion loses their cause.
+pub(super) fn resolve_workspace_with_store_error(
+    store: &GraphStore,
+    workspace: Option<&str>,
+    map_store_error: fn(nestweaver_store::StoreError) -> ApiError,
+) -> Result<ResolvedWorkspace, ApiError> {
     let Some(raw) = workspace.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(ResolvedWorkspace::all());
     };
@@ -226,7 +236,7 @@ pub fn resolve_workspace(
         return Ok(ResolvedWorkspace::all());
     }
 
-    let projects = store.list_projects()?;
+    let projects = store.list_projects().map_err(map_store_error)?;
     if let Some(project) = projects.iter().find(|project| project.uid == raw) {
         return Ok(ResolvedWorkspace::project(project));
     }
@@ -238,7 +248,7 @@ pub fn resolve_workspace(
         return Ok(ResolvedWorkspace::project(project));
     }
 
-    let repos = store.list_repos(None)?;
+    let repos = store.list_repos(None).map_err(map_store_error)?;
     if let Some(repo) = repos.iter().find(|repo| repo.uid == raw) {
         return Ok(ResolvedWorkspace::repo(repo));
     }
@@ -248,7 +258,7 @@ pub fn resolve_workspace(
         return Ok(ResolvedWorkspace::repo(repo));
     }
 
-    let vaults = store.list_vaults(None)?;
+    let vaults = store.list_vaults(None).map_err(map_store_error)?;
     if let Some(vault) = vaults.iter().find(|vault| vault.uid == raw) {
         return Ok(ResolvedWorkspace::vault(vault));
     }

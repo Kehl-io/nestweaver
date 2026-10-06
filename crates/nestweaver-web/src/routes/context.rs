@@ -157,7 +157,7 @@ pub async fn brain_context(
             .map_err(ApiError::from_context_read)?;
         reject_unresolved_http_seeds(&state.store, &body.seeds)?;
         state.admit_vault_derivation()?;
-        let workspace = workspaces::resolve_workspace(
+        let workspace = resolve_context_workspace(
             &state.store,
             workspaces::workspace_param(body.workspace.as_deref(), body.scope.as_deref()),
         )?;
@@ -238,6 +238,15 @@ pub async fn brain_context(
         Ok(Json(json).into_response())
     })
     .await
+}
+
+fn resolve_context_workspace(
+    store: &nestweaver_store::GraphStore,
+    workspace: Option<&str>,
+) -> Result<ResolvedWorkspace, ApiError> {
+    workspaces::resolve_workspace_with_store_error(store, workspace, |error| {
+        ApiError::from_context_read(error.into())
+    })
 }
 
 fn stamp_http_watcher_batch_disclosure(state: &AppState, json: &mut serde_json::Value) {
@@ -415,6 +424,44 @@ mod timeout_tests {
             assert_eq!(payload["retryable"], true);
             assert!(payload["message"].as_str().unwrap().contains("retry"));
         }
+    }
+
+    #[tokio::test]
+    async fn context_workspace_resolution_deadline_is_retryable() {
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let error = store
+            .with_read_deadline(std::time::Instant::now(), || {
+                resolve_context_workspace(&store, Some("project:fixture"))
+            })
+            .expect_err("workspace lookup must not hide a store deadline");
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(response.headers().get("retry-after").unwrap(), "1");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"], "context_timeout");
+        assert_eq!(payload["retryable"], true);
+    }
+
+    #[test]
+    fn generic_workspace_resolution_preserves_internal_deadline_status() {
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let error = store
+            .with_read_deadline(std::time::Instant::now(), || {
+                workspaces::resolve_workspace(&store, Some("project:fixture"))
+            })
+            .expect_err("the generic resolver must preserve its existing error contract");
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn context_workspace_resolution_keeps_unknown_workspace_a_client_error() {
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let error = resolve_context_workspace(&store, Some("project:missing"))
+            .expect_err("an unknown workspace cannot resolve");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]
