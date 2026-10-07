@@ -89,6 +89,9 @@ pub(crate) struct PprGraphCached {
 #[derive(Default)]
 struct IndexPublicationLeaseState {
     owner: Option<u64>,
+    /// Token that explicitly reserved or recovered this publication. An
+    /// inherited generation base alone cannot authorize a new snapshot lease.
+    reservation_owner: Option<u64>,
     next_token: u64,
     waiters: usize,
 }
@@ -162,6 +165,8 @@ impl IndexPublicationLease<'_> {
         let reserved = self
             .store
             .reserve_index_publication_generation(self.token)?;
+        self.store
+            .record_index_publication_reservation_owner(self.token)?;
         if prior == IndexPublicationReservationState::Unreserved {
             self.reservation.set(if reserved.recovered {
                 IndexPublicationReservationState::Recovered
@@ -2593,6 +2598,32 @@ impl GraphStore {
         self.invalidate_ranking_caches_locked();
     }
 
+    /// Dirty-read refusals must not destroy the active publisher's freshly
+    /// computed scores in its compute-to-save gap. Establishment and retirement
+    /// barriers own cache invalidation for a reserved in-process publication.
+    /// An unreserved lease (e.g. snapshot work), abandoned owner, or external
+    /// publication provides no such protection and retains fail-closed eviction.
+    /// The caller must hold `pagerank_compute_lock`; query refusal is unchanged.
+    pub(crate) fn invalidate_unowned_ranking_caches_locked(&self) {
+        let reservation_owned = {
+            let state = self
+                .index_publication_lease
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.owner.is_some() && state.reservation_owner == state.owner
+        };
+        let publication_owned = reservation_owned
+            && self
+                .index_publication_generation_base
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some();
+        if !publication_owned {
+            self.invalidate_ranking_caches_locked();
+        }
+    }
+
     pub(crate) fn invalidate_ranking_caches_locked(&self) {
         *self
             .pagerank_cache
@@ -2955,6 +2986,21 @@ impl GraphStore {
         true
     }
 
+    fn record_index_publication_reservation_owner(&self, token: u64) -> Result<(), StoreError> {
+        let mut state = self
+            .index_publication_lease
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.owner != Some(token) {
+            return Err(StoreError::Query(
+                "index publication reservation is not owned by this token".into(),
+            ));
+        }
+        state.reservation_owner = Some(token);
+        Ok(())
+    }
+
     fn validate_index_publication_owner(&self, token: u64) -> Result<(), StoreError> {
         let state = self
             .index_publication_lease
@@ -3034,6 +3080,7 @@ impl GraphStore {
             ));
         }
         state.owner = None;
+        state.reservation_owner = None;
         drop(state);
         self.index_publication_lease.available.notify_all();
         Ok(())

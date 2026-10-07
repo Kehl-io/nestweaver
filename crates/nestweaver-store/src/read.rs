@@ -4334,7 +4334,7 @@ impl GraphStore {
                 .unwrap_or_else(|error| error.into_inner())
         });
         if limit > 0 && query.is_none() && self.index_publication_blocks_ranking() {
-            self.invalidate_ranking_caches_locked();
+            self.invalidate_unowned_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);
         }
         let conn = self.conn()?;
@@ -4618,7 +4618,7 @@ impl GraphStore {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if self.index_publication_blocks_ranking() {
-            self.invalidate_ranking_caches_locked();
+            self.invalidate_unowned_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);
         }
         let conn = self.conn()?;
@@ -4717,7 +4717,7 @@ impl GraphStore {
         // project that has none. Refuse like every other ranked read (the
         // watcher-batch exception included).
         if self.index_publication_blocks_ranking() {
-            self.invalidate_ranking_caches_locked();
+            self.invalidate_unowned_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);
         }
         if limit == 0 {

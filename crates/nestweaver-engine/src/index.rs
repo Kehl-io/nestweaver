@@ -1228,7 +1228,7 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
         // clean-without-sidecar state returns by intent, not by race.
         //
         // A refresh failure therefore also blocks retirement — including the
-        // owner save failing closed when a reader wiped the fresh cache
+        // owner save failing closed if fresh ranks were invalidated
         // mid-window (`ranking.rs` `save_pagerank_cache_for_publication_owner`):
         // the publication stays dirty and recoverable instead of reporting
         // clean without ranks. The failure is still returned to the caller
@@ -1249,15 +1249,10 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
                         match io.save_pagerank(&lease, &pagerank_path) {
                             Ok(()) => {}
                             Err(error) => {
-                                // Known residual: under sustained ranked-query
-                                // traffic a reader blocked on
-                                // `pagerank_compute_lock` during the compute
-                                // typically acquires it in the compute→save gap
-                                // and wipes the fresh cache, so this fail-closed
-                                // save can fail on every retry and keep the
-                                // publication dirty (queries error) until
-                                // traffic pauses or a restart heals it via
-                                // recovery.
+                                // Reader refusals preserve the active owner's
+                                // ranks. Persistence errors still keep this
+                                // publication dirty for recovery rather than
+                                // retiring without its required sidecar.
                                 push_reconciliation_failure(
                                     &mut failures,
                                     DeletionReconciliationStage::PageRankPersistence,
@@ -15577,7 +15572,10 @@ module.exports = { check, plain };\n";
                 anyhow::bail!("injected PageRank save failure");
             }
             if self.reader_touch_before_save {
-                let _ = lease.store().pagerank_scores();
+                assert!(matches!(
+                    lease.store().pagerank_scores(),
+                    Err(nestweaver_store::StoreError::RankingUnavailable)
+                ));
             }
             FileSystemIndexEpilogueIo.save_pagerank(lease, path)?;
             if self.crash_after_save_pagerank {
@@ -15886,13 +15884,11 @@ module.exports = { check, plain };\n";
         assert_note_ranks(&persisted, "killsave");
     }
 
-    // No crash at all: a reader touching the rank path BETWEEN the owner's
-    // compute and save (the marker is still set, so the read fails closed and
-    // wipes the fresh cache). The owner save must then FAIL — blocking marker
-    // retirement — rather than silently writing nothing and publishing clean
-    // with no sidecar.
+    // A reader between owner compute and save still refuses the dirty
+    // publication, but must preserve the reserved owner's current ranks.
+    // Completion must persist code and note ranks before retiring the marker.
     #[test]
-    fn reader_in_refresh_window_cannot_leave_a_clean_rankless_publication() {
+    fn reader_in_refresh_window_preserves_ranks_and_publishes_clean() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.lbug");
         let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
@@ -15913,7 +15909,7 @@ module.exports = { check, plain };\n";
         insert_publication_graph(&store, "raced");
         insert_publication_notes(&store, "raced");
 
-        let error = finalize_committed_index_for_scope_with_io(
+        finalize_committed_index_for_scope_with_io(
             publication,
             Some(&db_path),
             "raced publisher",
@@ -15924,36 +15920,32 @@ module.exports = { check, plain };\n";
             Some(&nestweaver_store::GraphScope::unified()),
             true,
         )
-        .expect_err("a wiped owner cache must fail the sidecar save, not publish clean without it");
+        .expect("a refused read must not discard the reserved owner's ranks");
         assert!(
-            error
-                .failures
-                .iter()
-                .any(|f| f.stage == DeletionReconciliationStage::PageRankPersistence),
-            "the wipe must surface as a PageRank save failure: {error}"
+            !marker_path.exists(),
+            "a successful persisted publication retires its marker"
         );
         assert!(
-            marker_path.exists(),
-            "the publication must stay dirty so the next open reconciles it"
-        );
-        assert!(
-            !pagerank_path.exists(),
-            "no sidecar may be written from a wiped cache"
-        );
-        drop(store);
-
-        // And it recovers on the next open — with note ranks, not just code.
-        write_marker_with_pid(&marker_path, reaped_child_pid(), None);
-        let reopened = GraphStore::open_or_create(&db_path).unwrap();
-        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
-        let outcome = recover_abandoned_index_publication(&reopened, &authority).unwrap();
-        assert!(
-            outcome.recovered(),
-            "the dirty publication must reconcile: {}",
-            outcome.describe()
+            pagerank_path.exists(),
+            "the clean publication must have its rank sidecar"
         );
         let persisted = persisted_pagerank(&db_path);
         assert_note_ranks(&persisted, "raced");
+        for uid in ["sym:publisher-raced:source", "sym:publisher-raced:target"] {
+            assert!(
+                persisted.contains_key(uid),
+                "code rank {uid} must be persisted"
+            );
+        }
+        drop(store);
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(!reopened.is_index_publication_dirty());
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert_eq!(
+            reopened.pagerank_scores().unwrap(),
+            persisted,
+            "a cold opener must load the exact code and note population"
+        );
     }
 
     #[test]

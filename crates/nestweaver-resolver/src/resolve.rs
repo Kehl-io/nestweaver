@@ -835,6 +835,13 @@ fn resolve_single_reference(
                     })
                 };
             in_scope
+                && rust_path_import_positions.is_none_or(|positions| {
+                    language != Language::Rust
+                        || binding.original_name == "*"
+                        || binding
+                            .scope
+                            .is_some_and(|scope| positions.contains(&scope.position))
+                })
                 && exact_rust_call.is_none_or(|assignment| {
                     assignment.local_callee_line.is_none()
                         && binding.scope.is_some_and(|scope| {
@@ -915,7 +922,32 @@ fn resolve_single_reference(
             .as_deref()
             .expect("unresolved binding handled above");
         let exact_exports = matches!(language, Language::JavaScript | Language::TypeScript);
-        let (target_file, original, depth, literal_method_line) = if exact_exports {
+        // A Rust type path resolves through the same bounded named type route
+        // as a typed value. Keep the terminal declaration's byte identity so
+        // inline types and re-exports cannot donate a same-named hidden impl.
+        let rust_member_origin = if language == Language::Rust
+            && binding.original_name != "*"
+            && reference.receiver.is_some()
+            && rust_path_import_positions.is_some()
+        {
+            type_envs.and_then(|envs| {
+                rust_public_type_origin(
+                    source_file,
+                    original,
+                    binding.rust_inline_modules.as_deref()?,
+                    symbol_map,
+                    graph,
+                    envs,
+                )
+            })
+        } else {
+            None
+        };
+        let (target_file, original, depth, literal_method_line) = if let Some(origin) =
+            &rust_member_origin
+        {
+            (origin.file.as_str(), origin.name.as_str(), 0, None)
+        } else if exact_exports {
             let Some(target) = graph.exported_target_with_declaration(source_file, original) else {
                 return Some(unresolved_edge(source_uid, name, edge_type));
             };
@@ -934,7 +966,9 @@ fn resolve_single_reference(
             .flatten()
             .filter(|(file, symbol)| *file == target_file && symbol.parent_name.is_none())
             .collect();
-        let member_receiver = if member_parent.is_some() && receiver_declarations.len() == 1 {
+        let member_receiver = if let Some(origin) = &rust_member_origin {
+            Some((origin.name.as_str(), true))
+        } else if member_parent.is_some() && receiver_declarations.len() == 1 {
             let symbol = receiver_declarations[0].1;
             if symbol.kind == SymbolKind::Class {
                 Some((original, true))
@@ -1002,6 +1036,17 @@ fn resolve_single_reference(
                                 // staticmethods and classmethods alike. The
                                 // exact imported class supplies receiver evidence.
                                 && (language == Language::Python
+                                    // Rust has no `static` function modifier.
+                                    // A qualified exact type also permits
+                                    // explicit-self UFCS: Type::method(&value).
+                                    || language == Language::Rust
+                                        && class
+                                        && rust_member_origin.as_ref().is_some_and(|origin| {
+                                            method_belongs_to_origin(
+                                                file, symbol, origin, graph,
+                                                symbol_map, type_envs,
+                                            )
+                                        })
                                     || prefix
                                         .split_whitespace()
                                         .rev()
@@ -7135,6 +7180,278 @@ async fn same_line_after() { let (_, db, _) = spawn_server().await; { let db = u
             "{edges:#?}"
         );
         assert!(review_callers(&files, &edges, "other/lib.rs", "helper").is_empty());
+    }
+
+    #[test]
+    fn review5_rust_imported_type_qualified_functions_keep_exact_owner() {
+        for (lib, provider, user, import) in [
+            (
+                "src/lib.rs",
+                "src/storage.rs",
+                "src/user.rs",
+                "crate::storage::Storage",
+            ),
+            (
+                "crates/storage-one/src/lib.rs",
+                "crates/storage-one/src/storage.rs",
+                "crates/client/src/lib.rs",
+                "storage_one::storage::Storage",
+            ),
+        ] {
+            let provider_source = "pub struct Storage;\nimpl Storage {\n pub fn open() -> Storage { Storage }\n pub fn method(&self) {}\n}\n";
+            let user_source = format!(
+                "use {import} as Selected;\nfn direct() {{ Selected::open(); }}\nfn parameter(db: &Selected) {{ db.method(); }}\nfn ufcs(db: &Selected) {{ Selected::method(db); }}\nfn shadow(Selected: Unknown) {{ Selected::open(); }}\nfn dot() {{ Selected.open(); }}\nfn returned() {{ let db = Selected::open(); db.method(); }}\n"
+            );
+            let (files, edges) = review_edges(
+                &[
+                    (lib, "pub mod storage;\nmod user;\n"),
+                    (provider, provider_source),
+                    (user, &user_source),
+                    ("other/storage.rs", provider_source),
+                ],
+                Language::Rust,
+            );
+            assert_eq!(
+                review_callers(&files, &edges, provider, "open"),
+                ["direct", "returned"]
+                    .into_iter()
+                    .map(|name| uid(&files, user, name))
+                    .collect(),
+                "{import}: {files:#?} {edges:#?}"
+            );
+            assert_eq!(
+                review_callers(&files, &edges, provider, "method"),
+                ["parameter", "ufcs", "returned"]
+                    .into_iter()
+                    .map(|name| uid(&files, user, name))
+                    .collect(),
+                "{import}: {files:#?} {edges:#?}"
+            );
+            assert!(review_callers(&files, &edges, "other/storage.rs", "open").is_empty());
+            assert!(review_callers(&files, &edges, "other/storage.rs", "method").is_empty());
+        }
+    }
+
+    #[test]
+    fn review5_rust_imported_type_refuses_function_local_owner_donation() {
+        let provider = "src/storage.rs";
+        let (files, edges) = review_edges(
+            &[
+                ("src/lib.rs", "mod storage; mod user;\n"),
+                (
+                    provider,
+                    "pub struct Storage;\nfn hidden() { struct Storage; impl Storage { pub fn open() {} } }\n",
+                ),
+                (
+                    "src/user.rs",
+                    "use crate::storage::Storage;\nfn user() { Storage::open(); }\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert!(
+            review_callers(&files, &edges, provider, "open").is_empty(),
+            "{files:#?} {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review5_rust_imported_inline_and_reexported_type_paths_keep_terminal_owner() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "crates/provider/src/lib.rs",
+                    "pub mod process;\npub use process::testing::Runner as Exported;\n",
+                ),
+                (
+                    "crates/provider/src/process.rs",
+                    "pub mod testing {\n pub struct Runner;\n impl Runner { pub fn replying() {} }\n}\n",
+                ),
+                (
+                    "crates/user/src/lib.rs",
+                    "use provider::process::testing::Runner as Direct;\nuse provider::Exported as Alias;\nfn direct() { Direct::replying(); }\nfn alias() { Alias::replying(); }\nfn shadow(Direct: Unknown) { Direct::replying(); }\n",
+                ),
+                (
+                    "other/process.rs",
+                    "pub struct Runner;\nimpl Runner { pub fn replying() {} }\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "crates/provider/src/process.rs", "replying"),
+            ["direct", "alias"]
+                .into_iter()
+                .map(|name| uid(&files, "crates/user/src/lib.rs", name))
+                .collect(),
+            "{files:#?} {edges:#?}"
+        );
+        assert!(review_callers(&files, &edges, "other/process.rs", "replying").is_empty());
+    }
+
+    #[test]
+    fn review5_rust_inline_local_tuple_factory_keeps_parent_imported_type() {
+        let user = "crates/user/src/lib.rs";
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "crates/provider/src/lib.rs",
+                    "pub struct Storage;\nimpl Storage { pub fn method(&self) {} }\n",
+                ),
+                (
+                    user,
+                    "use provider::Storage;\n#[cfg(test)] mod tests {\n use super::*;\n fn helper() -> ((), Storage) { todo!() }\n fn caller() { let (_, db) = helper(); db.method(); }\n fn unknown(helper: Unknown) { let (_, db) = helper(); db.method(); }\n fn shadow() { let (_, db) = helper(); { let db = unknown(); db.method(); } }\n}\n",
+                ),
+                (
+                    "other/storage.rs",
+                    "pub struct Storage;\nimpl Storage { pub fn method(&self) {} }\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "crates/provider/src/lib.rs", "method"),
+            std::collections::BTreeSet::from([uid(&files, user, "caller")]),
+            "{files:#?} {edges:#?}"
+        );
+        assert!(review_callers(&files, &edges, "other/storage.rs", "method").is_empty());
+    }
+
+    #[test]
+    fn review5_rust_qualified_inner_named_import_shadows_outer_owner() {
+        let (files, edges) = review_edges(
+            &[
+                ("src/lib.rs", "mod outer; mod inner; mod user;\n"),
+                (
+                    "src/outer.rs",
+                    "pub struct Storage;\nimpl Storage { pub fn open() {} }\n",
+                ),
+                (
+                    "src/inner.rs",
+                    "pub struct Storage;\nimpl Storage { pub fn open() {} }\n",
+                ),
+                (
+                    "src/user.rs",
+                    "use crate::outer::Storage;\nfn outer() { Storage::open(); }\nmod tests { use crate::inner::Storage;\n fn inner() { Storage::open(); }\n}\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/outer.rs", "open"),
+            std::collections::BTreeSet::from([uid(&files, "src/user.rs", "outer")]),
+            "{files:#?} {edges:#?}"
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/inner.rs", "open"),
+            std::collections::BTreeSet::from([uid(&files, "src/user.rs", "inner")]),
+            "{files:#?} {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review5_rust_tuple_return_origin_precedes_caller_local_type_shadow() {
+        let provider = "crates/provider/src/lib.rs";
+        let user = "crates/user/src/lib.rs";
+        let (files, edges) = review_edges(
+            &[
+                (
+                    provider,
+                    "pub struct Storage;\nimpl Storage { pub fn method(&self) {} }\n",
+                ),
+                (
+                    user,
+                    "use provider::Storage;\nmod tests { use super::*;\n fn helper() -> ((), Storage) { todo!() }\n fn caller() {\n  struct Storage;\n  impl Storage { fn method(&self) {} }\n  let (_, db) = helper();\n  db.method();\n }\n}\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, provider, "method"),
+            std::collections::BTreeSet::from([uid(&files, user, "caller")]),
+            "{files:#?} {edges:#?}"
+        );
+        assert!(
+            review_callers(&files, &edges, user, "method").is_empty(),
+            "caller-local type cannot donate the factory's return: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review5_rust_parent_glob_respects_inner_named_alias_precedence() {
+        let user = "crates/user/src/lib.rs";
+        let provider_source = "pub struct Storage;\nimpl Storage { pub fn method(&self) {} }\n";
+        let (files, edges) = review_edges(
+            &[
+                ("crates/outer/src/lib.rs", provider_source),
+                ("crates/inner/src/lib.rs", provider_source),
+                (
+                    user,
+                    "use outer::Storage;\nmod tests { use super::*; use inner::Storage as Storage;\n fn helper() -> ((), Storage) { todo!() }\n fn caller() { let (_, db) = helper(); db.method(); }\n}\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "crates/inner/src/lib.rs", "method"),
+            std::collections::BTreeSet::from([uid(&files, user, "caller")]),
+            "{files:#?} {edges:#?}"
+        );
+        assert!(
+            review_callers(&files, &edges, "crates/outer/src/lib.rs", "method").is_empty(),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review5_rust_parent_glob_respects_module_local_type_override() {
+        let user = "crates/user/src/lib.rs";
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "crates/provider/src/lib.rs",
+                    "pub struct Storage;\nimpl Storage { pub fn method(&self) {} }\n",
+                ),
+                (
+                    user,
+                    "use provider::Storage;\nmod tests { use super::*;\n struct Storage;\n impl Storage { fn method(&self) {} }\n fn helper() -> ((), Storage) { todo!() }\n fn caller() { let (_, db) = helper(); db.method(); }\n}\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, user, "method"),
+            std::collections::BTreeSet::from([uid(&files, user, "caller")]),
+            "{files:#?} {edges:#?}"
+        );
+        assert!(
+            review_callers(&files, &edges, "crates/provider/src/lib.rs", "method").is_empty(),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review5_rust_nearer_unsupported_tuple_factory_defeats_outer_evidence() {
+        for nearest in [
+            "type OtherTuple = (Unknown,); fn helper() -> OtherTuple { todo!() }",
+            "fn helper<T>(_: T) -> (Unknown,) { todo!() }",
+        ] {
+            let call = if nearest.contains("<T>") {
+                "helper(())"
+            } else {
+                "helper()"
+            };
+            let path = "src/lib.rs";
+            let source = format!(
+                "struct Storage;\nimpl Storage {{ fn method(&self) {{}} }}\nstruct Unknown;\nfn helper() -> (Storage,) {{ todo!() }}\nfn parent() {{ let (db,) = helper(); db.method(); }}\nfn nested() {{\n {nearest}\n let (db,) = {call};\n db.method();\n}}\n"
+            );
+            let (files, edges) = review_edges(&[(path, &source)], Language::Rust);
+            assert_eq!(
+                review_callers(&files, &edges, path, "method"),
+                std::collections::BTreeSet::from([uid(&files, path, "parent")]),
+                "nearest unsupported return must not donate an outer type: {nearest}: {files:#?} {edges:#?}"
+            );
+        }
     }
 
     #[test]

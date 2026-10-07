@@ -5,8 +5,10 @@
 //!
 //! While an index publication is in flight (the `<db>.index-dirty` marker
 //! exists — see `crate::index_publication`), the ranking caches may describe
-//! a graph that no longer exists. Every guard site in this module calls
-//! `invalidate_ranking_caches_locked` first, so cache correctness is uniform.
+//! a graph that no longer exists. Dirty guards discard unowned caches, but
+//! preserve an active publication owner's cache between compute and persistence.
+//! The owner's establishment and retirement barriers still invalidate caches;
+//! readers never expose those ranks while publication blocks ranking.
 //! The return contract is uniform by policy:
 //!
 //! - **Query paths fail closed.** `compute_pagerank`, `personalized_pagerank*`,
@@ -17,7 +19,7 @@
 //!   successful-looking empty result.
 //! - **Sidecar load/save no-op.** `save_pagerank_cache` and
 //!   `load_pagerank_cache` return `Ok(())` without reading or writing sidecar
-//!   data (the caches are still invalidated, as at every guard site):
+//!   data (unowned caches are discarded, as at every dirty guard site):
 //!   refusing to persist or load during the window is a no-op by nature, not
 //!   a degraded answer.
 
@@ -845,7 +847,7 @@ impl GraphStore {
         warm_start: Option<&HashMap<String, f64>>,
     ) -> Result<(), StoreError> {
         if self.index_publication_blocks_ranking() {
-            self.invalidate_ranking_caches_locked();
+            self.invalidate_unowned_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);
         }
         self.compute_pagerank_warm_inner(damping, iterations, scope, warm_start, false)
@@ -973,7 +975,7 @@ impl GraphStore {
         }
 
         if !for_publication_owner && self.index_publication_blocks_ranking() {
-            self.invalidate_ranking_caches_locked();
+            self.invalidate_unowned_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);
         }
 
@@ -1226,7 +1228,7 @@ impl GraphStore {
         };
         ensure_active()?;
         if self.index_publication_blocks_ranking() {
-            self.invalidate_ranking_caches_locked();
+            self.invalidate_unowned_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);
         }
         let effective_damping = intent.map_or(damping, |i| i.damping());
@@ -1386,7 +1388,7 @@ impl GraphStore {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if self.index_publication_blocks_ranking() {
-            self.invalidate_ranking_caches_locked();
+            self.invalidate_unowned_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);
         }
         self.ensure_pagerank_loaded_locked()?;
@@ -1471,7 +1473,7 @@ impl GraphStore {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if self.is_index_publication_dirty() {
-            self.invalidate_ranking_caches_locked();
+            self.invalidate_unowned_ranking_caches_locked();
             return Ok(());
         }
         self.save_pagerank_cache_inner(path, self.graph_generation())
@@ -1485,10 +1487,10 @@ impl GraphStore {
     /// the sidecar land before the marker retires.
     ///
     /// Fails closed on an empty cache. Compute and save are separate calls
-    /// under `pagerank_compute_lock`, and any reader touching the rank path
-    /// while the marker exists wipes the cache via
-    /// `invalidate_ranking_caches_locked` — so a `None` cache here means the
-    /// owner's fresh ranks were wiped mid-window (the compute itself always
+    /// under `pagerank_compute_lock`. Dirty-read refusals preserve the active
+    /// owner's ranks, but an explicit mutation invalidation may still clear
+    /// them. A `None` cache here means the owner's fresh ranks were lost
+    /// mid-window (the compute itself always
     /// leaves `Some`, even for an empty graph). Persisting nothing and
     /// returning `Ok` would let the marker retire with no sidecar: the exact
     /// clean-but-rankless state the ordering exists to prevent. The error
@@ -1622,7 +1624,7 @@ impl GraphStore {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if self.is_index_publication_dirty() {
-            self.invalidate_ranking_caches_locked();
+            self.invalidate_unowned_ranking_caches_locked();
             return Ok(());
         }
         if path.exists() {
@@ -1708,7 +1710,7 @@ impl GraphStore {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if self.index_publication_blocks_ranking() {
-            self.invalidate_ranking_caches_locked();
+            self.invalidate_unowned_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);
         }
         self.ensure_pagerank_loaded_locked()?;
@@ -1737,7 +1739,7 @@ impl GraphStore {
 
     pub(crate) fn ensure_pagerank_loaded_locked(&self) -> Result<(), StoreError> {
         if self.index_publication_blocks_ranking() {
-            self.invalidate_ranking_caches_locked();
+            self.invalidate_unowned_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);
         }
         let loaded = |cache: &std::sync::Mutex<Option<HashMap<String, f64>>>| {
@@ -1767,7 +1769,7 @@ impl GraphStore {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if self.index_publication_blocks_ranking() {
-            self.invalidate_ranking_caches_locked();
+            self.invalidate_unowned_ranking_caches_locked();
             return Err(StoreError::RankingUnavailable);
         }
         let scope = GraphScope::unified();
@@ -2104,6 +2106,232 @@ mod tests {
             initial + 1,
             "8 concurrent callers must trigger exactly one compute"
         );
+    }
+
+    /// Schedule the refused read exactly in the owner's compute-to-save gap.
+    /// This tests publication persistence rather than relying on read-load timing.
+    fn owner_ranks_survive_refused_access(access: impl FnOnce(&GraphStore)) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        store.insert_symbol(&make_symbol("A", "before")).unwrap();
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        let marker = store.index_publication_marker_path().unwrap();
+        let sidecar = dir.path().join("owner.pagerank.json");
+        let publication = store.acquire_index_publication_lease().unwrap();
+        store.with_index_publication_rank_barrier(|| {
+            std::fs::write(&marker, b"dirty").unwrap();
+            publication.reserve_generation().unwrap();
+        });
+        assert!(store.pagerank_cache.lock().unwrap().is_none());
+        store.insert_symbol(&make_symbol("B", "after")).unwrap();
+        publication
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        let owned_scores = store.pagerank_cache.lock().unwrap().clone().unwrap();
+        assert_eq!(owned_scores.len(), 2);
+        assert!(owned_scores.contains_key("A") && owned_scores.contains_key("B"));
+        access(&store);
+        publication.save_pagerank(&sidecar).unwrap();
+        assert!(sidecar.exists());
+        assert_eq!(
+            store.pagerank_cache.lock().unwrap().as_ref(),
+            Some(&owned_scores)
+        );
+        assert!(store.is_index_publication_dirty());
+        store.with_index_publication_rank_barrier(|| {
+            publication.publish_clean_generation().unwrap();
+            std::fs::remove_file(&marker).unwrap();
+            publication.complete_generation().unwrap();
+        });
+        publication.release().unwrap();
+        assert!(
+            store.pagerank_cache.lock().unwrap().is_none(),
+            "retirement still discards all dirty-window memory caches"
+        );
+        store
+            .load_pagerank_cache_expecting(
+                &sidecar,
+                Some(&super::pagerank_algorithm_fingerprint(
+                    0.85,
+                    20,
+                    &GraphScope::code_only(),
+                )),
+            )
+            .unwrap();
+        assert_eq!(
+            store.pagerank_scores().unwrap(),
+            owned_scores,
+            "the published sidecar must contain the owner-computed current population"
+        );
+    }
+
+    macro_rules! refused_rank_access_preserves_owner {
+        ($name:ident, $access:expr) => {
+            #[test]
+            fn $name() {
+                owner_ranks_survive_refused_access(|store| {
+                    assert!(matches!(
+                        ($access)(store),
+                        Err(StoreError::RankingUnavailable)
+                    ));
+                });
+            }
+        };
+    }
+
+    refused_rank_access_preserves_owner!(
+        owner_save_survives_refused_workspace_ranked_read,
+        |s: &GraphStore| s.workspace_symbol_page(Some("repo-1"), None, None, 10)
+    );
+    refused_rank_access_preserves_owner!(
+        owner_save_survives_refused_repo_seed_read,
+        |s: &GraphStore| s.repo_symbol_seed_candidates("repo-1", 10)
+    );
+    refused_rank_access_preserves_owner!(
+        owner_save_survives_refused_project_seed_read,
+        |s: &GraphStore| s.list_project_symbol_uids_by_pagerank("project", 10, None, None)
+    );
+    refused_rank_access_preserves_owner!(
+        owner_save_survives_refused_rank_scores,
+        |s: &GraphStore| s.pagerank_scores()
+    );
+    refused_rank_access_preserves_owner!(
+        owner_save_survives_refused_rank_symbols,
+        |s: &GraphStore| s.symbols_by_pagerank(Some(10))
+    );
+    refused_rank_access_preserves_owner!(
+        owner_save_survives_refused_lazy_rank_load,
+        |s: &GraphStore| s.ensure_pagerank_loaded()
+    );
+    refused_rank_access_preserves_owner!(
+        owner_save_survives_refused_outsider_compute,
+        |s: &GraphStore| s.compute_pagerank(0.85, 20, &GraphScope::code_only())
+    );
+    refused_rank_access_preserves_owner!(owner_save_survives_refused_ppr, |s: &GraphStore| s
+        .personalized_pagerank(&["A".into()], 0.85, 20, &GraphScope::code_only()));
+    refused_rank_access_preserves_owner!(owner_save_survives_refused_warm_ppr, |s: &GraphStore| s
+        .warm_ppr_cache());
+
+    #[test]
+    fn owner_save_survives_dirty_sidecar_io_noops() {
+        owner_ranks_survive_refused_access(|store| {
+            let sidecar = store
+                .db_path
+                .as_ref()
+                .unwrap()
+                .with_extension("outsider.pagerank.json");
+            store.save_pagerank_cache(&sidecar).unwrap();
+            assert!(
+                !sidecar.exists(),
+                "outsiders cannot persist dirty-window ranks"
+            );
+            store.load_pagerank_cache(&sidecar).unwrap();
+        });
+    }
+
+    #[test]
+    fn abandoned_owner_ranks_are_invalidated_by_refused_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open_or_create(&dir.path().join("graph.lbug")).unwrap();
+        store.insert_symbol(&make_symbol("A", "before")).unwrap();
+        let owner = store.acquire_index_publication_lease().unwrap();
+        store.with_index_publication_rank_barrier(|| {
+            std::fs::write(store.index_publication_marker_path().unwrap(), b"dirty").unwrap();
+            owner.reserve_generation().unwrap();
+        });
+        owner
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        assert!(store.pagerank_cache.lock().unwrap().is_some());
+        drop(owner);
+        assert!(matches!(
+            store.pagerank_scores(),
+            Err(StoreError::RankingUnavailable)
+        ));
+        assert!(store.pagerank_cache.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn unreserved_lease_does_not_protect_dirty_ranking_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open_or_create(&dir.path().join("graph.lbug")).unwrap();
+        store.insert_symbol(&make_symbol("A", "before")).unwrap();
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        let snapshot_lease = store.acquire_index_publication_lease().unwrap();
+        // A lease without a publication reservation cannot authorize preserving
+        // old ranks when a marker appears; it has not established publication.
+        std::fs::write(store.index_publication_marker_path().unwrap(), b"dirty").unwrap();
+        assert!(store.pagerank_cache.lock().unwrap().is_some());
+        assert!(matches!(
+            store.pagerank_scores(),
+            Err(StoreError::RankingUnavailable)
+        ));
+        assert!(store.pagerank_cache.lock().unwrap().is_none());
+        drop(snapshot_lease);
+    }
+
+    #[test]
+    fn explicit_invalidation_still_blocks_owner_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open_or_create(&dir.path().join("graph.lbug")).unwrap();
+        store.insert_symbol(&make_symbol("A", "before")).unwrap();
+        let owner = store.acquire_index_publication_lease().unwrap();
+        store.with_index_publication_rank_barrier(|| {
+            std::fs::write(store.index_publication_marker_path().unwrap(), b"dirty").unwrap();
+            owner.reserve_generation().unwrap();
+        });
+        owner
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        assert!(store.pagerank_cache.lock().unwrap().is_some());
+        store.invalidate_pagerank();
+        let sidecar = dir.path().join("rejected.pagerank.json");
+        assert!(
+            owner.save_pagerank(&sidecar).is_err(),
+            "mutation invalidation must still prevent publication without ranks"
+        );
+        assert!(!sidecar.exists());
+        assert!(store.is_index_publication_dirty());
+    }
+
+    #[test]
+    fn inherited_base_does_not_authorize_a_new_unreserved_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open_or_create(&dir.path().join("graph.lbug")).unwrap();
+        store.insert_symbol(&make_symbol("A", "before")).unwrap();
+        let old_owner = store.acquire_index_publication_lease().unwrap();
+        store.with_index_publication_rank_barrier(|| {
+            std::fs::write(store.index_publication_marker_path().unwrap(), b"dirty").unwrap();
+            old_owner.reserve_generation().unwrap();
+        });
+        old_owner
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        assert!(store.pagerank_cache.lock().unwrap().is_some());
+        drop(old_owner);
+        let unreserved_lease = store.acquire_index_publication_lease().unwrap();
+        assert!(
+            store
+                .index_publication_generation_base
+                .lock()
+                .unwrap()
+                .is_some(),
+            "the abandoned generation must still be available for explicit recovery"
+        );
+        assert!(matches!(
+            store.pagerank_scores(),
+            Err(StoreError::RankingUnavailable)
+        ));
+        assert!(
+            store.pagerank_cache.lock().unwrap().is_none(),
+            "an inherited base cannot protect a different token's stale cache"
+        );
+        drop(unreserved_lease);
     }
 
     #[test]

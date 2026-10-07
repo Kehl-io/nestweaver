@@ -3661,13 +3661,29 @@ pub fn scoped_rust_assignment_evidence(
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
+    let tuple_origins: std::collections::HashMap<_, _> =
+        rust_tuple_factory_bindings(source.as_bytes(), &lexical_items, &local_bindings)
+            .into_iter()
+            .filter_map(|(binding, origin)| {
+                Some((binding.scope?.position, (binding.type_name, origin)))
+            })
+            .collect();
     let origins = bindings
         .iter()
         .filter_map(|binding| {
             let scope = binding.scope?;
-            let at = tree
-                .root_node()
-                .descendant_for_byte_range(scope.position, scope.position)?;
+            let at = if binding.kind == AstBindingKind::ReturnType {
+                tuple_origins
+                    .get(&scope.position)
+                    .filter(|(name, _)| *name == binding.type_name)
+                    .map(|(_, origin)| *origin)
+            } else {
+                None
+            }
+            .or_else(|| {
+                tree.root_node()
+                    .descendant_for_byte_range(scope.position, scope.position)
+            })?;
             let (local_line, local_position, ambiguous) =
                 lexical_items.visible_type(&binding.type_name, at);
             Some(ScopedRustTypeOrigin {
@@ -4006,7 +4022,12 @@ fn extract_types_from_tree(
     }
 
     if lang == Language::Rust {
-        collect_rust_tuple_factory_bindings(tree.root_node(), source, &mut bindings);
+        collect_rust_tuple_factory_bindings(
+            tree.root_node(),
+            source,
+            lexical_items.as_ref().expect("Rust evidence"),
+            &mut bindings,
+        );
         collect_rust_unit_constructor_bindings(
             tree.root_node(),
             source,
@@ -4170,31 +4191,48 @@ impl<'tree> RustLexicalItems<'tree> {
         name: &str,
         at: tree_sitter::Node<'tree>,
     ) -> Vec<&RawReference> {
-        let mut candidates: Vec<_> = self
-            .imports
-            .get(&rust_module_scope(at).id())
-            .into_iter()
-            .flatten()
-            .filter(|(scope, _, _)| scope.start <= at.start_byte() && at.start_byte() < scope.end)
-            .flat_map(|(scope, imports, _)| {
-                imports
-                    .iter()
-                    .filter(move |import| {
-                        import.kind == ReferenceKind::ImportAlias && import.name == name
-                            || import.kind == ReferenceKind::Import
-                                && import.receiver.as_deref() != Some("*")
-                                && import.name.rsplit("::").next() == Some(name)
-                    })
-                    .map(move |import| (scope.end - scope.start, import))
-            })
-            .collect();
-        candidates.sort_by_key(|(span, _)| *span);
-        let nearest = candidates.first().map(|(span, _)| *span);
-        candidates
-            .into_iter()
-            .filter(|(span, _)| Some(*span) == nearest)
-            .map(|(_, import)| import)
-            .collect()
+        let mut module = rust_module_scope(at);
+        loop {
+            let imports = self.imports.get(&module.id());
+            let mut candidates: Vec<_> = imports
+                .into_iter()
+                .flatten()
+                .filter(|(scope, _, _)| {
+                    scope.start <= at.start_byte() && at.start_byte() < scope.end
+                })
+                .flat_map(|(scope, imports, _)| {
+                    imports
+                        .iter()
+                        .filter(move |import| {
+                            import.kind == ReferenceKind::ImportAlias && import.name == name
+                                || import.kind == ReferenceKind::Import
+                                    && import.receiver.as_deref() != Some("*")
+                                    && import.name.rsplit("::").next() == Some(name)
+                        })
+                        .map(move |import| (scope.end - scope.start, import))
+                })
+                .collect();
+            candidates.sort_by_key(|(span, _)| *span);
+            if let Some((nearest, _)) = candidates.first() {
+                let nearest = *nearest;
+                return candidates
+                    .into_iter()
+                    .filter(|(span, _)| *span == nearest)
+                    .map(|(_, import)| import)
+                    .collect();
+            }
+            // `use super::*` exposes the parent's named imports too. Join
+            // their original declaration bytes, rather than treating the
+            // parent file as a public re-export barrel or guessing by name.
+            if module.kind() != "mod_item"
+                || !imports.into_iter().flatten().any(|(scope, _, super_glob)| {
+                    *super_glob && scope.start <= at.start_byte() && at.start_byte() < scope.end
+                })
+            {
+                return Vec::new();
+            }
+            module = rust_module_scope(module);
+        }
     }
 
     fn type_imports(
@@ -4478,50 +4516,27 @@ fn rust_standard_pointer_origin(ty: tree_sitter::Node<'_>, source: &[u8]) -> boo
 fn collect_rust_tuple_factory_bindings(
     root: tree_sitter::Node<'_>,
     source: &[u8],
+    lexical_items: &RustLexicalItems<'_>,
     bindings: &mut Vec<AstTypeBinding>,
 ) {
-    let mut functions = Vec::new();
-    let mut declarations = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "function_item"
-            && let (Some(name), Some(ret)) = (
-                node.child_by_field_name("name"),
-                node.child_by_field_name("return_type"),
-            )
-            && ret.kind() == "tuple_type"
-            && node.child_by_field_name("type_parameters").is_none()
-            && let Some(scope) = lexical_scope(name)
-        {
-            // An impl/trait method is not a bare local factory.
-            let mut parent = node.parent();
-            let mut method = false;
-            while let Some(ancestor) = parent {
-                if matches!(ancestor.kind(), "impl_item" | "trait_item") {
-                    method = true;
-                    break;
-                }
-                if matches!(
-                    ancestor.kind(),
-                    "mod_item" | "source_file" | "function_item"
-                ) {
-                    break;
-                }
-                parent = ancestor.parent();
-            }
-            if !method {
-                functions.push((name, ret, scope));
-            }
-        }
-        if node.kind() == "let_declaration" {
-            declarations.push(node);
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
-    }
     let mut local_bindings = Vec::new();
     collect_local_bindings(root, source, &mut local_bindings, Language::Rust);
-    for declaration in declarations {
+    bindings.extend(
+        rust_tuple_factory_bindings(source, lexical_items, &local_bindings)
+            .into_iter()
+            .map(|(binding, _)| binding),
+    );
+}
+
+/// One tuple selector supplies both cached bindings and ephemeral declaration
+/// provenance. Binding sites determine lifetime; return nodes determine type.
+fn rust_tuple_factory_bindings<'tree>(
+    source: &[u8],
+    lexical_items: &RustLexicalItems<'tree>,
+    local_bindings: &[RawReference],
+) -> Vec<(AstTypeBinding, tree_sitter::Node<'tree>)> {
+    let mut result = Vec::new();
+    for declaration in &lexical_items.lets {
         let (Some(pattern), Some(mut value)) = (
             declaration.child_by_field_name("pattern"),
             declaration.child_by_field_name("value"),
@@ -4562,19 +4577,38 @@ fn collect_rust_tuple_factory_bindings(
         }) {
             continue;
         }
-        let mut candidates: Vec<_> = functions
-            .iter()
-            .filter(|(name, _, scope)| {
-                name.utf8_text(source) == Ok(callee_name) && scope.start <= at && at < scope.end
+        let mut candidates: Vec<_> = lexical_items
+            .functions
+            .get(callee_name)
+            .into_iter()
+            .flatten()
+            .filter_map(|name| {
+                let scope = lexical_scope(*name)?;
+                lexical_items
+                    .item_visible(*name, value, callee_name)
+                    .then_some((*name, scope))
             })
             .collect();
-        candidates.sort_by_key(|(_, _, scope)| scope.end - scope.start);
-        let Some((factory_name, ret, chosen_scope)) = candidates.first().copied() else {
+        candidates.sort_by_key(|(_, scope)| scope.end - scope.start);
+        let Some((factory_name, chosen_scope)) = candidates.first().copied() else {
             continue;
         };
+        // Choose the lexical declaration before inspecting its return shape.
+        // An unsupported nearer declaration defeats an outer tuple factory.
+        if candidates.get(1).is_some_and(|(_, scope)| {
+            scope.start == chosen_scope.start && scope.end == chosen_scope.end
+        }) {
+            continue;
+        }
         let Some(factory) = factory_name.parent() else {
             continue;
         };
+        let Some(ret) = factory.child_by_field_name("return_type") else {
+            continue;
+        };
+        if ret.kind() != "tuple_type" || factory.child_by_field_name("type_parameters").is_some() {
+            continue;
+        }
         let mut cursor = factory.walk();
         let asynchronous = factory.named_children(&mut cursor).any(|child| {
             child.kind() == "function_modifiers"
@@ -4583,11 +4617,6 @@ fn collect_rust_tuple_factory_bindings(
                     .is_ok_and(|text| text.split_whitespace().any(|token| token == "async"))
         });
         if awaited != asynchronous {
-            continue;
-        }
-        if candidates.get(1).is_some_and(|(_, _, scope)| {
-            scope.start == chosen_scope.start && scope.end == chosen_scope.end
-        }) {
             continue;
         }
         let mut cursor = pattern.walk();
@@ -4616,15 +4645,19 @@ fn collect_rust_tuple_factory_bindings(
             else {
                 continue;
             };
-            bindings.push(AstTypeBinding {
-                scope: Some(scope),
-                var_name: var_name.into(),
-                type_name,
-                line: name.start_position().row as u32 + 1,
-                kind: AstBindingKind::ReturnType,
-            });
+            result.push((
+                AstTypeBinding {
+                    scope: Some(scope),
+                    var_name: var_name.into(),
+                    type_name,
+                    line: name.start_position().row as u32 + 1,
+                    kind: AstBindingKind::ReturnType,
+                },
+                ty,
+            ));
         }
     }
+    result
 }
 
 /// nw-356 (A) residual (quality-review round 2). Whether `node`'s subtree
