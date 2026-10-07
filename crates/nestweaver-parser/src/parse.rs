@@ -1501,10 +1501,20 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
 
     let mut cursor = QueryCursor::new();
     let source_bytes = source.as_bytes();
+    // Field, constructor, tuple and output-reference evidence share one
+    // within-tree lexical inventory; append order remains unchanged below.
+    let share_locals = matches!(
+        lang,
+        Language::Rust | Language::JavaScript | Language::TypeScript
+    );
+    let mut local_bindings = Vec::new();
+    if share_locals {
+        collect_local_bindings(tree.root_node(), source_bytes, &mut local_bindings, lang);
+    }
     let js_field_inventory = matches!(lang, Language::JavaScript | Language::TypeScript)
-        .then(|| JsFieldInventory::new(tree.root_node(), source_bytes, lang));
+        .then(|| JsFieldInventory::new(tree.root_node(), source_bytes, &local_bindings));
     let commonjs_object_methods =
-        collect_commonjs_object_methods(lang, tree.root_node(), source_bytes);
+        collect_commonjs_object_methods(lang, tree.root_node(), source_bytes, &local_bindings);
     let commonjs_exported_locals = collect_commonjs_reexport_names(
         lang,
         tree.root_node(),
@@ -2115,7 +2125,11 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     }
 
     // nw-724: parameters and local declarations shadow same-named symbols.
-    collect_local_bindings(tree.root_node(), source_bytes, &mut references, lang);
+    if share_locals {
+        references.extend(local_bindings.iter().cloned());
+    } else {
+        collect_local_bindings(tree.root_node(), source_bytes, &mut references, lang);
+    }
 
     // nw-291 follow-up: recover constant/static reads written as a bare name.
     if let Some(rules) = constant_read_rules(lang) {
@@ -2195,7 +2209,8 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     }
 
     // Type extraction: walk the same tree with type-specific queries
-    let type_bindings = extract_types_from_tree(&tree, &ts_lang, source_bytes, lang);
+    let type_bindings =
+        extract_types_from_tree(&tree, &ts_lang, source_bytes, lang, &local_bindings);
 
     Ok(ParsedFile {
         path: path.to_string_lossy().into_owned(),
@@ -2480,13 +2495,12 @@ fn collect_commonjs_object_methods(
     lang: Language,
     root: tree_sitter::Node<'_>,
     source: &[u8],
+    bindings: &[RawReference],
 ) -> std::collections::HashSet<usize> {
     let mut methods = std::collections::HashSet::new();
     if !matches!(lang, Language::JavaScript | Language::TypeScript) {
         return methods;
     }
-    let mut bindings = Vec::new();
-    collect_local_bindings(root, source, &mut bindings, lang);
     let module_scopes: Vec<_> = bindings
         .iter()
         .filter(|binding| binding.name == "module")
@@ -3002,6 +3016,12 @@ fn token_tree_receiver(
     segments.last().map(|segment| (*segment).to_string())
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_LOCAL_BINDING_WALK_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_NAMED_IMPORT_SELECTION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Record parameters and local declarations so a call of that name is not
 /// resolved to an unrelated symbol (nw-724).
 fn collect_local_bindings(
@@ -3010,6 +3030,8 @@ fn collect_local_bindings(
     references: &mut Vec<RawReference>,
     lang: Language,
 ) {
+    #[cfg(test)]
+    TEST_LOCAL_BINDING_WALK_COUNT.with(|count| count.set(count.get() + 1));
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if is_local_binding_site(node.kind()) {
@@ -3458,6 +3480,17 @@ pub struct ScopedRustTypeDeclaration {
     pub position: usize,
 }
 
+/// An exact named type import between inline modules in one source file.
+#[derive(Debug, Clone)]
+pub struct ScopedRustInlineTypeImport {
+    pub specifier: String,
+    pub local_name: String,
+    pub original_name: String,
+    pub module_path: Vec<String>,
+    pub scope: LexicalScope,
+    pub line: u32,
+}
+
 /// Per-file lexical evidence retained only while resolving references.
 #[derive(Debug, Clone, Default)]
 pub struct ScopedRustEvidence {
@@ -3469,6 +3502,7 @@ pub struct ScopedRustEvidence {
     pub path_imports: Vec<ScopedRustPathImports>,
     pub public_root_uses: Vec<usize>,
     pub module_types: Vec<ScopedRustTypeDeclaration>,
+    pub inline_type_imports: Vec<ScopedRustInlineTypeImport>,
 }
 
 fn rust_type_module_path(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<Vec<String>> {
@@ -3636,6 +3670,7 @@ pub fn scoped_rust_assignment_evidence(
                 } else {
                     (None, false)
                 };
+                let named_imports = lexical_items.named_import_evidence(callee_name, value);
                 result.push(ScopedCallAssignment {
                     variable: variable.into(),
                     scope,
@@ -3647,12 +3682,15 @@ pub fn scoped_rust_assignment_evidence(
                         .map(str::to_string),
                     local_callee_line,
                     local_callee_exists,
-                    import_positions: lexical_items
-                        .named_import_evidence(callee_name, value)
+                    import_positions: named_imports
                         .iter()
                         .filter_map(|reference| reference.scope.map(|scope| scope.position))
                         .collect(),
-                    import_paths: lexical_items.type_imports(callee_name, value, false),
+                    import_paths: lexical_items.type_imports_from_named(
+                        value,
+                        false,
+                        &named_imports,
+                    ),
                     call_position: value.start_byte(),
                     awaited,
                 });
@@ -3686,6 +3724,13 @@ pub fn scoped_rust_assignment_evidence(
             })?;
             let (local_line, local_position, ambiguous) =
                 lexical_items.visible_type(&binding.type_name, at);
+            let named_evidence = lexical_items.named_import_evidence(&binding.type_name, at);
+            let named_imports = lexical_items.type_imports_from_named(at, true, &named_evidence);
+            let imports = if named_evidence.is_empty() {
+                lexical_items.type_imports_from_named(at, false, &named_evidence)
+            } else {
+                named_imports.clone()
+            };
             Some(ScopedRustTypeOrigin {
                 type_name: binding.type_name.clone(),
                 line: binding.line,
@@ -3693,10 +3738,9 @@ pub fn scoped_rust_assignment_evidence(
                 position: scope.position,
                 local_position,
                 ambiguous,
-                imports: lexical_items.type_imports(&binding.type_name, at, false),
-                named_imports: lexical_items.type_imports(&binding.type_name, at, true),
-                named_import_positions: lexical_items
-                    .named_import_evidence(&binding.type_name, at)
+                imports,
+                named_imports,
+                named_import_positions: named_evidence
                     .iter()
                     .filter_map(|reference| reference.scope.map(|scope| scope.position))
                     .collect(),
@@ -3712,6 +3756,7 @@ pub fn scoped_rust_assignment_evidence(
         path_imports,
         public_root_uses,
         module_types,
+        inline_type_imports: lexical_items.inline_type_imports(tree.root_node(), source.as_bytes()),
     }
 }
 
@@ -3723,17 +3768,19 @@ struct JsFieldInventory<'tree> {
 }
 
 impl<'tree> JsFieldInventory<'tree> {
-    fn new(root: tree_sitter::Node<'tree>, source: &[u8], lang: Language) -> Self {
+    fn new(root: tree_sitter::Node<'tree>, source: &[u8], locals: &[RawReference]) -> Self {
         let mut result = Self {
             writes: Default::default(),
             declared: Default::default(),
             locals: Default::default(),
         };
-        let mut locals = Vec::new();
-        collect_local_bindings(root, source, &mut locals, lang);
         for binding in locals {
             if let Some(scope) = binding.scope {
-                result.locals.entry(binding.name).or_default().push(scope);
+                result
+                    .locals
+                    .entry(binding.name.clone())
+                    .or_default()
+                    .push(scope);
             }
         }
         let mut stack = vec![(root, None)];
@@ -3865,6 +3912,7 @@ fn extract_types_from_tree(
     ts_lang: &tree_sitter::Language,
     source: &[u8],
     lang: Language,
+    local_bindings: &[RawReference],
 ) -> Vec<AstTypeBinding> {
     let query_src = match type_query_source(lang) {
         Some(q) => q,
@@ -4023,15 +4071,15 @@ fn extract_types_from_tree(
 
     if lang == Language::Rust {
         collect_rust_tuple_factory_bindings(
-            tree.root_node(),
             source,
             lexical_items.as_ref().expect("Rust evidence"),
+            local_bindings,
             &mut bindings,
         );
         collect_rust_unit_constructor_bindings(
-            tree.root_node(),
             source,
             lexical_items.as_ref().expect("Rust evidence"),
+            local_bindings,
             &mut bindings,
         );
     }
@@ -4137,6 +4185,123 @@ impl<'tree> RustLexicalItems<'tree> {
         evidence
     }
 
+    /// Resolve only same-file self/super routes backed by exact inline types.
+    /// Function/block ancestry affects import lifetime, not its module path.
+    fn inline_type_imports(
+        &self,
+        root: tree_sitter::Node<'tree>,
+        source: &[u8],
+    ) -> Vec<ScopedRustInlineTypeImport> {
+        let mut result = Vec::new();
+        for (scope, imports, _) in self.imports.values().flatten() {
+            let Some(node) = root.descendant_for_byte_range(scope.position, scope.position) else {
+                continue;
+            };
+            let module = rust_module_scope(node);
+            let current_modules = if module.kind() == "source_file" {
+                Vec::new()
+            } else {
+                let Some(mut modules) = rust_type_module_path(module, source) else {
+                    continue;
+                };
+                let Some(name) = module
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(source).ok())
+                else {
+                    continue;
+                };
+                modules.push(name.into());
+                modules
+            };
+            for import in imports {
+                let aliased = import.kind == ReferenceKind::ImportAlias;
+                if !aliased
+                    && (import.kind != ReferenceKind::Import
+                        || import.receiver.as_deref() == Some("*")
+                        || imports.iter().any(|alias| {
+                            alias.kind == ReferenceKind::ImportAlias && alias.context == import.name
+                        }))
+                {
+                    continue;
+                }
+                let specifier = if aliased {
+                    &import.context
+                } else {
+                    &import.name
+                };
+                let segments: Vec<_> = specifier.split("::").collect();
+                let Some((original, path)) = segments.split_last() else {
+                    continue;
+                };
+                if path.is_empty() || original.is_empty() || *original == "*" {
+                    continue;
+                }
+                let mut modules = current_modules.clone();
+                let consumed = if path[0] == "self" {
+                    1
+                } else if path[0] == "super" {
+                    let parents = path
+                        .iter()
+                        .take_while(|segment| **segment == "super")
+                        .count();
+                    if parents > modules.len() {
+                        continue;
+                    }
+                    modules.truncate(modules.len() - parents);
+                    parents
+                } else {
+                    // Other prefixes require file/crate resolution evidence.
+                    continue;
+                };
+                if path[consumed..].iter().any(|segment| {
+                    segment.is_empty() || matches!(*segment, "self" | "super" | "crate" | "*")
+                }) {
+                    continue;
+                }
+                modules.extend(
+                    path[consumed..]
+                        .iter()
+                        .map(|segment| (*segment).to_string()),
+                );
+                if modules.len() > 64 {
+                    continue;
+                }
+                let count = self
+                    .types
+                    .get(*original)
+                    .into_iter()
+                    .flatten()
+                    .filter(|name| {
+                        name.parent().is_some_and(|declaration| {
+                            matches!(declaration.kind(), "struct_item" | "enum_item")
+                                && rust_type_module_path(declaration, source).as_ref()
+                                    == Some(&modules)
+                        })
+                    })
+                    .count();
+                if count != 1 {
+                    continue;
+                }
+                let Some(scope) = import.scope else {
+                    continue;
+                };
+                result.push(ScopedRustInlineTypeImport {
+                    specifier: specifier.clone(),
+                    local_name: if aliased {
+                        import.name.clone()
+                    } else {
+                        (*original).into()
+                    },
+                    original_name: (*original).into(),
+                    module_path: modules,
+                    scope,
+                    line: import.start_line,
+                });
+            }
+        }
+        result
+    }
+
     fn item_visible(
         &self,
         item: tree_sitter::Node<'tree>,
@@ -4191,6 +4356,8 @@ impl<'tree> RustLexicalItems<'tree> {
         name: &str,
         at: tree_sitter::Node<'tree>,
     ) -> Vec<&RawReference> {
+        #[cfg(test)]
+        TEST_NAMED_IMPORT_SELECTION_COUNT.with(|count| count.set(count.get() + 1));
         let mut module = rust_module_scope(at);
         loop {
             let imports = self.imports.get(&module.id());
@@ -4242,9 +4409,18 @@ impl<'tree> RustLexicalItems<'tree> {
         named_only: bool,
     ) -> Vec<String> {
         let named = self.named_import_evidence(name, at);
+        self.type_imports_from_named(at, named_only, &named)
+    }
+
+    fn type_imports_from_named(
+        &self,
+        at: tree_sitter::Node<'tree>,
+        named_only: bool,
+        named: &[&RawReference],
+    ) -> Vec<String> {
         if !named.is_empty() {
             return named
-                .into_iter()
+                .iter()
                 .map(|import| {
                     if import.kind == ReferenceKind::ImportAlias {
                         import.context.clone()
@@ -4342,18 +4518,19 @@ impl<'tree> RustLexicalItems<'tree> {
 }
 
 fn collect_rust_unit_constructor_bindings(
-    root: tree_sitter::Node<'_>,
     source: &[u8],
     evidence: &RustLexicalItems<'_>,
+    locals: &[RawReference],
     bindings: &mut Vec<AstTypeBinding>,
 ) {
-    let mut locals = Vec::new();
-    collect_local_bindings(root, source, &mut locals, Language::Rust);
     let mut locals_by_name: std::collections::HashMap<String, Vec<LexicalScope>> =
         Default::default();
     for local in locals {
         if let Some(scope) = local.scope {
-            locals_by_name.entry(local.name).or_default().push(scope);
+            locals_by_name
+                .entry(local.name.clone())
+                .or_default()
+                .push(scope);
         }
     }
     for declaration in &evidence.lets {
@@ -4514,15 +4691,13 @@ fn rust_standard_pointer_origin(ty: tree_sitter::Node<'_>, source: &[u8]) -> boo
 /// Destructuring an exact local function's tuple return supplies each binding's
 /// type. No factory-name or project-method guessing is involved.
 fn collect_rust_tuple_factory_bindings(
-    root: tree_sitter::Node<'_>,
     source: &[u8],
     lexical_items: &RustLexicalItems<'_>,
+    local_bindings: &[RawReference],
     bindings: &mut Vec<AstTypeBinding>,
 ) {
-    let mut local_bindings = Vec::new();
-    collect_local_bindings(root, source, &mut local_bindings, Language::Rust);
     bindings.extend(
-        rust_tuple_factory_bindings(source, lexical_items, &local_bindings)
+        rust_tuple_factory_bindings(source, lexical_items, local_bindings)
             .into_iter()
             .map(|(binding, _)| binding),
     );
@@ -5243,6 +5418,141 @@ pub fn parse_batch(files: &[(&Path, &str)]) -> ParseResult {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn rust_parse_reuses_one_local_binding_inventory() {
+        let source = "struct Unit;\nfn make() -> (Unit,) { (Unit,) }\nfn caller() { let unit = Unit; let (tuple,) = make(); }\n";
+        TEST_LOCAL_BINDING_WALK_COUNT.with(|count| count.set(0));
+        let parsed = parse_source(Path::new("src/lib.rs"), source).unwrap();
+        assert!(
+            parsed
+                .type_bindings
+                .iter()
+                .any(|binding| binding.var_name == "unit" && binding.type_name == "Unit")
+        );
+        assert!(
+            parsed
+                .type_bindings
+                .iter()
+                .any(|binding| binding.var_name == "tuple" && binding.type_name == "Unit")
+        );
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|reference| reference.kind == ReferenceKind::LocalBinding
+                    && reference.name == "tuple")
+        );
+        TEST_LOCAL_BINDING_WALK_COUNT.with(|count| {
+            assert_eq!(
+                count.get(),
+                1,
+                "reference, tuple, and unit evidence must share one within-tree local walk"
+            )
+        });
+        let evidence = scoped_rust_assignment_evidence(source, &parsed.type_bindings);
+        assert!(
+            evidence
+                .local_declarations
+                .iter()
+                .any(|binding| binding.name == "tuple")
+        );
+        TEST_LOCAL_BINDING_WALK_COUNT.with(|count| {
+            assert_eq!(
+                count.get(),
+                2,
+                "the separate ephemeral resolver parse still owns one local walk"
+            )
+        });
+    }
+
+    #[test]
+    fn js_parse_reuses_one_local_binding_inventory() {
+        let source = "class Store { query() {} } class Service { constructor() { this.store = new Store(); } run() { this.store.query(); } } module.exports = { run() {} }; function shadow(module) { return module.exports; }";
+        TEST_LOCAL_BINDING_WALK_COUNT.with(|count| count.set(0));
+        let parsed = parse_source(Path::new("src/main.js"), source).unwrap();
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|reference| reference.kind == ReferenceKind::LocalBinding
+                    && reference.name == "module")
+        );
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|reference| reference.kind == ReferenceKind::Call
+                    && reference.name == "query"
+                    && reference.receiver.as_deref() == Some("this.store"))
+        );
+        assert!(parsed.symbols.iter().any(|symbol| symbol.name == "run"));
+        TEST_LOCAL_BINDING_WALK_COUNT.with(|count| {
+            assert_eq!(
+                count.get(),
+                1,
+                "field, CommonJS, and output-reference evidence must share one local walk"
+            )
+        });
+    }
+
+    #[test]
+    fn rust_type_origins_select_named_imports_once_per_binding() {
+        let source =
+            "use crate::model::Imported;\nfn take(value: Imported) -> Imported { value }\n";
+        let parsed = parse_source(Path::new("src/main.rs"), source).unwrap();
+        assert_eq!(
+            parsed.type_bindings.len(),
+            2,
+            "parameter and return evidence are nonempty"
+        );
+        TEST_NAMED_IMPORT_SELECTION_COUNT.with(|count| count.set(0));
+        let evidence = scoped_rust_assignment_evidence(source, &parsed.type_bindings);
+        assert_eq!(evidence.type_origins.len(), 2);
+        for origin in &evidence.type_origins {
+            assert_eq!(origin.named_imports, vec!["crate::model::Imported"]);
+            assert_eq!(origin.imports, origin.named_imports);
+            assert_eq!(origin.named_import_positions.len(), 1);
+        }
+        TEST_NAMED_IMPORT_SELECTION_COUNT.with(|count| {
+            assert_eq!(
+                count.get(),
+                2,
+                "named paths and declaration bytes must come from the same selected imports"
+            )
+        });
+    }
+
+    // Capture these snapshots on the pre-optimization source, then keep them
+    // frozen when verifying shared inventory and named-import reuse.
+    #[test]
+    fn rust_shared_local_inventory_full_output() {
+        let source = "struct Unit;\nfn make() -> (Unit,) { (Unit,) }\nfn caller() { let unit = Unit; let (tuple,) = make(); }\n";
+        let parsed = parse_source(Path::new("src/lib.rs"), source).unwrap();
+        insta::assert_yaml_snapshot!("rust_shared_local_inventory_full_output", parsed);
+    }
+
+    #[test]
+    fn js_shared_local_inventory_full_output() {
+        let source = "class Store { query() {} } class Service { constructor() { this.store = new Store(); } run() { this.store.query(); } } module.exports = { run() {} }; function shadow(module) { return module.exports; }";
+        let parsed = parse_source(Path::new("src/main.js"), source).unwrap();
+        insta::assert_yaml_snapshot!("js_shared_local_inventory_full_output", parsed);
+    }
+
+    #[test]
+    fn rust_imported_type_full_output() {
+        let source =
+            "use crate::model::Imported;\nfn take(value: Imported) -> Imported { value }\n";
+        let parsed = parse_source(Path::new("src/main.rs"), source).unwrap();
+        insta::assert_yaml_snapshot!("rust_imported_type_full_output", parsed);
+    }
+
+    #[test]
+    fn ts_shared_local_inventory_full_output() {
+        let source = "class Store { query(): void {} } class Service { private store: Store; constructor() { this.store = new Store(); } run(): void { this.store.query(); } } module.exports = { run(): void {} }; function shadow(module: unknown) { return module; }";
+        let parsed = parse_source(Path::new("src/main.ts"), source).unwrap();
+        insta::assert_yaml_snapshot!("ts_shared_local_inventory_full_output", parsed);
+    }
 
     /// nw-601: the predicate every code-index route calls. The partial case is
     /// the counterweight, and it asserts `has_syntax_errors` is TRUE so the

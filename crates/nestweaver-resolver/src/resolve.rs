@@ -87,6 +87,31 @@ pub fn resolve_references_with_context(
     )
 }
 
+type ScopedCallKey<'a> = (&'a str, Option<&'a str>, usize);
+
+/// Index exact AST call identities once per file. Retain duplicate references
+/// so an ambiguous assignment stays refused instead of taking an arbitrary call.
+fn scoped_call_reference_index<'a>(
+    references: impl IntoIterator<Item = &'a RawReference>,
+) -> std::collections::HashMap<ScopedCallKey<'a>, Vec<&'a RawReference>> {
+    let mut calls: std::collections::HashMap<_, Vec<_>> = Default::default();
+    for reference in references {
+        if reference.kind == ReferenceKind::Call
+            && let Some(scope) = reference.scope
+        {
+            calls
+                .entry((
+                    reference.name.as_str(),
+                    reference.receiver.as_deref(),
+                    scope.position,
+                ))
+                .or_default()
+                .push(reference);
+        }
+    }
+    calls
+}
+
 /// Resolve a mixed-language repository using the language of each source file.
 /// The fallback preserves the single-language API for callers without a file map.
 pub fn resolve_references_with_file_languages(
@@ -104,8 +129,15 @@ pub fn resolve_references_with_file_languages(
             .copied()
             .unwrap_or(fallback_language)
     };
-    let graph =
+    let mut graph =
         build_import_graph_with_languages(files, fallback_language, file_languages, workspace_ctx);
+    if let Some(envs) = _type_envs {
+        for (file, env) in envs {
+            if language_for(file) == Language::Rust {
+                graph.register_rust_inline_type_imports(file, &env.rust_inline_type_imports);
+            }
+        }
+    }
 
     // Pre-sort symbols per file so find_enclosing_symbol's binary search invariant holds.
     // Tree-sitter guarantees sorted output in production, but callers (e.g. property tests)
@@ -197,22 +229,22 @@ pub fn resolve_references_with_file_languages(
             let Some(env) = original_envs.get(file_path) else {
                 continue;
             };
+            if env.call_assignments.is_empty() {
+                continue;
+            }
             let local_bindings: Vec<_> = references
                 .iter()
                 .filter(|reference| reference.kind == ReferenceKind::LocalBinding)
                 .collect();
+            let calls_by_identity = scoped_call_reference_index(references);
             for assignment in &env.call_assignments {
-                let calls: Vec<_> = references
-                    .iter()
-                    .filter(|reference| {
-                        reference.kind == ReferenceKind::Call
-                            && reference.receiver == assignment.receiver
-                            && reference.name == assignment.callee
-                            && reference
-                                .scope
-                                .is_some_and(|scope| scope.position == assignment.call_position)
-                    })
-                    .collect();
+                let Some(calls) = calls_by_identity.get(&(
+                    assignment.callee.as_str(),
+                    assignment.receiver.as_deref(),
+                    assignment.call_position,
+                )) else {
+                    continue;
+                };
                 if calls.len() != 1 {
                     continue;
                 }
@@ -866,6 +898,9 @@ fn resolve_single_reference(
     if let Some(syms) = symbol_map.get(name.as_str())
         && let Some((_, sym)) = syms.iter().find(|(f, sym)| {
             *f == file_path
+                && !(language == Language::Rust
+                    && reference.receiver.is_some()
+                    && binding.is_some())
                 && exact_rust_call.is_none_or(|assignment| {
                     assignment
                         .local_callee_line
@@ -1560,10 +1595,13 @@ fn typed_receiver_origin(
         }
         let mut candidates = Vec::new();
         let mut seen_files = std::collections::HashSet::new();
-        for (_specifier, file) in imports
-            .iter()
-            .filter(|(specifier, _)| selected_paths.contains(specifier))
-        {
+        for (_specifier, file) in imports.iter().filter(|(specifier, file)| {
+            selected_paths.contains(specifier)
+                && (named.is_empty()
+                    || named
+                        .iter()
+                        .any(|binding| binding.source_file.as_deref() == Some(file.as_str())))
+        }) {
             if !seen_files.insert(file) {
                 continue;
             }
@@ -2184,6 +2222,65 @@ mod tests {
             context: String::new(),
             receiver: None,
         }
+    }
+
+    #[test]
+    fn scoped_call_index_reads_each_reference_once_and_preserves_ambiguity() {
+        use nestweaver_parser::LexicalScope;
+        let scope = |position| LexicalScope {
+            position,
+            start: 0,
+            end: 10000,
+            initialized_at: 0,
+            hoisted_var: false,
+        };
+        let mut references: Vec<_> = (0..2000)
+            .map(|i| {
+                let mut reference = make_ref("other", ReferenceKind::Call, 1);
+                reference.scope = Some(scope(i));
+                reference
+            })
+            .collect();
+        let mut call = make_ref("factory", ReferenceKind::Call, 2);
+        call.scope = Some(scope(3000));
+        references.push(call.clone());
+        references.push(call.clone());
+        call.receiver = Some("value".into());
+        references.push(call.clone());
+        call.scope = Some(scope(3001));
+        references.push(call.clone());
+        call.kind = ReferenceKind::LocalBinding;
+        references.push(call.clone());
+        call.kind = ReferenceKind::Call;
+        call.scope = None;
+        references.push(call);
+        let reads = std::cell::Cell::new(0);
+        let index = scoped_call_reference_index(references.iter().inspect(|_| {
+            reads.set(reads.get() + 1);
+        }));
+        assert_eq!(reads.get(), references.len());
+        for _ in 0..32 {
+            assert_eq!(
+                index.get(&("factory", None, 3000)).unwrap().len(),
+                2,
+                "duplicate exact call references must stay ambiguous"
+            );
+            assert_eq!(
+                index.get(&("factory", Some("value"), 3000)).unwrap().len(),
+                1
+            );
+            assert_eq!(
+                index.get(&("factory", Some("value"), 3001)).unwrap().len(),
+                1,
+                "binding references and unscoped calls cannot donate identity"
+            );
+        }
+        assert_eq!(
+            reads.get(),
+            references.len(),
+            "assignment probes never rescan unrelated calls"
+        );
+        assert_eq!(index.len(), 2003);
     }
 
     fn make_binding(local: &str, original: &str, specifier: &str, line: u32) -> RawReference {
@@ -7451,6 +7548,147 @@ async fn same_line_after() { let (_, db, _) = spawn_server().await; { let db = u
                 std::collections::BTreeSet::from([uid(&files, path, "parent")]),
                 "nearest unsupported return must not donate an outer type: {nearest}: {files:#?} {edges:#?}"
             );
+        }
+    }
+
+    #[test]
+    fn review6_rust_same_file_sibling_inline_type_constructor_keeps_value_method() {
+        for import in [
+            "use super::testing::TempTree;",
+            "use super::testing::TempTree as Selected;",
+        ] {
+            let selected = if import.contains(" as ") {
+                "Selected"
+            } else {
+                "TempTree"
+            };
+            let path = "src/lib.rs";
+            let source = format!(
+                "pub mod testing {{\n pub struct TempTree;\n impl TempTree {{\n  pub fn new() -> Self {{ Self }}\n  pub fn layout(&self) {{}}\n }}\n}}\nmod tests {{\n {import}\n fn caller() {{ let tree = {selected}::new(); tree.layout(); }}\n fn shadow(value: Unknown) {{ let tree = value.new(); tree.layout(); }}\n fn unknown() {{ let tree = unknown(); tree.layout(); }}\n}}\n"
+            );
+            let (files, edges) = review_edges(&[(path, &source)], Language::Rust);
+            let expected = std::collections::BTreeSet::from([uid(&files, path, "caller")]);
+            assert_eq!(
+                review_callers(&files, &edges, path, "new"),
+                expected,
+                "{import}: {files:#?} {edges:#?}"
+            );
+            assert_eq!(
+                review_callers(&files, &edges, path, "layout"),
+                expected,
+                "{import}: {files:#?} {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review6_rust_same_file_inline_import_refuses_same_name_wrong_module() {
+        let path = "src/lib.rs";
+        let source = "mod wrong { pub struct TempTree; impl TempTree { pub fn new() -> Self { Self } pub fn layout(&self) {} } }\nmod testing { pub struct TempTree; impl TempTree { pub fn new() -> Self { Self } pub fn layout(&self) {} } }\nmod tests { use super::testing::TempTree as Selected; fn caller() { let tree = Selected::new(); tree.layout(); } }\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::Rust);
+        for name in ["new", "layout"] {
+            let candidates: Vec<_> = files[0]
+                .1
+                .iter()
+                .filter(|symbol| symbol.name == name)
+                .collect();
+            assert_eq!(candidates.len(), 2, "{files:#?}");
+            for candidate in candidates {
+                let actual: std::collections::BTreeSet<_> = edges
+                    .iter()
+                    .filter(|edge| {
+                        edge.edge_type == EdgeType::Calls
+                            && edge.target_uid
+                                == symbol_uid("repo:test:abc", path, name, candidate.start_line)
+                    })
+                    .map(|edge| edge.source_uid.clone())
+                    .collect();
+                let expected = if candidate.start_line == 2 {
+                    std::collections::BTreeSet::from([uid(&files, path, "caller")])
+                } else {
+                    std::collections::BTreeSet::new()
+                };
+                assert_eq!(actual, expected, "{name}: {candidate:#?} {edges:#?}");
+            }
+        }
+    }
+
+    #[test]
+    fn review6_rust_inline_type_route_boundaries_and_block_lifetime() {
+        for (middle, selected) in [
+            (
+                "use self::testing::TempTree as Selected;\nfn caller() { let tree = Selected::new(); tree.layout(); }\n",
+                "caller",
+            ),
+            (
+                "mod tests { mod nested { use super::super::testing::TempTree as Selected;\nfn caller() { let tree = Selected::new(); tree.layout(); }\n}}\n",
+                "caller",
+            ),
+            (
+                "fn caller() { { use self::testing::TempTree as Selected; let tree = Selected::new(); tree.layout(); } }\nfn outside() { let tree = Selected::new(); tree.layout(); }\n",
+                "caller",
+            ),
+        ] {
+            let path = "src/lib.rs";
+            let source = format!(
+                "pub mod testing {{\n pub struct TempTree;\n impl TempTree {{ pub fn new() -> Self {{ Self }} pub fn layout(&self) {{}} }}\n}}\n{middle}"
+            );
+            let (files, edges) = review_edges(&[(path, &source)], Language::Rust);
+            for name in ["new", "layout"] {
+                assert_eq!(
+                    review_callers(&files, &edges, path, name),
+                    std::collections::BTreeSet::from([uid(&files, path, selected)]),
+                    "{middle}: {files:#?} {edges:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review6_rust_inline_type_route_overrides_only_its_physical_file_guess() {
+        let path = "src/lib.rs";
+        let source = "pub mod testing {\n pub struct TempTree;\n impl TempTree { pub fn new() -> Self { Self } pub fn layout(&self) {} }\n}\nmod tests { use super::testing::TempTree as Selected; fn caller() { let tree = Selected::new(); tree.layout(); } }\n";
+        let decoy = "src/testing.rs";
+        let (files, edges) = review_edges(
+            &[
+                (path, source),
+                (
+                    decoy,
+                    "pub struct TempTree;\nimpl TempTree { pub fn new() -> Self { Self } pub fn layout(&self) {} }\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        for name in ["new", "layout"] {
+            assert_eq!(
+                review_callers(&files, &edges, path, name),
+                std::collections::BTreeSet::from([uid(&files, path, "caller")]),
+                "{files:#?} {edges:#?}"
+            );
+            assert!(
+                review_callers(&files, &edges, decoy, name).is_empty(),
+                "unused physical file is not the declared inline module: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review6_rust_inline_type_route_refuses_parent_escape_and_external_guess() {
+        for import in [
+            "use super::super::testing::TempTree as Selected;",
+            "use external::testing::TempTree as Selected;",
+        ] {
+            let path = "src/lib.rs";
+            let source = format!(
+                "pub mod testing {{\n pub struct TempTree;\n impl TempTree {{ pub fn new() -> Self {{ Self }} pub fn layout(&self) {{}} }}\n}}\nmod tests {{ {import} fn wrong() {{ let tree = Selected::new(); tree.layout(); }} }}\n"
+            );
+            let (files, edges) = review_edges(&[(path, &source)], Language::Rust);
+            for name in ["new", "layout"] {
+                assert!(
+                    review_callers(&files, &edges, path, name).is_empty(),
+                    "{import}: {files:#?} {edges:#?}"
+                );
+            }
         }
     }
 

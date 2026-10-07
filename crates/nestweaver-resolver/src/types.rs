@@ -93,6 +93,7 @@ pub struct TypeEnvironment {
     pub(crate) rust_module_types:
         HashMap<(String, Vec<String>), Vec<nestweaver_parser::parse::ScopedRustTypeDeclaration>>,
     pub(crate) rust_public_root_uses: std::collections::HashSet<usize>,
+    pub(crate) rust_inline_type_imports: Vec<nestweaver_parser::parse::ScopedRustInlineTypeImport>,
     pub(crate) rust_path_imports: HashMap<usize, Vec<usize>>,
     pub(crate) rust_method_owners: HashMap<(String, u32), Vec<usize>>,
     pub(crate) rust_type_origins: HashMap<usize, nestweaver_parser::parse::ScopedRustTypeOrigin>,
@@ -173,6 +174,7 @@ impl TypeEnvironment {
             path_imports: rust_path_imports,
             public_root_uses,
             module_types,
+            inline_type_imports,
         } = if language == Language::Rust {
             nestweaver_parser::parse::scoped_rust_assignment_evidence(source, ast_bindings)
         } else {
@@ -205,6 +207,7 @@ impl TypeEnvironment {
             rust_type_origins,
             rust_method_owners: owners,
             rust_public_root_uses: public_root_uses.into_iter().collect(),
+            rust_inline_type_imports: inline_type_imports,
             rust_module_types,
             rust_path_imports: rust_path_imports
                 .into_iter()
@@ -449,6 +452,7 @@ impl TypeEnvironment {
             rust_method_owners: Default::default(),
             rust_path_imports: Default::default(),
             rust_public_root_uses: Default::default(),
+            rust_inline_type_imports: Default::default(),
             rust_module_types: Default::default(),
         }
     }

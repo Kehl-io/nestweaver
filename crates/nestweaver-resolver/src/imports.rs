@@ -72,6 +72,44 @@ impl ImportGraph {
             .unwrap_or(&[])
     }
 
+    /// Add an AST-proven same-file inline type route without a file/name fallback.
+    pub(crate) fn register_rust_inline_type_imports(
+        &mut self,
+        file: &str,
+        imports: &[nestweaver_parser::parse::ScopedRustInlineTypeImport],
+    ) {
+        for import in imports {
+            let routes = self.resolved_imports.entry(file.into()).or_default();
+            if !routes
+                .iter()
+                .any(|(specifier, target)| specifier == &import.specifier && target == file)
+            {
+                routes.push((import.specifier.clone(), file.into()));
+            }
+            let bindings = self.named_bindings.entry(file.into()).or_default();
+            let binding = NamedBinding {
+                scope: Some(import.scope),
+                local_name: import.local_name.clone(),
+                original_name: import.original_name.clone(),
+                source_file: Some(file.into()),
+                rust_inline_modules: Some(import.module_path.clone()),
+                start_line: import.line,
+            };
+            if let Some(existing) = bindings.iter_mut().find(|binding| {
+                binding.local_name == import.local_name
+                    && binding
+                        .scope
+                        .is_some_and(|scope| scope.position == import.scope.position)
+            }) {
+                // The AST inline declaration defeats a physical file guess
+                // for this use byte; other declarations retain their routes.
+                *existing = binding;
+            } else {
+                bindings.push(binding);
+            }
+        }
+    }
+
     /// Follow only exact named public exports, bounded like the existing barrel walk.
     /// A public declaration name is not automatically another public export key.
     pub fn exported_target<'a>(

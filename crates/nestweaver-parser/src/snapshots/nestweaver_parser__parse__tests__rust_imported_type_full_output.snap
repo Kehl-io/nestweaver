@@ -1,0 +1,99 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+expression: parsed
+---
+path: src/main.rs
+symbols:
+  - name: take
+    kind: Function
+    start_line: 2
+    end_line: 2
+    signature: "fn take(value: Imported) -> Imported { value }"
+    content_hash: ffb469a88b9383960de6c67937947e9ba61ba96373529ad2ae0f32daa3df5761
+    is_entry_point: false
+    entry_point_kind: ~
+    visibility: Private
+    type_info:
+      declared_type: ~
+      parameter_types: []
+      return_type: "Imported { value }"
+    parent_name: ~
+    scope_chain: ~
+references:
+  - scope:
+      start: 0
+      end: 75
+      position: 0
+      initialized_at: 0
+      hoisted_var: false
+    name: "crate::model::Imported"
+    kind: Import
+    start_line: 1
+    context: "use crate::model::Imported;"
+    receiver: ~
+  - scope:
+      start: 28
+      end: 74
+      position: 36
+      initialized_at: 36
+      hoisted_var: false
+    name: Imported
+    kind: TypeRef
+    start_line: 2
+    context: "(value: Imported)"
+    receiver: ~
+  - scope:
+      start: 0
+      end: 75
+      position: 28
+      initialized_at: 28
+      hoisted_var: false
+    name: Imported
+    kind: TypeRef
+    start_line: 2
+    context: "fn take(value: Imported) -> Imported { value }"
+    receiver: ~
+  - scope:
+      start: 28
+      end: 74
+      position: 36
+      initialized_at: 36
+      hoisted_var: false
+    name: value
+    kind: LocalBinding
+    start_line: 2
+    context: ""
+    receiver: ~
+  - scope:
+      start: 28
+      end: 74
+      position: 36
+      initialized_at: 36
+      hoisted_var: false
+    name: value
+    kind: LocalBinding
+    start_line: 2
+    context: ""
+    receiver: ~
+type_bindings:
+  - scope:
+      start: 28
+      end: 74
+      position: 36
+      initialized_at: 36
+      hoisted_var: false
+    var_name: value
+    type_name: Imported
+    line: 2
+    kind: Parameter
+  - scope:
+      start: 0
+      end: 75
+      position: 31
+      initialized_at: 31
+      hoisted_var: false
+    var_name: take
+    type_name: Imported
+    line: 2
+    kind: ReturnType
+has_syntax_errors: false
