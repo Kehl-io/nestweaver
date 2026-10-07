@@ -3,9 +3,14 @@
 ; reference extraction (calls, use declarations, trait impls).
 
 ; Method definitions (functions inside impl/trait blocks)
-(declaration_list
-  (function_item
-    name: (identifier) @name) @definition.method)
+(impl_item
+  body: (declaration_list
+    (function_item
+      name: (identifier) @name) @definition.method))
+(trait_item
+  body: (declaration_list
+    (function_item
+      name: (identifier) @name) @definition.method))
 
 ; Free function definitions
 (function_item

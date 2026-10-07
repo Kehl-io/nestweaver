@@ -2,12 +2,24 @@
 source: crates/nestweaver-parser/src/parse.rs
 expression: "parsed_references(\"simple.rs\", &source)"
 ---
-- name: "std::collections::HashMap"
+- scope:
+    start: 0
+    end: 835
+    position: 0
+    initialized_at: 0
+    hoisted_var: false
+  name: "std::collections::HashMap"
   kind: Import
   start_line: 1
   context: "use std::collections::HashMap;"
   receiver: ~
-- name: "crate::config::Settings"
+- scope:
+    start: 0
+    end: 835
+    position: 31
+    initialized_at: 0
+    hoisted_var: false
+  name: "crate::config::Settings"
   kind: Import
   start_line: 2
   context: "use crate::config::Settings;"

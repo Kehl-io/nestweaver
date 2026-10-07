@@ -1462,22 +1462,63 @@ pub(crate) fn assert_wire_tool_contract(wire: &Value, full: &Value) {
     }
 }
 
+/// Complete authored wire summaries; argument captions carry usage details.
+/// Keep a summary for every registered tool instead of clipping prose.
+fn compact_tool_description(name: &str) -> &'static str {
+    match name {
+        "brain_context" => "Get ranked graph context.",
+        "code_context" => "Get ranked symbol context.",
+        "brain_search" => "Search notes and symbols.",
+        "note_get" => "Read note bodies and metadata.",
+        "backlinks" => "Find incoming note links.",
+        "brain_status" => "Show indexed source health.",
+        "brain_add_source" => "Index a vault or code repository.",
+        "brain_remove_source" => "Remove an indexed source.",
+        "prune_stale" => "Prune sources missing on disk.",
+        "compact_embeddings" => "Reclaim deleted-node vectors.",
+        "cross_repo_contracts" => "Find cross-repo symbol references.",
+        "brain_impact" => "Trace symbol dependents.",
+        "brain_guide" => "Generate a graph orientation guide.",
+        "flow_trace" => "Trace a symbol's callees.",
+        "detect_changes" => "Assess changed-file impact.",
+        "clusters" => "Group related code symbols.",
+        "stale_check" => "Check graph freshness.",
+        "set_extension" => "Set custom node metadata.",
+        "unset_extension" => "Remove custom node metadata.",
+        "query_extensions" => "Query custom node metadata.",
+        "brain_diff" => "Show changes since indexing.",
+        "project_context" => "Get ranked project context.",
+        "dead_code" => "Review unreachable code.",
+        "hub_nodes" => "Rank highly connected symbols.",
+        "bridge_nodes" => "Find architectural chokepoints.",
+        "blast_radius" => "Assess file-change blast radius.",
+        "get_summary" => "Summarize symbols/files/clusters.",
+        "read_symbols" => "Read symbol source spans.",
+        "regex_search" => "Search indexed text with regex.",
+        "count_patterns" => "Count indexed regex matches.",
+        "brain_broken_links" => "Find broken vault wikilinks.",
+        "brain_orphan_documents" => "Find notes without wikilinks.",
+        "brain_topic_clusters" => "Cluster notes by wikilinks.",
+        "brain_tag_graph" => "Show tag co-occurrence links.",
+        "brain_doc_stats" => "Summarize vault document health.",
+        "affected_tests" => "Prioritize affected test files.",
+        "investigate" => "Map a topic for investigation.",
+        "investigate_expand" => "Expand investigation map entries.",
+        "investigate_hydrate" => "Hydrate investigation bodies.",
+        "contract_drift" => "Audit API route/spec drift.",
+        "brain_memory_lint" => "Lint memory-vault health.",
+        "brain_memory_consolidate" => "Propose memory-tier promotions.",
+        "brain_memory_related" => "Walk typed note relationships.",
+        _ => panic!("missing compact tool description for {name}"),
+    }
+}
+
 fn compact_wire_tool(mut tool: Value) -> Value {
     if let Some(schema) = tool.get_mut("inputSchema") {
         compact_schema_documentation(schema);
     }
-    if let Some(description) = tool.get("description").and_then(Value::as_str) {
-        let compact = truncate_utf8_bytes(description, 35);
-        let compact = if compact.len() < description.len() {
-            compact
-                .rsplit_once(char::is_whitespace)
-                .map(|(words, _)| words)
-                .unwrap_or(&compact)
-        } else {
-            &compact
-        };
-        tool["description"] = json!(compact.trim_end());
-    }
+    let name = tool["name"].as_str().expect("registered tool name");
+    tool["description"] = json!(compact_tool_description(name));
     tool
 }
 
@@ -1806,6 +1847,112 @@ mod tool_schema_validation_tests {
             serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
             *payload
         );
+    }
+
+    #[test]
+    fn wire_catalogue_has_complete_authored_tool_summaries() {
+        // This independent expected registry makes clipped prose, generic
+        // punctuation fixes, missing tools, and unreviewed additions fail.
+        let expected = [
+            ("brain_context", "Get ranked graph context."),
+            ("code_context", "Get ranked symbol context."),
+            ("brain_search", "Search notes and symbols."),
+            ("note_get", "Read note bodies and metadata."),
+            ("backlinks", "Find incoming note links."),
+            ("brain_status", "Show indexed source health."),
+            ("brain_add_source", "Index a vault or code repository."),
+            ("brain_remove_source", "Remove an indexed source."),
+            ("prune_stale", "Prune sources missing on disk."),
+            ("compact_embeddings", "Reclaim deleted-node vectors."),
+            ("cross_repo_contracts", "Find cross-repo symbol references."),
+            ("brain_impact", "Trace symbol dependents."),
+            ("brain_guide", "Generate a graph orientation guide."),
+            ("flow_trace", "Trace a symbol's callees."),
+            ("detect_changes", "Assess changed-file impact."),
+            ("clusters", "Group related code symbols."),
+            ("stale_check", "Check graph freshness."),
+            ("set_extension", "Set custom node metadata."),
+            ("unset_extension", "Remove custom node metadata."),
+            ("query_extensions", "Query custom node metadata."),
+            ("brain_diff", "Show changes since indexing."),
+            ("project_context", "Get ranked project context."),
+            ("dead_code", "Review unreachable code."),
+            ("hub_nodes", "Rank highly connected symbols."),
+            ("bridge_nodes", "Find architectural chokepoints."),
+            ("blast_radius", "Assess file-change blast radius."),
+            ("get_summary", "Summarize symbols/files/clusters."),
+            ("read_symbols", "Read symbol source spans."),
+            ("regex_search", "Search indexed text with regex."),
+            ("count_patterns", "Count indexed regex matches."),
+            ("brain_broken_links", "Find broken vault wikilinks."),
+            ("brain_orphan_documents", "Find notes without wikilinks."),
+            ("brain_topic_clusters", "Cluster notes by wikilinks."),
+            ("brain_tag_graph", "Show tag co-occurrence links."),
+            ("brain_doc_stats", "Summarize vault document health."),
+            ("affected_tests", "Prioritize affected test files."),
+            ("investigate", "Map a topic for investigation."),
+            ("investigate_expand", "Expand investigation map entries."),
+            ("investigate_hydrate", "Hydrate investigation bodies."),
+            ("contract_drift", "Audit API route/spec drift."),
+            ("brain_memory_lint", "Lint memory-vault health."),
+            (
+                "brain_memory_consolidate",
+                "Propose memory-tier promotions.",
+            ),
+            ("brain_memory_related", "Walk typed note relationships."),
+        ];
+        set_direct_read_only(false);
+        ALLOWED_TOOLS.with(|slot| *slot.borrow_mut() = None);
+        let full = tool_list(false);
+        let page = tool_list_page(false, None).unwrap();
+        let tools = page["tools"].as_array().unwrap();
+        assert_eq!(expected.len(), 43);
+        assert_eq!(all_tool_schemas().len(), expected.len());
+        assert_eq!(tools.len(), expected.len());
+        assert!(page.get("nextCursor").is_none());
+        let expected: std::collections::BTreeMap<_, _> = expected.into_iter().collect();
+        let names: std::collections::BTreeSet<_> = tools
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, expected.keys().copied().collect());
+        let mut documented_arguments = 0;
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            let summary = tool["description"].as_str().unwrap();
+            assert_eq!(summary, expected[name], "authored summary for {name}");
+            assert!(
+                summary.len() <= 55 && summary.ends_with('.'),
+                "{name}: {summary}"
+            );
+            assert!(
+                !summary.contains('…') && !summary.contains("\n"),
+                "{name}: {summary}"
+            );
+            assert!(summary.split_whitespace().count() >= 2, "{name}: {summary}");
+            let original = full["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|original| original["name"] == name)
+                .unwrap();
+            assert_wire_tool_contract(tool, original);
+            for (argument, schema) in original["inputSchema"]["properties"].as_object().unwrap() {
+                if schema["description"].as_str().is_some() {
+                    documented_arguments += 1;
+                    assert!(
+                        tool["inputSchema"]["properties"][argument]["description"]
+                            .as_str()
+                            .is_some_and(|text| !text.trim().is_empty()),
+                        "{name}.{argument}"
+                    );
+                }
+            }
+        }
+        assert_eq!(documented_arguments, 233);
+        assert!(crate::output_budget::escaped_size(&page) <= crate::output_budget::CATALOGUE_BYTES);
+        let envelope = json!({"jsonrpc":"2.0", "id":2, "result":page});
+        assert!(crate::output_budget::escaped_size(&envelope) < 32_768);
     }
 
     #[test]

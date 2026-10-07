@@ -719,6 +719,23 @@ fn expand_rust_use_imports(
     source: &[u8],
     references: &mut Vec<RawReference>,
 ) {
+    let before = references.len();
+    expand_rust_use_paths(node, source, references);
+    let scope = lexical_scope(*node).map(|mut scope| {
+        scope.initialized_at = scope.start;
+        scope
+    });
+    for reference in &mut references[before..] {
+        reference.scope = scope;
+    }
+}
+
+/// Flatten paths and aliases without constructing unused lexical metadata.
+fn expand_rust_use_paths(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    references: &mut Vec<RawReference>,
+) {
     let context = node
         .utf8_text(source)
         .map(first_line)
@@ -791,12 +808,16 @@ fn expand_rust_use_tree(
             }
         }
         "use_wildcard" => {
+            let before = references.len();
             // `use a::*;` — record the module path itself so imports of the
             // module resolve and wildcard members resolve through them.
             for i in 0..node.named_child_count() {
                 if let Some(child) = node.named_child(i as u32) {
                     expand_rust_use_tree(&child, prefix, source, context, references);
                 }
+            }
+            for reference in &mut references[before..] {
+                reference.receiver = Some("*".into());
             }
         }
         "use_list" => {
@@ -1480,8 +1501,16 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
 
     let mut cursor = QueryCursor::new();
     let source_bytes = source.as_bytes();
-    let commonjs_exported_locals =
-        collect_commonjs_reexport_names(lang, tree.root_node(), source_bytes);
+    let js_field_inventory = matches!(lang, Language::JavaScript | Language::TypeScript)
+        .then(|| JsFieldInventory::new(tree.root_node(), source_bytes, lang));
+    let commonjs_object_methods =
+        collect_commonjs_object_methods(lang, tree.root_node(), source_bytes);
+    let commonjs_exported_locals = collect_commonjs_reexport_names(
+        lang,
+        tree.root_node(),
+        source_bytes,
+        &commonjs_object_methods,
+    );
     let exported_locals = if matches!(lang, Language::JavaScript | Language::TypeScript) {
         let mut names = collect_export_clause_names(tree.root_node(), source_bytes);
         names.extend(commonjs_exported_locals.iter().copied());
@@ -1735,8 +1764,9 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 // is reachable by regression-test selection regardless of filename.
                 // ES visibility alone is not execution evidence. CommonJS API
                 // assignments retain their intentional public-entry-point policy.
-                let ep_kind = if commonjs_exported_locals.contains(name.as_str())
-                    && is_local_runtime_declaration(node)
+                let ep_kind = if commonjs_object_methods.contains(&node.start_byte())
+                    || commonjs_exported_locals.contains(name.as_str())
+                        && is_local_runtime_declaration(node)
                     || (is_commonjs_export_assignment(lang, node, source_bytes)
                         && node.parent().is_some_and(|parent| {
                             parent.kind() == "expression_statement"
@@ -1776,6 +1806,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     node_text,
                     lang,
                     has_export_ancestor(&node)
+                        || commonjs_object_methods.contains(&node.start_byte())
                         || (exported_locals.contains(name.as_str())
                             && is_local_runtime_declaration(node))
                         // nw-687 (review): `module.exports.X = function` /
@@ -1787,8 +1818,13 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 let mut type_info = extract_type_info(&signature, lang);
                 if matches!(lang, Language::JavaScript | Language::TypeScript)
                     && kind == SymbolKind::Property
-                    && matches!(node.kind(), "field_definition" | "public_field_definition")
-                    && let Some(declared_type) = exact_js_field_type(node, source_bytes, lang)
+                    && matches!(
+                        node.kind(),
+                        "field_definition" | "public_field_definition" | "assignment_expression"
+                    )
+                    && let Some(declared_type) = js_field_inventory
+                        .as_ref()
+                        .and_then(|inventory| exact_js_field_type(node, source_bytes, inventory))
                 {
                     type_info = Some(TypeInfo {
                         declared_type: Some(declared_type),
@@ -1797,7 +1833,11 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     });
                 }
                 let parent_name = if matches!(kind, SymbolKind::Method | SymbolKind::Property) {
-                    find_parent_name(&node, source_bytes)
+                    if commonjs_object_methods.contains(&node.start_byte()) {
+                        Some("module.exports".into())
+                    } else {
+                        find_parent_name(&node, source_bytes)
+                    }
                 } else {
                     None
                 };
@@ -2057,7 +2097,12 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
 
     // Preserve exact import bindings as well as package exclusions.
     if matches!(lang, Language::JavaScript | Language::TypeScript) {
-        collect_js_import_bindings(tree.root_node(), source_bytes, &mut references);
+        collect_js_import_bindings(
+            tree.root_node(),
+            source_bytes,
+            &mut references,
+            &commonjs_object_methods,
+        );
         annotate_js_export_receivers(tree.root_node(), source_bytes, &references, &mut symbols);
     }
     if lang == Language::Python {
@@ -2318,6 +2363,7 @@ fn collect_commonjs_reexport_names<'a>(
     lang: Language,
     root: tree_sitter::Node<'a>,
     source_bytes: &'a [u8],
+    commonjs_object_methods: &std::collections::HashSet<usize>,
 ) -> std::collections::HashSet<&'a str> {
     let mut names = std::collections::HashSet::new();
     if !matches!(lang, Language::JavaScript | Language::TypeScript) {
@@ -2325,7 +2371,13 @@ fn collect_commonjs_reexport_names<'a>(
     }
     let mut cursor = root.walk();
     for statement in root.named_children(&mut cursor) {
-        collect_commonjs_reexport_names_from(lang, statement, source_bytes, &mut names);
+        collect_commonjs_reexport_names_from(
+            lang,
+            statement,
+            source_bytes,
+            &mut names,
+            commonjs_object_methods,
+        );
     }
     names
 }
@@ -2341,6 +2393,7 @@ fn collect_commonjs_reexport_names_from<'a>(
     statement: tree_sitter::Node<'a>,
     source_bytes: &'a [u8],
     names: &mut std::collections::HashSet<&'a str>,
+    commonjs_object_methods: &std::collections::HashSet<usize>,
 ) {
     match statement.kind() {
         "expression_statement" => {
@@ -2367,8 +2420,14 @@ fn collect_commonjs_reexport_names_from<'a>(
             {
                 return;
             }
-            for (_, local) in commonjs_object_exports(assignment, source_bytes) {
-                if let Ok(name) = local.utf8_text(source_bytes) {
+            for (_, local) in
+                commonjs_object_exports(assignment, source_bytes, commonjs_object_methods)
+            {
+                // Literal method keys identify their own declaration, not a
+                // same-named module-local identifier.
+                if local.kind() != "property_identifier"
+                    && let Ok(name) = local.utf8_text(source_bytes)
+                {
                     names.insert(name);
                 }
             }
@@ -2382,19 +2441,132 @@ fn collect_commonjs_reexport_names_from<'a>(
         "statement_block" | "else_clause" => {
             let mut cursor = statement.walk();
             for child in statement.named_children(&mut cursor) {
-                collect_commonjs_reexport_names_from(lang, child, source_bytes, names);
+                collect_commonjs_reexport_names_from(
+                    lang,
+                    child,
+                    source_bytes,
+                    names,
+                    commonjs_object_methods,
+                );
             }
         }
         "if_statement" => {
             if let Some(consequence) = statement.child_by_field_name("consequence") {
-                collect_commonjs_reexport_names_from(lang, consequence, source_bytes, names);
+                collect_commonjs_reexport_names_from(
+                    lang,
+                    consequence,
+                    source_bytes,
+                    names,
+                    commonjs_object_methods,
+                );
             }
             if let Some(alternative) = statement.child_by_field_name("alternative") {
-                collect_commonjs_reexport_names_from(lang, alternative, source_bytes, names);
+                collect_commonjs_reexport_names_from(
+                    lang,
+                    alternative,
+                    source_bytes,
+                    names,
+                    commonjs_object_methods,
+                );
             }
         }
         _ => {}
     }
+}
+
+/// Build exact CommonJS method evidence once per file, sharing lexical
+/// shadow checks with symbol and export processing.
+fn collect_commonjs_object_methods(
+    lang: Language,
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> std::collections::HashSet<usize> {
+    let mut methods = std::collections::HashSet::new();
+    if !matches!(lang, Language::JavaScript | Language::TypeScript) {
+        return methods;
+    }
+    let mut bindings = Vec::new();
+    collect_local_bindings(root, source, &mut bindings, lang);
+    let module_scopes: Vec<_> = bindings
+        .iter()
+        .filter(|binding| binding.name == "module")
+        .filter_map(|binding| binding.scope)
+        .collect();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if is_direct_commonjs_object_method(lang, node, source) {
+            let assignment = node
+                .parent()
+                .and_then(|object| object.parent())
+                .expect("validated export assignment");
+            let at = assignment.start_byte();
+            if !module_scopes
+                .iter()
+                .any(|scope| scope.start <= at && at < scope.end)
+            {
+                methods.insert(node.start_byte());
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    methods
+}
+
+/// A shorthand method is an exact public member only in the immediate
+/// top-level CommonJS export object. Getters, setters and computed keys are
+/// not callable export declarations.
+fn is_direct_commonjs_object_method(
+    lang: Language,
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> bool {
+    if !matches!(lang, Language::JavaScript | Language::TypeScript)
+        || node.kind() != "method_definition"
+        || node
+            .child_by_field_name("name")
+            .is_none_or(|name| name.kind() != "property_identifier")
+    {
+        return false;
+    }
+    let mut cursor = node.walk();
+    if node
+        .children(&mut cursor)
+        .any(|child| matches!(child.kind(), "get" | "set"))
+    {
+        return false;
+    }
+    let Some(object) = node.parent().filter(|parent| parent.kind() == "object") else {
+        return false;
+    };
+    let Some(assignment) = object
+        .parent()
+        .filter(|parent| parent.kind() == "assignment_expression")
+    else {
+        return false;
+    };
+    if assignment.child_by_field_name("right") != Some(object)
+        || !assignment.parent().is_some_and(|statement| {
+            statement.kind() == "expression_statement"
+                && statement
+                    .parent()
+                    .is_some_and(|root| root.kind() == "program")
+        })
+    {
+        return false;
+    }
+    assignment.child_by_field_name("left").is_some_and(|left| {
+        left.kind() == "member_expression"
+            && left.child_by_field_name("object").is_some_and(|object| {
+                object.kind() == "identifier" && object.utf8_text(source) == Ok("module")
+            })
+            && left
+                .child_by_field_name("property")
+                .is_some_and(|property| {
+                    property.kind() == "property_identifier"
+                        && property.utf8_text(source) == Ok("exports")
+                })
+    })
 }
 
 /// Literal CommonJS object exports refer to existing local values. A property
@@ -2402,6 +2574,7 @@ fn collect_commonjs_reexport_names_from<'a>(
 fn commonjs_object_exports<'a>(
     assignment: tree_sitter::Node<'a>,
     source: &[u8],
+    commonjs_object_methods: &std::collections::HashSet<usize>,
 ) -> Vec<(String, tree_sitter::Node<'a>)> {
     if assignment.kind() != "assignment_expression" {
         return Vec::new();
@@ -2433,6 +2606,11 @@ fn commonjs_object_exports<'a>(
         match property.kind() {
             "shorthand_property_identifier" => {
                 exports.push((property.utf8_text(source).unwrap_or("").into(), property))
+            }
+            "method_definition" if commonjs_object_methods.contains(&property.start_byte()) => {
+                if let Some(name) = property.child_by_field_name("name") {
+                    exports.push((name.utf8_text(source).unwrap_or("").into(), name));
+                }
             }
             "pair" => {
                 if let (Some(key), Some(value)) = (
@@ -3225,6 +3403,11 @@ pub struct ScopedCallAssignment {
     pub scope: LexicalScope,
     pub line: u32,
     pub callee: String,
+    pub receiver: Option<String>,
+    pub local_callee_line: Option<u32>,
+    pub local_callee_exists: bool,
+    pub import_positions: Vec<usize>,
+    pub import_paths: Vec<String>,
     pub call_position: usize,
     pub awaited: bool,
 }
@@ -3238,13 +3421,84 @@ pub struct ScopedAliasAssignment {
     pub source_position: usize,
 }
 
+/// Ephemeral lexical owner evidence; byte offsets never cross file boundaries.
+#[derive(Debug, Clone, Default)]
+pub struct ScopedRustTypeOrigin {
+    pub type_name: String,
+    pub line: u32,
+    pub local_line: Option<u32>,
+    pub position: usize,
+    pub local_position: Option<usize>,
+    pub ambiguous: bool,
+    pub imports: Vec<String>,
+    pub named_imports: Vec<String>,
+    pub named_import_positions: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScopedRustMethodOwner {
+    pub name: String,
+    pub line: u32,
+    pub class_position: usize,
+}
+
+/// Qualified call evidence joins the current module's exact use declaration.
+#[derive(Debug, Clone)]
+pub struct ScopedRustPathImports {
+    pub position: usize,
+    pub import_positions: Vec<usize>,
+}
+
+/// Identity of a type declared in the file's root or inline module.
+#[derive(Debug, Clone)]
+pub struct ScopedRustTypeDeclaration {
+    pub name: String,
+    pub module_path: Vec<String>,
+    pub line: u32,
+    pub position: usize,
+}
+
+/// Per-file lexical evidence retained only while resolving references.
+#[derive(Debug, Clone, Default)]
+pub struct ScopedRustEvidence {
+    pub call_assignments: Vec<ScopedCallAssignment>,
+    pub alias_assignments: Vec<ScopedAliasAssignment>,
+    pub local_declarations: Vec<RawReference>,
+    pub type_origins: Vec<ScopedRustTypeOrigin>,
+    pub method_owners: Vec<ScopedRustMethodOwner>,
+    pub path_imports: Vec<ScopedRustPathImports>,
+    pub public_root_uses: Vec<usize>,
+    pub module_types: Vec<ScopedRustTypeDeclaration>,
+}
+
+fn rust_type_module_path(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<Vec<String>> {
+    let mut modules = Vec::new();
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        match parent.kind() {
+            "source_file" => {
+                modules.reverse();
+                return Some(modules);
+            }
+            "mod_item" => modules.push(
+                parent
+                    .child_by_field_name("name")?
+                    .utf8_text(source)
+                    .ok()?
+                    .into(),
+            ),
+            "declaration_list" => {}
+            _ => return None,
+        }
+        ancestor = parent.parent();
+    }
+    None
+}
+
 pub fn scoped_rust_assignment_evidence(
     source: &str,
-) -> (
-    Vec<ScopedCallAssignment>,
-    Vec<ScopedAliasAssignment>,
-    Vec<RawReference>,
-) {
+    bindings: &[AstTypeBinding],
+) -> ScopedRustEvidence {
     let mut parser = tree_sitter::Parser::new();
     let language = build_ts_language(Language::Rust, Path::new("source.rs"));
     if parser.set_language(&language).is_err() {
@@ -3253,8 +3507,13 @@ pub fn scoped_rust_assignment_evidence(
     let Some(tree) = parser.parse(source, None) else {
         return Default::default();
     };
+    let lexical_items = RustLexicalItems::new(tree.root_node(), source.as_bytes());
     let mut result = Vec::new();
     let mut aliases = Vec::new();
+    let mut method_owners = Vec::new();
+    let mut path_imports = Vec::new();
+    let mut public_root_uses = Vec::new();
+    let mut module_types = Vec::new();
     let mut local_bindings = Vec::new();
     collect_local_bindings(
         tree.root_node(),
@@ -3264,6 +3523,65 @@ pub fn scoped_rust_assignment_evidence(
     );
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "struct_item" | "enum_item")
+            && let Some(module_path) = rust_type_module_path(node, source.as_bytes())
+            && let Some(identifier) = node.child_by_field_name("name")
+            && let Ok(name) = identifier.utf8_text(source.as_bytes())
+        {
+            module_types.push(ScopedRustTypeDeclaration {
+                name: name.into(),
+                module_path,
+                line: node.start_position().row as u32 + 1,
+                position: identifier.start_byte(),
+            });
+        }
+        if node.kind() == "use_declaration"
+            && node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "source_file")
+        {
+            let mut cursor = node.walk();
+            if node.named_children(&mut cursor).any(|child| {
+                child.kind() == "visibility_modifier"
+                    && child.utf8_text(source.as_bytes()) == Ok("pub")
+            }) {
+                public_root_uses.push(node.start_byte());
+            }
+        }
+        if node.kind() == "call_expression"
+            && let Some(function) = node.child_by_field_name("function")
+            && function.kind() == "scoped_identifier"
+            && let Some(path) = function.child_by_field_name("path")
+            && path.kind() == "identifier"
+            && let Ok(name) = path.utf8_text(source.as_bytes())
+        {
+            path_imports.push(ScopedRustPathImports {
+                position: node.start_byte(),
+                import_positions: lexical_items
+                    .named_import_evidence(name, node)
+                    .iter()
+                    .filter_map(|import| import.scope.map(|scope| scope.position))
+                    .collect(),
+            });
+        }
+        if node.kind() == "function_item"
+            && let Some(implementation) = node.parent().and_then(|parent| parent.parent())
+            && implementation.kind() == "impl_item"
+            && let Some(ty) = implementation.child_by_field_name("type")
+            && ty.kind() == "type_identifier"
+            && let (Ok(ty), Some(name)) = (
+                ty.utf8_text(source.as_bytes()),
+                node.child_by_field_name("name"),
+            )
+            && let Ok(name) = name.utf8_text(source.as_bytes())
+            && let (_, Some(class_position), false) = lexical_items.visible_type(ty, implementation)
+        {
+            method_owners.push(ScopedRustMethodOwner {
+                name: name.into(),
+                line: node.start_position().row as u32 + 1,
+                class_position,
+            });
+        }
         if node.kind() == "let_declaration"
             && let (Some(name), Some(mut value)) = (
                 node.child_by_field_name("pattern"),
@@ -3295,20 +3613,46 @@ pub fn scoped_rust_assignment_evidence(
                 }
             }
             if value.kind() == "call_expression"
-                && let Some(callee) = value
-                    .child_by_field_name("function")
-                    .filter(|callee| callee.kind() == "identifier")
+                && let Some(function) = value.child_by_field_name("function")
+                && let Some(callee) = if function.kind() == "identifier" {
+                    Some(function)
+                } else if function.kind() == "field_expression"
+                    && function
+                        .child_by_field_name("value")
+                        .is_some_and(|receiver| matches!(receiver.kind(), "identifier" | "self"))
+                {
+                    function.child_by_field_name("field")
+                } else {
+                    None
+                }
                 && let (Ok(variable), Ok(callee_name), Some(scope)) = (
                     name.utf8_text(source.as_bytes()),
                     callee.utf8_text(source.as_bytes()),
                     lexical_scope(name),
                 )
             {
+                let (local_callee_line, local_callee_exists) = if function.kind() == "identifier" {
+                    lexical_items.visible_free_function(callee_name, value)
+                } else {
+                    (None, false)
+                };
                 result.push(ScopedCallAssignment {
                     variable: variable.into(),
                     scope,
                     line: name.start_position().row as u32 + 1,
                     callee: callee_name.into(),
+                    receiver: function
+                        .child_by_field_name("value")
+                        .and_then(|receiver| receiver.utf8_text(source.as_bytes()).ok())
+                        .map(str::to_string),
+                    local_callee_line,
+                    local_callee_exists,
+                    import_positions: lexical_items
+                        .named_import_evidence(callee_name, value)
+                        .iter()
+                        .filter_map(|reference| reference.scope.map(|scope| scope.position))
+                        .collect(),
+                    import_paths: lexical_items.type_imports(callee_name, value, false),
                     call_position: value.start_byte(),
                     awaited,
                 });
@@ -3317,7 +3661,100 @@ pub fn scoped_rust_assignment_evidence(
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
-    (result, aliases, local_bindings)
+    let origins = bindings
+        .iter()
+        .filter_map(|binding| {
+            let scope = binding.scope?;
+            let at = tree
+                .root_node()
+                .descendant_for_byte_range(scope.position, scope.position)?;
+            let (local_line, local_position, ambiguous) =
+                lexical_items.visible_type(&binding.type_name, at);
+            Some(ScopedRustTypeOrigin {
+                type_name: binding.type_name.clone(),
+                line: binding.line,
+                local_line,
+                position: scope.position,
+                local_position,
+                ambiguous,
+                imports: lexical_items.type_imports(&binding.type_name, at, false),
+                named_imports: lexical_items.type_imports(&binding.type_name, at, true),
+                named_import_positions: lexical_items
+                    .named_import_evidence(&binding.type_name, at)
+                    .iter()
+                    .filter_map(|reference| reference.scope.map(|scope| scope.position))
+                    .collect(),
+            })
+        })
+        .collect();
+    ScopedRustEvidence {
+        call_assignments: result,
+        alias_assignments: aliases,
+        local_declarations: local_bindings,
+        type_origins: origins,
+        method_owners,
+        path_imports,
+        public_root_uses,
+        module_types,
+    }
+}
+
+/// Shared inventory avoids rescanning the class and file for each property.
+struct JsFieldInventory<'tree> {
+    writes: std::collections::HashMap<(usize, String), Vec<tree_sitter::Node<'tree>>>,
+    declared: std::collections::HashSet<(usize, String)>,
+    locals: std::collections::HashMap<String, Vec<LexicalScope>>,
+}
+
+impl<'tree> JsFieldInventory<'tree> {
+    fn new(root: tree_sitter::Node<'tree>, source: &[u8], lang: Language) -> Self {
+        let mut result = Self {
+            writes: Default::default(),
+            declared: Default::default(),
+            locals: Default::default(),
+        };
+        let mut locals = Vec::new();
+        collect_local_bindings(root, source, &mut locals, lang);
+        for binding in locals {
+            if let Some(scope) = binding.scope {
+                result.locals.entry(binding.name).or_default().push(scope);
+            }
+        }
+        let mut stack = vec![(root, None)];
+        while let Some((node, mut class)) = stack.pop() {
+            if matches!(node.kind(), "class_declaration" | "class") {
+                class = Some(node.id());
+            }
+            if let Some(class) = class {
+                if matches!(node.kind(), "field_definition" | "public_field_definition")
+                    && let Some(name) = node
+                        .child_by_field_name("property")
+                        .or_else(|| node.child_by_field_name("name"))
+                    && let Ok(name) = name.utf8_text(source)
+                {
+                    result.declared.insert((class, name.into()));
+                }
+                if node.kind() == "assignment_expression"
+                    && let Some(left) = node.child_by_field_name("left")
+                    && left.kind() == "member_expression"
+                    && left
+                        .child_by_field_name("object")
+                        .is_some_and(|object| object.kind() == "this")
+                    && let Some(name) = left.child_by_field_name("property")
+                    && let Ok(name) = name.utf8_text(source)
+                {
+                    result
+                        .writes
+                        .entry((class, name.into()))
+                        .or_default()
+                        .push(node);
+                }
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor).map(|child| (child, class)));
+        }
+        result
+    }
 }
 
 /// A field annotation, an unmodified initializer, or a sole constructor
@@ -3325,7 +3762,7 @@ pub fn scoped_rust_assignment_evidence(
 fn exact_js_field_type(
     node: tree_sitter::Node<'_>,
     source: &[u8],
-    lang: Language,
+    inventory: &JsFieldInventory<'_>,
 ) -> Option<String> {
     if let Some(annotation) = node.child_by_field_name("type") {
         let mut cursor = annotation.walk();
@@ -3335,7 +3772,12 @@ fn exact_js_field_type(
         }
         return None;
     }
-    let name = node
+    let field_node = if node.kind() == "assignment_expression" {
+        node.child_by_field_name("left")?
+    } else {
+        node
+    };
+    let name = field_node
         .child_by_field_name("property")
         .or_else(|| node.child_by_field_name("name"))?
         .utf8_text(source)
@@ -3348,28 +3790,11 @@ fn exact_js_field_type(
         }
         parent = ancestor.parent();
     };
-    let mut writes = Vec::new();
-    let mut stack = vec![class];
-    while let Some(current) = stack.pop() {
-        // A nested class has its own `this` receiver.
-        if current != class && matches!(current.kind(), "class_declaration" | "class") {
-            continue;
-        }
-        if current.kind() == "assignment_expression"
-            && let Some(left) = current.child_by_field_name("left")
-            && left.kind() == "member_expression"
-            && left
-                .child_by_field_name("object")
-                .is_some_and(|object| object.kind() == "this")
-            && left
-                .child_by_field_name("property")
-                .is_some_and(|property| property.utf8_text(source) == Ok(name))
-        {
-            writes.push(current);
-        }
-        let mut cursor = current.walk();
-        stack.extend(current.named_children(&mut cursor));
+    let key = (class.id(), name.to_string());
+    if node.kind() == "assignment_expression" && inventory.declared.contains(&key) {
+        return None;
     }
+    let writes = inventory.writes.get(&key).map_or(&[][..], Vec::as_slice);
     let value = if let Some(initializer) = node.child_by_field_name("value") {
         if !writes.is_empty() {
             return None;
@@ -3392,7 +3817,10 @@ fn exact_js_field_type(
                 }
                 break;
             }
-            if matches!(ancestor.kind(), "arrow_function" | "function_expression") {
+            if matches!(
+                ancestor.kind(),
+                "arrow_function" | "function_expression" | "function_declaration"
+            ) {
                 return None;
             }
             parent = ancestor.parent();
@@ -3406,17 +3834,10 @@ fn exact_js_field_type(
         .child_by_field_name("constructor")
         .filter(|constructor| constructor.kind() == "identifier")?;
     let name = constructor.utf8_text(source).ok()?;
-    let mut root = class;
-    while let Some(parent) = root.parent() {
-        root = parent;
-    }
-    let mut local_bindings = Vec::new();
-    collect_local_bindings(root, source, &mut local_bindings, lang);
-    if local_bindings.iter().any(|binding| {
-        binding.name == name
-            && binding.scope.is_some_and(|scope| {
-                scope.start <= constructor.start_byte() && constructor.start_byte() < scope.end
-            })
+    if inventory.locals.get(name).is_some_and(|scopes| {
+        scopes.iter().any(|scope| {
+            scope.start <= constructor.start_byte() && constructor.start_byte() < scope.end
+        })
     }) {
         return None;
     }
@@ -3454,6 +3875,8 @@ fn extract_types_from_tree(
         .collect();
     let mut cursor = tree_sitter::QueryCursor::new();
     let mut bindings = Vec::new();
+    let lexical_items =
+        (lang == Language::Rust).then(|| RustLexicalItems::new(tree.root_node(), source));
 
     let mut matches = cursor.matches(&query, tree.root_node(), source);
     while let Some(m) = matches.next() {
@@ -3561,6 +3984,16 @@ fn extract_types_from_tree(
         if let (Some(name), Some(type_name)) = (var_name, var_type)
             && !name.is_empty()
             && !type_name.is_empty()
+            && (lexical_items.as_ref().is_none_or(|items| {
+                binding_scope.is_none_or(|scope| {
+                    items.local_type_visible(
+                        &type_name,
+                        tree.root_node()
+                            .descendant_for_byte_range(scope.position, scope.position)
+                            .unwrap_or(tree.root_node()),
+                    )
+                })
+            }))
         {
             bindings.push(AstTypeBinding {
                 scope: binding_scope,
@@ -3574,8 +4007,358 @@ fn extract_types_from_tree(
 
     if lang == Language::Rust {
         collect_rust_tuple_factory_bindings(tree.root_node(), source, &mut bindings);
+        collect_rust_unit_constructor_bindings(
+            tree.root_node(),
+            source,
+            lexical_items.as_ref().expect("Rust evidence"),
+            &mut bindings,
+        );
     }
     bindings
+}
+
+fn rust_module_scope(node: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "mod_item" {
+            return parent;
+        }
+        current = parent;
+    }
+    current
+}
+
+struct RustLexicalItems<'tree> {
+    types: std::collections::HashMap<String, Vec<tree_sitter::Node<'tree>>>,
+    units: std::collections::HashMap<String, Vec<tree_sitter::Node<'tree>>>,
+    functions: std::collections::HashMap<String, Vec<tree_sitter::Node<'tree>>>,
+    imports: std::collections::HashMap<usize, Vec<(LexicalScope, Vec<RawReference>, bool)>>,
+    lets: Vec<tree_sitter::Node<'tree>>,
+}
+
+impl<'tree> RustLexicalItems<'tree> {
+    fn new(root: tree_sitter::Node<'tree>, source: &[u8]) -> Self {
+        let mut evidence = Self {
+            types: Default::default(),
+            units: Default::default(),
+            functions: Default::default(),
+            imports: Default::default(),
+            lets: Vec::new(),
+        };
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if matches!(node.kind(), "struct_item" | "enum_item" | "type_item")
+                && let Some(identifier) = node.child_by_field_name("name")
+                && let Ok(name) = identifier.utf8_text(source)
+            {
+                evidence
+                    .types
+                    .entry(name.into())
+                    .or_default()
+                    .push(identifier);
+                if node.kind() == "struct_item"
+                    && node.child_by_field_name("body").is_none()
+                    && node.child_by_field_name("type_parameters").is_none()
+                {
+                    evidence
+                        .units
+                        .entry(name.into())
+                        .or_default()
+                        .push(identifier);
+                }
+            }
+            if node.kind() == "function_item"
+                && let Some(identifier) = node.child_by_field_name("name")
+                && let Ok(name) = identifier.utf8_text(source)
+            {
+                let mut ancestor = node.parent();
+                let mut method = false;
+                while let Some(parent) = ancestor {
+                    if matches!(parent.kind(), "impl_item" | "trait_item") {
+                        method = true;
+                        break;
+                    }
+                    if matches!(parent.kind(), "function_item" | "mod_item" | "source_file") {
+                        break;
+                    }
+                    ancestor = parent.parent();
+                }
+                if !method {
+                    evidence
+                        .functions
+                        .entry(name.into())
+                        .or_default()
+                        .push(identifier);
+                }
+            }
+            if node.kind() == "let_declaration" {
+                evidence.lets.push(node);
+            }
+            if node.kind() == "use_declaration"
+                && let Some(scope) = lexical_scope(node)
+            {
+                let mut imports = Vec::new();
+                expand_rust_use_imports(&node, source, &mut imports);
+                let argument = node
+                    .child_by_field_name("argument")
+                    .and_then(|argument| argument.utf8_text(source).ok())
+                    .unwrap_or("");
+                let compact: String = argument.chars().filter(|c| !c.is_whitespace()).collect();
+                evidence
+                    .imports
+                    .entry(rust_module_scope(node).id())
+                    .or_default()
+                    .push((scope, imports, compact == "super::*"));
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        evidence
+    }
+
+    fn item_visible(
+        &self,
+        item: tree_sitter::Node<'tree>,
+        at: tree_sitter::Node<'tree>,
+        name: &str,
+    ) -> bool {
+        let Some(scope) = lexical_scope(item) else {
+            return false;
+        };
+        if !(scope.start <= at.start_byte() && at.start_byte() < scope.end) {
+            return false;
+        }
+        let target_module = rust_module_scope(item);
+        let mut module = rust_module_scope(at);
+        while module != target_module {
+            if module.kind() != "mod_item" {
+                return false;
+            }
+            let parent_name = format!("super::{name}");
+            let mut exposed = false;
+            for (scope, imports, super_glob) in self.imports.get(&module.id()).into_iter().flatten()
+            {
+                if !(scope.start <= at.start_byte() && at.start_byte() < scope.end) {
+                    continue;
+                }
+                exposed |= *super_glob
+                    || imports.iter().any(|import| {
+                        import.kind == ReferenceKind::Import && import.name == parent_name
+                    });
+                // A named import of the same local name defeats a parent glob.
+                if imports.iter().any(|import| {
+                    (import.kind == ReferenceKind::ImportAlias
+                        && import.name == name
+                        && import.context != parent_name)
+                        || (import.kind == ReferenceKind::Import
+                            && import.name.rsplit("::").next() == Some(name)
+                            && import.name != parent_name)
+                }) {
+                    return false;
+                }
+            }
+            if !exposed {
+                return false;
+            }
+            module = rust_module_scope(module);
+        }
+        true
+    }
+
+    fn named_import_evidence(
+        &self,
+        name: &str,
+        at: tree_sitter::Node<'tree>,
+    ) -> Vec<&RawReference> {
+        let mut candidates: Vec<_> = self
+            .imports
+            .get(&rust_module_scope(at).id())
+            .into_iter()
+            .flatten()
+            .filter(|(scope, _, _)| scope.start <= at.start_byte() && at.start_byte() < scope.end)
+            .flat_map(|(scope, imports, _)| {
+                imports
+                    .iter()
+                    .filter(move |import| {
+                        import.kind == ReferenceKind::ImportAlias && import.name == name
+                            || import.kind == ReferenceKind::Import
+                                && import.receiver.as_deref() != Some("*")
+                                && import.name.rsplit("::").next() == Some(name)
+                    })
+                    .map(move |import| (scope.end - scope.start, import))
+            })
+            .collect();
+        candidates.sort_by_key(|(span, _)| *span);
+        let nearest = candidates.first().map(|(span, _)| *span);
+        candidates
+            .into_iter()
+            .filter(|(span, _)| Some(*span) == nearest)
+            .map(|(_, import)| import)
+            .collect()
+    }
+
+    fn type_imports(
+        &self,
+        name: &str,
+        at: tree_sitter::Node<'tree>,
+        named_only: bool,
+    ) -> Vec<String> {
+        let named = self.named_import_evidence(name, at);
+        if !named.is_empty() {
+            return named
+                .into_iter()
+                .map(|import| {
+                    if import.kind == ReferenceKind::ImportAlias {
+                        import.context.clone()
+                    } else {
+                        import.name.clone()
+                    }
+                })
+                .collect();
+        }
+        if named_only {
+            return Vec::new();
+        }
+        self.imports
+            .get(&rust_module_scope(at).id())
+            .into_iter()
+            .flatten()
+            .filter(|(scope, _, _)| scope.start <= at.start_byte() && at.start_byte() < scope.end)
+            .flat_map(|(_, imports, _)| imports.iter())
+            .filter(|import| {
+                import.kind == ReferenceKind::Import && import.receiver.as_deref() == Some("*")
+            })
+            .map(|import| import.name.clone())
+            .collect()
+    }
+
+    fn visible_type(
+        &self,
+        name: &str,
+        at: tree_sitter::Node<'tree>,
+    ) -> (Option<u32>, Option<usize>, bool) {
+        let mut candidates: Vec<_> = self
+            .types
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|item| self.item_visible(**item, at, name))
+            .filter_map(|item| {
+                Some((
+                    lexical_scope(*item)?.end - lexical_scope(*item)?.start,
+                    item.parent()?.start_position().row as u32 + 1,
+                    item.start_byte(),
+                ))
+            })
+            .collect();
+        candidates.sort_unstable();
+        let ambiguous = candidates
+            .first()
+            .is_some_and(|first| candidates.get(1).is_some_and(|second| first.0 == second.0));
+        (
+            candidates
+                .first()
+                .filter(|_| !ambiguous)
+                .map(|(_, line, _)| *line),
+            candidates
+                .first()
+                .filter(|_| !ambiguous)
+                .map(|(_, _, position)| *position),
+            ambiguous,
+        )
+    }
+
+    fn local_type_visible(&self, name: &str, at: tree_sitter::Node<'tree>) -> bool {
+        self.types.get(name).is_none_or(|_| {
+            self.visible_type(name, at).0.is_some()
+                || !self.type_imports(name, at, false).is_empty()
+        })
+    }
+
+    fn visible_free_function(
+        &self,
+        name: &str,
+        at: tree_sitter::Node<'tree>,
+    ) -> (Option<u32>, bool) {
+        let Some(items) = self.functions.get(name) else {
+            return (None, false);
+        };
+        let mut candidates: Vec<_> = items
+            .iter()
+            .filter(|item| self.item_visible(**item, at, name))
+            .filter_map(|item| {
+                let scope = lexical_scope(*item)?;
+                Some((
+                    scope.end - scope.start,
+                    item.parent()?.start_position().row as u32 + 1,
+                ))
+            })
+            .collect();
+        candidates.sort_unstable();
+        let line = candidates
+            .first()
+            .filter(|first| candidates.get(1).is_none_or(|second| second.0 != first.0))
+            .map(|(_, line)| *line);
+        (line, !candidates.is_empty())
+    }
+}
+
+fn collect_rust_unit_constructor_bindings(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    evidence: &RustLexicalItems<'_>,
+    bindings: &mut Vec<AstTypeBinding>,
+) {
+    let mut locals = Vec::new();
+    collect_local_bindings(root, source, &mut locals, Language::Rust);
+    let mut locals_by_name: std::collections::HashMap<String, Vec<LexicalScope>> =
+        Default::default();
+    for local in locals {
+        if let Some(scope) = local.scope {
+            locals_by_name.entry(local.name).or_default().push(scope);
+        }
+    }
+    for declaration in &evidence.lets {
+        let (Some(name), Some(value)) = (
+            declaration.child_by_field_name("pattern"),
+            declaration.child_by_field_name("value"),
+        ) else {
+            continue;
+        };
+        if name.kind() != "identifier" || value.kind() != "identifier" {
+            continue;
+        }
+        let Ok(type_name) = value.utf8_text(source) else {
+            continue;
+        };
+        let Some(units) = evidence.units.get(type_name) else {
+            continue;
+        };
+        if locals_by_name.get(type_name).is_some_and(|scopes| {
+            scopes.iter().any(|scope| {
+                scope.start <= value.start_byte()
+                    && value.start_byte() < scope.end
+                    && scope.initialized_at <= value.start_byte()
+            })
+        }) {
+            continue;
+        }
+        let (_, Some(position), false) = evidence.visible_type(type_name, value) else {
+            continue;
+        };
+        if !units.iter().any(|unit| unit.start_byte() == position) {
+            continue;
+        }
+        if let (Ok(var_name), Some(scope)) = (name.utf8_text(source), lexical_scope(name)) {
+            bindings.push(AstTypeBinding {
+                scope: Some(scope),
+                var_name: var_name.into(),
+                type_name: type_name.into(),
+                line: name.start_position().row as u32 + 1,
+                kind: AstBindingKind::Constructor,
+            });
+        }
+    }
 }
 
 /// Known Rust pointer wrappers preserve the target's method set through Deref.
@@ -3654,7 +4437,7 @@ fn rust_standard_pointer_origin(ty: tree_sitter::Node<'_>, source: &[u8]) -> boo
                 lexical_scope(node).filter(|scope| scope.start <= at && at < scope.end)
         {
             let mut references = Vec::new();
-            expand_rust_use_imports(&node, source, &mut references);
+            expand_rust_use_paths(&node, source, &mut references);
             let aliases: Vec<_> = references
                 .iter()
                 .filter(|reference| reference.kind == ReferenceKind::ImportAlias)
@@ -3970,6 +4753,7 @@ fn collect_js_import_bindings(
     root: tree_sitter::Node<'_>,
     source: &[u8],
     references: &mut Vec<RawReference>,
+    commonjs_object_methods: &std::collections::HashSet<usize>,
 ) {
     let text = |node: tree_sitter::Node<'_>| node.utf8_text(source).unwrap_or("").to_string();
     let mut stack = vec![root];
@@ -4095,9 +4879,13 @@ fn collect_js_import_bindings(
                     receiver: None,
                 });
             }
-            for (exported, local) in commonjs_object_exports(assignment, source) {
+            for (exported, local) in
+                commonjs_object_exports(assignment, source, commonjs_object_methods)
+            {
                 references.push(RawReference {
-                    scope: None,
+                    scope: (local.kind() == "property_identifier")
+                        .then(|| lexical_scope(local))
+                        .flatten(),
                     name: exported,
                     kind: ReferenceKind::ExportAlias,
                     start_line: local.start_position().row as u32 + 1,

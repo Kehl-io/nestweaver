@@ -90,6 +90,12 @@ pub struct TypeEnvironment {
     alias_assignments: Vec<nestweaver_parser::parse::ScopedAliasAssignment>,
     local_declarations: Vec<nestweaver_parser::RawReference>,
     scoped_bindings: HashMap<ScopedBindingKey, (usize, TypeBinding)>,
+    pub(crate) rust_module_types:
+        HashMap<(String, Vec<String>), Vec<nestweaver_parser::parse::ScopedRustTypeDeclaration>>,
+    pub(crate) rust_public_root_uses: std::collections::HashSet<usize>,
+    pub(crate) rust_path_imports: HashMap<usize, Vec<usize>>,
+    pub(crate) rust_method_owners: HashMap<(String, u32), Vec<usize>>,
+    pub(crate) rust_type_origins: HashMap<usize, nestweaver_parser::parse::ScopedRustTypeOrigin>,
 }
 
 impl TypeEnvironment {
@@ -121,7 +127,11 @@ impl TypeEnvironment {
                     .or_insert((
                         scope.initialized_at,
                         TypeBinding {
-                            type_name: ab.type_name.clone(),
+                            type_name: if language == Language::Rust {
+                                format!("{}@{}", ab.type_name, scope.position)
+                            } else {
+                                ab.type_name.clone()
+                            },
                             line: ab.line,
                             confidence: 0.95,
                             source: source_kind,
@@ -154,18 +164,52 @@ impl TypeEnvironment {
         let assignments = extract_assignments(source);
         propagate_assignments(&mut bindings, &assignments, 10);
 
-        let (call_assignments, alias_assignments, local_declarations) =
-            if language == Language::Rust {
-                nestweaver_parser::parse::scoped_rust_assignment_evidence(source)
-            } else {
-                Default::default()
-            };
+        let nestweaver_parser::parse::ScopedRustEvidence {
+            call_assignments,
+            alias_assignments,
+            local_declarations,
+            type_origins: rust_type_origins,
+            method_owners: rust_method_owners,
+            path_imports: rust_path_imports,
+            public_root_uses,
+            module_types,
+        } = if language == Language::Rust {
+            nestweaver_parser::parse::scoped_rust_assignment_evidence(source, ast_bindings)
+        } else {
+            Default::default()
+        };
+        let rust_type_origins = rust_type_origins
+            .into_iter()
+            .map(|origin| (origin.position, origin))
+            .collect();
+        let mut owners: HashMap<(String, u32), Vec<usize>> = HashMap::new();
+        for owner in rust_method_owners {
+            owners
+                .entry((owner.name, owner.line))
+                .or_default()
+                .push(owner.class_position);
+        }
+        let mut rust_module_types: HashMap<_, Vec<_>> = HashMap::new();
+        for declaration in module_types {
+            rust_module_types
+                .entry((declaration.name.clone(), declaration.module_path.clone()))
+                .or_default()
+                .push(declaration);
+        }
         let mut env = Self {
             bindings,
             scoped_bindings,
             call_assignments,
             alias_assignments,
             local_declarations,
+            rust_type_origins,
+            rust_method_owners: owners,
+            rust_public_root_uses: public_root_uses.into_iter().collect(),
+            rust_module_types,
+            rust_path_imports: rust_path_imports
+                .into_iter()
+                .map(|imports| (imports.position, imports.import_positions))
+                .collect(),
         };
         env.propagate_scoped_aliases();
         env
@@ -233,19 +277,16 @@ impl TypeEnvironment {
     }
 
     pub(crate) fn ast_return_type(&self, name: &str, line: u32) -> Option<&TypeBinding> {
-        let binding = self.bindings.get(&(name.into(), line))?;
-        // Only the target declaration's AST return record, never an assignment
-        // or constructor record of a same-named local.
-        (binding.source == BindingSource::ReturnType
-            && self
-                .scoped_bindings
+        let mut candidates =
+            self.scoped_bindings
                 .iter()
-                .any(|((variable, _, _, _), (_, scoped))| {
+                .filter(|((variable, _, _, _), (_, binding))| {
                     variable == name
-                        && scoped.line == line
-                        && scoped.source == BindingSource::ReturnType
-                }))
-        .then_some(binding)
+                        && binding.line == line
+                        && binding.source == BindingSource::ReturnType
+                });
+        let (_, (_, binding)) = candidates.next()?;
+        candidates.next().is_none().then_some(binding)
     }
 
     pub(crate) fn seed_scoped_return(
@@ -256,6 +297,8 @@ impl TypeEnvironment {
     ) {
         if !binding
             .type_name
+            .split_once('@')
+            .map_or(binding.type_name.as_str(), |(name, _)| name)
             .chars()
             .all(|ch| ch.is_alphanumeric() || ch == '_')
         {
@@ -274,7 +317,7 @@ impl TypeEnvironment {
                 TypeBinding {
                     // Retain the exact callee's file for alias/import type-origin
                     // resolution; this tag stays internal to the type environment.
-                    type_name: format!("{target_file}#{}", binding.type_name),
+                    type_name: format!("{target_file}#{}#{}", binding.type_name, binding.line),
                     line: assignment.line,
                     confidence: binding.confidence.min(0.85),
                     source: BindingSource::ReturnType,
@@ -402,6 +445,11 @@ impl TypeEnvironment {
             call_assignments: Vec::new(),
             alias_assignments: Vec::new(),
             local_declarations: Vec::new(),
+            rust_type_origins: Default::default(),
+            rust_method_owners: Default::default(),
+            rust_path_imports: Default::default(),
+            rust_public_root_uses: Default::default(),
+            rust_module_types: Default::default(),
         }
     }
 }

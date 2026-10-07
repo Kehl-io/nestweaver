@@ -64,6 +64,13 @@ def prepare(fixture):
     )
     source += "".join(f"function _candidate{n:02d}() {{ return {n}; }}\n" for n in range(17))
     (fixture.repo / "library.js").write_text(source)
+    # CommonJS identifier publication remains an explicit execution root;
+    # ES export visibility alone supplies no root without a manifest/caller.
+    (fixture.repo / "commonjs.js").write_text(
+        "function rootedCommonJs() { return commonJsLeaf(); }\n"
+        "function commonJsLeaf() { return 3; }\n"
+        "module.exports = rootedCommonJs;\n"
+    )
     fixture.run("index", "--repo", fixture.repo, "--db", fixture.db)
     original_repo = fixture.repo
     fixture.repo = fixture.root / "other"
@@ -93,7 +100,17 @@ def cases(fixture):
     assert len(uids) == len(set(uids)) == first["matching_count"], collected
     names = {row["name"] for row in collected}
     assert {f"_candidate{n:02d}" for n in range(17)} <= names, names
-    assert not names.intersection({"exportedValue", "retainedLeaf", "defaultValue", "retainedDefaultLeaf", "_otherCandidate"}), names
+    assert {"exportedValue", "retainedLeaf", "defaultValue", "retainedDefaultLeaf"} <= names, names
+    assert not names.intersection({"rootedCommonJs", "commonJsLeaf", "_otherCandidate"}), names
+    # Verify the positive control exists and has an actual rooted caller edge,
+    # so absence from the unreachable population cannot pass vacuously.
+    root = json.loads(fixture.run("symbol", "rootedCommonJs", "--db", fixture.db, "--json").stdout)
+    leaf = json.loads(fixture.run("symbol", "commonJsLeaf", "--db", fixture.db, "--json").stdout)
+    assert root["symbol"]["name"] == "rootedCommonJs" and root["symbol"]["is_entry_point"] is True, root
+    assert leaf["symbol"]["name"] == "commonJsLeaf", leaf
+    root_uid, leaf_uid = root["symbol"]["uid"], leaf["symbol"]["uid"]
+    assert any(caller["uid"] == root_uid for caller in leaf["callers"]), leaf
+    assert root_uid not in uids and leaf_uid not in uids, collected
     assert all(row["confidence"] in ("low", "medium") for row in collected), collected
     full = cli(fixture, limit=1000)
     assert uids == [row["uid"] for row in full["unreachable_symbols"]], full

@@ -40,7 +40,9 @@ use serde::{Deserialize, Serialize};
 /// 3 — exact import bindings, Swift receivers, async function values.
 /// 4 — star exports, parameter defaults, macro mapping receivers, and lexical
 ///     declaration byte scopes. These changes share one unreleased cache version.
-const CACHE_VERSION: u32 = 4;
+/// 5 — Rust inline-module functions and exact unit/member-return evidence;
+///     CommonJS literal methods and implicit constructor fields.
+const CACHE_VERSION: u32 = 5;
 
 /// A log larger than this (and than the base) is folded into the base.
 const LOG_COMPACT_MIN_BYTES: u64 = 64 * 1024 * 1024;
@@ -525,19 +527,27 @@ mod tests {
         let mut stale = sample_result();
         stale.symbols[0].name = "old_proxy".into();
         let file = ParsedCacheFile {
-            version: 3,
+            version: 4,
             entries: HashMap::from([(hash.clone(), stale.clone())]),
         };
-        std::fs::write(&path, rmp_serde::to_vec(&file).unwrap()).unwrap();
+        std::fs::write(&path, rmp_serde::to_vec_named(&file).unwrap()).unwrap();
+        let decoded: ParsedCacheFile =
+            rmp_serde::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(decoded.version, 4);
+        assert_eq!(decoded.entries[&hash].symbols[0].name, "old_proxy");
         let record = LogRecord {
-            version: 3,
+            version: 4,
             hash: std::borrow::Cow::Borrowed(&hash),
             entry: std::borrow::Cow::Borrowed(&stale),
         };
-        let encoded = rmp_serde::to_vec(&record).unwrap();
+        let encoded = rmp_serde::to_vec_named(&record).unwrap();
         let mut log = (encoded.len() as u32).to_le_bytes().to_vec();
         log.extend(encoded);
         std::fs::write(log_path(&path), log).unwrap();
+        assert!(
+            ParsedCache::load(&path).get(&hash).is_none(),
+            "previous parser semantics must be rejected before indexing"
+        );
         // Run the real index pipeline with identical source bytes, not a test
         // reconstruction of its cache-miss branch.
         index(&db);

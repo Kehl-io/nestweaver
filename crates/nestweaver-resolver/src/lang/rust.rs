@@ -146,6 +146,45 @@ pub fn resolve_import(
     }
 }
 
+/// Retain the inline module tail after the first prefix proven to consume
+/// the resolved file. The final segment names the imported type or alias.
+pub(crate) fn inline_type_modules(
+    from_file: &str,
+    specifier: &str,
+    resolved_file: &str,
+    known_files: &HashSet<&str>,
+) -> Option<Vec<String>> {
+    const MAX_SEGMENTS: usize = 64;
+    let segments: Vec<_> = specifier
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .take(MAX_SEGMENTS + 1)
+        .collect();
+    if segments.len() > MAX_SEGMENTS {
+        return None;
+    }
+    let first = if segments.first() == Some(&"super") {
+        segments
+            .iter()
+            .take_while(|segment| **segment == "super")
+            .count()
+    } else {
+        1
+    };
+    for consumed in first..segments.len() {
+        let prefix = segments[..consumed].join("::");
+        if resolve_import(from_file, &prefix, known_files).as_deref() == Some(resolved_file) {
+            return Some(
+                segments[consumed..segments.len() - 1]
+                    .iter()
+                    .map(|segment| (*segment).into())
+                    .collect(),
+            );
+        }
+    }
+    None
+}
+
 /// Whether a file is a cargo dev target (integration test, bench, example) —
 /// the only places `use <crate_under_test>::…` appears, and therefore the
 /// only places the root-crate fallback may discard the unmatched crate name.
@@ -597,6 +636,94 @@ mod tests {
         // …and it must not reach ACROSS crates for a same-named module.
         assert_eq!(
             resolve_import("crates/other/src/lib.rs", "hubs::HubNode", &known),
+            None
+        );
+    }
+
+    #[test]
+    fn review4_inline_type_modules_preserves_resolved_file_boundary_and_budget() {
+        let known = set(&[
+            "src/lib.rs",
+            "src/browser_ws.rs",
+            "src/consumer.rs",
+            "src/consumer/db.rs",
+            "crates/service/src/lib.rs",
+            "crates/service/src/browser_ws.rs",
+        ]);
+        for (from, path, file, modules) in [
+            ("src/consumer.rs", "crate::Repository", "src/lib.rs", vec![]),
+            (
+                "src/consumer.rs",
+                "crate::browser_ws::flow::ViewerFlow",
+                "src/browser_ws.rs",
+                vec!["flow"],
+            ),
+            (
+                "src/consumer.rs",
+                "crate::browser_ws::flow::nested::ViewerFlow",
+                "src/browser_ws.rs",
+                vec!["flow", "nested"],
+            ),
+            (
+                "src/consumer.rs",
+                "self::db::flow::ViewerFlow",
+                "src/consumer/db.rs",
+                vec!["flow"],
+            ),
+            (
+                "src/consumer/db.rs",
+                "super::Repository",
+                "src/consumer.rs",
+                vec![],
+            ),
+            (
+                "src/consumer.rs",
+                "service::browser_ws::flow::ViewerFlow",
+                "crates/service/src/browser_ws.rs",
+                vec!["flow"],
+            ),
+            (
+                "src/lib.rs",
+                "browser_ws::flow::ViewerFlow",
+                "src/browser_ws.rs",
+                vec!["flow"],
+            ),
+        ] {
+            assert_eq!(resolve_import(from, path, &known).as_deref(), Some(file));
+            assert_eq!(
+                inline_type_modules(from, path, file, &known),
+                Some(modules.into_iter().map(String::from).collect()),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            inline_type_modules(
+                "src/consumer.rs",
+                "crate::browser_ws::ViewerFlow",
+                "src/consumer/db.rs",
+                &known
+            ),
+            None
+        );
+        let at_limit = format!(
+            "crate::browser_ws::{}::ViewerFlow",
+            std::iter::repeat_n("deep", 61)
+                .collect::<Vec<_>>()
+                .join("::")
+        );
+        assert_eq!(
+            inline_type_modules("src/consumer.rs", &at_limit, "src/browser_ws.rs", &known)
+                .map(|modules| modules.len()),
+            Some(61)
+        );
+        let over_limit = format!(
+            "crate::browser_ws::{}::ViewerFlow",
+            std::iter::repeat_n("deep", 62)
+                .collect::<Vec<_>>()
+                .join("::")
+        );
+        assert_eq!(
+            inline_type_modules("src/consumer.rs", &over_limit, "src/browser_ws.rs", &known),
             None
         );
     }

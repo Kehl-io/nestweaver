@@ -19,6 +19,8 @@ pub struct NamedBinding {
     pub original_name: String,
     /// The file that exports the original name, or a failed JS/TS import.
     pub source_file: Option<String>,
+    /// Exact inline module tail after a Rust import consumes its source file.
+    pub rust_inline_modules: Option<Vec<String>>,
     /// Import location, used to keep function-local bindings inside their owner.
     pub start_line: u32,
 }
@@ -32,6 +34,8 @@ pub struct ImportGraph {
     /// file → [named bindings (aliased imports)]
     named_bindings: HashMap<String, Vec<NamedBinding>>,
     export_aliases: HashMap<String, HashMap<String, (String, Option<String>)>>,
+    /// Exact literal-method declaration keyed by terminal exported name.
+    literal_export_lines: HashMap<String, HashMap<String, u32>>,
     star_exports: HashMap<String, Vec<String>>,
     go_packages: HashMap<String, String>,
     unresolved_exports: HashMap<String, HashSet<String>>,
@@ -75,6 +79,15 @@ impl ImportGraph {
         file: &'a str,
         name: &'a str,
     ) -> Option<(&'a str, &'a str, usize)> {
+        self.exported_target_with_declaration(file, name)
+            .map(|(file, name, depth, _)| (file, name, depth))
+    }
+
+    pub(crate) fn exported_target_with_declaration<'a>(
+        &'a self,
+        file: &'a str,
+        name: &'a str,
+    ) -> Option<(&'a str, &'a str, usize, Option<u32>)> {
         let mut targets = HashMap::new();
         let complete =
             self.collect_export_targets(file, name, 0, &mut HashSet::new(), &mut targets, &mut 256);
@@ -82,7 +95,7 @@ impl ImportGraph {
             targets
                 .into_iter()
                 .next()
-                .map(|((file, name), depth)| (file, name, depth))
+                .map(|((file, name, line), depth)| (file, name, depth, line))
         } else {
             None
         }
@@ -94,7 +107,7 @@ impl ImportGraph {
         name: &'a str,
         depth: usize,
         visited: &mut HashSet<(&'a str, &'a str)>,
-        targets: &mut HashMap<(&'a str, &'a str), usize>,
+        targets: &mut HashMap<(&'a str, &'a str, Option<u32>), usize>,
         remaining: &mut usize,
     ) -> bool {
         if depth > 3 || *remaining == 0 || targets.len() > 1 {
@@ -129,7 +142,14 @@ impl ImportGraph {
                 );
             } else {
                 targets
-                    .entry((file, local))
+                    .entry((
+                        file,
+                        local,
+                        self.literal_export_lines
+                            .get(file)
+                            .and_then(|lines| lines.get(name))
+                            .copied(),
+                    ))
                     .and_modify(|old| *old = (*old).min(depth))
                     .or_insert(depth);
             }
@@ -224,6 +244,7 @@ pub(crate) fn build_import_graph_with_languages(
     let mut resolved_imports: HashMap<String, Vec<(String, String)>> = HashMap::new();
     let mut named_bindings: HashMap<String, Vec<NamedBinding>> = HashMap::new();
     let mut export_aliases = HashMap::new();
+    let mut literal_export_lines = HashMap::new();
     let mut star_exports = HashMap::new();
     let mut go_packages = HashMap::new();
     let mut unresolved_exports: HashMap<String, HashSet<String>> = HashMap::new();
@@ -243,6 +264,45 @@ pub(crate) fn build_import_graph_with_languages(
                 go_packages.insert(file_path.clone(), packages[0].name.clone());
             }
         }
+        let literal_methods: HashSet<_> = symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.kind == nestweaver_schema::SymbolKind::Method
+                    && symbol.parent_name.as_deref() == Some("module.exports")
+            })
+            .map(|symbol| (symbol.name.as_str(), symbol.start_line))
+            .collect();
+        let is_literal_export = |reference: &RawReference| {
+            reference.scope.is_some()
+                && reference.receiver.is_none()
+                && literal_methods.contains(&(reference.context.as_str(), reference.start_line))
+        };
+        let mut lines = HashMap::new();
+        let mut seen = HashSet::new();
+        let mut duplicates = HashSet::new();
+        let mut literal_names = HashSet::new();
+        for reference in references
+            .iter()
+            .filter(|reference| reference.kind == ReferenceKind::ExportAlias)
+        {
+            if !seen.insert(reference.name.clone()) {
+                duplicates.insert(reference.name.clone());
+            }
+            if is_literal_export(reference) {
+                literal_names.insert(reference.name.clone());
+                lines.insert(reference.name.clone(), reference.start_line);
+            }
+        }
+        // The AST traversal does not promise overwrite order. Repeated
+        // aliases involving a literal method refuse instead of selecting one.
+        for name in duplicates.intersection(&literal_names) {
+            lines.remove(name);
+            unresolved_exports
+                .entry(file_path.clone())
+                .or_default()
+                .insert(name.clone());
+        }
+        literal_export_lines.insert(file_path.clone(), lines);
         // v2: filter by visibility — only non-private symbols are exported
         let exported_names: Vec<String> = symbols
             .iter()
@@ -255,6 +315,9 @@ pub(crate) fn build_import_graph_with_languages(
             .filter(|reference| reference.kind == ReferenceKind::ExportAlias)
         {
             let specifier = reference.receiver.as_deref().or_else(|| {
+                if is_literal_export(reference) {
+                    return None;
+                }
                 references
                     .iter()
                     .find(|binding| {
@@ -315,19 +378,23 @@ pub(crate) fn build_import_graph_with_languages(
                     // A module-local exported name can itself be a precise
                     // imported binding. Function-local imports cannot forward
                     // an unrelated declaration exported at module scope.
-                    let imported = references.iter().find(|binding| {
-                        binding.kind == ReferenceKind::ImportAlias
-                            && binding.name == reference.context
-                            && !symbols.iter().any(|symbol| {
-                                matches!(
-                                    symbol.kind,
-                                    nestweaver_schema::SymbolKind::Function
-                                        | nestweaver_schema::SymbolKind::Method
-                                        | nestweaver_schema::SymbolKind::Class
-                                ) && symbol.start_line <= binding.start_line
-                                    && binding.start_line <= symbol.end_line
-                            })
-                    });
+                    let imported = if is_literal_export(reference) {
+                        None
+                    } else {
+                        references.iter().find(|binding| {
+                            binding.kind == ReferenceKind::ImportAlias
+                                && binding.name == reference.context
+                                && !symbols.iter().any(|symbol| {
+                                    matches!(
+                                        symbol.kind,
+                                        nestweaver_schema::SymbolKind::Function
+                                            | nestweaver_schema::SymbolKind::Method
+                                            | nestweaver_schema::SymbolKind::Class
+                                    ) && symbol.start_line <= binding.start_line
+                                        && binding.start_line <= symbol.end_line
+                                })
+                        })
+                    };
                     let (local, source) = match reference.receiver.as_deref() {
                         Some(specifier) => (
                             reference.context.clone(),
@@ -389,7 +456,20 @@ pub(crate) fn build_import_graph_with_languages(
                     .next()
                     .unwrap_or(reference.context.as_str())
                     .to_string();
+                let rust_inline_modules = if language == Language::Rust {
+                    resolved.as_deref().and_then(|file| {
+                        lang::rust::inline_type_modules(
+                            file_path,
+                            &reference.context,
+                            file,
+                            &known_files,
+                        )
+                    })
+                } else {
+                    None
+                };
                 bindings.push(NamedBinding {
+                    rust_inline_modules,
                     scope: reference.scope,
                     local_name: reference.name.clone(),
                     original_name,
@@ -405,9 +485,41 @@ pub(crate) fn build_import_graph_with_languages(
                 continue;
             }
             let specifier = &reference.name;
-            if let Some(resolved) =
-                resolve_specifier(file_path, specifier, &known_files, language, workspace_ctx)
+            let resolved =
+                resolve_specifier(file_path, specifier, &known_files, language, workspace_ctx);
+            // A module import consumes the final path segment. An item
+            // import leaves the resolved module unchanged from its prefix,
+            // even when the item's spelling equals the module filename.
+            let rust_module_import = language == Language::Rust
+                && resolved.as_ref().is_some_and(|file| {
+                    specifier.rsplit_once("::").is_none_or(|(prefix, _)| {
+                        lang::rust::resolve_import(file_path, prefix, &known_files).as_ref()
+                            != Some(file)
+                    })
+                });
+            if language == Language::Rust
+                && reference.kind == ReferenceKind::Import
+                && reference.receiver.as_deref() != Some("*")
+                && !references.iter().any(|alias| {
+                    alias.kind == ReferenceKind::ImportAlias
+                        && alias.context == *specifier
+                        && alias.start_line == reference.start_line
+                })
             {
+                let name = specifier.rsplit("::").next().unwrap_or(specifier);
+                let rust_inline_modules = resolved.as_deref().and_then(|file| {
+                    lang::rust::inline_type_modules(file_path, specifier, file, &known_files)
+                });
+                bindings.push(NamedBinding {
+                    rust_inline_modules,
+                    scope: reference.scope,
+                    local_name: name.into(),
+                    original_name: if rust_module_import { "*" } else { name }.into(),
+                    source_file: resolved.clone(),
+                    start_line: reference.start_line,
+                });
+            }
+            if let Some(resolved) = resolved {
                 imports.push((specifier.clone(), resolved));
             }
         }
@@ -422,6 +534,7 @@ pub(crate) fn build_import_graph_with_languages(
         exports,
         named_bindings,
         export_aliases,
+        literal_export_lines,
         star_exports,
         go_packages,
         unresolved_exports,
@@ -657,6 +770,7 @@ mod tests {
         bindings.insert(
             "src/main.js".to_string(),
             vec![NamedBinding {
+                rust_inline_modules: None,
                 scope: None,
                 local_name: "MyAlias".to_string(),
                 original_name: "OriginalName".to_string(),
@@ -665,6 +779,7 @@ mod tests {
             }],
         );
         let graph = ImportGraph {
+            literal_export_lines: HashMap::new(),
             resolved_imports: HashMap::new(),
             exports: HashMap::new(),
             named_bindings: bindings,
@@ -756,6 +871,7 @@ mod tests {
     #[test]
     fn review_star_walk_budget_fails_closed_after_a_known_target() {
         let mut graph = ImportGraph {
+            literal_export_lines: HashMap::new(),
             resolved_imports: HashMap::new(),
             exports: HashMap::new(),
             named_bindings: HashMap::new(),
@@ -781,6 +897,7 @@ mod tests {
     #[test]
     fn review_star_walk_duplicate_paths_keep_one_target() {
         let graph = ImportGraph {
+            literal_export_lines: HashMap::new(),
             resolved_imports: HashMap::new(),
             exports: HashMap::new(),
             named_bindings: HashMap::new(),
