@@ -5288,6 +5288,69 @@ fn daemon_mcp_and_cli_add_source_share_default_instance() {
     assert_eq!(vaults[0]["instance_id"], "default");
 }
 
+/// Only these two publication guards are transient readiness failures. Exact
+/// messages prevent permission, lookup, and pinned-source errors being hidden.
+fn note_metadata_readiness_retryable(response: &serde_json::Value) -> bool {
+    if response.get("error").is_some() || response["result"]["isError"] != serde_json::json!(true) {
+        return false;
+    }
+    let Some(content) = response["result"]["content"].as_array() else {
+        return false;
+    };
+    if content.len() != 1 || content[0]["type"] != "text" {
+        return false;
+    }
+    matches!(
+        content[0]["text"].as_str(),
+        Some(
+            "tool note_get failed: note read overlaps index publication; retry after publication completes"
+        ) | Some("tool note_get failed: note index changed while reading; restart pagination")
+    )
+}
+
+#[test]
+fn note_metadata_readiness_classifier_retries_only_publication_guards() {
+    let error = |message: &str| {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2,
+            "result": { "isError": true, "content": [{ "type": "text", "text": message }] }
+        })
+    };
+    for message in [
+        "tool note_get failed: note read overlaps index publication; retry after publication completes",
+        "tool note_get failed: note index changed while reading; restart pagination",
+    ] {
+        assert!(
+            note_metadata_readiness_retryable(&error(message)),
+            "{message}"
+        );
+    }
+    for message in [
+        "tool note_get refused: permission denied",
+        "tool note_get failed: no note found with title 'Hello'",
+        "tool note_get failed: note body changed; restart at body_offset 0 without body_version",
+        "tool note_get failed: note body changed or became unavailable; restart pagination",
+        "tool note_get failed: native read admission exceeded its deadline",
+        "tool note_get failed: unrelated error",
+        "tool backlinks failed: note index changed while reading; restart pagination",
+        "tool note_get failed: permission denied: note index changed while reading; restart pagination",
+    ] {
+        assert!(
+            !note_metadata_readiness_retryable(&error(message)),
+            "{message}"
+        );
+    }
+    let mut successful =
+        error("tool note_get failed: note index changed while reading; restart pagination");
+    successful["result"]["isError"] = serde_json::json!(false);
+    assert!(!note_metadata_readiness_retryable(&successful));
+    let mut rpc_error =
+        error("tool note_get failed: note index changed while reading; restart pagination");
+    rpc_error["error"] = serde_json::json!({ "code": -32603, "message": "RPC failed" });
+    assert!(!note_metadata_readiness_retryable(&rpc_error));
+    assert!(!note_metadata_readiness_retryable(&serde_json::json!({})));
+}
+
 /// Final-hunt Z-2 (item 3a): note_get over the daemon must return the same
 /// `frontmatter` and `outline` fields the local path returns.
 #[test]
@@ -5313,13 +5376,34 @@ fn daemon_note_get_returns_frontmatter_and_outline() {
     let _guard = DaemonGuard::new(&db_path);
     start_daemon(&db_path);
 
-    let output = mcp_tool_call_in_mode(
-        &db_path,
-        "note_get",
-        serde_json::json!({ "title": "Hello", "include_body": false }),
-        McpMode::Daemon,
-    );
-    let response = mcp_call_response(&output);
+    // Socket readiness precedes background migration of a directly indexed
+    // vault. Retry only the two explicit publication guards until it settles.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let response = loop {
+        let output = mcp_tool_call_in_mode(
+            &db_path,
+            "note_get",
+            serde_json::json!({ "title": "Hello", "include_body": false }),
+            McpMode::Daemon,
+        );
+        let response = mcp_call_response(&output);
+        if note_metadata_readiness_retryable(&response) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "note metadata publication did not settle within 10s; response: {response}; raw stdout: {output}"
+            );
+            eprintln!("waiting for note metadata publication; response: {response}");
+            std::thread::sleep(Duration::from_millis(25));
+            continue;
+        }
+        assert!(
+            response.get("error").is_none()
+                && response["result"]["isError"] == serde_json::json!(false)
+                && response["result"]["structuredContent"].is_object(),
+            "note metadata request failed; response: {response}; raw stdout: {output}"
+        );
+        break response;
+    };
     let note = &response["result"]["structuredContent"];
     assert_eq!(
         note["frontmatter"],

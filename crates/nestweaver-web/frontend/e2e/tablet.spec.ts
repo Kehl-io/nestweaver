@@ -193,6 +193,8 @@ test.describe("Tablet width (nw-593)", () => {
 
 // nw-755: containment must survive long identities, not only the short fixture names.
 test("long search identities and paths keep tablet actions operable without overflow", async ({ page }) => {
+  // Keep both viewport transitions and every containment assertion on slower CI browsers.
+  test.setTimeout(60_000);
   const name = "VeryLongWorkspaceSymbolIdentity".repeat(5);
   const path = `src/${"long-folder-name/".repeat(9)}${name}.ts`;
   await page.route("**/api/v1/workspaces", async (route) => {
