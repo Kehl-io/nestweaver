@@ -960,20 +960,33 @@ fn resolve_single_reference(
         // A Rust type path resolves through the same bounded named type route
         // as a typed value. Keep the terminal declaration's byte identity so
         // inline types and re-exports cannot donate a same-named hidden impl.
+        let mut rust_parent_member_origin = false;
         let rust_member_origin = if language == Language::Rust
             && binding.original_name != "*"
             && reference.receiver.is_some()
             && rust_path_import_positions.is_some()
         {
             type_envs.and_then(|envs| {
-                rust_public_type_origin(
+                let direct_parent = rust_direct_parent_type_origin(
+                    file_path,
                     source_file,
                     original,
                     binding.rust_inline_modules.as_deref()?,
                     symbol_map,
                     graph,
                     envs,
-                )
+                );
+                rust_parent_member_origin = direct_parent.is_some();
+                direct_parent.or_else(|| {
+                    rust_public_type_origin(
+                        source_file,
+                        original,
+                        binding.rust_inline_modules.as_deref()?,
+                        symbol_map,
+                        graph,
+                        envs,
+                    )
+                })
             })
         } else {
             None
@@ -1039,7 +1052,9 @@ fn resolve_single_reference(
         let target_name = member_parent.map_or(original, |_| name.as_str());
         if let Some(symbols) = symbol_map.get(target_name) {
             let explicit_private = language == Language::Python
-                || (language == Language::Rust && graph.resolves_parent(file_path, target_file));
+                || language == Language::Rust
+                    && (graph.resolves_parent(file_path, target_file)
+                        || rust_parent_member_origin && file_path == target_file);
             let targets: Vec<_> = symbols
                 .iter()
                 .filter(|(file, symbol)| {
@@ -1446,6 +1461,45 @@ fn rust_module_type_position(
     positions.next().is_none().then_some(position)
 }
 
+/// A direct root parent type and its methods are visible to child modules.
+/// This never traverses a barrel or admits another inline module's private type.
+fn rust_direct_parent_type_origin(
+    source_file: &str,
+    file: &str,
+    name: &str,
+    modules: &[String],
+    symbol_map: &std::collections::HashMap<String, Vec<(&str, &RawSymbol)>>,
+    graph: &ImportGraph,
+    type_envs: &std::collections::HashMap<String, TypeEnvironment>,
+) -> Option<TypedReceiverOrigin> {
+    if !modules.is_empty() || !(source_file == file || graph.resolves_parent(source_file, file)) {
+        return None;
+    }
+    let declarations: Vec<_> = symbol_map
+        .get(name)
+        .into_iter()
+        .flatten()
+        .filter(|(owner_file, symbol)| {
+            *owner_file == file
+                && matches!(symbol.kind, SymbolKind::Class | SymbolKind::Enum)
+                && symbol.parent_name.is_none()
+                && symbol.scope_chain.is_none()
+                && rust_module_type_position(file, name, &[], symbol.start_line, type_envs)
+                    .is_some()
+        })
+        .collect();
+    if declarations.len() != 1 {
+        return None;
+    }
+    let position =
+        rust_module_type_position(file, name, &[], declarations[0].1.start_line, type_envs)?;
+    Some(TypedReceiverOrigin {
+        file: file.into(),
+        name: name.into(),
+        rust_class_position: Some(position),
+    })
+}
+
 /// Follow a unique public named type route, never a file's unrelated imports.
 fn rust_public_type_origin(
     file: &str,
@@ -1620,36 +1674,20 @@ fn typed_receiver_origin(
                 rust_public_type_origin(file, name, modules, symbol_map, graph, type_envs)
             {
                 candidates.push(candidate);
-            } else {
-                // Preserve exact directly imported private parent types.
-                let direct: Vec<_> = symbol_map
-                    .get(name)
-                    .into_iter()
-                    .flatten()
-                    .filter(|(owner_file, symbol)| {
-                        *owner_file == file
-                            && matches!(symbol.kind, SymbolKind::Class | SymbolKind::Enum)
-                            && symbol.parent_name.is_none()
-                            && symbol.scope_chain.is_none()
-                            && modules.is_empty()
-                            && graph.resolves_parent(source_file, file)
-                    })
-                    .collect();
-                if direct.len() == 1
-                    && let Some(position) = rust_module_type_position(
-                        file,
-                        name,
-                        &[],
-                        direct[0].1.start_line,
-                        type_envs,
-                    )
-                {
-                    candidates.push(TypedReceiverOrigin {
-                        file: file.clone(),
-                        name: name.into(),
-                        rust_class_position: Some(position),
-                    });
-                }
+            } else if (source_file != file || !named.is_empty())
+                && let Some(candidate) = rust_direct_parent_type_origin(
+                    source_file,
+                    file,
+                    name,
+                    modules,
+                    symbol_map,
+                    graph,
+                    type_envs,
+                )
+            {
+                // Preserve the existing cross-file parent route. Newly admitted
+                // same-file routes must carry an exact named import declaration.
+                candidates.push(candidate);
             }
         }
         return (candidates.len() == 1).then(|| candidates.remove(0));
@@ -7690,6 +7728,175 @@ async fn same_line_after() { let (_, db, _) = spawn_server().await; { let db = u
                 );
             }
         }
+    }
+
+    #[test]
+    fn review7_rust_direct_private_parent_type_preserves_constructor_and_ufcs() {
+        for (import, selected) in [
+            ("use super::Local;", "Local"),
+            ("use super::Local as Selected;", "Selected"),
+        ] {
+            let path = "src/lib.rs";
+            let source = format!(
+                "struct Local;\nimpl Local {{\n fn new() -> Self {{ Self }}\n fn run(&self) {{}}\n}}\nmod tests {{ {import}\n fn caller() {{ let x = {selected}::new(); x.run(); }}\n fn ufcs(x: &{selected}) {{ {selected}::run(x); }}\n}}\n"
+            );
+            let (files, edges) = review_edges(&[(path, &source)], Language::Rust);
+            for method in ["new", "run"] {
+                let expected = if method == "run" {
+                    std::collections::BTreeSet::from([
+                        uid(&files, path, "caller"),
+                        uid(&files, path, "ufcs"),
+                    ])
+                } else {
+                    std::collections::BTreeSet::from([uid(&files, path, "caller")])
+                };
+                assert_eq!(
+                    review_callers(&files, &edges, path, method),
+                    expected,
+                    "{import}: {files:#?} {edges:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review7_rust_private_parent_type_keeps_exact_root_owner_and_file() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "src/lib.rs",
+                    "mod child;\nstruct Local;\nimpl Local { fn new() -> Self { Self } fn run(&self) {} }\nfn hidden() { struct Local; impl Local { fn new() -> Self { Self } fn run(&self) {} } }\n",
+                ),
+                (
+                    "src/child.rs",
+                    "use super::Local as Selected;\nfn caller() { let x = Selected::new(); x.run(); }\n",
+                ),
+                (
+                    "other/lib.rs",
+                    "struct Local;\nimpl Local { fn new() -> Self { Self } fn run(&self) {} }\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        for name in ["new", "run"] {
+            let root = files[0]
+                .1
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .unwrap();
+            let actual: std::collections::BTreeSet<_> = edges
+                .iter()
+                .filter(|edge| {
+                    edge.edge_type == EdgeType::Calls
+                        && edge.target_uid
+                            == symbol_uid("repo:test:abc", "src/lib.rs", name, root.start_line)
+                })
+                .map(|edge| edge.source_uid.clone())
+                .collect();
+            assert_eq!(
+                actual,
+                std::collections::BTreeSet::from([uid(&files, "src/child.rs", "caller")]),
+                "{files:#?} {edges:#?}"
+            );
+            assert!(review_callers(&files, &edges, "other/lib.rs", name).is_empty());
+            for hidden in files[0]
+                .1
+                .iter()
+                .filter(|symbol| symbol.name == name && symbol.start_line != root.start_line)
+            {
+                assert!(
+                    !edges.iter().any(|edge| edge.edge_type == EdgeType::Calls
+                        && edge.target_uid
+                            == symbol_uid("repo:test:abc", "src/lib.rs", name, hidden.start_line)),
+                    "hidden function-local owner: {edges:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review7_rust_private_type_cannot_be_forwarded_through_public_barrel() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "crates/provider/src/lib.rs",
+                    "mod hidden;\npub use hidden::Local as Exported;\n",
+                ),
+                (
+                    "crates/provider/src/hidden.rs",
+                    "struct Local;\nimpl Local { pub fn new() -> Self { Self } pub fn run(&self) {} }\n",
+                ),
+                (
+                    "crates/user/src/lib.rs",
+                    "use provider::Exported as Selected;\nfn caller() { let x = Selected::new(); x.run(); }\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        for name in ["new", "run"] {
+            assert!(
+                review_callers(&files, &edges, "crates/provider/src/hidden.rs", name).is_empty(),
+                "private terminal is not a public reexport: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review7_rust_private_sibling_inline_type_is_not_a_root_parent_import() {
+        let path = "src/lib.rs";
+        let source = "mod hidden {\n struct Local;\n impl Local { pub fn new() -> Self { Self } pub fn run(&self) {} }\n}\nmod tests { use super::hidden::Local as Selected; fn wrong() { let x = Selected::new(); x.run(); } }\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::Rust);
+        for name in ["new", "run"] {
+            assert!(
+                review_callers(&files, &edges, path, name).is_empty(),
+                "private inline terminal is not a root-private parent type: {files:#?} {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review7_rust_public_root_type_private_methods_preserve_constructor_and_ufcs() {
+        for (import, selected) in [
+            ("use super::Local;", "Local"),
+            ("use super::Local as Selected;", "Selected"),
+        ] {
+            let path = "src/lib.rs";
+            let source = format!(
+                "pub struct Local;\nimpl Local {{\n fn new() -> Self {{ Self }}\n fn run(&self) {{}}\n}}\nmod tests {{ {import}\n fn caller() {{ let x = {selected}::new(); x.run(); }}\n fn ufcs(x: &{selected}) {{ {selected}::run(x); }}\n}}\n"
+            );
+            let (files, edges) = review_edges(&[(path, &source)], Language::Rust);
+            assert_eq!(
+                review_callers(&files, &edges, path, "new"),
+                std::collections::BTreeSet::from([uid(&files, path, "caller")]),
+                "{import}: {files:#?} {edges:#?}"
+            );
+            assert_eq!(
+                review_callers(&files, &edges, path, "run"),
+                std::collections::BTreeSet::from([
+                    uid(&files, path, "caller"),
+                    uid(&files, path, "ufcs")
+                ]),
+                "{import}: {files:#?} {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review7_rust_public_inline_type_private_methods_remain_sibling_private() {
+        let path = "src/lib.rs";
+        let source = "pub mod hidden {\n pub struct Local;\n impl Local { fn new() -> Self { Self } fn run(&self) {} }\n}\nmod tests {\n use super::hidden::Local as Selected;\n fn caller() { let x = Selected::new(); x.run(); }\n fn ufcs(x: &Selected) { Selected::run(x); }\n}\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::Rust);
+        assert!(
+            review_callers(&files, &edges, path, "new").is_empty(),
+            "private sibling associated method: {edges:#?}"
+        );
+        // `x.run` already uses the existing same-file typed member admission;
+        // this regression fix must not additionally admit sibling UFCS.
+        let callers = review_callers(&files, &edges, path, "run");
+        assert!(
+            !callers.contains(&uid(&files, path, "ufcs")),
+            "private sibling UFCS: {files:#?} {edges:#?}"
+        );
     }
 
     #[test]
