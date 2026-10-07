@@ -15,6 +15,18 @@ use nestweaver_proto::{JsonRequest, JsonResponse};
 /// `JsonResponse { result_json }` pass-through pattern. This function
 /// serializes the params, calls the matching RPC, and deserializes the
 /// response.
+pub fn profiled_request<T>(
+    value: T,
+    profile: nestweaver_schema::ToolDeliveryProfile,
+) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(value);
+    request.metadata_mut().insert(
+        nestweaver_schema::ToolDeliveryProfile::METADATA_KEY,
+        tonic::metadata::MetadataValue::from_static(profile.wire_value()),
+    );
+    request
+}
+
 pub async fn dispatch_json_rpc(
     client: &mut NestWeaverDaemonClient<Channel>,
     tool_name: &str,
@@ -31,32 +43,49 @@ pub async fn dispatch_json_rpc_authed(
     params: &Value,
     auth_token: Option<&str>,
 ) -> Result<Value> {
+    dispatch_json_rpc_authed_profile(
+        client,
+        tool_name,
+        params,
+        auth_token,
+        nestweaver_schema::ToolDeliveryProfile::FullCli,
+    )
+    .await
+}
+
+pub async fn dispatch_json_rpc_authed_profile(
+    client: &mut NestWeaverDaemonClient<Channel>,
+    tool_name: &str,
+    params: &Value,
+    auth_token: Option<&str>,
+    profile: nestweaver_schema::ToolDeliveryProfile,
+) -> Result<Value> {
     // ── Typed RPCs (not JsonRequest/JsonResponse) ─────────────────────
     //
     // These five tools use typed proto requests. Handle them first so
     // we don't build an unnecessary JsonRequest.
     match tool_name {
         "brain_search" => {
-            return dispatch_typed_brain_search(client, params, auth_token).await;
+            return dispatch_typed_brain_search(client, params, auth_token, profile).await;
         }
         "brain_context" => {
-            return dispatch_typed_brain_context(client, params, auth_token).await;
+            return dispatch_typed_brain_context(client, params, auth_token, profile).await;
         }
         "project_context" => {
-            return dispatch_typed_project_context(client, params, auth_token).await;
+            return dispatch_typed_project_context(client, params, auth_token, profile).await;
         }
         "note_get" => {
-            return dispatch_typed_note_get(client, params, auth_token).await;
+            return dispatch_typed_note_get(client, params, auth_token, profile).await;
         }
         "hub_nodes" => {
-            return dispatch_typed_hub_nodes(client, params, auth_token).await;
+            return dispatch_typed_hub_nodes(client, params, auth_token, profile).await;
         }
         _ => {} // fall through to JsonRequest dispatch
     }
 
     // ── JsonRequest/JsonResponse pass-through RPCs ────────────────────
     let args_json = serde_json::to_string(params)?;
-    let mut request = tonic::Request::new(JsonRequest { args_json });
+    let mut request = profiled_request(JsonRequest { args_json }, profile);
 
     if let Some(token) = auth_token
         && let Ok(val) = format!("Bearer {}", token).parse::<tonic::metadata::MetadataValue<_>>()
@@ -217,6 +246,7 @@ async fn dispatch_typed_brain_search(
     client: &mut NestWeaverDaemonClient<Channel>,
     params: &Value,
     auth_token: Option<&str>,
+    profile: nestweaver_schema::ToolDeliveryProfile,
 ) -> Result<Value> {
     let req = nestweaver_proto::BrainSearchRequest {
         query: params
@@ -243,7 +273,7 @@ async fn dispatch_typed_brain_search(
             .and_then(|v| v.as_str())
             .map(String::from),
     };
-    let mut request = tonic::Request::new(req);
+    let mut request = profiled_request(req, profile);
     inject_bearer_token(&mut request, auth_token);
     let resp = client
         .search(request)
@@ -350,9 +380,10 @@ async fn dispatch_typed_brain_context(
     client: &mut NestWeaverDaemonClient<Channel>,
     params: &Value,
     auth_token: Option<&str>,
+    profile: nestweaver_schema::ToolDeliveryProfile,
 ) -> Result<Value> {
     let req = brain_context_request(params);
-    let mut request = tonic::Request::new(req);
+    let mut request = profiled_request(req, profile);
     inject_bearer_token(&mut request, auth_token);
     let resp = client
         .get_context(request)
@@ -450,9 +481,10 @@ async fn dispatch_typed_project_context(
     client: &mut NestWeaverDaemonClient<Channel>,
     params: &Value,
     auth_token: Option<&str>,
+    profile: nestweaver_schema::ToolDeliveryProfile,
 ) -> Result<Value> {
     let req = project_context_request(params);
-    let mut request = tonic::Request::new(req);
+    let mut request = profiled_request(req, profile);
     inject_bearer_token(&mut request, auth_token);
     let resp = client
         .get_project_context(request)
@@ -476,6 +508,13 @@ fn note_get_request(params: &Value) -> nestweaver_proto::NoteGetRequest {
         // nw-316: preserve absence; see `project_context_request`.
         include_body: params.get("include_body").and_then(|value| value.as_bool()),
         sections: json_str_array(params, "sections"),
+        body_offset: params
+            .get("body_offset")
+            .and_then(serde_json::Value::as_u64),
+        body_version: params
+            .get("body_version")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
     }
 }
 
@@ -484,9 +523,10 @@ async fn dispatch_typed_note_get(
     client: &mut NestWeaverDaemonClient<Channel>,
     params: &Value,
     auth_token: Option<&str>,
+    profile: nestweaver_schema::ToolDeliveryProfile,
 ) -> Result<Value> {
     let req = note_get_request(params);
-    let mut request = tonic::Request::new(req);
+    let mut request = profiled_request(req, profile);
     inject_bearer_token(&mut request, auth_token);
     let resp = client
         .get_note(request)
@@ -502,6 +542,7 @@ async fn dispatch_typed_hub_nodes(
     client: &mut NestWeaverDaemonClient<Channel>,
     params: &Value,
     auth_token: Option<&str>,
+    profile: nestweaver_schema::ToolDeliveryProfile,
 ) -> Result<Value> {
     let req = nestweaver_proto::HubNodesRequest {
         // The MCP schema advertises 'limit'; 'top_n' kept as a backward-compat
@@ -529,7 +570,7 @@ async fn dispatch_typed_hub_nodes(
             })
             .unwrap_or_default(),
     };
-    let mut request = tonic::Request::new(req);
+    let mut request = profiled_request(req, profile);
     inject_bearer_token(&mut request, auth_token);
     let resp = client
         .hub_nodes(request)
@@ -556,6 +597,35 @@ fn json_str_array(params: &Value, key: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typed_and_json_requests_carry_identical_delivery_metadata() {
+        for profile in [
+            nestweaver_schema::ToolDeliveryProfile::FullCli,
+            nestweaver_schema::ToolDeliveryProfile::BoundedMcp,
+        ] {
+            let typed = super::profiled_request(
+                super::note_get_request(&serde_json::json!({"uid":"note:test"})),
+                profile,
+            );
+            let json = super::profiled_request(
+                nestweaver_proto::JsonRequest {
+                    args_json: "{}".into(),
+                },
+                profile,
+            );
+            for value in [typed.metadata(), json.metadata()] {
+                assert_eq!(
+                    value
+                        .get(nestweaver_schema::ToolDeliveryProfile::METADATA_KEY)
+                        .unwrap()
+                        .to_str()
+                        .unwrap(),
+                    profile.wire_value()
+                );
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

@@ -99,7 +99,7 @@ export function WorkspaceSwitcher() {
   }
 
   return (
-    <div className="min-w-0 shrink-0">
+    <div className="min-w-0 max-w-[30%] shrink">
       <Select.Root
         value={activeWorkspaceId}
         onValueChange={handleWorkspaceChange}
@@ -108,11 +108,11 @@ export function WorkspaceSwitcher() {
         <Select.Trigger
           aria-label="Workspace"
           title={`Workspace: ${triggerLabel}`}
-          className="inline-flex h-8 max-w-[11rem] items-center justify-between gap-2 rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-2 text-xs text-[var(--color-text)] outline-none transition-colors hover:bg-[var(--color-surface)] focus-visible:ring-2 focus-visible:ring-[var(--color-graph-selection)] focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--color-surface)] sm:max-w-[15rem]"
+          className="inline-flex min-w-0 h-8 max-w-full items-center justify-between gap-2 rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-2 text-xs text-[var(--color-text)] outline-none transition-colors hover:bg-[var(--color-surface)] focus-visible:ring-2 focus-visible:ring-[var(--color-graph-selection)] focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--color-surface)]"
         >
           <TriggerIcon className="h-3.5 w-3.5 shrink-0 text-[var(--color-text-muted)]" />
           <Select.Value>
-            <span className="truncate">{loading ? "Loading..." : triggerLabel}</span>
+            <span className="block min-w-0 truncate">{loading ? "Loading..." : triggerLabel}</span>
           </Select.Value>
           <Select.Icon asChild>
             <ChevronDown className="h-3.5 w-3.5 shrink-0 text-[var(--color-text-muted)]" />

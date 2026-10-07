@@ -354,18 +354,14 @@ fn is_ingest_failure(code: SkipReasonCode) -> bool {
     )
 }
 
-/// A file's mtime in the representation notes record (`Note::modified_at`).
-///
-/// nw-653: this is WHOLE SECONDS (`format_system_time`), so a change made in
-/// the same second as the recorded one is invisible to anything comparing
-/// these strings — the watcher's startup reconciliation included. An edit
-/// made while no watcher ran, within the second of the previous ingest, is
-/// not detected at startup; the next edit or a `brain refresh` picks it up.
+/// A file's mtime in the fixed-width UTC representation notes record.
+/// Fractional evidence distinguishes stopped-window edits within one second;
+/// older seconds-format records differ once and migrate on the next replay.
 fn file_mtime_string(path: &Path) -> Option<String> {
     std::fs::metadata(path)
         .ok()
         .and_then(|meta| meta.modified().ok())
-        .and_then(format_system_time)
+        .and_then(format_modified_system_time)
 }
 
 /// nw-653: the vault paths whose graph state no longer matches disk, for the
@@ -419,7 +415,6 @@ pub(crate) fn vault_startup_drift(
         let rel_str = rel_path.to_string_lossy().into_owned();
         let abs_path = vault_root.join(&rel_path);
         let meta = std::fs::metadata(&abs_path).ok();
-        // Whole-second granularity: see `file_mtime_string`.
         let on_disk = file_mtime_string(&abs_path);
         let drifted = match indexed.get(&rel_str) {
             // An oversized note the graph never held would only be skipped
@@ -3441,7 +3436,7 @@ fn prepare_single_note(
     let (created_at, modified_at) = match std::fs::metadata(path) {
         Ok(meta) => {
             let c = meta.created().ok().and_then(format_system_time);
-            let m = meta.modified().ok().and_then(format_system_time);
+            let m = meta.modified().ok().and_then(format_modified_system_time);
             (c, m)
         }
         Err(_) => (None, None),
@@ -3877,7 +3872,7 @@ where
         {
             Ok(meta) => {
                 let created = meta.created().ok().and_then(format_system_time);
-                let modified = meta.modified().ok().and_then(format_system_time);
+                let modified = meta.modified().ok().and_then(format_modified_system_time);
                 (created, modified)
             }
             Err(_) => (None, None),
@@ -4453,6 +4448,145 @@ struct NoteContext {
     /// "Supersedes" / "Depends on" / "See also" groups). `None` for the
     /// preamble or a section with no owning heading.
     section_heading_text: Vec<Option<String>>,
+}
+
+/// A navigable destination resolved by the indexing wikilink policy.
+#[derive(Debug, serde::Serialize)]
+pub struct WikilinkDestination {
+    pub note_uid: String,
+    pub heading_uid: Option<String>,
+    pub heading_slug: Option<String>,
+}
+
+/// Resolve a UI reference using only the originating vault's metadata.
+/// Navigation requires a single canonical destination; indexing may retain
+/// multiple low-confidence edges, but a browser must never choose one for users.
+pub fn resolve_note_wikilink(
+    source: &Note,
+    notes: &[Note],
+    headings: &[Heading],
+    target: &str,
+) -> Result<WikilinkDestination, &'static str> {
+    let mut headings_by_note: HashMap<&str, Vec<&Heading>> = HashMap::new();
+    for heading in headings {
+        headings_by_note
+            .entry(heading.note_uid.as_str())
+            .or_default()
+            .push(heading);
+    }
+    let contexts: Vec<NoteContext> = notes
+        .iter()
+        .filter(|note| note.vault_uid == source.vault_uid)
+        .map(|note| {
+            let frontmatter: serde_json::Value = note
+                .frontmatter
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_default();
+            let aliases = match frontmatter
+                .get("aliases")
+                .or_else(|| frontmatter.get("alias"))
+            {
+                Some(serde_json::Value::Array(values)) => values
+                    .iter()
+                    .filter_map(|value| {
+                        value
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|alias| !alias.is_empty())
+                            .map(str::to_string)
+                    })
+                    .collect(),
+                Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+                    vec![value.trim().to_string()]
+                }
+                _ => Vec::new(),
+            };
+            let local_headings = headings_by_note
+                .get(note.uid.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let path = note.file_path.replace('\\', "/");
+            NoteContext {
+                note_uid: note.uid.clone(),
+                rel_path: path.clone(),
+                title: note.title.clone(),
+                folder: path
+                    .rsplit_once('/')
+                    .map_or("", |(folder, _)| folder)
+                    .to_string(),
+                aliases,
+                heading_uids: local_headings
+                    .iter()
+                    .map(|heading| heading.uid.clone())
+                    .collect(),
+                heading_slugs: local_headings
+                    .iter()
+                    .map(|heading| heading.slug.clone())
+                    .collect(),
+                section_uids: Vec::new(),
+                wikilinks: Vec::new(),
+                tags: Vec::new(),
+                frontmatter,
+                section_heading_text: Vec::new(),
+            }
+        })
+        .collect();
+    let lookup = WikilinkLookup::build(&contexts);
+    let (note_target, anchor) = target
+        .split_once('#')
+        .map_or((target, None), |(note, heading)| (note, Some(heading)));
+    let source_path = source.file_path.replace('\\', "/");
+    let folder = source_path
+        .rsplit_once('/')
+        .map_or("", |(folder, _)| folder);
+    let note_target = if note_target.trim().is_empty() {
+        source_path.as_str()
+    } else {
+        note_target.trim()
+    };
+    // Explicit cross-vault prefixes are outside this origin-scoped web route.
+    if note_target
+        .find(':')
+        .is_some_and(|colon| colon > 1 && colon < note_target.find('/').unwrap_or(usize::MAX))
+    {
+        return Err("wikilink_unresolved");
+    }
+    let ResolveOutcome::Resolved(candidates) = lookup.resolve(note_target, folder) else {
+        return Err("wikilink_unresolved");
+    };
+    if candidates.len() != 1 {
+        return Err("wikilink_ambiguous");
+    }
+    let resolved = lookup.resolve_wikilink(
+        &RawWikilink {
+            target: note_target.to_string(),
+            heading_anchor: anchor.map(str::to_string),
+            display: None,
+            transclude: false,
+            section_idx: 0,
+            line: 0,
+            vault_prefix: None,
+        },
+        folder,
+    );
+    if resolved.unresolved || resolved.targets.is_empty() {
+        return Err(if anchor.is_some() {
+            "wikilink_heading_missing"
+        } else {
+            "wikilink_unresolved"
+        });
+    }
+    let heading_uid = anchor.map(|_| resolved.targets[0].0.clone());
+    let heading_slug = heading_uid
+        .as_ref()
+        .and_then(|uid| headings.iter().find(|heading| &heading.uid == uid))
+        .map(|heading| heading.slug.clone());
+    Ok(WikilinkDestination {
+        note_uid: candidates[0].note_uid.clone(),
+        heading_uid,
+        heading_slug,
+    })
 }
 
 /// Candidate target of a wikilink resolution. Carries the priority-tier
@@ -5217,6 +5351,16 @@ fn slugify_anchor(anchor: &str) -> String {
 
 /// Render a `SystemTime` as RFC 3339-ish UTC string. Falls back to None on
 /// pre-epoch dates.
+fn format_modified_system_time(t: std::time::SystemTime) -> Option<String> {
+    let duration = t.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let whole = format_system_time(t)?;
+    Some(format!(
+        "{}.{:09}Z",
+        whole.strip_suffix('Z')?,
+        duration.subsec_nanos()
+    ))
+}
+
 fn format_system_time(t: std::time::SystemTime) -> Option<String> {
     let duration = t.duration_since(std::time::UNIX_EPOCH).ok()?;
     let secs = duration.as_secs() as i64;

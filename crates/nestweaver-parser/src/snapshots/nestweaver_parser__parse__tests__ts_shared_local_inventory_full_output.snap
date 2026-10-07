@@ -1,0 +1,262 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+expression: parsed
+---
+path: src/main.ts
+symbols:
+  - name: Store
+    kind: Class
+    start_line: 1
+    end_line: 1
+    signature: "class Store { query(): void {} }"
+    content_hash: 96d23e25bd2215fcfbd661cd72661fc6d043b84fd86a780462a9266ccf9fe092
+    is_entry_point: true
+    entry_point_kind: Main
+    visibility: Private
+    type_info:
+      declared_type: ~
+      parameter_types: []
+      return_type: "void {} }"
+    parent_name: ~
+    scope_chain: ~
+  - name: query
+    kind: Method
+    start_line: 1
+    end_line: 1
+    signature: "query(): void {}"
+    content_hash: 87c868ffc96c302030a3a907b5bb287ce5312879a34055425143ece3f5d43759
+    is_entry_point: false
+    entry_point_kind: ~
+    visibility: Private
+    type_info:
+      declared_type: ~
+      parameter_types: []
+      return_type: "void {}"
+    parent_name: Store
+    scope_chain: Store
+  - name: Service
+    kind: Class
+    start_line: 1
+    end_line: 1
+    signature: "class Service { private store: Store; constructor() { this.store = new Store(); } run(): void { this.store.query(); } }"
+    content_hash: 05bb039e43d65d20c12ba9127ef749bdf81ac1fefe1c31adb1e18c2333f591dc
+    is_entry_point: true
+    entry_point_kind: Main
+    visibility: Private
+    type_info: ~
+    parent_name: ~
+    scope_chain: ~
+  - name: store
+    kind: Property
+    start_line: 1
+    end_line: 1
+    signature: "private store: Store"
+    content_hash: 887b37c0f0a10e04b0480e354192ebd0611a610c0e5fbe27c9b52d41d14f1129
+    is_entry_point: false
+    entry_point_kind: ~
+    visibility: Private
+    type_info:
+      declared_type: Store
+      parameter_types: []
+      return_type: ~
+    parent_name: Service
+    scope_chain: Service
+  - name: constructor
+    kind: Method
+    start_line: 1
+    end_line: 1
+    signature: "constructor() { this.store = new Store(); }"
+    content_hash: ca8750bfcf64a6ccf932e0ba202dd96055871744c357adc60cc47b7f027825f4
+    is_entry_point: false
+    entry_point_kind: ~
+    visibility: Private
+    type_info: ~
+    parent_name: Service
+    scope_chain: Service
+  - name: run
+    kind: Method
+    start_line: 1
+    end_line: 1
+    signature: "run(): void { this.store.query(); }"
+    content_hash: 2428432c91a9e883ebd5b3bc2e4446bb4e8ffd63673f8dbd2d0605d01a021ab0
+    is_entry_point: false
+    entry_point_kind: ~
+    visibility: Private
+    type_info: ~
+    parent_name: Service
+    scope_chain: Service
+  - name: shadow
+    kind: Function
+    start_line: 1
+    end_line: 1
+    signature: "function shadow(module: unknown) { return module; }"
+    content_hash: a88d49cc8e2d0f7c9b6bc9232bb82c6be22f766f0b4289f2bf95073c32b99b4e
+    is_entry_point: true
+    entry_point_kind: Main
+    visibility: Private
+    type_info: ~
+    parent_name: ~
+    scope_chain: ~
+references:
+  - scope:
+      start: 0
+      end: 241
+      position: 49
+      initialized_at: 49
+      hoisted_var: false
+    name: Store
+    kind: TypeRef
+    start_line: 1
+    context: "{ private store: Store; constructor() { this.store = new Store(); } run(): void { this.store.query(); } }"
+    receiver: ~
+  - scope:
+      start: 85
+      end: 114
+      position: 87
+      initialized_at: 87
+      hoisted_var: false
+    name: store
+    kind: ReadAccess
+    start_line: 1
+    context: this.store = new Store()
+    receiver: this
+  - scope:
+      start: 85
+      end: 114
+      position: 100
+      initialized_at: 100
+      hoisted_var: false
+    name: Store
+    kind: Call
+    start_line: 1
+    context: this.store = new Store()
+    receiver: ~
+  - scope:
+      start: 127
+      end: 150
+      position: 129
+      initialized_at: 129
+      hoisted_var: false
+    name: store
+    kind: ReadAccess
+    start_line: 1
+    context: this.store.query
+    receiver: this
+  - scope:
+      start: 127
+      end: 150
+      position: 129
+      initialized_at: 129
+      hoisted_var: false
+    name: query
+    kind: Call
+    start_line: 1
+    context: this.store.query();
+    receiver: this.store
+  - scope:
+      start: 127
+      end: 150
+      position: 129
+      initialized_at: 129
+      hoisted_var: false
+    name: query
+    kind: ReadAccess
+    start_line: 1
+    context: this.store.query()
+    receiver: this.store
+  - scope:
+      start: 0
+      end: 241
+      position: 153
+      initialized_at: 153
+      hoisted_var: false
+    name: exports
+    kind: ReadAccess
+    start_line: 1
+    context: "module.exports = { run(): void {} }"
+    receiver: module
+  - scope:
+      start: 0
+      end: 241
+      position: 172
+      initialized_at: 172
+      hoisted_var: false
+    name: run
+    kind: ExportAlias
+    start_line: 1
+    context: run
+    receiver: ~
+  - scope:
+      start: 190
+      end: 241
+      position: 206
+      initialized_at: 206
+      hoisted_var: false
+    name: module
+    kind: LocalBinding
+    start_line: 1
+    context: ""
+    receiver: ~
+  - scope:
+      start: 190
+      end: 241
+      position: 206
+      initialized_at: 206
+      hoisted_var: false
+    name: module
+    kind: LocalBinding
+    start_line: 1
+    context: ""
+    receiver: ~
+type_bindings:
+  - scope:
+      start: 0
+      end: 241
+      position: 14
+      initialized_at: 14
+      hoisted_var: false
+    var_name: query
+    type_name: void
+    line: 1
+    kind: ReturnType
+  - scope:
+      start: 0
+      end: 241
+      position: 57
+      initialized_at: 57
+      hoisted_var: false
+    var_name: store
+    type_name: Store
+    line: 1
+    kind: Annotation
+  - scope:
+      start: 0
+      end: 241
+      position: 115
+      initialized_at: 115
+      hoisted_var: false
+    var_name: run
+    type_name: void
+    line: 1
+    kind: ReturnType
+  - scope:
+      start: 0
+      end: 241
+      position: 172
+      initialized_at: 172
+      hoisted_var: false
+    var_name: run
+    type_name: void
+    line: 1
+    kind: ReturnType
+  - scope:
+      start: 190
+      end: 241
+      position: 206
+      initialized_at: 206
+      hoisted_var: false
+    var_name: module
+    type_name: unknown
+    line: 1
+    kind: Parameter
+has_syntax_errors: false

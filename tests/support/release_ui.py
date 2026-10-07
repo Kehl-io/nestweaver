@@ -23,6 +23,7 @@ class UiDaemon(IsolatedDaemon):
         self.ui_child = None
         self.ui_log = None
         self.browser_child = None
+        self.wikilink_fixture = False
 
     def create_repository(self):
         source = Path(__file__).resolve().parents[2] / "testdata" / "js"
@@ -47,6 +48,24 @@ class UiDaemon(IsolatedDaemon):
                             "-c", "commit.gpgSign=false", "-c", "tag.gpgSign=false", *args],
                            cwd=self.repo, env=self.env, stdin=subprocess.DEVNULL,
                            capture_output=True, check=True, timeout=30)
+
+    def create_wikilink_vault(self):
+        self.assert_owner()
+        vault = self.root / "release-wikilinks"
+        team = vault / "team"
+        team.mkdir(parents=True)
+        (team / "Source.md").write_text(
+            "---\ntitle: Release Wiki Source\n---\n\n"
+            "[[Release Wiki Alias#Usage & examples|Read real alias]]\n\n"
+            "[[team/A & B %20#Usage & examples|Read real punctuation]]\n\n"
+            "[[Release Wiki Missing|Read real missing]]\n", encoding="utf-8")
+        (team / "A & B %20.md").write_text(
+            "---\ntitle: Release Wiki Destination\naliases: [Release Wiki Alias]\n---\n\n"
+            "## Usage & examples\n\nReal indexed destination witness.\n", encoding="utf-8")
+        self.run("brain", "add", vault, "--name", "release-wikilinks", "--db", self.db)
+        self.assert_owner()
+        self.wikilink_fixture = True
+        self.record(kind="wikilink_fixture", path=str(vault), vault_name="release-wikilinks")
 
     def assert_owner(self):
         if self.child.poll() is not None or int(self.pidfile.read_text()) != self.child.pid:
@@ -98,17 +117,20 @@ class UiDaemon(IsolatedDaemon):
             time.sleep(0.1)
         raise TimeoutError(f"UI readiness timed out; artifacts: {self.root}")
 
-    def run_browser(self, frontend, node, browser, specs, grep=None):
+    def run_browser(self, frontend, node, browser, specs, grep=None, browser_timeout=1800):
         url = self.start_ui()
         env = self.env.copy()
         env.update(NESTWEAVER_UI_FIXTURE_URL=url,
                    NESTWEAVER_UI_RESULTS_DIR=str(self.root / "browser-results"),
                    NESTWEAVER_UI_BROWSER_EXECUTABLE=str(browser))
+        if self.wikilink_fixture:
+            env["NESTWEAVER_UI_WIKILINK_FIXTURE"] = "1"
         command = [str(node), str(frontend / "node_modules/@playwright/test/cli.js"),
                    "test", *specs, "--workers=1", "--retries=0"]
         if grep:
             command.extend(["--grep", grep])
-        self.record(kind="browser_start", request=command, fixture_url=url)
+        self.record(kind="browser_start", request=command, fixture_url=url,
+                    timeout_seconds=browser_timeout)
         with (self.root / "browser.log").open("w") as output:
             self._spawning = True
             try:
@@ -120,7 +142,7 @@ class UiDaemon(IsolatedDaemon):
                 self._spawning = False
             if self._interrupted is not None:
                 raise SystemExit(128 + self._interrupted)
-            code = self.browser_child.wait(timeout=900)
+            code = self.browser_child.wait(timeout=browser_timeout)
         self.assert_owner()
         self.record(kind="browser_exit", exit_code=code)
         return code
@@ -149,9 +171,15 @@ def main():
     parser.add_argument("--node", required=True)
     parser.add_argument("--browser", required=True)
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--browser-timeout", type=int, default=1800,
+                        help="Bounded total browser-suite deadline in seconds (default: 1800)")
+    parser.add_argument("--wikilink-fixture", action="store_true",
+                        help="Index a tiny private vault for real wikilink browser acceptance")
     parser.add_argument("--grep", help="Run only tests matching this Playwright title regex")
     parser.add_argument("spec", nargs="*", help="Optional specs; default runs the full suite")
     args = parser.parse_args()
+    if not 1 <= args.browser_timeout <= 3600:
+        parser.error("--browser-timeout must be between 1 and 3600 seconds")
     node = Path(args.node).resolve(strict=True)
     browser = Path(args.browser).resolve(strict=True)
     frontend = Path(__file__).resolve().parents[2] / "crates/nestweaver-web/frontend"
@@ -159,7 +187,10 @@ def main():
     print(f"UI evidence: {fixture.root}", flush=True)
     with fixture:
         fixture.bootstrap()
-        code = fixture.run_browser(frontend, node, browser, args.spec, args.grep)
+        if args.wikilink_fixture:
+            fixture.create_wikilink_vault()
+        code = fixture.run_browser(frontend, node, browser, args.spec, args.grep,
+                                   args.browser_timeout)
     raise SystemExit(code)
 
 

@@ -56,6 +56,8 @@ function isTemplate(n: Note): boolean {
 /** Loaded notes for one vault plus its true size (nw-648). */
 interface VaultNotes {
   notes: Note[];
+  /** Scanned page extent, retained across refresh even when rows are deleted. */
+  pagesLoaded: number;
   /** The vault's real note count: vault inventory first, page header second. */
   total: number;
   /** The server has no notes after the last loaded page. */
@@ -74,6 +76,12 @@ function errorMessage(e: unknown, fallback: string): string {
 }
 
 export function NotesTab() {
+  const graphEpoch = useStore((s) => s.graphEpoch);
+  const workspaceId = useStore((s) => s.activeWorkspaceId);
+  const catalogSeq = useRef(0);
+  const loadedWorkspace = useRef<string | null>(null);
+  const errorWorkspace = useRef<string | null>(null);
+  const loadedPages = useRef<Record<string, VaultNotes>>({});
   const exploreNode = useStore((s) => s.exploreNode);
   const selectNode = useStore((s) => s.selectNode);
 
@@ -96,15 +104,32 @@ export function NotesTab() {
   // each loads its own first page through the vault filter, and one vault's
   // failure is shown on that vault instead of blanking the tab.
   useEffect(() => {
+    const sequence = ++catalogSeq.current;
     let cancelled = false;
+    const current = () => !cancelled && sequence === catalogSeq.current && useStore.getState().graphEpoch === graphEpoch && useStore.getState().activeWorkspaceId === workspaceId;
+    const previous = loadedWorkspace.current === workspaceId ? loadedPages.current : {};
     setLoading(true);
     setError(null);
     Promise.all([api.brainVaults(), api.brainTags()])
       .then(async ([v, t]) => {
         const pages = await Promise.allSettled(
-          v.map((vault) => api.brainNotesPage(vault.uid)),
+          v.map(async (vault) => {
+            const target = Math.max(1, previous[vault.uid]?.pagesLoaded ?? 1);
+            let page = await api.brainNotesPage(vault.uid);
+            const notes = [...page.notes];
+            let pagesLoaded = 1;
+            const cursors = new Set<string>();
+            while (current() && pagesLoaded < target && page.nextAfter !== null) {
+              if (cursors.has(page.nextAfter)) throw new Error("Notes cursor did not advance");
+              cursors.add(page.nextAfter);
+              page = await api.brainNotesPage(vault.uid, page.nextAfter);
+              notes.push(...page.notes);
+              pagesLoaded += 1;
+            }
+            return { ...page, notes, pagesLoaded };
+          }),
         );
-        if (cancelled) return;
+        if (!current()) return;
         const loaded: Record<string, VaultNotes> = {};
         v.forEach((vault, i) => {
           const result = pages[i];
@@ -112,6 +137,7 @@ export function NotesTab() {
             const page = result.value;
             loaded[vault.uid] = {
               notes: page.notes,
+              pagesLoaded: page.pagesLoaded,
               total: vault.note_count ?? page.total ?? page.notes.length,
               exhausted: page.nextAfter === null,
               nextAfter: page.nextAfter,
@@ -120,33 +146,48 @@ export function NotesTab() {
             };
           } else {
             loaded[vault.uid] = {
-              notes: [],
+              notes: previous[vault.uid]?.notes ?? [],
+              pagesLoaded: previous[vault.uid]?.pagesLoaded ?? 0,
               total: vault.note_count ?? 0,
-              exhausted: false,
-              nextAfter: null,
+              exhausted: previous[vault.uid]?.exhausted ?? false,
+              nextAfter: previous[vault.uid]?.nextAfter ?? null,
               loadingMore: false,
               error: errorMessage(result.reason, "Failed to load this vault's notes"),
             };
           }
         });
+        loadedWorkspace.current = workspaceId;
+        loadedPages.current = loaded;
         setVaults(v);
         setByVault(loaded);
         setTags(t);
       })
       .catch((e) => {
-        if (!cancelled) setError(errorMessage(e, "Failed to load notes"));
+        if (current()) {
+          errorWorkspace.current = workspaceId;
+          setError(errorMessage(e, "Failed to load notes"));
+          // The epoch invalidated outstanding page callbacks. Retain useful
+          // rows and cursors, but release their obsolete request busy state.
+          setByVault((previous) => current()
+            ? Object.fromEntries(Object.entries(previous).map(([uid, entry]) => [uid, { ...entry, loadingMore: false }]))
+            : previous);
+        }
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (current()) setLoading(false);
       });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [graphEpoch, workspaceId]);
+
+  useEffect(() => { loadedPages.current = byVault; }, [byVault]);
 
   const loadMore = (vaultUid: string) => {
+    const sequence = catalogSeq.current;
+    const isCurrent = () => sequence === catalogSeq.current && useStore.getState().graphEpoch === graphEpoch && useStore.getState().activeWorkspaceId === workspaceId;
     const current = byVault[vaultUid];
-    if (!current || current.loadingMore) return;
+    if (!current || current.loadingMore || loading) return;
     // No cursor yet (the first page failed) retries the first page.
     const after = current.nextAfter ?? undefined;
     setByVault((prev) => ({
@@ -156,12 +197,14 @@ export function NotesTab() {
     api
       .brainNotesPage(vaultUid, after)
       .then((page) => {
+        if (!isCurrent()) return;
         const exhausted = page.nextAfter === null;
         setByVault((prev) => ({
           ...prev,
           [vaultUid]: {
             ...prev[vaultUid],
             notes: [...prev[vaultUid].notes, ...page.notes],
+            pagesLoaded: prev[vaultUid].pagesLoaded + 1,
             exhausted,
             nextAfter: page.nextAfter,
             loadingMore: false,
@@ -174,7 +217,8 @@ export function NotesTab() {
           setFocusAfterLoad({ vaultUid, noteUid: first?.uid ?? null });
         }
       })
-      .catch((e) =>
+      .catch((e) => {
+        if (!isCurrent()) return;
         setByVault((prev) => ({
           ...prev,
           [vaultUid]: {
@@ -182,8 +226,8 @@ export function NotesTab() {
             loadingMore: false,
             error: errorMessage(e, "Failed to load more notes"),
           },
-        })),
-      );
+        }));
+      });
   };
 
   useEffect(() => {
@@ -225,7 +269,7 @@ export function NotesTab() {
   const totalNotes = Object.values(byVault).reduce((sum, v) => sum + v.total, 0);
   const anyVaultError = Object.values(byVault).some((v) => v.error);
 
-  if (loading) {
+  if (loadedWorkspace.current !== workspaceId && !(error && errorWorkspace.current === workspaceId)) {
     return (
       <div className="flex h-full items-center justify-center text-sm text-[var(--color-text-muted)]">
         Loading...
@@ -233,7 +277,7 @@ export function NotesTab() {
     );
   }
 
-  if (error) {
+  if (error && errorWorkspace.current === workspaceId && loadedWorkspace.current !== workspaceId) {
     return (
       <div className="flex h-full items-center justify-center p-4 text-sm text-red-500">
         {error}
@@ -251,6 +295,7 @@ export function NotesTab() {
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
+      {error && errorWorkspace.current === workspaceId && <div role="alert" className="p-2 text-xs text-red-500">{error}</div>}
       {/* Search input */}
       <div className="border-b border-[var(--color-border)] p-2">
         <input
@@ -345,8 +390,8 @@ export function NotesTab() {
                     <button
                       type="button"
                       onClick={() => loadMore(vault.uid)}
-                      aria-busy={entry.loadingMore}
-                      aria-disabled={entry.loadingMore}
+                      aria-busy={loading || entry.loadingMore}
+                      aria-disabled={loading || entry.loadingMore}
                       className="text-[var(--color-graph-selection)] hover:underline aria-disabled:opacity-50"
                     >
                       {entry.loadingMore ? "Loading..." : entry.error ? "Retry" : "Load more"}

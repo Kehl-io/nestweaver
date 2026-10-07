@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::Json;
@@ -11,10 +12,53 @@ use crate::error::ApiError;
 use crate::rank_events::with_rank_event;
 use crate::state::AppState;
 
-pub async fn list_repos(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
-    let repos = nestweaver_engine::list_repos(&state.store, None)?;
-    let json = serde_json::to_value(&repos)?;
-    Ok(Json(json).into_response())
+#[derive(Deserialize)]
+pub struct RepoListParams {
+    pub workspace: Option<String>,
+    pub scope: Option<String>,
+}
+
+pub async fn list_repos(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<RepoListParams>,
+) -> Result<Response, ApiError> {
+    tokio::task::spawn_blocking(move || {
+        use crate::routes::workspaces::{WorkspaceKind, resolve_workspace, workspace_param};
+
+        let workspace = resolve_workspace(
+            &state.store,
+            workspace_param(params.workspace.as_deref(), params.scope.as_deref()),
+        )?;
+        let mut repos = nestweaver_engine::list_repos(&state.store, None)?;
+        match workspace.kind {
+            WorkspaceKind::All => {}
+            WorkspaceKind::Repo => {
+                repos.retain(|repo| workspace.uid.as_deref() == Some(repo.uid.as_str()));
+            }
+            WorkspaceKind::Project => {
+                let members: HashSet<String> = state
+                    .store
+                    .project_display_repo_uids(workspace.uid.as_deref().unwrap_or_default())?
+                    .into_iter()
+                    .collect();
+                repos.retain(|repo| members.contains(&repo.uid));
+            }
+            WorkspaceKind::Vault => repos.clear(),
+        }
+        // Scope cheap local membership reads before source freshness work.
+        let freshness = state.repo_freshness(&repos);
+        let payload = repos
+            .iter()
+            .map(|repo| {
+                let mut value = serde_json::to_value(repo)?;
+                value["freshness"] = serde_json::to_value(freshness.get(&repo.uid))?;
+                Ok(value)
+            })
+            .collect::<Result<Vec<serde_json::Value>, serde_json::Error>>()?;
+        Ok(Json(payload).into_response())
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?
 }
 
 pub async fn list_services(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {

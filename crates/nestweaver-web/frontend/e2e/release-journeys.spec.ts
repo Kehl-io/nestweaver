@@ -101,6 +101,8 @@ for (const firstContext of ["loading", "ready"]) {
       await page.getByTestId("search-input").fill("releaseA");
       await page.getByRole("listbox", { name: "Search results" }).getByRole("option", { name: /releaseA/ }).first().click();
       await sceneCaptured;
+      // Symbol metadata and scene context are independent requests.
+      await expect(page.getByTestId("detail-panel").getByText("releaseA", { exact: true }).first()).toBeVisible();
       await page.getByRole("tablist", { name: "Result representation" })
         .getByRole("tab", { name: "JSON representation", exact: true }).click();
       await page.getByRole("button", { name: "Compare", exact: true }).first().click();

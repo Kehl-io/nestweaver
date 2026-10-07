@@ -20,10 +20,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use tantivy::collector::{Collector, SegmentCollector, TopDocs};
+use tantivy::collector::{Collector, Count, SegmentCollector, TopDocs};
 use tantivy::directory::error::LockError;
 use tantivy::directory::{Directory, DirectoryLock, Lock, MmapDirectory};
-use tantivy::query::{Query, QueryParser};
+use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery, TermSetQuery};
 use tantivy::schema::{Field, STORED, STRING, Schema, TEXT, Value};
 use tantivy::store::StoreReader;
 use tantivy::{
@@ -891,6 +891,55 @@ impl TantivyIndex {
             &TopDocs::with_limit(limit).order_by_score(),
         )?;
         self.decode_hits(&searcher, top)
+    }
+
+    /// Filter document membership before ranking and limiting. The count is
+    /// matching search documents (notes, headings, sections), not unique notes.
+    pub fn search_note_scope(
+        &self,
+        query: &str,
+        limit: usize,
+        vault_uid: Option<&str>,
+        note_uids: Option<&[String]>,
+    ) -> Result<(Vec<SearchHit>, usize), TantivyError> {
+        validate_presentation_limit(limit)?;
+        self.ensure_reopen_not_required()?;
+        let Some(parsed) = self.parse_query(query) else {
+            return Ok((Vec::new(), 0));
+        };
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![(Occur::Must, parsed)];
+        if let Some(vault) = vault_uid {
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.vault_uid, vault),
+                    tantivy::schema::IndexRecordOption::Basic,
+                )),
+            ));
+        }
+        if let Some(notes) = note_uids {
+            if notes.is_empty() {
+                return Ok((Vec::new(), 0));
+            }
+            clauses.push((
+                Occur::Must,
+                Box::new(TermSetQuery::new(
+                    notes
+                        .iter()
+                        .map(|uid| Term::from_field_text(self.fields.note_uid, uid)),
+                )),
+            ));
+        }
+        let query = BooleanQuery::new(clauses);
+        let searcher = self.current_searcher();
+        if limit == 0 {
+            return Ok((Vec::new(), searcher.search(&query, &Count)?));
+        }
+        let (total, top) = searcher.search(
+            &query,
+            &(Count, TopDocs::with_limit(limit).order_by_score()),
+        )?;
+        Ok((self.decode_hits(&searcher, top)?, total))
     }
 
     /// BM25 search with a logical-entity total independent of `limit`.
@@ -1965,6 +2014,65 @@ mod tests {
     use super::*;
     use nestweaver_schema::{Heading, Note, NoteKind, Section, Tag, Vault};
     use tempfile::tempdir;
+
+    #[test]
+    fn review_note_scope_counts_and_limits_only_owning_documents() {
+        let temp = tempdir().unwrap();
+        let index = TantivyIndex::open_or_create(temp.path()).unwrap();
+        index
+            .update_note(
+                "note:foreign",
+                "needle",
+                "vlt:foreign",
+                &["needle".into()],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        index
+            .update_note(
+                "note:selected",
+                "Target",
+                "vlt:selected",
+                &["needle".into()],
+                &[("heading:selected".into(), "needle".into())],
+                &[("section:selected".into(), "needle".into(), "needle".into())],
+                &[],
+            )
+            .unwrap();
+        let members = vec!["note:selected".to_string()];
+        let (all, total) = index
+            .search_note_scope("needle", 10, None, Some(&members))
+            .unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|hit| hit.note_uid == "note:selected"));
+        let (prefix, total) = index
+            .search_note_scope("needle", 1, Some("vlt:selected"), Some(&members))
+            .unwrap();
+        assert_eq!(prefix.len(), 1);
+        assert_eq!(total, 3);
+        let (empty, total) = index
+            .search_note_scope("needle", 0, None, Some(&members))
+            .unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(total, 3);
+        assert_eq!(
+            index
+                .search_note_scope("needle", 10, None, Some(&[]))
+                .unwrap()
+                .1,
+            0
+        );
+        assert_eq!(
+            index
+                .search_note_scope("needle", 10, Some("vlt:foreign"), Some(&members))
+                .unwrap()
+                .1,
+            0
+        );
+    }
 
     fn add_raw_document(idx: &TantivyIndex, uid: &str, kind: &str, note_uid: &str, text: &str) {
         let mut writer = idx.writer.as_ref().unwrap().lock().unwrap();

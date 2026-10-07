@@ -110,14 +110,16 @@ pub enum ReferenceKind {
     /// usual [`ReferenceKind::Import`] reference for `a::b` plus one
     /// `ImportAlias` reference whose `name` is the alias (`c`) and whose
     /// `context` is the full original import path (`a::b`). The resolver
-    /// turns these into named bindings so calls to the alias resolve to the
-    /// original item.
+    /// turns these into named bindings so calls resolve to the original item.
+    /// JS/TS/Python store the module in `context` and the original name (or
+    /// namespace `*`) in `receiver`.
     ImportAlias,
     /// nw-688: a local name a JS/TS file binds from a PACKAGE (non-relative)
     /// specifier — `isEmpty` in `import { isEmpty } from 'lodash'` or
     /// `const { isEmpty } = require('lodash')`. `name` is the local binding,
     /// `context` the specifier. Resolution ignores it; the cross-repo name
-    /// matcher uses it to leave npm-package calls unattributed.
+    /// matcher uses it to leave npm-package calls unattributed. Go uses this
+    /// fact for the declared package name, distinguishing external test packages.
     PackageBinding,
     Extends,
     Implements,
@@ -133,6 +135,10 @@ pub enum ReferenceKind {
     /// A use of this name inside the enclosing symbol names the binding, not
     /// an unrelated symbol of the same name.
     LocalBinding,
+    /// Exact public export. `name` is the public name (including `default`),
+    /// `context` is the local declaration or original forwarded name, and
+    /// `receiver` is the source module for a named re-export. Not an edge.
+    ExportAlias,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,8 +162,21 @@ pub struct RawSymbol {
     pub scope_chain: Option<String>,
 }
 
+/// Byte positions for JS/TS lexical binding selection, including same-line scopes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexicalScope {
+    pub start: usize,
+    pub end: usize,
+    pub position: usize,
+    pub initialized_at: usize,
+    #[serde(default)]
+    pub hoisted_var: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawReference {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<LexicalScope>,
     pub name: String,
     pub kind: ReferenceKind,
     pub start_line: u32,
@@ -177,6 +196,8 @@ pub enum AstBindingKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AstTypeBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<LexicalScope>,
     pub var_name: String,
     pub type_name: String,
     pub line: u32,
@@ -698,6 +719,23 @@ fn expand_rust_use_imports(
     source: &[u8],
     references: &mut Vec<RawReference>,
 ) {
+    let before = references.len();
+    expand_rust_use_paths(node, source, references);
+    let scope = lexical_scope(*node).map(|mut scope| {
+        scope.initialized_at = scope.start;
+        scope
+    });
+    for reference in &mut references[before..] {
+        reference.scope = scope;
+    }
+}
+
+/// Flatten paths and aliases without constructing unused lexical metadata.
+fn expand_rust_use_paths(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    references: &mut Vec<RawReference>,
+) {
     let context = node
         .utf8_text(source)
         .map(first_line)
@@ -719,9 +757,10 @@ fn expand_rust_use_tree(
 ) {
     let text = node.utf8_text(source).unwrap_or("").trim();
     match node.kind() {
-        "identifier" | "scoped_identifier" | "crate" => {
+        "identifier" | "scoped_identifier" | "crate" | "super" => {
             if !text.is_empty() {
                 references.push(RawReference {
+                    scope: None,
                     name: format!("{prefix}{text}"),
                     kind: ReferenceKind::Import,
                     start_line: node.start_position().row as u32 + 1,
@@ -733,6 +772,7 @@ fn expand_rust_use_tree(
         // `use a::b::{self, c};` — `self` imports the path `a::b` itself.
         "self" if !prefix.is_empty() => {
             references.push(RawReference {
+                scope: None,
                 name: prefix.trim_end_matches("::").to_string(),
                 kind: ReferenceKind::Import,
                 start_line: node.start_position().row as u32 + 1,
@@ -756,6 +796,7 @@ fn expand_rust_use_tree(
                     if !alias_text.is_empty() {
                         let specifier = references[before].name.clone();
                         references.push(RawReference {
+                            scope: None,
                             name: alias_text.to_string(),
                             kind: ReferenceKind::ImportAlias,
                             start_line: node.start_position().row as u32 + 1,
@@ -767,12 +808,16 @@ fn expand_rust_use_tree(
             }
         }
         "use_wildcard" => {
+            let before = references.len();
             // `use a::*;` — record the module path itself so imports of the
             // module resolve and wildcard members resolve through them.
             for i in 0..node.named_child_count() {
                 if let Some(child) = node.named_child(i as u32) {
                     expand_rust_use_tree(&child, prefix, source, context, references);
                 }
+            }
+            for reference in &mut references[before..] {
+                reference.receiver = Some("*".into());
             }
         }
         "use_list" => {
@@ -839,7 +884,21 @@ fn infer_visibility(name: &str, node_text: &str, lang: Language, exported: bool)
         | Language::Svelte
         | Language::Astro => {
             let sig = first_line(node_text);
-            if exported || sig.contains("export ") {
+            if (matches!(
+                sig.split_whitespace().next(),
+                Some("private" | "protected" | "static")
+            ) && sig
+                .split('(')
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .rev()
+                .skip(1)
+                .any(|token| matches!(token, "private" | "protected")))
+                || name.starts_with('#')
+            {
+                Visibility::Private
+            } else if exported || sig.contains("export ") {
                 Visibility::Public
             } else {
                 Visibility::Private
@@ -1256,6 +1315,17 @@ fn find_parent_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
                     .map(|s| s.to_string());
             }
             // JS/TS/Java/C#/Dart/PHP/Python/Ruby: class Name { ... }
+            "object" => {
+                if let Some(declaration) = parent
+                    .parent()
+                    .filter(|node| node.kind() == "variable_declarator")
+                {
+                    return declaration
+                        .child_by_field_name("name")
+                        .and_then(|name| name.utf8_text(source).ok())
+                        .map(str::to_string);
+                }
+            }
             "class_declaration" | "class_definition" => {
                 return parent
                     .child_by_field_name("name")
@@ -1431,15 +1501,29 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
 
     let mut cursor = QueryCursor::new();
     let source_bytes = source.as_bytes();
+    // Field, constructor, tuple and output-reference evidence share one
+    // within-tree lexical inventory; append order remains unchanged below.
+    let share_locals = matches!(
+        lang,
+        Language::Rust | Language::JavaScript | Language::TypeScript
+    );
+    let mut local_bindings = Vec::new();
+    if share_locals {
+        collect_local_bindings(tree.root_node(), source_bytes, &mut local_bindings, lang);
+    }
+    let js_field_inventory = matches!(lang, Language::JavaScript | Language::TypeScript)
+        .then(|| JsFieldInventory::new(tree.root_node(), source_bytes, &local_bindings));
+    let commonjs_object_methods =
+        collect_commonjs_object_methods(lang, tree.root_node(), source_bytes, &local_bindings);
+    let commonjs_exported_locals = collect_commonjs_reexport_names(
+        lang,
+        tree.root_node(),
+        source_bytes,
+        &commonjs_object_methods,
+    );
     let exported_locals = if matches!(lang, Language::JavaScript | Language::TypeScript) {
         let mut names = collect_export_clause_names(tree.root_node(), source_bytes);
-        // CommonJS assignments to `module.exports` (with or without a
-        // property) and `exports.X` re-export local bindings.
-        names.extend(collect_commonjs_reexport_names(
-            lang,
-            tree.root_node(),
-            source_bytes,
-        ));
+        names.extend(commonjs_exported_locals.iter().copied());
         names
     } else {
         std::collections::HashSet::new()
@@ -1668,6 +1752,19 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     continue;
                 }
 
+                // Arrow/function-valued class fields are callable members.
+                // Normalize the existing field capture instead of creating a
+                // duplicate declaration with a second query rule.
+                if matches!(lang, Language::JavaScript | Language::TypeScript)
+                    && kind == SymbolKind::Property
+                    && matches!(node.kind(), "field_definition" | "public_field_definition")
+                    && node.child_by_field_name("value").is_some_and(|value| {
+                        matches!(value.kind(), "arrow_function" | "function_expression")
+                    })
+                {
+                    kind = SymbolKind::Method;
+                }
+
                 let content_hash = sha256_hex(node_text);
                 let signature = signature_line(node_text, lang_str);
 
@@ -1675,9 +1772,18 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 // JS/TS test-runner block (test/it/describe). The calls inside its
                 // callback attach to this symbol; mark it a test entry point so it
                 // is reachable by regression-test selection regardless of filename.
-                let ep_kind = if exported_locals.contains(name.as_str())
-                    && is_local_runtime_declaration(node)
-                {
+                // ES visibility alone is not execution evidence. CommonJS API
+                // assignments retain their intentional public-entry-point policy.
+                let ep_kind = if commonjs_object_methods.contains(&node.start_byte())
+                    || commonjs_exported_locals.contains(name.as_str())
+                        && is_local_runtime_declaration(node)
+                    || (is_commonjs_export_assignment(lang, node, source_bytes)
+                        && node.parent().is_some_and(|parent| {
+                            parent.kind() == "expression_statement"
+                                && parent
+                                    .parent()
+                                    .is_some_and(|module| module.kind() == "program")
+                        })) {
                     Some(EntryPointKind::Main)
                 } else if node.kind() == "call_expression" {
                     Some(EntryPointKind::TestEntry)
@@ -1710,6 +1816,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     node_text,
                     lang,
                     has_export_ancestor(&node)
+                        || commonjs_object_methods.contains(&node.start_byte())
                         || (exported_locals.contains(name.as_str())
                             && is_local_runtime_declaration(node))
                         // nw-687 (review): `module.exports.X = function` /
@@ -1718,9 +1825,29 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                         // `export` keyword), so they need their own check.
                         || is_commonjs_export_assignment(lang, node, source_bytes),
                 );
-                let type_info = extract_type_info(&signature, lang);
+                let mut type_info = extract_type_info(&signature, lang);
+                if matches!(lang, Language::JavaScript | Language::TypeScript)
+                    && kind == SymbolKind::Property
+                    && matches!(
+                        node.kind(),
+                        "field_definition" | "public_field_definition" | "assignment_expression"
+                    )
+                    && let Some(declared_type) = js_field_inventory
+                        .as_ref()
+                        .and_then(|inventory| exact_js_field_type(node, source_bytes, inventory))
+                {
+                    type_info = Some(TypeInfo {
+                        declared_type: Some(declared_type),
+                        parameter_types: Vec::new(),
+                        return_type: None,
+                    });
+                }
                 let parent_name = if matches!(kind, SymbolKind::Method | SymbolKind::Property) {
-                    find_parent_name(&node, source_bytes)
+                    if commonjs_object_methods.contains(&node.start_byte()) {
+                        Some("module.exports".into())
+                    } else {
+                        find_parent_name(&node, source_bytes)
+                    }
                 } else {
                     None
                 };
@@ -1750,6 +1877,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 let kind = match kind_str {
                     "call" => ReferenceKind::Call,
                     "import" => ReferenceKind::Import,
+                    "package" => ReferenceKind::PackageBinding,
                     "extends" => ReferenceKind::Extends,
                     "implements" => ReferenceKind::Implements,
                     "includes" => ReferenceKind::Includes,
@@ -1898,12 +2026,30 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                         None
                     };
 
+                    // Swift has no `function` field on call_expression. The
+                    // navigation target is its first child, before the suffix.
+                    let from_swift_navigation = if lang == Language::Swift {
+                        let mut cursor = node.walk();
+                        node.named_children(&mut cursor)
+                            .find(|child| child.kind() == "navigation_expression")
+                            .and_then(|navigation| {
+                                navigation
+                                    .child_by_field_name("target")
+                                    .or_else(|| navigation.named_child(0))
+                            })
+                            .and_then(|target| target.utf8_text(source_bytes).ok())
+                            .map(|text| arena.alloc_str(text) as &str)
+                    } else {
+                        None
+                    };
+
                     // Convert the chosen arena-backed &str to an owned String only once,
                     // at the point where we need it for RawReference.
                     from_function_child
                         .or(from_direct_object)
                         .or(from_receiver_field)
                         .or(from_scoped_path)
+                        .or(from_swift_navigation)
                         .map(|s| s.to_string())
                 } else if matches!(kind, ReferenceKind::ReadAccess | ReferenceKind::WriteAccess) {
                     // nw-308: a FIELD ACCESS has a receiver too, and until this
@@ -1940,6 +2086,14 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 };
 
                 references.push(RawReference {
+                    scope: if matches!(
+                        lang,
+                        Language::JavaScript | Language::TypeScript | Language::Rust
+                    ) {
+                        lexical_scope(node)
+                    } else {
+                        None
+                    },
                     name,
                     kind,
                     start_line,
@@ -1951,9 +2105,18 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         }
     }
 
-    // nw-688: names bound from package (non-relative) specifiers.
+    // Preserve exact import bindings as well as package exclusions.
     if matches!(lang, Language::JavaScript | Language::TypeScript) {
-        collect_js_package_bindings(tree.root_node(), source_bytes, &mut references);
+        collect_js_import_bindings(
+            tree.root_node(),
+            source_bytes,
+            &mut references,
+            &commonjs_object_methods,
+        );
+        annotate_js_export_receivers(tree.root_node(), source_bytes, &references, &mut symbols);
+    }
+    if lang == Language::Python {
+        collect_python_import_bindings(tree.root_node(), source_bytes, &mut references);
     }
 
     // nw-151: recover calls written inside Rust macro bodies.
@@ -1962,7 +2125,11 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     }
 
     // nw-724: parameters and local declarations shadow same-named symbols.
-    collect_local_bindings(tree.root_node(), source_bytes, &mut references);
+    if share_locals {
+        references.extend(local_bindings.iter().cloned());
+    } else {
+        collect_local_bindings(tree.root_node(), source_bytes, &mut references, lang);
+    }
 
     // nw-291 follow-up: recover constant/static reads written as a bare name.
     if let Some(rules) = constant_read_rules(lang) {
@@ -2042,7 +2209,8 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     }
 
     // Type extraction: walk the same tree with type-specific queries
-    let type_bindings = extract_types_from_tree(&tree, &ts_lang, source_bytes, lang);
+    let type_bindings =
+        extract_types_from_tree(&tree, &ts_lang, source_bytes, lang, &local_bindings);
 
     Ok(ParsedFile {
         path: path.to_string_lossy().into_owned(),
@@ -2210,6 +2378,7 @@ fn collect_commonjs_reexport_names<'a>(
     lang: Language,
     root: tree_sitter::Node<'a>,
     source_bytes: &'a [u8],
+    commonjs_object_methods: &std::collections::HashSet<usize>,
 ) -> std::collections::HashSet<&'a str> {
     let mut names = std::collections::HashSet::new();
     if !matches!(lang, Language::JavaScript | Language::TypeScript) {
@@ -2217,7 +2386,13 @@ fn collect_commonjs_reexport_names<'a>(
     }
     let mut cursor = root.walk();
     for statement in root.named_children(&mut cursor) {
-        collect_commonjs_reexport_names_from(lang, statement, source_bytes, &mut names);
+        collect_commonjs_reexport_names_from(
+            lang,
+            statement,
+            source_bytes,
+            &mut names,
+            commonjs_object_methods,
+        );
     }
     names
 }
@@ -2233,6 +2408,7 @@ fn collect_commonjs_reexport_names_from<'a>(
     statement: tree_sitter::Node<'a>,
     source_bytes: &'a [u8],
     names: &mut std::collections::HashSet<&'a str>,
+    commonjs_object_methods: &std::collections::HashSet<usize>,
 ) {
     match statement.kind() {
         "expression_statement" => {
@@ -2259,6 +2435,17 @@ fn collect_commonjs_reexport_names_from<'a>(
             {
                 return;
             }
+            for (_, local) in
+                commonjs_object_exports(assignment, source_bytes, commonjs_object_methods)
+            {
+                // Literal method keys identify their own declaration, not a
+                // same-named module-local identifier.
+                if local.kind() != "property_identifier"
+                    && let Ok(name) = local.utf8_text(source_bytes)
+                {
+                    names.insert(name);
+                }
+            }
             if let Some(right) = assignment.child_by_field_name("right")
                 && right.kind() == "identifier"
                 && let Ok(name) = right.utf8_text(source_bytes)
@@ -2269,19 +2456,190 @@ fn collect_commonjs_reexport_names_from<'a>(
         "statement_block" | "else_clause" => {
             let mut cursor = statement.walk();
             for child in statement.named_children(&mut cursor) {
-                collect_commonjs_reexport_names_from(lang, child, source_bytes, names);
+                collect_commonjs_reexport_names_from(
+                    lang,
+                    child,
+                    source_bytes,
+                    names,
+                    commonjs_object_methods,
+                );
             }
         }
         "if_statement" => {
             if let Some(consequence) = statement.child_by_field_name("consequence") {
-                collect_commonjs_reexport_names_from(lang, consequence, source_bytes, names);
+                collect_commonjs_reexport_names_from(
+                    lang,
+                    consequence,
+                    source_bytes,
+                    names,
+                    commonjs_object_methods,
+                );
             }
             if let Some(alternative) = statement.child_by_field_name("alternative") {
-                collect_commonjs_reexport_names_from(lang, alternative, source_bytes, names);
+                collect_commonjs_reexport_names_from(
+                    lang,
+                    alternative,
+                    source_bytes,
+                    names,
+                    commonjs_object_methods,
+                );
             }
         }
         _ => {}
     }
+}
+
+/// Build exact CommonJS method evidence once per file, sharing lexical
+/// shadow checks with symbol and export processing.
+fn collect_commonjs_object_methods(
+    lang: Language,
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    bindings: &[RawReference],
+) -> std::collections::HashSet<usize> {
+    let mut methods = std::collections::HashSet::new();
+    if !matches!(lang, Language::JavaScript | Language::TypeScript) {
+        return methods;
+    }
+    let module_scopes: Vec<_> = bindings
+        .iter()
+        .filter(|binding| binding.name == "module")
+        .filter_map(|binding| binding.scope)
+        .collect();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if is_direct_commonjs_object_method(lang, node, source) {
+            let assignment = node
+                .parent()
+                .and_then(|object| object.parent())
+                .expect("validated export assignment");
+            let at = assignment.start_byte();
+            if !module_scopes
+                .iter()
+                .any(|scope| scope.start <= at && at < scope.end)
+            {
+                methods.insert(node.start_byte());
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    methods
+}
+
+/// A shorthand method is an exact public member only in the immediate
+/// top-level CommonJS export object. Getters, setters and computed keys are
+/// not callable export declarations.
+fn is_direct_commonjs_object_method(
+    lang: Language,
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> bool {
+    if !matches!(lang, Language::JavaScript | Language::TypeScript)
+        || node.kind() != "method_definition"
+        || node
+            .child_by_field_name("name")
+            .is_none_or(|name| name.kind() != "property_identifier")
+    {
+        return false;
+    }
+    let mut cursor = node.walk();
+    if node
+        .children(&mut cursor)
+        .any(|child| matches!(child.kind(), "get" | "set"))
+    {
+        return false;
+    }
+    let Some(object) = node.parent().filter(|parent| parent.kind() == "object") else {
+        return false;
+    };
+    let Some(assignment) = object
+        .parent()
+        .filter(|parent| parent.kind() == "assignment_expression")
+    else {
+        return false;
+    };
+    if assignment.child_by_field_name("right") != Some(object)
+        || !assignment.parent().is_some_and(|statement| {
+            statement.kind() == "expression_statement"
+                && statement
+                    .parent()
+                    .is_some_and(|root| root.kind() == "program")
+        })
+    {
+        return false;
+    }
+    assignment.child_by_field_name("left").is_some_and(|left| {
+        left.kind() == "member_expression"
+            && left.child_by_field_name("object").is_some_and(|object| {
+                object.kind() == "identifier" && object.utf8_text(source) == Ok("module")
+            })
+            && left
+                .child_by_field_name("property")
+                .is_some_and(|property| {
+                    property.kind() == "property_identifier"
+                        && property.utf8_text(source) == Ok("exports")
+                })
+    })
+}
+
+/// Literal CommonJS object exports refer to existing local values. A property
+/// key alone (e.g. `bogus: 42`) is not evidence that a local `bogus` is exported.
+fn commonjs_object_exports<'a>(
+    assignment: tree_sitter::Node<'a>,
+    source: &[u8],
+    commonjs_object_methods: &std::collections::HashSet<usize>,
+) -> Vec<(String, tree_sitter::Node<'a>)> {
+    if assignment.kind() != "assignment_expression" {
+        return Vec::new();
+    }
+    let Some(left) = assignment
+        .child_by_field_name("left")
+        .filter(|node| node.kind() == "member_expression")
+    else {
+        return Vec::new();
+    };
+    let direct = left
+        .child_by_field_name("object")
+        .is_some_and(|node| node.kind() == "identifier" && node.utf8_text(source) == Ok("module"))
+        && left
+            .child_by_field_name("property")
+            .is_some_and(|node| node.utf8_text(source) == Ok("exports"));
+    if !direct {
+        return Vec::new();
+    }
+    let Some(object) = assignment
+        .child_by_field_name("right")
+        .filter(|node| node.kind() == "object")
+    else {
+        return Vec::new();
+    };
+    let mut exports = Vec::new();
+    let mut cursor = object.walk();
+    for property in object.named_children(&mut cursor) {
+        match property.kind() {
+            "shorthand_property_identifier" => {
+                exports.push((property.utf8_text(source).unwrap_or("").into(), property))
+            }
+            "method_definition" if commonjs_object_methods.contains(&property.start_byte()) => {
+                if let Some(name) = property.child_by_field_name("name") {
+                    exports.push((name.utf8_text(source).unwrap_or("").into(), name));
+                }
+            }
+            "pair" => {
+                if let (Some(key), Some(value)) = (
+                    property.child_by_field_name("key"),
+                    property.child_by_field_name("value"),
+                ) && matches!(key.kind(), "property_identifier" | "string")
+                    && value.kind() == "identifier"
+                {
+                    exports.push((strip_quotes(key.utf8_text(source).unwrap_or("")), value));
+                }
+            }
+            _ => {}
+        }
+    }
+    exports
 }
 
 /// Rust macros that REGISTER functions as harness entry points, whose argument
@@ -2574,6 +2932,7 @@ fn collect_calls_in_token_tree(
                 // bare call. The receiver is the tokens before the `.` or
                 // `::`, so the resolver can refuse an unrelated `fn len`.
                 references.push(RawReference {
+                    scope: lexical_scope(*child),
                     name: name.to_string(),
                     kind: if macro_call {
                         ReferenceKind::Macro
@@ -2602,6 +2961,8 @@ fn collect_calls_in_token_tree(
 /// the same with `::` (one token, or two `:` tokens). The returned text is
 /// the last segment before the separator (`items`, `Vec`), which is what the
 /// resolver's receiver gate compares to a file stem or a declaring type.
+/// Nonidentifier operands retain their expression text because their result
+/// type is unknown; they must not become receiver-less calls.
 /// A bare `helper()` has no separator and returns `None`.
 fn token_tree_receiver(
     children: &[tree_sitter::Node<'_>],
@@ -2612,9 +2973,28 @@ fn token_tree_receiver(
         return None;
     }
     let separator = children[index - 1].kind();
-    let method = separator == "." || separator == "::" || separator == ":";
+    let method = separator == "."
+        || separator == "::"
+        || (separator == ":" && index >= 2 && children[index - 2].kind() == ":");
     if !method {
         return None;
+    }
+    if index >= 2 && !matches!(children[index - 2].kind(), "identifier" | ":" | "::") {
+        // Call results, groups, literals, tuple fields, and postfix operands
+        // are still receivers. Keep their source expression instead of letting
+        // an unknown result type turn `.method()` into a bare call.
+        let mut start = index - 2;
+        while start > 0
+            && (children[start - 1].is_named()
+                || matches!(children[start - 1].kind(), "." | ":" | "::" | "!" | "?"))
+        {
+            start -= 1;
+        }
+        return std::str::from_utf8(
+            &source_bytes[children[start].start_byte()..children[index - 1].start_byte()],
+        )
+        .ok()
+        .map(|text| text.trim().to_string());
     }
     let mut cursor = index - 1;
     while cursor > 0 {
@@ -2636,17 +3016,26 @@ fn token_tree_receiver(
     segments.last().map(|segment| (*segment).to_string())
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_LOCAL_BINDING_WALK_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_NAMED_IMPORT_SELECTION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Record parameters and local declarations so a call of that name is not
 /// resolved to an unrelated symbol (nw-724).
 fn collect_local_bindings(
     root: tree_sitter::Node<'_>,
     source_bytes: &[u8],
     references: &mut Vec<RawReference>,
+    lang: Language,
 ) {
+    #[cfg(test)]
+    TEST_LOCAL_BINDING_WALK_COUNT.with(|count| count.set(count.get() + 1));
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if is_local_binding_site(node.kind()) {
-            emit_binding_names(node, source_bytes, references);
+            emit_binding_names(node, source_bytes, references, lang);
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
@@ -2659,6 +3048,8 @@ fn is_local_binding_site(kind: &str) -> bool {
     matches!(
         kind,
         "parameter"
+            | "parameters"
+            | "formal_parameters"
             | "formal_parameter"
             | "required_parameter"
             | "optional_parameter"
@@ -2678,6 +3069,7 @@ fn emit_binding_names(
     node: tree_sitter::Node<'_>,
     source_bytes: &[u8],
     references: &mut Vec<RawReference>,
+    lang: Language,
 ) {
     let root = match node.kind() {
         "let_declaration" | "for_expression" => node.child_by_field_name("pattern"),
@@ -2692,11 +3084,39 @@ fn emit_binding_names(
         if is_type_node(current.kind()) {
             continue;
         }
+        // Defaults are expressions, not binding names. Traverse only the
+        // pattern on the left so helper() in `arg = helper()` remains a use.
+        if matches!(
+            current.kind(),
+            "assignment_pattern"
+                | "object_assignment_pattern"
+                | "required_parameter"
+                | "optional_parameter"
+                | "default_parameter"
+                | "typed_default_parameter"
+        ) {
+            if let Some(left) = current
+                .child_by_field_name("left")
+                .or_else(|| current.child_by_field_name("pattern"))
+                .or_else(|| current.child_by_field_name("name"))
+            {
+                stack.push(left);
+            }
+            continue;
+        }
         if is_binding_identifier(current.kind())
             && let Ok(name) = current.utf8_text(source_bytes)
             && is_bindable_name(name)
         {
             references.push(RawReference {
+                scope: if matches!(
+                    lang,
+                    Language::JavaScript | Language::TypeScript | Language::Rust
+                ) {
+                    lexical_scope(current)
+                } else {
+                    None
+                },
                 name: name.to_string(),
                 kind: ReferenceKind::LocalBinding,
                 start_line: current.start_position().row as u32 + 1,
@@ -2710,6 +3130,67 @@ fn emit_binding_names(
             stack.push(child);
         }
     }
+}
+
+fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
+    let mut current = Some(node);
+    let mut function_scoped = false;
+    let mut hoisted_var = false;
+    let mut initialized_at = node.start_byte();
+    while let Some(parent) = current {
+        if matches!(parent.kind(), "variable_declarator" | "let_declaration") {
+            initialized_at = parent.end_byte();
+        }
+        if parent.kind() == "variable_declaration" {
+            function_scoped = true;
+            hoisted_var = true;
+        }
+        if matches!(
+            parent.kind(),
+            "formal_parameters"
+                | "required_parameter"
+                | "optional_parameter"
+                | "parameters"
+                | "parameter"
+                | "closure_parameters"
+        ) {
+            function_scoped = true;
+        }
+        if matches!(
+            parent.kind(),
+            "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "method_definition"
+                | "function_item"
+                | "closure_expression"
+        ) && function_scoped
+        {
+            return Some(LexicalScope {
+                start: parent.start_byte(),
+                end: parent.end_byte(),
+                position: node.start_byte(),
+                initialized_at,
+                hoisted_var,
+            });
+        }
+        if matches!(
+            parent.kind(),
+            "statement_block" | "block" | "declaration_list"
+        ) && !function_scoped
+            || matches!(parent.kind(), "program" | "source_file")
+        {
+            return Some(LexicalScope {
+                start: parent.start_byte(),
+                end: parent.end_byte(),
+                position: node.start_byte(),
+                initialized_at,
+                hoisted_var,
+            });
+        }
+        current = parent.parent();
+    }
+    None
 }
 
 fn is_type_node(kind: &str) -> bool {
@@ -2734,7 +3215,10 @@ fn is_type_node(kind: &str) -> bool {
 fn is_binding_identifier(kind: &str) -> bool {
     matches!(
         kind,
-        "identifier" | "simple_identifier" | "shorthand_field_identifier"
+        "identifier"
+            | "simple_identifier"
+            | "shorthand_field_identifier"
+            | "shorthand_property_identifier_pattern"
     )
 }
 
@@ -2840,6 +3324,7 @@ fn collect_constant_reads(
             && !is_own_definition_name(current, rules.definition_sites)
         {
             references.push(RawReference {
+                scope: None,
                 name: name.to_string(),
                 kind: ReferenceKind::ReadAccess,
                 start_line: current.start_position().row as u32 + 1,
@@ -2881,9 +3366,8 @@ fn is_own_definition_name(node: tree_sitter::Node<'_>, sites: &[(&str, &str)]) -
 fn type_query_source(lang: Language) -> Option<&'static str> {
     match lang {
         Language::Rust => Some(include_str!("../../../queries/rust_types.scm")),
-        Language::TypeScript | Language::JavaScript => {
-            Some(include_str!("../../../queries/typescript_types.scm"))
-        }
+        Language::TypeScript => Some(include_str!("../../../queries/typescript_types.scm")),
+        Language::JavaScript => Some(include_str!("../../../queries/javascript_types.scm")),
         Language::Java => Some(include_str!("../../../queries/java_types.scm")),
         Language::Python => Some(include_str!("../../../queries/python_types.scm")),
         Language::Go => Some(include_str!("../../../queries/go_types.scm")),
@@ -2933,11 +3417,502 @@ fn extract_base_type(full_type: &str) -> String {
     base.trim().to_string()
 }
 
+/// In-memory declaration evidence for seeding a resolved Rust free call's
+/// scalar return. This does not alter parsed-file serialization or cache shape.
+#[derive(Debug, Clone)]
+pub struct ScopedCallAssignment {
+    pub variable: String,
+    pub scope: LexicalScope,
+    pub line: u32,
+    pub callee: String,
+    pub receiver: Option<String>,
+    pub local_callee_line: Option<u32>,
+    pub local_callee_exists: bool,
+    pub import_positions: Vec<usize>,
+    pub import_paths: Vec<String>,
+    pub call_position: usize,
+    pub awaited: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScopedAliasAssignment {
+    pub variable: String,
+    pub scope: LexicalScope,
+    pub line: u32,
+    pub source: String,
+    pub source_position: usize,
+}
+
+/// Ephemeral lexical owner evidence; byte offsets never cross file boundaries.
+#[derive(Debug, Clone, Default)]
+pub struct ScopedRustTypeOrigin {
+    pub type_name: String,
+    pub line: u32,
+    pub local_line: Option<u32>,
+    pub position: usize,
+    pub local_position: Option<usize>,
+    pub ambiguous: bool,
+    pub imports: Vec<String>,
+    pub named_imports: Vec<String>,
+    pub named_import_positions: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScopedRustMethodOwner {
+    pub name: String,
+    pub line: u32,
+    pub class_position: usize,
+}
+
+/// Qualified call evidence joins the current module's exact use declaration.
+#[derive(Debug, Clone)]
+pub struct ScopedRustPathImports {
+    pub position: usize,
+    pub import_positions: Vec<usize>,
+}
+
+/// Identity of a type declared in the file's root or inline module.
+#[derive(Debug, Clone)]
+pub struct ScopedRustTypeDeclaration {
+    pub name: String,
+    pub module_path: Vec<String>,
+    pub line: u32,
+    pub position: usize,
+}
+
+/// An exact named type import between inline modules in one source file.
+#[derive(Debug, Clone)]
+pub struct ScopedRustInlineTypeImport {
+    pub specifier: String,
+    pub local_name: String,
+    pub original_name: String,
+    pub module_path: Vec<String>,
+    pub scope: LexicalScope,
+    pub line: u32,
+}
+
+/// Per-file lexical evidence retained only while resolving references.
+#[derive(Debug, Clone, Default)]
+pub struct ScopedRustEvidence {
+    pub call_assignments: Vec<ScopedCallAssignment>,
+    pub alias_assignments: Vec<ScopedAliasAssignment>,
+    pub local_declarations: Vec<RawReference>,
+    pub type_origins: Vec<ScopedRustTypeOrigin>,
+    pub method_owners: Vec<ScopedRustMethodOwner>,
+    pub path_imports: Vec<ScopedRustPathImports>,
+    pub public_root_uses: Vec<usize>,
+    pub module_types: Vec<ScopedRustTypeDeclaration>,
+    pub inline_type_imports: Vec<ScopedRustInlineTypeImport>,
+}
+
+fn rust_type_module_path(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<Vec<String>> {
+    let mut modules = Vec::new();
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        match parent.kind() {
+            "source_file" => {
+                modules.reverse();
+                return Some(modules);
+            }
+            "mod_item" => modules.push(
+                parent
+                    .child_by_field_name("name")?
+                    .utf8_text(source)
+                    .ok()?
+                    .into(),
+            ),
+            "declaration_list" => {}
+            _ => return None,
+        }
+        ancestor = parent.parent();
+    }
+    None
+}
+
+pub fn scoped_rust_assignment_evidence(
+    source: &str,
+    bindings: &[AstTypeBinding],
+) -> ScopedRustEvidence {
+    let mut parser = tree_sitter::Parser::new();
+    let language = build_ts_language(Language::Rust, Path::new("source.rs"));
+    if parser.set_language(&language).is_err() {
+        return Default::default();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Default::default();
+    };
+    let lexical_items = RustLexicalItems::new(tree.root_node(), source.as_bytes());
+    let mut result = Vec::new();
+    let mut aliases = Vec::new();
+    let mut method_owners = Vec::new();
+    let mut path_imports = Vec::new();
+    let mut public_root_uses = Vec::new();
+    let mut module_types = Vec::new();
+    let mut local_bindings = Vec::new();
+    collect_local_bindings(
+        tree.root_node(),
+        source.as_bytes(),
+        &mut local_bindings,
+        Language::Rust,
+    );
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "struct_item" | "enum_item")
+            && let Some(module_path) = rust_type_module_path(node, source.as_bytes())
+            && let Some(identifier) = node.child_by_field_name("name")
+            && let Ok(name) = identifier.utf8_text(source.as_bytes())
+        {
+            module_types.push(ScopedRustTypeDeclaration {
+                name: name.into(),
+                module_path,
+                line: node.start_position().row as u32 + 1,
+                position: identifier.start_byte(),
+            });
+        }
+        if node.kind() == "use_declaration"
+            && node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "source_file")
+        {
+            let mut cursor = node.walk();
+            if node.named_children(&mut cursor).any(|child| {
+                child.kind() == "visibility_modifier"
+                    && child.utf8_text(source.as_bytes()) == Ok("pub")
+            }) {
+                public_root_uses.push(node.start_byte());
+            }
+        }
+        if node.kind() == "call_expression"
+            && let Some(function) = node.child_by_field_name("function")
+            && function.kind() == "scoped_identifier"
+            && let Some(path) = function.child_by_field_name("path")
+            && path.kind() == "identifier"
+            && let Ok(name) = path.utf8_text(source.as_bytes())
+        {
+            path_imports.push(ScopedRustPathImports {
+                position: node.start_byte(),
+                import_positions: lexical_items
+                    .named_import_evidence(name, node)
+                    .iter()
+                    .filter_map(|import| import.scope.map(|scope| scope.position))
+                    .collect(),
+            });
+        }
+        if node.kind() == "function_item"
+            && let Some(implementation) = node.parent().and_then(|parent| parent.parent())
+            && implementation.kind() == "impl_item"
+            && let Some(ty) = implementation.child_by_field_name("type")
+            && ty.kind() == "type_identifier"
+            && let (Ok(ty), Some(name)) = (
+                ty.utf8_text(source.as_bytes()),
+                node.child_by_field_name("name"),
+            )
+            && let Ok(name) = name.utf8_text(source.as_bytes())
+            && let (_, Some(class_position), false) = lexical_items.visible_type(ty, implementation)
+        {
+            method_owners.push(ScopedRustMethodOwner {
+                name: name.into(),
+                line: node.start_position().row as u32 + 1,
+                class_position,
+            });
+        }
+        if node.kind() == "let_declaration"
+            && let (Some(name), Some(mut value)) = (
+                node.child_by_field_name("pattern"),
+                node.child_by_field_name("value"),
+            )
+            && name.kind() == "identifier"
+        {
+            if value.kind() == "identifier"
+                && let (Ok(variable), Ok(source_name), Some(scope)) = (
+                    name.utf8_text(source.as_bytes()),
+                    value.utf8_text(source.as_bytes()),
+                    lexical_scope(name),
+                )
+            {
+                aliases.push(ScopedAliasAssignment {
+                    variable: variable.into(),
+                    scope,
+                    line: name.start_position().row as u32 + 1,
+                    source: source_name.into(),
+                    source_position: value.start_byte(),
+                });
+            }
+            let awaited = value.kind() == "await_expression";
+            if awaited {
+                let mut cursor = value.walk();
+                let first = value.named_children(&mut cursor).next();
+                if let Some(inner) = first {
+                    value = inner;
+                }
+            }
+            if value.kind() == "call_expression"
+                && let Some(function) = value.child_by_field_name("function")
+                && let Some(callee) = if function.kind() == "identifier" {
+                    Some(function)
+                } else if function.kind() == "field_expression"
+                    && function
+                        .child_by_field_name("value")
+                        .is_some_and(|receiver| matches!(receiver.kind(), "identifier" | "self"))
+                {
+                    function.child_by_field_name("field")
+                } else {
+                    None
+                }
+                && let (Ok(variable), Ok(callee_name), Some(scope)) = (
+                    name.utf8_text(source.as_bytes()),
+                    callee.utf8_text(source.as_bytes()),
+                    lexical_scope(name),
+                )
+            {
+                let (local_callee_line, local_callee_exists) = if function.kind() == "identifier" {
+                    lexical_items.visible_free_function(callee_name, value)
+                } else {
+                    (None, false)
+                };
+                let named_imports = lexical_items.named_import_evidence(callee_name, value);
+                result.push(ScopedCallAssignment {
+                    variable: variable.into(),
+                    scope,
+                    line: name.start_position().row as u32 + 1,
+                    callee: callee_name.into(),
+                    receiver: function
+                        .child_by_field_name("value")
+                        .and_then(|receiver| receiver.utf8_text(source.as_bytes()).ok())
+                        .map(str::to_string),
+                    local_callee_line,
+                    local_callee_exists,
+                    import_positions: named_imports
+                        .iter()
+                        .filter_map(|reference| reference.scope.map(|scope| scope.position))
+                        .collect(),
+                    import_paths: lexical_items.type_imports_from_named(
+                        value,
+                        false,
+                        &named_imports,
+                    ),
+                    call_position: value.start_byte(),
+                    awaited,
+                });
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    let tuple_origins: std::collections::HashMap<_, _> =
+        rust_tuple_factory_bindings(source.as_bytes(), &lexical_items, &local_bindings)
+            .into_iter()
+            .filter_map(|(binding, origin)| {
+                Some((binding.scope?.position, (binding.type_name, origin)))
+            })
+            .collect();
+    let origins = bindings
+        .iter()
+        .filter_map(|binding| {
+            let scope = binding.scope?;
+            let at = if binding.kind == AstBindingKind::ReturnType {
+                tuple_origins
+                    .get(&scope.position)
+                    .filter(|(name, _)| *name == binding.type_name)
+                    .map(|(_, origin)| *origin)
+            } else {
+                None
+            }
+            .or_else(|| {
+                tree.root_node()
+                    .descendant_for_byte_range(scope.position, scope.position)
+            })?;
+            let (local_line, local_position, ambiguous) =
+                lexical_items.visible_type(&binding.type_name, at);
+            let named_evidence = lexical_items.named_import_evidence(&binding.type_name, at);
+            let named_imports = lexical_items.type_imports_from_named(at, true, &named_evidence);
+            let imports = if named_evidence.is_empty() {
+                lexical_items.type_imports_from_named(at, false, &named_evidence)
+            } else {
+                named_imports.clone()
+            };
+            Some(ScopedRustTypeOrigin {
+                type_name: binding.type_name.clone(),
+                line: binding.line,
+                local_line,
+                position: scope.position,
+                local_position,
+                ambiguous,
+                imports,
+                named_imports,
+                named_import_positions: named_evidence
+                    .iter()
+                    .filter_map(|reference| reference.scope.map(|scope| scope.position))
+                    .collect(),
+            })
+        })
+        .collect();
+    ScopedRustEvidence {
+        call_assignments: result,
+        alias_assignments: aliases,
+        local_declarations: local_bindings,
+        type_origins: origins,
+        method_owners,
+        path_imports,
+        public_root_uses,
+        module_types,
+        inline_type_imports: lexical_items.inline_type_imports(tree.root_node(), source.as_bytes()),
+    }
+}
+
+/// Shared inventory avoids rescanning the class and file for each property.
+struct JsFieldInventory<'tree> {
+    writes: std::collections::HashMap<(usize, String), Vec<tree_sitter::Node<'tree>>>,
+    declared: std::collections::HashSet<(usize, String)>,
+    locals: std::collections::HashMap<String, Vec<LexicalScope>>,
+}
+
+impl<'tree> JsFieldInventory<'tree> {
+    fn new(root: tree_sitter::Node<'tree>, source: &[u8], locals: &[RawReference]) -> Self {
+        let mut result = Self {
+            writes: Default::default(),
+            declared: Default::default(),
+            locals: Default::default(),
+        };
+        for binding in locals {
+            if let Some(scope) = binding.scope {
+                result
+                    .locals
+                    .entry(binding.name.clone())
+                    .or_default()
+                    .push(scope);
+            }
+        }
+        let mut stack = vec![(root, None)];
+        while let Some((node, mut class)) = stack.pop() {
+            if matches!(node.kind(), "class_declaration" | "class") {
+                class = Some(node.id());
+            }
+            if let Some(class) = class {
+                if matches!(node.kind(), "field_definition" | "public_field_definition")
+                    && let Some(name) = node
+                        .child_by_field_name("property")
+                        .or_else(|| node.child_by_field_name("name"))
+                    && let Ok(name) = name.utf8_text(source)
+                {
+                    result.declared.insert((class, name.into()));
+                }
+                if node.kind() == "assignment_expression"
+                    && let Some(left) = node.child_by_field_name("left")
+                    && left.kind() == "member_expression"
+                    && left
+                        .child_by_field_name("object")
+                        .is_some_and(|object| object.kind() == "this")
+                    && let Some(name) = left.child_by_field_name("property")
+                    && let Ok(name) = name.utf8_text(source)
+                {
+                    result
+                        .writes
+                        .entry((class, name.into()))
+                        .or_default()
+                        .push(node);
+                }
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor).map(|child| (child, class)));
+        }
+        result
+    }
+}
+
+/// A field annotation, an unmodified initializer, or a sole constructor
+/// assignment establishes its type. Other writes defeat initializer inference.
+fn exact_js_field_type(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    inventory: &JsFieldInventory<'_>,
+) -> Option<String> {
+    if let Some(annotation) = node.child_by_field_name("type") {
+        let mut cursor = annotation.walk();
+        let ty = annotation.named_children(&mut cursor).next()?;
+        if matches!(ty.kind(), "type_identifier" | "generic_type") {
+            return Some(extract_base_type(ty.utf8_text(source).ok()?));
+        }
+        return None;
+    }
+    let field_node = if node.kind() == "assignment_expression" {
+        node.child_by_field_name("left")?
+    } else {
+        node
+    };
+    let name = field_node
+        .child_by_field_name("property")
+        .or_else(|| node.child_by_field_name("name"))?
+        .utf8_text(source)
+        .ok()?;
+    let mut parent = node.parent();
+    let class = loop {
+        let ancestor = parent?;
+        if matches!(ancestor.kind(), "class_declaration" | "class") {
+            break ancestor;
+        }
+        parent = ancestor.parent();
+    };
+    let key = (class.id(), name.to_string());
+    if node.kind() == "assignment_expression" && inventory.declared.contains(&key) {
+        return None;
+    }
+    let writes = inventory.writes.get(&key).map_or(&[][..], Vec::as_slice);
+    let value = if let Some(initializer) = node.child_by_field_name("value") {
+        if !writes.is_empty() {
+            return None;
+        }
+        initializer
+    } else {
+        if writes.len() != 1 {
+            return None;
+        }
+        let assignment = writes[0];
+        let mut parent = assignment.parent();
+        loop {
+            let ancestor = parent?;
+            if ancestor.kind() == "method_definition" {
+                if !ancestor
+                    .child_by_field_name("name")
+                    .is_some_and(|name| name.utf8_text(source) == Ok("constructor"))
+                {
+                    return None;
+                }
+                break;
+            }
+            if matches!(
+                ancestor.kind(),
+                "arrow_function" | "function_expression" | "function_declaration"
+            ) {
+                return None;
+            }
+            parent = ancestor.parent();
+        }
+        assignment.child_by_field_name("right")?
+    };
+    if value.kind() != "new_expression" {
+        return None;
+    }
+    let constructor = value
+        .child_by_field_name("constructor")
+        .filter(|constructor| constructor.kind() == "identifier")?;
+    let name = constructor.utf8_text(source).ok()?;
+    if inventory.locals.get(name).is_some_and(|scopes| {
+        scopes.iter().any(|scope| {
+            scope.start <= constructor.start_byte() && constructor.start_byte() < scope.end
+        })
+    }) {
+        return None;
+    }
+    Some(name.into())
+}
+
 fn extract_types_from_tree(
     tree: &tree_sitter::Tree,
     ts_lang: &tree_sitter::Language,
     source: &[u8],
     lang: Language,
+    local_bindings: &[RawReference],
 ) -> Vec<AstTypeBinding> {
     let query_src = match type_query_source(lang) {
         Some(q) => q,
@@ -2964,6 +3939,8 @@ fn extract_types_from_tree(
         .collect();
     let mut cursor = tree_sitter::QueryCursor::new();
     let mut bindings = Vec::new();
+    let lexical_items =
+        (lang == Language::Rust).then(|| RustLexicalItems::new(tree.root_node(), source));
 
     let mut matches = cursor.matches(&query, tree.root_node(), source);
     while let Some(m) = matches.next() {
@@ -2971,6 +3948,7 @@ fn extract_types_from_tree(
         let mut var_type: Option<String> = None;
         let mut var_line: u32 = 0;
         let mut kind = AstBindingKind::Annotation;
+        let mut binding_scope = None;
 
         for capture in m.captures() {
             let name = &capture_names[capture.index as usize];
@@ -2979,14 +3957,35 @@ fn extract_types_from_tree(
 
             match name.as_str() {
                 "var.name" => {
+                    binding_scope = if matches!(
+                        lang,
+                        Language::JavaScript | Language::TypeScript | Language::Rust
+                    ) {
+                        lexical_scope(capture.node)
+                    } else {
+                        None
+                    };
                     var_name = Some(text.to_string());
                     var_line = line;
                     kind = AstBindingKind::Annotation;
                 }
                 "var.type" => {
-                    var_type = Some(extract_base_type(text));
+                    var_type = Some(if lang == Language::Rust {
+                        rust_receiver_type(capture.node, source)
+                            .unwrap_or_else(|| extract_base_type(text))
+                    } else {
+                        extract_base_type(text)
+                    });
                 }
                 "ctor.name" => {
+                    binding_scope = if matches!(
+                        lang,
+                        Language::JavaScript | Language::TypeScript | Language::Rust
+                    ) {
+                        lexical_scope(capture.node)
+                    } else {
+                        None
+                    };
                     var_name = Some(text.to_string());
                     var_line = line;
                     kind = AstBindingKind::Constructor;
@@ -3001,20 +4000,46 @@ fn extract_types_from_tree(
                     }
                 }
                 "return.name" => {
+                    binding_scope = if matches!(
+                        lang,
+                        Language::JavaScript | Language::TypeScript | Language::Rust
+                    ) {
+                        lexical_scope(capture.node)
+                    } else {
+                        None
+                    };
                     var_name = Some(text.to_string());
                     var_line = line;
                     kind = AstBindingKind::ReturnType;
                 }
                 "return.type" => {
-                    var_type = Some(extract_base_type(text));
+                    var_type = Some(if lang == Language::Rust {
+                        rust_receiver_type(capture.node, source)
+                            .unwrap_or_else(|| extract_base_type(text))
+                    } else {
+                        extract_base_type(text)
+                    });
                 }
                 "param.name" => {
+                    binding_scope = if matches!(
+                        lang,
+                        Language::JavaScript | Language::TypeScript | Language::Rust
+                    ) {
+                        lexical_scope(capture.node)
+                    } else {
+                        None
+                    };
                     var_name = Some(text.to_string());
                     var_line = line;
                     kind = AstBindingKind::Parameter;
                 }
                 "param.type" => {
-                    var_type = Some(extract_base_type(text));
+                    var_type = Some(if lang == Language::Rust {
+                        rust_receiver_type(capture.node, source)
+                            .unwrap_or_else(|| extract_base_type(text))
+                    } else {
+                        extract_base_type(text)
+                    });
                 }
                 _ => {}
             }
@@ -3023,8 +4048,19 @@ fn extract_types_from_tree(
         if let (Some(name), Some(type_name)) = (var_name, var_type)
             && !name.is_empty()
             && !type_name.is_empty()
+            && (lexical_items.as_ref().is_none_or(|items| {
+                binding_scope.is_none_or(|scope| {
+                    items.local_type_visible(
+                        &type_name,
+                        tree.root_node()
+                            .descendant_for_byte_range(scope.position, scope.position)
+                            .unwrap_or(tree.root_node()),
+                    )
+                })
+            }))
         {
             bindings.push(AstTypeBinding {
+                scope: binding_scope,
                 var_name: name,
                 type_name,
                 line: var_line,
@@ -3033,7 +4069,770 @@ fn extract_types_from_tree(
         }
     }
 
+    if lang == Language::Rust {
+        collect_rust_tuple_factory_bindings(
+            source,
+            lexical_items.as_ref().expect("Rust evidence"),
+            local_bindings,
+            &mut bindings,
+        );
+        collect_rust_unit_constructor_bindings(
+            source,
+            lexical_items.as_ref().expect("Rust evidence"),
+            local_bindings,
+            &mut bindings,
+        );
+    }
     bindings
+}
+
+fn rust_module_scope(node: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "mod_item" {
+            return parent;
+        }
+        current = parent;
+    }
+    current
+}
+
+struct RustLexicalItems<'tree> {
+    types: std::collections::HashMap<String, Vec<tree_sitter::Node<'tree>>>,
+    units: std::collections::HashMap<String, Vec<tree_sitter::Node<'tree>>>,
+    functions: std::collections::HashMap<String, Vec<tree_sitter::Node<'tree>>>,
+    imports: std::collections::HashMap<usize, Vec<(LexicalScope, Vec<RawReference>, bool)>>,
+    lets: Vec<tree_sitter::Node<'tree>>,
+}
+
+impl<'tree> RustLexicalItems<'tree> {
+    fn new(root: tree_sitter::Node<'tree>, source: &[u8]) -> Self {
+        let mut evidence = Self {
+            types: Default::default(),
+            units: Default::default(),
+            functions: Default::default(),
+            imports: Default::default(),
+            lets: Vec::new(),
+        };
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if matches!(node.kind(), "struct_item" | "enum_item" | "type_item")
+                && let Some(identifier) = node.child_by_field_name("name")
+                && let Ok(name) = identifier.utf8_text(source)
+            {
+                evidence
+                    .types
+                    .entry(name.into())
+                    .or_default()
+                    .push(identifier);
+                if node.kind() == "struct_item"
+                    && node.child_by_field_name("body").is_none()
+                    && node.child_by_field_name("type_parameters").is_none()
+                {
+                    evidence
+                        .units
+                        .entry(name.into())
+                        .or_default()
+                        .push(identifier);
+                }
+            }
+            if node.kind() == "function_item"
+                && let Some(identifier) = node.child_by_field_name("name")
+                && let Ok(name) = identifier.utf8_text(source)
+            {
+                let mut ancestor = node.parent();
+                let mut method = false;
+                while let Some(parent) = ancestor {
+                    if matches!(parent.kind(), "impl_item" | "trait_item") {
+                        method = true;
+                        break;
+                    }
+                    if matches!(parent.kind(), "function_item" | "mod_item" | "source_file") {
+                        break;
+                    }
+                    ancestor = parent.parent();
+                }
+                if !method {
+                    evidence
+                        .functions
+                        .entry(name.into())
+                        .or_default()
+                        .push(identifier);
+                }
+            }
+            if node.kind() == "let_declaration" {
+                evidence.lets.push(node);
+            }
+            if node.kind() == "use_declaration"
+                && let Some(scope) = lexical_scope(node)
+            {
+                let mut imports = Vec::new();
+                expand_rust_use_imports(&node, source, &mut imports);
+                let argument = node
+                    .child_by_field_name("argument")
+                    .and_then(|argument| argument.utf8_text(source).ok())
+                    .unwrap_or("");
+                let compact: String = argument.chars().filter(|c| !c.is_whitespace()).collect();
+                evidence
+                    .imports
+                    .entry(rust_module_scope(node).id())
+                    .or_default()
+                    .push((scope, imports, compact == "super::*"));
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        evidence
+    }
+
+    /// Resolve only same-file self/super routes backed by exact inline types.
+    /// Function/block ancestry affects import lifetime, not its module path.
+    fn inline_type_imports(
+        &self,
+        root: tree_sitter::Node<'tree>,
+        source: &[u8],
+    ) -> Vec<ScopedRustInlineTypeImport> {
+        let mut result = Vec::new();
+        for (scope, imports, _) in self.imports.values().flatten() {
+            let Some(node) = root.descendant_for_byte_range(scope.position, scope.position) else {
+                continue;
+            };
+            let module = rust_module_scope(node);
+            let current_modules = if module.kind() == "source_file" {
+                Vec::new()
+            } else {
+                let Some(mut modules) = rust_type_module_path(module, source) else {
+                    continue;
+                };
+                let Some(name) = module
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(source).ok())
+                else {
+                    continue;
+                };
+                modules.push(name.into());
+                modules
+            };
+            for import in imports {
+                let aliased = import.kind == ReferenceKind::ImportAlias;
+                if !aliased
+                    && (import.kind != ReferenceKind::Import
+                        || import.receiver.as_deref() == Some("*")
+                        || imports.iter().any(|alias| {
+                            alias.kind == ReferenceKind::ImportAlias && alias.context == import.name
+                        }))
+                {
+                    continue;
+                }
+                let specifier = if aliased {
+                    &import.context
+                } else {
+                    &import.name
+                };
+                let segments: Vec<_> = specifier.split("::").collect();
+                let Some((original, path)) = segments.split_last() else {
+                    continue;
+                };
+                if path.is_empty() || original.is_empty() || *original == "*" {
+                    continue;
+                }
+                let mut modules = current_modules.clone();
+                let consumed = if path[0] == "self" {
+                    1
+                } else if path[0] == "super" {
+                    let parents = path
+                        .iter()
+                        .take_while(|segment| **segment == "super")
+                        .count();
+                    if parents > modules.len() {
+                        continue;
+                    }
+                    modules.truncate(modules.len() - parents);
+                    parents
+                } else {
+                    // Other prefixes require file/crate resolution evidence.
+                    continue;
+                };
+                if path[consumed..].iter().any(|segment| {
+                    segment.is_empty() || matches!(*segment, "self" | "super" | "crate" | "*")
+                }) {
+                    continue;
+                }
+                modules.extend(
+                    path[consumed..]
+                        .iter()
+                        .map(|segment| (*segment).to_string()),
+                );
+                if modules.len() > 64 {
+                    continue;
+                }
+                let count = self
+                    .types
+                    .get(*original)
+                    .into_iter()
+                    .flatten()
+                    .filter(|name| {
+                        name.parent().is_some_and(|declaration| {
+                            matches!(declaration.kind(), "struct_item" | "enum_item")
+                                && rust_type_module_path(declaration, source).as_ref()
+                                    == Some(&modules)
+                        })
+                    })
+                    .count();
+                if count != 1 {
+                    continue;
+                }
+                let Some(scope) = import.scope else {
+                    continue;
+                };
+                result.push(ScopedRustInlineTypeImport {
+                    specifier: specifier.clone(),
+                    local_name: if aliased {
+                        import.name.clone()
+                    } else {
+                        (*original).into()
+                    },
+                    original_name: (*original).into(),
+                    module_path: modules,
+                    scope,
+                    line: import.start_line,
+                });
+            }
+        }
+        result
+    }
+
+    fn item_visible(
+        &self,
+        item: tree_sitter::Node<'tree>,
+        at: tree_sitter::Node<'tree>,
+        name: &str,
+    ) -> bool {
+        let Some(scope) = lexical_scope(item) else {
+            return false;
+        };
+        if !(scope.start <= at.start_byte() && at.start_byte() < scope.end) {
+            return false;
+        }
+        let target_module = rust_module_scope(item);
+        let mut module = rust_module_scope(at);
+        while module != target_module {
+            if module.kind() != "mod_item" {
+                return false;
+            }
+            let parent_name = format!("super::{name}");
+            let mut exposed = false;
+            for (scope, imports, super_glob) in self.imports.get(&module.id()).into_iter().flatten()
+            {
+                if !(scope.start <= at.start_byte() && at.start_byte() < scope.end) {
+                    continue;
+                }
+                exposed |= *super_glob
+                    || imports.iter().any(|import| {
+                        import.kind == ReferenceKind::Import && import.name == parent_name
+                    });
+                // A named import of the same local name defeats a parent glob.
+                if imports.iter().any(|import| {
+                    (import.kind == ReferenceKind::ImportAlias
+                        && import.name == name
+                        && import.context != parent_name)
+                        || (import.kind == ReferenceKind::Import
+                            && import.name.rsplit("::").next() == Some(name)
+                            && import.name != parent_name)
+                }) {
+                    return false;
+                }
+            }
+            if !exposed {
+                return false;
+            }
+            module = rust_module_scope(module);
+        }
+        true
+    }
+
+    fn named_import_evidence(
+        &self,
+        name: &str,
+        at: tree_sitter::Node<'tree>,
+    ) -> Vec<&RawReference> {
+        #[cfg(test)]
+        TEST_NAMED_IMPORT_SELECTION_COUNT.with(|count| count.set(count.get() + 1));
+        let mut module = rust_module_scope(at);
+        loop {
+            let imports = self.imports.get(&module.id());
+            let mut candidates: Vec<_> = imports
+                .into_iter()
+                .flatten()
+                .filter(|(scope, _, _)| {
+                    scope.start <= at.start_byte() && at.start_byte() < scope.end
+                })
+                .flat_map(|(scope, imports, _)| {
+                    imports
+                        .iter()
+                        .filter(move |import| {
+                            import.kind == ReferenceKind::ImportAlias && import.name == name
+                                || import.kind == ReferenceKind::Import
+                                    && import.receiver.as_deref() != Some("*")
+                                    && import.name.rsplit("::").next() == Some(name)
+                        })
+                        .map(move |import| (scope.end - scope.start, import))
+                })
+                .collect();
+            candidates.sort_by_key(|(span, _)| *span);
+            if let Some((nearest, _)) = candidates.first() {
+                let nearest = *nearest;
+                return candidates
+                    .into_iter()
+                    .filter(|(span, _)| *span == nearest)
+                    .map(|(_, import)| import)
+                    .collect();
+            }
+            // `use super::*` exposes the parent's named imports too. Join
+            // their original declaration bytes, rather than treating the
+            // parent file as a public re-export barrel or guessing by name.
+            if module.kind() != "mod_item"
+                || !imports.into_iter().flatten().any(|(scope, _, super_glob)| {
+                    *super_glob && scope.start <= at.start_byte() && at.start_byte() < scope.end
+                })
+            {
+                return Vec::new();
+            }
+            module = rust_module_scope(module);
+        }
+    }
+
+    fn type_imports(
+        &self,
+        name: &str,
+        at: tree_sitter::Node<'tree>,
+        named_only: bool,
+    ) -> Vec<String> {
+        let named = self.named_import_evidence(name, at);
+        self.type_imports_from_named(at, named_only, &named)
+    }
+
+    fn type_imports_from_named(
+        &self,
+        at: tree_sitter::Node<'tree>,
+        named_only: bool,
+        named: &[&RawReference],
+    ) -> Vec<String> {
+        if !named.is_empty() {
+            return named
+                .iter()
+                .map(|import| {
+                    if import.kind == ReferenceKind::ImportAlias {
+                        import.context.clone()
+                    } else {
+                        import.name.clone()
+                    }
+                })
+                .collect();
+        }
+        if named_only {
+            return Vec::new();
+        }
+        self.imports
+            .get(&rust_module_scope(at).id())
+            .into_iter()
+            .flatten()
+            .filter(|(scope, _, _)| scope.start <= at.start_byte() && at.start_byte() < scope.end)
+            .flat_map(|(_, imports, _)| imports.iter())
+            .filter(|import| {
+                import.kind == ReferenceKind::Import && import.receiver.as_deref() == Some("*")
+            })
+            .map(|import| import.name.clone())
+            .collect()
+    }
+
+    fn visible_type(
+        &self,
+        name: &str,
+        at: tree_sitter::Node<'tree>,
+    ) -> (Option<u32>, Option<usize>, bool) {
+        let mut candidates: Vec<_> = self
+            .types
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|item| self.item_visible(**item, at, name))
+            .filter_map(|item| {
+                Some((
+                    lexical_scope(*item)?.end - lexical_scope(*item)?.start,
+                    item.parent()?.start_position().row as u32 + 1,
+                    item.start_byte(),
+                ))
+            })
+            .collect();
+        candidates.sort_unstable();
+        let ambiguous = candidates
+            .first()
+            .is_some_and(|first| candidates.get(1).is_some_and(|second| first.0 == second.0));
+        (
+            candidates
+                .first()
+                .filter(|_| !ambiguous)
+                .map(|(_, line, _)| *line),
+            candidates
+                .first()
+                .filter(|_| !ambiguous)
+                .map(|(_, _, position)| *position),
+            ambiguous,
+        )
+    }
+
+    fn local_type_visible(&self, name: &str, at: tree_sitter::Node<'tree>) -> bool {
+        self.types.get(name).is_none_or(|_| {
+            self.visible_type(name, at).0.is_some()
+                || !self.type_imports(name, at, false).is_empty()
+        })
+    }
+
+    fn visible_free_function(
+        &self,
+        name: &str,
+        at: tree_sitter::Node<'tree>,
+    ) -> (Option<u32>, bool) {
+        let Some(items) = self.functions.get(name) else {
+            return (None, false);
+        };
+        let mut candidates: Vec<_> = items
+            .iter()
+            .filter(|item| self.item_visible(**item, at, name))
+            .filter_map(|item| {
+                let scope = lexical_scope(*item)?;
+                Some((
+                    scope.end - scope.start,
+                    item.parent()?.start_position().row as u32 + 1,
+                ))
+            })
+            .collect();
+        candidates.sort_unstable();
+        let line = candidates
+            .first()
+            .filter(|first| candidates.get(1).is_none_or(|second| second.0 != first.0))
+            .map(|(_, line)| *line);
+        (line, !candidates.is_empty())
+    }
+}
+
+fn collect_rust_unit_constructor_bindings(
+    source: &[u8],
+    evidence: &RustLexicalItems<'_>,
+    locals: &[RawReference],
+    bindings: &mut Vec<AstTypeBinding>,
+) {
+    let mut locals_by_name: std::collections::HashMap<String, Vec<LexicalScope>> =
+        Default::default();
+    for local in locals {
+        if let Some(scope) = local.scope {
+            locals_by_name
+                .entry(local.name.clone())
+                .or_default()
+                .push(scope);
+        }
+    }
+    for declaration in &evidence.lets {
+        let (Some(name), Some(value)) = (
+            declaration.child_by_field_name("pattern"),
+            declaration.child_by_field_name("value"),
+        ) else {
+            continue;
+        };
+        if name.kind() != "identifier" || value.kind() != "identifier" {
+            continue;
+        }
+        let Ok(type_name) = value.utf8_text(source) else {
+            continue;
+        };
+        let Some(units) = evidence.units.get(type_name) else {
+            continue;
+        };
+        if locals_by_name.get(type_name).is_some_and(|scopes| {
+            scopes.iter().any(|scope| {
+                scope.start <= value.start_byte()
+                    && value.start_byte() < scope.end
+                    && scope.initialized_at <= value.start_byte()
+            })
+        }) {
+            continue;
+        }
+        let (_, Some(position), false) = evidence.visible_type(type_name, value) else {
+            continue;
+        };
+        if !units.iter().any(|unit| unit.start_byte() == position) {
+            continue;
+        }
+        if let (Ok(var_name), Some(scope)) = (name.utf8_text(source), lexical_scope(name)) {
+            bindings.push(AstTypeBinding {
+                scope: Some(scope),
+                var_name: var_name.into(),
+                type_name: type_name.into(),
+                line: name.start_position().row as u32 + 1,
+                kind: AstBindingKind::Constructor,
+            });
+        }
+    }
+}
+
+/// Known Rust pointer wrappers preserve the target's method set through Deref.
+/// Other generic containers retain their own base type.
+fn rust_receiver_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    if node.kind() == "reference_type" {
+        return rust_receiver_type(node.child_by_field_name("type")?, source);
+    }
+    if node.kind() == "generic_type" {
+        let ty = node.child_by_field_name("type")?;
+        let name = ty.utf8_text(source).ok()?.rsplit("::").next()?;
+        if rust_standard_pointer_origin(ty, source) {
+            let arguments = node.child_by_field_name("type_arguments")?;
+            let mut cursor = arguments.walk();
+            let types: Vec<_> = arguments.named_children(&mut cursor).collect();
+            if types.len() != 1 {
+                return None;
+            }
+            return rust_receiver_type(types[0], source);
+        }
+        return Some(name.into());
+    }
+    matches!(node.kind(), "type_identifier" | "scoped_type_identifier")
+        .then(|| {
+            node.utf8_text(source)
+                .ok()
+                .map(|text| text.rsplit("::").next().unwrap_or(text).into())
+        })
+        .flatten()
+}
+
+/// Pointer transparency requires its real std/alloc origin. A custom Arc,
+/// Rc or Box has its own method set and must retain its own receiver type.
+fn rust_standard_pointer_origin(ty: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    fn standard(path: &str) -> bool {
+        matches!(
+            path.trim_start_matches("::"),
+            "std::sync::Arc"
+                | "alloc::sync::Arc"
+                | "std::rc::Rc"
+                | "alloc::rc::Rc"
+                | "std::boxed::Box"
+                | "alloc::boxed::Box"
+        )
+    }
+    let Ok(spelling) = ty.utf8_text(source) else {
+        return false;
+    };
+    if spelling.contains("::") {
+        return standard(spelling);
+    }
+    let mut root = ty;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let at = ty.start_byte();
+    let mut origins = Vec::new();
+    let mut visible_glob = false;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "use_wildcard"
+            && lexical_scope(node).is_some_and(|scope| scope.start <= at && at < scope.end)
+        {
+            visible_glob = true;
+        }
+        if matches!(node.kind(), "struct_item" | "enum_item" | "type_item")
+            && let Some(name) = node.child_by_field_name("name")
+            && name.utf8_text(source) == Ok(spelling)
+            && lexical_scope(name).is_some_and(|scope| scope.start <= at && at < scope.end)
+            && let Some(scope) = node.child_by_field_name("name").and_then(lexical_scope)
+        {
+            origins.push((scope.start, scope.end, false));
+        }
+        if node.kind() == "use_declaration"
+            && let Some(scope) =
+                lexical_scope(node).filter(|scope| scope.start <= at && at < scope.end)
+        {
+            let mut references = Vec::new();
+            expand_rust_use_paths(&node, source, &mut references);
+            let aliases: Vec<_> = references
+                .iter()
+                .filter(|reference| reference.kind == ReferenceKind::ImportAlias)
+                .collect();
+            for reference in &references {
+                if reference.kind == ReferenceKind::ImportAlias && reference.name == spelling {
+                    origins.push((scope.start, scope.end, standard(&reference.context)));
+                } else if reference.kind == ReferenceKind::Import
+                    && reference.name.rsplit("::").next() == Some(spelling)
+                    && !aliases.iter().any(|alias| alias.context == reference.name)
+                {
+                    origins.push((scope.start, scope.end, standard(&reference.name)));
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    let Some((start, end, _)) = origins
+        .iter()
+        .min_by_key(|(start, end, _)| end - start)
+        .copied()
+    else {
+        // A visible glob can override the prelude Box with a custom type.
+        return spelling == "Box" && !visible_glob;
+    };
+    let selected: Vec<_> = origins
+        .iter()
+        .filter(|(candidate_start, candidate_end, _)| {
+            *candidate_start == start && *candidate_end == end
+        })
+        .collect();
+    selected.len() == 1 && selected[0].2
+}
+
+/// Destructuring an exact local function's tuple return supplies each binding's
+/// type. No factory-name or project-method guessing is involved.
+fn collect_rust_tuple_factory_bindings(
+    source: &[u8],
+    lexical_items: &RustLexicalItems<'_>,
+    local_bindings: &[RawReference],
+    bindings: &mut Vec<AstTypeBinding>,
+) {
+    bindings.extend(
+        rust_tuple_factory_bindings(source, lexical_items, local_bindings)
+            .into_iter()
+            .map(|(binding, _)| binding),
+    );
+}
+
+/// One tuple selector supplies both cached bindings and ephemeral declaration
+/// provenance. Binding sites determine lifetime; return nodes determine type.
+fn rust_tuple_factory_bindings<'tree>(
+    source: &[u8],
+    lexical_items: &RustLexicalItems<'tree>,
+    local_bindings: &[RawReference],
+) -> Vec<(AstTypeBinding, tree_sitter::Node<'tree>)> {
+    let mut result = Vec::new();
+    for declaration in &lexical_items.lets {
+        let (Some(pattern), Some(mut value)) = (
+            declaration.child_by_field_name("pattern"),
+            declaration.child_by_field_name("value"),
+        ) else {
+            continue;
+        };
+        if pattern.kind() != "tuple_pattern" {
+            continue;
+        }
+        let awaited = value.kind() == "await_expression";
+        if awaited {
+            let mut cursor = value.walk();
+            let Some(inner) = value.named_children(&mut cursor).next() else {
+                continue;
+            };
+            value = inner;
+        }
+        if value.kind() != "call_expression" {
+            continue;
+        }
+        let Some(callee) = value
+            .child_by_field_name("function")
+            .filter(|node| node.kind() == "identifier")
+        else {
+            continue;
+        };
+        let Ok(callee_name) = callee.utf8_text(source) else {
+            continue;
+        };
+        let at = callee.start_byte();
+        // A parameter, closure or preceding let of the factory's name defeats
+        // item evidence. Rust lets begin shadowing only after initialization.
+        if local_bindings.iter().any(|binding| {
+            binding.name == callee_name
+                && binding.scope.is_some_and(|scope| {
+                    scope.start <= at && at < scope.end && scope.initialized_at <= at
+                })
+        }) {
+            continue;
+        }
+        let mut candidates: Vec<_> = lexical_items
+            .functions
+            .get(callee_name)
+            .into_iter()
+            .flatten()
+            .filter_map(|name| {
+                let scope = lexical_scope(*name)?;
+                lexical_items
+                    .item_visible(*name, value, callee_name)
+                    .then_some((*name, scope))
+            })
+            .collect();
+        candidates.sort_by_key(|(_, scope)| scope.end - scope.start);
+        let Some((factory_name, chosen_scope)) = candidates.first().copied() else {
+            continue;
+        };
+        // Choose the lexical declaration before inspecting its return shape.
+        // An unsupported nearer declaration defeats an outer tuple factory.
+        if candidates.get(1).is_some_and(|(_, scope)| {
+            scope.start == chosen_scope.start && scope.end == chosen_scope.end
+        }) {
+            continue;
+        }
+        let Some(factory) = factory_name.parent() else {
+            continue;
+        };
+        let Some(ret) = factory.child_by_field_name("return_type") else {
+            continue;
+        };
+        if ret.kind() != "tuple_type" || factory.child_by_field_name("type_parameters").is_some() {
+            continue;
+        }
+        let mut cursor = factory.walk();
+        let asynchronous = factory.named_children(&mut cursor).any(|child| {
+            child.kind() == "function_modifiers"
+                && child
+                    .utf8_text(source)
+                    .is_ok_and(|text| text.split_whitespace().any(|token| token == "async"))
+        });
+        if awaited != asynchronous {
+            continue;
+        }
+        let mut cursor = pattern.walk();
+        let names: Vec<_> = pattern
+            .children(&mut cursor)
+            .filter(|node| !matches!(node.kind(), "(" | ")" | ","))
+            .collect();
+        let mut cursor = ret.walk();
+        let types: Vec<_> = ret.named_children(&mut cursor).collect();
+        if names.len() != types.len()
+            || names
+                .iter()
+                .any(|name| !matches!(name.kind(), "identifier" | "_"))
+        {
+            continue;
+        }
+        for (name, ty) in names.into_iter().zip(types) {
+            let Ok(var_name) = name.utf8_text(source) else {
+                continue;
+            };
+            if !is_bindable_name(var_name) {
+                continue;
+            }
+            let (Some(type_name), Some(scope)) =
+                (rust_receiver_type(ty, source), lexical_scope(name))
+            else {
+                continue;
+            };
+            result.push((
+                AstTypeBinding {
+                    scope: Some(scope),
+                    var_name: var_name.into(),
+                    type_name,
+                    line: name.start_position().row as u32 + 1,
+                    kind: AstBindingKind::ReturnType,
+                },
+                ty,
+            ));
+        }
+    }
+    result
 }
 
 /// nw-356 (A) residual (quality-review round 2). Whether `node`'s subtree
@@ -3156,133 +4955,416 @@ fn find_name_capture(
     None
 }
 
-/// nw-688: record each local name a JS/TS file binds from a PACKAGE specifier
-/// (anything not starting with `.` or `/`) as a
-/// [`ReferenceKind::PackageBinding`]. Covers module-level ES imports (default,
-/// namespace and named, including `as` renames) and module-level
-/// `const|let|var X = require('pkg')` / `const { a, b: c } = require('pkg')`.
-fn collect_js_package_bindings(
+/// Extract exact named/namespace bindings without interpreting import text.
+/// Package bindings remain separate so cross-repo inference retains its guard.
+fn collect_js_import_bindings(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    references: &mut Vec<RawReference>,
+    commonjs_object_methods: &std::collections::HashSet<usize>,
+) {
+    let text = |node: tree_sitter::Node<'_>| node.utf8_text(source).unwrap_or("").to_string();
+    let mut stack = vec![root];
+    while let Some(statement) = stack.pop() {
+        let mut cursor = statement.walk();
+        stack.extend(statement.named_children(&mut cursor));
+        if statement.kind() == "export_statement"
+            && statement
+                .parent()
+                .is_some_and(|parent| parent.kind() == "program")
+        {
+            let mut push_export = |exported: String, local: tree_sitter::Node<'_>| {
+                references.push(RawReference {
+                    scope: None,
+                    name: exported,
+                    kind: ReferenceKind::ExportAlias,
+                    start_line: local.start_position().row as u32 + 1,
+                    context: text(local),
+                    receiver: statement
+                        .child_by_field_name("source")
+                        .map(|source| strip_quotes(&text(source))),
+                });
+            };
+            let mut cursor = statement.walk();
+            let is_default = statement
+                .children(&mut cursor)
+                .any(|child| child.kind() == "default");
+            if is_default {
+                let local = statement
+                    .child_by_field_name("declaration")
+                    .and_then(|declaration| declaration.child_by_field_name("name"))
+                    .or_else(|| {
+                        statement
+                            .child_by_field_name("value")
+                            .filter(|value| value.kind() == "identifier")
+                    });
+                if let Some(local) = local {
+                    push_export("default".into(), local);
+                }
+            }
+            if !is_default && let Some(declaration) = statement.child_by_field_name("declaration") {
+                if let Some(local) = declaration.child_by_field_name("name") {
+                    push_export(text(local), local);
+                } else {
+                    let mut cursor = declaration.walk();
+                    for declarator in declaration
+                        .named_children(&mut cursor)
+                        .filter(|node| node.kind() == "variable_declarator")
+                    {
+                        if let Some(local) = declarator
+                            .child_by_field_name("name")
+                            .filter(|node| node.kind() == "identifier")
+                        {
+                            push_export(text(local), local);
+                        }
+                    }
+                }
+            }
+            let mut cursor = statement.walk();
+            for clause in statement
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "export_clause")
+            {
+                let mut cursor = clause.walk();
+                for specifier in clause
+                    .named_children(&mut cursor)
+                    .filter(|child| child.kind() == "export_specifier")
+                {
+                    if let Some(local) = specifier.child_by_field_name("name") {
+                        let exported = specifier
+                            .child_by_field_name("alias")
+                            .map_or_else(|| text(local), text);
+                        push_export(strip_quotes(&exported), local);
+                    }
+                }
+            }
+            let mut cursor = statement.walk();
+            if statement
+                .children(&mut cursor)
+                .any(|child| child.kind() == "*")
+                && let Some(source) = statement.child_by_field_name("source")
+            {
+                references.push(RawReference {
+                    scope: None,
+                    name: "*".into(),
+                    kind: ReferenceKind::ExportAlias,
+                    start_line: statement.start_position().row as u32 + 1,
+                    context: "*".into(),
+                    receiver: Some(strip_quotes(&text(source))),
+                });
+            }
+            continue;
+        }
+        if statement.kind() == "expression_statement"
+            && let Some(assignment) = statement.named_child(0)
+        {
+            // Property assignments name one public key. Function values already
+            // have a parser symbol with that key; identifier values name a local.
+            if assignment.kind() == "assignment_expression"
+                && let (Some(left), Some(value)) = (
+                    assignment.child_by_field_name("left"),
+                    assignment.child_by_field_name("right"),
+                )
+                && left.kind() == "member_expression"
+                && is_commonjs_export_assignment(Language::JavaScript, assignment, source)
+                && let Some(key) = left.child_by_field_name("property")
+                && key.kind() == "property_identifier"
+                && matches!(
+                    value.kind(),
+                    "identifier" | "function_expression" | "arrow_function"
+                )
+            {
+                references.push(RawReference {
+                    scope: None,
+                    name: text(key),
+                    kind: ReferenceKind::ExportAlias,
+                    start_line: key.start_position().row as u32 + 1,
+                    context: if value.kind() == "identifier" {
+                        text(value)
+                    } else {
+                        text(key)
+                    },
+                    receiver: None,
+                });
+            }
+            for (exported, local) in
+                commonjs_object_exports(assignment, source, commonjs_object_methods)
+            {
+                references.push(RawReference {
+                    scope: (local.kind() == "property_identifier")
+                        .then(|| lexical_scope(local))
+                        .flatten(),
+                    name: exported,
+                    kind: ReferenceKind::ExportAlias,
+                    start_line: local.start_position().row as u32 + 1,
+                    context: text(local),
+                    receiver: None,
+                });
+            }
+        }
+        let (specifier, bindings): (String, Vec<(tree_sitter::Node<'_>, String)>) = match statement
+            .kind()
+        {
+            "import_statement" => {
+                let Some(spec) = statement.child_by_field_name("source") else {
+                    continue;
+                };
+                let mut cursor = statement.walk();
+                let Some(clause) = statement
+                    .named_children(&mut cursor)
+                    .find(|node| node.kind() == "import_clause")
+                else {
+                    continue;
+                };
+                let mut bindings = Vec::new();
+                let mut cursor = clause.walk();
+                for part in clause.named_children(&mut cursor) {
+                    match part.kind() {
+                        "identifier" => bindings.push((part, "default".into())),
+                        "namespace_import" => {
+                            if let Some(local) = part.named_child(0) {
+                                bindings.push((local, "*".into()));
+                            }
+                        }
+                        "named_imports" => {
+                            let mut cursor = part.walk();
+                            for binding in part
+                                .named_children(&mut cursor)
+                                .filter(|node| node.kind() == "import_specifier")
+                            {
+                                if let Some(original) = binding.child_by_field_name("name") {
+                                    let local =
+                                        binding.child_by_field_name("alias").unwrap_or(original);
+                                    bindings.push((local, text(original)));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                (strip_quotes(&text(spec)), bindings)
+            }
+            "variable_declarator" => {
+                let Some(mut value) = statement.child_by_field_name("value") else {
+                    continue;
+                };
+                if value.kind() == "await_expression" {
+                    let Some(inner) = value.named_child(0) else {
+                        continue;
+                    };
+                    value = inner;
+                }
+                if value.kind() != "call_expression" {
+                    continue;
+                }
+                let Some(function) = value.child_by_field_name("function") else {
+                    continue;
+                };
+                if !((function.kind() == "identifier" && text(function) == "require")
+                    || function.kind() == "import")
+                {
+                    continue;
+                }
+                let Some(spec) = value
+                    .child_by_field_name("arguments")
+                    .and_then(|args| args.named_child(0))
+                    .filter(|arg| arg.kind() == "string")
+                else {
+                    continue;
+                };
+                let Some(target) = statement.child_by_field_name("name") else {
+                    continue;
+                };
+                let mut bindings = Vec::new();
+                match target.kind() {
+                    "identifier" => bindings.push((target, "*".into())),
+                    "object_pattern" => {
+                        let mut cursor = target.walk();
+                        for property in target.named_children(&mut cursor) {
+                            match property.kind() {
+                                "shorthand_property_identifier_pattern" => {
+                                    bindings.push((property, text(property)))
+                                }
+                                "pair_pattern" => {
+                                    if let (Some(key), Some(local)) = (
+                                        property.child_by_field_name("key"),
+                                        property.child_by_field_name("value"),
+                                    ) && local.kind() == "identifier"
+                                    {
+                                        bindings.push((local, text(key)));
+                                    }
+                                }
+                                "object_assignment_pattern" => {
+                                    if let Some(local) =
+                                        property.child_by_field_name("left").filter(|node| {
+                                            node.kind() == "shorthand_property_identifier_pattern"
+                                        })
+                                    {
+                                        bindings.push((local, text(local)));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                let specifier = strip_quotes(&text(spec));
+                if function.kind() == "import" {
+                    references.push(RawReference {
+                        scope: None,
+                        name: specifier.clone(),
+                        kind: ReferenceKind::Import,
+                        start_line: value.start_position().row as u32 + 1,
+                        context: text(value),
+                        receiver: None,
+                    });
+                }
+                (specifier, bindings)
+            }
+            _ => continue,
+        };
+        for (local, original) in bindings {
+            let name = text(local);
+            let start_line = local.start_position().row as u32 + 1;
+            references.push(RawReference {
+                scope: lexical_scope(local),
+                name: name.clone(),
+                kind: ReferenceKind::ImportAlias,
+                start_line,
+                context: specifier.clone(),
+                receiver: Some(original),
+            });
+            if !specifier.is_empty() && !specifier.starts_with('.') && !specifier.starts_with('/') {
+                references.push(RawReference {
+                    scope: None,
+                    name,
+                    kind: ReferenceKind::PackageBinding,
+                    start_line,
+                    context: specifier.clone(),
+                    receiver: None,
+                });
+            }
+        }
+    }
+}
+
+/// Exact module-level object literals and constructor instances expose their own
+/// public methods. Unknown factory results supply no receiver type evidence.
+fn annotate_js_export_receivers(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    references: &[RawReference],
+    symbols: &mut [RawSymbol],
+) {
+    let exported: std::collections::HashSet<_> = references
+        .iter()
+        .filter(|reference| {
+            reference.kind == ReferenceKind::ExportAlias && reference.receiver.is_none()
+        })
+        .map(|reference| reference.context.as_str())
+        .collect();
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        let declaration = if statement.kind() == "export_statement" {
+            statement.child_by_field_name("declaration")
+        } else {
+            Some(statement)
+        };
+        let Some(declaration) = declaration
+            .filter(|node| matches!(node.kind(), "lexical_declaration" | "variable_declaration"))
+        else {
+            continue;
+        };
+        let mut cursor = declaration.walk();
+        for variable in declaration
+            .named_children(&mut cursor)
+            .filter(|node| node.kind() == "variable_declarator")
+        {
+            let (Some(name), Some(value)) = (
+                variable.child_by_field_name("name"),
+                variable.child_by_field_name("value"),
+            ) else {
+                continue;
+            };
+            let Ok(name) = name.utf8_text(source) else {
+                continue;
+            };
+            if !exported.contains(name) {
+                continue;
+            }
+            let receiver_type = if value.kind() == "object" {
+                let mut cursor = value.walk();
+                let exact = value.named_children(&mut cursor).all(|member| {
+                    member.kind() != "spread_element"
+                        && member
+                            .child_by_field_name("name")
+                            .or_else(|| member.child_by_field_name("key"))
+                            .is_none_or(|name| name.kind() != "computed_property_name")
+                });
+                exact.then_some("object")
+            } else if value.kind() == "new_expression" {
+                value
+                    .child_by_field_name("constructor")
+                    .filter(|node| matches!(node.kind(), "identifier" | "type_identifier"))
+                    .and_then(|node| node.utf8_text(source).ok())
+            } else {
+                None
+            };
+            let Some(receiver_type) = receiver_type else {
+                continue;
+            };
+            if let Some(symbol) = symbols.iter_mut().find(|symbol| {
+                symbol.name == name
+                    && symbol.start_line == declaration.start_position().row as u32 + 1
+            }) {
+                symbol.type_info = Some(TypeInfo {
+                    declared_type: Some(receiver_type.into()),
+                    parameter_types: Vec::new(),
+                    return_type: None,
+                });
+            }
+        }
+    }
+}
+
+fn collect_python_import_bindings(
     root: tree_sitter::Node<'_>,
     source: &[u8],
     references: &mut Vec<RawReference>,
 ) {
-    let text = |node: tree_sitter::Node<'_>| node.utf8_text(source).unwrap_or("").to_string();
-    let package_specifier = |node: tree_sitter::Node<'_>| {
-        let spec = strip_quotes(&text(node));
-        (!spec.is_empty() && !spec.starts_with('.') && !spec.starts_with('/')).then_some(spec)
-    };
-    let mut push = |name: String, spec: &str, node: tree_sitter::Node<'_>| {
-        references.push(RawReference {
-            name,
-            kind: ReferenceKind::PackageBinding,
-            start_line: node.start_position().row as u32 + 1,
-            context: spec.to_string(),
-            receiver: None,
-        });
-    };
-    let mut cursor = root.walk();
-    for statement in root.named_children(&mut cursor) {
-        match statement.kind() {
-            "import_statement" => {
-                let Some(spec) = statement
-                    .child_by_field_name("source")
-                    .and_then(package_specifier)
-                else {
+    let mut stack = vec![root];
+    while let Some(statement) = stack.pop() {
+        let mut cursor = statement.walk();
+        stack.extend(statement.named_children(&mut cursor));
+        if statement.kind() != "import_from_statement" {
+            continue;
+        }
+        let Some(module) = statement.child_by_field_name("module_name") else {
+            continue;
+        };
+        let specifier = module.utf8_text(source).unwrap_or("");
+        let mut cursor = statement.walk();
+        for binding in statement.children_by_field_name("name", &mut cursor) {
+            let (original, local) = if binding.kind() == "aliased_import" {
+                let Some(original) = binding.child_by_field_name("name") else {
                     continue;
                 };
-                let mut c = statement.walk();
-                let Some(clause) = statement
-                    .named_children(&mut c)
-                    .find(|n| n.kind() == "import_clause")
-                else {
+                let Some(local) = binding.child_by_field_name("alias") else {
                     continue;
                 };
-                let mut c = clause.walk();
-                for part in clause.named_children(&mut c) {
-                    match part.kind() {
-                        "identifier" => push(text(part), &spec, part),
-                        "namespace_import" => {
-                            let mut c = part.walk();
-                            if let Some(id) = part
-                                .named_children(&mut c)
-                                .find(|n| n.kind() == "identifier")
-                            {
-                                push(text(id), &spec, id);
-                            }
-                        }
-                        "named_imports" => {
-                            let mut c = part.walk();
-                            for specifier in part
-                                .named_children(&mut c)
-                                .filter(|n| n.kind() == "import_specifier")
-                            {
-                                if let Some(local) = specifier
-                                    .child_by_field_name("alias")
-                                    .or_else(|| specifier.child_by_field_name("name"))
-                                {
-                                    push(text(local), &spec, local);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            "lexical_declaration" | "variable_declaration" => {
-                let mut c = statement.walk();
-                for declarator in statement
-                    .named_children(&mut c)
-                    .filter(|n| n.kind() == "variable_declarator")
-                {
-                    let Some(value) = declarator.child_by_field_name("value") else {
-                        continue;
-                    };
-                    if value.kind() != "call_expression"
-                        || value
-                            .child_by_field_name("function")
-                            .is_none_or(|f| f.kind() != "identifier" || text(f) != "require")
-                    {
-                        continue;
-                    }
-                    let Some(spec) = value.child_by_field_name("arguments").and_then(|args| {
-                        let mut c = args.walk();
-                        args.named_children(&mut c)
-                            .next()
-                            .filter(|a| a.kind() == "string")
-                            .and_then(package_specifier)
-                    }) else {
-                        continue;
-                    };
-                    let Some(target) = declarator.child_by_field_name("name") else {
-                        continue;
-                    };
-                    match target.kind() {
-                        "identifier" => push(text(target), &spec, target),
-                        "object_pattern" => {
-                            let mut c = target.walk();
-                            for prop in target.named_children(&mut c) {
-                                let local = match prop.kind() {
-                                    "shorthand_property_identifier_pattern" => Some(prop),
-                                    "pair_pattern" => prop
-                                        .child_by_field_name("value")
-                                        .filter(|v| v.kind() == "identifier"),
-                                    "object_assignment_pattern" => {
-                                        prop.child_by_field_name("left").filter(|l| {
-                                            l.kind() == "shorthand_property_identifier_pattern"
-                                        })
-                                    }
-                                    _ => None,
-                                };
-                                if let Some(local) = local {
-                                    push(text(local), &spec, local);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
+                (original, local)
+            } else {
+                (binding, binding)
+            };
+            references.push(RawReference {
+                scope: None,
+                name: local.utf8_text(source).unwrap_or("").into(),
+                kind: ReferenceKind::ImportAlias,
+                start_line: local.start_position().row as u32 + 1,
+                context: specifier.into(),
+                receiver: Some(original.utf8_text(source).unwrap_or("").into()),
+            });
         }
     }
 }
@@ -3336,6 +5418,141 @@ pub fn parse_batch(files: &[(&Path, &str)]) -> ParseResult {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn rust_parse_reuses_one_local_binding_inventory() {
+        let source = "struct Unit;\nfn make() -> (Unit,) { (Unit,) }\nfn caller() { let unit = Unit; let (tuple,) = make(); }\n";
+        TEST_LOCAL_BINDING_WALK_COUNT.with(|count| count.set(0));
+        let parsed = parse_source(Path::new("src/lib.rs"), source).unwrap();
+        assert!(
+            parsed
+                .type_bindings
+                .iter()
+                .any(|binding| binding.var_name == "unit" && binding.type_name == "Unit")
+        );
+        assert!(
+            parsed
+                .type_bindings
+                .iter()
+                .any(|binding| binding.var_name == "tuple" && binding.type_name == "Unit")
+        );
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|reference| reference.kind == ReferenceKind::LocalBinding
+                    && reference.name == "tuple")
+        );
+        TEST_LOCAL_BINDING_WALK_COUNT.with(|count| {
+            assert_eq!(
+                count.get(),
+                1,
+                "reference, tuple, and unit evidence must share one within-tree local walk"
+            )
+        });
+        let evidence = scoped_rust_assignment_evidence(source, &parsed.type_bindings);
+        assert!(
+            evidence
+                .local_declarations
+                .iter()
+                .any(|binding| binding.name == "tuple")
+        );
+        TEST_LOCAL_BINDING_WALK_COUNT.with(|count| {
+            assert_eq!(
+                count.get(),
+                2,
+                "the separate ephemeral resolver parse still owns one local walk"
+            )
+        });
+    }
+
+    #[test]
+    fn js_parse_reuses_one_local_binding_inventory() {
+        let source = "class Store { query() {} } class Service { constructor() { this.store = new Store(); } run() { this.store.query(); } } module.exports = { run() {} }; function shadow(module) { return module.exports; }";
+        TEST_LOCAL_BINDING_WALK_COUNT.with(|count| count.set(0));
+        let parsed = parse_source(Path::new("src/main.js"), source).unwrap();
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|reference| reference.kind == ReferenceKind::LocalBinding
+                    && reference.name == "module")
+        );
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|reference| reference.kind == ReferenceKind::Call
+                    && reference.name == "query"
+                    && reference.receiver.as_deref() == Some("this.store"))
+        );
+        assert!(parsed.symbols.iter().any(|symbol| symbol.name == "run"));
+        TEST_LOCAL_BINDING_WALK_COUNT.with(|count| {
+            assert_eq!(
+                count.get(),
+                1,
+                "field, CommonJS, and output-reference evidence must share one local walk"
+            )
+        });
+    }
+
+    #[test]
+    fn rust_type_origins_select_named_imports_once_per_binding() {
+        let source =
+            "use crate::model::Imported;\nfn take(value: Imported) -> Imported { value }\n";
+        let parsed = parse_source(Path::new("src/main.rs"), source).unwrap();
+        assert_eq!(
+            parsed.type_bindings.len(),
+            2,
+            "parameter and return evidence are nonempty"
+        );
+        TEST_NAMED_IMPORT_SELECTION_COUNT.with(|count| count.set(0));
+        let evidence = scoped_rust_assignment_evidence(source, &parsed.type_bindings);
+        assert_eq!(evidence.type_origins.len(), 2);
+        for origin in &evidence.type_origins {
+            assert_eq!(origin.named_imports, vec!["crate::model::Imported"]);
+            assert_eq!(origin.imports, origin.named_imports);
+            assert_eq!(origin.named_import_positions.len(), 1);
+        }
+        TEST_NAMED_IMPORT_SELECTION_COUNT.with(|count| {
+            assert_eq!(
+                count.get(),
+                2,
+                "named paths and declaration bytes must come from the same selected imports"
+            )
+        });
+    }
+
+    // Capture these snapshots on the pre-optimization source, then keep them
+    // frozen when verifying shared inventory and named-import reuse.
+    #[test]
+    fn rust_shared_local_inventory_full_output() {
+        let source = "struct Unit;\nfn make() -> (Unit,) { (Unit,) }\nfn caller() { let unit = Unit; let (tuple,) = make(); }\n";
+        let parsed = parse_source(Path::new("src/lib.rs"), source).unwrap();
+        insta::assert_yaml_snapshot!("rust_shared_local_inventory_full_output", parsed);
+    }
+
+    #[test]
+    fn js_shared_local_inventory_full_output() {
+        let source = "class Store { query() {} } class Service { constructor() { this.store = new Store(); } run() { this.store.query(); } } module.exports = { run() {} }; function shadow(module) { return module.exports; }";
+        let parsed = parse_source(Path::new("src/main.js"), source).unwrap();
+        insta::assert_yaml_snapshot!("js_shared_local_inventory_full_output", parsed);
+    }
+
+    #[test]
+    fn rust_imported_type_full_output() {
+        let source =
+            "use crate::model::Imported;\nfn take(value: Imported) -> Imported { value }\n";
+        let parsed = parse_source(Path::new("src/main.rs"), source).unwrap();
+        insta::assert_yaml_snapshot!("rust_imported_type_full_output", parsed);
+    }
+
+    #[test]
+    fn ts_shared_local_inventory_full_output() {
+        let source = "class Store { query(): void {} } class Service { private store: Store; constructor() { this.store = new Store(); } run(): void { this.store.query(); } } module.exports = { run(): void {} }; function shadow(module: unknown) { return module; }";
+        let parsed = parse_source(Path::new("src/main.ts"), source).unwrap();
+        insta::assert_yaml_snapshot!("ts_shared_local_inventory_full_output", parsed);
+    }
 
     /// nw-601: the predicate every code-index route calls. The partial case is
     /// the counterweight, and it asserts `has_syntax_errors` is TRUE so the
@@ -4131,27 +6348,9 @@ class Config:
             .find(|s| s.name == "formatDate")
             .expect("ES export must be captured as a definition");
 
-        assert_eq!(
-            (
-                cjs_fn.visibility,
-                cjs_fn.is_entry_point,
-                cjs_fn.entry_point_kind
-            ),
-            (
-                es_fn.visibility,
-                es_fn.is_entry_point,
-                es_fn.entry_point_kind
-            ),
-            "a direct CommonJS export must match the equivalent ES export's \
-             (visibility, is_entry_point, entry_point_kind) triple: \
-             commonjs={:?}/{:?}/{:?} es={:?}/{:?}/{:?}",
-            cjs_fn.visibility,
-            cjs_fn.is_entry_point,
-            cjs_fn.entry_point_kind,
-            es_fn.visibility,
-            es_fn.is_entry_point,
-            es_fn.entry_point_kind
-        );
+        assert_eq!(cjs_fn.visibility, es_fn.visibility);
+        assert!(cjs_fn.is_entry_point);
+        assert!(!es_fn.is_entry_point);
         assert_eq!(cjs_fn.visibility, Visibility::Public);
     }
 
@@ -4181,27 +6380,9 @@ class Config:
             .find(|s| s.name == "formatDate")
             .expect("the local declaration must still be captured");
 
-        assert_eq!(
-            (
-                cjs_fn.visibility,
-                cjs_fn.is_entry_point,
-                cjs_fn.entry_point_kind
-            ),
-            (
-                es_fn.visibility,
-                es_fn.is_entry_point,
-                es_fn.entry_point_kind
-            ),
-            "a CommonJS bare-identifier re-export must match `export {{ name }}`'s \
-             (visibility, is_entry_point, entry_point_kind) triple: \
-             commonjs={:?}/{:?}/{:?} es={:?}/{:?}/{:?}",
-            cjs_fn.visibility,
-            cjs_fn.is_entry_point,
-            cjs_fn.entry_point_kind,
-            es_fn.visibility,
-            es_fn.is_entry_point,
-            es_fn.entry_point_kind
-        );
+        assert_eq!(cjs_fn.visibility, es_fn.visibility);
+        assert!(cjs_fn.is_entry_point);
+        assert!(!es_fn.is_entry_point);
         assert_eq!(cjs_fn.visibility, Visibility::Public);
         assert_eq!(cjs_fn.entry_point_kind, Some(EntryPointKind::Main));
     }
@@ -9935,6 +12116,75 @@ mod macro_call_tests {
     use super::*;
     use std::path::Path;
 
+    #[test]
+    fn macro_literal_and_tuple_field_methods_keep_receiver_evidence() {
+        let source = r#"fn witness() {
+    assert!(error.1.contains("real committed admin mutation failure"));
+    assert!("message".contains("mess"));
+    assert!(123.to_string().contains("12"));
+    assert!(1.5.is_finite());
+    assert!('x'.is_ascii());
+    assert!(make_items()?.len() > 0);
+}"#;
+        let parsed = parse_source(Path::new("src/witness.rs"), source).unwrap();
+        for (name, line, receiver) in [
+            ("contains", 2, "error.1"),
+            ("contains", 3, "\"message\""),
+            ("to_string", 4, "123"),
+            ("contains", 4, "123.to_string()"),
+            ("is_finite", 5, "1.5"),
+            ("is_ascii", 6, "'x'"),
+            ("len", 7, "make_items()?"),
+        ] {
+            let call = parsed
+                .references
+                .iter()
+                .find(|reference| {
+                    reference.kind == ReferenceKind::Call
+                        && reference.name == name
+                        && reference.start_line == line
+                })
+                .expect("actual macro call must be captured");
+            assert_eq!(call.receiver.as_deref(), Some(receiver), "{call:#?}");
+        }
+    }
+
+    #[test]
+    fn macro_call_result_and_grouped_methods_keep_receiver_evidence() {
+        let source = r#"fn witness() {
+    assert!(helper());
+    assert!(worker.run());
+    assert!(make_items().unwrap().len());
+    assert!((items).len());
+    assert!(format!("{error}").contains("message"));
+}"#;
+        let parsed = parse_source(Path::new("src/witness.rs"), source).unwrap();
+        for (name, line, receiver) in [
+            ("helper", 2, None),
+            ("run", 3, Some("worker")),
+            ("len", 4, Some("make_items().unwrap()")),
+            ("len", 5, Some("(items)")),
+            ("contains", 6, Some("format!(\"{error}\")")),
+        ] {
+            let call = parsed
+                .references
+                .iter()
+                .find(|reference| {
+                    reference.kind == ReferenceKind::Call
+                        && reference.name == name
+                        && reference.start_line == line
+                })
+                .expect("actual macro call must be captured");
+            assert_eq!(call.receiver.as_deref(), receiver, "{call:#?}");
+        }
+        assert!(
+            parsed.references.iter().any(|reference| {
+                reference.name == "format" && reference.kind == ReferenceKind::Macro
+            }),
+            "nested format invocation must remain a macro"
+        );
+    }
+
     /// nw-151: assertions are the dominant call site in Rust test suites, and
     /// tree-sitter parses macro arguments as an opaque token_tree, so calls
     /// inside `assert!(..)` produced no CALLS edge at all. That hollowed out
@@ -10022,7 +12272,43 @@ mod export_clause_tests {
     use std::path::Path;
 
     #[test]
-    fn local_list_exports_root_value_declarations_and_aliases_only() {
+    fn review2_es_exports_are_public_review_candidates_not_automatic_roots() {
+        for (path, source) in [
+            ("src/library.js", "export function unusedExport() {}\n"),
+            (
+                "src/library.ts",
+                "function unusedExport() {}\nexport { unusedExport as renamed };\n",
+            ),
+            (
+                "src/library.js",
+                "function unusedExport() {}\nexport default unusedExport;\n",
+            ),
+        ] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            let symbol = parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == "unusedExport")
+                .unwrap();
+            assert_eq!(symbol.visibility, Visibility::Public, "{path}");
+            assert!(
+                !symbol.is_entry_point,
+                "ES exports require independent root evidence: {symbol:#?}"
+            );
+        }
+        for source in [
+            "function api() {}\nmodule.exports = api;\n",
+            "function api() {}\nmodule.exports.api = api;\n",
+            "exports.api = function api() {};\n",
+        ] {
+            let parsed = parse_source(Path::new("src/library.js"), source).unwrap();
+            let symbol = parsed.symbols.iter().find(|s| s.name == "api").unwrap();
+            assert!(symbol.is_entry_point, "CommonJS public API: {symbol:#?}");
+        }
+    }
+
+    #[test]
+    fn local_list_exports_mark_value_declarations_public_without_rooting() {
         let parsed = parse_source(
             Path::new("src/library.js"),
             concat!(
@@ -10036,7 +12322,10 @@ mod export_clause_tests {
         .unwrap();
         for name in ["alpha", "beta", "arrow"] {
             let symbol = parsed.symbols.iter().find(|s| s.name == name).unwrap();
-            assert!(symbol.is_entry_point, "local export {name} must be a root");
+            assert!(
+                !symbol.is_entry_point,
+                "ES export {name} needs root evidence"
+            );
             assert_eq!(symbol.visibility, Visibility::Public);
         }
         assert!(
@@ -10065,7 +12354,7 @@ mod export_clause_tests {
             .iter()
             .find(|s| s.name == "kept" && s.start_line == 1)
             .unwrap();
-        assert!(kept.is_entry_point);
+        assert!(!kept.is_entry_point);
         assert_eq!(kept.visibility, Visibility::Public);
         assert!(
             !parsed
@@ -10076,7 +12365,7 @@ mod export_clause_tests {
                 .is_entry_point
         );
         assert!(
-            parsed
+            !parsed
                 .symbols
                 .iter()
                 .find(|s| s.name == "Container")
@@ -10106,9 +12395,9 @@ mod export_clause_tests {
             .filter(|s| s.name == "exported")
             .collect();
         assert_eq!(shadows.len(), 2);
-        assert_eq!(shadows.iter().filter(|s| s.is_entry_point).count(), 1);
+        assert_eq!(shadows.iter().filter(|s| s.is_entry_point).count(), 0);
         assert!(
-            shadows
+            !shadows
                 .iter()
                 .find(|s| s.start_line == 1)
                 .unwrap()
@@ -10146,7 +12435,7 @@ mod export_clause_tests {
             );
         }
         assert!(
-            parsed
+            !parsed
                 .symbols
                 .iter()
                 .find(|s| s.name == "value")
@@ -10156,14 +12445,14 @@ mod export_clause_tests {
     }
 
     #[test]
-    fn default_identifier_export_roots_local_value_not_imported_shadow() {
+    fn default_identifier_export_marks_local_value_public_without_rooting() {
         let local = parse_source(
             Path::new("src/library.js"),
             "function localValue() {}\nexport default localValue;\n",
         )
         .unwrap();
         assert!(
-            local
+            !local
                 .symbols
                 .iter()
                 .find(|s| s.name == "localValue")
@@ -11202,5 +13491,40 @@ mod attribute_string_reference_tests {
             calls(r#"struct A { #[serde(default = "default_timeout")] t: u64 }"#),
             vec!["default_timeout"],
         );
+    }
+}
+
+#[cfg(test)]
+mod review_macro_mapping_tests {
+    use super::*;
+    #[test]
+    fn review_macro_single_colon_separates_value_not_receiver() {
+        let parsed = parse_source(
+            std::path::Path::new("src/user.rs"),
+            r#"fn user() {
+    json!({
+        "key": helper(),
+        "method": worker.run(),
+        "path": module::helper()
+    });
+}"#,
+        )
+        .unwrap();
+        for (name, line, receiver) in [
+            ("helper", 3, None),
+            ("run", 4, Some("worker")),
+            ("helper", 5, Some("module")),
+        ] {
+            let call = parsed
+                .references
+                .iter()
+                .find(|reference| {
+                    reference.kind == ReferenceKind::Call
+                        && reference.name == name
+                        && reference.start_line == line
+                })
+                .expect("macro value call captured");
+            assert_eq!(call.receiver.as_deref(), receiver, "{call:#?}");
+        }
     }
 }

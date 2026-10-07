@@ -12,27 +12,33 @@ export function StatusBar() {
 
   const [status, setStatus] = useState<BrainStatus | null>(null);
   const [repos, setRepos] = useState<Repo[]>([]);
+  const graphEpoch = useStore((s) => s.graphEpoch);
   const mode = useStore((s) => s.graphMode);
   const sseConnected = useStore((s) => s.sseConnected);
   const selectedWorkspace = useStore((s) => s.selectedWorkspace());
   const sceneMetadata = useStore((s) => s.sceneMetadata);
 
   useEffect(() => {
-    api.brainStatus().then(setStatus).catch((error) => {
+    let cancelled = false;
+    const current = () => !cancelled && useStore.getState().graphEpoch === graphEpoch;
+    api.brainStatus().then((value) => { if (current()) setStatus(value); }).catch((error) => {
+      if (!current()) return;
       useStore.getState().notify({
         kind: "error",
         title: "Status unavailable",
         message: error instanceof Error ? error.message : "Brain status request failed",
       });
     });
-    api.repos().then(setRepos).catch((error) => {
+    api.repos().then((value) => { if (current()) setRepos(value); }).catch((error) => {
+      if (!current()) return;
       useStore.getState().notify({
         kind: "error",
         title: "Repos unavailable",
         message: error instanceof Error ? error.message : "Repository request failed",
       });
     });
-  }, []);
+    return () => { cancelled = true; };
+  }, [graphEpoch]);
 
   const repoCount = selectedWorkspace?.counts.repo_count ?? repos.length;
   const vaultCount = selectedWorkspace?.counts.vault_count ?? status?.vault_count;

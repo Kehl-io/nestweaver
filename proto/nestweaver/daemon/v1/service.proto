@@ -738,6 +738,9 @@ message NoteGetRequest {
   // tool's documented default of `true` could not survive this hop.
   optional bool include_body = 3;
   repeated string sections = 4;
+  // Unicode character continuation offset; absent means the first page.
+  optional uint64 body_offset = 5;
+  optional string body_version = 6;
 }
 message NoteGetResponse {
   string uid = 1;

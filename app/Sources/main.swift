@@ -5,13 +5,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusMenuItem: NSMenuItem?
     var daemonProcess: Process?
     var uiProcess: Process?
+    var uiReadiness: UIChildReadiness?
     var sigTermSource: DispatchSourceSignal?
     var childPids: [pid_t] = []
     var isQuitting = false
     var restartCount = 0
     let maxRestarts = 3
-    let port = 9377
-    var dbPath: String?
+    var port = 9377
+    var databaseSelection: DatabaseSelection?
 
     private static let socketDir = NSHomeDirectory() + "/.local/state/nestweaver"
 
@@ -47,8 +48,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         source.resume()
         sigTermSource = source
 
-        dbPath = detectDatabase()
-        guard let db = dbPath else {
+        databaseSelection = DatabaseSelector.select(
+            environment: ProcessInfo.processInfo.environment, home: NSHomeDirectory())
+        guard let selection = databaseSelection else {
             let alert = NSAlert()
             alert.messageText = "No NestWeaver Database Found"
             alert.informativeText = "Run 'nestweaver index --repo <path> --db <path>' first to create a database."
@@ -62,21 +64,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupMenuBar()
 
         if isDaemonSocketPresent() {
-            startWebUI(dbPath: db)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                self.openWebUI()
-                self.updateStatus("Running (external daemon)")
-            }
+            startWebUI(selection: selection, runningStatus: "Running (external daemon)")
         } else {
-            startDaemon(dbPath: db)
+            startDaemon(selection: selection)
             waitForDaemonSocket { [weak self] in
                 guard let self = self else { return }
-                self.startWebUI(dbPath: db)
+                self.startWebUI(selection: selection)
                 self.scheduleHealthyReset(for: self.daemonProcess)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                    self.openWebUI()
-                    self.updateStatus("Running")
-                }
             }
         }
     }
@@ -136,7 +130,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func startDaemon(dbPath: String) {
+    func startDaemon(selection: DatabaseSelection) {
         let binaryPath = Bundle.main.bundlePath + "/Contents/MacOS/nestweaver-cli"
 
         // Start the daemon as a launchd Aqua LaunchAgent (`daemon start`), NOT as an NSTask
@@ -150,7 +144,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.global().async { [weak self] in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: binaryPath)
-            process.arguments = ["daemon", "--db", dbPath, "start"]
+            process.arguments = selection.daemonArguments
             var environment = ProcessInfo.processInfo.environment
             // One line per diagnostic, so the alert below shows the whole
             // remedy rather than a terminal-width wrap of it.
@@ -198,21 +192,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func startWebUI(dbPath: String) {
+    func startWebUI(selection: DatabaseSelection, runningStatus: String = "Running") {
         if let old = uiProcess, old.isRunning {
             kill(old.processIdentifier, SIGTERM)
         }
         let binaryPath = Bundle.main.bundlePath + "/Contents/MacOS/nestweaver-cli"
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binaryPath)
-        process.arguments = ["ui", "--port", String(port), "--no-open", "--db", dbPath]
+        process.arguments = selection.uiArguments(port: port)
         process.environment = ProcessInfo.processInfo.environment
+        let readiness = UIChildReadiness()
+        uiReadiness = readiness
+        uiProcess = process
+        updateStatus("Starting Web UI…")
         do {
-            try process.run()
-            uiProcess = process
+            try readiness.launch(process, probe: { UIChildReadiness.healthy(port: $0) },
+                onReady: { [weak self, weak process] actualPort in
+                    DispatchQueue.main.async {
+                        guard let self = self, let process = process,
+                              self.uiProcess === process, !self.isQuitting,
+                              readiness.permitsReady(process)
+                              else { return }
+                        self.port = actualPort
+                        self.openWebUI()
+                        self.updateStatus(runningStatus)
+                    }
+                }, onFailure: { [weak self, weak process] diagnostic in
+                    DispatchQueue.main.async {
+                        guard let self = self, let process = process,
+                              self.uiProcess === process, !self.isQuitting else { return }
+                        self.updateStatus("Web UI failed")
+                        FileHandle.standardError.write(Data((diagnostic + "\n").utf8))
+                    }
+                })
             childPids.append(process.processIdentifier)
         } catch {
             updateStatus("Web UI failed to start")
+            FileHandle.standardError.write(Data((error.localizedDescription + "\n").utf8))
         }
     }
 
@@ -242,73 +258,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             usleep(50_000)
         }
         for pid in live { kill(pid, SIGKILL) }
-    }
-
-    func detectDatabase() -> String? {
-        // 1. Environment variable
-        if let envDb = ProcessInfo.processInfo.environment["NESTWEAVER_DB"], !envDb.isEmpty {
-            return envDb
-        }
-
-        let fm = FileManager.default
-        let home = NSHomeDirectory()
-
-        // 2. Parse ~/.nestweaver/instance.toml for db field
-        let instanceToml = home + "/.nestweaver/instance.toml"
-        if let contents = try? String(contentsOfFile: instanceToml, encoding: .utf8) {
-            if let dbValue = parseTomlString(contents, key: "db") {
-                // Resolve ~ in path
-                let resolved = dbValue.hasPrefix("~/")
-                    ? home + String(dbValue.dropFirst(1))
-                    : dbValue
-                // Resolve symlinks for consistency with Rust's canonicalize
-                let canonical = (resolved as NSString).resolvingSymlinksInPath
-                if fm.fileExists(atPath: canonical) {
-                    return canonical
-                }
-            }
-        }
-
-        // 3. Glob ~/.local/share/nestweaver/*/brain.lbug
-        let nestDir = home + "/.local/share/nestweaver"
-        if let dirs = try? fm.contentsOfDirectory(atPath: nestDir) {
-            for dir in dirs.sorted() {
-                let candidate = nestDir + "/" + dir + "/brain.lbug"
-                if fm.fileExists(atPath: candidate) {
-                    return (candidate as NSString).resolvingSymlinksInPath
-                }
-            }
-        }
-
-        return nil
-    }
-
-    /// Parse a simple key = "value" or key = 'value' from TOML content.
-    /// Handles quoted values correctly, including values containing '='.
-    func parseTomlString(_ content: String, key: String) -> String? {
-        for line in content.components(separatedBy: "\n") {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            // Skip comments and section headers
-            if trimmed.hasPrefix("#") || trimmed.hasPrefix("[") { continue }
-
-            // Match key = value pattern
-            guard let eqIndex = trimmed.firstIndex(of: "=") else { continue }
-            let lineKey = trimmed[trimmed.startIndex..<eqIndex]
-                .trimmingCharacters(in: .whitespaces)
-            if lineKey != key { continue }
-
-            var value = trimmed[trimmed.index(after: eqIndex)...]
-                .trimmingCharacters(in: .whitespaces)
-
-            // Strip matching quotes
-            if (value.hasPrefix("\"") && value.hasSuffix("\"")) ||
-               (value.hasPrefix("'") && value.hasSuffix("'")) {
-                value = String(value.dropFirst().dropLast())
-            }
-
-            return value.isEmpty ? nil : value
-        }
-        return nil
     }
 }
 

@@ -1,154 +1,333 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 8650
 expression: "parsed_references(\"simple.rs\", &source)"
 ---
-- name: "std::collections::HashMap"
+- scope:
+    start: 0
+    end: 835
+    position: 0
+    initialized_at: 0
+    hoisted_var: false
+  name: "std::collections::HashMap"
   kind: Import
   start_line: 1
   context: "use std::collections::HashMap;"
   receiver: ~
-- name: "crate::config::Settings"
+- scope:
+    start: 0
+    end: 835
+    position: 31
+    initialized_at: 0
+    hoisted_var: false
+  name: "crate::config::Settings"
   kind: Import
   start_line: 2
   context: "use crate::config::Settings;"
   receiver: ~
-- name: HashMap
+- scope:
+    start: 0
+    end: 835
+    position: 101
+    initialized_at: 101
+    hoisted_var: false
+  name: HashMap
   kind: TypeRef
   start_line: 5
   context: "sensors: HashMap<String, Sensor>"
   receiver: ~
-- name: Readable
+- scope:
+    start: 0
+    end: 835
+    position: 265
+    initialized_at: 265
+    hoisted_var: false
+  name: Readable
   kind: Extends
   start_line: 18
   context: "impl Readable for SensorManager {"
   receiver: ~
-- name: get_primary
+- scope:
+    start: 325
+    end: 367
+    position: 335
+    initialized_at: 335
+    hoisted_var: false
+  name: get_primary
   kind: Call
   start_line: 20
   context: self.get_primary().value
   receiver: self
-- name: get_primary
+- scope:
+    start: 325
+    end: 367
+    position: 335
+    initialized_at: 335
+    hoisted_var: false
+  name: get_primary
   kind: ReadAccess
   start_line: 20
   context: self.get_primary()
   receiver: self
-- name: value
+- scope:
+    start: 325
+    end: 367
+    position: 335
+    initialized_at: 335
+    hoisted_var: false
+  name: value
   kind: Call
   start_line: 20
   context: self.get_primary().value()
   receiver: self.get_primary()
-- name: value
+- scope:
+    start: 325
+    end: 367
+    position: 335
+    initialized_at: 335
+    hoisted_var: false
+  name: value
   kind: ReadAccess
   start_line: 20
   context: self.get_primary().value()
   receiver: self.get_primary()
-- name: for_each
+- scope:
+    start: 397
+    end: 463
+    position: 407
+    initialized_at: 407
+    hoisted_var: false
+  name: for_each
   kind: Call
   start_line: 24
   context: self.sensors.values_mut().for_each(|s| s.reset());
   receiver: self.sensors.values_mut()
-- name: for_each
+- scope:
+    start: 397
+    end: 463
+    position: 407
+    initialized_at: 407
+    hoisted_var: false
+  name: for_each
   kind: ReadAccess
   start_line: 24
   context: self.sensors.values_mut().for_each(|s| s.reset())
   receiver: self.sensors.values_mut()
-- name: reset
+- scope:
+    start: 397
+    end: 463
+    position: 446
+    initialized_at: 446
+    hoisted_var: false
+  name: reset
   kind: Call
   start_line: 24
   context: "|s| s.reset()"
   receiver: s
-- name: reset
+- scope:
+    start: 397
+    end: 463
+    position: 446
+    initialized_at: 446
+    hoisted_var: false
+  name: reset
   kind: ReadAccess
   start_line: 24
   context: s.reset()
   receiver: s
-- name: sensors
+- scope:
+    start: 397
+    end: 463
+    position: 407
+    initialized_at: 407
+    hoisted_var: false
+  name: sensors
   kind: ReadAccess
   start_line: 24
   context: self.sensors.values_mut
   receiver: self
-- name: values_mut
+- scope:
+    start: 397
+    end: 463
+    position: 407
+    initialized_at: 407
+    hoisted_var: false
+  name: values_mut
   kind: Call
   start_line: 24
   context: self.sensors.values_mut().for_each
   receiver: self.sensors
-- name: values_mut
+- scope:
+    start: 397
+    end: 463
+    position: 407
+    initialized_at: 407
+    hoisted_var: false
+  name: values_mut
   kind: ReadAccess
   start_line: 24
   context: self.sensors.values_mut()
   receiver: self.sensors
-- name: Self
+- scope:
+    start: 486
+    end: 684
+    position: 492
+    initialized_at: 492
+    hoisted_var: false
+  name: Self
   kind: TypeRef
   start_line: 29
   context: "pub fn new() -> Self {"
   receiver: ~
-- name: SensorManager
+- scope:
+    start: 513
+    end: 591
+    position: 523
+    initialized_at: 523
+    hoisted_var: false
+  name: SensorManager
   kind: TypeRef
   start_line: 30
   context: "SensorManager {"
   receiver: ~
-- name: HashMap
+- scope:
+    start: 513
+    end: 591
+    position: 560
+    initialized_at: 560
+    hoisted_var: false
+  name: HashMap
   kind: TypeRef
   start_line: 31
   context: "HashMap::new()"
   receiver: ~
-- name: new
+- scope:
+    start: 513
+    end: 591
+    position: 560
+    initialized_at: 560
+    hoisted_var: false
+  name: new
   kind: Call
   start_line: 31
   context: "sensors: HashMap::new()"
   receiver: HashMap
-- name: Sensor
+- scope:
+    start: 486
+    end: 684
+    position: 622
+    initialized_at: 622
+    hoisted_var: false
+  name: Sensor
   kind: TypeRef
   start_line: 35
   context: "fn get_primary(&self) -> &Sensor {"
   receiver: ~
-- name: get
+- scope:
+    start: 630
+    end: 682
+    position: 640
+    initialized_at: 640
+    hoisted_var: false
+  name: get
   kind: Call
   start_line: 36
   context: "self.sensors.get(\"primary\").unwrap"
   receiver: self.sensors
-- name: get
+- scope:
+    start: 630
+    end: 682
+    position: 640
+    initialized_at: 640
+    hoisted_var: false
+  name: get
   kind: ReadAccess
   start_line: 36
   context: "self.sensors.get(\"primary\")"
   receiver: self.sensors
-- name: sensors
+- scope:
+    start: 630
+    end: 682
+    position: 640
+    initialized_at: 640
+    hoisted_var: false
+  name: sensors
   kind: ReadAccess
   start_line: 36
   context: self.sensors.get
   receiver: self
-- name: unwrap
+- scope:
+    start: 630
+    end: 682
+    position: 640
+    initialized_at: 640
+    hoisted_var: false
+  name: unwrap
   kind: Call
   start_line: 36
   context: "self.sensors.get(\"primary\").unwrap()"
   receiver: "self.sensors.get(\"primary\")"
-- name: unwrap
+- scope:
+    start: 630
+    end: 682
+    position: 640
+    initialized_at: 640
+    hoisted_var: false
+  name: unwrap
   kind: ReadAccess
   start_line: 36
   context: "self.sensors.get(\"primary\").unwrap()"
   receiver: "self.sensors.get(\"primary\")"
-- name: SensorManager
+- scope:
+    start: 0
+    end: 835
+    position: 686
+    initialized_at: 686
+    hoisted_var: false
+  name: SensorManager
   kind: TypeRef
   start_line: 40
   context: "pub fn initialize(config: &Settings) -> SensorManager {"
   receiver: ~
-- name: Settings
+- scope:
+    start: 686
+    end: 834
+    position: 712
+    initialized_at: 712
+    hoisted_var: false
+  name: Settings
   kind: TypeRef
   start_line: 40
   context: "config: &Settings"
   receiver: ~
-- name: SensorManager
+- scope:
+    start: 740
+    end: 834
+    position: 756
+    initialized_at: 777
+    hoisted_var: false
+  name: SensorManager
   kind: TypeRef
   start_line: 41
   context: "SensorManager::new()"
   receiver: ~
-- name: new
+- scope:
+    start: 740
+    end: 834
+    position: 756
+    initialized_at: 777
+    hoisted_var: false
+  name: new
   kind: Call
   start_line: 41
   context: "let mgr = SensorManager::new();"
   receiver: SensorManager
-- name: println
+- scope:
+    start: 740
+    end: 834
+    position: 782
+    initialized_at: 782
+    hoisted_var: false
+  name: println
   kind: Macro
   start_line: 42
   context: "println!(\"Initialized with {:?}\", config);"

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as Select from "@radix-ui/react-select";
 import { ChevronDown } from "lucide-react";
 import { api } from "../../api/client";
@@ -12,8 +12,11 @@ const MAX_VISIBLE = 100;
 export function SymbolsTab() {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const exploreNode = useStore((s) => s.exploreNode);
+  const graphEpoch = useStore((s) => s.graphEpoch);
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
 
+  const loadedWorkspace = useRef<string | null>(null);
+  const errorWorkspace = useRef<string | null>(null);
   const [symbols, setSymbols] = useState<SymbolCandidate[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -21,14 +24,17 @@ export function SymbolsTab() {
   const [kindFilter, setKindFilter] = useState<string>("All");
 
   useEffect(() => {
+    let cancelled = false;
+    const current = () => !cancelled && useStore.getState().graphEpoch === graphEpoch && useStore.getState().activeWorkspaceId === activeWorkspaceId;
     setLoading(true);
     setError(null);
     api
       .symbolsTop(200, activeWorkspaceId)
-      .then(setSymbols)
-      .catch((e) => setError(e.message ?? "Failed to load symbols"))
-      .finally(() => setLoading(false));
-  }, [activeWorkspaceId]);
+      .then((rows) => { if (current()) { loadedWorkspace.current = activeWorkspaceId; setSymbols(rows); } })
+      .catch((e) => { if (current()) { errorWorkspace.current = activeWorkspaceId; setError(e.message ?? "Failed to load symbols"); } })
+      .finally(() => { if (current()) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [activeWorkspaceId, graphEpoch]);
 
   const filtered = useMemo(() => {
     const lc = filter.toLowerCase();
@@ -42,7 +48,7 @@ export function SymbolsTab() {
   const visible = filtered.slice(0, MAX_VISIBLE);
   const truncated = filtered.length > MAX_VISIBLE;
 
-  if (loading) {
+  if (loadedWorkspace.current !== activeWorkspaceId && !(error && errorWorkspace.current === activeWorkspaceId)) {
     return (
       <div className="flex h-full items-center justify-center text-sm text-[var(--color-text-muted)]">
         Loading symbols...
@@ -50,7 +56,7 @@ export function SymbolsTab() {
     );
   }
 
-  if (error) {
+  if (error && errorWorkspace.current === activeWorkspaceId && loadedWorkspace.current !== activeWorkspaceId) {
     return (
       <div className="flex h-full items-center justify-center p-4 text-sm text-red-500">
         {error}
@@ -59,7 +65,8 @@ export function SymbolsTab() {
   }
 
   return (
-    <div className="flex h-full flex-col overflow-hidden">
+    <div aria-busy={loading} className="flex h-full flex-col overflow-hidden">
+      {error && errorWorkspace.current === activeWorkspaceId && <div role="alert" className="p-2 text-xs text-red-500">{error}</div>}
       <div className="flex gap-1 border-b border-[var(--color-border)] p-2">
         <input
           type="text"

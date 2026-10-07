@@ -259,7 +259,14 @@ use std::path::Path;
 ///     package no longer earns a name-matched `CROSS_REPO_LINK` to another
 ///     repo's same-named symbol. A stale graph keeps the shadowing symbols and
 ///     the wrong edges until re-indexed.
-pub const RESOLVER_GENERATION: u32 = 8;
+/// 9 — actual binding-user imports replace first-symbol proxies and module
+///     fanout; src-layout Python imports and Swift static receivers resolve.
+///     Composed receivers no longer inherit the first segment's type, removing
+///     false method edges such as a lock-result `len()` calling its enclosing `len`.
+///     Rust macro call-result receivers retain their syntax instead of becoming
+///     bare calls that bind unrelated same-named methods.
+///     Re-index existing repositories with `nestweaver index --repo <path> --force`.
+pub const RESOLVER_GENERATION: u32 = 9;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would

@@ -1729,6 +1729,10 @@ const ENV_REGISTRY: &[EnvVar] = &[
         role: EnvRole::Configures,
     },
     EnvVar {
+        name: "NESTWEAVER_LAUNCHER_READY_TOKEN",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
         name: "NESTWEAVER_LBUG_AUTO_CHECKPOINT",
         role: EnvRole::Configures,
     },
@@ -1924,11 +1928,11 @@ const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
                   to AI agents through query commands. Index a repo, then search symbols,\n\
                   trace dependencies, and generate context-window-sized summaries.\n\n\
                   Quick start:\n  \
-                  nestweaver index --repo ./my-project\n  \
-                  nestweaver context processPayment CheckoutService\n  \
-                  nestweaver search \"UserService\"\n  \
-                  nestweaver symbol \"processPayment\"\n  \
-                  nestweaver repo-map --token-budget 2000",
+                  nestweaver index --repo ./my-project --db ./nestweaver.lbug\n  \
+                  nestweaver context processPayment CheckoutService --db ./nestweaver.lbug\n  \
+                  nestweaver search \"UserService\" --db ./nestweaver.lbug\n  \
+                  nestweaver symbol \"processPayment\" --db ./nestweaver.lbug\n  \
+                  nestweaver repo-map --token-budget 2000 --db ./nestweaver.lbug",
     // nw-399: the exit-code mapping lives HERE, in `nestweaver --help`, because
     // the audience for it is a script author and that is the one place they will
     // look without being told to. The item's defect was not only the zero-byte
@@ -6144,6 +6148,8 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
     /// Measure affected-tests selection quality against full-suite outcomes:
     /// record ground truth from CI, report rolling recall.
@@ -7731,6 +7737,8 @@ enum Commands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
 
     /// Assess blast radius for a set of changed files
@@ -8804,6 +8812,8 @@ enum BrainCommands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
     /// Watch a vault directory for changes and keep the brain in sync.
     /// Runs in the foreground; Ctrl-C stops it cleanly. On each .md save
@@ -9873,6 +9883,8 @@ enum ContractCommands {
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
     },
     /// Diff two OpenAPI spec files (base vs head) at the endpoint AND
     /// request/response field/type level, classifying each change as
@@ -11517,6 +11529,121 @@ fn uninstall_pre_push_hook(cwd: &Path) -> anyhow::Result<i32> {
     Ok(EXIT_SUCCESS)
 }
 
+fn indexed_database_target_message(db: &Path) -> String {
+    let absolute = |path: &Path| {
+        path.canonicalize().unwrap_or_else(|_| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir().unwrap_or_default().join(path)
+            }
+        })
+    };
+    let selected = absolute(db);
+    let logical_anchor = nestweaver_engine::publication::instance_anchor_database(db);
+    // A publication namespace is derived from the logical final filename.
+    // Resolving an anchor symlink would select a different CURRENT namespace.
+    let anchor = if logical_anchor.as_path() != db {
+        if logical_anchor.is_absolute() {
+            logical_anchor
+        } else {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join(logical_anchor)
+        }
+    } else {
+        selected.clone()
+    };
+    if anchor == selected {
+        format!("Indexed database: {}", anchor.display())
+    } else {
+        format!(
+            "Indexed database: {}\nSelected graph: {}",
+            anchor.display(),
+            selected.display()
+        )
+    }
+}
+
+#[cfg(test)]
+mod index_target_disclosure_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn index_target_disclosure_preserves_symlink_publication_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let original = root.join("original.lbug");
+        let alias = root.join("alias.lbug");
+        std::fs::write(&original, b"").unwrap();
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        let graph = nestweaver_engine::publication::default_publication_root(&alias)
+            .join("slots/00000000-0000-4000-8000-000000000001/graph.lbug");
+        let other_graph = nestweaver_engine::publication::default_publication_root(&original)
+            .join("slots/00000000-0000-4000-8000-000000000002/graph.lbug");
+        for path in [&graph, &other_graph] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"").unwrap();
+        }
+        assert_ne!(
+            graph, other_graph,
+            "the aliases have distinct publication namespaces"
+        );
+        let message = indexed_database_target_message(&graph);
+        let lines: Vec<_> = message.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                format!("Indexed database: {}", alias.display()),
+                format!(
+                    "Selected graph: {}",
+                    graph.canonicalize().unwrap().display()
+                )
+            ],
+            "the reusable target must retain the logical publication namespace"
+        );
+    }
+
+    #[test]
+    fn index_target_disclosure_keeps_publication_only_logical_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("brain.lbug");
+        let graph = nestweaver_engine::publication::default_publication_root(&base)
+            .join("slots/00000000-0000-4000-8000-000000000001/graph.lbug");
+        std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
+        std::fs::write(&graph, b"").unwrap();
+        assert!(!base.exists());
+        let message = indexed_database_target_message(&graph);
+        assert!(
+            message.contains(&format!("Indexed database: {}", base.display())),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "Selected graph: {}",
+                graph.canonicalize().unwrap().display()
+            )),
+            "{message}"
+        );
+
+        let relative = Path::new(
+            "relative-brain.lbug.publications/slots/00000000-0000-4000-8000-000000000001/graph.lbug",
+        );
+        let message = indexed_database_target_message(relative);
+        assert!(
+            message.contains(&format!(
+                "Indexed database: {}",
+                std::env::current_dir()
+                    .unwrap()
+                    .join("relative-brain.lbug")
+                    .display()
+            )),
+            "{message}"
+        );
+    }
+}
+
 /// Resolve the DB path for repository-scoped commands (`index` and code
 /// `watch`) while preserving their repository-local final fallback.
 ///
@@ -11945,20 +12072,112 @@ impl DegradedUiServer {
     }
 }
 
-/// Probe the daemon that serves the UI. `Err` carries why the daemon is
-/// considered down (socket gone, connect failed, RPC failed, timed out).
+/// Probe and return a healthy existing connection within one shared budget.
+/// A deadline is an observation failure, not evidence that the daemon died.
 fn ui_daemon_health_probe(
     rt: &tokio::runtime::Runtime,
     db_path: &std::path::Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<nestweaver_client::DaemonClient> {
     rt.block_on(async {
         tokio::time::timeout(UI_DAEMON_PROBE_TIMEOUT, async {
             let mut probe = nestweaver_client::DaemonClient::connect_existing(db_path).await?;
             probe.health_check().await?;
-            anyhow::Ok(())
+            anyhow::Ok(probe)
         })
         .await
         .context("daemon health probe timed out")?
+    })
+}
+
+/// Prove absence before taking over a daemon's listener. Unknown ownership,
+/// slow RPCs and accepting sockets are inconclusive; they cannot justify
+/// displacement. All socket candidates share one cancellable connect budget.
+fn ui_daemon_absence_verified(
+    rt: &tokio::runtime::Runtime,
+    db_path: &std::path::Path,
+    probe_error: &anyhow::Error,
+) -> bool {
+    ui_daemon_absence_verified_with_pidfile_probe(rt, db_path, probe_error, ui_pidfile_lock_held)
+}
+
+/// A failed lock observation is unknown, never evidence that the inode is
+/// free. A successful nonblocking acquisition must also be released before
+/// absence can be proven. This proof is local to UI listener supervision.
+fn ui_pidfile_lock_held(pidfile: &std::path::Path) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pidfile)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        return Ok(false);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(true)
+    } else {
+        Err(error)
+    }
+}
+
+fn ui_daemon_absence_verified_with_pidfile_probe(
+    rt: &tokio::runtime::Runtime,
+    db_path: &std::path::Path,
+    probe_error: &anyhow::Error,
+    pidfile_probe: impl Fn(&std::path::Path) -> std::io::Result<bool>,
+) -> bool {
+    if probe_error
+        .chain()
+        .any(|cause| cause.is::<tokio::time::error::Elapsed>())
+    {
+        return false;
+    }
+    if !nestweaver_daemon::lifecycle::db_write_lock(db_path).is_provably_free() {
+        return false;
+    }
+    let instance = nestweaver_daemon::instance_id_from_db_path(db_path);
+    for pidfile in nestweaver_daemon::lifecycle::pidfile_candidates(&instance) {
+        match pidfile_probe(&pidfile) {
+            Ok(false) => {}
+            Ok(true) => return false,
+            Err(error) => {
+                tracing::debug!(pidfile = %pidfile.display(), error = %error, "UI daemon ownership observation is inconclusive");
+                return false;
+            }
+        }
+        // Raw pidfile contents alone never identify an incumbent or a
+        // recycled PID; command-line identity remains an independent guard.
+        if nestweaver_client::autostart::read_pid(&pidfile)
+            .is_some_and(|pid| daemon_identity_cmdline_ok(pid, db_path))
+        {
+            return false;
+        }
+    }
+    rt.block_on(async {
+        tokio::time::timeout(UI_DAEMON_PROBE_TIMEOUT, async {
+            for socket in nestweaver_daemon::lifecycle::daemon_socket_candidates(&instance) {
+                match tokio::net::UnixStream::connect(&socket).await {
+                    Ok(_) => return false,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                        ) => {}
+                    Err(_) => return false,
+                }
+            }
+            true
+        })
+        .await
+        .unwrap_or(false)
     })
 }
 
@@ -12015,6 +12234,7 @@ fn wait_for_daemon_watcher(
     rt: &tokio::runtime::Runtime,
     client: &mut nestweaver_client::DaemonClient,
     watcher_id: u64,
+    db_path: &std::path::Path,
     rx: &std::sync::mpsc::Receiver<()>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -12025,17 +12245,49 @@ fn wait_for_daemon_watcher(
         match rx.recv_timeout(std::time::Duration::from_secs(2)) {
             Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let health = rt
-                    .block_on(async {
-                        tokio::time::timeout(
-                            std::time::Duration::from_secs(3),
-                            client.health_check(),
-                        )
+                let health = match rt.block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(3), client.health_check())
                         .await
-                    })
-                    .context(
-                        "watcher status timed out; controller is no longer observing its watcher",
-                    )??;
+                }) {
+                    Ok(Ok(health)) => health,
+                    Err(_) => continue, // A deadline cannot prove daemon death.
+                    Ok(Err(error)) => {
+                        match rx.try_recv() {
+                            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                return Ok(());
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        }
+                        if ui_daemon_absence_verified(rt, db_path, &error) {
+                            return Err(error.context("watcher daemon is no longer running"));
+                        }
+                        match rx.try_recv() {
+                            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                return Ok(());
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        }
+                        // Reconnect only to an existing selected peer within
+                        // the shared health budget. Session identity stays
+                        // fixed; no autostart or unconditional successor stop.
+                        match rt.block_on(async {
+                            tokio::time::timeout(UI_DAEMON_PROBE_TIMEOUT, async {
+                                let mut observed =
+                                    nestweaver_client::DaemonClient::connect_existing(db_path)
+                                        .await?;
+                                let health = observed.health_check().await?;
+                                anyhow::Ok((observed, health))
+                            })
+                            .await
+                        }) {
+                            Ok(Ok((observed, health))) => {
+                                *client = observed;
+                                health
+                            }
+                            _ => continue,
+                        }
+                    }
+                };
                 anyhow::ensure!(
                     health.watcher.as_ref().is_some_and(|w| w.id == watcher_id),
                     "watcher session {watcher_id} was displaced or stopped; this controller has terminated"
@@ -12109,11 +12361,10 @@ fn supervise_ui_daemon(
 ) -> anyhow::Result<bool> {
     let mut daemon_up = true;
     let mut degraded: Option<DegradedUiServer> = None;
-    // Two consecutive probe failures before an outage is declared: a busy
-    // daemon can exceed the probe timeout without being down, and degrading
-    // against a LIVE daemon means grabbing (and failing to bind) a port it
-    // still owns.
+    // Only verified absence counts toward an outage. Repeated timeouts while
+    // an owner remains live must retain its listener and remain retryable.
     let mut probe_failures = 0u32;
+    let mut inconclusive_logged = false;
     // Same two-strike rule for the port probe (the daemon's server task can
     // take a moment to bind after a fresh serve_ui).
     let mut port_failures = 0u32;
@@ -12130,8 +12381,10 @@ fn supervise_ui_daemon(
 
         if daemon_up {
             match ui_daemon_health_probe(rt, db_path) {
-                Ok(()) => {
+                Ok(candidate) => {
+                    *client = candidate;
                     probe_failures = 0;
+                    inconclusive_logged = false;
                     // A healthy daemon does not prove the UI port is served
                     // (its server task can have died independently), so probe
                     // the port itself. The daemon still owns the port here,
@@ -12179,6 +12432,18 @@ fn supervise_ui_daemon(
                     }
                 }
                 Err(error) => {
+                    if !ui_daemon_absence_verified(rt, db_path, &error) {
+                        probe_failures = 0;
+                        if !inconclusive_logged {
+                            tracing::warn!(
+                                port,
+                                "daemon health observation is inconclusive ({error:#}); retaining its UI listener and retrying"
+                            );
+                            inconclusive_logged = true;
+                        }
+                        continue;
+                    }
+                    inconclusive_logged = false;
                     probe_failures += 1;
                     if probe_failures == 1 {
                         tracing::warn!(
@@ -12222,10 +12487,7 @@ fn supervise_ui_daemon(
             }
 
             // Re-resolve the daemon connection; the startup client is dead.
-            if let Ok(mut candidate) =
-                rt.block_on(nestweaver_client::DaemonClient::connect_existing(db_path))
-                && rt.block_on(candidate.health_check()).is_ok()
-            {
+            if let Ok(mut candidate) = ui_daemon_health_probe(rt, db_path) {
                 // Ask BEFORE releasing the degraded port: while we hold it
                 // the daemon cannot bind, so ok:true here can only mean it
                 // ALREADY serves a UI — possibly a different port, if
@@ -13841,13 +14103,12 @@ const LBUG_FILE_MAGIC: &[u8; 4] = b"LBUG";
 /// Deliberately a cheap header probe and NOT an open: an open is what costs,
 /// and this runs before every daemon-routed read.
 ///
-/// nw-385: this is a READ guard, and every one of its callers is a read —
-/// `open_store` (which only ever performs `open_read_only`) and
-/// `try_hybrid_json_rpc_checked` (the daemon-routed read funnel, which `index`
-/// deliberately does not route through). It used to exempt a zero-byte file
-/// "because the store initialises it", which is a statement about the CREATE
-/// path and was therefore an exemption for a caller that has never existed.
-/// See the `Ok(0)` arm for what that cost.
+/// nw-385: read routes must not initialise an empty file. nw-735 also applies
+/// this admission guard to commands that mutate an EXISTING database, before
+/// daemon autostart or writer authority can create artifacts. Documented create
+/// routes (`index`, `brain add`, restore) retain their own store admission.
+/// The old zero-byte exemption confused an existing-database operation with a
+/// create path; see the `Ok(0)` arm for what that cost.
 ///
 /// This does NOT claim to detect corruption. A `.lbug` whose header is intact
 /// and whose index region is not still passes here, by construction; see
@@ -15826,7 +16087,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // `--db` like its 36 siblings, rather than reading a sidecar beside
             // a database that does not exist and reporting "0 annotated
             // node(s)". A typo'd `--db` is not an empty store.
-            require_existing_db(&db_path)?;
+            require_openable_db(&db_path)?;
             // nw-257: `load_extensions` folds a corrupt or unreadable sidecar
             // into an empty map, which in THIS command would print
             // "0 annotated node(s)" and exit 0 — an audit reporting nothing
@@ -16184,7 +16445,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             force,
         } => {
             let db_path = selected_db_path(&db.unwrap_or_else(default_db_path))?;
-            require_existing_db(&db_path)?;
+            require_openable_db(&db_path)?;
             let code = run_repair_index_publication(&db_path, json, dry_run, force)?;
             Ok((code, None))
         }
@@ -16622,7 +16883,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Ok(Some(value)) => Ok(Some(value)),
                 Ok(None) => {
                     let store = open_store(Some(&db_path))?;
-                    nestweaver_mcp::tools::dispatch(
+                    nestweaver_mcp::tools::dispatch_cli(
                         &store,
                         None,
                         "cross_repo_contracts",
@@ -16741,7 +17002,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Ok(Some(value)) => Ok(Some(value)),
                 Ok(None) => {
                     let store = open_store(Some(&db_path))?;
-                    nestweaver_mcp::tools::dispatch(&store, None, "backlinks", args, None).map(Some)
+                    nestweaver_mcp::tools::dispatch_cli(&store, None, "backlinks", args, None)
+                        .map(Some)
                 }
                 Err(error) => Err(error),
             };
@@ -16821,7 +17083,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Ok(Some(value)) => Ok(Some(value)),
                 Ok(None) => {
                     let store = open_store(Some(&db_path))?;
-                    nestweaver_mcp::tools::dispatch(&store, None, "note_get", args, None).map(Some)
+                    nestweaver_mcp::tools::dispatch_cli(&store, None, "note_get", args, None)
+                        .map(Some)
                 }
                 Err(error) => Err(error),
             };
@@ -16933,7 +17196,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Ok(Some(value)) => Ok(Some(value)),
                 Ok(None) => {
                     let store = open_store(Some(&db_path))?;
-                    nestweaver_mcp::tools::dispatch(
+                    nestweaver_mcp::tools::dispatch_cli(
                         &store,
                         None,
                         "cross_repo_contracts",
@@ -18802,30 +19065,37 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if !repos.is_empty() {
                 let mut args = clusters_tool_args(limit, members, resolution);
                 args["repos"] = serde_json::json!(repos);
-                let payload = match try_hybrid_json_rpc_checked(
-                    use_daemon,
-                    &db_path,
-                    config_opt.as_deref(),
-                    "clusters",
-                    args.clone(),
-                ) {
+                let mut direct_store = None;
+                let mut fetch =
+                    |args: serde_json::Value| -> anyhow::Result<Option<serde_json::Value>> {
+                        if let Some(value) = try_hybrid_json_rpc_checked(
+                            use_daemon,
+                            &db_path,
+                            config_opt.as_deref(),
+                            "clusters",
+                            args.clone(),
+                        )? {
+                            return Ok(Some(strip_hybrid_meta(value)));
+                        }
+                        if direct_store.is_none() {
+                            direct_store = Some(open_store(Some(&db_path))?);
+                        }
+                        nestweaver_mcp::tools::set_current_db_path(db_path.clone());
+                        Ok(Some(nestweaver_mcp::tools::dispatch_cli(
+                            direct_store.as_ref().unwrap(),
+                            None,
+                            "clusters",
+                            args,
+                            None,
+                        )?))
+                    };
+                let payload = match collect_cluster_tool_pages(args, &mut fetch, true) {
                     Err(error) if error_is_unresolved_repo_filter(&error) => {
                         return Ok((report_unresolved_repo_filter(&error, json), None));
                     }
                     Err(error) => return Err(error),
-                    Ok(Some(value)) => strip_hybrid_meta(value),
-                    Ok(None) => {
-                        let store = open_store(Some(&db_path))?;
-                        nestweaver_mcp::tools::set_current_db_path(db_path.clone());
-                        match nestweaver_mcp::tools::dispatch(&store, None, "clusters", args, None)
-                        {
-                            Err(error) if error_is_unresolved_repo_filter(&error) => {
-                                return Ok((report_unresolved_repo_filter(&error, json), None));
-                            }
-                            Err(error) => return Err(error),
-                            Ok(value) => value,
-                        }
-                    }
+                    Ok(Some(value)) => value,
+                    Ok(None) => unreachable!("direct scoped fallback always returns a page"),
                 };
                 if json {
                     print_json_payload(&payload)?;
@@ -18860,12 +19130,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // trusted from here: a comment cannot notice when it stops
                 // being true, and this one would have had to notice twice.
                 let args = clusters_tool_args(limit, members, resolution);
-                if let Some(value) = try_hybrid_json_rpc_checked(
-                    true,
-                    &db_path,
-                    config_opt.as_deref(),
-                    "clusters",
+                if let Some(value) = collect_cluster_tool_pages(
                     args,
+                    |args| {
+                        Ok(try_hybrid_json_rpc_checked(
+                            true,
+                            &db_path,
+                            config_opt.as_deref(),
+                            "clusters",
+                            args,
+                        )?
+                        .map(strip_hybrid_meta))
+                    },
+                    false,
                 )? {
                     // The tool returns {clusters: [...]} with `size` where
                     // the direct path's ClusteringOutput uses `communities` and
@@ -19168,6 +19445,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // pinned config cannot delete out of a different instance's graph.
             InteractionCommands::Forget { uid, db, config } => {
                 let db_path = resolve_db_with_config(db, config.as_deref())?;
+                require_openable_db(&db_path)?;
                 // nw-462: same gate, same reasoning as `extensions unset`. Both
                 // delete verbs shipped in one commit calling the engine
                 // directly; both now route through the daemon.
@@ -19278,9 +19556,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::Config { command } => run_config(command),
         Commands::Brain { command } => run_brain(*command, out, t0, use_daemon),
         Commands::RtsEval { command } => run_rts_eval(command),
-        Commands::StaleCheck { json, db } => {
-            run_brain(BrainCommands::StaleCheck { json, db }, out, t0, use_daemon)
-        }
+        Commands::StaleCheck { json, db, config } => run_brain(
+            BrainCommands::StaleCheck { json, db, config },
+            out,
+            t0,
+            use_daemon,
+        ),
         Commands::Memory { command } => run_memory(*command, t0, use_daemon),
         Commands::Ranking { command } => run_ranking(command, t0, use_daemon),
         Commands::Eval { command } => run_eval_cmd(command, use_daemon).map(|c| (c, None)),
@@ -19378,8 +19659,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // the `cochange-unavailable` disclosure, so the direct path
                     // would answer with LESS honesty than the daemon (nw-062).
                     nestweaver_mcp::tools::set_current_db_path(db_path.clone());
-                    match nestweaver_mcp::tools::dispatch(&store, None, "blast_radius", args, None)
-                    {
+                    match nestweaver_mcp::tools::dispatch_cli(
+                        &store,
+                        None,
+                        "blast_radius",
+                        args,
+                        None,
+                    ) {
                         Err(error) if error_is_unresolved_repo_filter(&error) => {
                             return Ok((report_unresolved_repo_filter(&error, json), None));
                         }
@@ -19441,7 +19727,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // daemon sets it; without it here the direct route would drop
                     // the cluster risk boost and disagree with `blast-radius`.
                     nestweaver_mcp::tools::set_current_db_path(db_path.clone());
-                    nestweaver_mcp::tools::dispatch(&store, None, "detect_changes", args, None)?
+                    nestweaver_mcp::tools::dispatch_cli(&store, None, "detect_changes", args, None)?
                 }
             };
             if json {
@@ -19516,7 +19802,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Ok(None) => {
                     let store = open_store(Some(&db_path))?;
                     nestweaver_mcp::tools::set_current_db_path(db_path.clone());
-                    nestweaver_mcp::tools::dispatch(&store, None, "flow_trace", args, None)
+                    nestweaver_mcp::tools::dispatch_cli(&store, None, "flow_trace", args, None)
                         .map(Some)
                 }
                 Err(error) => Err(error),
@@ -19584,17 +19870,26 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             generation,
             page_token,
             db,
+            config,
         } => {
             use nestweaver_engine::dead_code::{
                 DeadCodePageRequest, dead_code_database_identity, dead_code_page_guard,
                 dead_code_page_malformed_token_refusal, is_well_formed_page_token,
                 serialize_dead_code_page,
             };
-            let db_path = db.clone().unwrap_or_else(default_db_path);
             if let Err((code, message)) = reject_oversized_repo_selectors(&repos) {
                 eprintln!("{message}");
                 return Ok((code, None));
             }
+            // Malformed continuation tokens keep their refusal before DB/config admission.
+            let malformed_token = page_token
+                .as_deref()
+                .is_some_and(|token| !is_well_formed_page_token(token));
+            let db_path = if malformed_token {
+                db.clone().unwrap_or_else(default_db_path)
+            } else {
+                resolve_db_with_config(db, config.as_deref())?
+            };
             let mut args =
                 serde_json::json!({ "min_confidence": min_confidence, "offset": offset });
             if let Some(n) = limit {
@@ -19625,12 +19920,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             } else if use_daemon {
                 // A reproducible page belongs to the selected database. Never
                 // substitute or merge an upstream population for this route.
-                require_existing_db(&db_path)?;
+                require_openable_db(&db_path)?;
                 let runtime = tokio::runtime::Runtime::new()?;
                 let answer = runtime.block_on(async {
                     let query = async {
                         let mut client =
-                            nestweaver_client::DaemonClient::connect(&db_path, None).await?;
+                            nestweaver_client::DaemonClient::connect(&db_path, config.as_deref())
+                                .await?;
                         let response = client
                             .inner_mut()
                             .dead_code(nestweaver_proto::JsonRequest {
@@ -19655,7 +19951,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     other => other?,
                 }
             } else {
-                let store = open_store(db.as_deref())?;
+                let store = open_store(Some(&db_path))?;
                 let all_repos = store.list_repos(None)?;
                 if let Some(refusal) =
                     nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(
@@ -19685,7 +19981,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 let request = DeadCodePageRequest {
                     min_confidence: DeadCodeConfidence::from_str_loose(&min_confidence)
                         .ok_or_else(|| anyhow::anyhow!("invalid dead-code confidence"))?,
-                    limit: limit.unwrap_or(nestweaver_engine::config::DEFAULT_RESULT_LIMIT),
+                    limit: resolve_limit(
+                        limit,
+                        load_instance_config_opt(config.as_deref()).as_ref(),
+                        nestweaver_engine::config::DEFAULT_RESULT_LIMIT,
+                    ),
                     offset,
                     expected_generation: generation,
                     page_token: page_token.as_deref(),
@@ -20424,6 +20724,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // ignoring it is exactly what the config-DB inventory contract
             // exists to catch, and it caught this.
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            require_openable_db(&db_path)?;
             let rt = tokio::runtime::Runtime::new()?;
             let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
                 &db_path,
@@ -20580,7 +20881,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         let _ = ctrlc_handler(move || {
                             let _ = tx.send(());
                         });
-                        wait_for_daemon_watcher(&rt, &mut client, resp.watcher_id, &rx)?;
+                        wait_for_daemon_watcher(&rt, &mut client, resp.watcher_id, &db_path, &rx)?;
 
                         stop_owned_daemon_watcher(&rt, &mut client, resp.watcher_id)?;
                         eprintln!("Watcher stopped.");
@@ -20801,6 +21102,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 lite,
                 !use_daemon_mcp,
             )?;
+            if let Err(error) = require_openable_db(&db_path) {
+                eprintln!("Error: {error:#}");
+                let _ = nestweaver_mcp::answer_stdio_boot_failure(format!("{error:#}"));
+                return Ok((EXIT_ERROR, None));
+            }
             if let Some(ref allowed) = tool_allowlist {
                 nestweaver_mcp::tools::set_allowed_tools(allowed.clone());
             }
@@ -20967,6 +21273,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // the ACTUAL running port (resp.port), not the one they
                         // requested, instead of printing a dead URL.
                         let actual_port = served_ui_port(&resp)?;
+                        nestweaver_web::announce_launcher_ready(
+                            actual_port,
+                            nestweaver_web::LauncherUiMode::Attached,
+                        );
                         println!("NestWeaver UI: http://127.0.0.1:{actual_port}");
                         println!("{}", resp.message);
                         return Ok((EXIT_SUCCESS, None));
@@ -20974,6 +21284,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok(resp) => {
                         let port = served_ui_port(&resp)?;
                         daemon_ok = true;
+                        nestweaver_web::announce_launcher_ready(
+                            port,
+                            nestweaver_web::LauncherUiMode::Supervised,
+                        );
                         println!("NestWeaver UI: http://127.0.0.1:{port}");
                         if watch {
                             println!("Watch mode enabled — changes auto-reindex.");
@@ -22973,7 +23287,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // no model can be loaded.
             let embed_model =
                 load_direct_semantic_model(&store, direct_instance_cfg.as_ref(), no_embed);
-            let response = nestweaver_mcp::tools::dispatch(
+            let response = nestweaver_mcp::tools::dispatch_cli(
                 &store,
                 tantivy.as_ref(),
                 "project_context",
@@ -23711,6 +24025,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     }
                 }
 
+                if !fail_on_skip || terminal.skipped_count == 0 {
+                    out.status(&indexed_database_target_message(&db_path));
+                }
                 // nw-023: setup is client-side (config files + marker, no DB access); give
                 // daemon-mode users the same gated first-index convenience as the direct path.
                 maybe_run_auto_setup(&db_path, &repo_path, out, setup);
@@ -24058,6 +24375,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 );
             }
 
+            if !fail_on_skip || skipped_files.is_empty() {
+                out.status(&indexed_database_target_message(&db_path));
+            }
             let stats = format!(
                 "{} files, {} symbols, {} edges in {}",
                 files_count,
@@ -27836,6 +28156,7 @@ mod cli_help_contract_tests {
             // a decision about.
             "nestweaver brain remove",
             "nestweaver brain search",
+            "nestweaver brain stale-check",
             "nestweaver brain status",
             "nestweaver brain tag-graph",
             "nestweaver brain topic-clusters",
@@ -27843,8 +28164,10 @@ mod cli_help_contract_tests {
             "nestweaver bridges",
             "nestweaver clusters",
             "nestweaver context",
+            "nestweaver contracts drift",
             "nestweaver count-patterns",
             "nestweaver cross-repo-contracts",
+            "nestweaver dead-code",
             "nestweaver detect-changes",
             // nw-229: added deliberately. It reads the extension sidecar
             // beside the database, so it resolves the pair through the same
@@ -27892,6 +28215,7 @@ mod cli_help_contract_tests {
             "nestweaver search",
             "nestweaver server backup save",
             "nestweaver snapshot build",
+            "nestweaver stale-check",
             "nestweaver suggest-links",
             // nw-414: `summary` joined this inventory. It took `--db` and no
             // `--config`, so it could not resolve an instance, could not take
@@ -30471,6 +30795,14 @@ fn run_publication(command: PublicationCommands) -> anyhow::Result<i32> {
             db,
             json,
         } => {
+            let db = if explicit_root.is_none() {
+                let (base, _) = resolve_base_db_with_config(db, None)?;
+                Some(nestweaver_engine::publication::instance_anchor_database(
+                    &base,
+                ))
+            } else {
+                db
+            };
             let root = root(explicit_root, db)?;
             if let Some(operation) = operation {
                 let state =
@@ -33788,9 +34120,12 @@ credential_method = "gh"
             identity_bound_config(dir.path(), &db, &identity.brain_uuid),
         )
         .unwrap();
+        let configured_db = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join(db.file_name().unwrap());
         assert_eq!(
             resolve_db_with_config(None, Some(&config_path)).unwrap(),
-            db
+            configured_db
         );
         assert_eq!(
             resolve_db_with_config(Some(db.clone()), Some(&config_path)).unwrap(),
@@ -38571,6 +38906,188 @@ mod since_boundary_tests {
     }
 }
 
+/// Reassemble CLI cluster bounds from ordinary bounded tool pages. Each
+/// continuation uses the first page's generation, scope, and resolution.
+fn collect_cluster_tool_pages(
+    original: serde_json::Value,
+    mut fetch: impl FnMut(serde_json::Value) -> anyhow::Result<Option<serde_json::Value>>,
+    include_members: bool,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    use serde_json::{Value, json};
+    let requested_limit = original["limit"].as_u64().unwrap_or(50) as usize;
+    let requested_members = original["members"].as_u64().unwrap_or(20) as usize;
+    let mut request = original.clone();
+    request["members"] = json!(if requested_members == 0 {
+        20
+    } else {
+        requested_members
+    });
+    let Some(mut envelope) = fetch(request.clone())? else {
+        return Ok(None);
+    };
+    let generation = envelope["graph_generation"].as_u64().ok_or_else(|| {
+        anyhow::anyhow!("cluster page missing graph_generation; update daemon and retry")
+    })?;
+    let token = envelope["page_token"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("cluster page missing page_token; update daemon and retry"))?
+        .to_string();
+    let scope = envelope["scope"].clone();
+    let resolution = envelope["resolution"].clone();
+    let total = envelope["total"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("cluster page missing total"))? as usize;
+    let wanted = if requested_limit == 0 {
+        total
+    } else {
+        requested_limit.min(total)
+    };
+    request["resolution"] = resolution.clone();
+    request["expected_generation"] = json!(generation);
+    request["page_token"] = json!(token);
+    let validate = |page: &Value| -> anyhow::Result<()> {
+        anyhow::ensure!(
+            page["graph_generation"] == generation
+                && page["scope"] == scope
+                && page["resolution"] == resolution
+                && page["page_token"] == token,
+            "cluster continuation generation/scope/resolution changed; restart command"
+        );
+        Ok(())
+    };
+    let mut page = envelope.clone();
+    let mut rows = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    while rows.len() < wanted {
+        validate(&page)?;
+        let page_rows = page["clusters"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("malformed cluster page"))?;
+        anyhow::ensure!(
+            !page_rows.is_empty(),
+            "cluster continuation made no progress; narrow scope and retry"
+        );
+        for row in page_rows.iter().take(wanted - rows.len()) {
+            let mut row = row.clone();
+            let id = row["id"]
+                .as_i64()
+                .ok_or_else(|| anyhow::anyhow!("cluster page missing id"))?;
+            anyhow::ensure!(
+                seen.insert(id),
+                "cluster continuation repeated a cluster; restart command"
+            );
+            if include_members {
+                let size = row["size"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("cluster page missing size"))?
+                    as usize;
+                let target = if requested_members == 0 {
+                    size
+                } else {
+                    requested_members.min(size)
+                };
+                let mut members = row["members"]
+                    .as_array()
+                    .ok_or_else(|| anyhow::anyhow!("cluster page missing members"))?
+                    .clone();
+                members.truncate(target);
+                let mut seen_members: std::collections::HashSet<String> = members
+                    .iter()
+                    .filter_map(|m| m["uid"].as_str().map(str::to_owned))
+                    .collect();
+                while members.len() < target {
+                    let offset = row["next_member_offset"].as_u64().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "cluster member page cannot progress; narrow scope and retry"
+                        )
+                    })? as usize;
+                    anyhow::ensure!(
+                        offset == members.len(),
+                        "cluster member continuation offset changed; restart command"
+                    );
+                    let mut member_request = request.clone();
+                    member_request
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("cluster_offset");
+                    member_request["cluster_id"] = json!(id);
+                    member_request["member_offset"] = json!(offset);
+                    member_request["members"] = json!((target - members.len()).min(200));
+                    let member_page = fetch(member_request)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "daemon disappeared during cluster continuation; retry command"
+                        )
+                    })?;
+                    validate(&member_page)?;
+                    let next = member_page["clusters"]
+                        .as_array()
+                        .and_then(|r| r.first())
+                        .ok_or_else(|| anyhow::anyhow!("empty cluster member continuation"))?;
+                    anyhow::ensure!(
+                        next["id"] == id && next["size"] == size,
+                        "cluster membership changed; restart command"
+                    );
+                    let new_members = next["members"]
+                        .as_array()
+                        .ok_or_else(|| anyhow::anyhow!("malformed cluster member page"))?;
+                    anyhow::ensure!(
+                        !new_members.is_empty(),
+                        "cluster member continuation made no progress; narrow scope and retry"
+                    );
+                    for member in new_members.iter().take(target - members.len()) {
+                        let uid = member["uid"]
+                            .as_str()
+                            .ok_or_else(|| anyhow::anyhow!("cluster member missing uid"))?;
+                        anyhow::ensure!(
+                            seen_members.insert(uid.to_owned()),
+                            "cluster member continuation repeated a UID; restart command"
+                        );
+                        members.push(member.clone());
+                    }
+                    row["next_member_offset"] = next["next_member_offset"].clone();
+                }
+                row["members"] = json!(members);
+                row["returned_members"] = json!(members.len());
+                row["members_truncated"] = json!(members.len() < size);
+                row["member_offset"] = json!(0);
+                row["members_omitted"] = json!(size.saturating_sub(members.len()));
+                row["next_member_offset"] = if members.len() < size {
+                    json!(members.len())
+                } else {
+                    Value::Null
+                };
+                row["retry_guidance"] = if members.len() < size {
+                    json!(
+                        "Query this cluster_id with member_offset=next_member_offset, the same repos/resolution, expected_generation=graph_generation, and page_token from this response to retrieve omitted members."
+                    )
+                } else {
+                    Value::Null
+                };
+            }
+            rows.push(row);
+        }
+        if rows.len() < wanted {
+            let offset = page["next_cluster_offset"].as_u64().ok_or_else(|| {
+                anyhow::anyhow!("cluster listing cannot progress; narrow scope and retry")
+            })? as usize;
+            anyhow::ensure!(
+                offset == rows.len(),
+                "cluster listing repeated/changed offset; restart command"
+            );
+            request["cluster_offset"] = json!(offset);
+            page = fetch(request.clone())?.ok_or_else(|| {
+                anyhow::anyhow!("daemon disappeared during cluster continuation; retry command")
+            })?;
+        }
+    }
+    envelope["clusters"] = json!(rows);
+    envelope["returned"] = json!(rows.len());
+    envelope["limit"] = original["limit"].clone();
+    envelope["truncated"] = json!(rows.len() < total);
+    envelope["next_cluster_offset"] = Value::Null;
+    Ok(Some(envelope))
+}
+
 /// nw-299(b): the CLI must never construct `clusters` arguments the tool will
 /// reject. Under `additionalProperties: false` plus declared bounds, a bad
 /// value is not ignored — it fails the whole call, so the daemon route would
@@ -38578,6 +39095,184 @@ mod since_boundary_tests {
 #[cfg(test)]
 mod clusters_forwarding_tests {
     use super::*;
+
+    fn cluster_collector_store() -> nestweaver_store::GraphStore {
+        use nestweaver_schema::{EdgeType, Repo, ResolvedEdge, Symbol, SymbolKind, Visibility};
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&Repo {
+                uid: "repo:pages".into(),
+                url: "https://example.test/pages".into(),
+                indexed_sha: String::new(),
+                staleness_commits_behind: 0,
+                instance_id: "default".into(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        for index in 0..150 {
+            let uid = format!("symbol:{index:03}");
+            store
+                .insert_symbol(&Symbol {
+                    uid: uid.clone(),
+                    name: uid.clone(),
+                    kind: SymbolKind::Function,
+                    repo_uid: "repo:pages".into(),
+                    file_path: format!("src/{index}.rs"),
+                    start_line: 1,
+                    end_line: 2,
+                    signature: String::new(),
+                    summary: None,
+                    content_hash: "h".into(),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Inferred,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+            if index > 0 && index < 80 {
+                for (a, b) in [("symbol:000", uid.as_str()), (uid.as_str(), "symbol:000")] {
+                    store
+                        .insert_edge(&ResolvedEdge {
+                            source_uid: a.into(),
+                            target_uid: b.into(),
+                            edge_type: EdgeType::Calls,
+                            confidence: 1.0,
+                            link_type: None,
+                            evidence: vec![],
+                        })
+                        .unwrap();
+                }
+            }
+        }
+        store
+    }
+
+    #[test]
+    fn cluster_collector_actual_dispatch_preserves_cli_zero_and_explicit_bounds() {
+        let store = cluster_collector_store();
+        for (limit, members) in [(0, 0), (70, 3)] {
+            let mut args = clusters_tool_args(limit, members, None);
+            args["repos"] = serde_json::json!(["repo:pages"]);
+            let mut calls = 0;
+            let result = collect_cluster_tool_pages(
+                args,
+                |args| {
+                    calls += 1;
+                    let bounded = nestweaver_mcp::tools::dispatch(
+                        &store,
+                        None,
+                        "clusters",
+                        args.clone(),
+                        None,
+                    )?;
+                    assert!(serde_json::to_vec(&bounded).unwrap().len() <= 20_000);
+                    let page =
+                        nestweaver_mcp::tools::dispatch_cli(&store, None, "clusters", args, None)?;
+                    assert_eq!(page["total"], bounded["total"]);
+                    Ok(Some(page))
+                },
+                true,
+            )
+            .unwrap()
+            .unwrap();
+            let rows = result["clusters"].as_array().unwrap();
+            assert!(
+                result["total"].as_u64().unwrap() > 50,
+                "fixture must span listing pages"
+            );
+            assert_eq!(
+                rows.len(),
+                if limit == 0 {
+                    result["total"].as_u64().unwrap() as usize
+                } else {
+                    70
+                }
+            );
+            assert!(calls > 1);
+            if members == 0 {
+                assert_eq!(
+                    rows.iter()
+                        .map(|row| row["members"].as_array().unwrap().len())
+                        .sum::<usize>(),
+                    150
+                );
+                assert!(rows.iter().all(|row| row["members_truncated"] == false));
+                assert!(
+                    rows.iter().any(|row| row["size"].as_u64().unwrap() > 20),
+                    "fixture must collect a community across member pages"
+                );
+                for row in rows {
+                    assert_eq!(
+                        row["members_omitted"], 0,
+                        "completed membership must not retain a first-page omission count: {row}"
+                    );
+                    assert!(row["next_member_offset"].is_null(), "{row}");
+                    assert!(
+                        row["retry_guidance"].is_null(),
+                        "completed membership must not advise a nonexistent next page: {row}"
+                    );
+                }
+            } else {
+                for row in rows {
+                    assert_eq!(
+                        row["members"].as_array().unwrap().len(),
+                        3.min(row["size"].as_u64().unwrap() as usize)
+                    );
+                    assert_eq!(
+                        row["members_omitted"].as_u64().unwrap(),
+                        row["size"].as_u64().unwrap() - row["returned_members"].as_u64().unwrap(),
+                        "explicit previews must still disclose the omitted membership: {row}"
+                    );
+                    assert_eq!(row["member_offset"], 0, "{row}");
+                    if row["members_truncated"] == true {
+                        assert_eq!(row["next_member_offset"], row["returned_members"], "{row}");
+                        assert!(
+                            row["retry_guidance"]
+                                .as_str()
+                                .unwrap()
+                                .contains("page_token"),
+                            "{row}"
+                        );
+                    } else {
+                        assert!(row["next_member_offset"].is_null(), "{row}");
+                        assert!(row["retry_guidance"].is_null(), "{row}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cluster_collector_rejects_generation_drift_during_actual_dispatch() {
+        let store = cluster_collector_store();
+        let mut args = clusters_tool_args(0, 0, None);
+        args["repos"] = serde_json::json!(["repo:pages"]);
+        let mut calls = 0;
+        let error = collect_cluster_tool_pages(
+            args,
+            |args| {
+                calls += 1;
+                let mut page =
+                    nestweaver_mcp::tools::dispatch_cli(&store, None, "clusters", args, None)?;
+                if calls > 1 {
+                    page["graph_generation"] = serde_json::json!(u64::MAX);
+                }
+                Ok(Some(page))
+            },
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("generation/scope/resolution changed")
+        );
+    }
 
     #[test]
     fn every_cli_reachable_bound_produces_arguments_the_tool_accepts() {
@@ -40431,5 +41126,68 @@ mod cross_repo_debt_on_early_exit_tests {
             armed: true,
         });
         assert!(pending(), "an early return records the debt");
+    }
+}
+
+#[cfg(test)]
+mod publication_status_recovery_tests {
+    use super::*;
+    #[test]
+    fn status_reads_journal_without_opening_legacy_or_current_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("damaged.lbug");
+        std::fs::write(&db, b"not a graph").unwrap();
+        let root = nestweaver_engine::publication::default_publication_root(&db);
+        std::fs::create_dir_all(&root).unwrap();
+        let operation = "22222222-2222-4222-8222-222222222222";
+        nestweaver_engine::publication_operation::create_operation(
+            &root,
+            nestweaver_engine::publication_operation::PublicationOperationPlan {
+                operation_uuid: operation.into(),
+                brain_uuid: "33333333-3333-4333-8333-333333333333".into(),
+                target_publication_uuid: "44444444-4444-4444-8444-444444444444".into(),
+                expected_current_publication_uuid: None,
+                input_fingerprint: "fixture".into(),
+                producer_version: "fixture".into(),
+                publication_format_version: 1,
+                created_unix_millis: 0,
+            },
+        )
+        .unwrap();
+        let journal =
+            nestweaver_engine::publication_operation::operation_state_path(&root, operation)
+                .unwrap();
+        let original_journal = std::fs::read(&journal).unwrap();
+        for marker in ["invalid marker", "11111111-1111-4111-8111-111111111111\n"] {
+            std::fs::write(root.join("CURRENT"), marker).unwrap();
+            assert_eq!(
+                run_publication(PublicationCommands::Status {
+                    operation: Some(operation.into()),
+                    root: None,
+                    db: Some(db.clone()),
+                    json: true,
+                })
+                .unwrap(),
+                0
+            );
+            assert_eq!(std::fs::read(&db).unwrap(), b"not a graph");
+            assert_eq!(
+                std::fs::read_to_string(root.join("CURRENT")).unwrap(),
+                marker
+            );
+            assert_eq!(std::fs::read(&journal).unwrap(), original_journal);
+            assert!(resolve_db_with_config(Some(db.clone()), None).is_err());
+        }
+        std::fs::remove_file(root.join("CURRENT")).unwrap();
+        assert_eq!(
+            run_publication(PublicationCommands::Status {
+                operation: None,
+                root: None,
+                db: Some(db),
+                json: true,
+            })
+            .unwrap(),
+            0
+        );
     }
 }

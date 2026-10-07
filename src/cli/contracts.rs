@@ -158,16 +158,27 @@ pub(crate) fn run_contracts(
             render_contract_list(&contracts, json)?;
             Ok((EXIT_SUCCESS, None))
         }
-        ContractCommands::Drift { repo, json, db } => {
+        ContractCommands::Drift {
+            repo,
+            json,
+            db,
+            config,
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            require_openable_db(&db_path)?;
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
-                let db_path = db.clone().unwrap_or_else(default_db_path);
                 let mut args = serde_json::json!({});
                 if let Some(ref r) = repo {
                     args["repo"] = serde_json::json!(r);
                 }
-                let answer = match try_hybrid_json_rpc(true, &db_path, None, "contract_drift", args)
-                {
+                let answer = match try_hybrid_json_rpc_checked(
+                    true,
+                    &db_path,
+                    config.as_deref(),
+                    "contract_drift",
+                    args,
+                ) {
                     Err(error) if error_is_unresolved_repo_filter(&error) => {
                         return Ok((report_unresolved_repo_filter(&error, json), None));
                     }
@@ -182,7 +193,7 @@ pub(crate) fn run_contracts(
                     return Ok((EXIT_SUCCESS, None));
                 }
             }
-            let store = open_store(db.as_deref())?;
+            let store = open_store(Some(&db_path))?;
             let repo_uid = match resolve_contract_repo_filter(&store, repo.as_deref()) {
                 Err(error) if error_is_unresolved_repo_filter(&error) => {
                     return Ok((report_unresolved_repo_filter(&error, json), None));
@@ -198,7 +209,7 @@ pub(crate) fn run_contracts(
             // shape depended on whether a daemon happened to be running. Build
             // the same envelope from the same builder and render it with the
             // same renderer.
-            let cfg = load_instance_config_opt(None);
+            let cfg = load_instance_config_opt(config.as_deref());
             let limit = resolve_limit(
                 None,
                 cfg.as_ref(),

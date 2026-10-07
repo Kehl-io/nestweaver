@@ -1,3 +1,4 @@
+import { fetchAfterInitialGraphBaseline } from "../sse/initialReadBarrier";
 import type {
   BacklinkRow,
   BrainContextResult,
@@ -31,7 +32,8 @@ import { apiErrorFromBody } from "./errors";
 export const NOTES_PAGE_SIZE = 1000;
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init);
+  const graphRead = !init?.method || init.method.toUpperCase() === "GET" || ["/api/v1/context", "/api/v1/brain/context", "/api/v1/brain/wikilink", "/api/v1/llm/query"].includes(url);
+  const res = await (graphRead ? fetchAfterInitialGraphBaseline(url, init) : fetch(url, init));
   if (init?.signal?.aborted) {
     throw new DOMException("Aborted", "AbortError");
   }
@@ -108,8 +110,8 @@ export const api = {
     return loadImpactLens(uid, { depth, confidence, workspaceId });
   },
 
-  repos() {
-    return get<Repo[]>("/api/v1/repos");
+  repos(workspaceId?: string) {
+    return get<Repo[]>(appendWorkspaceParam("/api/v1/repos", workspaceId));
   },
 
   services() {
@@ -145,7 +147,7 @@ export const api = {
   async brainNotesPage(vaultUid: string, after?: string, limit = NOTES_PAGE_SIZE): Promise<NotesPage> {
     const params = new URLSearchParams({ vault: vaultUid, limit: String(limit) });
     if (after !== undefined) params.set("after", after);
-    const res = await fetch(`/api/v1/brain/notes?${params}`);
+    const res = await fetchAfterInitialGraphBaseline(`/api/v1/brain/notes?${params}`);
     if (!res.ok) {
       const body = await res.json().catch(() => ({ error: res.statusText }));
       throw apiErrorFromBody(res.status, body, res.statusText);
@@ -160,6 +162,11 @@ export const api = {
       total: total === null || Number.isNaN(total) ? null : total,
       nextAfter: next === null ? null : decodeURIComponent(next.replace(/\+/g, "%20")),
     };
+  },
+
+  resolveWikilink(sourceUid: string, target: string) {
+    return post<{ note_uid: string; heading_uid: string | null; heading_slug: string | null }>(
+      "/api/v1/brain/wikilink", { source_uid: sourceUid, target });
   },
 
   brainNote(uid: string, init?: RequestInit) {

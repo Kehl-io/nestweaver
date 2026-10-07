@@ -2157,6 +2157,7 @@ pub fn build_brain_context_hybrid(
 fn ensure_brain_context_not_cancelled(
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(), anyhow::Error> {
+    GraphStore::check_read_deadline()?;
     if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
         return Err(anyhow::Error::new(nestweaver_store::StoreError::Cancelled(
             nestweaver_store::CancelReason::Timeout,
@@ -2311,6 +2312,21 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     // Container seeds that exist but hold nothing (a vault with no notes).
     let mut empty_containers: Vec<String> = Vec::new();
 
+    // Project investigations supply exhaustive member seeds; reuse bounded
+    // primary-key identity/label probes instead of hydrating each row twice.
+    let mut direct_labels = std::collections::HashMap::new();
+    for chunk in inputs.chunks(256) {
+        ensure_brain_context_not_cancelled(cancel)?;
+        let uids: Vec<&str> = chunk
+            .iter()
+            .map(|raw| raw.trim())
+            .filter(|uid| uid.starts_with("sym:") || uid.starts_with("note:"))
+            .collect();
+        if !uids.is_empty() {
+            direct_labels.extend(store.brain_seed_labels(&uids)?);
+        }
+    }
+
     for raw in inputs {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -2327,7 +2343,13 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             || trimmed.starts_with("vlt:")
             || trimmed.starts_with("proj:")
         {
-            if !brain_seed_uid_exists(store, trimmed)? {
+            let batched = trimmed.starts_with("sym:") || trimmed.starts_with("note:");
+            let exists = if batched {
+                direct_labels.contains_key(trimmed)
+            } else {
+                brain_seed_uid_exists(store, trimmed)?
+            };
+            if !exists {
                 unresolved.push(raw.clone());
                 continue;
             }
@@ -2355,7 +2377,15 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
                 continue;
             }
             seed_uids.push(trimmed.to_string());
-            if let Some(text) = brain_seed_query_text(store, trimmed)? {
+            let text = if batched {
+                direct_labels
+                    .get(trimmed)
+                    .filter(|label| !label.trim().is_empty())
+                    .cloned()
+            } else {
+                brain_seed_query_text(store, trimmed)?
+            };
+            if let Some(text) = text {
                 resolved_inputs.push(text);
             }
             continue;
@@ -6086,6 +6116,63 @@ mod semantic_leg_tests {
     }
 
     #[test]
+    fn batched_direct_seeds_preserve_labels_duplicates_and_missing_identity() {
+        struct RecordingEmbed(std::sync::Mutex<Vec<String>>);
+        impl EmbedQueryFn for RecordingEmbed {
+            fn embed_query(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+                self.0.lock().unwrap().push(text.into());
+                Ok(vec![1.0, 0.0, 0.0, 0.0])
+            }
+        }
+        let store = store_with_symbol();
+        let mut blank = payment_symbol();
+        blank.uid = "sym:blank".into();
+        blank.name = "   ".into();
+        store.insert_symbol(&blank).unwrap();
+        store
+            .insert_note(&nestweaver_schema::Note {
+                uid: "note:seed".into(),
+                vault_uid: "vlt:test".into(),
+                file_path: "seed.md".into(),
+                title: "Seed note".into(),
+                note_kind: nestweaver_schema::NoteKind::General,
+                word_count: 1,
+                content_hash: "hash".into(),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        assert!(store.add_embedding("sym:payment", vec![1.0, 0.0, 0.0, 0.0]));
+        let model = RecordingEmbed(std::sync::Mutex::new(Vec::new()));
+        let inputs = vec![
+            " note:seed ".into(),
+            "sym:payment".into(),
+            "sym:missing".into(),
+            "sym:blank".into(),
+            "sym:payment".into(),
+        ];
+        let result = build_brain_context_hybrid_with_aliases(
+            &store,
+            &inputs,
+            None,
+            &HybridSearchConfig::default(),
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            Some(&model),
+            None,
+        )
+        .unwrap();
+        assert_eq!(*model.0.lock().unwrap(), vec!["Seed note Payment Payment"]);
+        assert_eq!(result.unresolved_seeds, vec!["sym:missing"]);
+        assert!(result.seeds.iter().any(|seed| seed.uid == "sym:blank"));
+    }
+
+    #[test]
     fn release_context_requires_resolved_seed() {
         struct RecordingEmbed(std::sync::Mutex<Vec<String>>);
         impl EmbedQueryFn for RecordingEmbed {
@@ -7485,5 +7572,26 @@ mod vault_seed_tests {
         let result = run(&store, "tag:a:x").unwrap();
         let seeds: Vec<&str> = result.seeds.iter().map(|n| n.uid.as_str()).collect();
         assert_eq!(seeds, ["tag:a:x"]);
+    }
+}
+
+#[cfg(test)]
+mod context_deadline_boundary_tests {
+    use super::*;
+    #[test]
+    fn context_cancel_guard_honors_deadline_without_cancel_flag() {
+        let store = GraphStore::in_memory().unwrap();
+        let result = store.with_read_deadline(std::time::Instant::now(), || {
+            ensure_brain_context_not_cancelled(None)
+        });
+        assert!(matches!(
+            result
+                .unwrap_err()
+                .downcast_ref::<nestweaver_store::StoreError>(),
+            Some(nestweaver_store::StoreError::Cancelled(
+                nestweaver_store::CancelReason::Timeout
+            ))
+        ));
+        ensure_brain_context_not_cancelled(None).unwrap();
     }
 }

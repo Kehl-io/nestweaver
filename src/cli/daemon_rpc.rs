@@ -791,6 +791,26 @@ pub(crate) fn hybrid_search_candidates_from_value(
         .context("decode search candidates from the daemon")
 }
 
+/// Catalogue routing is independent of an established graph connection.
+/// Keep the request cursor and correlation at the actual hybrid wire seam.
+pub(crate) fn hybrid_catalogue_reply(
+    request: &nestweaver_mcp::protocol::Request,
+    lite: bool,
+) -> serde_json::Value {
+    let id = request.id.clone().unwrap_or(serde_json::Value::Null);
+    let cursor = request
+        .params
+        .as_ref()
+        .and_then(|params| params.get("cursor"))
+        .and_then(serde_json::Value::as_str);
+    match nestweaver_mcp::tools::tool_list_page(lite, cursor) {
+        Ok(page) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":page}),
+        Err(message) => {
+            serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":message}})
+        }
+    }
+}
+
 /// Run the MCP stdio server using HybridClient for query routing.
 ///
 /// Read-only queries are dispatched through `HybridClient::query()` which
@@ -805,6 +825,7 @@ pub(crate) fn dispatch_hybrid_mcp_request(
     request: &nestweaver_mcp::protocol::Request,
     cancel: &nestweaver_mcp::session::CancelFlag,
 ) -> serde_json::Value {
+    hybrid.set_delivery_profile(nestweaver_schema::ToolDeliveryProfile::BoundedMcp);
     let id = request.id.clone().unwrap_or(serde_json::Value::Null);
     match request.method.as_str() {
         "initialize" => serde_json::json!({
@@ -822,10 +843,7 @@ pub(crate) fn dispatch_hybrid_mcp_request(
         "notifications/initialized" | "initialized" => serde_json::json!({
             "jsonrpc": "2.0", "id": id, "result": null
         }),
-        "tools/list" => serde_json::json!({
-            "jsonrpc": "2.0", "id": id,
-            "result": nestweaver_mcp::tools::tool_list(lite),
-        }),
+        "tools/list" => hybrid_catalogue_reply(request, lite),
         "tools/call" => {
             let params = request.params.clone().unwrap_or(serde_json::Value::Null);
             let name = params
@@ -960,6 +978,7 @@ pub(crate) fn run_mcp_hybrid(
     track_interactions: bool,
     _db_path: &Path,
 ) -> anyhow::Result<()> {
+    hybrid.set_delivery_profile(nestweaver_schema::ToolDeliveryProfile::BoundedMcp);
     nestweaver_mcp::tools::set_lite_mode(lite);
 
     // Start the background maintenance task (active upstream health recovery +
@@ -1003,4 +1022,162 @@ pub(crate) fn run_mcp_hybrid(
     nestweaver_mcp::session::run_stdio(|request, cancel| {
         dispatch_hybrid_mcp_request(&mut hybrid, &rt, lite, &write_tools, request, cancel)
     })
+}
+
+#[cfg(test)]
+mod hybrid_catalogue_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    // Compare schema positions independently of wire compaction. Defaults,
+    // examples, constraints, and properties named description remain data.
+    fn assert_wire_tool_contract(wire: &Value, full: &Value) {
+        fn schema(wire: &Value, full: &Value) {
+            let Some(expected) = full.as_object() else {
+                assert_eq!(wire, full);
+                return;
+            };
+            let actual = wire.as_object().expect("schema object");
+            assert_eq!(
+                actual.len(),
+                expected.len()
+                    - usize::from(
+                        expected.contains_key("description") && !actual.contains_key("description")
+                    )
+            );
+            for (key, value) in expected {
+                if key == "description" {
+                    if let Some(got) = actual.get(key) {
+                        let text = got.as_str().expect("description string");
+                        assert!(text.len() <= 100);
+                        assert!(!text.is_empty());
+                    }
+                    continue;
+                }
+                let got = actual
+                    .get(key)
+                    .unwrap_or_else(|| panic!("schema constraint removed: {key}"));
+                match key.as_str() {
+                    "properties" | "patternProperties" | "$defs" | "definitions"
+                    | "dependentSchemas" => {
+                        let names = value.as_object().unwrap();
+                        let observed = got.as_object().unwrap();
+                        assert_eq!(observed.len(), names.len());
+                        for (name, child) in names {
+                            schema(
+                                observed.get(name).expect("property/definition retained"),
+                                child,
+                            );
+                        }
+                    }
+                    "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
+                        let items = value.as_array().unwrap();
+                        let observed = got.as_array().unwrap();
+                        assert_eq!(items.len(), observed.len());
+                        for (child, expected) in observed.iter().zip(items) {
+                            schema(child, expected);
+                        }
+                    }
+                    "items"
+                    | "additionalProperties"
+                    | "unevaluatedProperties"
+                    | "additionalItems"
+                    | "not"
+                    | "if"
+                    | "then"
+                    | "else"
+                    | "contains"
+                    | "propertyNames"
+                    | "unevaluatedItems" => {
+                        if let Some(items) = value.as_array() {
+                            let observed = got.as_array().unwrap();
+                            assert_eq!(observed.len(), items.len());
+                            for (child, expected) in observed.iter().zip(items) {
+                                schema(child, expected);
+                            }
+                        } else {
+                            schema(got, value);
+                        }
+                    }
+                    "dependencies" => {
+                        let expected = value.as_object().unwrap();
+                        let actual = got.as_object().unwrap();
+                        assert_eq!(actual.len(), expected.len());
+                        for (name, child) in expected {
+                            let observed = actual.get(name).expect("dependency retained");
+                            if child.is_object() {
+                                schema(observed, child);
+                            } else {
+                                assert_eq!(observed, child);
+                            }
+                        }
+                    }
+                    _ => assert_eq!(got, value, "literal/constraint fidelity: {key}"),
+                }
+            }
+        }
+        assert_eq!(
+            wire.as_object().unwrap().len(),
+            full.as_object().unwrap().len()
+        );
+        for (name, parameter) in full["inputSchema"]["properties"].as_object().unwrap() {
+            let authored = parameter["description"]
+                .as_str()
+                .expect("authored parameter guidance");
+            assert!(!authored.is_empty(), "missing source guidance: {name}");
+            let caption = wire["inputSchema"]["properties"][name]["description"]
+                .as_str()
+                .expect("wire parameter guidance retained");
+            assert!(
+                !caption.trim().is_empty() && caption.len() <= 100,
+                "invalid guidance: {name}"
+            );
+        }
+        for (key, value) in full.as_object().unwrap() {
+            match key.as_str() {
+                "inputSchema" => schema(&wire[key], value),
+                "description" => assert!(wire[key].as_str().unwrap().len() <= 200),
+                _ => assert_eq!(&wire[key], value),
+            }
+        }
+    }
+
+    #[test]
+    fn first_page_contains_complete_hybrid_catalogue_and_cursor_errors_are_correlated() {
+        let full = nestweaver_mcp::tools::tool_list(false);
+        let expected = full["tools"].as_array().unwrap();
+        assert_eq!(expected.len(), 43, "complete default hybrid profile");
+        let request = nestweaver_mcp::protocol::validate_request(json!({
+            "jsonrpc":"2.0", "id":"page-0", "method":"tools/list", "params":{}
+        }))
+        .unwrap();
+        let reply = hybrid_catalogue_reply(&request, false);
+        assert_eq!(reply["jsonrpc"], "2.0");
+        assert_eq!(reply["id"], "page-0");
+        assert!(reply.get("error").is_none(), "{reply}");
+        let page = &reply["result"];
+        assert!(
+            nestweaver_mcp::output_budget::escaped_size(page)
+                <= nestweaver_mcp::output_budget::CATALOGUE_BYTES
+        );
+        assert!(
+            page.get("nextCursor").is_none(),
+            "first-page discovery must be complete"
+        );
+        let actual = page["tools"].as_array().unwrap();
+        assert_eq!(actual.len(), expected.len());
+        let mut names = std::collections::HashSet::new();
+        for (wire, full) in actual.iter().zip(expected) {
+            assert!(
+                names.insert(wire["name"].as_str().unwrap()),
+                "duplicate tool: {wire}"
+            );
+            assert_wire_tool_contract(wire, full);
+        }
+        let request = nestweaver_mcp::protocol::validate_request(json!({"jsonrpc":"2.0","id":"bad-cursor","method":"tools/list","params":{"cursor":"broken"}})).unwrap();
+        let error = hybrid_catalogue_reply(&request, false);
+        assert_eq!(error["jsonrpc"], "2.0");
+        assert_eq!(error["id"], "bad-cursor");
+        assert_eq!(error["error"]["code"], -32602);
+    }
 }

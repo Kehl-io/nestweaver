@@ -67,20 +67,20 @@ pub fn resolve_import(
             }
         }
     } else {
-        // Absolute import: convert dotted path to file path
+        // Only repository-root and the conventional src-layout root are known.
+        // Multiple matches are ambiguous; never select an arbitrary local package.
         let module_path = specifier.replace('.', "/");
-
-        // Try as file: module_path.py
-        let candidate = format!("{module_path}.py");
-        if known_files.contains(&candidate.as_str()) {
-            return Some(candidate);
-        }
-
-        // Try as package: module_path/__init__.py
-        let candidate = format!("{module_path}/__init__.py");
-        if known_files.contains(&candidate.as_str()) {
-            return Some(candidate);
-        }
+        let candidates = [
+            format!("{module_path}.py"),
+            format!("{module_path}/__init__.py"),
+            format!("src/{module_path}.py"),
+            format!("src/{module_path}/__init__.py"),
+        ];
+        let mut matches = candidates
+            .into_iter()
+            .filter(|candidate| known_files.contains(candidate.as_str()));
+        let first = matches.next()?;
+        return matches.next().is_none().then_some(first);
     }
 
     None
@@ -139,5 +139,35 @@ mod tests {
         let known = set(&["app/helper.py", "app/sub/module.py"]);
         let result = resolve_import("app/sub/module.py", "..helper", &known);
         assert_eq!(result, Some("app/helper.py".to_string()));
+    }
+    #[test]
+    fn python_src_layout_is_bounded_and_rejects_root_collisions() {
+        let known = set(&[
+            "src/qrec/coredata.py",
+            "src/qrec/util/__init__.py",
+            "tests/test_coredata.py",
+        ]);
+        assert_eq!(
+            resolve_import("tests/test_coredata.py", "qrec.coredata", &known),
+            Some("src/qrec/coredata.py".into())
+        );
+        assert_eq!(
+            resolve_import("tests/test_coredata.py", "qrec.util", &known),
+            Some("src/qrec/util/__init__.py".into())
+        );
+        assert_eq!(
+            resolve_import("src/qrec/coredata.py", ".util", &known),
+            Some("src/qrec/util/__init__.py".into())
+        );
+        let collision = set(&["qrec/coredata.py", "src/qrec/coredata.py"]);
+        assert_eq!(
+            resolve_import("tests/test_coredata.py", "qrec.coredata", &collision),
+            None
+        );
+        let unrelated = set(&["vendor/qrec/coredata.py"]);
+        assert_eq!(
+            resolve_import("tests/test_coredata.py", "qrec.coredata", &unrelated),
+            None
+        );
     }
 }

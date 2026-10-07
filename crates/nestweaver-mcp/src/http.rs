@@ -551,7 +551,7 @@ fn add_limit_metadata(mut result: Value, limits: &[AppliedLimit]) -> Value {
         }
     }
 
-    result
+    crate::output_budget::finalize(result)
 }
 
 /// Inject provenance into the MCP result envelope so a raw client hitting this
@@ -1000,12 +1000,17 @@ async fn handle_mcp(
         }),
 
         "tools/list" => {
-            let tool_list = tools::tool_list(state.lite);
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": tool_list,
-            })
+            let cursor = req
+                .params
+                .as_ref()
+                .and_then(|params| params.get("cursor"))
+                .and_then(Value::as_str);
+            match tools::tool_list_page(state.lite, cursor) {
+                Ok(page) => json!({"jsonrpc":"2.0","id":id,"result":page}),
+                Err(message) => {
+                    json!({"jsonrpc":"2.0","id":id,"error":{"code":error_code::INVALID_PARAMS,"message":message}})
+                }
+            }
         }
 
         "tools/call" => {
@@ -1208,6 +1213,9 @@ async fn handle_mcp(
             let work = tokio::time::timeout(
                 timeout,
                 tokio::task::spawn_blocking(move || {
+                    let _delivery = tools::scoped_tool_delivery(
+                        nestweaver_schema::ToolDeliveryProfile::BoundedMcp,
+                    );
                     tools::set_current_db_path(db_path);
                     tools::set_lite_mode(lite);
                     tools::set_current_instance_config(instance_cfg);
@@ -1558,6 +1566,43 @@ mod tests {
     }
 
     #[test]
+    fn final_http_limit_metadata_fits_escaped_dual_result_cap() {
+        let limits = vec![
+            AppliedLimit {
+                param: "limit",
+                requested: 10_000,
+                applied: MAX_RESULTS
+            };
+            32
+        ];
+        let result = add_limit_metadata(
+            tools::wrap_tool_result(json!({"nodes":[{"uid":"symbol:a",
+            "body":"\"\\\n\u{2028}\u{2029}".repeat(10_000)}],
+            "coverage":{"traversal_truncated":true},
+            "_meta":{"scope":"hybrid","sources":["local","server"]}})),
+            &limits,
+        );
+        let wire = serde_json::to_string(&result)
+            .unwrap()
+            .replace('\u{2028}', "\\u2028")
+            .replace('\u{2029}', "\\u2029");
+        assert!(
+            wire.len() <= 40_000,
+            "final HTTP metadata included: {} bytes",
+            wire.len()
+        );
+        assert_eq!(result["_meta"]["limits"].as_array().unwrap().len(), 32);
+        assert_eq!(
+            result["structuredContent"]["coverage"]["traversal_truncated"],
+            true
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+            result["structuredContent"]
+        );
+    }
+
+    #[test]
     fn rate_limit_rejects_at_limit_within_window() {
         let sessions = DashMap::new();
         let now = Instant::now();
@@ -1870,30 +1915,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_returns_tools() {
+    async fn tools_list_returns_tools_in_bounded_intact_pages() {
         let app = test_app();
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/list",
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["id"], 2);
-        let tools = json["result"]["tools"].as_array().expect("tools array");
-        assert!(tools.len() >= 30, "expected 30+ tools, got {}", tools.len());
+        let expected = tools::tool_list(false)["tools"].as_array().unwrap().clone();
+        let mut actual = Vec::new();
+        let mut cursor = None;
+        for id in 2..100 {
+            let params = cursor.as_ref().map_or(json!({}), |c| json!({"cursor":c}));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"jsonrpc":"2.0","id":id,"method":"tools/list","params":params})
+                        .to_string(),
+                ))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(parsed["id"], id);
+            let result = &parsed["result"];
+            assert!(serde_json::to_vec(result).unwrap().len() <= 32_000);
+            let listed = result["tools"].as_array().unwrap();
+            assert_eq!(
+                listed.len(),
+                expected.len(),
+                "complete visible catalogue on first page"
+            );
+            actual.extend(listed.iter().cloned());
+            cursor = result
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+            assert!(!listed.is_empty());
+        }
+        assert_eq!(actual.len(), expected.len());
+        for (wire, full) in actual.iter().zip(&expected) {
+            tools::assert_wire_tool_contract(wire, full);
+        }
     }
 
     #[tokio::test]

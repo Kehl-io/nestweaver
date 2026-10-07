@@ -72,6 +72,20 @@ function initialExpanded(
   return open;
 }
 
+function expandableIds(repoTrees: { repo: Repo; tree: TreeNode }[]): Set<string> {
+  const ids = new Set<string>();
+  for (const { repo, tree } of repoTrees) {
+    ids.add(`repo:${repo.uid}`);
+    const visit = (node: TreeNode) => {
+      for (const child of node.children.values()) {
+        if (!child.isFile) { ids.add(`dir:${repo.uid}:${child.fullPath}`); visit(child); }
+      }
+    };
+    visit(tree);
+  }
+  return ids;
+}
+
 function visibleRows(
   repoTrees: { repo: Repo; repoName: string; tree: TreeNode }[],
   expanded: Set<string>,
@@ -124,26 +138,35 @@ function visibleRows(
 }
 
 export function FilesTab() {
+  const workspaceId = useStore((s) => s.activeWorkspaceId);
+  const graphEpoch = useStore((s) => s.graphEpoch);
   const selectNode = useStore((s) => s.selectNode);
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectedKind = useStore((s) => s.selectedNodeKind);
 
+  const loadedWorkspace = useRef<string | null>(null);
+  const errorWorkspace = useRef<string | null>(null);
   const [repos, setRepos] = useState<Repo[]>([]);
   const [symbols, setSymbols] = useState<SymbolCandidate[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
+    const current = () => !cancelled && useStore.getState().graphEpoch === graphEpoch && useStore.getState().activeWorkspaceId === workspaceId;
     setLoading(true);
     setError(null);
-    Promise.all([api.repos(), api.symbolsTop(500)])
+    Promise.all([api.repos(workspaceId), api.symbolsTop(500, workspaceId)])
       .then(([r, s]) => {
+        if (!current()) return;
+        loadedWorkspace.current = workspaceId;
         setRepos(r);
         setSymbols(s);
       })
-      .catch((e) => setError(e.message ?? "Failed to load files"))
-      .finally(() => setLoading(false));
-  }, []);
+      .catch((e) => { if (current()) { errorWorkspace.current = workspaceId; setError(e.message ?? "Failed to load files"); } })
+      .finally(() => { if (current()) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [workspaceId, graphEpoch]);
 
   const repoTrees = useMemo(() => {
     const byRepo = new Map<string, Set<string>>();
@@ -169,7 +192,7 @@ export function FilesTab() {
     selectNode(path, "file");
   };
 
-  if (loading) {
+  if (loadedWorkspace.current !== workspaceId && !(error && errorWorkspace.current === workspaceId)) {
     return (
       <div className="flex h-full items-center justify-center text-sm text-[var(--color-text-muted)]">
         Loading files...
@@ -177,7 +200,7 @@ export function FilesTab() {
     );
   }
 
-  if (error) {
+  if (error && errorWorkspace.current === workspaceId && loadedWorkspace.current !== workspaceId) {
     return (
       <div className="flex h-full items-center justify-center p-4 text-sm text-red-500">
         {error}
@@ -194,11 +217,15 @@ export function FilesTab() {
   }
 
   return (
+    <div aria-busy={loading} className="h-full">
+    {error && errorWorkspace.current === workspaceId && <div role="alert" className="p-2 text-xs text-red-500">{error}</div>}
     <FileTree
+      key={workspaceId}
       repoTrees={repoTrees}
       selectedPath={selectedKind === "file" ? selectedNodeId : null}
       onSelect={handleSelect}
     />
+    </div>
   );
 }
 
@@ -221,6 +248,14 @@ function FileTree({
   const [activeId, setActiveId] = useState<string | null>(null);
   const itemRefs = useRef(new Map<string, HTMLDivElement>());
   const rows = useMemo(() => visibleRows(repoTrees, expanded), [repoTrees, expanded]);
+  const knownIds = useRef(expandableIds(repoTrees));
+  useEffect(() => {
+    const valid = expandableIds(repoTrees);
+    const addedDefaults = [...initialExpanded(repoTrees)].filter((id) => !knownIds.current.has(id));
+    knownIds.current = valid;
+    setExpanded((previous) => new Set([...previous].filter((id) => valid.has(id)).concat(addedDefaults)));
+  }, [repoTrees]);
+
   const current = rows.find((row) => row.id === activeId) ?? rows[0] ?? null;
 
   const moveTo = (row: TreeRow | undefined) => {

@@ -47,6 +47,8 @@ export function SourceEvidencePanel({
   compact = false,
   className = "",
 }: SourceEvidencePanelProps) {
+  const graphEpoch = useStore((s) => s.graphEpoch);
+  const workspaceId = useStore((s) => s.activeWorkspaceId);
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectedNodeKind = useStore((s) => s.selectedNodeKind);
   const graphInstance = useStore((s) => s.graphInstance);
@@ -130,7 +132,8 @@ export function SourceEvidencePanel({
     const requestedUid = selectedNodeId;
     const isCurrent = () =>
       !controller.signal.aborted &&
-      useStore.getState().selectedNodeId === requestedUid;
+      useStore.getState().selectedNodeId === requestedUid &&
+      useStore.getState().graphEpoch === graphEpoch && useStore.getState().activeWorkspaceId === workspaceId;
 
     if (isSymbolLike(selectedNodeId, selectedNodeKind)) {
       startLoading();
@@ -186,6 +189,7 @@ export function SourceEvidencePanel({
         .symbolsInFile(path)
         .catch(() => [] as SymbolCandidate[])
         .then(async (allSymbols) => {
+          if (!isCurrent()) return null;
           const symbols = pickedRepo
             ? allSymbols.filter((s) => s.repo_uid === pickedRepo)
             : allSymbols;
@@ -197,8 +201,9 @@ export function SourceEvidencePanel({
             });
           return [symbols, source] as const;
         })
-        .then(([symbols, source]) => {
-          if (controller.signal.aborted) return;
+        .then((result) => {
+          if (!isCurrent() || !result) return;
+          const [symbols, source] = result;
           setFileSymbols(symbols);
           setFileSource(source);
           setError(null);
@@ -209,19 +214,19 @@ export function SourceEvidencePanel({
           }
         })
         .catch((e) => {
-          if (!controller.signal.aborted) {
+          if (isCurrent()) {
             setError(e instanceof Error ? e.message : "File evidence is unavailable.");
           }
         })
         .finally(() => {
-          if (!controller.signal.aborted) setLoading(false);
+          if (isCurrent()) setLoading(false);
         });
       return () => controller.abort();
     }
 
     setLoading(false);
     return () => controller.abort();
-  }, [selectedNodeId, selectedNodeKind, pickedRepo, symbolGeneration]);
+  }, [selectedNodeId, selectedNodeKind, pickedRepo, symbolGeneration, graphEpoch, workspaceId]);
 
   const pickRepo = (uid: string, candidates: string[]) => {
     if (selectedNodeId) setRepoChoice({ path: selectedNodeId, candidates, repo: uid });

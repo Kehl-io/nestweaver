@@ -43,6 +43,7 @@ pub struct AppState {
     pub event_tx: broadcast::Sender<GraphEvent>,
     pub db_path: PathBuf,
     pub file_lock: Mutex<()>,
+    repo_freshness: Mutex<RepoFreshnessCache>,
     /// Lazily computed global bridge pool (uid -> raw betweenness), filled
     /// once per process by `crate::bridge::global_bridge_scores`. Cached
     /// because the engine's sampled Brandes pass is too expensive to run per
@@ -56,6 +57,225 @@ pub struct AppState {
     /// idle timeout. Each HTTP request notifies it (nw-749). Absent in tests
     /// and in any router that is not tied to a daemon idle loop.
     pub idle_activity: OnceLock<std::sync::Arc<tokio::sync::Notify>>,
+}
+
+/// Local Git observation. The legacy indexed distance is not freshness proof.
+#[derive(Clone, serde::Serialize)]
+pub struct RepoFreshness {
+    pub status: String,
+    pub indexed_sha: String,
+    pub current_sha: Option<String>,
+    pub commits_behind: Option<u64>,
+    pub commits_ahead: Option<u64>,
+}
+
+impl RepoFreshness {
+    fn unknown(repo: &nestweaver_schema::Repo) -> Self {
+        Self {
+            status: "unknown".into(),
+            indexed_sha: repo.indexed_sha.clone(),
+            current_sha: None,
+            commits_behind: None,
+            commits_ahead: None,
+        }
+    }
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct RepoFreshnessKey {
+    generation: u64,
+    uid: String,
+    indexed_sha: String,
+    root: Option<String>,
+}
+#[derive(Default)]
+struct RepoFreshnessCache {
+    entries: HashMap<RepoFreshnessKey, (Instant, RepoFreshness)>,
+}
+const FRESHNESS_CACHE_LIMIT: usize = 512;
+const FRESHNESS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn bounded_local_git(root: &str, args: &[&str], deadline: Instant) -> Result<Option<String>, ()> {
+    let budget = deadline.saturating_duration_since(Instant::now());
+    if budget.is_zero() {
+        return Err(());
+    }
+    let mut command = std::process::Command::new("git");
+    // The selected indexed root is authoritative for this local observation.
+    // Inherited Git routing and object stores must not substitute another repo.
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+    ] {
+        command.env_remove(key);
+    }
+    command.env("GIT_NO_LAZY_FETCH", "1");
+    command.args(["-C", root]).args(args);
+    let output =
+        nestweaver_engine::git_cmd::run_git_with_timeout_and_output_limit(command, budget, 4096)
+            .map_err(|_| ())?;
+    Ok(output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned()))
+}
+
+fn observe_local_git(repo: &nestweaver_schema::Repo, request_deadline: Instant) -> RepoFreshness {
+    use nestweaver_engine::repo_head::is_full_sha;
+    let deadline = request_deadline.min(Instant::now() + std::time::Duration::from_millis(500));
+    let mut observation = RepoFreshness::unknown(repo);
+    let Some(root) = repo.local_root() else {
+        return observation;
+    };
+    match std::fs::metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            observation.status = "missing".into();
+            return observation;
+        }
+        Err(_) => return observation,
+        Ok(metadata) if !metadata.is_dir() => return observation,
+        Ok(_) => {}
+    }
+    let head = match bounded_local_git(root, &["rev-parse", "HEAD"], deadline) {
+        Ok(Some(head)) if is_full_sha(&head) => head,
+        Ok(_) => {
+            if matches!(std::fs::symlink_metadata(std::path::Path::new(root).join(".git")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            {
+                observation.status = "untracked".into();
+            }
+            return observation;
+        }
+        Err(_) => return observation,
+    };
+    observation.current_sha = Some(head.clone());
+    if !is_full_sha(&repo.indexed_sha) {
+        return observation;
+    }
+    if head == repo.indexed_sha {
+        observation.status = "current".into();
+        observation.commits_behind = Some(0);
+        observation.commits_ahead = Some(0);
+        return observation;
+    }
+    let behind = format!("{}..{head}", repo.indexed_sha);
+    let ahead = format!("{head}..{}", repo.indexed_sha);
+    let counts = (
+        bounded_local_git(root, &["rev-list", "--count", &behind], deadline),
+        bounded_local_git(root, &["rev-list", "--count", &ahead], deadline),
+    );
+    let (Ok(behind), Ok(ahead)) = counts else {
+        return observation;
+    };
+    observation.commits_behind = behind.and_then(|count| count.parse().ok());
+    observation.commits_ahead = ahead.and_then(|count| count.parse().ok());
+    observation.status = match (observation.commits_behind, observation.commits_ahead) {
+        (Some(behind), Some(0)) if behind > 0 => "behind",
+        (Some(0), Some(ahead)) if ahead > 0 => "ahead",
+        (Some(behind), Some(ahead)) if behind > 0 && ahead > 0 => "diverged",
+        _ => "different",
+    }
+    .into();
+    observation
+}
+
+impl AppState {
+    /// Call on blocking work, after obtaining repo rows and releasing graph
+    /// connections. Bounded per-call probes and TTL avoid repeated Git work.
+    pub fn repo_freshness(
+        &self,
+        repos: &[nestweaver_schema::Repo],
+    ) -> HashMap<String, RepoFreshness> {
+        let generation = self.store.graph_generation();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        {
+            let mut cache = self
+                .repo_freshness
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            cache.entries.retain(|key, (at, _)| {
+                key.generation == generation && at.elapsed() < FRESHNESS_CACHE_TTL
+            });
+        }
+        repos
+            .iter()
+            .enumerate()
+            .map(|(index, repo)| {
+                let key = RepoFreshnessKey {
+                    generation,
+                    uid: repo.uid.clone(),
+                    indexed_sha: repo.indexed_sha.clone(),
+                    root: repo.local_root().map(str::to_owned),
+                };
+                let cached = self
+                    .repo_freshness
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .entries
+                    .get(&key)
+                    .map(|(_, observation)| observation.clone());
+                let observation = if let Some(cached) = cached {
+                    cached
+                } else if index >= FRESHNESS_CACHE_LIMIT || Instant::now() >= deadline {
+                    RepoFreshness::unknown(repo)
+                } else {
+                    // Never hold the shared cache mutex or a graph connection
+                    // while an owned, timeout-bounded Git process runs.
+                    let observation = observe_local_git(repo, deadline);
+                    let mut cache = self
+                        .repo_freshness
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if cache.entries.len() >= FRESHNESS_CACHE_LIMIT
+                        && let Some(oldest) = cache
+                            .entries
+                            .iter()
+                            .min_by_key(|(_, (at, _))| *at)
+                            .map(|(key, _)| key.clone())
+                    {
+                        cache.entries.remove(&oldest);
+                    }
+                    cache
+                        .entries
+                        .insert(key, (Instant::now(), observation.clone()));
+                    observation
+                };
+                (repo.uid.clone(), observation)
+            })
+            .collect()
+    }
+
+    pub fn aggregate_repo_freshness(&self, repos: &[nestweaver_schema::Repo]) -> String {
+        let observations = self.repo_freshness(repos);
+        aggregate_freshness(
+            observations
+                .values()
+                .map(|observation| observation.status.as_str()),
+        )
+    }
+}
+
+pub fn aggregate_freshness<'a>(statuses: impl IntoIterator<Item = &'a str>) -> String {
+    let statuses: Vec<_> = statuses.into_iter().collect();
+    if statuses.is_empty() {
+        return "unknown".into();
+    }
+    if statuses.iter().all(|status| *status == statuses[0]) {
+        return statuses[0].into();
+    }
+    if statuses
+        .iter()
+        .any(|status| matches!(*status, "behind" | "ahead" | "diverged" | "different"))
+    {
+        "stale".into()
+    } else {
+        "unknown".into()
+    }
 }
 
 pub struct VaultDerivationHttp {
@@ -88,6 +308,7 @@ impl AppState {
             event_tx,
             db_path,
             file_lock: Mutex::new(()),
+            repo_freshness: Mutex::new(RepoFreshnessCache::default()),
             bridge_scores: OnceLock::new(),
             gaps_cache: GapsCache::new(),
             manifest_recovery: OnceLock::new(),
@@ -108,6 +329,7 @@ impl AppState {
             event_tx,
             db_path,
             file_lock: Mutex::new(()),
+            repo_freshness: Mutex::new(RepoFreshnessCache::default()),
             bridge_scores: OnceLock::new(),
             gaps_cache: GapsCache::new(),
             manifest_recovery: OnceLock::new(),
@@ -128,6 +350,7 @@ impl AppState {
             event_tx,
             db_path,
             file_lock: Mutex::new(()),
+            repo_freshness: Mutex::new(RepoFreshnessCache::default()),
             bridge_scores: OnceLock::new(),
             gaps_cache: GapsCache::new(),
             manifest_recovery: OnceLock::new(),

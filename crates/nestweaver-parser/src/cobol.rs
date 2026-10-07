@@ -170,6 +170,7 @@ pub fn parse_cobol(path: &Path, source: &str) -> ParsedFile {
 
         for cap in RE_PERFORM.captures_iter(&upper) {
             references.push(RawReference {
+                scope: None,
                 name: cap[1].to_string(),
                 kind: ReferenceKind::Call,
                 start_line: line_no,
@@ -180,6 +181,7 @@ pub fn parse_cobol(path: &Path, source: &str) -> ParsedFile {
 
         for cap in RE_CALL.captures_iter(&upper) {
             references.push(RawReference {
+                scope: None,
                 name: cap[1].to_string(),
                 kind: ReferenceKind::Call,
                 start_line: line_no,
@@ -190,6 +192,7 @@ pub fn parse_cobol(path: &Path, source: &str) -> ParsedFile {
 
         for cap in RE_COPY.captures_iter(&upper) {
             references.push(RawReference {
+                scope: None,
                 name: cap[1].to_string(),
                 kind: ReferenceKind::Includes,
                 start_line: line_no,

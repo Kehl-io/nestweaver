@@ -204,6 +204,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/brain/status", get(routes::brain::brain_status))
         .route("/api/v1/brain/vaults", get(routes::brain::list_vaults))
         .route("/api/v1/brain/tags", get(routes::brain::list_tags))
+        .route(
+            "/api/v1/brain/wikilink",
+            post(routes::brain::resolve_wikilink),
+        )
         .route("/api/v1/brain/notes", get(routes::brain::list_notes))
         .route("/api/v1/brain/note/{uid}", get(routes::brain::note_by_uid))
         .route(
@@ -436,18 +440,55 @@ pub async fn start_degraded_server(
     Ok(())
 }
 
+/// The native launcher supplies a fresh nonce only to its UI child. This
+/// announcement follows successful listener binding or daemon attachment.
+#[derive(Clone, Copy)]
+pub enum LauncherUiMode {
+    Attached,
+    Supervised,
+    Direct,
+}
+
+pub fn announce_launcher_ready(port: u16, mode: LauncherUiMode) {
+    use std::io::Write;
+    if let Ok(token) = std::env::var("NESTWEAVER_LAUNCHER_READY_TOKEN")
+        && !token.is_empty()
+        && token.len() <= 64
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    {
+        let mode = match mode {
+            LauncherUiMode::Attached => "attached",
+            LauncherUiMode::Supervised => "supervised",
+            LauncherUiMode::Direct => "direct",
+        };
+        println!("NW_UI_READY:{token}:{mode}:{port}");
+        let _ = std::io::stdout().flush();
+    }
+}
+
 /// Start the web UI server with a pre-built router.
-///
-/// This allows callers (e.g. the daemon's `serve_ui` RPC) to customise the
-/// router — for instance by nesting the admin API — before starting.
+/// Callers can customise the router before starting.
 pub async fn start_server_with_router(
     app: Router,
     port: u16,
     open_browser: bool,
 ) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    serve_bound_router(app, listener, open_browser).await
+}
+
+/// Serve a listener retained by the caller, without reopening a bind race.
+pub async fn serve_bound_router(
+    app: Router,
+    listener: tokio::net::TcpListener,
+    open_browser: bool,
+) -> anyhow::Result<()> {
     let app = crate::hardening::harden(app);
-    let addr = format!("127.0.0.1:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let address = listener.local_addr()?;
+    let addr = address.to_string();
+    announce_launcher_ready(address.port(), LauncherUiMode::Direct);
     tracing::info!("nestweaver-web listening on http://{addr}");
 
     if open_browser {
@@ -663,5 +704,44 @@ mod degraded_tests {
             .unwrap();
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.contains("daemon_unavailable"), "body: {text}");
+    }
+}
+
+#[cfg(test)]
+mod bound_ui_listener_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[tokio::test]
+    async fn retained_listener_is_owned_before_serve_task_starts() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        assert!(
+            std::net::TcpListener::bind(address).is_err(),
+            "no startup bind gap"
+        );
+        let router = Router::new().route("/api/v1/health", get(|| async { "ok" }));
+        let task = tokio::spawn(serve_bound_router(router, listener, false));
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(
+                    b"GET /api/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.unwrap();
+            String::from_utf8(bytes).unwrap()
+        })
+        .await;
+        task.abort();
+        let _ = task.await;
+        assert!(response.unwrap().starts_with("HTTP/1.1 200"));
+        assert!(
+            tokio::net::TcpListener::bind(address).await.is_ok(),
+            "abort releases owned listener"
+        );
     }
 }

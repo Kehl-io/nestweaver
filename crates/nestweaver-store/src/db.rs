@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::error::StoreError;
+use crate::native_admission::{Admission, ConnectionRegistration, Mode, NativeAdmission};
 use crate::ranking::QueryIntent;
 use crate::write_lease::{DbWriteLease, WriteLeaseError, acquire_db_write_lease};
 
@@ -88,6 +89,9 @@ pub(crate) struct PprGraphCached {
 #[derive(Default)]
 struct IndexPublicationLeaseState {
     owner: Option<u64>,
+    /// Token that explicitly reserved or recovered this publication. An
+    /// inherited generation base alone cannot authorize a new snapshot lease.
+    reservation_owner: Option<u64>,
     next_token: u64,
     waiters: usize,
 }
@@ -161,6 +165,8 @@ impl IndexPublicationLease<'_> {
         let reserved = self
             .store
             .reserve_index_publication_generation(self.token)?;
+        self.store
+            .record_index_publication_reservation_owner(self.token)?;
         if prior == IndexPublicationReservationState::Unreserved {
             self.reservation.set(if reserved.recovered {
                 IndexPublicationReservationState::Recovered
@@ -287,6 +293,7 @@ impl Drop for IndexPublicationLease<'_> {
 /// blocks, so a thread that already holds a connection and opens a second one
 /// can never deadlock behind a pending reopen.
 pub(crate) struct ReopenableDatabase {
+    native_admission: NativeAdmission,
     gate: std::sync::RwLock<()>,
     cell: std::cell::UnsafeCell<Option<lbug::Database>>,
     /// Set while an escalated reopen waits for open connections to finish:
@@ -307,6 +314,7 @@ unsafe impl Send for ReopenableDatabase {}
 impl ReopenableDatabase {
     fn new(db: lbug::Database) -> Self {
         Self {
+            native_admission: NativeAdmission::default(),
             gate: std::sync::RwLock::new(()),
             cell: std::cell::UnsafeCell::new(Some(db)),
             holding_off: std::sync::atomic::AtomicBool::new(false),
@@ -375,9 +383,63 @@ impl Drop for HoldOff<'_> {
 /// retry that applies the write twice.
 pub struct StoreConnection<'a> {
     // Declared first so it drops BEFORE the guard below.
-    conn: lbug::Connection<'a>,
-    _open: Option<std::sync::RwLockReadGuard<'a, ()>>,
+    conn: std::mem::ManuallyDrop<lbug::Connection<'a>>,
+    configured_timeout_ms: std::sync::atomic::AtomicU64,
+    native_call: std::sync::Mutex<()>,
+    #[cfg(test)]
+    native_timeout_ms: std::sync::atomic::AtomicU64,
+    _native_registration: Option<ConnectionRegistration<'a>>,
     deferred: Option<&'a std::sync::atomic::AtomicBool>,
+    native_admission: Option<&'a NativeAdmission>,
+    // Keep the native database open through destruction and unregistering.
+    _open: Option<std::sync::RwLockReadGuard<'a, ()>>,
+}
+
+// Restore the caller's connection timer before releasing native admission.
+struct NativeCallAdmission<'c, 'a> {
+    _timeout: Option<NativeTimeoutRestore<'c, 'a>>,
+    _admission: Option<Admission<'c>>,
+    _connection_call: std::sync::MutexGuard<'c, ()>,
+}
+
+struct NativeTimeoutRestore<'c, 'a> {
+    connection: &'c StoreConnection<'a>,
+}
+
+impl Drop for NativeTimeoutRestore<'_, '_> {
+    fn drop(&mut self) {
+        self.connection.set_native_query_timeout(
+            self.connection
+                .configured_timeout_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+    }
+}
+
+impl Drop for StoreConnection<'_> {
+    fn drop(&mut self) {
+        let admission = self
+            .native_admission
+            .map(|gate| gate.acquire_exclusive_cleanup());
+        // Observation must not prevent destruction even if a test hook panics.
+        #[cfg(test)]
+        let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(gate) = self.native_admission {
+                gate.observe(Mode::Exclusive, "drop");
+            }
+        }));
+        // SAFETY: conn is initialized once, never moved out, and destroyed only
+        // here. The reopen guard is still alive; rollback owns admission.
+        unsafe {
+            std::mem::ManuallyDrop::drop(&mut self.conn);
+        }
+        drop(self._native_registration.take());
+        drop(admission);
+        #[cfg(test)]
+        if let Err(payload) = observed {
+            std::panic::resume_unwind(payload);
+        }
+    }
 }
 
 /// Rows of one statement, borrowing the [`StoreConnection`] that ran it.
@@ -418,10 +480,111 @@ fn statement_returns_rows(query: &str) -> bool {
         .any(|word| word.eq_ignore_ascii_case("RETURN"))
 }
 
+// Conservative control override: the native analyzer reports these as reads.
+// Matches in comments/strings/identifiers only choose stronger exclusion.
+fn statement_controls_transaction(query: &str) -> bool {
+    query
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|word| {
+            ["BEGIN", "COMMIT", "ROLLBACK", "CHECKPOINT"]
+                .iter()
+                .any(|control| word.eq_ignore_ascii_case(control))
+        })
+}
+
+// The pinned native Cypher grammar includes separators that Rust's
+// char::is_whitespace omits (FS–US and U+180E).
+fn native_cypher_whitespace(value: char) -> bool {
+    matches!(value, ' ' | '\t' | '\n' | '\u{000B}' | '\u{000C}' | '\r'
+        | '\u{001C}'..='\u{001F}' | '\u{1680}' | '\u{180E}'
+        | '\u{2000}'..='\u{200A}' | '\u{2028}' | '\u{2029}'
+        | '\u{205F}' | '\u{3000}' | '\u{00A0}' | '\u{202F}')
+}
+
+// Detect only statement-leading CHECKPOINT, preserving quoted data,
+// backtick identifiers and the native grammar's nonnested block comments.
+fn statement_has_checkpoint(query: &str) -> bool {
+    let bytes = query.as_bytes();
+    let mut index = 0;
+    let mut leading = true;
+    while index < bytes.len() {
+        let character = query[index..]
+            .chars()
+            .next()
+            .expect("index is a character boundary");
+        if native_cypher_whitespace(character) {
+            index += character.len_utf8();
+            continue;
+        }
+        match bytes[index] {
+            b';' => {
+                leading = true;
+                index += 1;
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' && bytes[index] != b'\r' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index < bytes.len() {
+                    if bytes.get(index..index + 2) == Some(&b"*/"[..]) {
+                        index += 2;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            quote @ (b'\'' | b'"' | b'`') => {
+                leading = false;
+                index += 1;
+                while index < bytes.len() {
+                    if quote != b'`' && bytes[index] == b'\\' {
+                        index = (index + 2).min(bytes.len());
+                    } else if bytes[index] == quote {
+                        index += 1;
+                        // Native EscapedSymbolicName permits adjacent backtick
+                        // segments; ordinary string quotes do not escape by doubling.
+                        if quote == b'`' && bytes.get(index) == Some(&quote) {
+                            index += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            value if value.is_ascii_alphabetic() || value == b'_' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                {
+                    index += 1;
+                }
+                if leading && query[start..index].eq_ignore_ascii_case("CHECKPOINT") {
+                    return true;
+                }
+                leading = false;
+            }
+            _ => {
+                leading = false;
+                index += character.len_utf8();
+            }
+        }
+    }
+    false
+}
+
 /// A prepared statement, borrowing the [`StoreConnection`] that prepared it.
 pub struct StoreStatement<'c> {
     inner: lbug::PreparedStatement,
     returns_rows: bool,
+    exclusive: bool,
+    checkpoint: bool,
     _connection: std::marker::PhantomData<&'c ()>,
 }
 
@@ -437,23 +600,44 @@ impl<'a> StoreConnection<'a> {
     /// migration). Such a handle is never swapped, so no guard is needed.
     pub(crate) fn unguarded(conn: lbug::Connection<'a>) -> Self {
         Self {
-            conn,
+            conn: std::mem::ManuallyDrop::new(conn),
+            configured_timeout_ms: std::sync::atomic::AtomicU64::new(0),
+            native_call: std::sync::Mutex::new(()),
+            #[cfg(test)]
+            native_timeout_ms: std::sync::atomic::AtomicU64::new(0),
+            _native_registration: None,
             _open: None,
             deferred: None,
+            native_admission: None,
         }
     }
 
     /// Run one statement.
     pub fn query(&self, query: &str) -> Result<StoreRows<'_, 'a>, lbug::Error> {
+        // Raw queries may contain multiple statements. Preserve that native
+        // behavior and conservatively exclude them for the entire call.
+        let _admission = self.admit_native(
+            Mode::Exclusive,
+            true,
+            statement_has_checkpoint(query),
+            "query",
+        )?;
         let result = self.conn.query(query);
         self.settle(result, statement_returns_rows(query))
     }
 
     /// Prepare one statement.
     pub fn prepare(&self, query: &str) -> Result<StoreStatement<'_>, lbug::Error> {
+        // Preparing a write can itself commit a newly opened transaction;
+        // is_read_only is available only after preparation returns.
+        let _admission = self.admit_native(Mode::Exclusive, true, false, "prepare")?;
+        let inner = self.conn.prepare(query)?;
+        let exclusive = !inner.is_read_only() || statement_controls_transaction(query);
         Ok(StoreStatement {
-            inner: self.conn.prepare(query)?,
+            inner,
             returns_rows: statement_returns_rows(query),
+            exclusive,
+            checkpoint: statement_has_checkpoint(query),
             _connection: std::marker::PhantomData,
         })
     }
@@ -464,13 +648,127 @@ impl<'a> StoreConnection<'a> {
         statement: &mut StoreStatement<'_>,
         params: Vec<(&str, lbug::Value)>,
     ) -> Result<StoreRows<'_, 'a>, lbug::Error> {
+        let mode = if statement.exclusive {
+            Mode::Exclusive
+        } else {
+            Mode::Read
+        };
+        let _admission =
+            self.admit_native(mode, !statement.exclusive, statement.checkpoint, "execute")?;
         let result = self.conn.execute(&mut statement.inner, params);
         self.settle(result, statement.returns_rows)
     }
 
+    // Legacy callers receive lbug::Error. A scoped context boundary must check
+    // the absolute deadline around each stage to retain typed cancellation;
+    // this conversion does not claim to preserve StoreError::Cancelled.
+    fn admit_native(
+        &self,
+        mode: Mode,
+        scoped_read: bool,
+        checkpoint: bool,
+        operation: &'static str,
+    ) -> Result<NativeCallAdmission<'_, 'a>, lbug::Error> {
+        // Native already serializes calls on one connection. Keep temporary
+        // timer setup/call/restore atomic with that same connection's callers.
+        let deadline = if scoped_read {
+            READ_DEADLINE.get()
+        } else {
+            None
+        };
+        let connection_call = if let Some(deadline) = deadline {
+            loop {
+                match self.native_call.try_lock() {
+                    Ok(guard) => break guard,
+                    Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        if remaining.is_zero() {
+                            return Err(lbug::Error::FailedQuery(
+                                "native connection admission exceeded its deadline".into(),
+                            ));
+                        }
+                        std::thread::sleep(remaining.min(std::time::Duration::from_millis(1)));
+                    }
+                }
+            }
+        } else {
+            self.native_call
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+        };
+        let admission = self
+            .native_admission
+            .map(|gate| gate.acquire(mode, deadline))
+            .transpose()
+            .map_err(|error| lbug::Error::FailedQuery(error.to_string()))?;
+        // A checkpoint waits for manual writes to finish. Holding admission
+        // while another connection needs it to COMMIT would invert that wait.
+        if checkpoint {
+            let others = self
+                .native_admission
+                .map_or(0, |gate| gate.connection_count().saturating_sub(1));
+            if others > 0 {
+                return Err(lbug::Error::FailedQuery(format!(
+                    "explicit CHECKPOINT is busy: {others} other store connection(s) are still alive; finish or close them and retry"
+                )));
+            }
+        }
+        #[cfg(test)]
+        if let Some(gate) = self.native_admission {
+            gate.observe(mode, if checkpoint { "checkpoint" } else { operation });
+        }
+        #[cfg(not(test))]
+        let _ = operation;
+        let mut timeout = None;
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(lbug::Error::FailedQuery(
+                    "native read admission exceeded its deadline".into(),
+                ));
+            }
+            // Round upward. Zero disables the engine timer, and rounding down
+            // can interrupt a native read before the absolute deadline expires.
+            let millis = remaining
+                .as_millis()
+                .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0));
+            let scoped_ms = millis.min(u128::from(u64::MAX)) as u64;
+            let configured = self
+                .configured_timeout_ms
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let effective = if configured == 0 {
+                scoped_ms
+            } else {
+                scoped_ms.min(configured)
+            };
+            self.set_native_query_timeout(effective);
+            timeout = Some(NativeTimeoutRestore { connection: self });
+        }
+        Ok(NativeCallAdmission {
+            _timeout: timeout,
+            _admission: admission,
+            _connection_call: connection_call,
+        })
+    }
+
     /// Bound every later statement on this connection.
     pub fn set_query_timeout(&self, timeout_ms: u64) {
+        let _call = self
+            .native_call
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.configured_timeout_ms
+            .store(timeout_ms, std::sync::atomic::Ordering::Relaxed);
+        self.set_native_query_timeout(timeout_ms);
+    }
+
+    fn set_native_query_timeout(&self, timeout_ms: u64) {
         self.conn.set_query_timeout(timeout_ms);
+        #[cfg(test)]
+        self.native_timeout_ms
+            .store(timeout_ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn settle(
@@ -2300,6 +2598,32 @@ impl GraphStore {
         self.invalidate_ranking_caches_locked();
     }
 
+    /// Dirty-read refusals must not destroy the active publisher's freshly
+    /// computed scores in its compute-to-save gap. Establishment and retirement
+    /// barriers own cache invalidation for a reserved in-process publication.
+    /// An unreserved lease (e.g. snapshot work), abandoned owner, or external
+    /// publication provides no such protection and retains fail-closed eviction.
+    /// The caller must hold `pagerank_compute_lock`; query refusal is unchanged.
+    pub(crate) fn invalidate_unowned_ranking_caches_locked(&self) {
+        let reservation_owned = {
+            let state = self
+                .index_publication_lease
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.owner.is_some() && state.reservation_owner == state.owner
+        };
+        let publication_owned = reservation_owned
+            && self
+                .index_publication_generation_base
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some();
+        if !publication_owned {
+            self.invalidate_ranking_caches_locked();
+        }
+    }
+
     pub(crate) fn invalidate_ranking_caches_locked(&self) {
         *self
             .pagerank_cache
@@ -2662,6 +2986,21 @@ impl GraphStore {
         true
     }
 
+    fn record_index_publication_reservation_owner(&self, token: u64) -> Result<(), StoreError> {
+        let mut state = self
+            .index_publication_lease
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.owner != Some(token) {
+            return Err(StoreError::Query(
+                "index publication reservation is not owned by this token".into(),
+            ));
+        }
+        state.reservation_owner = Some(token);
+        Ok(())
+    }
+
     fn validate_index_publication_owner(&self, token: u64) -> Result<(), StoreError> {
         let state = self
             .index_publication_lease
@@ -2741,6 +3080,7 @@ impl GraphStore {
             ));
         }
         state.owner = None;
+        state.reservation_owner = None;
         drop(state);
         self.index_publication_lease.available.notify_all();
         Ok(())
@@ -4062,19 +4402,25 @@ impl GraphStore {
                     .unwrap_or_else(|| "in progress".to_string())
             ))
         })?;
+        let registration = self.db.native_admission.register_connection();
         let conn = StoreConnection {
-            conn: lbug::Connection::new(db)?,
+            conn: std::mem::ManuallyDrop::new(lbug::Connection::new(db)?),
+            configured_timeout_ms: std::sync::atomic::AtomicU64::new(0),
+            native_call: std::sync::Mutex::new(()),
+            #[cfg(test)]
+            native_timeout_ms: std::sync::atomic::AtomicU64::new(0),
+            _native_registration: Some(registration),
             _open: Some(open),
             deferred: Some(&self.checkpoint_deferred),
+            native_admission: Some(&self.db.native_admission),
         };
         if let Some(deadline) = READ_DEADLINE.get() {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 return Err(StoreError::Cancelled(crate::CancelReason::Timeout));
             }
-            // Zero disables Ladybug's timer, so round a sub-millisecond budget
-            // up to one millisecond instead of accidentally removing it.
-            conn.set_query_timeout((remaining.as_millis() as u64).max(1));
+            // Apply the remaining budget only for each scoped native call.
+            // A connection retained after this scope keeps its caller timer.
         }
         Ok(conn)
     }
@@ -5411,6 +5757,661 @@ impl GraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_guard_preserves_multistatement_queries_and_releases_before_rows() {
+        let store = GraphStore::in_memory().unwrap();
+        let conn = store.conn().unwrap();
+        conn.query("CREATE (:Meta {key: 'guard_a', value: 'one'}); CREATE (:Meta {key: 'guard_b', value: 'two'});").unwrap();
+        assert!(store.db.native_admission.is_idle());
+        let mut rows = conn
+            .query("MATCH (m:Meta) WHERE m.key STARTS WITH 'guard_' RETURN m.key ORDER BY m.key")
+            .unwrap();
+        assert!(
+            store.db.native_admission.is_idle(),
+            "returned rows retain no admission"
+        );
+        let mut prepared = conn
+            .prepare("MATCH (m:Meta) WHERE m.key = $key RETURN m.value")
+            .unwrap();
+        assert!(
+            !prepared.exclusive,
+            "verified read execution remains shared"
+        );
+        let nested = store.conn().unwrap();
+        let mut nested_rows = conn
+            .execute(
+                &mut prepared,
+                vec![("key", lbug::Value::String("guard_b".into()))],
+            )
+            .unwrap();
+        assert!(nested_rows.next().is_some());
+        assert!(store.db.native_admission.is_idle());
+        // Retain both connections, statement, and materialized results while a
+        // following mutation enters. A connection-lifetime gate deadlocks here.
+        nested
+            .query("CREATE (:Meta {key: 'guard_c', value: 'three'})")
+            .unwrap();
+        assert!(rows.next().is_some());
+        assert!(rows.next().is_some());
+        assert!(rows.next().is_none());
+        for control in ["COMMIT", "CHECKPOINT", "BEGIN TRANSACTION", "ROLLBACK"] {
+            assert!(statement_controls_transaction(control));
+        }
+    }
+
+    #[test]
+    fn scoped_native_timers_restore_configured_timeout_on_success_and_unwind() {
+        use std::time::{Duration, Instant};
+        fn assert_sync<T: Sync>() {}
+        assert_sync::<StoreConnection<'_>>();
+        let store = GraphStore::in_memory().unwrap();
+        let conn = store
+            .with_read_deadline(Instant::now() + Duration::from_secs(1), || store.conn())
+            .unwrap();
+        assert_eq!(
+            conn.configured_timeout_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "construction does not persist a scoped timer"
+        );
+        conn.set_query_timeout(5000);
+        store.with_read_deadline(Instant::now() + Duration::from_secs(1), || {
+            let mut statement = conn.prepare("MATCH (m:Meta) RETURN m.key").unwrap();
+            assert_eq!(
+                conn.configured_timeout_ms
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                5000
+            );
+            let mut rows = conn.execute(&mut statement, vec![]).unwrap();
+            let _ = rows.next();
+            assert_eq!(
+                conn.configured_timeout_ms
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                5000
+            );
+        });
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.with_read_deadline(Instant::now() + Duration::from_secs(1), || {
+                let _native = conn
+                    .admit_native(Mode::Exclusive, true, false, "query")
+                    .unwrap();
+                assert!(
+                    conn.native_timeout_ms
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        <= 1000
+                );
+                panic!("exercise scoped timer unwind");
+            });
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(
+            conn.configured_timeout_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            5000
+        );
+        assert!(store.db.native_admission.is_idle());
+        assert_eq!(
+            conn.native_timeout_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            5000
+        );
+        std::thread::scope(|scope| {
+            let held = conn
+                .native_call
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let (sent, received) = std::sync::mpsc::channel();
+            let conn = &conn;
+            let store = &store;
+            let worker = scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_millis(30);
+                let outcome = store.with_read_deadline(deadline, || {
+                    let result = conn.query("MATCH (m:Meta) RETURN m.key");
+                    GraphStore::check_read_deadline()?;
+                    result.map(|_| ()).map_err(StoreError::from)
+                });
+                let _ = sent.send(outcome);
+            });
+            let outcome = received.recv_timeout(Duration::from_secs(2));
+            drop(held);
+            worker.join().unwrap();
+            assert!(matches!(
+                outcome,
+                Ok(Err(StoreError::Cancelled(crate::CancelReason::Timeout)))
+            ));
+        });
+        conn.query("CREATE (:Meta {key: 'timer_after_scope', value: 'ok'})")
+            .unwrap();
+        conn.set_query_timeout(0);
+        assert_eq!(
+            conn.configured_timeout_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn native_admission_expiry_can_be_preserved_by_typed_scoped_stage() {
+        let store = std::sync::Arc::new(GraphStore::in_memory().unwrap());
+        let exclusive = store
+            .db
+            .native_admission
+            .acquire(Mode::Exclusive, None)
+            .unwrap();
+        let worker_store = std::sync::Arc::clone(&store);
+        let (outcome, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let conn = worker_store.conn().unwrap();
+            let result = worker_store.with_read_deadline(
+                std::time::Instant::now() + std::time::Duration::from_millis(30),
+                || {
+                    let native = conn
+                        .query("MATCH (s:Symbol) WHERE s.repo_uid = 'repo:fixture' RETURN s.uid")
+                        .map(|_| ())
+                        .map_err(StoreError::from);
+                    GraphStore::check_read_deadline()?;
+                    native
+                },
+            );
+            let _ = outcome.send(result);
+            drop(conn); // Cleanup waits without any read deadline.
+        });
+        let outcome = received.recv_timeout(std::time::Duration::from_secs(2));
+        drop(exclusive);
+        let joined = worker.join();
+        assert!(matches!(
+            outcome.unwrap(),
+            Err(StoreError::Cancelled(crate::CancelReason::Timeout))
+        ));
+        joined.unwrap();
+        assert!(
+            store
+                .lookup_symbols_by_repo("repo:fixture")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn explicit_checkpoint_refuses_other_connections_without_blocking_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            GraphStore::create(&directory.path().join("checkpoint-admission.lbug")).unwrap();
+        let transaction = store.conn().unwrap();
+        transaction.query("BEGIN TRANSACTION").unwrap();
+        transaction
+            .query("CREATE (:Meta {key: 'gate_transaction', value: 'pending'})")
+            .unwrap();
+        let refuse_native = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = std::sync::Arc::clone(&refuse_native);
+        let observer =
+            store
+                .db
+                .native_admission
+                .set_observer(std::sync::Arc::new(move |_, operation| {
+                    if operation == "checkpoint" && flag.load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        panic!("busy checkpoint must be refused before native entry");
+                    }
+                }));
+        let error = store.checkpoint().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("explicit CHECKPOINT is busy: 1 other store connection(s)")
+        );
+        for whitespace in [
+            "\u{000B}", "\u{000C}", "\u{001C}", "\u{001D}", "\u{001E}", "\u{001F}", "\u{00A0}",
+            "\u{1680}", "\u{180E}", "\u{2000}", "\u{2001}", "\u{2002}", "\u{2003}", "\u{2004}",
+            "\u{2005}", "\u{2006}", "\u{2007}", "\u{2008}", "\u{2009}", "\u{200A}", "\u{2028}",
+            "\u{2029}", "\u{202F}", "\u{205F}", "\u{3000}",
+        ] {
+            let checkpoint = format!("{whitespace}CHECKPOINT");
+            assert!(statement_has_checkpoint(&checkpoint));
+            let other = store.conn().unwrap();
+            assert!(
+                other
+                    .query(&checkpoint)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("explicit CHECKPOINT is busy")
+            );
+        }
+        transaction.query("COMMIT").unwrap();
+        // Even an idle connection deliberately retains conservative refusal.
+        assert!(store.checkpoint().is_err());
+        drop(transaction);
+        assert_eq!(store.db.native_admission.connection_count(), 0);
+        refuse_native.store(false, std::sync::atomic::Ordering::Release);
+        store.checkpoint().unwrap();
+        for whitespace in ["\u{000B}", "\u{000C}", "\u{001C}", "\u{00A0}", "\u{180E}"] {
+            let conn = store.conn().unwrap();
+            conn.query(&format!("{whitespace}CHECKPOINT")).unwrap();
+        }
+        drop(observer);
+        let dropped_transaction = store.conn().unwrap();
+        dropped_transaction.query("BEGIN TRANSACTION").unwrap();
+        dropped_transaction
+            .query("CREATE (:Meta {key: 'rolled_back_gate', value: 'pending'})")
+            .unwrap();
+        drop(dropped_transaction); // Native rollback precedes RAII unregister.
+        assert_eq!(store.db.native_admission.connection_count(), 0);
+        store.checkpoint().unwrap();
+        assert!(statement_has_checkpoint("/* prefix */ CHECKPOINT;"));
+        assert!(statement_has_checkpoint(
+            "RETURN 'safe'; // line\n CHECKPOINT"
+        ));
+        assert!(!statement_has_checkpoint("RETURN 'text; CHECKPOINT'"));
+        assert!(!statement_has_checkpoint(
+            "MATCH (m:Meta) RETURN m.checkpoint"
+        ));
+        assert!(!statement_has_checkpoint("/* CHECKPOINT */ RETURN 'value'"));
+        assert!(statement_has_checkpoint("/* /* */ CHECKPOINT"));
+        assert!(statement_has_checkpoint(r"RETURN `name\`; CHECKPOINT"));
+        assert!(!statement_has_checkpoint("RETURN `text; CHECKPOINT`"));
+        assert!(!statement_has_checkpoint("RETURN 'héllo; CHECKPOINT'"));
+        assert!(!statement_has_checkpoint("MATCH (λ) RETURN λ"));
+    }
+
+    #[test]
+    fn wrapper_verified_reads_overlap_and_commit_waits_for_native_entry() {
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::{Duration, Instant};
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        let _admission_bound = store
+            .db
+            .native_admission
+            .bound_test_admission(Instant::now() + Duration::from_secs(12));
+        {
+            let conn = store.conn().unwrap();
+            conn.query("CREATE (:Meta {key: 'wrapper_witness', value: 'one'})")
+                .unwrap();
+        }
+        // Begin before holding reader hooks so COMMIT itself attempts admission.
+        let (begun, transaction_started) = mpsc::channel();
+        let (commit, wait_for_commit) = mpsc::channel();
+        let writer_store = Arc::clone(&store);
+        let writer = std::thread::spawn(move || {
+            let conn = writer_store.conn()?;
+            conn.query("BEGIN TRANSACTION").map_err(StoreError::from)?;
+            let _ = begun.send(());
+            if wait_for_commit
+                .recv_timeout(Duration::from_secs(8))
+                .is_err()
+            {
+                return Err(StoreError::Query(
+                    "fixture commit was never released".into(),
+                ));
+            }
+            conn.query("COMMIT").map_err(StoreError::from)?;
+            Ok::<_, StoreError>(())
+        });
+        let began = transaction_started
+            .recv_timeout(Duration::from_secs(1))
+            .is_ok();
+        let (events, observed) = mpsc::channel();
+        let mut release_senders = Vec::new();
+        let mut release_receivers = Vec::new();
+        for _ in 0..2 {
+            let (send, receive) = mpsc::channel();
+            release_senders.push(send);
+            release_receivers.push(Mutex::new(receive));
+        }
+        let read_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let releases_ok = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let index = Arc::clone(&read_index);
+        let success = Arc::clone(&releases_ok);
+        let observer = store
+            .db
+            .native_admission
+            .set_observer(Arc::new(move |mode, operation| {
+                if mode == Mode::Read && operation == "execute" {
+                    let reader = index.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    let _ = events.send("reader");
+                    if reader >= 2
+                        || release_receivers[reader]
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(3))
+                            .is_err()
+                    {
+                        success.store(false, std::sync::atomic::Ordering::Release);
+                    }
+                } else if mode == Mode::Exclusive && operation == "query" {
+                    let _ = events.send("commit");
+                }
+            }));
+        let (prepared, prepared_reads) = mpsc::channel();
+        let mut execution_senders = Vec::new();
+        let mut readers = Vec::new();
+        for _ in 0..2 {
+            let store = Arc::clone(&store);
+            let prepared = prepared.clone();
+            let (execute, wait_to_execute) = mpsc::channel();
+            execution_senders.push(execute);
+            readers.push(std::thread::spawn(move || {
+                store.with_read_deadline(Instant::now() + Duration::from_secs(8), || {
+                    let conn = store.conn()?;
+                    let mut statement = conn
+                        .prepare("MATCH (m:Meta {key: 'wrapper_witness'}) RETURN m.value")
+                        .map_err(StoreError::from)?;
+                    let _ = prepared.send(());
+                    if wait_to_execute
+                        .recv_timeout(Duration::from_secs(3))
+                        .is_err()
+                    {
+                        return Err(StoreError::Query("fixture read was never released".into()));
+                    }
+                    let mut rows = conn
+                        .execute(&mut statement, vec![])
+                        .map_err(StoreError::from)?;
+                    Ok::<_, StoreError>(rows.next().is_some())
+                })
+            }));
+        }
+        // Finish both conservative preparations before holding shared executes.
+        let both_prepared = prepared_reads.recv_timeout(Duration::from_secs(1)).is_ok()
+            && prepared_reads.recv_timeout(Duration::from_secs(1)).is_ok();
+        for execute in execution_senders {
+            let _ = execute.send(());
+        }
+        let first = observed.recv_timeout(Duration::from_secs(1));
+        let second = observed.recv_timeout(Duration::from_secs(1));
+        let overlapping = first.as_ref().is_ok_and(|value| *value == "reader")
+            && second.as_ref().is_ok_and(|value| *value == "reader");
+        let _ = commit.send(());
+        let attempt_deadline = Instant::now() + Duration::from_secs(1);
+        while !store.db.native_admission.has_exclusive_waiter() && Instant::now() < attempt_deadline
+        {
+            std::thread::yield_now();
+        }
+        let commit_waiting = store.db.native_admission.has_exclusive_waiter();
+        let entered_early = observed.try_recv().is_ok();
+        for release in release_senders {
+            let _ = release.send(());
+        }
+        let reader_results: Vec<_> = readers.into_iter().map(|worker| worker.join()).collect();
+        let writer_result = writer.join();
+        let commit_entered = observed.recv_timeout(Duration::from_secs(1));
+        drop(observer);
+        assert!(began && both_prepared);
+        assert!(overlapping, "two actual read executes enter simultaneously");
+        assert!(
+            commit_waiting && !entered_early,
+            "attempted COMMIT cannot enter while reader calls hold admission"
+        );
+        assert!(
+            commit_entered
+                .as_ref()
+                .is_ok_and(|value| *value == "commit")
+        );
+        assert!(releases_ok.load(std::sync::atomic::Ordering::Acquire));
+        for result in reader_results {
+            assert!(result.unwrap().unwrap());
+        }
+        assert!(writer_result.unwrap().is_ok());
+        assert_eq!(store.db.native_admission.connection_count(), 0);
+    }
+
+    #[test]
+    fn dropping_manual_write_waits_for_held_native_read_before_rollback() {
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::{Duration, Instant};
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        let _bound = store
+            .db
+            .native_admission
+            .bound_test_admission(Instant::now() + Duration::from_secs(12));
+        let (started, writer_started) = mpsc::channel();
+        let (drop_writer, wait_to_drop) = mpsc::channel();
+        let writer_store = Arc::clone(&store);
+        let writer = std::thread::spawn(move || {
+            let conn = writer_store.conn().unwrap();
+            conn.query("BEGIN TRANSACTION").unwrap();
+            conn.query("CREATE (:Meta {key: 'drop_rollback_witness', value: 'pending'})")
+                .unwrap();
+            let _ = started.send(std::thread::current().id());
+            let _ = wait_to_drop.recv_timeout(Duration::from_secs(8));
+            drop(conn);
+        });
+        let writer_id = writer_started.recv_timeout(Duration::from_secs(1));
+        let (events, observed) = mpsc::channel();
+        let (release_read, wait_for_release) = mpsc::channel();
+        let wait_for_release = Mutex::new(wait_for_release);
+        let release_ok = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let success = Arc::clone(&release_ok);
+        let expected_writer = writer_id.as_ref().ok().copied();
+        let observer = store
+            .db
+            .native_admission
+            .set_observer(Arc::new(move |mode, operation| {
+                if mode == Mode::Read && operation == "execute" {
+                    let _ = events.send("reader");
+                    if wait_for_release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(3))
+                        .is_err()
+                    {
+                        success.store(false, std::sync::atomic::Ordering::Release);
+                    }
+                } else if operation == "drop"
+                    && Some(std::thread::current().id()) == expected_writer
+                {
+                    let _ = events.send("rollback");
+                }
+            }));
+        let reader_store = Arc::clone(&store);
+        let reader = std::thread::spawn(move || {
+            reader_store.with_read_deadline(Instant::now() + Duration::from_secs(8), || {
+                let conn = reader_store.conn()?;
+                let mut statement = conn
+                    .prepare("MATCH (m:Meta) RETURN m.key")
+                    .map_err(StoreError::from)?;
+                let mut rows = conn
+                    .execute(&mut statement, vec![])
+                    .map_err(StoreError::from)?;
+                let _ = rows.next();
+                Ok::<_, StoreError>(())
+            })
+        });
+        let read_held = observed.recv_timeout(Duration::from_secs(1));
+        let _ = drop_writer.send(());
+        let wait_until = Instant::now() + Duration::from_secs(1);
+        while !store.db.native_admission.has_exclusive_waiter() && Instant::now() < wait_until {
+            std::thread::yield_now();
+        }
+        let drop_waiting = store.db.native_admission.has_exclusive_waiter();
+        let entered_early = observed.try_recv().is_ok();
+        let _ = release_read.send(());
+        let reader_result = reader.join();
+        let writer_result = writer.join();
+        let rollback_entered = observed.recv_timeout(Duration::from_secs(1));
+        drop(observer);
+        assert!(writer_id.is_ok());
+        assert!(read_held.as_ref().is_ok_and(|event| *event == "reader"));
+        assert!(drop_waiting && !entered_early);
+        assert!(
+            rollback_entered
+                .as_ref()
+                .is_ok_and(|event| *event == "rollback")
+        );
+        assert!(release_ok.load(std::sync::atomic::Ordering::Acquire));
+        reader_result.unwrap().unwrap();
+        writer_result.unwrap();
+        assert_eq!(store.db.native_admission.connection_count(), 0);
+        let conn = store.conn().unwrap();
+        let mut rows = conn
+            .query("MATCH (m:Meta {key: 'drop_rollback_witness'}) RETURN m.key")
+            .unwrap();
+        assert!(rows.next().is_none(), "implicit write rollback completed");
+    }
+
+    /// Exercise one native catalog while changed Symbol commits auto-checkpoint.
+    #[test]
+    fn concurrent_symbol_reads_and_checkpointed_commits_keep_catalog_valid() {
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::{Duration, Instant};
+
+        struct CheckpointOverride(bool);
+        impl Drop for CheckpointOverride {
+            fn drop(&mut self) {
+                CHECKPOINT_EVERY_COMMIT.with(|flag| flag.set(self.0));
+            }
+        }
+        let previous = CHECKPOINT_EVERY_COMMIT.with(|flag| flag.replace(true));
+        let override_guard = CheckpointOverride(previous);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("concurrent.lbug");
+        let store = Arc::new(GraphStore::create(&path).unwrap());
+        drop(override_guard); // Configuration belongs to this opened handle.
+        let symbol = nestweaver_schema::Symbol {
+            uid: "sym:concurrency:witness".into(),
+            name: "witness".into(),
+            kind: nestweaver_schema::SymbolKind::Function,
+            repo_uid: "repo:concurrency".into(),
+            file_path: "witness.rs".into(),
+            start_line: 1,
+            end_line: 1,
+            signature: "fn witness()".into(),
+            summary: None,
+            content_hash: "initial".into(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: nestweaver_schema::Visibility::Public,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        store.insert_symbol(&symbol).unwrap();
+        assert_eq!(
+            store
+                .lookup_symbols_by_repo("repo:concurrency")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let start = Arc::new(Barrier::new(3));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let commits = Arc::new(AtomicUsize::new(0));
+        // This is an integrity stress test, not a throughput assertion. Retain
+        // all reads/commits but allow contended CI hosts to finish the workload.
+        let deadline = Instant::now() + Duration::from_secs(180);
+        let reader = {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            let reads = Arc::clone(&reads);
+            let commits = Arc::clone(&commits);
+            std::thread::spawn(move || -> Result<(), String> {
+                start.wait();
+                for _ in 0..4096 {
+                    if Instant::now() >= deadline {
+                        return Err("reader deadline exceeded".into());
+                    }
+                    let rows = store
+                        .with_read_deadline(
+                            deadline.min(Instant::now() + Duration::from_secs(30)),
+                            || store.lookup_symbols_by_repo("repo:concurrency"),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    if rows.len() != 1 || rows[0].name != "witness" {
+                        return Err(format!("invalid concurrent Symbol result: {rows:?}"));
+                    }
+                    let count = reads.fetch_add(1, Ordering::SeqCst) + 1;
+                    if count.is_multiple_of(256) {
+                        eprintln!(
+                            "catalog fixture reads={count} commits={} generation={}",
+                            commits.load(Ordering::SeqCst),
+                            store.graph_generation()
+                        );
+                    }
+                    std::thread::yield_now();
+                }
+                Ok(())
+            })
+        };
+        let writer = {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            let reads = Arc::clone(&reads);
+            let commits = Arc::clone(&commits);
+            std::thread::spawn(move || -> Result<(), String> {
+                start.wait();
+                for iteration in 0..128 {
+                    if Instant::now() >= deadline {
+                        return Err("writer deadline exceeded".into());
+                    }
+                    let connection = store
+                        .begin_transaction()
+                        .map_err(|error| error.to_string())?;
+                    connection.set_query_timeout(30_000);
+                    let mut statement = connection
+                        .prepare("MATCH (s:Symbol {uid: $uid}) SET s.content_hash = $hash")
+                        .map_err(|error| error.to_string())?;
+                    connection
+                        .execute(
+                            &mut statement,
+                            vec![
+                                ("uid", lbug::Value::String("sym:concurrency:witness".into())),
+                                ("hash", lbug::Value::String(format!("commit-{iteration}"))),
+                            ],
+                        )
+                        .map_err(|error| error.to_string())?;
+                    drop(statement);
+                    store
+                        .commit_transaction(&connection)
+                        .map_err(|error| error.to_string())?;
+                    // Each changed commit uses the per-handle forced checkpoint setting.
+                    if store.reopen_required() {
+                        return Err("commit deferred its forced checkpoint".into());
+                    }
+                    store.bump_graph_generation();
+                    let count = commits.fetch_add(1, Ordering::SeqCst) + 1;
+                    if count.is_multiple_of(16) {
+                        eprintln!(
+                            "catalog fixture commits={count} reads={} generation={}",
+                            reads.load(Ordering::SeqCst),
+                            store.graph_generation()
+                        );
+                    }
+                    std::thread::yield_now();
+                }
+                Ok(())
+            })
+        };
+        eprintln!(
+            "catalog fixture private_db={} auto_checkpoint_every_commit=true",
+            path.display()
+        );
+        start.wait();
+        // Join both children before asserting, so a recoverable failure never detaches one.
+        let reader_result = reader.join();
+        let writer_result = writer.join();
+        eprintln!(
+            "catalog fixture final reads={} commits={}",
+            reads.load(Ordering::SeqCst),
+            commits.load(Ordering::SeqCst)
+        );
+        reader_result
+            .expect("reader thread panicked")
+            .expect("reader failed");
+        writer_result
+            .expect("writer thread panicked")
+            .expect("writer failed");
+        assert_eq!(reads.load(Ordering::SeqCst), 4096);
+        assert_eq!(commits.load(Ordering::SeqCst), 128);
+        assert_eq!(
+            store.lookup_symbols_by_repo("repo:concurrency").unwrap()[0].content_hash,
+            "commit-127"
+        );
+    }
 
     /// nw-670 re-review N3: a database a newer binary never opened writable
     /// lacks PROJECT_INCLUDES_REPO (read-only opens run no schema init).

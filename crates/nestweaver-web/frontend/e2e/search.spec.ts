@@ -313,3 +313,263 @@ test.describe("Search Flow", () => {
     await expect(evidencePanel).toContainText("No selection");
   });
 });
+
+// nw-021: selecting evidence must not replace the current analysis scene.
+test("Detail preserves scene identities, lens and representation while Explore and Add navigate", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/?representation=json");
+  const json = page.getByRole("region", { name: "JSON result", exact: true }).locator("code");
+  await expect(json).toBeVisible({ timeout: 15_000 });
+  const read = async () => JSON.parse((await json.textContent()) ?? "{}");
+  await expect.poll(async () => (await read()).graph.nodes.length).toBeGreaterThan(0);
+  const before = await read();
+  await page.getByTestId("search-input").fill("greet");
+  const results = page.getByRole("listbox", { name: "Search results" });
+  const option = results.getByRole("option").first();
+  await expect(option).toBeVisible();
+  await option.getByRole("button", { name: "Detail" }).click();
+  await expect(results).toBeHidden();
+  await expect.poll(async () => (await read()).selected_node.uid).not.toBeNull();
+  const after = await read();
+  expect(after.graph.nodes.map((n: { uid: string }) => n.uid).sort()).toEqual(
+    before.graph.nodes.map((n: { uid: string }) => n.uid).sort(),
+  );
+  expect(after.graph.edges).toEqual(before.graph.edges);
+  expect(after.active_lens).toEqual(before.active_lens);
+  expect(after.representation).toBe("json");
+  await expect(page.getByRole("complementary", { name: "Source and note evidence" })).toContainText("greet");
+
+  await page.getByTestId("search-input").focus();
+  await expect(results).toBeVisible();
+  await option.getByRole("button", { name: "Explore" }).click();
+  await expect(results).toBeHidden();
+  await expect.poll(() => new URL(page.url()).searchParams.get("mode")).toBe("context");
+  await expect.poll(async () => (await read()).active_lens.lens).toBe("context");
+  await page.getByTestId("search-input").fill("releaseA");
+  await expect(option).toContainText("releaseA");
+  await option.getByRole("button", { name: "Add" }).click();
+  await expect(results).toBeVisible();
+  await expect.poll(async () => (await read()).active_lens.lens).toBe("search");
+  await expect.poll(async () => (await read()).graph.nodes.some((n: { label: string }) => n.label === "releaseA")).toBe(true);
+});
+
+test("committed refresh updates held evidence and search without reopening a dismissed dropdown", async ({ page }) => {
+  let committed = false;
+  const events = { pending: "" };
+  await page.route("**/api/v1/events", (route) => {
+    const body = `retry: 200\n${events.pending}\n`;
+    events.pending = "";
+    return route.fulfill({ contentType: "text/event-stream", body });
+  });
+  const hit = () => ({ uid: "sym:held:identity", name: committed ? "Held committed name" : "Held previous name",
+    kind: "Function", file_path: "held.ts", start_line: 12 });
+  await page.route("**/api/v1/search?**", (route) => route.fulfill({ json: [hit()] }));
+  await page.route("**/api/v1/brain/search?**", (route) => route.fulfill({ json: [] }));
+  await page.route("**/api/v1/symbol/**", (route) => route.fulfill({ json: symbolPayload(hit()) }));
+  await page.goto("/?representation=json");
+  const json = page.getByRole("region", { name: "JSON result", exact: true }).locator("code");
+  await expect(json).toBeVisible({ timeout: 15_000 });
+  await expect.poll(async () => JSON.parse((await json.textContent()) ?? "{}").graph.nodes.length).toBeGreaterThan(0);
+  await page.getByTestId("search-input").fill("Held");
+  const dropdown = page.getByRole("listbox", { name: "Search results" });
+  await expect(dropdown).toContainText("Held previous name");
+  await dropdown.getByRole("button", { name: "Detail", exact: true }).click();
+  const evidence = page.getByRole("complementary", { name: "Source and note evidence" });
+  await expect(evidence).toContainText("Held previous name");
+  committed = true;
+  events.pending = "event: graph:updated\ndata: {}\n\nevent: full_refresh\ndata: {}\n\n";
+  await expect(evidence).toContainText("Held committed name");
+  await expect(dropdown).toBeHidden();
+  await expect.poll(() => new URL(page.url()).searchParams.get("node")).toBe("sym:held:identity");
+  await expect(page.getByRole("tab", { name: "JSON representation", exact: true })).toHaveAttribute("aria-selected", "true");
+  await page.getByTestId("search-input").focus();
+  await expect(dropdown).toContainText("Held committed name");
+  await expect(dropdown).not.toContainText("Held previous name");
+});
+
+
+for (const mode of ["local", "impact"] as const) {
+  test(`Detail inspects evidence without reanchoring a held ${mode} scene`, async ({ page, request }) => {
+    const lookup = async (name: string) => {
+      const response = await request.get(`/api/v1/search?q=${name}&limit=8`);
+      expect(response.ok()).toBe(true);
+      const rows = await response.json() as { uid: string; name: string; kind: string }[];
+      const hit = rows.find((row) => row.name === name);
+      expect(hit, `real fixture has ${name}`).toBeDefined();
+      return hit!;
+    };
+    const anchor = await lookup("releaseA");
+    const inspected = await lookup("releaseB");
+    const added = await lookup("releaseC");
+    expect(inspected.uid).not.toBe(anchor.uid);
+    const detailResponse = await request.get(`/api/v1/symbol/${encodeURIComponent(inspected.uid)}`);
+    expect(detailResponse.ok()).toBe(true);
+    const detail = await detailResponse.json() as { symbol: { repo_uid: string } };
+    const catalogResponse = await request.get("/api/v1/workspaces");
+    expect(catalogResponse.ok()).toBe(true);
+    const catalog = await catalogResponse.json() as { workspaces: { id: string; uid?: string; type: string; label: string }[] };
+    const repo = catalog.workspaces.find((entry) => entry.type === "repo" && entry.uid === detail.symbol.repo_uid);
+    const all = catalog.workspaces.find((entry) => entry.id === "all");
+    expect(repo, "real workspace catalog contains the inspected symbol's repository").toBeDefined();
+    expect(all).toBeDefined();
+    const events = { pending: "" };
+    await page.route("**/api/v1/events", (route) => {
+      const body = `retry: 200\n${events.pending}\n`;
+      events.pending = "";
+      return route.fulfill({ status: 200, contentType: "text/event-stream", body });
+    });
+    const sceneCalls: { target: string; depth?: string | null; confidence?: string | null }[] = [];
+    await page.route("**/api/v1/brain/context", async (route) => {
+      if (mode === "local") sceneCalls.push({ target: (route.request().postDataJSON() as { seeds: string[] }).seeds[0] });
+      await route.continue();
+    });
+    await page.route("**/api/v1/impact/**", async (route) => {
+      const url = new URL(route.request().url());
+      if (mode === "impact") sceneCalls.push({ target: decodeURIComponent(url.pathname.slice("/api/v1/impact/".length)),
+        depth: url.searchParams.get("depth"), confidence: url.searchParams.get("confidence") });
+      await route.continue();
+    });
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto(`/?mode=${mode}&node=${encodeURIComponent(anchor.uid)}&kind=${anchor.kind}&seeds=${encodeURIComponent(anchor.uid)}&representation=json&depth=2&confidence=0.5`);
+    const json = page.getByRole("region", { name: "JSON result", exact: true }).locator("code");
+    await expect(json).toBeVisible({ timeout: 15_000 });
+    const read = async () => JSON.parse((await json.textContent()) ?? "{}");
+    await expect.poll(async () => {
+      const scene = await read();
+      return scene.active_lens.targetUid === anchor.uid && scene.graph.nodes.some((n: { uid: string }) => n.uid === anchor.uid);
+    }, { timeout: 15_000 }).toBe(true);
+    if (mode === "local") await expect(page.getByRole("status", { name: "Local result state", exact: true })).toContainText(/nodes/);
+    if (mode === "impact") expect(sceneCalls.at(-1)).toMatchObject({ target: anchor.uid, depth: "2", confidence: "0.5" });
+    const before = await read();
+    const initialCalls = sceneCalls.length;
+    await page.getByTestId("search-input").fill(inspected.name);
+    const results = page.getByRole("listbox", { name: "Search results" });
+    const option = results.getByRole("option").filter({ hasText: inspected.name }).first();
+    await expect(option).toBeVisible();
+    await option.getByRole("button", { name: "Detail", exact: true }).click();
+    await expect(results).toBeHidden();
+    await expect(page.getByRole("complementary", { name: "Source and note evidence" })).toContainText(inspected.name);
+    await expect.poll(async () => (await read()).selected_node.uid).toBe(inspected.uid);
+    const after = await read();
+    expect(after.graph.nodes.map((n: { uid: string }) => n.uid).sort()).toEqual(before.graph.nodes.map((n: { uid: string }) => n.uid).sort());
+    expect(after.graph.edges).toEqual(before.graph.edges);
+    expect(after.active_lens).toEqual(before.active_lens);
+    expect(after.representation).toBe("json");
+    expect(sceneCalls.slice(initialCalls).some((call) => call.target === inspected.uid)).toBe(false);
+
+    const refreshStart = sceneCalls.length;
+    const refreshed = page.waitForResponse((response) => mode === "local"
+      ? new URL(response.url()).pathname === "/api/v1/brain/context" && (response.request().postDataJSON() as { seeds: string[] }).seeds[0] === anchor.uid
+      : new URL(response.url()).pathname === `/api/v1/impact/${encodeURIComponent(anchor.uid)}`);
+    events.pending = "event: graph:updated\ndata: {}\n\n";
+    const refreshResponse = await refreshed;
+    expect(refreshResponse.ok()).toBe(true);
+    await refreshResponse.finished();
+    await expect.poll(async () => (await read()).graph.nodes.length).toBeGreaterThan(0);
+    const committed = await read();
+    expect(committed.active_lens).toEqual(before.active_lens);
+    expect(committed.selected_node.uid).toBe(inspected.uid);
+    expect(committed.graph.nodes.map((n: { uid: string }) => n.uid).sort()).toEqual(before.graph.nodes.map((n: { uid: string }) => n.uid).sort());
+    expect(sceneCalls.slice(refreshStart).every((call) => call.target === anchor.uid)).toBe(true);
+    if (mode === "impact") expect(sceneCalls.at(-1)).toMatchObject({ depth: "2", confidence: "0.5" });
+    await expect(results).toBeHidden();
+
+    // Workspace navigation discards the inspection exception, including on return to All.
+    for (const workspace of [repo!, all!]) {
+      await page.getByLabel("Workspace", { exact: true }).click();
+      await page.getByRole("option").filter({ has: page.getByText(workspace.label, { exact: true }) }).click();
+      await expect.poll(async () => {
+        const scene = await read();
+        return scene._meta.workspace_id === workspace.id && scene.active_lens.targetUid === inspected.uid &&
+          scene.graph.nodes.some((n: { uid: string }) => n.uid === inspected.uid);
+      }, { timeout: 15_000 }).toBe(true);
+      expect((await read()).selected_node.uid).toBe(inspected.uid);
+      expect(sceneCalls.at(-1)?.target).toBe(inspected.uid);
+    }
+
+    // Counterweights: navigation actions still replace or extend the context seeds.
+    await page.getByTestId("search-input").focus();
+    await expect(option).toBeVisible();
+    await option.getByRole("button", { name: "Explore", exact: true }).click();
+    await expect(results).toBeHidden();
+    await expect.poll(() => new URL(page.url()).searchParams.get("mode")).toBe("context");
+    await expect.poll(async () => (await read()).active_lens.targetUid).toBe(inspected.uid);
+    await page.getByTestId("search-input").fill(added.name);
+    await results.getByRole("option").filter({ hasText: added.name }).first().getByRole("button", { name: "Add", exact: true }).click();
+    await expect.poll(() => new URL(page.url()).searchParams.get("seeds")?.split(",")).toEqual([inspected.uid, added.uid]);
+    await expect.poll(async () => (await read()).graph.nodes.some((n: { uid: string }) => n.uid === added.uid)).toBe(true);
+
+    if (mode === "impact") {
+      // A fresh deep link must still apply the full target/depth/confidence query.
+      await page.goto(`/?mode=impact&node=${encodeURIComponent(inspected.uid)}&kind=${inspected.kind}&representation=json&depth=4&confidence=0.7`);
+      await expect(json).toBeVisible();
+      await expect.poll(async () => (await read()).active_lens.targetUid).toBe(inspected.uid);
+      await expect.poll(() => sceneCalls.at(-1)).toMatchObject({ target: inspected.uid, depth: "4", confidence: "0.7" });
+      await expect.poll(async () => (await read()).graph.nodes.some((n: { uid: string }) => n.uid === inspected.uid)).toBe(true);
+    }
+  });
+}
+
+test("committed Impact refresh publishes graph data while preserving the Related lens", async ({ page, request }) => {
+  const response = await request.get("/api/v1/search?q=releaseA&limit=8");
+  expect(response.ok()).toBe(true);
+  const rows = await response.json() as { uid: string; name: string; kind: string }[];
+  const anchor = rows.find((row) => row.name === "releaseA");
+  expect(anchor, "real fixture has the Impact target").toBeDefined();
+  let committed = false;
+  let deliveredRefreshes = 0;
+  const refreshedName = "releaseA committed Impact publication";
+  await page.route("**/api/v1/impact/**", async (route) => {
+    const actual = await route.fetch();
+    expect(actual.ok()).toBe(true);
+    const body = await actual.json() as { target: { uid: string; name: string }; nodes: { uid: string; name: string }[] };
+    expect(body.target.uid).toBe(anchor!.uid);
+    if (committed) {
+      // Keep the real backend topology; the marker proves the refreshed reply was published.
+      body.target.name = refreshedName;
+      body.nodes = body.nodes.map((node) => node.uid === anchor!.uid ? { ...node, name: refreshedName } : node);
+      await route.fulfill({ response: actual, json: body });
+      deliveredRefreshes += 1;
+    } else {
+      await route.fulfill({ response: actual });
+    }
+  });
+  const events = { pending: "" };
+  await page.route("**/api/v1/events", (route) => {
+    const body = `retry: 200\n${events.pending}\n`;
+    events.pending = "";
+    return route.fulfill({ status: 200, contentType: "text/event-stream", body });
+  });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto(`/?mode=impact&node=${encodeURIComponent(anchor!.uid)}&kind=${anchor!.kind}&representation=json&depth=2&confidence=0.5`);
+  const json = page.getByRole("region", { name: "JSON result", exact: true }).locator("code");
+  await expect(json).toBeVisible({ timeout: 15_000 });
+  const read = async () => JSON.parse((await json.textContent()) ?? "{}");
+  await expect.poll(async () => {
+    const scene = await read();
+    return scene.active_lens.lens === "impact" && scene.active_lens.targetUid === anchor!.uid &&
+      scene.graph.nodes.some((node: { uid: string }) => node.uid === anchor!.uid);
+  }, { timeout: 15_000 }).toBe(true);
+  const impact = await read();
+  await page.getByTestId("detail-panel").getByRole("group", { name: "Node actions", exact: true }).first().getByRole("button", { name: "Related", exact: true }).click();
+  await expect.poll(async () => (await read()).active_lens.label).toMatch(/^Related to /);
+  const related = await read();
+  expect(related.active_lens.lens).toBe("search");
+  expect(related.selected_node.uid).toBe(anchor!.uid);
+  expect(related.graph.nodes.map((node: { uid: string }) => node.uid).sort()).toEqual(impact.graph.nodes.map((node: { uid: string }) => node.uid).sort());
+  expect(related.graph.edges).toEqual(impact.graph.edges);
+  expect(new URL(page.url()).searchParams.get("mode")).toBe("impact");
+
+  committed = true;
+  events.pending = "event: graph:updated\ndata: {}\n\n";
+  await expect.poll(() => deliveredRefreshes).toBeGreaterThan(0);
+  await expect.poll(async () => (await read()).graph.nodes.some((node: { uid: string; label: string }) =>
+    node.uid === anchor!.uid && node.label === refreshedName), { timeout: 15_000 }).toBe(true);
+  const after = await read();
+  expect(after.active_lens).toEqual(related.active_lens);
+  expect(after.selected_node).toEqual(related.selected_node);
+  expect(after.representation).toBe(related.representation);
+  expect(after.graph.nodes.map((node: { uid: string }) => node.uid).sort()).toEqual(related.graph.nodes.map((node: { uid: string }) => node.uid).sort());
+  expect(after.graph.edges).toEqual(related.graph.edges);
+  expect(new URL(page.url()).searchParams.get("mode")).toBe("impact");
+});

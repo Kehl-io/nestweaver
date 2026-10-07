@@ -53,7 +53,7 @@ fi
 
 # Step 4: Compile Swift launcher
 echo "[4/6] Compiling Swift launcher..."
-swiftc "$SCRIPT_DIR/Sources/main.swift" \
+swiftc "$SCRIPT_DIR/Sources/main.swift" "$SCRIPT_DIR/Sources/DatabaseSelection.swift" "$SCRIPT_DIR/Sources/UIChildReadiness.swift" \
     -o "$REPO_ROOT/target/release/NestWeaverLauncher" \
     -target "$SWIFT_TARGET" \
     -framework AppKit \

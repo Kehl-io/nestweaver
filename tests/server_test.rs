@@ -3,6 +3,8 @@
 //! Run with:
 //!   cargo test --test server_test -- --test-threads=1
 
+#[path = "helpers/catalogue_contract.rs"]
+mod catalogue_contract;
 mod helpers;
 
 use std::process::Command as StdCommand;
@@ -920,26 +922,9 @@ async fn server_mcp_http_initialize() {
 async fn server_mcp_http_tools_list() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.lbug");
-    let repo_dir = dir.path().join("repo");
-    write_test_repo(&repo_dir);
-
-    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
-        .env("NESTWEAVER_NO_DAEMON", "1")
-        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
-        .args([
-            "index",
-            "--repo",
-            &repo_dir.display().to_string(),
-            "--db",
-            &db_path.display().to_string(),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "index failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    // Catalogue discovery is graph-independent. Initialize a private fixture
+    // without an indexing subprocess that could autostart a competing daemon.
+    drop(nestweaver_store::GraphStore::open(&db_path).unwrap());
 
     let guard = helpers::server_guard::ServerGuard::start(&db_path);
     let mcp_addr = guard.mcp_addr();
@@ -947,22 +932,19 @@ async fn server_mcp_http_tools_list() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{mcp_addr}/mcp"))
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/list",
-        }))
+        .json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
         .send()
         .await
         .expect("MCP HTTP request failed");
-
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["id"], 2);
-    let tools = body["result"]["tools"]
-        .as_array()
-        .expect("tools should be an array");
-    assert!(tools.len() >= 30, "expected 30+ tools, got {}", tools.len());
+    assert_eq!(body["jsonrpc"], "2.0");
+    assert!(body.get("error").is_none(), "{body}");
+    let full = nestweaver_mcp::tools::tool_list(false);
+    let expected = full["tools"].as_array().unwrap();
+    assert_eq!(expected.len(), 43, "complete default HTTP profile");
+    catalogue_contract::assert_complete_catalogue_page(&body["result"], expected);
 }
 
 #[tokio::test]

@@ -1158,3 +1158,633 @@ async fn p1_brain_context_nodes_expose_scene_bridge_scores() {
         );
     }
 }
+
+#[tokio::test]
+async fn scoped_symbol_search_prefers_exact_name_before_rank_and_keeps_legacy_scope() {
+    let store = setup_p1_store();
+    store
+        .insert_symbol(&symbol("sym:alpha:bot", "repo:alpha", "bot", 0.00001))
+        .unwrap();
+    store
+        .insert_symbol(&symbol(
+            "sym:alpha:max",
+            "repo:alpha",
+            "MAX_BOTS_PER_ROOM",
+            100.0,
+        ))
+        .unwrap();
+    store
+        .insert_symbol(&symbol("sym:beta:bot", "repo:beta", "bot", 200.0))
+        .unwrap();
+    store
+        .batch_insert_project_symbol_edges(
+            "proj:local:alpha",
+            &["sym:alpha:bot".into(), "sym:alpha:max".into()],
+            1.0,
+        )
+        .unwrap();
+    let state = AppState::new(store, None, "/tmp/scoped-search.lbug".into());
+    let app = create_router(state);
+    for workspace in ["repo:alpha", "proj:local:alpha"] {
+        let (status, body) = get_json(
+            &app,
+            &format!("/api/v1/brain/search?q=bot&workspace={workspace}&limit=1"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["results"][0]["uid"], "sym:alpha:bot", "{body}");
+        assert_eq!(body["_meta"]["truncation"]["omitted_count"], 1);
+    }
+}
+
+#[tokio::test]
+async fn symbols_top_scopes_before_limit_and_does_not_widen_legacy_membership() {
+    let store = setup_p1_store();
+    store
+        .insert_symbol(&symbol(
+            "sym:alpha:unselected",
+            "repo:alpha",
+            "unselected",
+            300.0,
+        ))
+        .unwrap();
+    store
+        .insert_symbol(&symbol("sym:beta:global", "repo:beta", "global", 400.0))
+        .unwrap();
+    // Rank this leader through actual graph structure; persisted fixture
+    // scores are not the authoritative cache that Top serves.
+    for caller in [
+        "sym:alpha:parse",
+        "sym:alpha:format",
+        "sym:alpha:unselected",
+    ] {
+        store
+            .insert_edge(&calls_edge(caller, "sym:alpha:unselected"))
+            .unwrap();
+    }
+    store
+        .compute_pagerank(0.85, 20, &GraphScope::code_only())
+        .unwrap();
+    let state = AppState::new(store, None, "/tmp/scoped-top.lbug".into());
+    let app = create_router(state);
+    let (status, body) = get_json(
+        &app,
+        "/api/v1/symbols/top?workspace=proj:local:alpha&limit=1",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body[0]["repo_uid"], "repo:alpha");
+    assert_ne!(body[0]["uid"], "sym:alpha:unselected");
+    let (_, body) = get_json(&app, "/api/v1/symbols/top?workspace=repo:alpha&limit=1").await;
+    assert_eq!(body[0]["uid"], "sym:alpha:unselected");
+    let (_, body) = get_json(&app, "/api/v1/symbols/top?workspace=vlt:brain&limit=1").await;
+    assert_eq!(body, json!([]));
+    let (status, _) = get_json(&app, "/api/v1/symbols/top?workspace=repo:missing").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn project_overview_includes_explicit_empty_repository_and_true_counts() {
+    let store = setup_p1_store();
+    store.insert_repo(&repo("repo:empty", "empty")).unwrap();
+    store
+        .replace_project_repo_edges(
+            &["proj:local:alpha".into()],
+            &[("proj:local:alpha".into(), "repo:empty".into())],
+        )
+        .unwrap();
+    let state = AppState::new(store, None, "/tmp/empty-project.lbug".into());
+    let app = create_router(state);
+    let (status, body) = get_json(
+        &app,
+        "/api/v1/overview?workspace=proj:local:alpha&kind=repo&limit=6",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["counts"]["repo_count"], 2, "{body}");
+    assert_eq!(body["counts"]["symbol_count"], 2);
+    assert!(
+        body["landmarks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["uid"] == "repo:empty")
+    );
+    let (_, catalog) = get_json(&app, "/api/v1/workspaces").await;
+    let project = catalog["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["uid"] == "proj:local:alpha")
+        .unwrap();
+    assert_eq!(project["counts"]["repo_count"], 2);
+}
+
+#[tokio::test]
+async fn scoped_top_deduplicates_repo_and_legacy_members_and_breaks_ties_by_uid() {
+    let store = GraphStore::in_memory().unwrap();
+    store.insert_repo(&repo("repo:member", "member")).unwrap();
+    store.insert_repo(&repo("repo:foreign", "foreign")).unwrap();
+    store
+        .insert_project(&project("proj:member", "Member"))
+        .unwrap();
+    for uid in ["sym:member:z", "sym:member:a", "sym:member:m"] {
+        store
+            .insert_symbol(&symbol(uid, "repo:member", "tied", 1.0))
+            .unwrap();
+    }
+    for i in 0..12 {
+        store
+            .insert_symbol(&symbol(
+                &format!("sym:foreign:{i}"),
+                "repo:foreign",
+                "tied",
+                100.0,
+            ))
+            .unwrap();
+    }
+    store
+        .replace_project_repo_edges(
+            &["proj:member".into()],
+            &[("proj:member".into(), "repo:member".into())],
+        )
+        .unwrap();
+    store
+        .batch_insert_project_symbol_edges("proj:member", &["sym:member:a".into()], 1.0)
+        .unwrap();
+    let app = create_router(AppState::new(store, None, "/tmp/tied-project.lbug".into()));
+    let (_, body) = get_json(&app, "/api/v1/symbols/top?workspace=proj:member&limit=2").await;
+    assert_eq!(
+        body.as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["uid"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["sym:member:a", "sym:member:m"]
+    );
+    let (_, body) = get_json(
+        &app,
+        "/api/v1/overview?workspace=proj:member&kind=symbol&limit=6",
+    )
+    .await;
+    assert_eq!(body["counts"]["symbol_count"], 3);
+    assert_eq!(body["landmarks"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn scoped_top_uses_warmed_authoritative_rank_before_limit() {
+    let store = GraphStore::in_memory().unwrap();
+    store.insert_repo(&repo("repo:rank", "rank")).unwrap();
+    store.insert_project(&project("proj:rank", "Rank")).unwrap();
+    for (uid, name) in [("sym:rank:a", "caller"), ("sym:rank:z", "leader")] {
+        store
+            .insert_symbol(&symbol(uid, "repo:rank", name, 0.0))
+            .unwrap();
+    }
+    store
+        .insert_edge(&calls_edge("sym:rank:a", "sym:rank:z"))
+        .unwrap();
+    store
+        .insert_edge(&calls_edge("sym:rank:z", "sym:rank:z"))
+        .unwrap();
+    store
+        .batch_insert_project_symbol_edges(
+            "proj:rank",
+            &["sym:rank:a".into(), "sym:rank:z".into()],
+            1.0,
+        )
+        .unwrap();
+    store
+        .compute_pagerank(0.85, 20, &GraphScope::code_only())
+        .unwrap();
+    let app = create_router(AppState::new(
+        store,
+        None,
+        "/tmp/authoritative-top.lbug".into(),
+    ));
+    let (_, all) = get_json(&app, "/api/v1/symbols/top?limit=1").await;
+    assert_eq!(all[0]["uid"], "sym:rank:z");
+    let score = all[0]["pagerank_score"].as_f64().unwrap();
+    assert!(score > 0.0);
+    for workspace in ["repo:rank", "proj:rank"] {
+        let (status, scoped) = get_json(
+            &app,
+            &format!("/api/v1/symbols/top?workspace={workspace}&limit=1"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(scoped[0]["uid"], "sym:rank:z", "{scoped}");
+        assert!((scoped[0]["pagerank_score"].as_f64().unwrap() - score).abs() < 1e-12);
+    }
+}
+
+#[tokio::test]
+async fn scoped_top_preserves_repo_keyed_git_activity_scores() {
+    let store = GraphStore::in_memory().unwrap();
+    store.insert_repo(&repo("repo:rank", "rank")).unwrap();
+    for (uid, name) in [("sym:rank:a", "stale"), ("sym:rank:z", "fresh")] {
+        store
+            .insert_symbol(&symbol(uid, "repo:rank", name, 0.0))
+            .unwrap();
+    }
+    store
+        .insert_edge(&calls_edge("sym:rank:a", "sym:rank:z"))
+        .unwrap();
+    store
+        .insert_edge(&calls_edge("sym:rank:z", "sym:rank:a"))
+        .unwrap();
+    store
+        .compute_pagerank(0.85, 20, &GraphScope::code_only())
+        .unwrap();
+    store.load_git_activity_cache(std::collections::HashMap::from([(
+        "repo:rank".into(),
+        std::collections::HashMap::from([
+            ("src/stale.rs".into(), 0.0),
+            ("src/fresh.rs".into(), 1.0),
+        ]),
+    )]));
+    let app = create_router(AppState::new(store, None, "/tmp/activity-top.lbug".into()));
+    let (_, all) = get_json(&app, "/api/v1/symbols/top?limit=1").await;
+    assert_eq!(all[0]["uid"], "sym:rank:z");
+    let (_, scoped) = get_json(&app, "/api/v1/symbols/top?workspace=repo:rank&limit=1").await;
+    assert_eq!(scoped[0]["uid"], "sym:rank:z");
+    assert_eq!(scoped[0]["pagerank_score"], all[0]["pagerank_score"]);
+}
+
+#[tokio::test]
+async fn local_git_freshness_is_shared_by_repo_workspace_and_overview() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    let empty_git_dir = dir.path().join("empty-git-config");
+    std::fs::create_dir(&empty_git_dir).unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TEMPLATE_DIR", &empty_git_dir)
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "tag.gpgsign=false",
+                "-c",
+            ])
+            .arg(format!("core.hooksPath={}", empty_git_dir.display()))
+            .args(args)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {:?}", output.stderr);
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "fixture@example.com"]);
+    git(&["config", "user.name", "Fixture"]);
+    std::fs::write(root.join("a.txt"), "one").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "one"]);
+    let indexed = git(&["rev-parse", "HEAD"]);
+    let store = GraphStore::in_memory().unwrap();
+    let mut indexed_repo = repo("repo:local", "local");
+    indexed_repo.root_path = Some(root.to_string_lossy().into_owned());
+    indexed_repo.indexed_sha = indexed.clone();
+    indexed_repo.staleness_commits_behind = 0;
+    store.insert_repo(&indexed_repo).unwrap();
+    let state = AppState::new(store, None, dir.path().join("graph.lbug"));
+    let app = create_router(state.clone());
+    let (_, current) = get_json(&app, "/api/v1/repos").await;
+    assert_eq!(current[0]["freshness"]["status"], "current");
+    std::fs::write(root.join("a.txt"), "two").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "two"]);
+    // Generation invalidation must force a new observation even within TTL.
+    state.store.bump_graph_generation();
+    let (_, behind) = get_json(&app, "/api/v1/repos").await;
+    assert_eq!(behind[0]["freshness"]["status"], "behind");
+    assert_eq!(behind[0]["freshness"]["commits_behind"], 1);
+    let (_, overview) = get_json(&app, "/api/v1/overview?workspace=repo:local").await;
+    assert_eq!(overview["_meta"]["trust"]["freshness"], "behind");
+    let (_, catalog) = get_json(&app, "/api/v1/workspaces").await;
+    let entry = catalog["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["uid"] == "repo:local")
+        .unwrap();
+    assert_eq!(entry["_meta"]["trust"]["freshness"], "behind");
+    // A rewind and independent branch must not read as "current, 0 behind".
+    let newer = git(&["rev-parse", "HEAD"]);
+    indexed_repo.indexed_sha = newer.clone();
+    state
+        .store
+        .update_repo_sha(&indexed_repo.uid, &indexed_repo.indexed_sha)
+        .unwrap();
+    git(&["checkout", "--detach", &indexed]);
+    state.store.bump_graph_generation();
+    let (_, ahead) = get_json(&app, "/api/v1/repos").await;
+    assert_eq!(ahead[0]["freshness"]["status"], "ahead");
+    git(&["checkout", "-qb", "independent"]);
+    std::fs::write(root.join("a.txt"), "independent").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "independent"]);
+    state.store.bump_graph_generation();
+    let (_, diverged) = get_json(&app, "/api/v1/repos").await;
+    assert_eq!(diverged[0]["freshness"]["status"], "diverged");
+    assert_eq!(diverged[0]["freshness"]["commits_ahead"], 1);
+    assert_eq!(diverged[0]["freshness"]["commits_behind"], 1);
+    std::fs::remove_file(root.join(".git/HEAD")).unwrap();
+    state.store.bump_graph_generation();
+    let (_, failed_observation) = get_json(&app, "/api/v1/repos").await;
+    assert_eq!(failed_observation[0]["freshness"]["status"], "unknown");
+    // Missing, present non-Git, and invalid indexed SHA are distinct.
+    std::fs::remove_dir_all(&root).unwrap();
+    state.store.bump_graph_generation();
+    let (_, missing) = get_json(&app, "/api/v1/repos").await;
+    assert_eq!(missing[0]["freshness"]["status"], "missing");
+    std::fs::create_dir(&root).unwrap();
+    state.store.bump_graph_generation();
+    let (_, untracked) = get_json(&app, "/api/v1/repos").await;
+    assert_eq!(untracked[0]["freshness"]["status"], "untracked");
+    git(&["init", "-q"]);
+    std::fs::write(root.join("a.txt"), "three").unwrap();
+    git(&["config", "user.email", "fixture@example.com"]);
+    git(&["config", "user.name", "Fixture"]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "three"]);
+    indexed_repo.indexed_sha = "watch".into();
+    state
+        .store
+        .update_repo_sha(&indexed_repo.uid, &indexed_repo.indexed_sha)
+        .unwrap();
+    state.store.bump_graph_generation();
+    let (_, unknown) = get_json(&app, "/api/v1/repos").await;
+    assert_eq!(unknown[0]["freshness"]["status"], "unknown");
+    assert!(unknown[0]["freshness"]["commits_behind"].is_null());
+}
+
+fn review_fixture_git(root: &std::path::Path, args: &[&str]) -> String {
+    let mut command = std::process::Command::new("git");
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_INDEX_FILE",
+        "GIT_NO_LAZY_FETCH",
+    ] {
+        command.env_remove(key);
+    }
+    let output = command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TEMPLATE_DIR", root.join("empty-template"))
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "tag.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn review_fixture_repo(root: &std::path::Path, body: &str) -> String {
+    std::fs::create_dir_all(root).unwrap();
+    review_fixture_git(root, &["init", "-q"]);
+    review_fixture_git(root, &["config", "user.name", "Fixture"]);
+    review_fixture_git(root, &["config", "user.email", "fixture@example.com"]);
+    std::fs::write(root.join("file.txt"), body).unwrap();
+    review_fixture_git(root, &["add", "."]);
+    review_fixture_git(root, &["commit", "-qm", body]);
+    review_fixture_git(root, &["rev-parse", "HEAD"])
+}
+
+fn review_freshness_child(
+    root: &std::path::Path,
+    sha: &str,
+    status: &str,
+) -> std::process::Command {
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--ignored",
+            "--exact",
+            "git_freshness_review_child",
+            "--nocapture",
+        ])
+        .env("NW_FRESHNESS_CHILD_ROOT", root)
+        .env("NW_FRESHNESS_CHILD_SHA", sha)
+        .env("NW_FRESHNESS_CHILD_STATUS", status)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_INDEX_FILE",
+        "GIT_NO_LAZY_FETCH",
+    ] {
+        child.env_remove(key);
+    }
+    child
+}
+
+// Environment contamination is confined to a separately owned test process;
+// parallel tests and the host process never mutate their environment.
+#[test]
+#[ignore]
+fn git_freshness_review_child() {
+    let root = std::env::var("NW_FRESHNESS_CHILD_ROOT").expect("owned fixture child only");
+    let sha = std::env::var("NW_FRESHNESS_CHILD_SHA").unwrap();
+    let expected = std::env::var("NW_FRESHNESS_CHILD_STATUS").unwrap();
+    let mut indexed = repo("repo:review", "review");
+    indexed.root_path = Some(root);
+    indexed.indexed_sha = sha;
+    let store = GraphStore::in_memory().unwrap();
+    store.insert_repo(&indexed).unwrap();
+    let state = AppState::new(store, None, std::path::PathBuf::from("unused.lbug"));
+    for _ in 0..2 {
+        let observation = state.repo_freshness(std::slice::from_ref(&indexed));
+        assert_eq!(
+            observation[&indexed.uid].status, expected,
+            "caller-local observation and cached repeat must use the selected repository"
+        );
+        if expected == "current" {
+            assert_eq!(
+                observation[&indexed.uid].current_sha.as_deref(),
+                Some(indexed.indexed_sha.as_str())
+            );
+        }
+        if expected == "different" {
+            assert!(observation[&indexed.uid].current_sha.is_some());
+            assert!(observation[&indexed.uid].commits_behind.is_none());
+            assert!(observation[&indexed.uid].commits_ahead.is_none());
+        }
+    }
+}
+
+#[test]
+fn d_quality_git_scrubs_inherited_repository_routing() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    let sha_a = review_fixture_repo(&a, "repository a");
+    let sha_b = review_fixture_repo(&b, "repository b");
+    assert_ne!(sha_a, sha_b);
+    let positive = review_freshness_child(&a, &sha_a, "current")
+        .output()
+        .unwrap();
+    assert!(
+        positive.status.success(),
+        "{}",
+        String::from_utf8_lossy(&positive.stdout)
+    );
+    for key in ["GIT_DIR", "GIT_COMMON_DIR"] {
+        let contaminated = review_freshness_child(&a, &sha_a, "current")
+            .env(key, b.join(".git"))
+            .env("GIT_WORK_TREE", &b)
+            .output()
+            .unwrap();
+        assert!(
+            contaminated.status.success(),
+            "{key} must not redirect A to B: {}",
+            String::from_utf8_lossy(&contaminated.stdout)
+        );
+    }
+    std::fs::write(a.join("file.txt"), "a second commit").unwrap();
+    review_fixture_git(&a, &["add", "."]);
+    review_fixture_git(&a, &["commit", "-qm", "second"]);
+    let objects = review_freshness_child(&a, &sha_a, "behind")
+        .env("GIT_OBJECT_DIRECTORY", b.join(".git/objects"))
+        .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", b.join(".git/objects"))
+        .output()
+        .unwrap();
+    assert!(
+        objects.status.success(),
+        "foreign object routing must not hide A's ancestry: {}",
+        String::from_utf8_lossy(&objects.stdout)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn d_quality_git_never_lazily_fetches_promisor_objects() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("partial");
+    let indexed = review_fixture_repo(&root, "first commit");
+    std::fs::write(root.join("file.txt"), "second commit").unwrap();
+    review_fixture_git(&root, &["add", "."]);
+    review_fixture_git(&root, &["commit", "-qm", "second"]);
+    let remote = dir.path().join("local-remote.git");
+    review_fixture_git(
+        &root,
+        &[
+            "clone",
+            "--bare",
+            "--no-local",
+            root.to_str().unwrap(),
+            remote.to_str().unwrap(),
+        ],
+    );
+    let log = dir.path().join("upload-pack.log");
+    let wrapper = dir.path().join("record-upload-pack");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf 'invoked\\n' >> '{}'\nexec git-upload-pack \"$@\"\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    review_fixture_git(
+        &root,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    review_fixture_git(&root, &["config", "remote.origin.promisor", "true"]);
+    review_fixture_git(
+        &root,
+        &["config", "remote.origin.partialclonefilter", "blob:none"],
+    );
+    review_fixture_git(&root, &["config", "extensions.partialClone", "origin"]);
+    review_fixture_git(&root, &["config", "core.repositoryformatversion", "1"]);
+    review_fixture_git(
+        &root,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            wrapper.to_str().unwrap(),
+        ],
+    );
+    let missing = root
+        .join(".git/objects")
+        .join(&indexed[..2])
+        .join(&indexed[2..]);
+    assert!(
+        missing.is_file(),
+        "fixture commit is initially a loose object"
+    );
+    std::fs::remove_file(&missing).unwrap();
+    let output = review_freshness_child(&root, &indexed, "different")
+        .output()
+        .unwrap();
+    assert!(
+        !log.exists(),
+        "freshness must not invoke even a local promisor upload-pack helper"
+    );
+    assert!(
+        !missing.exists(),
+        "missing indexed commit must not be recovered by an observation"
+    );
+    let mut inspect = std::process::Command::new("git");
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ] {
+        inspect.env_remove(key);
+    }
+    let object = inspect
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg("-C")
+        .arg(&root)
+        .args(["cat-file", "-e", &indexed])
+        .output()
+        .unwrap();
+    assert!(
+        !object.status.success(),
+        "the indexed commit must remain absent from every local object pack"
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    // Counterweight proves the local remote really can restore this exact
+    // missing object and the recording helper is connected to Git's fetch.
+    review_fixture_git(&root, &["cat-file", "-t", &indexed]);
+    assert!(
+        log.exists(),
+        "positive control must exercise the local promisor helper"
+    );
+}

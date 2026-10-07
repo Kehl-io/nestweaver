@@ -7,6 +7,7 @@ pub struct ApiError {
     pub message: String,
     /// A coded body to send instead of `{"error": message}`.
     pub body: Option<serde_json::Value>,
+    retry_after: Option<axum::http::HeaderValue>,
 }
 
 impl ApiError {
@@ -15,6 +16,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             message: msg.into(),
             body: None,
+            retry_after: None,
         }
     }
 
@@ -23,6 +25,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             message: msg.into(),
             body: None,
+            retry_after: None,
         }
     }
 
@@ -33,6 +36,7 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             message: msg.into(),
             body: Some(body),
+            retry_after: None,
         }
     }
 
@@ -41,6 +45,7 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: msg.into(),
             body: None,
+            retry_after: None,
         }
     }
 
@@ -49,7 +54,36 @@ impl ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: msg.into(),
             body: None,
+            retry_after: None,
         }
+    }
+
+    /// Only typed cancellation is deadline evidence. Context's read boundary
+    /// converts actual scoped expiry to this variant, including Rust rendering;
+    /// unrelated native interruption text remains an internal error.
+    pub fn from_context_read(err: anyhow::Error) -> Self {
+        let timed_out = err.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<nestweaver_store::StoreError>(),
+                Some(nestweaver_store::StoreError::Cancelled(
+                    nestweaver_store::CancelReason::Timeout
+                ))
+            )
+        });
+        if timed_out {
+            tracing::info!(error = %err, "context read deadline exceeded");
+            let message =
+                "Context read exceeded its deadline; retry shortly or narrow the context seeds.";
+            return Self {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                message: message.into(),
+                body: Some(
+                    json!({"error": "context_timeout", "message": message, "retryable": true}),
+                ),
+                retry_after: Some(axum::http::HeaderValue::from_static("1")),
+            };
+        }
+        Self::from_ranking(err)
     }
 
     /// Classify a failed ranking query. A dirty-publication refusal
@@ -77,7 +111,13 @@ impl IntoResponse for ApiError {
         let body = self
             .body
             .unwrap_or_else(|| json!({ "error": self.message }));
-        (self.status, axum::Json(body)).into_response()
+        let mut response = (self.status, axum::Json(body)).into_response();
+        if let Some(retry_after) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, retry_after);
+        }
+        response
     }
 }
 

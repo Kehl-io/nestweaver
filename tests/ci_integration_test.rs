@@ -238,17 +238,17 @@ fn fail_on_breaking_exits_nonzero() {
     let repo_dir = dir.path().join("repo");
     let db_path = dir.path().join("test.lbug");
 
-    // Set up a git repo with a function and a caller of that function,
+    // Set up a git repo with an exported function and an actual imported caller,
     // so the store records a CALLS edge that makes removal Breaking.
     init_git_repo(&repo_dir);
     std::fs::write(
         repo_dir.join("lib.js"),
-        "function processOrder(orderId) { return orderId; }\n",
+        "export function processOrder(orderId) { return orderId; }\n",
     )
     .unwrap();
     std::fs::write(
         repo_dir.join("app.js"),
-        "function handleCheckout(order) { return processOrder(order.id); }\n",
+        "import { processOrder } from './lib.js';\nfunction handleCheckout(order) { return processOrder(order.id); }\n",
     )
     .unwrap();
     git(&repo_dir, &["add", "."]);

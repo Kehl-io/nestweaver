@@ -6,6 +6,7 @@ use nestweaver_schema::{
 use rayon::prelude::*;
 
 use crate::imports::{ImportGraph, build_import_graph_with_languages};
+use crate::types::TypeEnvironment;
 use crate::util::parent_dir;
 use crate::workspace::WorkspaceContext;
 
@@ -22,9 +23,8 @@ use crate::workspace::WorkspaceContext;
 ///    - Re-exports (one level deep) → ReExportResolved confidence
 ///    - Same package/directory → SamePackageFallback confidence
 ///    - No match → confidence 0.0, target_uid = "unresolved:{name}"
-/// 3. Create IMPORTS edges from the import graph:
-///    a) File-level: one IMPORTS edge per resolved import (first symbol → first symbol)
-///    b) Named: link the enclosing source symbol to all exported target symbols
+/// 3. Attribute IMPORTS to genuine resolved binding users or explicitly named
+///    Rust imports enclosed by source symbols.
 ///
 /// Edges are deduplicated by (source_uid, target_uid, edge_type).
 ///
@@ -87,6 +87,31 @@ pub fn resolve_references_with_context(
     )
 }
 
+type ScopedCallKey<'a> = (&'a str, Option<&'a str>, usize);
+
+/// Index exact AST call identities once per file. Retain duplicate references
+/// so an ambiguous assignment stays refused instead of taking an arbitrary call.
+fn scoped_call_reference_index<'a>(
+    references: impl IntoIterator<Item = &'a RawReference>,
+) -> std::collections::HashMap<ScopedCallKey<'a>, Vec<&'a RawReference>> {
+    let mut calls: std::collections::HashMap<_, Vec<_>> = Default::default();
+    for reference in references {
+        if reference.kind == ReferenceKind::Call
+            && let Some(scope) = reference.scope
+        {
+            calls
+                .entry((
+                    reference.name.as_str(),
+                    reference.receiver.as_deref(),
+                    scope.position,
+                ))
+                .or_default()
+                .push(reference);
+        }
+    }
+    calls
+}
+
 /// Resolve a mixed-language repository using the language of each source file.
 /// The fallback preserves the single-language API for callers without a file map.
 pub fn resolve_references_with_file_languages(
@@ -104,8 +129,15 @@ pub fn resolve_references_with_file_languages(
             .copied()
             .unwrap_or(fallback_language)
     };
-    let graph =
+    let mut graph =
         build_import_graph_with_languages(files, fallback_language, file_languages, workspace_ctx);
+    if let Some(envs) = _type_envs {
+        for (file, env) in envs {
+            if language_for(file) == Language::Rust {
+                graph.register_rust_inline_type_imports(file, &env.rust_inline_type_imports);
+            }
+        }
+    }
 
     // Pre-sort symbols per file so find_enclosing_symbol's binary search invariant holds.
     // Tree-sitter guarantees sorted output in production, but callers (e.g. property tests)
@@ -167,6 +199,121 @@ pub fn resolve_references_with_file_languages(
         map
     };
 
+    // Scalar Rust factory results are seeded only after resolving the exact
+    // AST free-call reference to one target declaration. Sibling function names
+    // and the engine's line-global return map cannot donate a scoped type.
+    let mut scoped_envs = _type_envs.cloned();
+    if let (Some(original_envs), Some(derived)) = (_type_envs, scoped_envs.as_mut()) {
+        let mut seeds = Vec::new();
+        let returns_by_uid: std::collections::HashMap<_, _> = files
+            .iter()
+            .flat_map(|(file, symbols, _)| {
+                symbols
+                    .iter()
+                    .filter(|symbol| {
+                        matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method)
+                    })
+                    .map(move |symbol| {
+                        (
+                            symbol_uid(repo_uid, file, &symbol.name, symbol.start_line),
+                            (file, symbol),
+                        )
+                    })
+            })
+            .collect();
+        for ((file_path, _, references), sorted_syms) in files.iter().zip(&sorted_symbols_per_file)
+        {
+            if language_for(file_path) != Language::Rust {
+                continue;
+            }
+            let Some(env) = original_envs.get(file_path) else {
+                continue;
+            };
+            if env.call_assignments.is_empty() {
+                continue;
+            }
+            let local_bindings: Vec<_> = references
+                .iter()
+                .filter(|reference| reference.kind == ReferenceKind::LocalBinding)
+                .collect();
+            let calls_by_identity = scoped_call_reference_index(references);
+            for assignment in &env.call_assignments {
+                let Some(calls) = calls_by_identity.get(&(
+                    assignment.callee.as_str(),
+                    assignment.receiver.as_deref(),
+                    assignment.call_position,
+                )) else {
+                    continue;
+                };
+                if calls.len() != 1 {
+                    continue;
+                }
+                if assignment.receiver.is_none()
+                    && assignment.local_callee_exists
+                    && assignment.local_callee_line.is_none()
+                {
+                    continue;
+                }
+                let Some(edge) = resolve_single_reference(
+                    file_path,
+                    calls[0],
+                    &local_bindings,
+                    sorted_syms,
+                    &symbol_map,
+                    &extends_map,
+                    &graph,
+                    Language::Rust,
+                    repo_uid,
+                    _type_envs,
+                ) else {
+                    continue;
+                };
+                if !edge.target_uid.starts_with("sym:") {
+                    continue;
+                }
+                let exact_local = assignment
+                    .local_callee_line
+                    .map(|line| symbol_uid(repo_uid, file_path, &assignment.callee, line));
+                let target_uid = if assignment.receiver.is_none() {
+                    exact_local.as_ref().unwrap_or(&edge.target_uid)
+                } else {
+                    &edge.target_uid
+                };
+                let Some((target_file, target)) = returns_by_uid.get(target_uid).copied() else {
+                    continue;
+                };
+                let asynchronous = target
+                    .signature
+                    .split_whitespace()
+                    .any(|token| token == "async");
+                if assignment.awaited != asynchronous {
+                    continue;
+                }
+                let Some(binding) = original_envs
+                    .get(target_file)
+                    .and_then(|env| env.ast_return_type(&target.name, target.start_line))
+                else {
+                    continue;
+                };
+                seeds.push((
+                    file_path.clone(),
+                    assignment.clone(),
+                    target_file.clone(),
+                    binding.clone(),
+                ));
+            }
+        }
+        for (file, assignment, target_file, binding) in seeds {
+            if let Some(env) = derived.get_mut(&file) {
+                env.seed_scoped_return(&assignment, &target_file, &binding);
+            }
+        }
+        for env in derived.values_mut() {
+            env.propagate_scoped_aliases();
+        }
+    }
+    let type_envs = scoped_envs.as_ref().or(_type_envs);
+
     // ── Pass 2: Resolve non-import references in parallel per file ─────
     let ref_edges: Vec<ResolvedEdge> = files
         .par_iter()
@@ -182,10 +329,21 @@ pub fn resolve_references_with_file_languages(
             }
             let mut local_edges = Vec::new();
             let language = language_for(file_path);
-            let local_bindings: Vec<(&str, u32)> = references
+            let local_bindings: Vec<&RawReference> = references
                 .iter()
-                .filter(|reference| reference.kind == ReferenceKind::LocalBinding)
-                .map(|reference| (reference.name.as_str(), reference.start_line))
+                .filter(|reference| {
+                    reference.kind == ReferenceKind::LocalBinding
+                        && !graph.bindings_of(file_path).iter().any(|binding| {
+                            binding.local_name == reference.name
+                                && if let Some(scope) = reference.scope {
+                                    binding
+                                        .scope
+                                        .is_some_and(|import| import.position == scope.position)
+                                } else {
+                                    binding.start_line == reference.start_line
+                                }
+                        })
+                })
                 .collect();
             for reference in references {
                 if let Some(edge) = resolve_single_reference(
@@ -198,8 +356,23 @@ pub fn resolve_references_with_file_languages(
                     &graph,
                     language,
                     repo_uid,
-                    _type_envs,
+                    type_envs,
                 ) {
+                    if edge.target_uid.starts_with("sym:")
+                        && edge.evidence.iter().any(|evidence| {
+                            matches!(
+                                evidence.kind.as_str(),
+                                "import_alias"
+                                    | "import_resolved"
+                                    | "re_export"
+                                    | "reexport_resolved"
+                            )
+                        })
+                    {
+                        let mut import = edge.clone();
+                        import.edge_type = EdgeType::Imports;
+                        local_edges.push(import);
+                    }
                     local_edges.push(edge);
                 }
             }
@@ -209,189 +382,51 @@ pub fn resolve_references_with_file_languages(
 
     let mut edges: Vec<ResolvedEdge> = ref_edges;
 
-    // ── Pass 3: Create IMPORTS edges from the import graph ──────────────
-    //
-    // Two sub-passes:
-    //   3a) File-level IMPORTS edges: for every resolved import, create one
-    //       IMPORTS edge from the first symbol in the source file to the first
-    //       symbol in the target file. This is a file-level proxy that ensures
-    //       connectivity even when named-binding data is unavailable.
-    //   3b) Named-import IMPORTS edges (original logic): for each resolved
-    //       import, link the enclosing source symbol to all non-private symbols
-    //       in the target file. These are more precise when available.
-    //
-    // Both sub-passes are purely additive. Edges are deduplicated at the end.
-
-    // Build a file → symbols lookup for target file symbol access.
-    let file_symbols: std::collections::HashMap<&str, &Vec<RawSymbol>> = files
-        .iter()
-        .map(|(path, syms, _)| (path.as_str(), syms))
-        .collect();
-
-    // Build a file → sorted symbols lookup for find_enclosing_symbol in Pass 3b.
-    let file_sorted_symbols: std::collections::HashMap<&str, &Vec<&RawSymbol>> = files
-        .iter()
-        .zip(sorted_symbols_per_file.iter())
-        .map(|((path, _, _), sorted)| (path.as_str(), sorted))
-        .collect();
-
-    // Build a file → references lookup for import reference line matching.
-    let file_refs: std::collections::HashMap<&str, &Vec<RawReference>> = files
-        .iter()
-        .map(|(path, _, refs)| (path.as_str(), refs))
-        .collect();
-
-    // ── Pass 3a: File-level IMPORTS edges ─────────────────────────────
-    for (src_file, _specifier, tgt_file) in graph.all_resolved_imports() {
-        if let Some(filter) = resolve_only
-            && !filter.contains(src_file)
+    // A named Rust use inside a genuine owner is a precise dependency,
+    // including type-only uses. Module imports never fan out to all exports.
+    for ((file, _, references), sorted) in files.iter().zip(&sorted_symbols_per_file) {
+        if language_for(file) != Language::Rust
+            || resolve_only.is_some_and(|filter| !filter.contains(file))
         {
             continue;
         }
-        let src_sym = file_symbols.get(src_file).and_then(|syms| syms.first());
-        let tgt_sym = file_symbols.get(tgt_file).and_then(|syms| syms.first());
-
-        if let (Some(src), Some(tgt)) = (src_sym, tgt_sym) {
-            let source_uid = symbol_uid(repo_uid, src_file, &src.name, src.start_line);
-            let target_uid = symbol_uid(repo_uid, tgt_file, &tgt.name, tgt.start_line);
-            let confidence = confidence_score(MatchType::ImportResolved, language_for(src_file));
-            edges.push(ResolvedEdge {
-                source_uid,
-                target_uid,
-                edge_type: EdgeType::Imports,
-                confidence,
-                link_type: None,
-                evidence: vec![EdgeEvidence {
-                    kind: "structural".to_string(),
-                    weight: confidence,
-                    note: None,
-                }],
-            });
-        }
-    }
-
-    // ── Pass 3b: Named-import IMPORTS edges (original precision pass) ─
-    for (file_path, _symbols, _references) in files {
-        if let Some(filter) = resolve_only
-            && !filter.contains(file_path)
+        for reference in references
+            .iter()
+            .filter(|reference| reference.kind == ReferenceKind::Import)
         {
-            continue;
-        }
-        let imports = graph.imports_of(file_path);
-        if imports.is_empty() {
-            continue;
-        }
-
-        // A file with no symbols has nothing that could enclose an import, so
-        // skip it before doing any per-import work. The symbol list itself is
-        // no longer read here: since nw-103 this pass attributes an edge only
-        // to a genuine enclosing symbol, never to the file's first declaration.
-        if file_symbols
-            .get(file_path.as_str())
-            .is_none_or(|syms| syms.is_empty())
-        {
-            continue;
-        }
-
-        let source_sorted_syms: &[&RawSymbol] = match file_sorted_symbols.get(file_path.as_str()) {
-            Some(syms) if !syms.is_empty() => syms.as_slice(),
-            _ => continue,
-        };
-
-        let empty_refs = Vec::new();
-        let source_refs = file_refs
-            .get(file_path.as_str())
-            .copied()
-            .unwrap_or(&empty_refs);
-
-        for (specifier, target_file) in &imports {
-            // Find the import reference line to determine the enclosing source symbol.
-            let import_line = source_refs
-                .iter()
-                .find(|r| {
-                    matches!(
-                        r.kind,
-                        ReferenceKind::Import | ReferenceKind::Includes | ReferenceKind::Uses
-                    ) && r.name == *specifier
-                })
-                .map(|r| r.start_line);
-
-            // Attribute a named-import edge only when the import genuinely sits
-            // INSIDE a symbol — e.g. a dynamic `import()` in a function body.
-            //
-            // A top-level import has no enclosing symbol. Falling back to the
-            // file's first declaration (nw-103) made that arbitrary symbol look
-            // like the file's dependency hub: this pass then fans out to every
-            // non-private symbol in the target file, so a 3-reference,
-            // never-exported string constant acquired 830 out-edges and ranked
-            // #5 in a 158k-symbol graph. Pass 3a already emits a file-level
-            // proxy edge per import, so connectivity does not depend on this.
-            let source_sym = import_line
-                .and_then(|line| find_enclosing_symbol(source_sorted_syms, line).symbol());
-
-            let source_uid = match source_sym {
-                Some(sym) => symbol_uid(repo_uid, file_path, &sym.name, sym.start_line),
-                None => continue,
-            };
-
-            // Get all non-private symbols in the target file.
-            let target_symbols = match file_symbols.get(target_file.as_str()) {
-                Some(syms) => *syms,
-                None => continue,
-            };
-
-            let visible: Vec<&RawSymbol> = target_symbols
-                .iter()
-                .filter(|s| !matches!(s.visibility, Visibility::Private))
-                .collect();
-
-            if visible.is_empty() {
+            let Some(source) = find_enclosing_symbol(sorted, reference.start_line).symbol() else {
                 continue;
-            }
-
-            // nw-153: honour the import's named binding. A specifier that names
-            // one item -- `use crate::publication::ArtifactKind` -- must produce
-            // ONE edge to that item, not one edge per symbol in the target file.
-            //
-            // The fan-out made backup_artifact_contract, whose body contains a
-            // single `use`, an importer of all 64 symbols in publication.rs
-            // including rollback_current and compare_and_swap_current. That is
-            // why `impact rollback_current` surfaced unrelated backup code while
-            // missing its real callers.
-            //
-            // The bound name is the specifier's last path segment. Languages
-            // whose specifier names a MODULE rather than an item (JS `./helper`,
-            // Python `os.path`) will not match a symbol, and those keep the
-            // existing every-visible-symbol behaviour so connectivity is
-            // unchanged for them.
-            let bound_name = specifier
-                .rsplit([':', '/', '.'])
-                .find(|segment| !segment.is_empty());
-            let named: Option<&&RawSymbol> =
-                bound_name.and_then(|name| visible.iter().find(|candidate| candidate.name == name));
-
-            let exported: Vec<&RawSymbol> = match named {
-                Some(symbol) => vec![*symbol],
-                None => visible,
             };
-
-            let confidence = confidence_score(MatchType::ImportResolved, language_for(file_path));
-
-            for target_sym in &exported {
-                let target_uid = symbol_uid(
-                    repo_uid,
-                    target_file,
-                    &target_sym.name,
-                    target_sym.start_line,
-                );
+            let Some(name) = reference.name.rsplit("::").next() else {
+                continue;
+            };
+            for (specifier, target_file) in graph.imports_of(file) {
+                if specifier != reference.name {
+                    continue;
+                }
+                let Some(candidates) = symbol_map.get(name) else {
+                    continue;
+                };
+                let mut targets = candidates.iter().filter(|(path, symbol)| {
+                    *path == target_file
+                        && symbol.visibility != Visibility::Private
+                        && symbol.name == name
+                });
+                let Some((path, target)) = targets.next() else {
+                    continue;
+                };
+                if targets.next().is_some() {
+                    continue;
+                }
+                let confidence = confidence_score(MatchType::ImportResolved, Language::Rust);
                 edges.push(ResolvedEdge {
-                    source_uid: source_uid.clone(),
-                    target_uid,
+                    source_uid: symbol_uid(repo_uid, file, &source.name, source.start_line),
+                    target_uid: symbol_uid(repo_uid, path, &target.name, target.start_line),
                     edge_type: EdgeType::Imports,
                     confidence,
                     link_type: None,
                     evidence: vec![EdgeEvidence {
-                        kind: "structural".to_string(),
+                        kind: "structural".into(),
                         weight: confidence,
                         note: None,
                     }],
@@ -418,7 +453,7 @@ pub fn resolve_references_with_file_languages(
 fn resolve_single_reference(
     file_path: &str,
     reference: &RawReference,
-    local_bindings: &[(&str, u32)],
+    local_bindings: &[&RawReference],
     sorted_syms: &[&RawSymbol],
     symbol_map: &std::collections::HashMap<String, Vec<(&str, &RawSymbol)>>,
     extends_map: &std::collections::HashMap<String, Vec<String>>,
@@ -438,7 +473,8 @@ fn resolve_single_reference(
         | ReferenceKind::ImportAlias
         | ReferenceKind::PackageBinding
         | ReferenceKind::Uses
-        | ReferenceKind::LocalBinding => return None,
+        | ReferenceKind::LocalBinding
+        | ReferenceKind::ExportAlias => return None,
     };
 
     // nw-349 (1). The three cases are now distinguishable, and only two of them
@@ -460,7 +496,44 @@ fn resolve_single_reference(
 
     // nw-724: a parameter, let, or lambda binding is the target. Do not
     // continue on to a same-named function in this file or another.
-    if name_is_locally_bound(local_bindings, sorted_syms, reference) {
+    if reference.receiver.is_none()
+        && name_is_locally_bound(local_bindings, sorted_syms, reference, language)
+    {
+        return Some(unresolved_edge(source_uid, &reference.name, edge_type));
+    }
+
+    // A declared class field with an unknown value cannot borrow a type from
+    // an imported file sharing its spelling (`this.store` vs `store.ts`).
+    if edge_type == EdgeType::Calls
+        && matches!(language, Language::JavaScript | Language::TypeScript)
+        && let Some(field) = reference
+            .receiver
+            .as_deref()
+            .and_then(|receiver| receiver.strip_prefix("this."))
+        && let Some(owner) = source_sym.parent_name.as_deref()
+        && symbol_map.get(field).is_some_and(|symbols| {
+            let properties: Vec<_> = symbols
+                .iter()
+                .filter(|(file, symbol)| {
+                    *file == file_path
+                        && symbol.kind == SymbolKind::Property
+                        && symbol.parent_name.as_deref() == Some(owner)
+                })
+                .collect();
+            !properties.is_empty()
+                && properties
+                    .iter()
+                    .filter(|(_, symbol)| {
+                        symbol
+                            .type_info
+                            .as_ref()
+                            .and_then(|info| info.declared_type.as_ref())
+                            .is_some()
+                    })
+                    .count()
+                    != 1
+        })
+    {
         return Some(unresolved_edge(source_uid, &reference.name, edge_type));
     }
 
@@ -470,28 +543,151 @@ fn resolve_single_reference(
         && let Some(envs) = type_envs
         && let Some(env) = envs.get(file_path)
     {
-        let receiver_type = if receiver == "self" || receiver == "this" || receiver == "$this" {
-            env.lookup_self(reference.start_line)
-        } else if receiver.contains('.') {
-            let first = receiver.split('.').next().unwrap_or(receiver);
-            if first == "self" || first == "this" || first == "$this" {
-                env.lookup_self(reference.start_line)
-            } else {
-                env.lookup(first, reference.start_line)
-            }
+        // A direct `this.field` receiver can use that owning class's exact
+        // declared property type. A longer chain or unknown factory supplies
+        // no result-type evidence.
+        let field_binding = if matches!(language, Language::JavaScript | Language::TypeScript) {
+            receiver
+                .strip_prefix("this.")
+                .filter(|field| {
+                    !field.is_empty()
+                        && field
+                            .chars()
+                            .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '$')
+                })
+                .and_then(|field| {
+                    let owner = source_sym.parent_name.as_deref()?;
+                    let properties: Vec<_> = symbol_map
+                        .get(field)?
+                        .iter()
+                        .filter(|(file, symbol)| {
+                            *file == file_path
+                                && symbol.kind == SymbolKind::Property
+                                && symbol.parent_name.as_deref() == Some(owner)
+                                && symbol
+                                    .type_info
+                                    .as_ref()
+                                    .and_then(|info| info.declared_type.as_ref())
+                                    .is_some()
+                        })
+                        .collect();
+                    if properties.len() != 1 {
+                        return None;
+                    }
+                    let symbol = properties[0].1;
+                    Some(crate::type_extractors::TypeBinding {
+                        type_name: symbol.type_info.as_ref()?.declared_type.clone()?,
+                        line: symbol.start_line,
+                        confidence: 0.95,
+                        source: crate::type_extractors::BindingSource::Annotation,
+                    })
+                })
         } else {
-            env.lookup(receiver, reference.start_line)
+            None
+        };
+        let receiver_type = if field_binding.is_some() {
+            field_binding.as_ref()
+        } else if receiver == "self" || receiver == "this" || receiver == "$this" {
+            env.lookup_self(reference.start_line)
+        } else {
+            // A member or call chain has its own result type. The first
+            // segment's binding cannot establish the complete receiver's type.
+            if let Some(call_scope) = reference.scope {
+                if let Some(declaration) =
+                    active_lexical_binding(local_bindings, reference, receiver, language)
+                {
+                    env.lookup_declaration(receiver, declaration.scope?, call_scope.position)
+                } else if language == Language::Rust {
+                    let item_lines: Vec<_> = symbol_map
+                        .get(receiver)
+                        .into_iter()
+                        .flatten()
+                        .filter(|(file, symbol)| {
+                            *file == file_path && symbol.kind == SymbolKind::Constant
+                        })
+                        .map(|(_, symbol)| symbol.start_line)
+                        .collect();
+                    env.lookup_scoped_item(receiver, &item_lines, call_scope.position)
+                } else {
+                    None
+                }
+            } else {
+                env.lookup(receiver, reference.start_line)
+            }
         };
 
-        if let Some(binding) = receiver_type {
+        if let Some(binding) = receiver_type.filter(|binding| {
+            reference.scope.is_some()
+                || !name_is_locally_bound(local_bindings, sorted_syms, reference, language)
+                || binding.line >= source_sym.start_line
+        }) {
             let method_name = &reference.name;
             let type_name = &binding.type_name;
+            let scoped_origin_required = reference.scope.is_some()
+                && matches!(
+                    language,
+                    Language::Rust | Language::JavaScript | Language::TypeScript
+                );
+            let (origin_file, tagged_type) =
+                type_name.split_once('#').unwrap_or((file_path, type_name));
+            let (unqualified_type, _origin_line) = tagged_type
+                .split_once('#')
+                .map_or((tagged_type, binding.line), |(name, line)| {
+                    (name, line.parse().unwrap_or(binding.line))
+                });
+            let (unqualified_type, origin_position) = unqualified_type
+                .split_once('@')
+                .map_or((unqualified_type, None), |(name, position)| {
+                    (name, position.parse::<usize>().ok())
+                });
+            let constructor_shadowed = binding.source
+                == crate::type_extractors::BindingSource::Constructor
+                && matches!(language, Language::JavaScript | Language::TypeScript)
+                && active_lexical_binding(local_bindings, reference, unqualified_type, language)
+                    .is_some();
+            let origin = if constructor_shadowed {
+                None
+            } else {
+                typed_receiver_origin(
+                    origin_file,
+                    unqualified_type,
+                    reference,
+                    symbol_map,
+                    graph,
+                    language,
+                    type_envs.and_then(|envs| {
+                        let env = envs.get(origin_file)?;
+                        origin_position
+                            .and_then(|position| env.rust_type_origins.get(&position))
+                            .filter(|origin| origin.type_name == unqualified_type)
+                            .map(|origin| RustReceiverEvidence {
+                                origin,
+                                type_envs: envs,
+                            })
+                    }),
+                )
+            };
+            let direct: Vec<_> = symbol_map
+                .get(method_name.as_str())
+                .into_iter()
+                .flatten()
+                .filter(|(file, symbol)| {
+                    typed_member_accessible(file_path, file, source_sym, symbol, language, graph)
+                        && if let Some(origin) = &origin {
+                            method_belongs_to_origin(
+                                file, symbol, origin, graph, symbol_map, type_envs,
+                            )
+                        } else {
+                            !scoped_origin_required
+                                && symbol.parent_name.as_deref() == Some(unqualified_type)
+                        }
+                })
+                .collect();
 
-            // Direct match on the receiver type
-            if let Some(candidates) = symbol_map.get(method_name.as_str())
-                && let Some((candidate_file, sym)) = candidates
-                    .iter()
-                    .find(|(_, s)| s.parent_name.as_deref() == Some(type_name.as_str()))
+            // A typed receiver still needs one accessible target at its exact
+            // local/imported origin; duplicate class names are not evidence.
+            if direct.len() == 1
+                && let Some((candidate_file, sym)) = direct.first().copied()
             {
                 let target_uid = symbol_uid(repo_uid, candidate_file, &sym.name, sym.start_line);
                 let confidence = binding.confidence.min(0.95);
@@ -504,16 +700,29 @@ fn resolve_single_reference(
                     evidence: vec![EdgeEvidence {
                         kind: "type_aware".to_string(),
                         weight: confidence,
-                        note: Some(format!("{} -> {}", receiver, type_name)),
+                        note: Some(format!("{} -> {}", receiver, unqualified_type)),
                     }],
                 });
             }
 
             // MRO walk: check parent types via inheritance chain
+            let resolved_type = origin
+                .as_ref()
+                .map_or(unqualified_type, |origin| origin.name.as_str());
+            if (!scoped_origin_required || origin.is_some())
+                && symbol_map.get(resolved_type).is_none_or(|symbols| {
+                    symbols
+                        .iter()
+                        .filter(|(_, symbol)| {
+                            matches!(symbol.kind, SymbolKind::Class | SymbolKind::Enum)
+                        })
+                        .count()
+                        <= 1
+                })
             {
-                let mut current_types = vec![type_name.clone()];
+                let mut current_types = vec![resolved_type.to_string()];
                 let mut visited = std::collections::HashSet::new();
-                visited.insert(type_name.clone());
+                visited.insert(resolved_type.to_string());
                 let mut depth = 0u32;
 
                 while depth < 5 && !current_types.is_empty() {
@@ -526,10 +735,37 @@ fn resolve_single_reference(
                                 }
                                 visited.insert(parent.clone());
 
-                                if let Some(candidates) = symbol_map.get(method_name.as_str())
-                                    && let Some((cf, sym)) = candidates.iter().find(|(_, s)| {
-                                        s.parent_name.as_deref() == Some(parent.as_str())
+                                let parent_origin = typed_receiver_origin(
+                                    origin
+                                        .as_ref()
+                                        .map_or(file_path, |origin| origin.file.as_str()),
+                                    parent,
+                                    reference,
+                                    symbol_map,
+                                    graph,
+                                    language,
+                                    None,
+                                );
+                                let inherited: Vec<_> = symbol_map
+                                    .get(method_name.as_str())
+                                    .into_iter()
+                                    .flatten()
+                                    .filter(|(file, symbol)| {
+                                        typed_member_accessible(
+                                            file_path, file, source_sym, symbol, language, graph,
+                                        ) && if let Some(origin) = &parent_origin {
+                                            method_belongs_to_origin(
+                                                file, symbol, origin, graph, symbol_map, type_envs,
+                                            )
+                                        } else {
+                                            !scoped_origin_required
+                                                && symbol.parent_name.as_deref()
+                                                    == Some(parent.as_str())
+                                        }
                                     })
+                                    .collect();
+                                if inherited.len() == 1
+                                    && let Some((cf, sym)) = inherited.first().copied()
                                 {
                                     let target_uid =
                                         symbol_uid(repo_uid, cf, &sym.name, sym.start_line);
@@ -560,20 +796,118 @@ fn resolve_single_reference(
                     depth += 1;
                 }
             }
-            // Type was known but method not found on that type or ancestors.
-            // Fall through to name-based resolution.
+            if scoped_origin_required {
+                return Some(unresolved_edge(source_uid, &reference.name, edge_type));
+            }
+            // Older unscoped environments retain the existing lower tiers.
         }
     }
 
+    if name_is_locally_bound(local_bindings, sorted_syms, reference, language) {
+        return Some(unresolved_edge(source_uid, &reference.name, edge_type));
+    }
+
     let name = &reference.name;
+
+    let exact_rust_call = if language == Language::Rust && reference.receiver.is_none() {
+        type_envs
+            .and_then(|envs| envs.get(file_path))
+            .and_then(|env| {
+                env.call_assignments.iter().find(|assignment| {
+                    assignment.receiver.is_none()
+                        && assignment.callee == reference.name
+                        && reference
+                            .scope
+                            .is_some_and(|scope| scope.position == assignment.call_position)
+                })
+            })
+    } else {
+        None
+    };
+    if exact_rust_call.is_some_and(|assignment| {
+        assignment.local_callee_exists && assignment.local_callee_line.is_none()
+    }) {
+        return Some(unresolved_edge(source_uid, &reference.name, edge_type));
+    }
+
+    let rust_path_import_positions = if language == Language::Rust {
+        type_envs
+            .and_then(|envs| envs.get(file_path))
+            .and_then(|env| {
+                reference
+                    .scope
+                    .and_then(|scope| env.rust_path_imports.get(&scope.position))
+            })
+    } else {
+        None
+    };
+
+    // Aliased import (`use path::to::original as name;`): the binding records
+    // the original name and the file it was imported from.
+    let module_binding = rust_path_import_positions.and_then(|positions| {
+        graph.bindings_of(file_path).iter().find(|binding| {
+            binding.original_name == "*"
+                && reference.receiver.as_deref() == Some(binding.local_name.as_str())
+                && binding
+                    .scope
+                    .is_some_and(|scope| positions.contains(&scope.position))
+        })
+    });
+    let binding = module_binding.or_else(|| {
+        graph.bindings_of(file_path).iter().find(|binding| {
+            let owner = find_enclosing_symbol(sorted_syms, binding.start_line).symbol();
+            let in_scope =
+                if let (Some(binding_scope), Some(call_scope)) = (binding.scope, reference.scope) {
+                    binding_scope.start <= call_scope.position
+                        && call_scope.position < binding_scope.end
+                        && binding_scope.initialized_at <= call_scope.position
+                } else {
+                    owner.is_none_or(|owner| {
+                        owner.start_line == source_sym.start_line && owner.name == source_sym.name
+                    })
+                };
+            in_scope
+                && rust_path_import_positions.is_none_or(|positions| {
+                    language != Language::Rust
+                        || binding.original_name == "*"
+                        || binding
+                            .scope
+                            .is_some_and(|scope| positions.contains(&scope.position))
+                })
+                && exact_rust_call.is_none_or(|assignment| {
+                    assignment.local_callee_line.is_none()
+                        && binding.scope.is_some_and(|scope| {
+                            assignment.import_positions.contains(&scope.position)
+                        })
+                })
+                && if binding.original_name == "*" {
+                    reference.receiver.as_deref() == Some(binding.local_name.as_str())
+                } else {
+                    (binding.local_name == *name && reference.receiver.is_none())
+                        || reference.receiver.as_deref() == Some(binding.local_name.as_str())
+                }
+        })
+    });
+    if binding.is_some_and(|binding| binding.source_file.is_none()) {
+        return Some(unresolved_edge(source_uid, &reference.name, edge_type));
+    }
 
     // Priority 1: Same file. A local symbol shadows an import alias of the
     // same name, so this check runs on the reference's own name, before any
     // alias rewriting.
     if let Some(syms) = symbol_map.get(name.as_str())
-        && let Some((_, sym)) = syms
-            .iter()
-            .find(|(f, sym)| *f == file_path && candidate_matches(reference, file_path, f, sym))
+        && let Some((_, sym)) = syms.iter().find(|(f, sym)| {
+            *f == file_path
+                && !(language == Language::Rust
+                    && reference.receiver.is_some()
+                    && binding.is_some())
+                && exact_rust_call.is_none_or(|assignment| {
+                    assignment
+                        .local_callee_line
+                        .is_some_and(|line| sym.start_line == line)
+                })
+                && candidate_matches(reference, file_path, f, sym, language, graph)
+        })
     {
         let target_uid = symbol_uid(repo_uid, file_path, &sym.name, sym.start_line);
         let confidence = confidence_score(MatchType::SameFileExact, language);
@@ -591,32 +925,275 @@ fn resolve_single_reference(
         });
     }
 
-    // Aliased import (`use path::to::original as name;`): the binding records
-    // the original name and the file it was imported from.
-    let binding = graph
-        .bindings_of(file_path)
-        .into_iter()
-        .find(|b| b.local_name == *name);
-    if let Some(binding) = binding
-        && let Some(syms) = symbol_map.get(binding.original_name.as_str())
-        && let Some((_, sym)) = syms.iter().find(|(f, sym)| {
-            f == &binding.source_file && candidate_matches(reference, file_path, f, sym)
-        })
+    if exact_rust_call.is_some_and(|assignment| {
+        assignment.local_callee_line.is_none()
+            && (assignment.import_paths.is_empty()
+                || !assignment.import_positions.is_empty() && binding.is_none())
+    }) {
+        return Some(unresolved_edge(source_uid, name, edge_type));
+    }
+
+    if let Some(binding) = binding {
+        // A Rust module namespace is supported by an AST qualified call,
+        // never by a value receiver with the same spelling.
+        if language == Language::Rust
+            && binding.original_name == "*"
+            && type_envs.is_some_and(|envs| envs.contains_key(file_path))
+            && !rust_path_import_positions.is_some_and(|positions| {
+                binding
+                    .scope
+                    .is_some_and(|scope| positions.contains(&scope.position))
+            })
+        {
+            return Some(unresolved_edge(source_uid, name, edge_type));
+        }
+        let original = if binding.original_name == "*" {
+            name.as_str()
+        } else {
+            binding.original_name.as_str()
+        };
+        let source_file = binding
+            .source_file
+            .as_deref()
+            .expect("unresolved binding handled above");
+        let exact_exports = matches!(language, Language::JavaScript | Language::TypeScript);
+        // A Rust type path resolves through the same bounded named type route
+        // as a typed value. Keep the terminal declaration's byte identity so
+        // inline types and re-exports cannot donate a same-named hidden impl.
+        let mut rust_parent_member_origin = false;
+        let rust_member_origin = if language == Language::Rust
+            && binding.original_name != "*"
+            && reference.receiver.is_some()
+            && rust_path_import_positions.is_some()
+        {
+            type_envs.and_then(|envs| {
+                let direct_parent = rust_direct_parent_type_origin(
+                    file_path,
+                    source_file,
+                    original,
+                    binding.rust_inline_modules.as_deref()?,
+                    symbol_map,
+                    graph,
+                    envs,
+                );
+                rust_parent_member_origin = direct_parent.is_some();
+                direct_parent.or_else(|| {
+                    rust_public_type_origin(
+                        source_file,
+                        original,
+                        binding.rust_inline_modules.as_deref()?,
+                        symbol_map,
+                        graph,
+                        envs,
+                    )
+                })
+            })
+        } else {
+            None
+        };
+        let (target_file, original, depth, literal_method_line) = if let Some(origin) =
+            &rust_member_origin
+        {
+            (origin.file.as_str(), origin.name.as_str(), 0, None)
+        } else if exact_exports {
+            let Some(target) = graph.exported_target_with_declaration(source_file, original) else {
+                return Some(unresolved_edge(source_uid, name, edge_type));
+            };
+            target
+        } else {
+            (source_file, original, 0, None)
+        };
+        let member_parent = if binding.original_name != "*" && reference.receiver.is_some() {
+            Some(original)
+        } else {
+            None
+        };
+        let receiver_declarations: Vec<_> = symbol_map
+            .get(original)
+            .into_iter()
+            .flatten()
+            .filter(|(file, symbol)| *file == target_file && symbol.parent_name.is_none())
+            .collect();
+        let member_receiver = if let Some(origin) = &rust_member_origin {
+            Some((origin.name.as_str(), true))
+        } else if member_parent.is_some() && receiver_declarations.len() == 1 {
+            let symbol = receiver_declarations[0].1;
+            if symbol.kind == SymbolKind::Class {
+                Some((original, true))
+            } else {
+                symbol
+                    .type_info
+                    .as_ref()
+                    .and_then(|info| info.declared_type.as_deref())
+                    .and_then(|receiver_type| {
+                        if receiver_type == "object" {
+                            Some((original, false))
+                        } else if symbol_map.get(receiver_type).is_some_and(|types| {
+                            types
+                                .iter()
+                                .filter(|(file, symbol)| {
+                                    *file == target_file && symbol.kind == SymbolKind::Class
+                                })
+                                .count()
+                                == 1
+                        }) {
+                            Some((receiver_type, false))
+                        } else {
+                            None
+                        }
+                    })
+            }
+        } else {
+            None
+        };
+        if member_parent.is_some() && member_receiver.is_none() {
+            return Some(unresolved_edge(source_uid, name, edge_type));
+        }
+        let target_name = member_parent.map_or(original, |_| name.as_str());
+        if let Some(symbols) = symbol_map.get(target_name) {
+            let explicit_private = language == Language::Python
+                || language == Language::Rust
+                    && (graph.resolves_parent(file_path, target_file)
+                        || rust_parent_member_origin && file_path == target_file);
+            let targets: Vec<_> = symbols
+                .iter()
+                .filter(|(file, symbol)| {
+                    *file == target_file
+                        && (language != Language::Rust
+                            || binding.original_name != "*"
+                            || symbol.parent_name.is_none() && symbol.scope_chain.is_none())
+                        && if let Some(line) = literal_method_line {
+                            symbol.start_line == line
+                                && symbol.kind == SymbolKind::Method
+                                && symbol.parent_name.as_deref() == Some("module.exports")
+                        } else {
+                            !exact_exports
+                                || member_receiver.is_some()
+                                || symbol.parent_name.is_none()
+                        }
+                        && (symbol.visibility != Visibility::Private
+                            || explicit_private
+                            || member_receiver.is_some_and(|(_, class)| !class))
+                        && member_receiver.is_none_or(|(parent, class)| {
+                            let prefix = symbol.signature.split('(').next().unwrap_or("");
+                            symbol.kind == SymbolKind::Method
+                                && symbol.parent_name.as_deref() == Some(parent)
+                                && !prefix.split_whitespace().rev().skip(1).any(|token| {
+                                    matches!(token, "private" | "protected" | "get" | "set")
+                                })
+                                && !symbol.name.starts_with('#')
+                                // Python class attributes expose functions,
+                                // staticmethods and classmethods alike. The
+                                // exact imported class supplies receiver evidence.
+                                && (language == Language::Python
+                                    // Rust has no `static` function modifier.
+                                    // A qualified exact type also permits
+                                    // explicit-self UFCS: Type::method(&value).
+                                    || language == Language::Rust
+                                        && class
+                                        && rust_member_origin.as_ref().is_some_and(|origin| {
+                                            method_belongs_to_origin(
+                                                file, symbol, origin, graph,
+                                                symbol_map, type_envs,
+                                            )
+                                        })
+                                    || prefix
+                                        .split_whitespace()
+                                        .rev()
+                                        .skip(1)
+                                        .any(|token| token == "static")
+                                        == class)
+                        })
+                        && candidate_matches(
+                            &RawReference {
+                                name: target_name.into(),
+                                receiver: None,
+                                ..reference.clone()
+                            },
+                            if explicit_private || member_receiver.is_some_and(|(_, class)| !class)
+                            {
+                                target_file
+                            } else {
+                                file_path
+                            },
+                            file,
+                            symbol,
+                            language,
+                            graph,
+                        )
+                })
+                .collect();
+            let selected = if targets.len() == 1 {
+                targets.first().copied()
+            } else if language == Language::TypeScript
+                && targets.iter().all(|(_, symbol)| {
+                    symbol.kind == SymbolKind::Function && symbol.parent_name.is_none()
+                })
+            {
+                let implementations: Vec<_> = targets
+                    .iter()
+                    .copied()
+                    .filter(|(_, symbol)| {
+                        symbol.kind == SymbolKind::Function
+                            && !symbol.signature.trim_end().ends_with(';')
+                    })
+                    .collect();
+                if implementations.len() == 1 {
+                    implementations.first().copied()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some((file, symbol)) = selected {
+                if targets.len() > 1 && language != Language::TypeScript {
+                    return Some(unresolved_edge(source_uid, name, edge_type));
+                }
+                {
+                    let confidence = confidence_score(
+                        if depth == 0 {
+                            MatchType::ImportResolved
+                        } else {
+                            MatchType::ReExportResolved
+                        },
+                        language,
+                    );
+                    return Some(ResolvedEdge {
+                        source_uid,
+                        target_uid: symbol_uid(repo_uid, file, &symbol.name, symbol.start_line),
+                        edge_type,
+                        confidence,
+                        link_type: None,
+                        evidence: vec![EdgeEvidence {
+                            kind: if depth == 0 {
+                                "import_alias"
+                            } else {
+                                "reexport_resolved"
+                            }
+                            .into(),
+                            weight: confidence,
+                            note: Some(format!("{} -> {}", binding.local_name, original)),
+                        }],
+                    });
+                }
+            }
+            if symbols.iter().any(|(file, symbol)| {
+                *file == target_file && symbol.visibility == Visibility::Private
+            }) {
+                return Some(unresolved_edge(source_uid, name, edge_type));
+            }
+        }
+        if exact_exports {
+            return Some(unresolved_edge(source_uid, name, edge_type));
+        }
+    }
+
+    if matches!(language, Language::JavaScript | Language::TypeScript)
+        && !graph.imports_of(file_path).is_empty()
+        && binding.is_none()
     {
-        let target_uid = symbol_uid(repo_uid, &binding.source_file, &sym.name, sym.start_line);
-        let confidence = confidence_score(MatchType::ImportResolved, language);
-        return Some(ResolvedEdge {
-            source_uid,
-            target_uid,
-            edge_type,
-            confidence,
-            link_type: None,
-            evidence: vec![EdgeEvidence {
-                kind: "import_alias".to_string(),
-                weight: confidence,
-                note: Some(format!("{} -> {}", name, binding.original_name)),
-            }],
-        });
+        return Some(unresolved_edge(source_uid, name, edge_type));
     }
 
     // Fall back to resolving the original name through the normal priority
@@ -651,7 +1228,7 @@ fn resolve_single_reference(
         let mut qualified: Vec<_> = syms
             .iter()
             .filter(|(candidate_file, sym)| {
-                candidate_matches(reference, file_path, candidate_file, sym)
+                candidate_matches(reference, file_path, candidate_file, sym, language, graph)
                     && candidate_file
                         .rsplit('/')
                         .next()
@@ -690,12 +1267,37 @@ fn resolve_single_reference(
     // type alias, or macro invocation.
 
     // Priority 2: Direct imports
-    let mut imports = graph.imports_of(file_path);
+    let mut imports = if let Some(binding) = binding {
+        vec![(
+            binding.local_name.clone(),
+            binding.source_file.clone().expect("resolved binding"),
+        )]
+    } else {
+        graph
+            .imports_of(file_path)
+            .into_iter()
+            .filter(|(specifier, _)| {
+                exact_rust_call.is_none_or(|assignment| assignment.import_paths.contains(specifier))
+            })
+            .collect()
+    };
     imports.sort_by(|(_, a), (_, b)| a.cmp(b));
     for (_, imported_file) in &imports {
         if let Some(syms) = &candidates
             && let Some((_, sym)) = syms.iter().find(|(f, sym)| {
-                f == imported_file && candidate_matches(reference, file_path, f, sym)
+                f == imported_file
+                    && candidate_matches(
+                        reference,
+                        if language == Language::Rust && graph.resolves_parent(file_path, f) {
+                            f
+                        } else {
+                            file_path
+                        },
+                        f,
+                        sym,
+                        language,
+                        graph,
+                    )
             })
         {
             let target_uid = symbol_uid(repo_uid, imported_file, &sym.name, sym.start_line);
@@ -743,7 +1345,7 @@ fn resolve_single_reference(
             if let Some(syms) = &candidates
                 && let Some((_, sym)) = syms.iter().find(|(f, sym)| {
                     *f == transitive_file.as_str()
-                        && candidate_matches(reference, file_path, f, sym)
+                        && candidate_matches(reference, file_path, f, sym, language, graph)
                 })
             {
                 let target_uid = symbol_uid(repo_uid, transitive_file, &sym.name, sym.start_line);
@@ -768,6 +1370,10 @@ fn resolve_single_reference(
         frontier = next_frontier;
     }
 
+    if binding.is_some() {
+        return Some(unresolved_edge(source_uid, name, edge_type));
+    }
+
     // Priority 4: Same package/directory
     //
     // nw-150: for a METHOD call this fallback invents edges. `knex.where(..)`
@@ -790,7 +1396,7 @@ fn resolve_single_reference(
                 *candidate_file != file_path && parent_dir(candidate_file) == same_dir
             })
             .filter(|(candidate_file, sym)| {
-                candidate_matches(reference, file_path, candidate_file, sym)
+                candidate_matches(reference, file_path, candidate_file, sym, language, graph)
             })
             .collect();
         same_pkg.sort_by_key(|(path, _)| *path);
@@ -825,12 +1431,423 @@ fn resolve_single_reference(
 /// `Err(...)` to `type Err = String`. A method call (`items.len()`) does not
 /// name a free function in a file the caller happens to import. A field
 /// access may still name a field in the same file; it may not name a function.
+struct TypedReceiverOrigin {
+    file: String,
+    name: String,
+    rust_class_position: Option<usize>,
+}
+
+struct RustReceiverEvidence<'a> {
+    origin: &'a nestweaver_parser::parse::ScopedRustTypeOrigin,
+    type_envs: &'a std::collections::HashMap<String, TypeEnvironment>,
+}
+
+fn rust_module_type_position(
+    file: &str,
+    name: &str,
+    modules: &[String],
+    line: u32,
+    type_envs: &std::collections::HashMap<String, TypeEnvironment>,
+) -> Option<usize> {
+    let declarations = type_envs
+        .get(file)?
+        .rust_module_types
+        .get(&(name.into(), modules.to_vec()))?;
+    let mut positions = declarations
+        .iter()
+        .filter(|declaration| declaration.line == line)
+        .map(|declaration| declaration.position);
+    let position = positions.next()?;
+    positions.next().is_none().then_some(position)
+}
+
+/// A direct root parent type and its methods are visible to child modules.
+/// This never traverses a barrel or admits another inline module's private type.
+fn rust_direct_parent_type_origin(
+    source_file: &str,
+    file: &str,
+    name: &str,
+    modules: &[String],
+    symbol_map: &std::collections::HashMap<String, Vec<(&str, &RawSymbol)>>,
+    graph: &ImportGraph,
+    type_envs: &std::collections::HashMap<String, TypeEnvironment>,
+) -> Option<TypedReceiverOrigin> {
+    if !modules.is_empty() || !(source_file == file || graph.resolves_parent(source_file, file)) {
+        return None;
+    }
+    let declarations: Vec<_> = symbol_map
+        .get(name)
+        .into_iter()
+        .flatten()
+        .filter(|(owner_file, symbol)| {
+            *owner_file == file
+                && matches!(symbol.kind, SymbolKind::Class | SymbolKind::Enum)
+                && symbol.parent_name.is_none()
+                && symbol.scope_chain.is_none()
+                && rust_module_type_position(file, name, &[], symbol.start_line, type_envs)
+                    .is_some()
+        })
+        .collect();
+    if declarations.len() != 1 {
+        return None;
+    }
+    let position =
+        rust_module_type_position(file, name, &[], declarations[0].1.start_line, type_envs)?;
+    Some(TypedReceiverOrigin {
+        file: file.into(),
+        name: name.into(),
+        rust_class_position: Some(position),
+    })
+}
+
+/// Follow a unique public named type route, never a file's unrelated imports.
+fn rust_public_type_origin(
+    file: &str,
+    name: &str,
+    modules: &[String],
+    symbol_map: &std::collections::HashMap<String, Vec<(&str, &RawSymbol)>>,
+    graph: &ImportGraph,
+    type_envs: &std::collections::HashMap<String, TypeEnvironment>,
+) -> Option<TypedReceiverOrigin> {
+    let mut file = file.to_string();
+    let mut name = name.to_string();
+    let mut modules = modules.to_vec();
+    let mut visited = std::collections::HashSet::new();
+    for depth in 0..=3 {
+        if !visited.insert((file.clone(), name.clone(), modules.clone())) {
+            return None;
+        }
+        let module_path = modules.join("::");
+        let declarations: Vec<_> = symbol_map
+            .get(&name)
+            .into_iter()
+            .flatten()
+            .filter(|(owner, symbol)| {
+                *owner == file
+                    && matches!(symbol.kind, SymbolKind::Class | SymbolKind::Enum)
+                    && symbol.parent_name.is_none()
+                    && symbol.scope_chain.as_deref()
+                        == if modules.is_empty() {
+                            None
+                        } else {
+                            Some(module_path.as_str())
+                        }
+                    && rust_module_type_position(
+                        &file,
+                        &name,
+                        &modules,
+                        symbol.start_line,
+                        type_envs,
+                    )
+                    .is_some()
+            })
+            .collect();
+        if !declarations.is_empty() {
+            if declarations.len() != 1 || declarations[0].1.visibility == Visibility::Private {
+                return None;
+            }
+            let position = rust_module_type_position(
+                &file,
+                &name,
+                &modules,
+                declarations[0].1.start_line,
+                type_envs,
+            )?;
+            return Some(TypedReceiverOrigin {
+                file,
+                name,
+                rust_class_position: Some(position),
+            });
+        }
+        if depth == 3 || !modules.is_empty() {
+            return None;
+        }
+        let public_uses = &type_envs.get(&file)?.rust_public_root_uses;
+        let bindings: Vec<_> = graph
+            .bindings_of(&file)
+            .iter()
+            .filter(|binding| {
+                binding.local_name == name
+                    && binding.original_name != "*"
+                    && binding
+                        .scope
+                        .is_some_and(|scope| public_uses.contains(&scope.position))
+            })
+            .collect();
+        if bindings.len() != 1 {
+            return None;
+        }
+        let binding = bindings[0];
+        modules = binding.rust_inline_modules.as_ref()?.clone();
+        file = binding.source_file.as_ref()?.clone();
+        name = binding.original_name.clone();
+    }
+    None
+}
+
+fn typed_receiver_origin(
+    source_file: &str,
+    type_name: &str,
+    reference: &RawReference,
+    symbol_map: &std::collections::HashMap<String, Vec<(&str, &RawSymbol)>>,
+    graph: &ImportGraph,
+    language: Language,
+    rust_origin: Option<RustReceiverEvidence<'_>>,
+) -> Option<TypedReceiverOrigin> {
+    if language == Language::Rust
+        && let Some(RustReceiverEvidence { origin, type_envs }) = rust_origin
+    {
+        if origin.ambiguous {
+            return None;
+        }
+        if let Some(line) = origin.local_line {
+            return symbol_map
+                .get(type_name)?
+                .iter()
+                .find(|(file, symbol)| {
+                    *file == source_file
+                        && symbol.start_line == line
+                        && matches!(symbol.kind, SymbolKind::Class | SymbolKind::Enum)
+                })
+                .map(|_| TypedReceiverOrigin {
+                    file: source_file.into(),
+                    name: type_name.into(),
+                    rust_class_position: origin.local_position,
+                });
+        }
+        let imports = graph.imports_of(source_file);
+        if origin
+            .named_imports
+            .iter()
+            .any(|path| !imports.iter().any(|(specifier, _)| specifier == path))
+        {
+            return None;
+        }
+        let selected_paths = if origin.named_imports.is_empty() {
+            &origin.imports
+        } else {
+            &origin.named_imports
+        };
+        // Named aliases retain their original declaration spelling. Unresolved
+        // exact imports cannot be rescued by another resolved glob.
+        let named: Vec<_> = graph
+            .bindings_of(source_file)
+            .iter()
+            .filter(|binding| {
+                binding.local_name == type_name
+                    && binding.scope.is_some_and(|scope| {
+                        origin.named_import_positions.contains(&scope.position)
+                    })
+                    && imports.iter().any(|(specifier, file)| {
+                        selected_paths.contains(specifier)
+                            && binding.source_file.as_deref() == Some(file.as_str())
+                    })
+            })
+            .collect();
+        if !origin.named_imports.is_empty() && named.len() != 1 {
+            return None;
+        }
+        let mut candidates = Vec::new();
+        let mut seen_files = std::collections::HashSet::new();
+        for (_specifier, file) in imports.iter().filter(|(specifier, file)| {
+            selected_paths.contains(specifier)
+                && (named.is_empty()
+                    || named
+                        .iter()
+                        .any(|binding| binding.source_file.as_deref() == Some(file.as_str())))
+        }) {
+            if !seen_files.insert(file) {
+                continue;
+            }
+            let name = named
+                .iter()
+                .find(|binding| binding.source_file.as_deref() == Some(file.as_str()))
+                .map_or(type_name, |binding| binding.original_name.as_str());
+            let modules = named
+                .iter()
+                .find(|binding| binding.source_file.as_deref() == Some(file.as_str()))
+                .map(|binding| binding.rust_inline_modules.as_deref());
+            let Some(modules) = modules.unwrap_or(Some(&[])) else {
+                continue;
+            };
+            if let Some(candidate) =
+                rust_public_type_origin(file, name, modules, symbol_map, graph, type_envs)
+            {
+                candidates.push(candidate);
+            } else if (source_file != file || !named.is_empty())
+                && let Some(candidate) = rust_direct_parent_type_origin(
+                    source_file,
+                    file,
+                    name,
+                    modules,
+                    symbol_map,
+                    graph,
+                    type_envs,
+                )
+            {
+                // Preserve the existing cross-file parent route. Newly admitted
+                // same-file routes must carry an exact named import declaration.
+                candidates.push(candidate);
+            }
+        }
+        return (candidates.len() == 1).then(|| candidates.remove(0));
+    }
+    let local: Vec<_> = symbol_map
+        .get(type_name)
+        .into_iter()
+        .flatten()
+        .filter(|(file, symbol)| {
+            *file == source_file && matches!(symbol.kind, SymbolKind::Class | SymbolKind::Enum)
+        })
+        .collect();
+    if local.len() == 1 {
+        return Some(TypedReceiverOrigin {
+            file: source_file.into(),
+            name: type_name.into(),
+            rust_class_position: None,
+        });
+    }
+    if !local.is_empty() {
+        return None;
+    }
+    let imports: Vec<_> = graph
+        .bindings_of(source_file)
+        .iter()
+        .filter(|binding| {
+            binding.local_name == type_name
+                && binding.original_name != "*"
+                && binding.scope.is_none_or(|scope| {
+                    reference.scope.is_some_and(|call| {
+                        scope.start <= call.position
+                            && call.position < scope.end
+                            && scope.initialized_at <= call.position
+                    })
+                })
+        })
+        .collect();
+    if imports.len() == 1 {
+        let binding = imports[0];
+        let file = binding.source_file.as_deref()?;
+        let (file, name, _) = if matches!(language, Language::JavaScript | Language::TypeScript) {
+            graph.exported_target(file, &binding.original_name)?
+        } else {
+            (file, binding.original_name.as_str(), 0)
+        };
+        let declarations = symbol_map
+            .get(name)?
+            .iter()
+            .filter(|(candidate, symbol)| {
+                *candidate == file && matches!(symbol.kind, SymbolKind::Class | SymbolKind::Enum)
+            })
+            .count();
+        return (declarations == 1).then(|| TypedReceiverOrigin {
+            file: file.into(),
+            name: name.into(),
+            rust_class_position: None,
+        });
+    }
+    if !imports.is_empty() {
+        return None;
+    }
+    // Resolved globs may expose a class even without a named alias record.
+    let imports = graph.imports_of(source_file);
+    let reachable: Vec<_> = symbol_map
+        .get(type_name)
+        .into_iter()
+        .flatten()
+        .filter(|(file, symbol)| {
+            matches!(symbol.kind, SymbolKind::Class | SymbolKind::Enum)
+                && imports.iter().any(|(_, target)| target == file)
+                && (symbol.visibility != Visibility::Private
+                    || language == Language::Rust && graph.resolves_parent(source_file, file))
+        })
+        .collect();
+    (reachable.len() == 1).then(|| TypedReceiverOrigin {
+        file: reachable[0].0.into(),
+        name: type_name.into(),
+        rust_class_position: None,
+    })
+}
+
+fn method_belongs_to_origin(
+    file: &str,
+    symbol: &RawSymbol,
+    origin: &TypedReceiverOrigin,
+    graph: &ImportGraph,
+    symbol_map: &std::collections::HashMap<String, Vec<(&str, &RawSymbol)>>,
+    type_envs: Option<&std::collections::HashMap<String, TypeEnvironment>>,
+) -> bool {
+    symbol.parent_name.as_deref() == Some(origin.name.as_str())
+        && (file == origin.file
+            && origin.rust_class_position.is_none_or(|position| {
+                let owners = type_envs.and_then(|envs| envs.get(file)).and_then(|env| {
+                    env.rust_method_owners
+                        .get(&(symbol.name.clone(), symbol.start_line))
+                });
+                owners.is_some_and(|owners| owners.len() == 1 && owners[0] == position)
+            })
+            || !symbol_map
+                .get(&origin.name)
+                .into_iter()
+                .flatten()
+                .any(|(owner_file, owner)| {
+                    *owner_file == file
+                        && matches!(owner.kind, SymbolKind::Class | SymbolKind::Enum)
+                })
+                && graph.bindings_of(file).iter().any(|binding| {
+                    binding.local_name == origin.name
+                        && binding.original_name == origin.name
+                        && binding.source_file.as_deref() == Some(origin.file.as_str())
+                }))
+}
+
+fn typed_member_accessible(
+    source_file: &str,
+    target_file: &str,
+    source: &RawSymbol,
+    target: &RawSymbol,
+    language: Language,
+    graph: &ImportGraph,
+) -> bool {
+    if target.kind != SymbolKind::Method {
+        return false;
+    }
+    let prefix = target.signature.split('(').next().unwrap_or("");
+    if prefix
+        .split_whitespace()
+        .rev()
+        .skip(1)
+        .any(|token| matches!(token, "private" | "protected"))
+        || target.name.starts_with('#')
+    {
+        return source_file == target_file
+            && source.parent_name.is_some()
+            && source.parent_name == target.parent_name;
+    }
+    target.visibility != Visibility::Private
+        || source_file == target_file
+        || (language == Language::Go
+            && parent_dir(source_file) == parent_dir(target_file)
+            && graph.same_go_package(source_file, target_file))
+        || (language == Language::Rust && graph.resolves_parent(source_file, target_file))
+}
+
 fn candidate_matches(
     reference: &RawReference,
     source_file: &str,
     candidate_file: &str,
     sym: &RawSymbol,
+    language: Language,
+    graph: &ImportGraph,
 ) -> bool {
+    if source_file != candidate_file
+        && sym.visibility == Visibility::Private
+        && !(language == Language::Go
+            && parent_dir(source_file) == parent_dir(candidate_file)
+            && graph.same_go_package(source_file, candidate_file))
+    {
+        return false;
+    }
     match reference.kind {
         ReferenceKind::Macro => {
             if !is_macro_symbol(sym) {
@@ -903,23 +1920,87 @@ fn path_denotes(candidate_file: &str, sym: &RawSymbol, qualifier: &str) -> bool 
 /// A local binding shadows `reference` when it sits in the same enclosing
 /// symbol at or before the use, and it is not the declaration of a graph
 /// symbol of that name (a `const len = ...` that IS the symbol).
+fn active_lexical_binding<'a>(
+    bindings: &[&'a RawReference],
+    reference: &RawReference,
+    name: &str,
+    language: Language,
+) -> Option<&'a RawReference> {
+    let at = reference.scope?.position;
+    bindings
+        .iter()
+        .copied()
+        .filter(|binding| {
+            binding.name == name
+                && binding.scope.is_some_and(|scope| {
+                    scope.start <= at
+                        && at < scope.end
+                        && (language != Language::Rust || scope.initialized_at <= at)
+                })
+        })
+        .min_by_key(|binding| {
+            let scope = binding.scope.expect("filtered scoped binding");
+            (
+                scope.end - scope.start,
+                scope.hoisted_var && scope.position > at,
+                std::cmp::Reverse(if scope.hoisted_var && scope.position > at {
+                    0
+                } else {
+                    scope.position
+                }),
+            )
+        })
+}
+
 fn name_is_locally_bound(
-    bindings: &[(&str, u32)],
+    bindings: &[&RawReference],
     sorted_syms: &[&RawSymbol],
     reference: &RawReference,
+    language: Language,
 ) -> bool {
+    if reference.scope.is_some() {
+        let name = reference
+            .receiver
+            .as_deref()
+            .and_then(|receiver| receiver.split('.').next())
+            .unwrap_or(&reference.name);
+        return active_lexical_binding(bindings, reference, name, language).is_some_and(
+            |binding| {
+                !binding.scope.is_some_and(|scope| {
+                    scope.initialized_at > scope.position
+                        && reference.scope.is_some_and(|call| {
+                            call.position >= scope.initialized_at
+                                // A nested function body may close over a
+                                // later callable declaration in its outer scope.
+                                // A direct use in the declaration's own body
+                                // retains the temporal-dead-zone guard.
+                                || call.start > scope.start && call.end <= scope.end
+                        })
+                        && sorted_syms.iter().any(|symbol| {
+                            symbol.name == reference.name && symbol.start_line == binding.start_line
+                        })
+                })
+            },
+        );
+    }
     let enclosing = match find_enclosing_symbol(sorted_syms, reference.start_line) {
         Enclosing::Exact(symbol) | Enclosing::Degenerate(symbol) => symbol,
         Enclosing::ModuleScope => return false,
     };
-    bindings.iter().any(|(name, line)| {
-        *name == reference.name
-            && *line <= reference.start_line
-            && *line >= enclosing.start_line
-            && *line <= enclosing.end_line
+    bindings.iter().any(|binding| {
+        let name = binding.name.as_str();
+        let line = binding.start_line;
+        (name == reference.name
+            || reference
+                .receiver
+                .as_deref()
+                .is_some_and(|receiver| receiver.split('.').next() == Some(name)))
+            && line <= reference.start_line
+            && line >= enclosing.start_line
+            && line <= enclosing.end_line
             && !sorted_syms
                 .iter()
-                .any(|symbol| symbol.name == reference.name && symbol.start_line == *line)
+                .any(|symbol| symbol.name == reference.name && symbol.start_line == line)
     })
 }
 
@@ -1009,7 +2090,7 @@ fn receiver_denotes(candidate_file: &str, sym: &RawSymbol, receiver: Option<&str
         .rsplit('/')
         .next()
         .and_then(|base| base.split('.').next());
-    if stem == Some(denoted) {
+    if stem == Some(denoted) && (!candidate_file.ends_with(".swift") || sym.parent_name.is_none()) {
         return true;
     }
     sym.parent_name.as_deref() == Some(denoted)
@@ -1172,11 +2253,93 @@ mod tests {
 
     fn make_ref(name: &str, kind: ReferenceKind, line: u32) -> RawReference {
         RawReference {
+            scope: None,
             name: name.to_string(),
             kind,
             start_line: line,
             context: String::new(),
             receiver: None,
+        }
+    }
+
+    #[test]
+    fn scoped_call_index_reads_each_reference_once_and_preserves_ambiguity() {
+        use nestweaver_parser::LexicalScope;
+        let scope = |position| LexicalScope {
+            position,
+            start: 0,
+            end: 10000,
+            initialized_at: 0,
+            hoisted_var: false,
+        };
+        let mut references: Vec<_> = (0..2000)
+            .map(|i| {
+                let mut reference = make_ref("other", ReferenceKind::Call, 1);
+                reference.scope = Some(scope(i));
+                reference
+            })
+            .collect();
+        let mut call = make_ref("factory", ReferenceKind::Call, 2);
+        call.scope = Some(scope(3000));
+        references.push(call.clone());
+        references.push(call.clone());
+        call.receiver = Some("value".into());
+        references.push(call.clone());
+        call.scope = Some(scope(3001));
+        references.push(call.clone());
+        call.kind = ReferenceKind::LocalBinding;
+        references.push(call.clone());
+        call.kind = ReferenceKind::Call;
+        call.scope = None;
+        references.push(call);
+        let reads = std::cell::Cell::new(0);
+        let index = scoped_call_reference_index(references.iter().inspect(|_| {
+            reads.set(reads.get() + 1);
+        }));
+        assert_eq!(reads.get(), references.len());
+        for _ in 0..32 {
+            assert_eq!(
+                index.get(&("factory", None, 3000)).unwrap().len(),
+                2,
+                "duplicate exact call references must stay ambiguous"
+            );
+            assert_eq!(
+                index.get(&("factory", Some("value"), 3000)).unwrap().len(),
+                1
+            );
+            assert_eq!(
+                index.get(&("factory", Some("value"), 3001)).unwrap().len(),
+                1,
+                "binding references and unscoped calls cannot donate identity"
+            );
+        }
+        assert_eq!(
+            reads.get(),
+            references.len(),
+            "assignment probes never rescan unrelated calls"
+        );
+        assert_eq!(index.len(), 2003);
+    }
+
+    fn make_binding(local: &str, original: &str, specifier: &str, line: u32) -> RawReference {
+        RawReference {
+            scope: None,
+            name: local.into(),
+            kind: ReferenceKind::ImportAlias,
+            start_line: line,
+            context: specifier.into(),
+            receiver: Some(original.into()),
+        }
+    }
+
+    fn make_export(public: &str, local: &str, source: Option<&str>, line: u32) -> RawReference {
+        RawReference {
+            scope: None,
+            name: public.into(),
+            kind: ReferenceKind::ExportAlias,
+            start_line: line,
+            context: local.into(),
+            receiver: source.map(str::to_string),
         }
     }
 
@@ -1213,13 +2376,14 @@ mod tests {
                 vec![make_symbol("main", 5)],
                 vec![
                     make_ref("./helper", ReferenceKind::Import, 1),
+                    make_binding("helperFn", "helperFn", "./helper", 1),
                     make_ref("helperFn", ReferenceKind::Call, 10),
                 ],
             ),
             (
                 "src/helper.js".to_string(),
                 vec![make_symbol("helperFn", 1)],
-                vec![],
+                vec![make_export("helperFn", "helperFn", None, 1)],
             ),
         ];
 
@@ -1594,13 +2758,14 @@ mod tests {
                 vec![caller],
                 vec![
                     make_ref("./helper", ReferenceKind::Import, 1),
+                    make_binding("helperFn", "helperFn", "./helper", 1),
                     make_ref("helperFn", ReferenceKind::Call, 10), // receiver: None
                 ],
             ),
             (
                 "src/helper.js".to_string(),
                 vec![make_symbol("helperFn", 1)],
-                vec![],
+                vec![make_export("helperFn", "helperFn", None, 1)],
             ),
         ];
         let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
@@ -1626,12 +2791,16 @@ mod tests {
             (
                 "src/handler.js".to_string(),
                 vec![caller],
-                vec![make_ref("./store", ReferenceKind::Import, 1), call],
+                vec![
+                    make_ref("./store", ReferenceKind::Import, 1),
+                    make_binding("store", "*", "./store", 1),
+                    call,
+                ],
             ),
             (
                 "src/store.js".to_string(),
                 vec![make_symbol("query", 5)],
-                vec![],
+                vec![make_export("query", "query", None, 5)],
             ),
         ];
         let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
@@ -1654,13 +2823,14 @@ mod tests {
             (
                 "src/common/money.ts".to_string(),
                 vec![make_symbol("roundMoney", 5)],
-                vec![],
+                vec![make_export("roundMoney", "roundMoney", None, 5)],
             ),
             (
                 "src/common/__tests__/money.test.ts".to_string(),
                 vec![make_symbol("rounds to 2 decimal places", 6)],
                 vec![
                     make_ref("../money.js", ReferenceKind::Import, 3),
+                    make_binding("roundMoney", "roundMoney", "../money.js", 3),
                     make_ref("roundMoney", ReferenceKind::Call, 7),
                 ],
             ),
@@ -1685,7 +2855,7 @@ mod tests {
         );
         assert!(
             edges.iter().any(|e| e.edge_type == EdgeType::Imports),
-            "an IMPORTS edge must also be emitted (resolve.rs pass 3a)"
+            "the actual binding user must also have an IMPORTS dependency"
         );
     }
 
@@ -1702,23 +2872,45 @@ mod tests {
                 vec![caller],
                 vec![
                     make_ref("../../common/errors.js", ReferenceKind::Import, 1),
+                    make_binding(
+                        "NotFoundError",
+                        "NotFoundError",
+                        "../../common/errors.js",
+                        1,
+                    ),
                     make_ref("NotFoundError", ReferenceKind::Call, 12),
                 ],
             ),
             (
                 "src/common/errors.ts".to_string(),
                 vec![],
-                vec![make_ref("./errors/index.js", ReferenceKind::Import, 1)],
+                vec![
+                    make_ref("./errors/index.js", ReferenceKind::Import, 1),
+                    make_export(
+                        "NotFoundError",
+                        "NotFoundError",
+                        Some("./errors/index.js"),
+                        1,
+                    ),
+                ],
             ),
             (
                 "src/common/errors/index.ts".to_string(),
                 vec![],
-                vec![make_ref("./http-errors.js", ReferenceKind::Import, 1)],
+                vec![
+                    make_ref("./http-errors.js", ReferenceKind::Import, 1),
+                    make_export(
+                        "NotFoundError",
+                        "NotFoundError",
+                        Some("./http-errors.js"),
+                        1,
+                    ),
+                ],
             ),
             (
                 "src/common/errors/http-errors.ts".to_string(),
                 vec![make_symbol("NotFoundError", 20)],
-                vec![],
+                vec![make_export("NotFoundError", "NotFoundError", None, 20)],
             ),
         ];
         let edges = resolve_references(&files, Language::TypeScript, "repo:test:abc");
@@ -1961,7 +3153,7 @@ mod tests {
     }
 
     #[test]
-    fn top_level_import_creates_one_file_level_proxy_edge() {
+    fn unused_top_level_import_has_no_symbol_owner() {
         let files = vec![
             (
                 "src/main.js".to_string(),
@@ -1980,24 +3172,10 @@ mod tests {
             .iter()
             .filter(|e| e.edge_type == EdgeType::Imports)
             .collect();
-        assert_eq!(
-            import_edges.len(),
-            1,
-            "a top-level import should yield exactly one file-level proxy edge, \
-             not one per export (nw-103 fan-out); got: {import_edges:?}"
+        assert!(
+            import_edges.is_empty(),
+            "unused module import cannot name a symbol owner: {import_edges:?}"
         );
-
-        let expected_confidence = confidence_score(MatchType::ImportResolved, Language::JavaScript);
-        for edge in &import_edges {
-            assert!(
-                (edge.confidence - expected_confidence).abs() < f32::EPSILON,
-                "IMPORTS edge should have ImportResolved confidence"
-            );
-            assert!(
-                !edge.target_uid.starts_with("unresolved:"),
-                "IMPORTS target should be resolved"
-            );
-        }
     }
 
     /// nw-103: a top-level import must not turn the file's first declaration
@@ -2042,10 +3220,9 @@ mod tests {
             .collect();
 
         assert!(
-            from_storage_key.len() <= 1,
+            from_storage_key.is_empty(),
             "STORAGE_KEY is declared after the import block and must not inherit \
-             the file's imports; at most a single file-level proxy edge is \
-             acceptable. Got {} IMPORTS edges: {:#?}",
+             the file's imports. Got {} IMPORTS edges: {:#?}",
             from_storage_key.len(),
             from_storage_key
         );
@@ -2077,8 +3254,8 @@ mod tests {
             .collect();
         assert_eq!(
             import_edges.len(),
-            1,
-            "should only create IMPORTS edge to non-private symbol; got: {import_edges:?}"
+            0,
+            "unused imports must not acquire a symbol owner; got: {import_edges:?}"
         );
     }
 
@@ -2092,12 +3269,20 @@ mod tests {
                 vec![
                     make_ref("./helper", ReferenceKind::Import, 1),
                     make_ref("helperFn", ReferenceKind::Call, 10),
+                    RawReference {
+                        scope: None,
+                        name: "helperFn".into(),
+                        kind: ReferenceKind::ImportAlias,
+                        start_line: 1,
+                        context: "./helper".into(),
+                        receiver: Some("helperFn".into()),
+                    },
                 ],
             ),
             (
                 "src/helper.js".to_string(),
                 vec![make_symbol("helperFn", 1)],
-                vec![],
+                vec![make_export("helperFn", "helperFn", None, 1)],
             ),
         ];
 
@@ -2162,27 +3347,9 @@ mod tests {
             .iter()
             .filter(|e| e.edge_type == EdgeType::Imports)
             .collect();
-        // Two IMPORTS edges: file-level (init -> helperFn) + named (setup -> helperFn)
-        assert_eq!(
-            import_edges.len(),
-            2,
-            "expected 2 IMPORTS edges; got: {import_edges:?}"
-        );
-
-        // The named-import edge should use "setup" (line 10) as source
-        let named_source = symbol_uid("repo:test:abc", "src/main.js", "setup", 10);
         assert!(
-            import_edges.iter().any(|e| e.source_uid == named_source),
-            "should have an IMPORTS edge from the enclosing symbol at the import line"
-        );
-
-        // The file-level edge should use "init" (line 1) as source
-        let file_level_source = symbol_uid("repo:test:abc", "src/main.js", "init", 1);
-        assert!(
-            import_edges
-                .iter()
-                .any(|e| e.source_uid == file_level_source),
-            "should have a file-level IMPORTS edge from the first symbol in the file"
+            import_edges.is_empty(),
+            "a module specifier alone cannot identify an exported symbol: {import_edges:?}"
         );
     }
 
@@ -2211,11 +3378,9 @@ mod tests {
             .iter()
             .filter(|e| e.edge_type == EdgeType::Imports)
             .collect();
-        // File-level and named-import both resolve to (main -> helperFn), deduped to 1
-        assert_eq!(
-            import_edges.len(),
-            1,
-            "duplicate imports should be deduplicated; got: {import_edges:?}"
+        assert!(
+            import_edges.is_empty(),
+            "module imports without used bindings must not acquire owners: {import_edges:?}"
         );
     }
 
@@ -2248,11 +3413,9 @@ mod tests {
             .iter()
             .filter(|e| e.edge_type == EdgeType::Imports)
             .collect();
-        // Two targets: main->helperFn and main->utilFn (file-level + named dedup to 2)
-        assert_eq!(
-            import_edges.len(),
-            2,
-            "should have IMPORTS edges to both target files; got: {import_edges:?}"
+        assert!(
+            import_edges.is_empty(),
+            "module imports without used bindings must not acquire owners: {import_edges:?}"
         );
     }
 
@@ -2955,6 +4118,7 @@ mod tests {
                     vec![make_symbol("main", 5)],
                     vec![
                         make_ref("./helper", ReferenceKind::Import, 1),
+                        make_binding("helperFn", "helperFn", "./helper", 1),
                         make_ref("helperFn", ReferenceKind::Call, 10),
                         make_ref("missingFn", ReferenceKind::Call, 15),
                     ],
@@ -2962,7 +4126,7 @@ mod tests {
                 (
                     "src/helper.js".to_string(),
                     vec![make_symbol("helperFn", 1)],
-                    vec![],
+                    vec![make_export("helperFn", "helperFn", None, 1)],
                 ),
             ];
             assert_yaml_snapshot!(sorted_edges(files, Language::JavaScript));
@@ -2987,7 +4151,7 @@ mod tests {
         // File A: class Foo with method bar
         let mut foo_bar = make_symbol("bar", 5);
         foo_bar.parent_name = Some("Foo".to_string());
-        foo_bar.kind = SymbolKind::Function;
+        foo_bar.kind = SymbolKind::Method;
 
         let foo_class = RawSymbol {
             name: "Foo".to_string(),
@@ -3006,6 +4170,7 @@ mod tests {
 
         // File B: class Baz with method bar (different parent)
         let mut baz_bar = make_symbol("bar", 5);
+        baz_bar.kind = SymbolKind::Method;
         baz_bar.parent_name = Some("Baz".to_string());
 
         let baz_class = RawSymbol {
@@ -3026,6 +4191,7 @@ mod tests {
         // File C: caller that does foo_instance.bar()
         let caller = make_symbol("caller", 1);
         let bar_call = RawReference {
+            scope: None,
             name: "bar".to_string(),
             kind: ReferenceKind::Call,
             start_line: 3,
@@ -3100,6 +4266,7 @@ mod tests {
         do_work.parent_name = Some("MyClass".to_string());
 
         let this_call = RawReference {
+            scope: None,
             name: "helper".to_string(),
             kind: ReferenceKind::Call,
             start_line: 12,
@@ -3178,6 +4345,7 @@ mod tests {
 
         // BaseClass has method "save" at line 5
         let mut save_method = make_symbol("save", 5);
+        save_method.kind = SymbolKind::Method;
         save_method.parent_name = Some("BaseClass".to_string());
 
         let base_class = RawSymbol {
@@ -3212,6 +4380,7 @@ mod tests {
         };
 
         let extends_ref = RawReference {
+            scope: None,
             name: "BaseClass".to_string(),
             kind: ReferenceKind::Extends,
             start_line: 30,
@@ -3222,6 +4391,7 @@ mod tests {
         // Caller file: child_instance.save()
         let caller = make_symbol("caller", 1);
         let save_call = RawReference {
+            scope: None,
             name: "save".to_string(),
             kind: ReferenceKind::Call,
             start_line: 5,
@@ -3300,6 +4470,7 @@ mod tests {
 
         let caller = make_symbol("caller", 1);
         let bar_call = RawReference {
+            scope: None,
             name: "bar".to_string(),
             kind: ReferenceKind::Call,
             start_line: 3,
@@ -3520,6 +4691,7 @@ mod tests {
         handle_method.parent_name = Some("MyService".to_string());
 
         let chained_call = RawReference {
+            scope: None,
             name: "query".to_string(),
             kind: ReferenceKind::Call,
             start_line: 12,
@@ -3593,6 +4765,7 @@ mod tests {
 
     fn make_alias_ref(alias: &str, specifier: &str, line: u32) -> RawReference {
         RawReference {
+            scope: None,
             name: alias.to_string(),
             kind: ReferenceKind::ImportAlias,
             start_line: line,
@@ -3726,5 +4899,3603 @@ mod tests {
             (call_edges[0].confidence - expected_confidence).abs() < f32::EPSILON,
             "shadowed alias should resolve with SameFileExact confidence"
         );
+    }
+}
+
+#[cfg(test)]
+mod user_pain_reference_tests {
+    use super::*;
+    use nestweaver_parser::parse_source;
+    use std::path::Path;
+
+    #[test]
+    fn actual_embedding_base_contains_has_only_explicit_callers() {
+        let path = "crates/nestweaver-store/src/search.rs";
+        let source = format!(
+            "{}\nfn review_typed_embedding_base_contains(base: &EmbeddingBase, uid: &str) -> bool {{\n base.contains(uid)\n}}\n",
+            include_str!("../../nestweaver-store/src/search.rs")
+        );
+        let parsed = parse_source(Path::new(path), &source).unwrap();
+        let env = crate::types::TypeEnvironment::build(
+            &source,
+            Language::Rust,
+            &parsed.symbols,
+            &parsed.type_bindings,
+        );
+        let files = vec![(path.to_string(), parsed.symbols, parsed.references)];
+        for witness in [
+            "binary_v2_round_trip_binds_identity_pipeline_and_payload",
+            "an_implausible_embedding_count_is_rejected_not_allocated",
+            "binary_atomic_replace_cleans_partial_temp_after_write_error",
+            "binary_save_reports_parent_sync_failure_and_reopens_complete_replacement",
+            "binary_load_rejects_bad_magic",
+        ] {
+            let symbol = files[0]
+                .1
+                .iter()
+                .find(|symbol| symbol.name == witness)
+                .expect("actual error-string witness");
+            let calls: Vec<_> = files[0]
+                .2
+                .iter()
+                .filter(|reference| {
+                    reference.kind == ReferenceKind::Call
+                        && reference.name == "contains"
+                        && reference.start_line >= symbol.start_line
+                        && reference.start_line <= symbol.end_line
+                })
+                .collect();
+            assert!(
+                !calls.is_empty(),
+                "actual witness {witness} must retain its calls"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .all(|reference| reference
+                        .receiver
+                        .as_deref()
+                        .is_some_and(|receiver| receiver.contains("to_string()")
+                            || receiver.contains("format!"))),
+                "actual string-result receivers must retain their syntax: {witness}: {calls:#?}"
+            );
+        }
+        let envs = std::collections::HashMap::from([(path.to_string(), env)]);
+        let edges = resolve_references_with_context(
+            &files,
+            Language::Rust,
+            "repo:test:abc",
+            &WorkspaceContext::default(),
+            Some(&envs),
+            None,
+        );
+        let target = uid(&files, path, "contains");
+        // Closure and field-chain typing remains unsupported; prove the known
+        // parameter case while retaining all real string-result counterweights.
+        let allowed = std::collections::BTreeSet::from([uid(
+            &files,
+            path,
+            "review_typed_embedding_base_contains",
+        )]);
+        let incoming: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.edge_type == EdgeType::Calls && edge.target_uid == target)
+            .collect();
+        let actual: std::collections::BTreeSet<_> = incoming
+            .iter()
+            .map(|edge| edge.source_uid.clone())
+            .collect();
+        assert_eq!(
+            actual, allowed,
+            "EmbeddingBase::contains must retain exactly its supported typed caller: {incoming:#?}"
+        );
+    }
+
+    #[test]
+    fn actual_regex_reader_pool_len_has_only_its_explicit_caller() {
+        let path = "crates/nestweaver-store/src/regex_index.rs";
+        let source = format!(
+            "{}\nfn review_typed_regex_reader_pool_len(pool: &RegexReaderPool) -> usize {{\n pool.len()\n}}\n",
+            include_str!("../../nestweaver-store/src/regex_index.rs")
+        );
+        let parsed = parse_source(Path::new(path), &source).unwrap();
+        let env = crate::types::TypeEnvironment::build(
+            &source,
+            Language::Rust,
+            &parsed.symbols,
+            &parsed.type_bindings,
+        );
+        let files = vec![(path.to_string(), parsed.symbols, parsed.references)];
+        let saturated = files[0]
+            .1
+            .iter()
+            .find(|symbol| {
+                symbol.name == "saturated_candidate_query_widens_instead_of_dropping_matches"
+            })
+            .expect("actual saturated candidate witness");
+        let macro_chain_line = source
+            .lines()
+            .enumerate()
+            .find_map(|(index, line)| {
+                let line_number = index as u32 + 1;
+                (line_number >= saturated.start_line
+                    && line_number <= saturated.end_line
+                    && line.trim() == ".len(),")
+                    .then_some(line_number)
+            })
+            .expect("actual multiline macro-result len witness");
+        let macro_chain = files[0]
+            .2
+            .iter()
+            .find(|reference| {
+                reference.kind == ReferenceKind::Call
+                    && reference.name == "len"
+                    && reference.start_line == macro_chain_line
+            })
+            .expect("parser must retain the actual chained macro call");
+        let source_lines = source.lines().collect::<Vec<_>>();
+        let preceding = source_lines[..(macro_chain_line - 1) as usize]
+            .iter()
+            .rev()
+            .take(2)
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            preceding,
+            vec!["                .unwrap()", "                .unwrap()"]
+        );
+        assert!(
+            macro_chain.receiver.is_some(),
+            "a method on a macro call result must retain receiver evidence: {macro_chain:#?}"
+        );
+        let envs = std::collections::HashMap::from([(path.to_string(), env)]);
+        let edges = resolve_references_with_context(
+            &files,
+            Language::Rust,
+            "repo:test:abc",
+            &WorkspaceContext::default(),
+            Some(&envs),
+            None,
+        );
+        let target = uid(&files, path, "len");
+        let allowed = uid(&files, path, "review_typed_regex_reader_pool_len");
+        let incoming: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.edge_type == EdgeType::Calls && edge.target_uid == target)
+            .collect();
+        let actual: std::collections::BTreeSet<_> = incoming
+            .iter()
+            .map(|edge| edge.source_uid.clone())
+            .collect();
+        assert_eq!(
+            actual,
+            std::collections::BTreeSet::from([allowed]),
+            "RegexReaderPool::len must retain its supported typed caller; macro metadata: {macro_chain:#?}; incoming: {incoming:#?}"
+        );
+    }
+
+    #[test]
+    fn parsed_multiline_lock_chain_does_not_call_its_enclosing_len() {
+        let path = "src/regex_index.rs";
+        let source = r#"struct RegexReaderPool { shards: Mutex<Vec<Reader>> }
+static POOL: RegexReaderPool = todo!();
+impl RegexReaderPool {
+    fn len(&self) -> usize {
+        self.shards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+    fn direct(&self) -> usize {
+        self.len()
+    }
+}
+fn known() -> usize {
+    POOL.len()
+}
+"#;
+        let parsed = parse_source(Path::new(path), source).unwrap();
+        let env = crate::types::TypeEnvironment::build(
+            source,
+            Language::Rust,
+            &parsed.symbols,
+            &parsed.type_bindings,
+        );
+        let files = vec![(path.to_string(), parsed.symbols, parsed.references)];
+        let chain = files[0]
+            .2
+            .iter()
+            .find(|reference| {
+                reference.kind == ReferenceKind::Call
+                    && reference.name == "len"
+                    && reference
+                        .receiver
+                        .as_deref()
+                        .is_some_and(|receiver| receiver.contains("lock()"))
+            })
+            .expect("parser must capture the actual multiline chain");
+        assert!(
+            chain.receiver.as_deref().is_some_and(|receiver| {
+                receiver.contains("lock()") && receiver.contains("unwrap_or_else")
+            }),
+            "{chain:?}"
+        );
+        let known = files[0]
+            .2
+            .iter()
+            .find(|reference| {
+                reference.kind == ReferenceKind::Call
+                    && reference.name == "len"
+                    && reference.receiver.as_deref() == Some("POOL")
+            })
+            .expect("parser must capture the typed direct receiver");
+        assert_eq!(
+            env.lookup("POOL", known.start_line)
+                .map(|binding| binding.type_name.as_str()),
+            Some("RegexReaderPool"),
+            "the positive witness needs an actual receiver type binding"
+        );
+        let envs = std::collections::HashMap::from([(path.to_string(), env)]);
+        let edges = resolve_references_with_context(
+            &files,
+            Language::Rust,
+            "repo:test:abc",
+            &WorkspaceContext::default(),
+            Some(&envs),
+            None,
+        );
+        let len = uid(&files, path, "len");
+        assert!(
+            !edges.iter().any(|edge| {
+                edge.edge_type == EdgeType::Calls
+                    && edge.source_uid == len
+                    && edge.target_uid == len
+            }),
+            "lock result must not inherit the enclosing self type: {edges:#?}"
+        );
+        for caller in ["direct", "known"] {
+            assert!(
+                edges.iter().any(|edge| {
+                    edge.edge_type == EdgeType::Calls
+                        && edge.source_uid == uid(&files, path, caller)
+                        && edge.target_uid == len
+                        && edge.evidence.iter().any(|e| e.kind == "type_aware")
+                }),
+                "known direct receiver {caller} must still resolve: {edges:#?}"
+            );
+        }
+    }
+
+    fn parsed_files(inputs: &[(&str, &str)]) -> Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> {
+        inputs
+            .iter()
+            .map(|(path, source)| {
+                let parsed = parse_source(Path::new(path), source).unwrap();
+                (path.to_string(), parsed.symbols, parsed.references)
+            })
+            .collect()
+    }
+
+    fn uid(
+        files: &[(String, Vec<RawSymbol>, Vec<RawReference>)],
+        path: &str,
+        name: &str,
+    ) -> String {
+        let symbol = files
+            .iter()
+            .find(|(file, _, _)| file == path)
+            .unwrap()
+            .1
+            .iter()
+            .find(|symbol| symbol.name == name)
+            .unwrap();
+        symbol_uid("repo:test:abc", path, name, symbol.start_line)
+    }
+
+    #[test]
+    fn used_import_bindings_connect_actual_users_without_file_proxies() {
+        for import_and_call in [
+            (
+                "import { used as selected, unused } from './helper.js';",
+                "selected()",
+            ),
+            ("import * as helper from './helper.js';", "helper.used()"),
+            ("const helper = require('./helper.js');", "helper.used()"),
+            (
+                "const { used: selected, unused } = require('./helper.js');",
+                "selected()",
+            ),
+        ] {
+            let consumer = format!(
+                "{}\nconst unrelatedFirst = 1;\nfunction user() {{\n  return {};\n}}\nfunction unrelated() {{ return 2; }}\n",
+                import_and_call.0, import_and_call.1
+            );
+            let files = parsed_files(&[
+                (
+                    "src/helper.js",
+                    "export function unused() { return 0; }\nexport function used() { return 1; }\nfunction privateHelper() { return 2; }\n",
+                ),
+                ("src/consumer.js", &consumer),
+            ]);
+            let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+            let imports: Vec<_> = edges
+                .iter()
+                .filter(|edge| edge.edge_type == EdgeType::Imports)
+                .map(|edge| (edge.source_uid.clone(), edge.target_uid.clone()))
+                .collect();
+            assert_eq!(
+                imports,
+                vec![(
+                    uid(&files, "src/consumer.js", "user"),
+                    uid(&files, "src/helper.js", "used")
+                )],
+                "{}: {edges:#?}",
+                import_and_call.0
+            );
+            assert!(
+                edges.iter().any(|edge| edge.edge_type == EdgeType::Calls
+                    && edge.source_uid == uid(&files, "src/consumer.js", "user")
+                    && edge.target_uid == uid(&files, "src/helper.js", "used")),
+                "actual call missing: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unused_side_effect_and_shadowed_imports_do_not_attribute_symbols() {
+        let files = parsed_files(&[
+            (
+                "src/helper.js",
+                "export function selected() { return 1; }\nexport function unused() { return 0; }\n",
+            ),
+            (
+                "src/consumer.js",
+                "import { selected, unused } from './helper.js';\nimport './helper.js';\nconst first = 1;\nfunction shadow(selected) {\n  return selected();\n}\nfunction unrelated() { return 2; }\n",
+            ),
+        ]);
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        assert!(
+            !edges.iter().any(|edge| edge.edge_type == EdgeType::Imports),
+            "unused/shadowed imports acquired owners: {edges:#?}"
+        );
+        assert!(
+            !edges.iter().any(|edge| edge.target_uid.starts_with("sym:")
+                && edge.target_uid == uid(&files, "src/helper.js", "selected")),
+            "shadowed parameter bound to import: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn public_name_alias_is_not_a_second_export_of_the_local_name() {
+        for (exporter, valid_import, valid_target, invalid_import) in [
+            (
+                "function actual() {}\nmodule.exports = { renamed: actual };\n",
+                "const { renamed } = require('./helper.js');",
+                "actual",
+                "const { actual } = require('./helper.js');",
+            ),
+            (
+                "function Router() {}\nexport { Router as default };\n",
+                "import renamed from './helper.js';",
+                "Router",
+                "import { Router as actual } from './helper.js';",
+            ),
+        ] {
+            let valid_call = "renamed()";
+            let valid = format!("{valid_import}\nfunction user() {{\n  {valid_call};\n}}\n");
+            let files = parsed_files(&[("src/helper.js", exporter), ("src/user.js", &valid)]);
+            let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+            assert!(
+                edges
+                    .iter()
+                    .any(|edge| edge.source_uid == uid(&files, "src/user.js", "user")
+                        && edge.target_uid == uid(&files, "src/helper.js", valid_target)
+                        && edge.edge_type == EdgeType::Calls),
+                "valid public alias: {edges:#?}"
+            );
+            let invalid = format!("{invalid_import}\nfunction user() {{\n  actual();\n}}\n");
+            let files = parsed_files(&[("src/helper.js", exporter), ("src/user.js", &invalid)]);
+            let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+            assert!(
+                !edges
+                    .iter()
+                    .any(|edge| edge.target_uid == uid(&files, "src/helper.js", valid_target)),
+                "local declaration was not exported under its own name: {edges:#?}"
+            );
+        }
+        for name in ["actual", "renamed"] {
+            let consumer = format!(
+                "import {{ {name} }} from './helper.js';\nfunction user() {{\n  {name}();\n}}\n"
+            );
+            let files = parsed_files(&[
+                (
+                    "src/helper.js",
+                    "export function actual() {}\nexport { actual as renamed };\n",
+                ),
+                ("src/user.js", &consumer),
+            ]);
+            let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+            assert!(
+                edges.iter().any(
+                    |edge| edge.target_uid == uid(&files, "src/helper.js", "actual")
+                        && edge.edge_type == EdgeType::Calls
+                ),
+                "valid {name} public name: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_bound_import_cannot_fall_back_to_a_sibling_homonym() {
+        for importer in [
+            "import { selected } from './missing.js';\nfunction user() {\n  selected();\n}\n",
+            "import * as ns from './missing.js';\nfunction user() {\n  ns.selected();\n}\n",
+        ] {
+            let files = parsed_files(&[
+                ("src/other.js", "export function selected() {}\n"),
+                ("src/user.js", importer),
+            ]);
+            let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+            assert!(
+                !edges
+                    .iter()
+                    .any(|edge| edge.target_uid == uid(&files, "src/other.js", "selected")),
+                "unresolved binding donated sibling: {edges:#?}"
+            );
+        }
+        let files = parsed_files(&[(
+            "src/user.js",
+            "function selected() {}\nasync function owner() {\n  const { selected } = await import('./missing.js');\n  selected();\n}\nfunction outsider() {\n  selected();\n}\n",
+        )]);
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let target = uid(&files, "src/user.js", "selected");
+        assert!(
+            !edges.iter().any(
+                |edge| edge.source_uid == uid(&files, "src/user.js", "owner")
+                    && edge.target_uid == target
+            ),
+            "unresolved local binding must shadow the global function: {edges:#?}"
+        );
+        assert!(
+            edges.iter().any(
+                |edge| edge.source_uid == uid(&files, "src/user.js", "outsider")
+                    && edge.target_uid == target
+                    && edge.edge_type == EdgeType::Calls
+            ),
+            "local missing import must not escape into outsider: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn named_default_reexport_preserves_exact_default_target() {
+        let files = parsed_files(&[
+            (
+                "src/Router.js",
+                "export default function Router() {}\nexport function unused() {}\n",
+            ),
+            ("src/barrel.js", "export { default } from './Router.js';\n"),
+            (
+                "src/user.js",
+                "import Router from './barrel.js';\nfunction user() {\n  Router();\n}\n",
+            ),
+        ]);
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let target = uid(&files, "src/Router.js", "Router");
+        for kind in [EdgeType::Calls, EdgeType::Imports] {
+            assert!(
+                edges
+                    .iter()
+                    .any(|edge| edge.source_uid == uid(&files, "src/user.js", "user")
+                        && edge.target_uid == target
+                        && edge.edge_type == kind),
+                "{edges:#?}"
+            );
+        }
+        assert!(
+            !edges
+                .iter()
+                .any(|edge| edge.target_uid == uid(&files, "src/Router.js", "unused")),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn imported_local_reexport_preserves_exact_original_target() {
+        for (barrel, public) in [
+            (
+                "import { secret } from './target.js';\nexport { secret };\n",
+                "secret",
+            ),
+            (
+                "import { secret as selected } from './target.js';\nexport { selected as publicName };\n",
+                "publicName",
+            ),
+        ] {
+            let consumer = format!(
+                "import {{ {public} as chosen }} from './a.js';\nfunction user() {{\n  chosen();\n}}\n"
+            );
+            let files = parsed_files(&[
+                ("src/a.js", barrel),
+                (
+                    "src/target.js",
+                    "export function secret() {}\nexport function unused() {}\n",
+                ),
+                ("src/user.js", &consumer),
+            ]);
+            let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+            for kind in [EdgeType::Calls, EdgeType::Imports] {
+                assert!(
+                    edges
+                        .iter()
+                        .any(|edge| edge.source_uid == uid(&files, "src/user.js", "user")
+                            && edge.target_uid == uid(&files, "src/target.js", "secret")
+                            && edge.edge_type == kind),
+                    "{barrel}: {edges:#?}"
+                );
+            }
+            assert!(
+                !edges
+                    .iter()
+                    .any(|edge| edge.target_uid == uid(&files, "src/target.js", "unused")),
+                "{edges:#?}"
+            );
+        }
+        let files = parsed_files(&[
+            (
+                "src/a.js",
+                "function secret() {}\nasync function owner() {\n  const { secret } = await import('./target.js');\n  secret();\n}\nexport { secret };\n",
+            ),
+            ("src/target.js", "export function secret() {}\n"),
+            (
+                "src/user.js",
+                "import { secret as chosen } from './a.js';\nfunction user() {\n  chosen();\n}\n",
+            ),
+        ]);
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.source_uid == uid(&files, "src/user.js", "user")
+                    && edge.target_uid == uid(&files, "src/a.js", "secret")
+                    && edge.edge_type == EdgeType::Calls),
+            "function-local import must not replace the module export: {edges:#?}"
+        );
+        let files = parsed_files(&[
+            (
+                "src/a.js",
+                "import { secret as selected } from './missing.js';\nexport { selected as publicName };\n",
+            ),
+            ("src/target.js", "export function secret() {}\n"),
+            (
+                "src/user.js",
+                "import { publicName as chosen } from './a.js';\nfunction user() {\n  chosen();\n}\n",
+            ),
+        ]);
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        assert!(
+            !edges
+                .iter()
+                .any(|edge| edge.target_uid == uid(&files, "src/target.js", "secret")),
+            "missing forwarding source: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn correction_failed_binding_never_rebinds_to_unrelated_import() {
+        for a in [
+            "function secret() {}\nexport function marker() {}\n",
+            "export function marker() {}\n",
+        ] {
+            let files = parsed_files(&[
+                ("src/a.js", a),
+                (
+                    "src/b.js",
+                    "export function secret() {}\nexport function other() {}\n",
+                ),
+                (
+                    "src/user.js",
+                    "import { secret as selected } from './a.js';\nimport { other } from './b.js';\nfunction user() {\n  selected();\n}\n",
+                ),
+            ]);
+            let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+            assert!(
+                !edges
+                    .iter()
+                    .any(|edge| edge.target_uid == uid(&files, "src/b.js", "secret")),
+                "{edges:#?}"
+            );
+        }
+        let files = parsed_files(&[
+            ("src/a.js", "export { secret } from './target.js';\n"),
+            ("src/target.js", "export function secret() {}\n"),
+            (
+                "src/b.js",
+                "export function secret() {}\nexport function other() {}\n",
+            ),
+            (
+                "src/user.js",
+                "import { secret as selected } from './a.js';\nimport { other } from './b.js';\nfunction user() {\n  selected();\n}\n",
+            ),
+        ]);
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.source_uid == uid(&files, "src/user.js", "user")
+                    && edge.target_uid == uid(&files, "src/target.js", "secret")
+                    && edge.edge_type == EdgeType::Calls),
+            "{edges:#?}"
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|edge| edge.target_uid == uid(&files, "src/b.js", "secret")),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn correction_default_parameter_initializer_is_a_use_not_a_binding() {
+        let files = parsed_files(&[
+            ("src/helper.js", "export function helper() { return 1; }\n"),
+            (
+                "src/user.js",
+                "import { helper } from './helper.js';\nfunction consume(fallback = helper()) {\n  return fallback;\n}\nfunction shadow(helper) {\n  helper();\n}\n",
+            ),
+        ]);
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let target = uid(&files, "src/helper.js", "helper");
+        assert!(
+            edges.iter().any(
+                |edge| edge.source_uid == uid(&files, "src/user.js", "consume")
+                    && edge.target_uid == target
+                    && edge.edge_type == EdgeType::Calls
+            ),
+            "{edges:#?}"
+        );
+        assert!(
+            !edges.iter().any(
+                |edge| edge.source_uid == uid(&files, "src/user.js", "shadow")
+                    && edge.target_uid == target
+            ),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn correction_commonjs_object_exports_bind_exact_local_values_only() {
+        let files = parsed_files(&[
+            (
+                "src/helper.js",
+                "function used() {}\nfunction actual() {}\nfunction hidden() {}\nfunction bogus() {}\nmodule.exports = { used, renamed: actual, bogus: 42 };\n",
+            ),
+            (
+                "src/user.js",
+                "const { used, renamed: chosen } = require('./helper.js');\nfunction user() {\n  used();\n  chosen();\n}\n",
+            ),
+        ]);
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        for name in ["used", "actual"] {
+            assert!(
+                edges
+                    .iter()
+                    .any(|edge| edge.source_uid == uid(&files, "src/user.js", "user")
+                        && edge.target_uid == uid(&files, "src/helper.js", name)
+                        && edge.edge_type == EdgeType::Calls),
+                "{name}: {edges:#?}"
+            );
+        }
+        for name in ["hidden", "bogus"] {
+            assert!(
+                !edges
+                    .iter()
+                    .any(|edge| edge.target_uid == uid(&files, "src/helper.js", name)),
+                "{name}: {edges:#?}"
+            );
+            assert_eq!(
+                files[0]
+                    .1
+                    .iter()
+                    .find(|symbol| symbol.name == name)
+                    .unwrap()
+                    .visibility,
+                Visibility::Private
+            );
+        }
+    }
+
+    #[test]
+    fn default_import_uses_the_exact_named_default_export() {
+        for exporter in [
+            "export function unused() {}\nexport default function Router() { return 1; }\n",
+            "function Router() { return 1; }\nexport function unused() {}\nexport { Router as default };\n",
+        ] {
+            let files = parsed_files(&[
+                ("src/Router.js", exporter),
+                (
+                    "src/App.js",
+                    "import Selected from './Router.js';\nconst first = 0;\nfunction app() {\n  return Selected();\n}\nfunction unrelated() { return 1; }\n",
+                ),
+            ]);
+            let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+            let target = uid(&files, "src/Router.js", "Router");
+            for kind in [EdgeType::Calls, EdgeType::Imports] {
+                assert!(
+                    edges
+                        .iter()
+                        .any(|edge| edge.source_uid == uid(&files, "src/App.js", "app")
+                            && edge.target_uid == target
+                            && edge.edge_type == kind),
+                    "{exporter}: {edges:#?}"
+                );
+            }
+            assert!(
+                !edges
+                    .iter()
+                    .any(|edge| edge.target_uid == uid(&files, "src/Router.js", "unused")),
+                "{edges:#?}"
+            );
+            assert!(
+                !edges.iter().any(
+                    |edge| edge.source_uid == uid(&files, "src/App.js", "unrelated")
+                        && edge.edge_type == EdgeType::Imports
+                ),
+                "{edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_namespace_member_targets_the_default_export() {
+        let files = parsed_files(&[
+            (
+                "src/Router.js",
+                "export function unused() {}\nexport default function Router() {}\n",
+            ),
+            (
+                "src/App.js",
+                "import * as ns from './Router.js';\nfunction app() {\n  ns.default();\n}\n",
+            ),
+        ]);
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let target = uid(&files, "src/Router.js", "Router");
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.source_uid == uid(&files, "src/App.js", "app")
+                    && edge.target_uid == target
+                    && edge.edge_type == EdgeType::Calls),
+            "{edges:#?}"
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|edge| edge.target_uid == uid(&files, "src/Router.js", "unused")),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn type_imports_attribute_only_the_enclosing_signature_user() {
+        let files = parsed_files(&[
+            (
+                "src/types.ts",
+                "export interface Shape { value: number; }\nexport interface Unused { value: number; }\n",
+            ),
+            (
+                "src/user.ts",
+                "import type { Shape as Input, Unused } from './types';\nconst first = 1;\nfunction consume(input: Input) {\n  return input.value;\n}\nfunction unrelated() { return 0; }\n",
+            ),
+        ]);
+        let edges = resolve_references(&files, Language::TypeScript, "repo:test:abc");
+        let imports: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.edge_type == EdgeType::Imports)
+            .map(|edge| (edge.source_uid.clone(), edge.target_uid.clone()))
+            .collect();
+        assert_eq!(
+            imports,
+            vec![(
+                uid(&files, "src/user.ts", "consume"),
+                uid(&files, "src/types.ts", "Shape")
+            )],
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn imported_module_does_not_donate_private_or_unbound_homonyms() {
+        let files = parsed_files(&[
+            (
+                "src/helper.js",
+                "export function selected() { return 1; }\nexport function unbound() { return 2; }\nfunction secret() { return 3; }\n",
+            ),
+            (
+                "src/consumer.js",
+                "import { selected, secret } from './helper.js';\nfunction user() {\n  unbound();\n  secret();\n}\nfunction local() { return 0; }\n",
+            ),
+        ]);
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        for name in ["unbound", "secret"] {
+            let target = uid(&files, "src/helper.js", name);
+            assert!(
+                !edges.iter().any(|edge| edge.target_uid == target),
+                "unbound/private {name}: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_local_import_binding_does_not_escape_and_namespace_can_be_shadowed() {
+        let files = parsed_files(&[
+            ("src/helper.js", "export function used() { return 1; }\n"),
+            (
+                "src/consumer.js",
+                "import * as helper from './helper.js';\nasync function owner() {\n  const { used: selected } = await import('./helper.js');\n  selected();\n}\nfunction outsider() {\n  selected();\n}\nfunction shadow(helper) {\n  helper.used();\n}\n",
+            ),
+        ]);
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let target = uid(&files, "src/helper.js", "used");
+        assert!(
+            edges.iter().any(
+                |edge| edge.source_uid == uid(&files, "src/consumer.js", "owner")
+                    && edge.target_uid == target
+                    && edge.edge_type == EdgeType::Imports
+            ),
+            "{edges:#?}"
+        );
+        for name in ["outsider", "shadow"] {
+            assert!(
+                !edges.iter().any(
+                    |edge| edge.source_uid == uid(&files, "src/consumer.js", name)
+                        && edge.target_uid == target
+                ),
+                "{name}: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn enclosed_dynamic_import_connects_only_the_used_named_member() {
+        let files = parsed_files(&[
+            (
+                "src/helper.js",
+                "export function unused() { return 0; }\nexport function used() { return 1; }\n",
+            ),
+            (
+                "src/consumer.js",
+                "const first = 0;\nasync function user() {\n  const { used: selected } = await import('./helper.js');\n  return selected();\n}\nasync function sideEffect() {\n  await import('./helper.js');\n}\n",
+            ),
+        ]);
+        let edges = resolve_references(&files, Language::JavaScript, "repo:test:abc");
+        let imports: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.edge_type == EdgeType::Imports)
+            .map(|edge| (edge.source_uid.clone(), edge.target_uid.clone()))
+            .collect();
+        assert_eq!(
+            imports,
+            vec![(
+                uid(&files, "src/consumer.js", "user"),
+                uid(&files, "src/helper.js", "used")
+            )],
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn parsed_swift_static_receiver_selects_its_declaring_type() {
+        let files = parsed_files(&[(
+            "Worker.swift",
+            "struct Other {\n  static func execute() {}\n}\nstruct Worker {\n  static func execute() {}\n}\nfunc runner() {\n  Worker.execute()\n}\n",
+        )]);
+        let reference = files[0]
+            .2
+            .iter()
+            .find(|reference| reference.kind == ReferenceKind::Call && reference.name == "execute")
+            .unwrap();
+        assert_eq!(
+            reference.receiver.as_deref(),
+            Some("Worker"),
+            "{reference:?}"
+        );
+        let edges = resolve_references(&files, Language::Swift, "repo:test:abc");
+        let worker = files[0]
+            .1
+            .iter()
+            .find(|symbol| {
+                symbol.name == "execute" && symbol.parent_name.as_deref() == Some("Worker")
+            })
+            .unwrap();
+        let target = symbol_uid(
+            "repo:test:abc",
+            "Worker.swift",
+            "execute",
+            worker.start_line,
+        );
+        assert!(
+            edges.iter().any(
+                |edge| edge.source_uid == uid(&files, "Worker.swift", "runner")
+                    && edge.target_uid == target
+                    && edge.edge_type == EdgeType::Calls
+            ),
+            "{edges:#?}"
+        );
+        assert!(
+            !edges.iter().any(
+                |edge| edge.source_uid == uid(&files, "Worker.swift", "runner")
+                    && edge.target_uid != target
+                    && edge.edge_type == EdgeType::Calls
+            ),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn parsed_async_function_expression_owns_its_call_once() {
+        for path in ["main.js", "main.ts"] {
+            let files = parsed_files(&[(
+                path,
+                "function helper() {}\nconst work = async function() {\n  helper();\n};\nconst sync = function() { helper(); };\nconst arrow = async () => { helper(); };\nconst sync_arrow = () => { helper(); };\n",
+            )]);
+            for name in ["work", "sync", "arrow", "sync_arrow"] {
+                let hits: Vec<_> = files[0]
+                    .1
+                    .iter()
+                    .filter(|symbol| symbol.name == name)
+                    .collect();
+                assert_eq!(hits.len(), 1, "{path} duplicate {name}: {hits:?}");
+                assert_eq!(hits[0].kind, SymbolKind::Function);
+            }
+            let work = files[0]
+                .1
+                .iter()
+                .find(|symbol| symbol.name == "work")
+                .unwrap();
+            assert_eq!(
+                (work.start_line, work.end_line),
+                (2, 4),
+                "{path}: async expression span must include its body"
+            );
+            let edges = resolve_references(
+                &files,
+                if path.ends_with(".ts") {
+                    Language::TypeScript
+                } else {
+                    Language::JavaScript
+                },
+                "repo:test:abc",
+            );
+            for name in ["work", "sync", "arrow", "sync_arrow"] {
+                let calls: Vec<_> = edges
+                    .iter()
+                    .filter(|edge| {
+                        edge.edge_type == EdgeType::Calls
+                            && edge.source_uid == uid(&files, path, name)
+                    })
+                    .collect();
+                assert_eq!(
+                    calls.len(),
+                    1,
+                    "{path}: {name} must own exactly its helper call: {calls:#?}"
+                );
+                assert_eq!(
+                    calls[0].target_uid,
+                    uid(&files, path, "helper"),
+                    "{path}: {name} helper target"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parsed_python_src_layout_connects_test_to_definition() {
+        let files = parsed_files(&[
+            ("src/qrec/coredata.py", "def load():\n    return 1\n"),
+            (
+                "tests/test_coredata.py",
+                "from qrec.coredata import load\ndef test_load():\n    load()\n",
+            ),
+        ]);
+        let edges = resolve_references(&files, Language::Python, "repo:test:abc");
+        assert!(
+            edges.iter().any(|edge| edge.edge_type == EdgeType::Calls
+                && edge.source_uid == uid(&files, "tests/test_coredata.py", "test_load")
+                && edge.target_uid == uid(&files, "src/qrec/coredata.py", "load")),
+            "{edges:#?}"
+        );
+    }
+
+    type ReviewParsedFiles = Vec<(String, Vec<RawSymbol>, Vec<RawReference>)>;
+
+    fn review_edges(
+        inputs: &[(&str, &str)],
+        language: Language,
+    ) -> (ReviewParsedFiles, Vec<ResolvedEdge>) {
+        let mut files = Vec::new();
+        let mut envs = std::collections::HashMap::new();
+        for (path, source) in inputs {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            let env = crate::types::TypeEnvironment::build(
+                source,
+                language,
+                &parsed.symbols,
+                &parsed.type_bindings,
+            );
+            envs.insert((*path).to_string(), env);
+            files.push(((*path).to_string(), parsed.symbols, parsed.references));
+        }
+        let edges = resolve_references_with_context(
+            &files,
+            language,
+            "repo:test:abc",
+            &WorkspaceContext::default(),
+            Some(&envs),
+            None,
+        );
+        (files, edges)
+    }
+
+    fn review_callers(
+        files: &[(String, Vec<RawSymbol>, Vec<RawReference>)],
+        edges: &[ResolvedEdge],
+        path: &str,
+        name: &str,
+    ) -> std::collections::BTreeSet<String> {
+        let target = uid(files, path, name);
+        edges
+            .iter()
+            .filter(|edge| edge.edge_type == EdgeType::Calls && edge.target_uid == target)
+            .map(|edge| edge.source_uid.clone())
+            .collect()
+    }
+
+    #[test]
+    fn review4_rust_module_impl_trait_and_nested_function_classification() {
+        let path = "src/lib.rs";
+        let source = "struct S;\nimpl S { fn method(&self) {} }\ntrait T { fn trait_method(&self) {} }\nmod tests { fn module_free() {} }\nfn enclosing() {\n fn nested_free() {}\n nested_free();\n}\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::Rust);
+        for (name, kind) in [
+            ("method", SymbolKind::Method),
+            ("trait_method", SymbolKind::Method),
+            ("module_free", SymbolKind::Function),
+            ("nested_free", SymbolKind::Function),
+        ] {
+            let symbols: Vec<_> = files[0]
+                .1
+                .iter()
+                .filter(|symbol| symbol.name == name)
+                .collect();
+            assert_eq!(symbols.len(), 1, "{name}: {symbols:#?}");
+            assert_eq!(symbols[0].kind, kind, "{name}: {symbols:#?}");
+        }
+        assert_eq!(
+            review_callers(&files, &edges, path, "nested_free"),
+            std::collections::BTreeSet::from([uid(&files, path, "enclosing")]),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review4_rust_factory_same_name_uses_exact_lexical_declaration() {
+        let path = "src/lib.rs";
+        let source = r#"struct Right;
+impl Right { fn right(&self) {} }
+struct Wrong;
+impl Wrong { fn wrong(&self) {} }
+fn factory() -> Wrong { Wrong }
+mod tests {
+ use super::*;
+ fn factory() -> Right { Right }
+ fn caller() { let result = factory(); result.right(); result.wrong(); }
+}
+"#;
+        let (files, edges) = review_edges(&[(path, source)], Language::Rust);
+        assert_eq!(
+            review_callers(&files, &edges, path, "right"),
+            std::collections::BTreeSet::from([uid(&files, path, "caller")]),
+            "{files:#?} {edges:#?}"
+        );
+        assert!(
+            review_callers(&files, &edges, path, "wrong").is_empty(),
+            "wrong factory donated owner: {edges:#?}"
+        );
+        let factory = files[0]
+            .1
+            .iter()
+            .find(|symbol| symbol.name == "factory" && symbol.start_line > 6)
+            .unwrap();
+        assert!(
+            edges.iter().any(|edge| edge.edge_type == EdgeType::Calls
+                && edge.source_uid == uid(&files, path, "caller")
+                && edge.target_uid
+                    == symbol_uid("repo:test:abc", path, "factory", factory.start_line)),
+            "exact callee edge: {edges:#?}"
+        );
+        assert!(
+            !edges.iter().any(|edge| edge.edge_type == EdgeType::Calls
+                && edge.source_uid == uid(&files, path, "caller")
+                && edge.target_uid == uid(&files, path, "factory")),
+            "outer callee must not win: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review4_same_spelling_rust_classes_keep_module_owner() {
+        let path = "src/lib.rs";
+        let source = r#"struct T;
+impl T { fn top(&self) {} }
+mod hidden {
+ pub struct T;
+ impl T { pub fn nested_method(&self) {} }
+ fn hidden_local(t: &T) { t.nested_method(); t.top(); }
+}
+fn top_user(t: &T) { t.top(); t.nested_method(); }
+"#;
+        let (files, edges) = review_edges(&[(path, source)], Language::Rust);
+        assert_eq!(
+            review_callers(&files, &edges, path, "top"),
+            std::collections::BTreeSet::from([uid(&files, path, "top_user")]),
+            "{edges:#?}"
+        );
+        assert_eq!(
+            review_callers(&files, &edges, path, "nested_method"),
+            std::collections::BTreeSet::from([uid(&files, path, "hidden_local")]),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review4_same_provider_type_aliases_keep_import_declaration() {
+        let path = "src/consumer.rs";
+        let source = r#"use crate::provider::First as Alias;
+mod sibling {
+ use crate::provider::Second as Alias;
+ fn sibling_user(value: &Alias) { value.second(); value.first(); }
+}
+fn top_user(value: &Alias) { value.first(); value.second(); }
+"#;
+        let (files, edges) = review_edges(
+            &[
+                ("src/lib.rs", "mod consumer; mod provider;"),
+                (path, source),
+                (
+                    "src/provider.rs",
+                    r#"pub struct First;
+impl First { pub fn first(&self) {} }
+pub struct Second;
+impl Second { pub fn second(&self) {} }
+"#,
+                ),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/provider.rs", "first"),
+            std::collections::BTreeSet::from([uid(&files, path, "top_user")]),
+            "{edges:#?}"
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/provider.rs", "second"),
+            std::collections::BTreeSet::from([uid(&files, path, "sibling_user")]),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review4_factory_imports_keep_current_module_provenance() {
+        for (top_import, nested_import, providers, top_target, nested_target) in [
+            (
+                "use crate::a::factory;",
+                "use crate::b::factory;",
+                vec![
+                    (
+                        "src/a.rs",
+                        "pub struct First;\nimpl First { pub fn first(&self) {} }\npub fn factory() -> First { First }\n",
+                    ),
+                    (
+                        "src/b.rs",
+                        "pub struct Second;\nimpl Second { pub fn second(&self) {} }\npub fn factory() -> Second { Second }\n",
+                    ),
+                ],
+                ("src/a.rs", "factory"),
+                ("src/b.rs", "factory"),
+            ),
+            (
+                "use crate::provider::first_factory as factory;",
+                "use crate::provider::second_factory as factory;",
+                vec![(
+                    "src/provider.rs",
+                    "pub struct First;\nimpl First { pub fn first(&self) {} }\npub struct Second;\nimpl Second { pub fn second(&self) {} }\npub fn first_factory() -> First { First }\npub fn second_factory() -> Second { Second }\n",
+                )],
+                ("src/provider.rs", "first_factory"),
+                ("src/provider.rs", "second_factory"),
+            ),
+        ] {
+            let source = format!(
+                "{top_import}\nfn top_user() {{ let value = factory(); value.first(); value.second(); }}\nmod nested {{\n {nested_import}\n fn nested_user() {{ let value = factory(); value.second(); value.first(); }}\n}}\nmod outside {{ fn missing() {{ let value = factory(); value.first(); value.second(); }} }}\n"
+            );
+            let mut inputs = vec![
+                ("src/lib.rs", "mod consumer; mod a; mod b; mod provider;"),
+                ("src/consumer.rs", source.as_str()),
+            ];
+            inputs.extend(providers);
+            let (files, edges) = review_edges(&inputs, Language::Rust);
+            assert_eq!(
+                review_callers(&files, &edges, top_target.0, "first"),
+                std::collections::BTreeSet::from([uid(&files, "src/consumer.rs", "top_user")]),
+                "{source}: {edges:#?}"
+            );
+            assert_eq!(
+                review_callers(&files, &edges, nested_target.0, "second"),
+                std::collections::BTreeSet::from([uid(&files, "src/consumer.rs", "nested_user")]),
+                "{source}: {edges:#?}"
+            );
+            for (caller, target) in [("top_user", top_target), ("nested_user", nested_target)] {
+                assert_eq!(
+                    review_callers(&files, &edges, target.0, target.1),
+                    std::collections::BTreeSet::from([uid(&files, "src/consumer.rs", caller)]),
+                    "exact factory: {source}: {edges:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review4_rust_exact_inline_type_import_retains_module_and_owner() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "src/lib.rs",
+                    "mod browser_ws; mod consumer;\npub use browser_ws::flow::ViewerFlow as PublicFlow;\n",
+                ),
+                (
+                    "src/consumer.rs",
+                    "use crate::PublicFlow;\nfn forwarded(viewer: &PublicFlow) { viewer.seed_unacked(); viewer.wrong_root(); viewer.wrong_hidden(); viewer.wrong_fn(); }\n",
+                ),
+                (
+                    "src/browser_ws.rs",
+                    r#"pub struct ViewerFlow;
+impl ViewerFlow { pub fn wrong_root(&self) {} }
+pub(crate) mod flow {
+ pub(crate) struct ViewerFlow;
+ impl ViewerFlow {
+  pub(crate) fn new() -> Self { Self }
+  pub(crate) fn seed_unacked(&self) {}
+ }
+ pub(crate) struct ReplayWindow;
+ impl ReplayWindow {
+  pub(crate) fn new() -> Self { Self }
+  pub(crate) fn replay_tail(&self) {}
+ }
+ pub(crate) mod nested {
+  pub(crate) struct ViewerFlow;
+  impl ViewerFlow { pub(crate) fn nested_method(&self) {} }
+ }
+}
+mod hidden {
+ pub struct ViewerFlow;
+ impl ViewerFlow { pub fn wrong_hidden(&self) {} }
+}
+fn local_type_donor() {
+ struct ViewerFlow;
+ impl ViewerFlow { pub fn wrong_fn(&self) {} }
+ let viewer: ViewerFlow = ViewerFlow;
+ viewer.wrong_fn();
+}
+mod tests {
+ use crate::browser_ws::flow::{ViewerFlow, ReplayWindow};
+ fn annotated(viewer: &ViewerFlow, window: &ReplayWindow) {
+  viewer.seed_unacked(); window.replay_tail(); viewer.wrong_root(); viewer.wrong_hidden(); viewer.wrong_fn();
+ }
+ fn make_flow() -> ViewerFlow { ViewerFlow::new() }
+ fn make_window() -> ReplayWindow { ReplayWindow::new() }
+ fn inferred() {
+  let viewer = make_flow(); let window = make_window();
+  viewer.seed_unacked(); window.replay_tail(); viewer.wrong_root(); viewer.wrong_hidden(); viewer.wrong_fn();
+ }
+ fn constructor() {
+  let viewer = ViewerFlow::new(); let window = ReplayWindow::new();
+  viewer.seed_unacked(); window.replay_tail(); viewer.wrong_root(); viewer.wrong_hidden(); viewer.wrong_fn();
+ }
+ mod nested_alias {
+  use crate::browser_ws::flow::nested::ViewerFlow as Nested;
+  fn nested_user(viewer: &Nested) { viewer.nested_method(); viewer.seed_unacked(); viewer.wrong_root(); }
+ }
+ mod unresolved {
+  use crate::browser_ws::missing::ViewerFlow;
+  fn unresolved_user(viewer: &ViewerFlow) { viewer.seed_unacked(); viewer.wrong_root(); }
+ }
+ mod glob {
+  use crate::browser_ws::flow::*;
+  fn unsupported_glob(viewer: &ViewerFlow) { viewer.seed_unacked(); }
+ }
+ fn unknown(viewer: Unknown) { viewer.seed_unacked(); }
+}
+"#,
+                ),
+            ],
+            Language::Rust,
+        );
+        let mut seed_callers = std::collections::BTreeSet::from([
+            uid(&files, "src/browser_ws.rs", "annotated"),
+            uid(&files, "src/browser_ws.rs", "inferred"),
+            uid(&files, "src/browser_ws.rs", "constructor"),
+        ]);
+        assert_eq!(
+            review_callers(&files, &edges, "src/browser_ws.rs", "replay_tail"),
+            seed_callers,
+            "{edges:#?}"
+        );
+        seed_callers.insert(uid(&files, "src/consumer.rs", "forwarded"));
+        assert_eq!(
+            review_callers(&files, &edges, "src/browser_ws.rs", "seed_unacked"),
+            seed_callers,
+            "{edges:#?}"
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/browser_ws.rs", "nested_method"),
+            std::collections::BTreeSet::from([uid(&files, "src/browser_ws.rs", "nested_user")]),
+            "{edges:#?}"
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/browser_ws.rs", "wrong_fn"),
+            std::collections::BTreeSet::from([uid(
+                &files,
+                "src/browser_ws.rs",
+                "local_type_donor"
+            )]),
+            "{edges:#?}"
+        );
+        for method in ["wrong_root", "wrong_hidden"] {
+            assert!(
+                review_callers(&files, &edges, "src/browser_ws.rs", method).is_empty(),
+                "{edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review4_rust_private_parent_type_retains_exact_method_owner() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "src/lib.rs",
+                    "mod consumer;\nstruct Repository;\nimpl Repository { pub fn inspect(&self) {} }\nmod hidden {\n struct Repository;\n impl Repository { pub fn hidden_method(&self) {} }\n fn hidden_local(repo: &Repository) { repo.hidden_method(); repo.inspect(); }\n}\n",
+                ),
+                (
+                    "src/consumer.rs",
+                    "use super::Repository;\nfn immutable(repo: &Repository) { repo.inspect(); repo.hidden_method(); }\nfn mutable(repo: &mut Repository) { repo.inspect(); repo.hidden_method(); }\nfn make() -> Repository { panic!() }\nfn inferred() { let repo = make(); repo.inspect(); repo.hidden_method(); }\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/lib.rs", "inspect"),
+            std::collections::BTreeSet::from([
+                uid(&files, "src/consumer.rs", "immutable"),
+                uid(&files, "src/consumer.rs", "mutable"),
+                uid(&files, "src/consumer.rs", "inferred")
+            ]),
+            "{edges:#?}"
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/lib.rs", "hidden_method"),
+            std::collections::BTreeSet::from([uid(&files, "src/lib.rs", "hidden_local")]),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review4_rust_typed_receiver_follows_only_exact_public_reexports() {
+        for (facade, other, target) in [
+            ("pub use crate::db::Repository;", "", Some("src/db.rs")),
+            (
+                "pub use crate::db::Original as Repository;",
+                "",
+                Some("src/db.rs"),
+            ),
+            (
+                "pub use crate::other::Repository;",
+                "pub use crate::db::Repository;",
+                Some("src/db.rs"),
+            ),
+            (
+                "pub use crate::donor::Repository;",
+                "",
+                Some("src/donor.rs"),
+            ),
+            ("use crate::db::Repository;", "", None),
+            ("pub(in crate::facade) use crate::db::Repository;", "", None),
+            ("mod hidden { pub use crate::db::Repository; }", "", None),
+            ("pub use crate::missing::Repository;", "", None),
+            (
+                "pub use crate::db::Repository;\npub use crate::donor::Repository;",
+                "",
+                None,
+            ),
+            (
+                "pub use crate::other::Repository;",
+                "pub use crate::facade::Repository;",
+                None,
+            ),
+        ] {
+            let (files, edges) = review_edges(
+                &[
+                    (
+                        "src/lib.rs",
+                        "mod db; mod donor; mod consumer; mod facade; mod other;\npub use facade::Repository;",
+                    ),
+                    ("src/facade.rs", facade),
+                    ("src/other.rs", other),
+                    (
+                        "src/db.rs",
+                        "pub struct Repository;\nimpl Repository { pub fn inspect(&self) {} }\npub struct Original;\nimpl Original { pub fn inspect_original(&self) {} }\nmod hidden {\n pub struct Repository;\n impl Repository { pub fn hidden_repository(&self) {} }\n pub struct Original;\n impl Original { pub fn hidden_original(&self) {} }\n}\n",
+                    ),
+                    (
+                        "src/donor.rs",
+                        "pub struct Repository;\nimpl Repository { pub fn inspect(&self) {} }\n",
+                    ),
+                    (
+                        "src/consumer.rs",
+                        "use crate::{Repository};\nfn immutable(repo: &Repository) { repo.inspect(); repo.inspect_original(); repo.hidden_repository(); repo.hidden_original(); }\nfn mutable(repo: &mut Repository) { repo.inspect(); repo.inspect_original(); repo.hidden_repository(); repo.hidden_original(); }\nfn make() -> Repository { panic!() }\nfn inferred() { let repo = make(); repo.inspect(); repo.inspect_original(); repo.hidden_repository(); repo.hidden_original(); }\nmod hidden { pub struct Repository; }\n",
+                    ),
+                ],
+                Language::Rust,
+            );
+            for method in ["hidden_repository", "hidden_original"] {
+                assert!(
+                    review_callers(&files, &edges, "src/db.rs", method).is_empty(),
+                    "{facade}: {edges:#?}"
+                );
+            }
+            let callers = std::collections::BTreeSet::from([
+                uid(&files, "src/consumer.rs", "immutable"),
+                uid(&files, "src/consumer.rs", "mutable"),
+                uid(&files, "src/consumer.rs", "inferred"),
+            ]);
+            for (file, method) in [
+                ("src/db.rs", "inspect"),
+                ("src/db.rs", "inspect_original"),
+                ("src/donor.rs", "inspect"),
+            ] {
+                let expected = if target == Some(file)
+                    && (method == "inspect_original") == facade.contains("Original as Repository")
+                {
+                    callers.clone()
+                } else {
+                    Default::default()
+                };
+                assert_eq!(
+                    review_callers(&files, &edges, file, method),
+                    expected,
+                    "{facade}: {edges:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review4_rust_item_matching_module_filename_keeps_exact_factory() {
+        let (files, edges) = review_edges(
+            &[
+                ("src/lib.rs", "mod consumer; mod factory; mod invalid;"),
+                (
+                    "src/consumer.rs",
+                    r#"use crate::factory::factory;
+fn bare_user() { let value = factory(); value.work(); }
+mod namespace {
+ use crate::factory;
+ fn module_user() { factory::factory(); }
+ fn unknown_receiver(factory: Unknown) { factory.factory(); }
+}
+"#,
+                ),
+                (
+                    "src/invalid.rs",
+                    "use crate::factory::factory;\nfn invalid_value_path() { factory::factory(); }\nfn invalid_method_path() { factory::work(); }\nfn invalid_value_dot() { factory.work(); }\n",
+                ),
+                (
+                    "src/factory.rs",
+                    "pub struct Service;\nimpl Service { pub fn work(&self) {} }\npub fn factory() -> Service { Service }\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/factory.rs", "work"),
+            std::collections::BTreeSet::from([uid(&files, "src/consumer.rs", "bare_user")]),
+            "{edges:#?}"
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/factory.rs", "factory"),
+            std::collections::BTreeSet::from([
+                uid(&files, "src/consumer.rs", "bare_user"),
+                uid(&files, "src/consumer.rs", "module_user")
+            ]),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review4_plain_rust_module_import_keeps_qualified_free_call() {
+        let (files, edges) = review_edges(
+            &[
+                ("src/lib.rs", "mod consumer; mod provider;"),
+                (
+                    "src/consumer.rs",
+                    "use crate::provider;\nfn user() { provider::factory(); }\nfn shadow(provider: Unknown) { provider.factory(); }\n",
+                ),
+                ("src/provider.rs", "pub fn factory() {}\n"),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/provider.rs", "factory"),
+            std::collections::BTreeSet::from([uid(&files, "src/consumer.rs", "user")]),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review4_function_local_type_retains_exact_impl_owner() {
+        let path = "src/lib.rs";
+        let source = r#"struct T;
+impl T { fn top(&self) {} }
+fn local_user() {
+ struct T;
+ impl T { fn local(&self) {} }
+ let value = T;
+ value.local(); value.top();
+}
+fn top_user(value: &T) { value.top(); value.local(); }
+"#;
+        let (files, edges) = review_edges(&[(path, source)], Language::Rust);
+        assert_eq!(
+            review_callers(&files, &edges, path, "local"),
+            std::collections::BTreeSet::from([uid(&files, path, "local_user")]),
+            "{edges:#?}"
+        );
+        assert_eq!(
+            review_callers(&files, &edges, path, "top"),
+            std::collections::BTreeSet::from([uid(&files, path, "top_user")]),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review4_same_line_module_imports_keep_byte_identity() {
+        let provider = "pub struct First;\nimpl First { pub fn first(&self) {} }\npub struct Second;\nimpl Second { pub fn second(&self) {} }\npub fn first_factory() -> First { First }\npub fn second_factory() -> Second { Second }\n";
+        for source in [
+            "use crate::provider::First as Alias; mod nested { use crate::provider::Second as Alias;\n fn nested_user(value: &Alias) { value.second(); value.first(); }\n}\nfn top_user(value: &Alias) { value.first(); value.second(); }\n",
+            "use crate::provider::first_factory as factory; mod nested { use crate::provider::second_factory as factory;\n fn nested_user() { let value = factory(); value.second(); value.first(); }\n}\nfn top_user() { let value = factory(); value.first(); value.second(); }\n",
+        ] {
+            let (files, edges) = review_edges(
+                &[
+                    ("src/lib.rs", "mod consumer; mod provider;"),
+                    ("src/consumer.rs", source),
+                    ("src/provider.rs", provider),
+                ],
+                Language::Rust,
+            );
+            assert_eq!(
+                review_callers(&files, &edges, "src/provider.rs", "first"),
+                std::collections::BTreeSet::from([uid(&files, "src/consumer.rs", "top_user")]),
+                "{source}: {edges:#?}"
+            );
+            assert_eq!(
+                review_callers(&files, &edges, "src/provider.rs", "second"),
+                std::collections::BTreeSet::from([uid(&files, "src/consumer.rs", "nested_user")]),
+                "{source}: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review4_exact_imported_factory_survives_hidden_same_name_functions() {
+        let path = "src/consumer.rs";
+        let source = r#"struct Wrong;
+impl Wrong { fn work(&self) {} }
+fn factory() -> Wrong { Wrong }
+mod hidden { fn factory() -> super::Wrong { todo!() } }
+mod tests {
+ use crate::provider::factory;
+ fn imported_user() { let value = factory(); value.work(); }
+ fn shadow(factory: Unknown) { let value = factory(); value.work(); }
+}
+mod outside { fn missing() { let value = factory(); value.work(); } }
+"#;
+        let (files, edges) = review_edges(
+            &[
+                ("src/lib.rs", "mod consumer; mod provider;"),
+                (path, source),
+                (
+                    "src/provider.rs",
+                    "pub struct ExternalType;\nimpl ExternalType { pub fn work(&self) {} }\npub fn factory() -> ExternalType { ExternalType }\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/provider.rs", "work"),
+            std::collections::BTreeSet::from([uid(&files, path, "imported_user")]),
+            "{files:#?} {edges:#?}"
+        );
+        assert!(
+            review_callers(&files, &edges, path, "work").is_empty(),
+            "hidden function must not donate Wrong: {edges:#?}"
+        );
+        assert!(
+            edges.iter().any(|edge| edge.edge_type == EdgeType::Calls
+                && edge.source_uid == uid(&files, path, "imported_user")
+                && edge.target_uid == uid(&files, "src/provider.rs", "factory")),
+            "exact external factory: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review4_imported_annotation_and_return_refuse_hidden_local_type_donation() {
+        let path = "src/consumer.rs";
+        let source = r#"use crate::provider::ExternalType;
+mod hidden {
+ struct ExternalType;
+ impl ExternalType { fn work(&self) {} }
+ fn local(value: &ExternalType) { value.work(); }
+}
+fn annotated(value: &ExternalType) { value.work(); }
+fn imported_return() -> ExternalType { todo!() }
+fn returned() { let value = imported_return(); value.work(); }
+fn shadow(value: &ExternalType) { let value = unknown(); value.work(); }
+mod missing {
+ use missing_provider::*;
+ fn absent(value: &ExternalType) { value.work(); }
+}
+"#;
+        let (files, edges) = review_edges(
+            &[
+                ("src/lib.rs", "mod consumer; mod provider;"),
+                (path, source),
+                (
+                    "src/provider.rs",
+                    "pub struct ExternalType;\nimpl ExternalType { pub fn work(&self) {} }\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/provider.rs", "work"),
+            ["annotated", "returned"]
+                .into_iter()
+                .map(|name| uid(&files, path, name))
+                .collect(),
+            "{files:#?} {edges:#?}"
+        );
+        assert_eq!(
+            review_callers(&files, &edges, path, "work"),
+            std::collections::BTreeSet::from([uid(&files, path, "local")]),
+            "hidden type only owns its actual local parameter: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review4_rust_inline_module_factories_and_unit_constructors_keep_exact_methods() {
+        let path = "src/lib.rs";
+        let source = r#"struct KeyTr3;
+impl KeyTr3 { fn seed_unacked(&self) {} }
+fn top_helper() -> KeyTr3 { KeyTr3 }
+mod tests {
+ use super::*;
+ fn nested_helper() -> KeyTr3 { KeyTr3 }
+ fn nested_factory_user() { let t = nested_helper(); t.seed_unacked(); }
+ fn unit_user() { let t = KeyTr3; t.seed_unacked(); }
+ fn annotated_control() { let t: KeyTr3 = KeyTr3; t.seed_unacked(); }
+ fn outer_factory_control() { let t = top_helper(); t.seed_unacked(); }
+ fn local_shadow(KeyTr3: Unknown) { let t = KeyTr3; t.seed_unacked(); }
+ fn factory_shadow(nested_helper: Unknown) { let t = nested_helper(); t.seed_unacked(); }
+ fn receiver_shadow() { let t = nested_helper(); { let t = unknown(); t.seed_unacked(); } }
+}
+mod unresolved {
+ use missing::*;
+ fn invalid() { let t = KeyTr3; t.seed_unacked(); }
+}
+"#;
+        let (files, edges) = review_edges(
+            &[
+                (path, source),
+                (
+                    "other/lib.rs",
+                    "struct Other;\nimpl Other { fn seed_unacked(&self) {} }\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, path, "seed_unacked"),
+            [
+                "nested_factory_user",
+                "unit_user",
+                "annotated_control",
+                "outer_factory_control"
+            ]
+            .into_iter()
+            .map(|name| uid(&files, path, name))
+            .collect(),
+            "{files:#?} {edges:#?}"
+        );
+        assert!(
+            review_callers(&files, &edges, "other/lib.rs", "seed_unacked").is_empty(),
+            "wrong owner: {edges:#?}"
+        );
+        for name in ["nested_helper", "nested_factory_user"] {
+            let symbol = files[0].1.iter().find(|s| s.name == name).unwrap();
+            assert_eq!(
+                symbol.kind,
+                SymbolKind::Function,
+                "module member is a free function: {symbol:#?}"
+            );
+        }
+        let method = files[0]
+            .1
+            .iter()
+            .find(|s| s.name == "seed_unacked")
+            .unwrap();
+        assert_eq!(method.kind, SymbolKind::Method);
+    }
+
+    #[test]
+    fn review4_rust_exact_member_return_keeps_nested_module_paths() {
+        let path = "src/lib.rs";
+        let source = r#"struct OrbitPaths;
+impl OrbitPaths { fn create_private_dirs(&self) {} }
+mod tests {
+ use super::*;
+ struct TempTree;
+ impl TempTree {
+  fn new() -> Self { TempTree }
+  fn paths(&self) -> OrbitPaths { OrbitPaths }
+ }
+ fn caller() { let tree = TempTree::new(); let paths = tree.paths(); paths.create_private_dirs(); }
+ fn wrong(tree: Unknown) { let paths = tree.paths(); paths.create_private_dirs(); }
+ fn shadow() { let tree = TempTree::new(); let tree = unknown(); let paths = tree.paths(); paths.create_private_dirs(); }
+}
+"#;
+        let (files, edges) = review_edges(&[(path, source)], Language::Rust);
+        assert_eq!(
+            review_callers(&files, &edges, path, "create_private_dirs"),
+            std::collections::BTreeSet::from([uid(&files, path, "caller")]),
+            "{files:#?} {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review4_js_implicit_constructor_field_is_exact_and_shadow_safe() {
+        let path = "src/service.js";
+        let source = r#"class Store { query() {} }
+class Controller {
+ constructor() { this.store = new Store(); }
+ run() { this.store.query(); }
+}
+class UnknownController {
+ constructor() { this.store = unknown(); }
+ runUnknown() { this.store.query(); }
+}
+class ChangedController {
+ constructor() { this.store = new Store(); this.store = unknown(); }
+ runChanged() { this.store.query(); }
+}
+class ShadowController {
+ constructor(Store) { this.store = new Store(); }
+ runShadow() { this.store.query(); }
+}
+class CallbackController {
+ constructor() { function callback() { this.store = new Store(); } }
+ runCallback() { this.store.query(); }
+}
+"#;
+        let (files, edges) = review_edges(&[(path, source)], Language::JavaScript);
+        assert_eq!(
+            review_callers(&files, &edges, path, "query"),
+            std::collections::BTreeSet::from([uid(&files, path, "run")]),
+            "{files:#?} {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review4_commonjs_literal_method_does_not_export_same_named_free_function() {
+        let path = "src/provider.js";
+        let (files, edges) = review_edges(
+            &[
+                (
+                    path,
+                    "function run() {}\nmodule.exports = {\n run() {}\n};\n",
+                ),
+                (
+                    "src/user.js",
+                    "const api = require('./provider');\nfunction user() { api.run(); }\n",
+                ),
+            ],
+            Language::JavaScript,
+        );
+        let free = files[0]
+            .1
+            .iter()
+            .find(|symbol| symbol.name == "run" && symbol.start_line == 1)
+            .expect("actual free declaration");
+        let method = files[0]
+            .1
+            .iter()
+            .find(|symbol| symbol.name == "run" && symbol.start_line == 3)
+            .expect("actual literal method");
+        assert_eq!(free.visibility, Visibility::Private);
+        assert!(!free.is_entry_point);
+        assert_eq!(method.parent_name.as_deref(), Some("module.exports"));
+        let target = symbol_uid("repo:test:abc", path, &method.name, method.start_line);
+        let caller = uid(&files, "src/user.js", "user");
+        let calls: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.edge_type == EdgeType::Calls && edge.source_uid == caller)
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "nonvacuous exact call: {files:#?} {edges:#?}"
+        );
+        assert_eq!(
+            calls[0].target_uid, target,
+            "literal declaration identity: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review4_commonjs_literal_method_does_not_forward_same_named_import() {
+        let (files, edges) = review_edges(
+            &[
+                ("src/other.js", "export function run() {}\n"),
+                (
+                    "src/provider.js",
+                    "import { run } from './other';\nmodule.exports = {\n run() {}\n};\n",
+                ),
+                (
+                    "src/missing_provider.js",
+                    "import { run } from './missing';\nmodule.exports = {\n run() {}\n};\n",
+                ),
+                (
+                    "src/forward.js",
+                    "import { run } from './other'; module.exports = { run };\n",
+                ),
+                (
+                    "src/user.js",
+                    "const good = require('./provider'); const missing = require('./missing_provider'); const forwarded = require('./forward');\nfunction good_user() { good.run(); }\nfunction missing_user() { missing.run(); }\nfunction forwarding_control() { forwarded.run(); }\n",
+                ),
+            ],
+            Language::JavaScript,
+        );
+        for (caller_name, path, line) in [
+            ("good_user", "src/provider.js", 3),
+            ("missing_user", "src/missing_provider.js", 3),
+            ("forwarding_control", "src/other.js", 1),
+        ] {
+            let caller = uid(&files, "src/user.js", caller_name);
+            let calls: Vec<_> = edges
+                .iter()
+                .filter(|edge| edge.edge_type == EdgeType::Calls && edge.source_uid == caller)
+                .collect();
+            assert_eq!(
+                calls.len(),
+                1,
+                "nonvacuous {caller_name}: {files:#?} {edges:#?}"
+            );
+            assert_eq!(
+                calls[0].target_uid,
+                symbol_uid("repo:test:abc", path, "run", line),
+                "{caller_name}: {edges:#?}"
+            );
+        }
+        let decoy = symbol_uid("repo:test:abc", "src/other.js", "run", 1);
+        for name in ["good_user", "missing_user"] {
+            let caller = uid(&files, "src/user.js", name);
+            assert!(!edges.iter().any(|edge| edge.edge_type == EdgeType::Calls
+                && edge.source_uid == caller
+                && edge.target_uid == decoy));
+        }
+    }
+
+    #[test]
+    fn review4_commonjs_literal_identity_survives_aliases_and_other_method_owners() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "src/a.js",
+                    "function run() {}\nexport class Keeper { run() {} }\nmodule.exports = {\n run() {},\n free: run\n};\n",
+                ),
+                ("src/b.js", "module.exports = {\n run() {}\n};\n"),
+                ("src/barrel.js", "export { run as execute } from './a';\n"),
+                (
+                    "src/user.js",
+                    "const a = require('./a'); const b = require('./b');\nimport { execute } from './barrel';\nfunction first() { a.run(); }\nfunction second() { b.run(); }\nfunction forwarded() { execute(); }\nfunction identifier() { a.free(); }\nfunction unknown(a) { a.run(); }\n",
+                ),
+            ],
+            Language::JavaScript,
+        );
+        for (caller_name, path, line) in [
+            ("first", "src/a.js", 4),
+            ("second", "src/b.js", 2),
+            ("forwarded", "src/a.js", 4),
+            ("identifier", "src/a.js", 1),
+        ] {
+            let caller = uid(&files, "src/user.js", caller_name);
+            let calls: Vec<_> = edges
+                .iter()
+                .filter(|edge| edge.edge_type == EdgeType::Calls && edge.source_uid == caller)
+                .collect();
+            assert_eq!(calls.len(), 1, "{caller_name}: {files:#?} {edges:#?}");
+            assert_eq!(
+                calls[0].target_uid,
+                symbol_uid("repo:test:abc", path, "run", line),
+                "{caller_name}: {edges:#?}"
+            );
+        }
+        let unknown = uid(&files, "src/user.js", "unknown");
+        assert!(
+            !edges.iter().any(|edge| edge.edge_type == EdgeType::Calls
+                && edge.source_uid == unknown
+                && edge.target_uid.starts_with("sym:")),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review4_commonjs_direct_function_assignments_and_class_exports_remain_supported() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "src/direct.js",
+                    "module.exports.run = function() {};\nexports.other = () => {};\nclass Thing {}\nmodule.exports.Thing = Thing;\n",
+                ),
+                (
+                    "src/user.js",
+                    "const api = require('./direct'); const { Thing } = require('./direct');\nfunction first() { api.run(); }\nfunction second() { api.other(); }\nfunction construct() { new Thing(); }\n",
+                ),
+            ],
+            Language::JavaScript,
+        );
+        for (caller_name, target_name, line) in [
+            ("first", "run", 1),
+            ("second", "other", 2),
+            ("construct", "Thing", 3),
+        ] {
+            let caller = uid(&files, "src/user.js", caller_name);
+            let calls: Vec<_> = edges
+                .iter()
+                .filter(|edge| edge.edge_type == EdgeType::Calls && edge.source_uid == caller)
+                .collect();
+            assert_eq!(calls.len(), 1, "{caller_name}: {edges:#?}");
+            assert_eq!(
+                calls[0].target_uid,
+                symbol_uid("repo:test:abc", "src/direct.js", target_name, line),
+                "{edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review4_duplicate_literal_export_records_refuse_without_overwrite_order_guessing() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "src/provider.js",
+                    "module.exports = {\n run() {}\n};\nmodule.exports = {\n run() {}\n};\n",
+                ),
+                (
+                    "src/user.js",
+                    "const api = require('./provider'); function user() { api.run(); }",
+                ),
+            ],
+            Language::JavaScript,
+        );
+        let caller = uid(&files, "src/user.js", "user");
+        let targets: std::collections::HashSet<_> = files[0]
+            .1
+            .iter()
+            .map(|symbol| {
+                symbol_uid(
+                    "repo:test:abc",
+                    "src/provider.js",
+                    &symbol.name,
+                    symbol.start_line,
+                )
+            })
+            .collect();
+        assert!(
+            !edges.iter().any(|edge| edge.edge_type == EdgeType::Calls
+                && edge.source_uid == caller
+                && targets.contains(&edge.target_uid)),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review4_commonjs_literal_method_is_an_exact_export() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "src/provider.js",
+                    "module.exports = { run(module) {}, get value() { return 1; } };\nconst decoy = { hidden() {} };\nfunction shadowModule(module) {}\n",
+                ),
+                (
+                    "src/user.js",
+                    "const api = require('./provider');\nfunction user() { api.run(); }\nfunction unknown(api) { api.run(); }\nfunction hidden() { api.hidden(); }\nfunction getter() { api.value(); }\n",
+                ),
+            ],
+            Language::JavaScript,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/provider.js", "run"),
+            std::collections::BTreeSet::from([uid(&files, "src/user.js", "user")]),
+            "{files:#?} {edges:#?}"
+        );
+        for name in ["hidden", "value"] {
+            assert!(
+                review_callers(&files, &edges, "src/provider.js", name).is_empty(),
+                "{name}: {edges:#?}"
+            );
+        }
+        let run = files[0]
+            .1
+            .iter()
+            .find(|symbol| symbol.name == "run")
+            .unwrap();
+        assert_eq!(run.parent_name.as_deref(), Some("module.exports"));
+        assert_eq!(run.visibility, Visibility::Public);
+        assert!(run.is_entry_point);
+    }
+
+    #[test]
+    fn review4_commonjs_literal_method_requires_exact_unshadowed_top_level_export() {
+        for source in [
+            "const ordinary = { run() {} };",
+            "function later() { module.exports = { run() {} }; }",
+            "module.exports = { ['run']() {} };",
+            "const module = { exports: null }; module.exports = { run() {} };",
+            "module.exports = { run() {} }; const module = { exports: null };",
+            "module.exports = { run() {} }; if (false) { var module; }",
+        ] {
+            let (files, edges) = review_edges(
+                &[
+                    ("src/provider.js", source),
+                    (
+                        "src/user.js",
+                        "const api = require('./provider'); function user() { api.run(); }",
+                    ),
+                ],
+                Language::JavaScript,
+            );
+            let provider_uids: std::collections::HashSet<_> = files[0]
+                .1
+                .iter()
+                .map(|symbol| {
+                    symbol_uid(
+                        "repo:test:abc",
+                        "src/provider.js",
+                        &symbol.name,
+                        symbol.start_line,
+                    )
+                })
+                .collect();
+            assert!(
+                !edges.iter().any(|edge| edge.edge_type == EdgeType::Calls
+                    && provider_uids.contains(&edge.target_uid)),
+                "{source}: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review2_macro_tuple_receiver_shadow_uses_its_lexical_declaration() {
+        let path = "src/library.rs";
+        let source = r#"use std::sync::Arc;
+struct Storage;
+impl Storage { pub fn create_nonce(&self) -> bool { true } }
+fn factory() -> ((), Storage) { todo!() }
+fn inner() {
+ let (_, db) = factory();
+ { let db = unknown_factory(); assert!(db.create_nonce()); }
+}
+fn after() {
+ let (_, db) = factory();
+ { let db = unknown_factory(); }
+ assert!(db.create_nonce());
+}
+fn sibling() {
+ let (_, db) = factory();
+ { let db = unknown_factory(); }
+ { assert!(db.create_nonce()); }
+}
+"#;
+        let (files, edges) = review_edges(&[(path, source)], Language::Rust);
+        assert_eq!(
+            review_callers(&files, &edges, path, "create_nonce"),
+            ["after", "sibling"]
+                .into_iter()
+                .map(|name| uid(&files, path, name))
+                .collect(),
+            "macro scopes must not borrow an unknown inner declaration's outer type: {files:#?} {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review2_rust_simple_typed_alias_keeps_its_scoped_source_type() {
+        let path = "src/library.rs";
+        let source = r#"struct Storage;
+impl Storage { pub fn create_nonce(&self) {} }
+fn user(db: &Storage) {
+ let alias = db;
+ alias.create_nonce();
+}
+fn unknown(db: &Storage) {
+ let db = unknown_factory();
+ let alias = db;
+ alias.create_nonce();
+}
+"#;
+        let (files, edges) = review_edges(&[(path, source)], Language::Rust);
+        assert_eq!(
+            review_callers(&files, &edges, path, "create_nonce"),
+            std::collections::BTreeSet::from([uid(&files, path, "user")]),
+            "simple alias preserves its active typed source; unknown shadow cannot donate it: {files:#?} {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review2_rust_tuple_factory_receivers_are_scoped_and_typed() {
+        let path = "src/library.rs";
+        let source = r#"use std::sync::Arc;
+struct Storage;
+impl Storage {
+ pub fn create_nonce(&self) {}
+ pub fn len(&self) -> usize { 1 }
+ pub fn contains(&self) -> bool { true }
+}
+struct Registry;
+impl Registry { pub fn register(&self) {} }
+async fn spawn_server() -> (String, Arc<Storage>, Registry) { todo!() }
+async fn user() {
+ let (_, db, registry) = spawn_server().await;
+ db.create_nonce();
+ registry.register();
+}
+async fn inner_unknown() {
+ let (_, db, _) = spawn_server().await;
+ { let db = unknown_factory(); db.create_nonce(); }
+}
+async fn after_inner() {
+ let (_, db, _) = spawn_server().await;
+ { let db = unknown_factory(); }
+ db.create_nonce();
+}
+async fn sibling() {
+ let (_, db, _) = spawn_server().await;
+ { let db = unknown_factory(); }
+ { db.create_nonce(); }
+}
+async fn parameter_shadow(db: Unknown) { db.create_nonce(); }
+async fn factory_shadow(spawn_server: Unknown) {
+ let (_, db, _) = spawn_server().await;
+ db.create_nonce();
+}
+async fn factory_local_shadow() {
+ let spawn_server = unknown_factory();
+ let (_, db, _) = spawn_server().await;
+ db.create_nonce();
+}
+async fn unknown_tuple() {
+ let (_, db, _) = unknown_factory().await;
+ db.create_nonce();
+}
+async fn generic_guards(items: Vec<u8>, value: String) {
+ items.len(); items.contains(&1);
+ format!("{}", value.len());
+}
+async fn same_line_inside() { let (_, db, _) = spawn_server().await; { let db = unknown_factory(); db.create_nonce(); } }
+async fn same_line_after() { let (_, db, _) = spawn_server().await; { let db = unknown_factory(); } db.create_nonce(); }
+"#;
+        let (files, edges) = review_edges(&[(path, source)], Language::Rust);
+        let expected: std::collections::BTreeSet<_> =
+            ["user", "after_inner", "sibling", "same_line_after"]
+                .into_iter()
+                .map(|name| uid(&files, path, name))
+                .collect();
+        assert_eq!(
+            review_callers(&files, &edges, path, "create_nonce"),
+            expected,
+            "{files:#?} {edges:#?}"
+        );
+        assert_eq!(
+            review_callers(&files, &edges, path, "register"),
+            std::collections::BTreeSet::from([uid(&files, path, "user")]),
+            "{edges:#?}"
+        );
+        for name in ["len", "contains"] {
+            assert!(
+                review_callers(&files, &edges, path, name).is_empty(),
+                "{name}: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review2_later_const_is_referenced_from_deferred_function_body() {
+        let path = "src/library.js";
+        let (files, edges) = review_edges(
+            &[(
+                path,
+                "function user() { return later(); }\nconst later = () => 1;\nuser();\nfunction shadow(later) { return later(); }\nfunction early() { local(); const local = () => 2; }\n",
+            )],
+            Language::JavaScript,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, path, "later"),
+            std::collections::BTreeSet::from([uid(&files, path, "user")]),
+            "{edges:#?}"
+        );
+        assert!(
+            review_callers(&files, &edges, path, "local").is_empty(),
+            "same-body TDZ: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review2_constructor_field_evidence_refuses_reassignment_and_constructor_shadow() {
+        for (members, expected) in [
+            (
+                "store;\n constructor() { this.store = new Store(); }\n run() { this.store.query(); }\n",
+                true,
+            ),
+            (
+                "store = new Store();\n replace() { this.store = unknownFactory(); }\n run() { this.store.query(); }\n",
+                false,
+            ),
+            (
+                "store;\n constructor(Store) { this.store = new Store(); }\n run() { this.store.query(); }\n",
+                false,
+            ),
+            (
+                "store;\n constructor() { this.store = unknownFactory(); }\n run() { this.store.query(); }\n",
+                false,
+            ),
+        ] {
+            let path = "src/library.js";
+            let source =
+                format!("class Store {{\n query() {{}}\n}}\nclass Controller {{\n{members}}}\n");
+            let (files, edges) = review_edges(&[(path, &source)], Language::JavaScript);
+            let expected = if expected {
+                std::collections::BTreeSet::from([uid(&files, path, "run")])
+            } else {
+                std::collections::BTreeSet::new()
+            };
+            assert_eq!(
+                review_callers(&files, &edges, path, "query"),
+                expected,
+                "{members}: {files:#?} {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review2_scalar_factory_return_and_tuple_types_keep_import_origin() {
+        let (files, edges) = review_edges(
+            &[
+                ("src/lib.rs", "mod storage; mod provider; mod user;\n"),
+                (
+                    "src/storage.rs",
+                    "pub struct Storage;\nimpl Storage { pub fn create_nonce(&self) {} }\n",
+                ),
+                (
+                    "other/storage.rs",
+                    "pub struct Storage;\nimpl Storage { pub fn create_nonce(&self) {} }\n",
+                ),
+                (
+                    "src/provider.rs",
+                    "use crate::storage::Storage;\npub fn factory() -> Storage { todo!() }\n",
+                ),
+                (
+                    "src/user.rs",
+                    "use crate::provider::factory;\nfn user() { let db = factory(); db.create_nonce(); }\nfn shadow(factory: Unknown) { let db = factory(); db.create_nonce(); }\nfn inner() { let db = factory(); { let db = unknown(); db.create_nonce(); } }\nfn after() { let db = factory(); { let db = unknown(); } db.create_nonce(); }\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/storage.rs", "create_nonce"),
+            ["user", "after"]
+                .into_iter()
+                .map(|name| uid(&files, "src/user.rs", name))
+                .collect(),
+            "{files:#?} {edges:#?}"
+        );
+        assert!(
+            review_callers(&files, &edges, "other/storage.rs", "create_nonce").is_empty(),
+            "wrong class origin: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review2_field_constructor_alias_preserves_duplicate_class_origin() {
+        let (files, edges) = review_edges(
+            &[
+                ("src/store.ts", "export class Store {\n query() {}\n}\n"),
+                ("other/store.ts", "export class Store {\n query() {}\n}\n"),
+                (
+                    "src/user.ts",
+                    "import { Store as Selected } from './store';\nclass Controller {\n store = new Selected();\n run() { this.store.query(); }\n}\nclass Unknown {\n store = unknownFactory();\n bad() { this.store.query(); }\n}\n",
+                ),
+            ],
+            Language::TypeScript,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/store.ts", "query"),
+            std::collections::BTreeSet::from([uid(&files, "src/user.ts", "run")]),
+            "{files:#?} {edges:#?}"
+        );
+        assert!(
+            review_callers(&files, &edges, "other/store.ts", "query").is_empty(),
+            "wrong class origin: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review2_std_pointer_origin_refuses_custom_arc_receiver_types() {
+        for (pointer, prefix, expected) in [
+            ("Box<Storage>", "", true),
+            ("std::boxed::Box<Storage>", "", true),
+            (
+                "Box<Storage>",
+                "mod other { pub struct Box<T>(pub T); impl<T> Box<T> { pub fn create_nonce(&self) {} } }\nuse other::*;\n",
+                false,
+            ),
+            ("std::sync::Arc<Storage>", "", true),
+            ("Arc<Storage>", "use std::sync::Arc;\n", true),
+            ("Shared<Storage>", "use std::sync::Arc as Shared;\n", true),
+            (
+                "Arc<Storage>",
+                "struct Arc<T> { inner: T }\nimpl<T> Arc<T> { fn create_nonce(&self) {} }\n",
+                false,
+            ),
+            (
+                "other::Arc<Storage>",
+                "mod other { pub struct Arc<T> { inner: T } }\n",
+                false,
+            ),
+        ] {
+            let path = "src/library.rs";
+            let source = format!(
+                "{prefix}struct Storage;\nimpl Storage {{ pub fn create_nonce(&self) {{}} }}\nfn user(db: {pointer}) {{ db.create_nonce(); }}\n"
+            );
+            let (files, edges) = review_edges(&[(path, &source)], Language::Rust);
+            let storage = files[0]
+                .1
+                .iter()
+                .find(|symbol| {
+                    symbol.name == "create_nonce"
+                        && symbol.parent_name.as_deref() == Some("Storage")
+                })
+                .unwrap();
+            let target = symbol_uid("repo:test:abc", path, &storage.name, storage.start_line);
+            let actual: std::collections::BTreeSet<_> = edges
+                .iter()
+                .filter(|edge| edge.edge_type == EdgeType::Calls && edge.target_uid == target)
+                .map(|edge| edge.source_uid.clone())
+                .collect();
+            let expected = if expected {
+                std::collections::BTreeSet::from([uid(&files, path, "user")])
+            } else {
+                std::collections::BTreeSet::new()
+            };
+            assert_eq!(actual, expected, "{pointer}: {files:#?} {edges:#?}");
+        }
+    }
+
+    #[test]
+    fn review2_rust_named_super_import_reaches_exact_parent_item() {
+        let (files, edges) = review_edges(
+            &[
+                ("src/lib.rs", "mod child;\nfn helper() {}\n"),
+                (
+                    "src/child.rs",
+                    "use super::helper;\nfn user() { helper(); }\n",
+                ),
+                ("other/lib.rs", "fn helper() {}\n"),
+                ("src/outsider.rs", "fn outsider() { helper(); }\n"),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/lib.rs", "helper"),
+            std::collections::BTreeSet::from([uid(&files, "src/child.rs", "user")]),
+            "{edges:#?}"
+        );
+        assert!(review_callers(&files, &edges, "other/lib.rs", "helper").is_empty());
+    }
+
+    #[test]
+    fn review5_rust_imported_type_qualified_functions_keep_exact_owner() {
+        for (lib, provider, user, import) in [
+            (
+                "src/lib.rs",
+                "src/storage.rs",
+                "src/user.rs",
+                "crate::storage::Storage",
+            ),
+            (
+                "crates/storage-one/src/lib.rs",
+                "crates/storage-one/src/storage.rs",
+                "crates/client/src/lib.rs",
+                "storage_one::storage::Storage",
+            ),
+        ] {
+            let provider_source = "pub struct Storage;\nimpl Storage {\n pub fn open() -> Storage { Storage }\n pub fn method(&self) {}\n}\n";
+            let user_source = format!(
+                "use {import} as Selected;\nfn direct() {{ Selected::open(); }}\nfn parameter(db: &Selected) {{ db.method(); }}\nfn ufcs(db: &Selected) {{ Selected::method(db); }}\nfn shadow(Selected: Unknown) {{ Selected::open(); }}\nfn dot() {{ Selected.open(); }}\nfn returned() {{ let db = Selected::open(); db.method(); }}\n"
+            );
+            let (files, edges) = review_edges(
+                &[
+                    (lib, "pub mod storage;\nmod user;\n"),
+                    (provider, provider_source),
+                    (user, &user_source),
+                    ("other/storage.rs", provider_source),
+                ],
+                Language::Rust,
+            );
+            assert_eq!(
+                review_callers(&files, &edges, provider, "open"),
+                ["direct", "returned"]
+                    .into_iter()
+                    .map(|name| uid(&files, user, name))
+                    .collect(),
+                "{import}: {files:#?} {edges:#?}"
+            );
+            assert_eq!(
+                review_callers(&files, &edges, provider, "method"),
+                ["parameter", "ufcs", "returned"]
+                    .into_iter()
+                    .map(|name| uid(&files, user, name))
+                    .collect(),
+                "{import}: {files:#?} {edges:#?}"
+            );
+            assert!(review_callers(&files, &edges, "other/storage.rs", "open").is_empty());
+            assert!(review_callers(&files, &edges, "other/storage.rs", "method").is_empty());
+        }
+    }
+
+    #[test]
+    fn review5_rust_imported_type_refuses_function_local_owner_donation() {
+        let provider = "src/storage.rs";
+        let (files, edges) = review_edges(
+            &[
+                ("src/lib.rs", "mod storage; mod user;\n"),
+                (
+                    provider,
+                    "pub struct Storage;\nfn hidden() { struct Storage; impl Storage { pub fn open() {} } }\n",
+                ),
+                (
+                    "src/user.rs",
+                    "use crate::storage::Storage;\nfn user() { Storage::open(); }\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert!(
+            review_callers(&files, &edges, provider, "open").is_empty(),
+            "{files:#?} {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review5_rust_imported_inline_and_reexported_type_paths_keep_terminal_owner() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "crates/provider/src/lib.rs",
+                    "pub mod process;\npub use process::testing::Runner as Exported;\n",
+                ),
+                (
+                    "crates/provider/src/process.rs",
+                    "pub mod testing {\n pub struct Runner;\n impl Runner { pub fn replying() {} }\n}\n",
+                ),
+                (
+                    "crates/user/src/lib.rs",
+                    "use provider::process::testing::Runner as Direct;\nuse provider::Exported as Alias;\nfn direct() { Direct::replying(); }\nfn alias() { Alias::replying(); }\nfn shadow(Direct: Unknown) { Direct::replying(); }\n",
+                ),
+                (
+                    "other/process.rs",
+                    "pub struct Runner;\nimpl Runner { pub fn replying() {} }\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "crates/provider/src/process.rs", "replying"),
+            ["direct", "alias"]
+                .into_iter()
+                .map(|name| uid(&files, "crates/user/src/lib.rs", name))
+                .collect(),
+            "{files:#?} {edges:#?}"
+        );
+        assert!(review_callers(&files, &edges, "other/process.rs", "replying").is_empty());
+    }
+
+    #[test]
+    fn review5_rust_inline_local_tuple_factory_keeps_parent_imported_type() {
+        let user = "crates/user/src/lib.rs";
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "crates/provider/src/lib.rs",
+                    "pub struct Storage;\nimpl Storage { pub fn method(&self) {} }\n",
+                ),
+                (
+                    user,
+                    "use provider::Storage;\n#[cfg(test)] mod tests {\n use super::*;\n fn helper() -> ((), Storage) { todo!() }\n fn caller() { let (_, db) = helper(); db.method(); }\n fn unknown(helper: Unknown) { let (_, db) = helper(); db.method(); }\n fn shadow() { let (_, db) = helper(); { let db = unknown(); db.method(); } }\n}\n",
+                ),
+                (
+                    "other/storage.rs",
+                    "pub struct Storage;\nimpl Storage { pub fn method(&self) {} }\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "crates/provider/src/lib.rs", "method"),
+            std::collections::BTreeSet::from([uid(&files, user, "caller")]),
+            "{files:#?} {edges:#?}"
+        );
+        assert!(review_callers(&files, &edges, "other/storage.rs", "method").is_empty());
+    }
+
+    #[test]
+    fn review5_rust_qualified_inner_named_import_shadows_outer_owner() {
+        let (files, edges) = review_edges(
+            &[
+                ("src/lib.rs", "mod outer; mod inner; mod user;\n"),
+                (
+                    "src/outer.rs",
+                    "pub struct Storage;\nimpl Storage { pub fn open() {} }\n",
+                ),
+                (
+                    "src/inner.rs",
+                    "pub struct Storage;\nimpl Storage { pub fn open() {} }\n",
+                ),
+                (
+                    "src/user.rs",
+                    "use crate::outer::Storage;\nfn outer() { Storage::open(); }\nmod tests { use crate::inner::Storage;\n fn inner() { Storage::open(); }\n}\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/outer.rs", "open"),
+            std::collections::BTreeSet::from([uid(&files, "src/user.rs", "outer")]),
+            "{files:#?} {edges:#?}"
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/inner.rs", "open"),
+            std::collections::BTreeSet::from([uid(&files, "src/user.rs", "inner")]),
+            "{files:#?} {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review5_rust_tuple_return_origin_precedes_caller_local_type_shadow() {
+        let provider = "crates/provider/src/lib.rs";
+        let user = "crates/user/src/lib.rs";
+        let (files, edges) = review_edges(
+            &[
+                (
+                    provider,
+                    "pub struct Storage;\nimpl Storage { pub fn method(&self) {} }\n",
+                ),
+                (
+                    user,
+                    "use provider::Storage;\nmod tests { use super::*;\n fn helper() -> ((), Storage) { todo!() }\n fn caller() {\n  struct Storage;\n  impl Storage { fn method(&self) {} }\n  let (_, db) = helper();\n  db.method();\n }\n}\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, provider, "method"),
+            std::collections::BTreeSet::from([uid(&files, user, "caller")]),
+            "{files:#?} {edges:#?}"
+        );
+        assert!(
+            review_callers(&files, &edges, user, "method").is_empty(),
+            "caller-local type cannot donate the factory's return: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review5_rust_parent_glob_respects_inner_named_alias_precedence() {
+        let user = "crates/user/src/lib.rs";
+        let provider_source = "pub struct Storage;\nimpl Storage { pub fn method(&self) {} }\n";
+        let (files, edges) = review_edges(
+            &[
+                ("crates/outer/src/lib.rs", provider_source),
+                ("crates/inner/src/lib.rs", provider_source),
+                (
+                    user,
+                    "use outer::Storage;\nmod tests { use super::*; use inner::Storage as Storage;\n fn helper() -> ((), Storage) { todo!() }\n fn caller() { let (_, db) = helper(); db.method(); }\n}\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "crates/inner/src/lib.rs", "method"),
+            std::collections::BTreeSet::from([uid(&files, user, "caller")]),
+            "{files:#?} {edges:#?}"
+        );
+        assert!(
+            review_callers(&files, &edges, "crates/outer/src/lib.rs", "method").is_empty(),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review5_rust_parent_glob_respects_module_local_type_override() {
+        let user = "crates/user/src/lib.rs";
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "crates/provider/src/lib.rs",
+                    "pub struct Storage;\nimpl Storage { pub fn method(&self) {} }\n",
+                ),
+                (
+                    user,
+                    "use provider::Storage;\nmod tests { use super::*;\n struct Storage;\n impl Storage { fn method(&self) {} }\n fn helper() -> ((), Storage) { todo!() }\n fn caller() { let (_, db) = helper(); db.method(); }\n}\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, user, "method"),
+            std::collections::BTreeSet::from([uid(&files, user, "caller")]),
+            "{files:#?} {edges:#?}"
+        );
+        assert!(
+            review_callers(&files, &edges, "crates/provider/src/lib.rs", "method").is_empty(),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review5_rust_nearer_unsupported_tuple_factory_defeats_outer_evidence() {
+        for nearest in [
+            "type OtherTuple = (Unknown,); fn helper() -> OtherTuple { todo!() }",
+            "fn helper<T>(_: T) -> (Unknown,) { todo!() }",
+        ] {
+            let call = if nearest.contains("<T>") {
+                "helper(())"
+            } else {
+                "helper()"
+            };
+            let path = "src/lib.rs";
+            let source = format!(
+                "struct Storage;\nimpl Storage {{ fn method(&self) {{}} }}\nstruct Unknown;\nfn helper() -> (Storage,) {{ todo!() }}\nfn parent() {{ let (db,) = helper(); db.method(); }}\nfn nested() {{\n {nearest}\n let (db,) = {call};\n db.method();\n}}\n"
+            );
+            let (files, edges) = review_edges(&[(path, &source)], Language::Rust);
+            assert_eq!(
+                review_callers(&files, &edges, path, "method"),
+                std::collections::BTreeSet::from([uid(&files, path, "parent")]),
+                "nearest unsupported return must not donate an outer type: {nearest}: {files:#?} {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review6_rust_same_file_sibling_inline_type_constructor_keeps_value_method() {
+        for import in [
+            "use super::testing::TempTree;",
+            "use super::testing::TempTree as Selected;",
+        ] {
+            let selected = if import.contains(" as ") {
+                "Selected"
+            } else {
+                "TempTree"
+            };
+            let path = "src/lib.rs";
+            let source = format!(
+                "pub mod testing {{\n pub struct TempTree;\n impl TempTree {{\n  pub fn new() -> Self {{ Self }}\n  pub fn layout(&self) {{}}\n }}\n}}\nmod tests {{\n {import}\n fn caller() {{ let tree = {selected}::new(); tree.layout(); }}\n fn shadow(value: Unknown) {{ let tree = value.new(); tree.layout(); }}\n fn unknown() {{ let tree = unknown(); tree.layout(); }}\n}}\n"
+            );
+            let (files, edges) = review_edges(&[(path, &source)], Language::Rust);
+            let expected = std::collections::BTreeSet::from([uid(&files, path, "caller")]);
+            assert_eq!(
+                review_callers(&files, &edges, path, "new"),
+                expected,
+                "{import}: {files:#?} {edges:#?}"
+            );
+            assert_eq!(
+                review_callers(&files, &edges, path, "layout"),
+                expected,
+                "{import}: {files:#?} {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review6_rust_same_file_inline_import_refuses_same_name_wrong_module() {
+        let path = "src/lib.rs";
+        let source = "mod wrong { pub struct TempTree; impl TempTree { pub fn new() -> Self { Self } pub fn layout(&self) {} } }\nmod testing { pub struct TempTree; impl TempTree { pub fn new() -> Self { Self } pub fn layout(&self) {} } }\nmod tests { use super::testing::TempTree as Selected; fn caller() { let tree = Selected::new(); tree.layout(); } }\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::Rust);
+        for name in ["new", "layout"] {
+            let candidates: Vec<_> = files[0]
+                .1
+                .iter()
+                .filter(|symbol| symbol.name == name)
+                .collect();
+            assert_eq!(candidates.len(), 2, "{files:#?}");
+            for candidate in candidates {
+                let actual: std::collections::BTreeSet<_> = edges
+                    .iter()
+                    .filter(|edge| {
+                        edge.edge_type == EdgeType::Calls
+                            && edge.target_uid
+                                == symbol_uid("repo:test:abc", path, name, candidate.start_line)
+                    })
+                    .map(|edge| edge.source_uid.clone())
+                    .collect();
+                let expected = if candidate.start_line == 2 {
+                    std::collections::BTreeSet::from([uid(&files, path, "caller")])
+                } else {
+                    std::collections::BTreeSet::new()
+                };
+                assert_eq!(actual, expected, "{name}: {candidate:#?} {edges:#?}");
+            }
+        }
+    }
+
+    #[test]
+    fn review6_rust_inline_type_route_boundaries_and_block_lifetime() {
+        for (middle, selected) in [
+            (
+                "use self::testing::TempTree as Selected;\nfn caller() { let tree = Selected::new(); tree.layout(); }\n",
+                "caller",
+            ),
+            (
+                "mod tests { mod nested { use super::super::testing::TempTree as Selected;\nfn caller() { let tree = Selected::new(); tree.layout(); }\n}}\n",
+                "caller",
+            ),
+            (
+                "fn caller() { { use self::testing::TempTree as Selected; let tree = Selected::new(); tree.layout(); } }\nfn outside() { let tree = Selected::new(); tree.layout(); }\n",
+                "caller",
+            ),
+        ] {
+            let path = "src/lib.rs";
+            let source = format!(
+                "pub mod testing {{\n pub struct TempTree;\n impl TempTree {{ pub fn new() -> Self {{ Self }} pub fn layout(&self) {{}} }}\n}}\n{middle}"
+            );
+            let (files, edges) = review_edges(&[(path, &source)], Language::Rust);
+            for name in ["new", "layout"] {
+                assert_eq!(
+                    review_callers(&files, &edges, path, name),
+                    std::collections::BTreeSet::from([uid(&files, path, selected)]),
+                    "{middle}: {files:#?} {edges:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review6_rust_inline_type_route_overrides_only_its_physical_file_guess() {
+        let path = "src/lib.rs";
+        let source = "pub mod testing {\n pub struct TempTree;\n impl TempTree { pub fn new() -> Self { Self } pub fn layout(&self) {} }\n}\nmod tests { use super::testing::TempTree as Selected; fn caller() { let tree = Selected::new(); tree.layout(); } }\n";
+        let decoy = "src/testing.rs";
+        let (files, edges) = review_edges(
+            &[
+                (path, source),
+                (
+                    decoy,
+                    "pub struct TempTree;\nimpl TempTree { pub fn new() -> Self { Self } pub fn layout(&self) {} }\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        for name in ["new", "layout"] {
+            assert_eq!(
+                review_callers(&files, &edges, path, name),
+                std::collections::BTreeSet::from([uid(&files, path, "caller")]),
+                "{files:#?} {edges:#?}"
+            );
+            assert!(
+                review_callers(&files, &edges, decoy, name).is_empty(),
+                "unused physical file is not the declared inline module: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review6_rust_inline_type_route_refuses_parent_escape_and_external_guess() {
+        for import in [
+            "use super::super::testing::TempTree as Selected;",
+            "use external::testing::TempTree as Selected;",
+        ] {
+            let path = "src/lib.rs";
+            let source = format!(
+                "pub mod testing {{\n pub struct TempTree;\n impl TempTree {{ pub fn new() -> Self {{ Self }} pub fn layout(&self) {{}} }}\n}}\nmod tests {{ {import} fn wrong() {{ let tree = Selected::new(); tree.layout(); }} }}\n"
+            );
+            let (files, edges) = review_edges(&[(path, &source)], Language::Rust);
+            for name in ["new", "layout"] {
+                assert!(
+                    review_callers(&files, &edges, path, name).is_empty(),
+                    "{import}: {files:#?} {edges:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review7_rust_direct_private_parent_type_preserves_constructor_and_ufcs() {
+        for (import, selected) in [
+            ("use super::Local;", "Local"),
+            ("use super::Local as Selected;", "Selected"),
+        ] {
+            let path = "src/lib.rs";
+            let source = format!(
+                "struct Local;\nimpl Local {{\n fn new() -> Self {{ Self }}\n fn run(&self) {{}}\n}}\nmod tests {{ {import}\n fn caller() {{ let x = {selected}::new(); x.run(); }}\n fn ufcs(x: &{selected}) {{ {selected}::run(x); }}\n}}\n"
+            );
+            let (files, edges) = review_edges(&[(path, &source)], Language::Rust);
+            for method in ["new", "run"] {
+                let expected = if method == "run" {
+                    std::collections::BTreeSet::from([
+                        uid(&files, path, "caller"),
+                        uid(&files, path, "ufcs"),
+                    ])
+                } else {
+                    std::collections::BTreeSet::from([uid(&files, path, "caller")])
+                };
+                assert_eq!(
+                    review_callers(&files, &edges, path, method),
+                    expected,
+                    "{import}: {files:#?} {edges:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review7_rust_private_parent_type_keeps_exact_root_owner_and_file() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "src/lib.rs",
+                    "mod child;\nstruct Local;\nimpl Local { fn new() -> Self { Self } fn run(&self) {} }\nfn hidden() { struct Local; impl Local { fn new() -> Self { Self } fn run(&self) {} } }\n",
+                ),
+                (
+                    "src/child.rs",
+                    "use super::Local as Selected;\nfn caller() { let x = Selected::new(); x.run(); }\n",
+                ),
+                (
+                    "other/lib.rs",
+                    "struct Local;\nimpl Local { fn new() -> Self { Self } fn run(&self) {} }\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        for name in ["new", "run"] {
+            let root = files[0]
+                .1
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .unwrap();
+            let actual: std::collections::BTreeSet<_> = edges
+                .iter()
+                .filter(|edge| {
+                    edge.edge_type == EdgeType::Calls
+                        && edge.target_uid
+                            == symbol_uid("repo:test:abc", "src/lib.rs", name, root.start_line)
+                })
+                .map(|edge| edge.source_uid.clone())
+                .collect();
+            assert_eq!(
+                actual,
+                std::collections::BTreeSet::from([uid(&files, "src/child.rs", "caller")]),
+                "{files:#?} {edges:#?}"
+            );
+            assert!(review_callers(&files, &edges, "other/lib.rs", name).is_empty());
+            for hidden in files[0]
+                .1
+                .iter()
+                .filter(|symbol| symbol.name == name && symbol.start_line != root.start_line)
+            {
+                assert!(
+                    !edges.iter().any(|edge| edge.edge_type == EdgeType::Calls
+                        && edge.target_uid
+                            == symbol_uid("repo:test:abc", "src/lib.rs", name, hidden.start_line)),
+                    "hidden function-local owner: {edges:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review7_rust_private_type_cannot_be_forwarded_through_public_barrel() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "crates/provider/src/lib.rs",
+                    "mod hidden;\npub use hidden::Local as Exported;\n",
+                ),
+                (
+                    "crates/provider/src/hidden.rs",
+                    "struct Local;\nimpl Local { pub fn new() -> Self { Self } pub fn run(&self) {} }\n",
+                ),
+                (
+                    "crates/user/src/lib.rs",
+                    "use provider::Exported as Selected;\nfn caller() { let x = Selected::new(); x.run(); }\n",
+                ),
+            ],
+            Language::Rust,
+        );
+        for name in ["new", "run"] {
+            assert!(
+                review_callers(&files, &edges, "crates/provider/src/hidden.rs", name).is_empty(),
+                "private terminal is not a public reexport: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review7_rust_private_sibling_inline_type_is_not_a_root_parent_import() {
+        let path = "src/lib.rs";
+        let source = "mod hidden {\n struct Local;\n impl Local { pub fn new() -> Self { Self } pub fn run(&self) {} }\n}\nmod tests { use super::hidden::Local as Selected; fn wrong() { let x = Selected::new(); x.run(); } }\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::Rust);
+        for name in ["new", "run"] {
+            assert!(
+                review_callers(&files, &edges, path, name).is_empty(),
+                "private inline terminal is not a root-private parent type: {files:#?} {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review7_rust_public_root_type_private_methods_preserve_constructor_and_ufcs() {
+        for (import, selected) in [
+            ("use super::Local;", "Local"),
+            ("use super::Local as Selected;", "Selected"),
+        ] {
+            let path = "src/lib.rs";
+            let source = format!(
+                "pub struct Local;\nimpl Local {{\n fn new() -> Self {{ Self }}\n fn run(&self) {{}}\n}}\nmod tests {{ {import}\n fn caller() {{ let x = {selected}::new(); x.run(); }}\n fn ufcs(x: &{selected}) {{ {selected}::run(x); }}\n}}\n"
+            );
+            let (files, edges) = review_edges(&[(path, &source)], Language::Rust);
+            assert_eq!(
+                review_callers(&files, &edges, path, "new"),
+                std::collections::BTreeSet::from([uid(&files, path, "caller")]),
+                "{import}: {files:#?} {edges:#?}"
+            );
+            assert_eq!(
+                review_callers(&files, &edges, path, "run"),
+                std::collections::BTreeSet::from([
+                    uid(&files, path, "caller"),
+                    uid(&files, path, "ufcs")
+                ]),
+                "{import}: {files:#?} {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review7_rust_public_inline_type_private_methods_remain_sibling_private() {
+        let path = "src/lib.rs";
+        let source = "pub mod hidden {\n pub struct Local;\n impl Local { fn new() -> Self { Self } fn run(&self) {} }\n}\nmod tests {\n use super::hidden::Local as Selected;\n fn caller() { let x = Selected::new(); x.run(); }\n fn ufcs(x: &Selected) { Selected::run(x); }\n}\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::Rust);
+        assert!(
+            review_callers(&files, &edges, path, "new").is_empty(),
+            "private sibling associated method: {edges:#?}"
+        );
+        // `x.run` already uses the existing same-file typed member admission;
+        // this regression fix must not additionally admit sibling UFCS.
+        let callers = review_callers(&files, &edges, path, "run");
+        assert!(
+            !callers.contains(&uid(&files, path, "ufcs")),
+            "private sibling UFCS: {files:#?} {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review2_python_imported_class_static_method_keeps_shadow_guard() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "pkg/service.py",
+                    "class Service:\n    @staticmethod\n    def run():\n        return 1\n",
+                ),
+                (
+                    "pkg/user.py",
+                    "from .service import Service\ndef user():\n    return Service.run()\ndef shadow(Service):\n    return Service.run()\n",
+                ),
+                (
+                    "other/service.py",
+                    "class Service:\n    @staticmethod\n    def run():\n        return 2\n",
+                ),
+            ],
+            Language::Python,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "pkg/service.py", "run"),
+            std::collections::BTreeSet::from([uid(&files, "pkg/user.py", "user")]),
+            "{edges:#?}"
+        );
+        assert!(review_callers(&files, &edges, "other/service.py", "run").is_empty());
+    }
+
+    #[test]
+    fn review2_js_constructor_control_uses_real_scoped_environment() {
+        let (files, edges) = review_edges(
+            &[(
+                "src/library.js",
+                "class Service {\n run() {}\n}\nfunction user() {\n const s = new Service();\n s.run();\n}\nfunction shadow(s) { s.run(); }\n",
+            )],
+            Language::JavaScript,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/library.js", "run"),
+            std::collections::BTreeSet::from([uid(&files, "src/library.js", "user")]),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review_commonjs_export_calls_local_private_helper() {
+        let (files, edges) = review_edges(
+            &[
+                ("index.js", "const h = require('./helpers');\nh.listen();\n"),
+                (
+                    "helpers.js",
+                    "module.exports.listen = function listen() {\n return context();\n};\nfunction context() {}\nfunction unused() {}\n",
+                ),
+            ],
+            Language::JavaScript,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "helpers.js", "context"),
+            std::collections::BTreeSet::from([uid(&files, "helpers.js", "listen")]),
+            "files={files:#?} edges={edges:#?}"
+        );
+        assert!(review_callers(&files, &edges, "helpers.js", "unused").is_empty());
+        assert!(
+            files[1]
+                .1
+                .iter()
+                .any(|symbol| symbol.name == "listen" && symbol.is_entry_point),
+            "exported executable must root its private helper: {files:#?}"
+        );
+    }
+
+    #[test]
+    fn review_parsed_typed_receiver_reaches_inherited_method() {
+        let (files, edges) = review_edges(
+            &[(
+                "src/main.ts",
+                "class Base {\n run() { return 1; }\n}\nclass Child extends Base {}\nfunction user() {\n const child = new Child();\n return child.run();\n}\nfunction shadow(child: unknown) { return child.run(); }\n",
+            )],
+            Language::TypeScript,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/main.ts", "run"),
+            std::collections::BTreeSet::from([uid(&files, "src/main.ts", "user")]),
+            "files={files:#?} edges={edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review_go_lowercase_sibling_is_visible_only_within_package() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "pkg/helper.go",
+                    "package sample\nfunc helper() int { return 1 }\n",
+                ),
+                (
+                    "pkg/user.go",
+                    "package sample\nfunc user() int {\n return helper()\n}\n",
+                ),
+                (
+                    "other/user.go",
+                    "package other\nfunc outsider() int {\n return helper()\n}\n",
+                ),
+                (
+                    "pkg/external_test.go",
+                    "package sample_test\nfunc external() int {\n return helper()\n}\n",
+                ),
+            ],
+            Language::Go,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "pkg/helper.go", "helper"),
+            std::collections::BTreeSet::from([uid(&files, "pkg/user.go", "user")]),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review_rust_child_glob_can_call_parent_private_helper() {
+        let (files, edges) = review_edges(
+            &[
+                ("src/lib.rs", "mod tests;\nfn helper() -> usize { 1 }\n"),
+                (
+                    "src/tests.rs",
+                    "use super::*;\nfn user() {\n helper();\n}\n",
+                ),
+                ("other/outsider.rs", "fn outsider() {\n helper();\n}\n"),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/lib.rs", "helper"),
+            std::collections::BTreeSet::from([uid(&files, "src/tests.rs", "user")]),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review_python_explicit_private_import_and_shadow_counterweight() {
+        let (files, edges) = review_edges(
+            &[
+                ("pkg/helper.py", "def _helper():\n    return 1\n"),
+                (
+                    "pkg/user.py",
+                    "from .helper import _helper\ndef user():\n    return _helper()\ndef shadow(_helper):\n    return _helper()\n",
+                ),
+                ("other/user.py", "def outsider():\n    return _helper()\n"),
+            ],
+            Language::Python,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "pkg/helper.py", "_helper"),
+            std::collections::BTreeSet::from([uid(&files, "pkg/user.py", "user")]),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review_local_receiver_type_precedes_unknown_receiver_refusal() {
+        for (path, language, source, method) in [
+            (
+                "src/pool.rs",
+                Language::Rust,
+                "struct Pool;\nimpl Pool {\n fn len(&self) -> usize { 1 }\n}\nfn typed(pool: &Pool) -> usize {\n pool.len()\n}\nfn unrelated(items: Vec<u8>) -> usize {\n items.len()\n}\n",
+                "len",
+            ),
+            (
+                "src/service.ts",
+                Language::TypeScript,
+                "class Service {\n run() { return 1; }\n}\nfunction typed() {\n const svc = new Service();\n return svc.run();\n}\nfunction unrelated(svc: unknown) {\n return svc.run();\n}\n",
+                "run",
+            ),
+        ] {
+            let (files, edges) = review_edges(&[(path, source)], language);
+            assert_eq!(
+                review_callers(&files, &edges, path, method),
+                std::collections::BTreeSet::from([uid(&files, path, "typed")]),
+                "{path}: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_named_and_default_imported_static_receivers() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "src/logger.js",
+                    "export class Logger {\n static write() { return 1; }\n}\n",
+                ),
+                (
+                    "src/db.js",
+                    "export default class Database {\n static query() { return 2; }\n}\n",
+                ),
+                (
+                    "src/user.js",
+                    "import { Logger } from './logger.js';\nimport db from './db.js';\nfunction user() {\n Logger.write();\n db.query();\n}\nfunction shadow(Logger, db) {\n Logger.write();\n db.query();\n}\n",
+                ),
+            ],
+            Language::JavaScript,
+        );
+        for (path, method) in [("src/logger.js", "write"), ("src/db.js", "query")] {
+            assert_eq!(
+                review_callers(&files, &edges, path, method),
+                std::collections::BTreeSet::from([uid(&files, "src/user.js", "user")]),
+                "{edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_unrelated_import_preserves_same_file_calls_only() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "src/other.js",
+                    "export function spare() { return 0; }\nexport function helper() { return 0; }\n",
+                ),
+                (
+                    "src/user.js",
+                    "import { spare } from './other.js';\nfunction helper() { return 1; }\nfunction user() {\n return helper();\n}\nfunction unrelated(items) {\n return items.helper();\n}\n",
+                ),
+            ],
+            Language::JavaScript,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/user.js", "helper"),
+            std::collections::BTreeSet::from([uid(&files, "src/user.js", "user")]),
+            "{edges:#?}"
+        );
+        assert!(
+            review_callers(&files, &edges, "src/other.js", "helper").is_empty(),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review_star_barrels_follow_named_exports_without_default_or_private_leaks() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "src/helper.ts",
+                    "export function helper() { return 1; }\nfunction hidden() { return 2; }\nexport default function fallback() { return 3; }\n",
+                ),
+                ("src/middle.ts", "export * from './helper';\n"),
+                ("src/index.ts", "export * from './middle';\n"),
+                (
+                    "src/user.ts",
+                    "import { helper, hidden } from './index';\nimport fallback from './index';\nfunction user() {\n helper();\n hidden();\n fallback();\n}\n",
+                ),
+            ],
+            Language::TypeScript,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/helper.ts", "helper"),
+            std::collections::BTreeSet::from([uid(&files, "src/user.ts", "user")]),
+            "{edges:#?}"
+        );
+        for name in ["hidden", "fallback"] {
+            assert!(
+                review_callers(&files, &edges, "src/helper.ts", name).is_empty(),
+                "{edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_conflicting_star_exports_do_not_select_arbitrary_target() {
+        let (files, edges) = review_edges(
+            &[
+                ("src/a.ts", "export function helper() { return 1; }\n"),
+                ("src/b.ts", "export function helper() { return 2; }\n"),
+                (
+                    "src/index.ts",
+                    "export * from './a';\nexport * from './b';\n",
+                ),
+                (
+                    "src/user.ts",
+                    "import { helper } from './index';\nfunction user() {\n helper();\n}\n",
+                ),
+            ],
+            Language::TypeScript,
+        );
+        for path in ["src/a.ts", "src/b.ts"] {
+            assert!(
+                review_callers(&files, &edges, path, "helper").is_empty(),
+                "{edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_typescript_overload_declarations_select_one_implementation() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "src/helper.ts",
+                    "export function pick(value: string): string;\nexport function pick(value: number): number;\nexport function pick(value: string | number): string | number {\n return value;\n}\n",
+                ),
+                (
+                    "src/user.ts",
+                    "import { pick } from './helper';\nfunction user() {\n return pick('text');\n}\nfunction shadow(pick: () => string) {\n return pick();\n}\n",
+                ),
+            ],
+            Language::TypeScript,
+        );
+        let implementation = files[0]
+            .1
+            .iter()
+            .find(|symbol| symbol.name == "pick" && symbol.end_line > symbol.start_line)
+            .expect("parsed overload implementation");
+        let target = symbol_uid(
+            "repo:test:abc",
+            "src/helper.ts",
+            "pick",
+            implementation.start_line,
+        );
+        let actual: std::collections::BTreeSet<_> = edges
+            .iter()
+            .filter(|edge| edge.edge_type == EdgeType::Calls && edge.target_uid == target)
+            .map(|edge| edge.source_uid.clone())
+            .collect();
+        assert_eq!(
+            actual,
+            std::collections::BTreeSet::from([uid(&files, "src/user.ts", "user")]),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review_default_parameter_initializers_are_uses_in_typescript_and_python() {
+        for (language, helper_path, user_path, helper, source) in [
+            (
+                Language::TypeScript,
+                "src/helper.ts",
+                "src/user.ts",
+                "export function helper() { return 1; }\n",
+                "import { helper } from './helper';\nfunction consume(fallback: number = helper()) {\n return fallback;\n}\nfunction shadow(helper: () => number) {\n return helper();\n}\n",
+            ),
+            (
+                Language::Python,
+                "pkg/helper.py",
+                "pkg/user.py",
+                "def helper():\n    return 1\n",
+                "from .helper import helper\ndef consume(fallback=helper()):\n    return fallback\ndef shadow(helper):\n    return helper()\n",
+            ),
+        ] {
+            let (files, edges) =
+                review_edges(&[(helper_path, helper), (user_path, source)], language);
+            assert_eq!(
+                review_callers(&files, &edges, helper_path, "helper"),
+                std::collections::BTreeSet::from([uid(&files, user_path, "consume")]),
+                "{user_path}: {edges:#?}"
+            );
+        }
+    }
+    #[test]
+    fn review_receiver_shadow_scopes_restore_outer_types() {
+        let path = "src/scopes.ts";
+        let source = r#"class Service {
+ run() { return 1; }
+}
+class Other {
+ run() { return 2; }
+}
+function before() {
+ const svc = new Service();
+ return svc.run();
+}
+function inside() {
+ const svc = new Service();
+ { const svc = unknownFactory();
+   return svc.run(); }
+}
+function after() {
+ const svc = new Service();
+ { const svc = unknownFactory(); }
+ return svc.run();
+}
+function sibling() {
+ const svc = new Service();
+ { const svc = unknownFactory(); }
+ { return svc.run(); }
+}
+function knownInner() {
+ const svc = new Service();
+ { const svc = new Other();
+   return svc.run(); }
+}
+function afterKnownInner() {
+ const svc = new Service();
+ { const svc = new Other(); }
+ return svc.run();
+}
+function sameLineInside() { const svc = new Service(); { const svc = unknownFactory(); return svc.run(); } }
+function sameLineAfter() { const svc = new Service(); { const svc = unknownFactory(); } return svc.run(); }
+function sameLineKnownInner() { const svc = new Service(); { const svc = new Other(); return svc.run(); } }
+function parameterShadow(svc: unknown) { return svc.run(); }
+function temporalDeadZone() {
+ const svc = new Service();
+ { svc.run(); const svc = unknownFactory(); }
+}
+function varBeforeInitialization() { svc.run(); var svc = new Service(); }
+function varAfterInitialization() { var svc = new Service(); return svc.run(); }
+"#;
+        let (files, edges) = review_edges(&[(path, source)], Language::TypeScript);
+        let target = |parent: &str| {
+            let symbol = files[0]
+                .1
+                .iter()
+                .find(|symbol| {
+                    symbol.name == "run" && symbol.parent_name.as_deref() == Some(parent)
+                })
+                .unwrap();
+            symbol_uid("repo:test:abc", path, "run", symbol.start_line)
+        };
+        let callers = |target: String| {
+            edges
+                .iter()
+                .filter(|edge| edge.edge_type == EdgeType::Calls && edge.target_uid == target)
+                .map(|edge| edge.source_uid.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(
+            callers(target("Service")),
+            [
+                "before",
+                "after",
+                "sibling",
+                "afterKnownInner",
+                "sameLineAfter",
+                "varAfterInitialization"
+            ]
+            .into_iter()
+            .map(|name| uid(&files, path, name))
+            .collect(),
+            "{files:#?} {edges:#?}"
+        );
+        assert_eq!(
+            callers(target("Other")),
+            ["knownInner", "sameLineKnownInner"]
+                .into_iter()
+                .map(|name| uid(&files, path, name))
+                .collect(),
+            "{files:#?} {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn review_unresolved_exports_cannot_prove_a_star_target() {
+        let mut failures = Vec::new();
+        for (barrel, expected) in [
+            ("export * from './known';\n", true),
+            (
+                "export { helper } from './missing';\nexport * from './known';\n",
+                false,
+            ),
+            (
+                "export * from './known';\nexport * from './missing';\n",
+                false,
+            ),
+            (
+                "export * from './missing';\nexport * from './known';\n",
+                false,
+            ),
+        ] {
+            let (files, edges) = review_edges(
+                &[
+                    ("src/known.ts", "export function helper() { return 1; }\n"),
+                    ("src/index.ts", barrel),
+                    (
+                        "src/user.ts",
+                        "import { helper } from './index';\nfunction user() { return helper(); }\nfunction shadow(helper: () => number) { return helper(); }\n",
+                    ),
+                ],
+                Language::TypeScript,
+            );
+            let expected = if expected {
+                std::collections::BTreeSet::from([uid(&files, "src/user.ts", "user")])
+            } else {
+                std::collections::BTreeSet::new()
+            };
+            let actual = review_callers(&files, &edges, "src/known.ts", "helper");
+            if actual != expected {
+                failures.push(format!(
+                    "{barrel}: expected={expected:?} actual={actual:?} edges={edges:#?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn review_imported_receiver_shape_preserves_exposed_members_only() {
+        let mut failures = Vec::new();
+        for (provider, member, call, expected) in [
+            (
+                "export class Logger {\n static write() { return 1; }\n}\n",
+                "write",
+                "api.write()",
+                true,
+            ),
+            (
+                "export class Logger {\n write() { return 1; }\n}\n",
+                "write",
+                "api.write()",
+                false,
+            ),
+            (
+                "export class Logger {\n private static write() { return 1; }\n}\n",
+                "write",
+                "api.write()",
+                false,
+            ),
+            (
+                "export default class Logger {\n static write() { return 1; }\n}\n",
+                "write",
+                "api.write()",
+                true,
+            ),
+            (
+                "const db = {\n query() { return 1; }\n};\nexport default db;\n",
+                "query",
+                "api.query()",
+                true,
+            ),
+            (
+                "class Database {\n query() { return 1; }\n}\nconst db = new Database();\nexport default db;\n",
+                "query",
+                "api.query()",
+                true,
+            ),
+            (
+                "class Database {\n private query() { return 1; }\n}\nconst db = new Database();\nexport default db;\n",
+                "query",
+                "api.query()",
+                false,
+            ),
+            (
+                "class Database {\n query() { return 1; }\n}\nconst db = unknownFactory();\nexport default db;\n",
+                "query",
+                "api.query()",
+                false,
+            ),
+            (
+                "const db = {\n query() { return 1; },\n ...unknownMembers\n};\nexport default db;\n",
+                "query",
+                "api.query()",
+                false,
+            ),
+            (
+                "const db = {\n query() { return 1; },\n [unknownKey]() { return 2; }\n};\nexport default db;\n",
+                "query",
+                "api.query()",
+                false,
+            ),
+        ] {
+            let import = if provider.starts_with("export class") {
+                "import { Logger as api } from './provider';"
+            } else {
+                "import api from './provider';"
+            };
+            let user = format!(
+                "{import}\nfunction user() {{ return {call}; }}\nfunction shadow(api: unknown) {{ return {call}; }}\n"
+            );
+            let (files, edges) = review_edges(
+                &[
+                    ("src/provider.ts", provider),
+                    ("src/user.ts", &user),
+                    (
+                        "src/unrelated.ts",
+                        "export class Database {\n query() { return 3; }\n}\nexport class Logger {\n static write() { return 3; }\n}\n",
+                    ),
+                ],
+                Language::TypeScript,
+            );
+            let expected = if expected {
+                std::collections::BTreeSet::from([uid(&files, "src/user.ts", "user")])
+            } else {
+                std::collections::BTreeSet::new()
+            };
+            if provider.contains("export default db") {
+                let exposed = files[0]
+                    .1
+                    .iter()
+                    .find(|symbol| symbol.name == member)
+                    .unwrap();
+                assert!(
+                    !exposed.is_entry_point,
+                    "exported methods need independent root evidence: {provider}: {exposed:#?}"
+                );
+            }
+            let actual = review_callers(&files, &edges, "src/provider.ts", member);
+            let unrelated = review_callers(&files, &edges, "src/unrelated.ts", member);
+            if actual != expected || !unrelated.is_empty() {
+                failures.push(format!("{provider}: expected={expected:?} actual={actual:?} unrelated={unrelated:?} files={files:#?} edges={edges:#?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }

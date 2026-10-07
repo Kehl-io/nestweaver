@@ -6,6 +6,9 @@
 //! Run with:
 //!   cargo test --test daemon_test -- --test-threads=1
 
+#[path = "helpers/catalogue_contract.rs"]
+mod catalogue_contract;
+
 use assert_cmd::Command;
 use nestweaver_engine::{load_filemeta_sidecar, save_filemeta_sidecar, sidecar_path};
 use predicates::prelude::PredicateBooleanExt;
@@ -690,15 +693,35 @@ fn direct_mcp_fails_closed_on_config_and_exposes_only_read_tools() {
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(frames.len(), 2);
-    let tools = frames[0]["result"]["tools"].as_array().unwrap();
-    // 42 registered minus the mutating tools direct read-only hides.
-    assert_eq!(tools.len(), 36);
+    let page = &frames[0];
+    assert_eq!(page["id"], 1);
+    assert_eq!(page["jsonrpc"], "2.0");
+    assert!(page.get("error").is_none(), "{page}");
+    let full = nestweaver_mcp::tools::tool_list(false);
+    assert_eq!(
+        full["tools"].as_array().unwrap().len(),
+        43,
+        "complete default profile"
+    );
+    let expected: Vec<_> = full["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|tool| {
+            !nestweaver_mcp::http::MUTATING_TOOLS.contains(&tool["name"].as_str().unwrap())
+        })
+        .cloned()
+        .collect();
+    catalogue_contract::assert_complete_catalogue_page(&page["result"], &expected);
+    let tools = page["result"]["tools"].as_array().unwrap();
     for mutator in nestweaver_mcp::http::MUTATING_TOOLS {
         assert!(
             tools.iter().all(|tool| tool["name"] != *mutator),
             "direct tools/list exposed {mutator}"
         );
     }
+    assert_eq!(frames[1]["id"], 2);
+    assert_eq!(frames[1]["jsonrpc"], "2.0");
     assert_eq!(frames[1]["result"]["isError"], true);
     assert!(
         frames[1]["result"]["content"][0]["text"]
@@ -5265,6 +5288,69 @@ fn daemon_mcp_and_cli_add_source_share_default_instance() {
     assert_eq!(vaults[0]["instance_id"], "default");
 }
 
+/// Only these two publication guards are transient readiness failures. Exact
+/// messages prevent permission, lookup, and pinned-source errors being hidden.
+fn note_metadata_readiness_retryable(response: &serde_json::Value) -> bool {
+    if response.get("error").is_some() || response["result"]["isError"] != serde_json::json!(true) {
+        return false;
+    }
+    let Some(content) = response["result"]["content"].as_array() else {
+        return false;
+    };
+    if content.len() != 1 || content[0]["type"] != "text" {
+        return false;
+    }
+    matches!(
+        content[0]["text"].as_str(),
+        Some(
+            "tool note_get failed: note read overlaps index publication; retry after publication completes"
+        ) | Some("tool note_get failed: note index changed while reading; restart pagination")
+    )
+}
+
+#[test]
+fn note_metadata_readiness_classifier_retries_only_publication_guards() {
+    let error = |message: &str| {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2,
+            "result": { "isError": true, "content": [{ "type": "text", "text": message }] }
+        })
+    };
+    for message in [
+        "tool note_get failed: note read overlaps index publication; retry after publication completes",
+        "tool note_get failed: note index changed while reading; restart pagination",
+    ] {
+        assert!(
+            note_metadata_readiness_retryable(&error(message)),
+            "{message}"
+        );
+    }
+    for message in [
+        "tool note_get refused: permission denied",
+        "tool note_get failed: no note found with title 'Hello'",
+        "tool note_get failed: note body changed; restart at body_offset 0 without body_version",
+        "tool note_get failed: note body changed or became unavailable; restart pagination",
+        "tool note_get failed: native read admission exceeded its deadline",
+        "tool note_get failed: unrelated error",
+        "tool backlinks failed: note index changed while reading; restart pagination",
+        "tool note_get failed: permission denied: note index changed while reading; restart pagination",
+    ] {
+        assert!(
+            !note_metadata_readiness_retryable(&error(message)),
+            "{message}"
+        );
+    }
+    let mut successful =
+        error("tool note_get failed: note index changed while reading; restart pagination");
+    successful["result"]["isError"] = serde_json::json!(false);
+    assert!(!note_metadata_readiness_retryable(&successful));
+    let mut rpc_error =
+        error("tool note_get failed: note index changed while reading; restart pagination");
+    rpc_error["error"] = serde_json::json!({ "code": -32603, "message": "RPC failed" });
+    assert!(!note_metadata_readiness_retryable(&rpc_error));
+    assert!(!note_metadata_readiness_retryable(&serde_json::json!({})));
+}
+
 /// Final-hunt Z-2 (item 3a): note_get over the daemon must return the same
 /// `frontmatter` and `outline` fields the local path returns.
 #[test]
@@ -5290,13 +5376,34 @@ fn daemon_note_get_returns_frontmatter_and_outline() {
     let _guard = DaemonGuard::new(&db_path);
     start_daemon(&db_path);
 
-    let output = mcp_tool_call_in_mode(
-        &db_path,
-        "note_get",
-        serde_json::json!({ "title": "Hello", "include_body": false }),
-        McpMode::Daemon,
-    );
-    let response = mcp_call_response(&output);
+    // Socket readiness precedes background migration of a directly indexed
+    // vault. Retry only the two explicit publication guards until it settles.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let response = loop {
+        let output = mcp_tool_call_in_mode(
+            &db_path,
+            "note_get",
+            serde_json::json!({ "title": "Hello", "include_body": false }),
+            McpMode::Daemon,
+        );
+        let response = mcp_call_response(&output);
+        if note_metadata_readiness_retryable(&response) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "note metadata publication did not settle within 10s; response: {response}; raw stdout: {output}"
+            );
+            eprintln!("waiting for note metadata publication; response: {response}");
+            std::thread::sleep(Duration::from_millis(25));
+            continue;
+        }
+        assert!(
+            response.get("error").is_none()
+                && response["result"]["isError"] == serde_json::json!(false)
+                && response["result"]["structuredContent"].is_object(),
+            "note metadata request failed; response: {response}; raw stdout: {output}"
+        );
+        break response;
+    };
     let note = &response["result"]["structuredContent"];
     assert_eq!(
         note["frontmatter"],
@@ -6623,10 +6730,9 @@ exclude = {exclude}
 // checked here only because it still exists and must not diverge; it is not
 // the reference implementation, and nothing below treats it as one.
 //
-// `unreferencedOrphan` is the non-vacuity control. It is exported exactly like
-// `glueInit`, sits in the same package, and nothing references it. If merely
-// being an ES export rooted a symbol, it would come back live too and the
-// `glueInit` assertion would prove nothing about manifests.
+// ES export visibility does not seed execution. Without a manifest, the entry
+// function, its exported downstream helper, and the orphan must all be dead.
+// Adding `main` must reach the entry and helper while leaving the orphan dead.
 //
 // The `daemon_` prefix is load-bearing: the main Linux CI job runs
 // `--skip daemon_` and a separate job runs `-- daemon_`.
@@ -6640,13 +6746,9 @@ fn daemon_dead_code_honors_manifest_entry_files_on_every_route() {
         &repo_dir,
         &[
             (
-                "packages/glue/package.json",
-                r#"{"name":"glue","version":"1.0.0","main":"glue_entry.js"}"#,
-            ),
-            (
                 "packages/glue/glue_entry.js",
                 "import { helperCalledOnlyByEntry } from './helper.js';\n\
-                 export function glueInit() { return helperCalledOnlyByEntry(); }\n",
+                 function glueInit() { return helperCalledOnlyByEntry(); }\n",
             ),
             (
                 "packages/glue/helper.js",
@@ -6654,7 +6756,7 @@ fn daemon_dead_code_honors_manifest_entry_files_on_every_route() {
             ),
             (
                 "packages/glue/orphan.js",
-                "export function unreferencedOrphan() { return 2; }\n",
+                "function unreferencedOrphan() { return 2; }\n",
             ),
         ],
     );
@@ -6662,22 +6764,6 @@ fn daemon_dead_code_honors_manifest_entry_files_on_every_route() {
 
     let _guard = DaemonGuard::new(&db_path);
     start_daemon(&db_path);
-
-    // Re-index inside the SAME daemon session. The manifest sidecar is
-    // generation-bound, and the live daemon holds an open store — so a fix
-    // that only works against a freshly opened database, or only against the
-    // sidecar written by the cold index before the daemon existed, is caught
-    // here rather than in production.
-    daemon_cmd()
-        .args([
-            "index",
-            "--repo",
-            &repo_dir.display().to_string(),
-            "--db",
-            &db_path.display().to_string(),
-        ])
-        .assert()
-        .success();
 
     // Every route, named by how a user actually reaches it.
     let unreachable_from_cli = |cmd: &mut Command| -> Vec<String> {
@@ -6738,20 +6824,56 @@ fn daemon_dead_code_honors_manifest_entry_files_on_every_route() {
             .collect()
     };
 
-    let routes = [
-        (
-            "default CLI (daemon)",
-            unreachable_from_cli(&mut daemon_cmd()),
-        ),
-        ("MCP direct", unreachable_from_mcp(McpMode::Direct)),
-        ("MCP via daemon", unreachable_from_mcp(McpMode::Daemon)),
-        // The `--no-daemon` bypass. Checked so it cannot drift while it still
-        // exists; it is NOT the baseline the others are compared against.
-        (
-            "CLI bypass (--no-daemon)",
-            unreachable_from_cli(&mut no_daemon_cmd()),
-        ),
-    ];
+    let collect_routes = || {
+        [
+            (
+                "default CLI (daemon)",
+                unreachable_from_cli(&mut daemon_cmd()),
+            ),
+            ("MCP direct", unreachable_from_mcp(McpMode::Direct)),
+            ("MCP via daemon", unreachable_from_mcp(McpMode::Daemon)),
+            // The `--no-daemon` bypass. Checked so it cannot drift while it still
+            // exists; it is NOT the baseline the others are compared against.
+            (
+                "CLI bypass (--no-daemon)",
+                unreachable_from_cli(&mut no_daemon_cmd()),
+            ),
+        ]
+    };
+
+    assert!(!repo_dir.join("packages/glue/package.json").exists());
+    let without_manifest = collect_routes();
+    for (route, unreachable) in &without_manifest {
+        for private in ["glueInit", "unreferencedOrphan", "helperCalledOnlyByEntry"] {
+            assert!(
+                unreachable.iter().any(|name| name == private),
+                "{route}: without a manifest the private control {private} must be unreachable: {unreachable:?}"
+            );
+        }
+    }
+    std::fs::write(
+        repo_dir.join("packages/glue/package.json"),
+        r#"{"name":"glue","version":"1.0.0","main":"glue_entry.js"}"#,
+    )
+    .unwrap();
+    // Re-index inside the SAME daemon session. The manifest sidecar is
+    // generation-bound, and the live daemon holds an open store — so a fix
+    // that only works against a freshly opened database, or only against the
+    // sidecar written by the cold index before the daemon existed, is caught
+    // here rather than in production.
+    daemon_cmd()
+        .args([
+            "index",
+            "--force",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    let routes = collect_routes();
 
     for (route, unreachable) in &routes {
         assert!(
@@ -6769,9 +6891,19 @@ fn daemon_dead_code_honors_manifest_entry_files_on_every_route() {
             !unreachable
                 .iter()
                 .any(|name| name == "helperCalledOnlyByEntry"),
-            "{route}: reachable only THROUGH the manifest-declared entry \
-             point, so it proves the entry file seeded a walk rather than \
-             merely marking one symbol live. Got: {unreachable:?}"
+            "{route}: the exported helper remains an independently live public \
+             API root. Got: {unreachable:?}"
+        );
+    }
+
+    for (route, unreachable) in &without_manifest[1..] {
+        let mut this = unreachable.clone();
+        let mut first = without_manifest[0].1.clone();
+        this.sort();
+        first.sort();
+        assert_eq!(
+            this, first,
+            "{route} disagrees with the pre-manifest control population"
         );
     }
 

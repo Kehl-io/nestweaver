@@ -4,6 +4,13 @@
     (function_definition
       name: (identifier) @name) @definition.method))
 
+; Decorated class functions (staticmethod/classmethod) retain their owner.
+(class_definition
+  body: (block
+    (decorated_definition
+      definition: (function_definition
+        name: (identifier) @name) @definition.method)))
+
 ; Function definitions
 (function_definition
   name: (identifier) @name) @definition.function

@@ -1286,7 +1286,67 @@ impl InstanceConfig {
 
     pub fn from_file(path: &std::path::Path) -> Result<Self, anyhow::Error> {
         let contents = std::fs::read_to_string(path)?;
-        Self::from_toml_str(&contents)
+        let mut config = Self::from_toml_str(&contents)?;
+        if let Some(db) = config.db.as_deref() {
+            config.db = Some(
+                file_database_path(db, path, dirs::home_dir().as_deref())?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        Ok(config)
+    }
+}
+
+// File configuration paths follow the canonical config's directory; raw TOML
+// and explicit CLI database arguments retain their existing interpretation.
+fn file_database_path(
+    db: &str,
+    config: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> anyhow::Result<std::path::PathBuf> {
+    let expanded = if let Some(rest) = db.strip_prefix("~/") {
+        home.ok_or_else(|| anyhow::anyhow!("cannot expand config db without a home directory"))?
+            .join(rest)
+    } else {
+        std::path::PathBuf::from(db)
+    };
+    let config = std::fs::canonicalize(config)?;
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        config
+            .parent()
+            .expect("config file has a parent")
+            .join(expanded)
+    };
+    let name = absolute
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("config db must name a database"))?;
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("config db must have a parent"))?;
+    let normalized_parent = std::fs::canonicalize(parent).unwrap_or_else(|_| {
+        let mut normalized = std::path::PathBuf::new();
+        for component in parent.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    normalized.pop();
+                }
+                other => normalized.push(other.as_os_str()),
+            }
+        }
+        normalized
+    });
+    let logical = normalized_parent.join(name);
+    if crate::publication::default_publication_root(&logical)
+        .join("CURRENT")
+        .exists()
+    {
+        Ok(logical)
+    } else {
+        Ok(std::fs::canonicalize(&logical).unwrap_or(logical))
     }
 }
 
@@ -1600,6 +1660,68 @@ mod tests {
         let parsed: SourceIndexingConfig =
             toml::from_str("with_trigrams = true\n").expect("the correct spelling must parse");
         assert!(parsed.with_trigrams);
+    }
+
+    #[test]
+    fn file_db_paths_follow_config_directory_but_raw_toml_stays_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir(&config_dir).unwrap();
+        let path = config_dir.join("instance.toml");
+        let text = format!("db = 'relative.lbug'\n{MINIMAL_TOML}");
+        std::fs::write(&path, &text).unwrap();
+        assert_eq!(
+            InstanceConfig::from_toml_str(&text).unwrap().db_path(),
+            Some(std::path::PathBuf::from("relative.lbug"))
+        );
+        assert_eq!(
+            InstanceConfig::from_file(&path).unwrap().db_path(),
+            Some(
+                std::fs::canonicalize(&config_dir)
+                    .unwrap()
+                    .join("relative.lbug")
+            )
+        );
+        assert_eq!(
+            file_database_path("~/home.lbug", &path, Some(dir.path())).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap().join("home.lbug")
+        );
+        assert_eq!(
+            file_database_path("not-created/../nested/brain.lbug", &path, Some(dir.path()))
+                .unwrap(),
+            std::fs::canonicalize(&config_dir)
+                .unwrap()
+                .join("nested/brain.lbug")
+        );
+        assert!(file_database_path("/", &path, Some(dir.path())).is_err());
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("linked.toml");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert_eq!(
+                InstanceConfig::from_file(&link).unwrap().db_path(),
+                InstanceConfig::from_file(&path).unwrap().db_path()
+            );
+            let logical = config_dir.join("relative.lbug");
+            let physical = config_dir.join("old-slot.lbug");
+            std::fs::write(&physical, "fixture").unwrap();
+            std::os::unix::fs::symlink(&physical, &logical).unwrap();
+            let publication = crate::publication::default_publication_root(&logical);
+            std::fs::create_dir(&publication).unwrap();
+            std::fs::write(
+                publication.join("CURRENT"),
+                "invalid is resolver's responsibility",
+            )
+            .unwrap();
+            assert_eq!(
+                InstanceConfig::from_file(&path).unwrap().db_path(),
+                Some(
+                    std::fs::canonicalize(&config_dir)
+                        .unwrap()
+                        .join("relative.lbug")
+                )
+            );
+        }
     }
 
     const MINIMAL_TOML: &str = r#"

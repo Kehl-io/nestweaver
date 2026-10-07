@@ -63,12 +63,30 @@ pub fn derive_identity(bearer: &str, is_admin: bool) -> nestweaver_engine::authz
 /// * `admin_token` — if the request's token matches the admin token,
 ///   rate limiting is bypassed.
 /// * `rate_limiters` — when `Some`, per-client rate limiting is enforced.
+fn capture_tool_delivery(mut req: Request<()>) -> Result<Request<()>, Status> {
+    let profile = match req
+        .metadata()
+        .get(nestweaver_schema::ToolDeliveryProfile::METADATA_KEY)
+    {
+        None => nestweaver_schema::ToolDeliveryProfile::FullCli,
+        Some(value) => nestweaver_schema::ToolDeliveryProfile::parse_wire(
+            value
+                .to_str()
+                .map_err(|_| Status::invalid_argument("invalid delivery profile"))?,
+        )
+        .ok_or_else(|| Status::invalid_argument("unknown delivery profile"))?,
+    };
+    req.extensions_mut().insert(profile);
+    Ok(req)
+}
+
 pub fn bearer_auth_interceptor(
     expected_token: Option<String>,
     admin_token: Option<String>,
     rate_limiters: Option<Arc<ClientRateLimiters>>,
 ) -> impl Fn(Request<()>) -> Result<Request<()>, Status> + Clone {
     move |req: Request<()>| {
+        let req = capture_tool_delivery(req)?;
         let Some(ref token) = expected_token else {
             return Ok(req);
         };
@@ -132,7 +150,8 @@ pub fn bearer_auth_interceptor(
 /// cross-repo node away from the trusted local admin. This mirrors the TCP
 /// admin-token path in [`bearer_auth_interceptor`], keeping the authz layer the
 /// single source of truth for visibility.
-pub fn uds_admin_interceptor(mut req: Request<()>) -> Result<Request<()>, Status> {
+pub fn uds_admin_interceptor(req: Request<()>) -> Result<Request<()>, Status> {
+    let mut req = capture_tool_delivery(req)?;
     req.extensions_mut().insert(IsAdmin(true));
     req.extensions_mut()
         .insert(nestweaver_engine::authz::Identity::Admin);
@@ -154,6 +173,54 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use tonic::metadata::MetadataValue;
     use tonic::transport::server::TcpConnectInfo;
+
+    #[test]
+    fn delivery_metadata_is_captured_before_auth_early_return_and_rejects_unknown() {
+        for profile in [
+            nestweaver_schema::ToolDeliveryProfile::FullCli,
+            nestweaver_schema::ToolDeliveryProfile::BoundedMcp,
+        ] {
+            let mut req = Request::new(());
+            req.metadata_mut().insert(
+                nestweaver_schema::ToolDeliveryProfile::METADATA_KEY,
+                MetadataValue::from_static(profile.wire_value()),
+            );
+            let mut tcp_req = Request::new(());
+            tcp_req.metadata_mut().insert(
+                nestweaver_schema::ToolDeliveryProfile::METADATA_KEY,
+                MetadataValue::from_static(profile.wire_value()),
+            );
+            let tcp = bearer_auth_interceptor(None, None, None)(tcp_req).unwrap();
+            assert_eq!(
+                tcp.extensions()
+                    .get::<nestweaver_schema::ToolDeliveryProfile>(),
+                Some(&profile)
+            );
+            let uds = uds_admin_interceptor(req).unwrap();
+            assert_eq!(
+                uds.extensions()
+                    .get::<nestweaver_schema::ToolDeliveryProfile>(),
+                Some(&profile)
+            );
+            assert!(uds.extensions().get::<IsAdmin>().unwrap().0);
+        }
+        let mut invalid = Request::new(());
+        invalid.metadata_mut().insert(
+            nestweaver_schema::ToolDeliveryProfile::METADATA_KEY,
+            MetadataValue::from_static("unknown"),
+        );
+        assert_eq!(
+            uds_admin_interceptor(invalid).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+        let legacy = uds_admin_interceptor(Request::new(())).unwrap();
+        assert_eq!(
+            legacy
+                .extensions()
+                .get::<nestweaver_schema::ToolDeliveryProfile>(),
+            Some(&nestweaver_schema::ToolDeliveryProfile::FullCli)
+        );
+    }
 
     fn request_with_token(token: &str) -> Request<()> {
         let mut req = Request::new(());

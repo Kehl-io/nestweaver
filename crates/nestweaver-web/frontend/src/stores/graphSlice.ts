@@ -45,12 +45,17 @@ export interface GraphSlice {
   toggleReducedEffects: () => void;
   viewMode: ViewMode;
   detailFocus: DetailFocus;
+  noteHeadingDestination: { uid: string; heading: string | null } | null;
+  setNoteHeadingDestination: (destination: { uid: string; heading: string | null } | null) => void;
   toggleViewMode: () => void;
   setViewMode: (mode: ViewMode) => void;
   setDetailFocus: (focus: DetailFocus) => void;
   cameraZoom: number;
   setCameraZoom: (zoom: number) => void;
   selectNode: (id: string | null, kind?: string | null) => void;
+  inspectNode: (id: string, kind?: string | null) => void;
+  /** Search Detail changes evidence while node-scoped modes keep their scene target. */
+  inspectedSceneTarget: { uid: string; mode: "local" | "impact"; workspaceId: string } | null;
   exploreNode: (id: string, kind?: string | null) => void;
   hoverNode: (id: string | null) => void;
   setGraphMode: (mode: GraphMode) => void;
@@ -92,7 +97,10 @@ export const createGraphSlice: StateCreator<
   [],
   GraphSlice
 > = (set) => ({
+  noteHeadingDestination: null,
+  setNoteHeadingDestination: (destination) => set((s) => { s.noteHeadingDestination = destination; }),
   selectedNodeId: null,
+  inspectedSceneTarget: null,
   selectedNodeKind: null,
   hoveredNodeId: null,
   previewNodeId: null,
@@ -191,6 +199,8 @@ export const createGraphSlice: StateCreator<
 
   selectNode: (id, kind) =>
     set((s) => {
+      s.inspectedSceneTarget = null;
+      s.noteHeadingDestination = null;
       s.selectedNodeId = id;
       s.selectedNodeKind = kind ?? null;
       s.detailFocus = "summary";
@@ -202,8 +212,26 @@ export const createGraphSlice: StateCreator<
       }
     }),
 
+  inspectNode: (id, kind) =>
+    set((s) => {
+      if ((s.graphMode === "local" || s.graphMode === "impact") && s.selectedNodeId) {
+        const previous = s.inspectedSceneTarget;
+        if (!previous || previous.mode !== s.graphMode || previous.workspaceId !== s.activeWorkspaceId) {
+          s.inspectedSceneTarget = { uid: s.selectedNodeId, mode: s.graphMode, workspaceId: s.activeWorkspaceId };
+        }
+      } else {
+        s.inspectedSceneTarget = null;
+      }
+      s.noteHeadingDestination = null;
+      s.selectedNodeId = id;
+      s.selectedNodeKind = kind ?? null;
+      s.detailFocus = "summary";
+    }),
+
   exploreNode: (id, kind) =>
     set((s) => {
+      s.inspectedSceneTarget = null;
+      s.noteHeadingDestination = null;
       s.selectedNodeId = id;
       s.selectedNodeKind = kind ?? null;
       s.seeds = [id];
@@ -225,8 +253,10 @@ export const createGraphSlice: StateCreator<
 
   openPreview: (id, kind, expanded = false) =>
     set((s) => {
+      s.inspectedSceneTarget = null;
       s.previewNodeId = id;
       s.previewExpanded = expanded;
+      s.noteHeadingDestination = null;
       s.selectedNodeId = id;
       s.selectedNodeKind = kind ?? null;
     }),
@@ -254,6 +284,7 @@ export const createGraphSlice: StateCreator<
 
   setGraphMode: (mode) =>
     set((s) => {
+      s.inspectedSceneTarget = null;
       // A new scene frames everything; a targeted fit belongs to its scene.
       if (s.graphMode !== mode) s.cameraFitUids = null;
       s.graphMode = mode;
@@ -266,6 +297,7 @@ export const createGraphSlice: StateCreator<
 
   addSeed: (uid) =>
     set((s) => {
+      s.inspectedSceneTarget = null;
       if (!s.seeds.includes(uid)) s.seeds.push(uid);
       s.graphMode = "context";
     }),

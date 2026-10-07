@@ -13,7 +13,7 @@ use std::time::Instant;
 use serde_json::Value;
 use tracing::debug;
 
-use crate::dispatch::dispatch_json_rpc_authed;
+use crate::dispatch::dispatch_json_rpc_authed_profile;
 use crate::health::{effective_timeout, eject_with_cap, is_upstream_down};
 use crate::results::inject_or_wrap_provenance;
 use crate::upstream::UpstreamHandle;
@@ -28,11 +28,30 @@ use crate::upstream::UpstreamHandle;
 ///
 /// Used for blast_radius, brain_impact, and affected_tests.
 pub async fn two_tier_query(
+    local_result: Value,
+    upstreams: &[UpstreamHandle],
+    ejection_guard: &Mutex<()>,
+    tool_name: &str,
+    params: &Value,
+) -> Value {
+    two_tier_query_profile(
+        local_result,
+        upstreams,
+        ejection_guard,
+        tool_name,
+        params,
+        nestweaver_schema::ToolDeliveryProfile::FullCli,
+    )
+    .await
+}
+
+pub async fn two_tier_query_profile(
     mut local_result: Value,
     upstreams: &[UpstreamHandle],
     ejection_guard: &Mutex<()>,
     tool_name: &str,
     params: &Value,
+    profile: nestweaver_schema::ToolDeliveryProfile,
 ) -> Value {
     // 1. If no healthy upstream is configured, return local-only with clear
     // annotation.
@@ -72,7 +91,13 @@ pub async fn two_tier_query(
     let started = Instant::now();
     let server_result = match tokio::time::timeout(
         timeout,
-        dispatch_json_rpc_authed(&mut up_client, &tool, &server_params, token.as_deref()),
+        dispatch_json_rpc_authed_profile(
+            &mut up_client,
+            &tool,
+            &server_params,
+            token.as_deref(),
+            profile,
+        ),
     )
     .await
     {

@@ -1,0 +1,111 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+expression: parsed
+---
+path: src/lib.rs
+symbols:
+  - name: Unit
+    kind: Class
+    start_line: 1
+    end_line: 1
+    signature: struct Unit;
+    content_hash: 926c27e7bf217f24de9e2c4fcf5f38c42013abfe58543ae2fa578521eb86e3ca
+    is_entry_point: false
+    entry_point_kind: ~
+    visibility: Private
+    type_info: ~
+    parent_name: ~
+    scope_chain: ~
+  - name: make
+    kind: Function
+    start_line: 2
+    end_line: 2
+    signature: "fn make() -> (Unit,) { (Unit,) }"
+    content_hash: f2d0b941f3fcd0f98a4d4362d02c2c571e4b9f177c40fb7a19aea03650d4fb07
+    is_entry_point: false
+    entry_point_kind: ~
+    visibility: Private
+    type_info:
+      declared_type: ~
+      parameter_types: []
+      return_type: "(Unit,) { (Unit,) }"
+    parent_name: ~
+    scope_chain: ~
+  - name: caller
+    kind: Function
+    start_line: 3
+    end_line: 3
+    signature: "fn caller() { let unit = Unit; let (tuple,) = make(); }"
+    content_hash: f2e5ea5fc7c590c839a4a7872623140855af3c47a1aaf1a22254aa075859a77b
+    is_entry_point: false
+    entry_point_kind: ~
+    visibility: Private
+    type_info: ~
+    parent_name: ~
+    scope_chain: ~
+references:
+  - scope:
+      start: 58
+      end: 101
+      position: 92
+      initialized_at: 99
+      hoisted_var: false
+    name: make
+    kind: Call
+    start_line: 3
+    context: "let (tuple,) = make();"
+    receiver: ~
+  - scope:
+      start: 58
+      end: 101
+      position: 82
+      initialized_at: 99
+      hoisted_var: false
+    name: tuple
+    kind: LocalBinding
+    start_line: 3
+    context: ""
+    receiver: ~
+  - scope:
+      start: 58
+      end: 101
+      position: 64
+      initialized_at: 76
+      hoisted_var: false
+    name: unit
+    kind: LocalBinding
+    start_line: 3
+    context: ""
+    receiver: ~
+type_bindings:
+  - scope:
+      start: 0
+      end: 102
+      position: 16
+      initialized_at: 16
+      hoisted_var: false
+    var_name: make
+    type_name: "(Unit,)"
+    line: 2
+    kind: ReturnType
+  - scope:
+      start: 58
+      end: 101
+      position: 82
+      initialized_at: 99
+      hoisted_var: false
+    var_name: tuple
+    type_name: Unit
+    line: 3
+    kind: ReturnType
+  - scope:
+      start: 58
+      end: 101
+      position: 64
+      initialized_at: 76
+      hoisted_var: false
+    var_name: unit
+    type_name: Unit
+    line: 3
+    kind: Constructor
+has_syntax_errors: false

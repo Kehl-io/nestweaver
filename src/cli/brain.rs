@@ -876,17 +876,17 @@ pub(crate) fn run_brain(
             Ok((EXIT_SUCCESS, None))
         }
 
-        BrainCommands::StaleCheck { json, db } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+        BrainCommands::StaleCheck { json, db, config } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
             // nw-087: read-only command — fail `db_not_found` on a
             // missing --db before any daemon/store connect could create one.
-            require_existing_db(&db_path)?;
+            require_openable_db(&db_path)?;
 
             // ── daemon guard ──────────────────────────────────────
             if let Some(value) = try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
-                None,
+                config.as_deref(),
                 "stale_check",
                 serde_json::json!({}),
             )? {
@@ -1381,7 +1381,7 @@ pub(crate) fn run_brain(
                     let _ = tx.send(());
                 });
 
-                wait_for_daemon_watcher(&rt, &mut client, resp.watcher_id, &rx)?;
+                wait_for_daemon_watcher(&rt, &mut client, resp.watcher_id, &db_path, &rx)?;
 
                 stop_owned_daemon_watcher(&rt, &mut client, resp.watcher_id)?;
                 out.status("Watcher stopped.");
@@ -2167,13 +2167,15 @@ pub(crate) fn run_brain(
         }
 
         BrainCommands::ReindexSearch { db } => {
-            let db_path = db.unwrap_or_else(default_db_path);
+            let base_db = db.unwrap_or_else(default_db_path);
+            let db_path = selected_db_path(&base_db)?;
+            require_openable_db(&db_path)?;
 
             if use_daemon {
                 match tokio::runtime::Runtime::new() {
                     Ok(rt) => {
                         let connect =
-                            rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None));
+                            rt.block_on(nestweaver_client::DaemonClient::connect(&base_db, None));
                         match connect {
                             Ok(mut client) => {
                                 let rpc = rt.block_on(async {
@@ -2246,7 +2248,6 @@ pub(crate) fn run_brain(
             // database while the sidecar is rewritten, and any client connect
             // autostarts a daemon.
             // The direct rebuild targets what the daemon would serve.
-            let db_path = selected_db_path(&db_path)?;
             let write_lease = require_exclusive_store_access(&db_path, "rebuild the search index")?;
 
             let sidecar = tantivy_sidecar_path_for(&db_path);

@@ -221,7 +221,7 @@ fn overview_response(state: &Arc<AppState>, params: &OverviewParams) -> Result<R
         Some(LandmarkKind::Symbol) => counts.symbol_count,
         Some(LandmarkKind::Note) => counts.note_count,
     };
-    let meta = workspaces::p1_meta_for_result_set(
+    let mut meta = workspaces::p1_meta_for_result_set(
         &workspace,
         meta_state.result,
         meta_state.unsupported,
@@ -231,6 +231,7 @@ fn overview_response(state: &Arc<AppState>, params: &OverviewParams) -> Result<R
         Some(total_landmark_count),
     );
 
+    meta.trust.freshness = state.aggregate_repo_freshness(&repos);
     let start_here = landmarks.iter().take(8).cloned().collect();
     let response = OverviewResponse {
         counts: OverviewCounts {
@@ -274,7 +275,8 @@ fn overview_scope_data(
                 .symbols_by_pagerank(Some(limit))
                 .map_err(|e| ApiError::from_ranking(e.into()))?;
             let vaults = state.store.list_vaults(None)?;
-            let notes = state.store.list_notes_lite(None)?;
+            let notes =
+                note_lites(workspaces::notes_page(&state.store, workspace, None, limit)?.items);
             let counts = OverviewCounts {
                 project_count: projects.len(),
                 repo_count: repos.len(),
@@ -297,13 +299,20 @@ fn overview_scope_data(
         WorkspaceKind::Project => {
             let project_uid = workspace.uid.as_deref().unwrap_or_default();
             let repos = workspaces::repos_for_project(&state.store, project_uid)?;
-            let services = workspaces::services_for_project(&state.store, project_uid)?;
+            let repo_uids: HashSet<_> = repos.iter().map(|repo| repo.uid.as_str()).collect();
+            let services = state
+                .store
+                .list_services(None)?
+                .into_iter()
+                .filter(|service| repo_uids.contains(service.repo_uid.as_str()))
+                .collect::<Vec<_>>();
             let vaults = workspaces::vaults_for_project(&state.store, project_uid)?;
-            let mut top_symbols = workspaces::symbols_for_project(&state.store, project_uid)?;
-            let symbol_count = top_symbols.len();
-            top_symbols.truncate(limit);
-            let notes = workspaces::note_lites_for_project(&state.store, project_uid)?;
-            let note_count = notes.len();
+            let symbol_page = workspaces::symbols_page(&state.store, workspace, None, limit)?;
+            let symbol_count = symbol_page.total_count;
+            let top_symbols = symbol_page.items;
+            let note_page = workspaces::notes_page(&state.store, workspace, None, limit)?;
+            let note_count = note_page.total_count;
+            let notes = note_lites(note_page.items);
             let counts = OverviewCounts {
                 project_count: 1,
                 repo_count: repos.len(),
@@ -330,9 +339,9 @@ fn overview_scope_data(
                 .filter(|repo| repo.uid == repo_uid)
                 .collect();
             let services = workspaces::services_for_repo(&state.store, repo_uid)?;
-            let mut top_symbols = workspaces::symbols_for_repo(&state.store, repo_uid)?;
-            let symbol_count = top_symbols.len();
-            top_symbols.truncate(limit);
+            let symbol_page = workspaces::symbols_page(&state.store, workspace, None, limit)?;
+            let symbol_count = symbol_page.total_count;
+            let top_symbols = symbol_page.items;
             let counts = OverviewCounts {
                 project_count: 0,
                 repo_count: repos.len(),
@@ -367,17 +376,19 @@ fn overview_scope_data(
                 .into_iter()
                 .filter(|vault| vault.uid == vault_uid)
                 .collect();
-            let notes = state.store.list_notes_lite(Some(vault_uid))?;
+            let note_page = workspaces::notes_page(&state.store, workspace, None, limit)?;
+            let note_count = note_page.total_count;
+            let notes = note_lites(note_page.items);
             let counts = OverviewCounts {
                 project_count: 0,
                 repo_count: 0,
                 service_count: 0,
                 vault_count: vaults.len(),
-                note_count: notes.len(),
+                note_count,
                 symbol_count: 0,
                 gap_count: 0,
             };
-            let total_landmark_count = notes.len();
+            let total_landmark_count = note_count;
             let meta = OverviewMetaState {
                 result: "partial",
                 unsupported: vec!["code-landmarks"],
@@ -395,6 +406,19 @@ fn overview_scope_data(
             ))
         }
     }
+}
+
+fn note_lites(notes: Vec<nestweaver_schema::Note>) -> Vec<nestweaver_store::NoteLite> {
+    notes
+        .into_iter()
+        .map(|note| nestweaver_store::NoteLite {
+            uid: note.uid,
+            title: note.title,
+            file_path: note.file_path,
+            vault_uid: note.vault_uid,
+            pagerank_score: note.pagerank_score.unwrap_or(0.0),
+        })
+        .collect()
 }
 
 fn select_landmarks(

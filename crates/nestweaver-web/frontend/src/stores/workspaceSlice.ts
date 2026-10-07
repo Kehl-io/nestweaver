@@ -27,6 +27,8 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
+let catalogRequest = 0;
+
 export const createWorkspaceSlice: StateCreator<
   StoreState,
   [["zustand/immer", never]],
@@ -57,6 +59,7 @@ export const createWorkspaceSlice: StateCreator<
           (workspace) => workspace.id === s.activeWorkspaceId,
         )
       ) {
+        if (s.activeWorkspaceId !== "all") s.inspectedSceneTarget = null;
         s.activeWorkspaceId = "all";
       }
     }),
@@ -64,7 +67,10 @@ export const createWorkspaceSlice: StateCreator<
   setActiveWorkspaceId: (id) =>
     set((s) => {
       // Another workspace is another scene: drop a targeted camera fit.
-      if (s.activeWorkspaceId !== id) s.cameraFitUids = null;
+      if (s.activeWorkspaceId !== id) {
+        s.cameraFitUids = null;
+        s.inspectedSceneTarget = null;
+      }
       s.activeWorkspaceId = id;
     }),
 
@@ -79,12 +85,15 @@ export const createWorkspaceSlice: StateCreator<
     }),
 
   loadWorkspaces: async () => {
+    const requestId = ++catalogRequest;
+    const epoch = get().graphEpoch;
     set((s) => {
       s.workspacesLoading = true;
       s.workspacesError = null;
     });
     try {
       const response = await fetchWorkspaces();
+      if (requestId !== catalogRequest || get().graphEpoch !== epoch) return;
       set((s) => {
         s.workspaces = response.workspaces;
         s.workspacesMeta = response._meta;
@@ -94,10 +103,12 @@ export const createWorkspaceSlice: StateCreator<
             (workspace) => workspace.id === s.activeWorkspaceId,
           )
         ) {
+          if (s.activeWorkspaceId !== "all") s.inspectedSceneTarget = null;
           s.activeWorkspaceId = "all";
         }
       });
     } catch (error) {
+      if (requestId !== catalogRequest || get().graphEpoch !== epoch) return;
       set((s) => {
         s.workspacesLoading = false;
         s.workspacesError = errorMessage(error);

@@ -1228,7 +1228,7 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
         // clean-without-sidecar state returns by intent, not by race.
         //
         // A refresh failure therefore also blocks retirement — including the
-        // owner save failing closed when a reader wiped the fresh cache
+        // owner save failing closed if fresh ranks were invalidated
         // mid-window (`ranking.rs` `save_pagerank_cache_for_publication_owner`):
         // the publication stays dirty and recoverable instead of reporting
         // clean without ranks. The failure is still returned to the caller
@@ -1249,15 +1249,10 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
                         match io.save_pagerank(&lease, &pagerank_path) {
                             Ok(()) => {}
                             Err(error) => {
-                                // Known residual: under sustained ranked-query
-                                // traffic a reader blocked on
-                                // `pagerank_compute_lock` during the compute
-                                // typically acquires it in the compute→save gap
-                                // and wipes the fresh cache, so this fail-closed
-                                // save can fail on every retry and keep the
-                                // publication dirty (queries error) until
-                                // traffic pauses or a restart heals it via
-                                // recovery.
+                                // Reader refusals preserve the active owner's
+                                // ranks. Persistence errors still keep this
+                                // publication dirty for recovery rather than
+                                // retiring without its required sidecar.
                                 push_reconciliation_failure(
                                     &mut failures,
                                     DeletionReconciliationStage::PageRankPersistence,
@@ -3901,7 +3896,7 @@ fn prepare_index_resolution(
             file_ast_bindings,
         );
 
-        if env.binding_count() > 0 {
+        if env.binding_count() > 0 || env.has_scoped_call_assignments() {
             Some((file_path.clone(), env))
         } else {
             None
@@ -8258,9 +8253,9 @@ fn build_reresolve_edges(
     // visibility into other files' symbols.  To restore those
     // changed→unchanged edges we must include the unchanged files' symbols
     // in the resolver's symbol map so the resolver can find them as
-    // targets.  We add them to `file_data` with empty references (we
-    // don't need to resolve their references — those edges were never
-    // deleted) and populate `uid_to_file` so the edge filter can look up
+    // targets. We initially add them to `file_data` with empty references
+    // (their outgoing edges were never deleted); reachable JS/TS targets'
+    // export metadata is hydrated below and populate `uid_to_file` so the edge filter can look up
     // their file paths.  `db_symbols` is the repo's live (post-mutation)
     // symbol set, fetched by the caller.
     let mut unchanged_by_file: HashMap<String, Vec<RawSymbol>> = HashMap::new();
@@ -8324,6 +8319,120 @@ fn build_reresolve_edges(
     } else {
         Default::default()
     };
+
+    // Unchanged JS/TS targets need their exact public keys, not just stored
+    // symbol visibility. Hydrate direct targets of scoped files, then only
+    // named forwarding sources, without re-parsing unrelated repo files.
+    let mut frontier: std::collections::HashSet<String> = scope
+        .iter()
+        .filter(|file| {
+            matches!(
+                file_languages.get(*file),
+                Some(Language::JavaScript | Language::TypeScript)
+            )
+        })
+        .cloned()
+        .collect();
+    let mut hydrated = scope.clone();
+    let positions: HashMap<String, usize> = file_data
+        .iter()
+        .enumerate()
+        .map(|(position, (path, _, _))| (path.clone(), position))
+        .collect();
+    // One direct-import layer and at most three named forwarding hops.
+    for _ in 0..=3 {
+        let graph = nestweaver_resolver::imports::build_import_graph(
+            &file_data,
+            Language::JavaScript,
+            &workspace_ctx,
+        );
+        let targets: std::collections::HashSet<String> = graph
+            .all_resolved_imports()
+            .into_iter()
+            .filter(|(from, _, _)| frontier.contains(*from))
+            .map(|(_, _, target)| target.to_string())
+            .collect();
+        let mut next = std::collections::HashSet::new();
+        for target in targets {
+            if !matches!(
+                file_languages.get(&target),
+                Some(Language::JavaScript | Language::TypeScript)
+            ) || !hydrated.insert(target.clone())
+            {
+                continue;
+            }
+            let Some(&position) = positions.get(&target) else {
+                continue;
+            };
+            let references = if let Some((_, references)) =
+                prepared_file_data.and_then(|prepared| prepared.get(&target))
+            {
+                references.clone()
+            } else {
+                let Ok(source) = reader.read_file(Path::new(&target)) else {
+                    continue;
+                };
+                let Ok(parsed) = parse_source(&reader.root().join(&target), &source) else {
+                    continue;
+                };
+                parsed.references
+            };
+            let exported_locals: std::collections::HashSet<&str> = references
+                .iter()
+                .filter(|reference| {
+                    reference.kind == nestweaver_parser::ReferenceKind::ExportAlias
+                        && reference.receiver.is_none()
+                })
+                .map(|reference| reference.context.as_str())
+                .collect();
+            let exported_bindings: Vec<&RawReference> = references
+                .iter()
+                .filter(|reference| {
+                    reference.kind == nestweaver_parser::ReferenceKind::ImportAlias
+                        && exported_locals.contains(reference.name.as_str())
+                        && !file_data[position].1.iter().any(|symbol| {
+                            matches!(
+                                symbol.kind,
+                                nestweaver_schema::SymbolKind::Function
+                                    | nestweaver_schema::SymbolKind::Method
+                                    | nestweaver_schema::SymbolKind::Class
+                            ) && symbol.start_line <= reference.start_line
+                                && reference.start_line <= symbol.end_line
+                        })
+                })
+                .collect();
+            let forwarding_sources: std::collections::HashSet<&str> = references
+                .iter()
+                .filter(|reference| reference.kind == nestweaver_parser::ReferenceKind::ExportAlias)
+                .filter_map(|reference| reference.receiver.as_deref())
+                .chain(
+                    exported_bindings
+                        .iter()
+                        .map(|binding| binding.context.as_str()),
+                )
+                .collect();
+            file_data[position].2 = references
+                .iter()
+                .filter(|reference| {
+                    reference.kind == nestweaver_parser::ReferenceKind::ExportAlias
+                        || exported_bindings.iter().any(|binding| {
+                            binding.name == reference.name
+                                && binding.start_line == reference.start_line
+                                && binding.context == reference.context
+                                && reference.kind == nestweaver_parser::ReferenceKind::ImportAlias
+                        })
+                        || (reference.kind == nestweaver_parser::ReferenceKind::Import
+                            && forwarding_sources.contains(reference.name.as_str()))
+                })
+                .cloned()
+                .collect();
+            next.insert(target);
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
 
     let resolved_edges = resolve_references_with_file_languages(
         &file_data,
@@ -13605,7 +13714,7 @@ function hello(name) { return "Hello " + name; }
         fs::create_dir_all(&src).unwrap();
         fs::write(
             src.join("index.js"),
-            "const h = require('./helpers');\nh.listen();\n",
+            "const h = require('./helpers');\nfunction start() {\n  h.listen();\n}\n",
         )
         .unwrap();
         fs::write(
@@ -13620,7 +13729,7 @@ function hello(name) { return "Hello " + name; }
         let (_, store) =
             index_directory_in_memory(&src, "test", "https://example.com/mixed", "abc123").unwrap();
         let repo = repo_uid("test", "https://example.com/mixed");
-        let importer = symbol_uid(&repo, "index.js", "h", 1);
+        let importer = symbol_uid(&repo, "index.js", "start", 2);
         let exported = symbol_uid(&repo, "helpers.js", "listen", 1);
         let edges = store.load_typed_edges().unwrap();
         assert!(
@@ -13970,7 +14079,7 @@ module.exports = { check, plain };\n";
         fs::create_dir_all(&src).unwrap();
         fs::write(
             src.join("index.js"),
-            "const h = require('./helpers');\nh.listen();\n",
+            "const h = require('./helpers');\nfunction start() {\n  h.listen();\n}\n",
         )
         .unwrap();
         fs::write(
@@ -14001,7 +14110,7 @@ module.exports = { check, plain };\n";
             None,
         )
         .unwrap();
-        let importer = symbol_uid(&repo, "index.js", "h", 1);
+        let importer = symbol_uid(&repo, "index.js", "start", 2);
         let exported = symbol_uid(&repo, "helpers.js", "listen", 1);
         assert!(
             edges.iter().any(|edge| {
@@ -14010,6 +14119,180 @@ module.exports = { check, plain };\n";
                     && edge.edge_type == nestweaver_schema::EdgeType::Imports
             }),
             "watcher re-resolution must use the importing file's language: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn watcher_reresolve_hydrates_only_reachable_export_metadata() {
+        struct CountingReader {
+            root: PathBuf,
+            reads: std::sync::Mutex<Vec<PathBuf>>,
+        }
+        impl crate::content_reader::ContentReader for CountingReader {
+            fn read_file(&self, path: &Path) -> anyhow::Result<String> {
+                self.reads.lock().unwrap().push(path.to_path_buf());
+                Ok(fs::read_to_string(self.root.join(path))?)
+            }
+            fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
+                Ok(Vec::new())
+            }
+            fn file_meta_nanos(&self, _: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+                Ok(None)
+            }
+            fn root(&self) -> &Path {
+                &self.root
+            }
+            fn version_id(&self) -> &str {
+                "counting"
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("App.js"),
+            "import Chosen from './Router.js';\nfunction app() {\n  Chosen();\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Router.js"),
+            "export default function Router() {}\nexport function unused() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("unrelated.js"),
+            "export function unrelated() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("barrel.js"), "import { secret as selected } from './target.js';\nexport { selected as publicName };\nexport function marker() {}\n").unwrap();
+        fs::write(
+            root.join("target.js"),
+            "export function secret() {}\nexport function unused() {}\n",
+        )
+        .unwrap();
+        let (_, store) =
+            index_directory_in_memory(root, "test", "https://example.com/hydrate", "sha").unwrap();
+        let repo = repo_uid("test", "https://example.com/hydrate");
+        let symbols = store.lookup_symbols_by_repo(&repo).unwrap();
+        let reader = CountingReader {
+            root: root.to_path_buf(),
+            reads: Default::default(),
+        };
+        let changed = std::collections::HashSet::from(["App.js".to_string()]);
+        let assert_target = |edges: &[nestweaver_schema::ResolvedEdge]| {
+            for kind in [
+                nestweaver_schema::EdgeType::Calls,
+                nestweaver_schema::EdgeType::Imports,
+            ] {
+                assert!(
+                    edges.iter().any(|edge| edge.source_uid
+                        == symbol_uid(&repo, "App.js", "app", 2)
+                        && edge.target_uid == symbol_uid(&repo, "Router.js", "Router", 1)
+                        && edge.edge_type == kind),
+                    "{edges:#?}"
+                );
+            }
+        };
+        let edges = build_reresolve_edges(
+            &reader,
+            &repo,
+            &changed,
+            &Default::default(),
+            &symbols,
+            None,
+        )
+        .unwrap();
+        assert_target(&edges);
+        let reads = reader.reads.lock().unwrap().clone();
+        assert_eq!(
+            reads
+                .iter()
+                .filter(|path| path.as_path() == Path::new("Router.js"))
+                .count(),
+            1
+        );
+        assert!(
+            !reads
+                .iter()
+                .any(|path| path.as_path() == Path::new("unrelated.js")),
+            "{reads:?}"
+        );
+
+        // Frozen target metadata avoids reading the same target again.
+        let parsed = parse_source(
+            &root.join("Router.js"),
+            &fs::read_to_string(root.join("Router.js")).unwrap(),
+        )
+        .unwrap();
+        let prepared =
+            HashMap::from([("Router.js".to_string(), (parsed.symbols, parsed.references))]);
+        reader.reads.lock().unwrap().clear();
+        let edges = build_reresolve_edges(
+            &reader,
+            &repo,
+            &changed,
+            &Default::default(),
+            &symbols,
+            Some(&prepared),
+        )
+        .unwrap();
+        assert_target(&edges);
+        assert!(
+            !reader
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.as_path() == Path::new("Router.js")
+                    || path.as_path() == Path::new("unrelated.js"))
+        );
+        // An unchanged named barrel forwards the exact imported local binding.
+        fs::write(root.join("App.js"), "import { publicName as chosen } from './barrel.js';\nfunction app() {\n  chosen();\n}\n").unwrap();
+        reader.reads.lock().unwrap().clear();
+        let edges = build_reresolve_edges(
+            &reader,
+            &repo,
+            &changed,
+            &Default::default(),
+            &symbols,
+            None,
+        )
+        .unwrap();
+        for kind in [
+            nestweaver_schema::EdgeType::Calls,
+            nestweaver_schema::EdgeType::Imports,
+        ] {
+            assert!(
+                edges.iter().any(
+                    |edge| edge.source_uid == symbol_uid(&repo, "App.js", "app", 2)
+                        && edge.target_uid == symbol_uid(&repo, "target.js", "secret", 1)
+                        && edge.edge_type == kind
+                ),
+                "named local forwarding: {edges:#?}"
+            );
+        }
+        assert!(
+            !edges
+                .iter()
+                .any(|edge| edge.target_uid == symbol_uid(&repo, "target.js", "unused", 2)),
+            "{edges:#?}"
+        );
+        let reads = reader.reads.lock().unwrap().clone();
+        for target in ["barrel.js", "target.js"] {
+            assert_eq!(
+                reads
+                    .iter()
+                    .filter(|path| path.as_path() == Path::new(target))
+                    .count(),
+                1,
+                "{reads:?}"
+            );
+        }
+        assert!(
+            !reads
+                .iter()
+                .any(|path| path.as_path() == Path::new("unrelated.js")
+                    || path.as_path() == Path::new("Router.js")),
+            "{reads:?}"
         );
     }
 
@@ -14402,6 +14685,116 @@ module.exports = { check, plain };\n";
     /// the touched-file set: the destination's re-inserted symbol must KEEP its
     /// place in the graph while the old path's UID disappears. That arm was
     /// untestable until the failure below was fixed.
+    #[test]
+    fn user_pain_python_src_layout_selects_actual_affected_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src/qrec")).unwrap();
+        fs::create_dir_all(repo.join("tests")).unwrap();
+        fs::write(
+            repo.join("src/qrec/coredata.py"),
+            "def load():\n    return 1\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("tests/test_coredata.py"),
+            "from qrec.coredata import load\ndef test_load():\n    load()\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("tests/test_other.py"),
+            "def test_other():\n    pass\n",
+        )
+        .unwrap();
+        let (_, store) =
+            index_directory_in_memory(&repo, "test", "https://example.com/src-layout", "abc123")
+                .unwrap();
+        let result =
+            crate::affected_tests::affected_tests(&store, &["src/qrec/coredata.py".into()])
+                .unwrap();
+        let selected: Vec<_> = result
+            .tier_1
+            .iter()
+            .chain(&result.tier_2)
+            .chain(&result.tier_3)
+            .map(|file| file.test_file.as_str())
+            .collect();
+        assert!(selected.contains(&"tests/test_coredata.py"), "{result:#?}");
+        assert!(!selected.contains(&"tests/test_other.py"), "{result:#?}");
+    }
+
+    #[test]
+    fn user_pain_rename_incoming_edges_match_fresh_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("Router.js"),
+            "export default function Router() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("App.js"),
+            "import Router from './Router.js';\nexport function app() {\n  return Router();\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("stable.js"),
+            "export function stable() { return 2; }\n",
+        )
+        .unwrap();
+        fs::write(repo.join("unchanged.js"), "import { stable } from './stable.js';\nexport function caller() {\n  return stable();\n}\n").unwrap();
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "initial"]);
+        let db = dir.path().join("incremental.lbug");
+        let url = "https://example.com/rename-incoming";
+        index_directory(&repo, &db, "test", url, &git(&["rev-parse", "HEAD"])).unwrap();
+        fs::rename(repo.join("Router.js"), repo.join("Navigator.js")).unwrap();
+        fs::write(repo.join("App.js"), "import Router from './Navigator.js';\nexport function app() {\n  return Router();\n}\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "rename router"]);
+        incremental_index(&repo, &db, "test", url).unwrap();
+        let incremental = GraphStore::open_or_create(&db).unwrap();
+        let fresh_db = dir.path().join("fresh.lbug");
+        index_directory(&repo, &fresh_db, "test", url, &git(&["rev-parse", "HEAD"])).unwrap();
+        let fresh = GraphStore::open_or_create(&fresh_db).unwrap();
+        let edge_set = |store: &GraphStore| {
+            store
+                .load_typed_edges()
+                .unwrap()
+                .into_iter()
+                .filter(|(_, _, kind, _, _)| kind == "CALLS" || kind == "IMPORTS")
+                .map(|(source, target, kind, _, _)| (source, target, kind))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(edge_set(&incremental), edge_set(&fresh));
+        let app = incremental.lookup_symbols_by_name("app").unwrap()[0]
+            .uid
+            .clone();
+        let route = incremental.lookup_symbols_by_name("Router").unwrap()[0]
+            .uid
+            .clone();
+        assert!(edge_set(&incremental).contains(&(app.clone(), route.clone(), "CALLS".into())));
+        assert!(edge_set(&incremental).contains(&(app, route, "IMPORTS".into())));
+        assert!(incremental.symbols_in_file("Router.js").unwrap().is_empty());
+    }
+
     #[test]
     fn incremental_index_survives_a_rename_between_parseable_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -15179,7 +15572,10 @@ module.exports = { check, plain };\n";
                 anyhow::bail!("injected PageRank save failure");
             }
             if self.reader_touch_before_save {
-                let _ = lease.store().pagerank_scores();
+                assert!(matches!(
+                    lease.store().pagerank_scores(),
+                    Err(nestweaver_store::StoreError::RankingUnavailable)
+                ));
             }
             FileSystemIndexEpilogueIo.save_pagerank(lease, path)?;
             if self.crash_after_save_pagerank {
@@ -15488,13 +15884,11 @@ module.exports = { check, plain };\n";
         assert_note_ranks(&persisted, "killsave");
     }
 
-    // No crash at all: a reader touching the rank path BETWEEN the owner's
-    // compute and save (the marker is still set, so the read fails closed and
-    // wipes the fresh cache). The owner save must then FAIL — blocking marker
-    // retirement — rather than silently writing nothing and publishing clean
-    // with no sidecar.
+    // A reader between owner compute and save still refuses the dirty
+    // publication, but must preserve the reserved owner's current ranks.
+    // Completion must persist code and note ranks before retiring the marker.
     #[test]
-    fn reader_in_refresh_window_cannot_leave_a_clean_rankless_publication() {
+    fn reader_in_refresh_window_preserves_ranks_and_publishes_clean() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.lbug");
         let marker_path = crate::sidecar_path(&db_path, ".index-dirty");
@@ -15515,7 +15909,7 @@ module.exports = { check, plain };\n";
         insert_publication_graph(&store, "raced");
         insert_publication_notes(&store, "raced");
 
-        let error = finalize_committed_index_for_scope_with_io(
+        finalize_committed_index_for_scope_with_io(
             publication,
             Some(&db_path),
             "raced publisher",
@@ -15526,36 +15920,32 @@ module.exports = { check, plain };\n";
             Some(&nestweaver_store::GraphScope::unified()),
             true,
         )
-        .expect_err("a wiped owner cache must fail the sidecar save, not publish clean without it");
+        .expect("a refused read must not discard the reserved owner's ranks");
         assert!(
-            error
-                .failures
-                .iter()
-                .any(|f| f.stage == DeletionReconciliationStage::PageRankPersistence),
-            "the wipe must surface as a PageRank save failure: {error}"
+            !marker_path.exists(),
+            "a successful persisted publication retires its marker"
         );
         assert!(
-            marker_path.exists(),
-            "the publication must stay dirty so the next open reconciles it"
-        );
-        assert!(
-            !pagerank_path.exists(),
-            "no sidecar may be written from a wiped cache"
-        );
-        drop(store);
-
-        // And it recovers on the next open — with note ranks, not just code.
-        write_marker_with_pid(&marker_path, reaped_child_pid(), None);
-        let reopened = GraphStore::open_or_create(&db_path).unwrap();
-        let authority = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
-        let outcome = recover_abandoned_index_publication(&reopened, &authority).unwrap();
-        assert!(
-            outcome.recovered(),
-            "the dirty publication must reconcile: {}",
-            outcome.describe()
+            pagerank_path.exists(),
+            "the clean publication must have its rank sidecar"
         );
         let persisted = persisted_pagerank(&db_path);
         assert_note_ranks(&persisted, "raced");
+        for uid in ["sym:publisher-raced:source", "sym:publisher-raced:target"] {
+            assert!(
+                persisted.contains_key(uid),
+                "code rank {uid} must be persisted"
+            );
+        }
+        drop(store);
+        let reopened = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(!reopened.is_index_publication_dirty());
+        reopened.load_pagerank_cache(&pagerank_path).unwrap();
+        assert_eq!(
+            reopened.pagerank_scores().unwrap(),
+            persisted,
+            "a cold opener must load the exact code and note population"
+        );
     }
 
     #[test]

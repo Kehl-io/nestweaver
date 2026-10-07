@@ -147,7 +147,7 @@ export function buildGraphFromOverview(result: OverviewResponse): Graph {
     });
 
     if (parent && graph.hasNode(parent)) {
-      graph.addEdge(parent, item.uid, {
+      graph.addDirectedEdgeWithKey(`overview:${JSON.stringify(["hub", parent, item.uid])}`, parent, item.uid, {
         type: "overview",
         confidence: Math.max(item.score / maxScore, 0.18),
         // Varied rest lengths break the perfect-radius starburst: without
@@ -173,7 +173,7 @@ export function buildGraphFromOverview(result: OverviewResponse): Graph {
       if (hashUnit(`${uids[i]}:sib`) < 0.45) {
         const j = Math.floor(hashUnit(`${uids[i]}:pick`) * i);
         if (!graph.hasEdge(uids[j], uids[i]) && !graph.hasEdge(uids[i], uids[j])) {
-          graph.addEdge(uids[j], uids[i], {
+          graph.addDirectedEdgeWithKey(`overview:${JSON.stringify(["sibling", uids[j], uids[i]])}`, uids[j], uids[i], {
             type: "overview",
             confidence: 0.14,
             linkDistance: 20 + hashUnit(`${uids[i]}:siblen`) * 22,

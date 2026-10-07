@@ -114,6 +114,9 @@ export interface ContentSlice {
 
   // Bumped (debounced) when the backend finishes a lazy PageRank recompute so
   // lenses that consume rank data can retry a stale/timed-out result once.
+  graphEpoch: number;
+  bumpGraphEpoch: () => void;
+
   ranksGeneration: number;
   bumpRanksGeneration: () => void;
 
@@ -284,6 +287,9 @@ export const createContentSlice: StateCreator<
     set((s) => {
       s.lastEventTimestamp = timestamp;
     }),
+
+  graphEpoch: 0,
+  bumpGraphEpoch: () => set((s) => { s.graphEpoch += 1; }),
 
   ranksGeneration: 0,
   bumpRanksGeneration: () =>

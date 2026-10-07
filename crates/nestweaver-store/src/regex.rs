@@ -57,6 +57,10 @@ pub const MAX_PATTERN_BYTES: usize = 4096;
 /// instead of on every search.
 static TRIGRAM_STALE_WARNED: AtomicBool = AtomicBool::new(false);
 
+/// Serializes test searches that can set or clear the process-global warning latch.
+#[cfg(test)]
+pub(crate) static LATCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Compiled-program size limit for a single regex. The `regex` crate defaults to
 /// 10 MiB; we cap lower because patterns arrive from untrusted clients. The
 /// engine is finite-automata / linear-time (no catastrophic backtracking), so
@@ -437,7 +441,39 @@ fn regex_shard_trusted(
         && metadata.candidate_digest == state.candidate_digest
 }
 
+#[cfg(test)]
+mod planning_allocation_witness {
+    use std::{cell::RefCell, rc::Rc};
+    type Events = Rc<RefCell<Vec<(&'static str, usize)>>>;
+    thread_local! { static ACTIVE: RefCell<Option<Events>> = const { RefCell::new(None) }; }
+    pub struct Guard {
+        pub events: Events,
+        previous: Option<Events>,
+    }
+    impl Guard {
+        pub fn new() -> Self {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let previous = ACTIVE.with(|active| active.replace(Some(events.clone())));
+            Self { events, previous }
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| active.replace(self.previous.take()));
+        }
+    }
+    pub fn record(kind: &'static str, count: usize) {
+        ACTIVE.with(|active| {
+            if let Some(events) = active.borrow().as_ref() {
+                events.borrow_mut().push((kind, count));
+            }
+        });
+    }
+}
+
 struct TrigramPrefilterPlan {
+    scope_population_complete: bool,
+    candidate_cap_reached: bool,
     matching_ready_uids: HashSet<String>,
     ready_scopes: HashSet<String>,
     dirty_scopes: HashSet<String>,
@@ -449,12 +485,33 @@ fn text_hash(text: &str) -> String {
     blake3::hash(text.as_bytes()).to_hex().to_string()
 }
 
+fn candidate_path(candidate: &Candidate) -> String {
+    if candidate.kind == "Note" {
+        candidate.location.clone()
+    } else {
+        file_of(&candidate.location)
+    }
+}
+
+fn candidate_document_hash(candidate: &Candidate) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for value in [
+        &candidate.text_hash,
+        &candidate.kind,
+        &candidate_path(candidate),
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update(&[0]);
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 fn candidate_digest(candidates: &[Candidate]) -> String {
     let mut hasher = blake3::Hasher::new();
     for candidate in candidates {
         hasher.update(candidate.uid.as_bytes());
         hasher.update(&[0]);
-        hasher.update(candidate.text_hash.as_bytes());
+        hasher.update(candidate_document_hash(candidate).as_bytes());
         hasher.update(&[0xff]);
     }
     hasher.finalize().to_hex().to_string()
@@ -963,7 +1020,7 @@ impl GraphStore {
                 .unwrap_or_default();
             let desired_documents: HashMap<_, _> = candidates
                 .iter()
-                .map(|candidate| (candidate.uid.clone(), candidate.text_hash.clone()))
+                .map(|candidate| (candidate.uid.clone(), candidate_document_hash(candidate)))
                 .collect();
             stats.nodes_added += desired_documents
                 .keys()
@@ -1002,7 +1059,10 @@ impl GraphStore {
                 .map(|(candidate, trigrams)| RegexShardDocument {
                     uid: &candidate.uid,
                     kind: &candidate.kind,
-                    text_hash: &candidate.text_hash,
+                    path: candidate_path(candidate),
+                    text_hash: desired_documents
+                        .get(&candidate.uid)
+                        .expect("candidate document hash"),
                     trigrams,
                 })
                 .collect();
@@ -1099,6 +1159,8 @@ impl GraphStore {
                 );
             }
         }
+        #[cfg(test)]
+        planning_allocation_witness::record("states", states.len());
         Ok(states)
     }
 
@@ -1155,7 +1217,101 @@ impl GraphStore {
                 }));
             }
         }
+        #[cfg(test)]
+        planning_allocation_witness::record("inventory", scopes.len());
         Ok(scopes)
+    }
+
+    /// Bounded search inventory: lightweight deterministic UID projections,
+    /// including ownership fallback for imported graphs without source roots.
+    fn active_regex_scopes_bounded(&self, cap: usize) -> Result<(Vec<String>, bool), StoreError> {
+        let conn = self.conn()?;
+        let probe = cap.saturating_add(1);
+        let mut scopes = Vec::new();
+        for (table, field) in [("Repo", "uid"), ("Vault", "uid")] {
+            let rows = conn
+                .query(&format!(
+                    "MATCH (n:{table}) RETURN DISTINCT n.{field} ORDER BY n.{field} LIMIT {probe}"
+                ))
+                .map_err(|e| StoreError::Query(format!("bounded regex inventory: {e}")))?;
+            for row in rows {
+                if let Some(Value::String(uid)) = row.first() {
+                    scopes.push(uid.clone());
+                }
+            }
+        }
+        if scopes.is_empty() {
+            for (table, field) in [("Symbol", "repo_uid"), ("Note", "vault_uid")] {
+                let rows = conn.query(&format!("MATCH (n:{table}) WHERE n.{field} <> '' RETURN DISTINCT n.{field} ORDER BY n.{field} LIMIT {probe}"))
+                    .map_err(|e| StoreError::Query(format!("bounded regex ownership: {e}")))?;
+                for row in rows {
+                    if let Some(Value::String(uid)) = row.first() {
+                        scopes.push(uid.clone());
+                    }
+                }
+            }
+        }
+        scopes.sort();
+        scopes.dedup();
+        scopes.truncate(probe);
+        #[cfg(test)]
+        planning_allocation_witness::record("inventory", scopes.len());
+        let complete = scopes.len() <= cap;
+        scopes.truncate(cap);
+        Ok((scopes, complete))
+    }
+
+    fn read_regex_scope_states_selected(
+        &self,
+        scopes: &[String],
+        interrupted: impl Fn() -> Result<bool, StoreError>,
+    ) -> Result<HashMap<String, RegexGraphScopeState>, StoreError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare("UNWIND $uids AS wanted MATCH (s:RegexScopeState {uid: wanted}) RETURN s.uid, s.desired_epoch, s.acknowledged_epoch, s.candidate_count, s.candidate_digest, s.tombstone")
+            .map_err(|e| StoreError::Query(format!("prepare selected regex state: {e}")))?;
+        let mut states = HashMap::new();
+        for chunk in scopes.chunks(256) {
+            if interrupted()? {
+                break;
+            }
+            let rows = conn
+                .execute(
+                    &mut stmt,
+                    vec![(
+                        "uids",
+                        Value::List(
+                            lbug::LogicalType::String,
+                            chunk.iter().cloned().map(Value::String).collect(),
+                        ),
+                    )],
+                )
+                .map_err(|e| StoreError::Query(format!("selected regex state: {e}")))?;
+            for row in rows {
+                if let [
+                    Value::String(uid),
+                    Value::Int64(desired),
+                    Value::Int64(acknowledged),
+                    Value::Int64(count),
+                    Value::String(digest),
+                    Value::Bool(tombstone),
+                ] = row.as_slice()
+                {
+                    states.insert(
+                        uid.clone(),
+                        RegexGraphScopeState {
+                            desired_epoch: (*desired).max(0) as u64,
+                            acknowledged_epoch: (*acknowledged).max(0) as u64,
+                            candidate_count: (*count).max(0) as usize,
+                            candidate_digest: digest.clone(),
+                            tombstone: *tombstone,
+                        },
+                    );
+                }
+            }
+        }
+        #[cfg(test)]
+        planning_allocation_witness::record("states", states.len());
+        Ok(states)
     }
 
     /// Collect all searchable candidate nodes (Sections, Notes, Frontmatter,
@@ -1723,6 +1879,32 @@ impl GraphStore {
         start: Instant,
         deadline_ms: u64,
         cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        candidate_cap: usize,
+        bounded_prefix: bool,
+    ) -> Result<Option<TrigramPrefilterPlan>, StoreError> {
+        self.regex_v3_candidate_uids_scoped(
+            clauses,
+            start,
+            deadline_ms,
+            cancel,
+            candidate_cap,
+            bounded_prefix,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn regex_v3_candidate_uids_scoped(
+        &self,
+        clauses: &[HashSet<String>],
+        start: Instant,
+        deadline_ms: u64,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        candidate_cap: usize,
+        bounded_prefix: bool,
+        path_prefix: Option<&str>,
+        kinds: Option<&[String]>,
     ) -> Result<Option<TrigramPrefilterPlan>, StoreError> {
         let interrupted = || -> Result<bool, StoreError> {
             if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
@@ -1733,13 +1915,22 @@ impl GraphStore {
         if interrupted()? {
             return Ok(None);
         }
+        let (active_scopes, mut scope_population_complete) = if bounded_prefix {
+            self.active_regex_scopes_bounded(candidate_cap)?
+        } else {
+            let mut scopes: Vec<_> = self.active_regex_scopes()?.into_iter().collect();
+            scopes.sort();
+            (scopes, true)
+        };
         let Some(root) = self.regex_sidecar_root() else {
-            let dirty_scopes = self.active_regex_scopes()?;
+            let dirty_scopes = active_scopes.into_iter().collect();
             if interrupted()? {
                 return Ok(None);
             }
             return Ok(Some(TrigramPrefilterPlan {
                 matching_ready_uids: HashSet::new(),
+                candidate_cap_reached: !scope_population_complete,
+                scope_population_complete,
                 ready_scopes: HashSet::new(),
                 dirty_scopes,
                 error_scopes: HashSet::new(),
@@ -1750,14 +1941,23 @@ impl GraphStore {
         let identity = self.publication_identity()?.ok_or_else(|| {
             StoreError::Query("regex v3 requires graph publication identity".to_string())
         })?;
-        let states = self.read_regex_scope_states()?;
-        let active_scopes = self.active_regex_scopes()?;
+        let states = if bounded_prefix {
+            self.read_regex_scope_states_selected(&active_scopes, interrupted)?
+        } else {
+            self.read_regex_scope_states()?
+        };
         let has_index = index.root().join("scopes").is_dir();
         let mut ready_scopes = HashSet::new();
         let mut dirty_scopes = HashSet::new();
         let mut error_scopes = HashSet::new();
         let mut matching_ready_uids = HashSet::new();
+        let mut candidate_cap_reached = !scope_population_complete;
         for scope_uid in active_scopes {
+            if bounded_prefix && matching_ready_uids.len() >= candidate_cap {
+                scope_population_complete = false;
+                candidate_cap_reached = true;
+                break;
+            }
             if interrupted()? {
                 return Ok(None);
             }
@@ -1769,6 +1969,8 @@ impl GraphStore {
                 dirty_scopes.insert(scope_uid);
                 continue;
             }
+            #[cfg(test)]
+            planning_allocation_witness::record("metadata", 1);
             let metadata = match index.metadata(&scope_uid) {
                 Ok(Some(metadata)) => metadata,
                 Ok(None) => {
@@ -1785,10 +1987,28 @@ impl GraphStore {
                 dirty_scopes.insert(scope_uid);
                 continue;
             }
-            match index.candidate_uids(&metadata, clauses, CANDIDATE_CAP) {
-                Ok(Some(uids)) => {
+            #[cfg(test)]
+            planning_allocation_witness::record("posting", 1);
+            let candidates = if bounded_prefix {
+                index.candidate_uids_bounded_scoped(
+                    &metadata,
+                    clauses,
+                    candidate_cap.saturating_sub(matching_ready_uids.len()),
+                    path_prefix,
+                    kinds,
+                )
+            } else {
+                // Exact counts retain the original per-scope allowance and
+                // widen saturated scopes to a complete graph scan.
+                index
+                    .candidate_uids(&metadata, clauses, candidate_cap)
+                    .map(|uids| uids.map(|uids| (uids, false)))
+            };
+            match candidates {
+                Ok(Some((uids, cut))) => {
                     ready_scopes.insert(scope_uid);
                     matching_ready_uids.extend(uids);
+                    candidate_cap_reached |= cut;
                 }
                 Ok(None) => {
                     dirty_scopes.insert(scope_uid);
@@ -1822,6 +2042,8 @@ impl GraphStore {
         }
         Ok(Some(TrigramPrefilterPlan {
             matching_ready_uids,
+            scope_population_complete,
+            candidate_cap_reached,
             ready_scopes,
             dirty_scopes,
             error_scopes,
@@ -1871,20 +2093,12 @@ impl GraphStore {
         )
     }
 
-    /// `regex_search_cancellable` with the candidate cap parameterized
-    /// instead of hardcoded to [`CANDIDATE_CAP`]. The public entry point above
-    /// always passes the real constant; this seam exists so a unit test can
-    /// force `hydration_stop = Some(CandidateCap)` on a small, fast in-memory
-    /// store (nw-427) rather than needing 200,000 real rows to hit the
-    /// production cap — `CandidateCap` and `Deadline` both flow through the
-    /// identical `hydration_stop` -> verification-loop path this item fixes,
-    /// so exercising one deterministically exercises the other.
-    // One parameter more than the public entry point it mirrors, which is the
-    // whole point of the seam: the signature is deliberately identical so the
-    // test and production paths cannot drift. Bundling the arguments here would
-    // make them differ.
+    /// Regex search with a caller-specific work allowance, used by bounded
+    /// MCP delivery. The ordinary CLI entry keeps its 200000-candidate budget.
+    /// Planning posting collectors and hydration share this allowance; cuts
+    /// retain the same candidate-cap/deadline/cancellation disclosure.
     #[allow(clippy::too_many_arguments)]
-    fn regex_search_cancellable_with_candidate_cap(
+    pub fn regex_search_cancellable_with_candidate_cap(
         &self,
         pattern: &str,
         path_prefix: Option<&str>,
@@ -1918,7 +2132,16 @@ impl GraphStore {
         let clauses = required_trigram_clauses(pattern);
         let (plan, mut planning_deadline) = match &clauses {
             Some(clauses) => {
-                match self.regex_v3_candidate_uids(clauses, start, deadline_ms, cancel)? {
+                match self.regex_v3_candidate_uids_scoped(
+                    clauses,
+                    start,
+                    deadline_ms,
+                    cancel,
+                    candidate_cap,
+                    true,
+                    path_prefix,
+                    kinds,
+                )? {
                     Some(plan) => (Some(plan), false),
                     None => (None, true),
                 }
@@ -1968,7 +2191,7 @@ impl GraphStore {
                         deadline_ms,
                         CandidateLimits {
                             cancel,
-                            max_candidates: candidate_cap,
+                            max_candidates: candidate_cap.saturating_sub(candidates.len()),
                         },
                     )?;
                     hydration_stop = stronger_truncation(fallback_stop, hydrated_stop);
@@ -2031,6 +2254,10 @@ impl GraphStore {
         // planning_deadline { (Vec::new(), 0) }` above) — there is nothing to
         // lose by skipping it. Whether collection was complete is folded back
         // in AFTER the loop runs, not before.
+        if plan.as_ref().is_some_and(|plan| plan.candidate_cap_reached) {
+            hydration_stop =
+                stronger_truncation(hydration_stop, Some(RegexTruncationReason::CandidateCap));
+        }
         let collection_incomplete = hydration_stop.is_some() || elapsed_deadline;
         let mut truncated = planning_deadline;
         let mut truncation_reason = planning_deadline.then_some(RegexTruncationReason::Deadline);
@@ -2179,7 +2406,7 @@ impl GraphStore {
         }
 
         // nw-097: attach the note at the source so no caller has to remember.
-        Ok(RegexSearchResult {
+        let mut response = RegexSearchResult {
             results,
             truncated,
             scanned_fallback,
@@ -2199,7 +2426,18 @@ impl GraphStore {
             },
             note: None,
         }
-        .with_scan_budget_note())
+        .with_scan_budget_note();
+        if plan
+            .as_ref()
+            .is_some_and(|plan| !plan.scope_population_complete)
+        {
+            let disclosure = "Scope planning budget reached: ready/dirty/error scope counts are lower bounds; total scope population is unknown. Use a scoped source graph or a CLI search with a larger work allowance and retry.";
+            response.note = Some(match response.note {
+                Some(note) => format!("{note} {disclosure}"),
+                None => disclosure.into(),
+            });
+        }
+        Ok(response)
     }
 
     /// Counts-only companion to `regex_search`. For each pattern, returns the
@@ -2216,6 +2454,17 @@ impl GraphStore {
         path_prefix: Option<&str>,
         kinds: Option<&[String]>,
     ) -> Result<Vec<PatternCount>, StoreError> {
+        self.count_patterns_with_planning_cap(patterns, path_prefix, kinds, CANDIDATE_CAP)
+    }
+
+    // Small-budget regression seam; public behavior keeps the original cap.
+    fn count_patterns_with_planning_cap(
+        &self,
+        patterns: &[String],
+        path_prefix: Option<&str>,
+        kinds: Option<&[String]>,
+        planning_cap: usize,
+    ) -> Result<Vec<PatternCount>, StoreError> {
         let mut out = Vec::new();
         for pattern in patterns {
             let started = Instant::now();
@@ -2225,7 +2474,14 @@ impl GraphStore {
             let planning_started = Instant::now();
             let clauses = required_trigram_clauses(pattern);
             let plan = match &clauses {
-                Some(clauses) => self.regex_v3_candidate_uids(clauses, started, u64::MAX, None)?,
+                Some(clauses) => self.regex_v3_candidate_uids(
+                    clauses,
+                    started,
+                    u64::MAX,
+                    None,
+                    planning_cap,
+                    false,
+                )?,
                 None => None,
             };
             let planning_ms = elapsed_millis(planning_started);
@@ -2486,6 +2742,7 @@ mod tests {
     /// `candidates` held real, already-collected matches.
     #[test]
     fn hydration_candidate_cap_does_not_discard_already_collected_candidates() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = GraphStore::in_memory().unwrap();
         for i in 0..4 {
             store
@@ -2619,13 +2876,6 @@ mod tests {
 
     use super::*;
     use nestweaver_schema::{Note, NoteKind, Section, Symbol, SymbolKind, Visibility};
-
-    /// Serializes tests that touch the process-global TRIGRAM_STALE_WARNED
-    /// latch: a parallel stale observation (which sets the latch) can land
-    /// between the fresh-index re-arm and its assertion, flaking
-    /// `fresh_index_observation_rearms_stale_warning_latch` under load (seen
-    /// on CI). Every stale-observation test must hold this lock too.
-    static LATCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// nw-142: within ONE literal the trigrams are CONJUNCTS - a match must
     /// contain all of them. Only across alternation branches are they
@@ -2799,6 +3049,7 @@ mod tests {
     /// index, so the comparison is not two scans.
     #[test]
     fn planned_regex_results_match_a_full_scan() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let planned_store = GraphStore::open(&temp.path().join("brain.lbug")).unwrap();
         let scan_store = GraphStore::in_memory().unwrap();
@@ -2958,6 +3209,7 @@ mod tests {
     /// the newer epoch. The refresh must defer it, disclose it, and succeed.
     #[test]
     fn a_scope_advanced_mid_publication_is_deferred_not_fatal() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         store.mark_regex_scope_dirty("repo:1", false).unwrap();
         store.mark_regex_scope_dirty("vlt:v", false).unwrap();
@@ -3048,6 +3300,7 @@ mod tests {
 
     #[test]
     fn deleting_one_file_queues_its_scope_and_reports_live_posting_deletions() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         let mut kept = store.lookup_symbol("sym:1").unwrap();
         let repo = kept.repo_uid.clone();
@@ -3079,6 +3332,7 @@ mod tests {
 
     #[test]
     fn refresh_reports_live_posting_deltas_across_rebuild_edit_and_retirement() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         let first = store.rebuild_trigram_index().unwrap();
         assert!(first.postings_added > 0);
@@ -3121,6 +3375,7 @@ mod tests {
 
     #[test]
     fn on_disk_store_uses_identity_bound_regex_v3_shards() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let db = temp.path().join("brain.lbug");
         let store = GraphStore::open(&db).unwrap();
@@ -3173,6 +3428,7 @@ mod tests {
     /// a remedy that could not repair anything.
     #[test]
     fn refresh_repairs_every_shard_search_distrusts_not_only_outbox_scopes() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let db = temp.path().join("brain.lbug");
         let store = GraphStore::open(&db).unwrap();
@@ -3224,6 +3480,7 @@ mod tests {
 
     #[test]
     fn corrupt_regex_v3_shard_widens_only_that_scope_to_scan() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let db = temp.path().join("brain.lbug");
         let store = GraphStore::open(&db).unwrap();
@@ -3274,6 +3531,7 @@ mod tests {
 
     #[test]
     fn regex_search_finds_pattern_in_section_and_symbol_without_index() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         // No trigram index built → must fall back to a direct scan and still
         // find the matches.
@@ -3290,7 +3548,151 @@ mod tests {
     }
 
     #[test]
+    fn review_scoped_regex_unicode_punctuation_and_same_uid_move_refresh() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
+        let store = store_with_text();
+        let mut row = store.lookup_symbol("sym:1").unwrap();
+        row.uid = "sym:path-sensitive".into();
+        row.name = "pathNeedle".into();
+        row.signature = "fn pathNeedle()".into();
+        row.file_path = "雪/[a]+(b).rs".into();
+        store.insert_symbol(&row).unwrap();
+        store.build_trigram_index().unwrap();
+        let kinds = vec!["Symbol".to_string()];
+        let query = |prefix| {
+            store
+                .regex_search_cancellable_with_candidate_cap(
+                    "pathNeedle",
+                    Some(prefix),
+                    Some(&kinds),
+                    Some(1),
+                    Some(5000),
+                    None,
+                    2,
+                )
+                .unwrap()
+        };
+        assert!(
+            query("雪/[a]+")
+                .results
+                .iter()
+                .any(|hit| hit.uid == row.uid)
+        );
+        assert!(
+            query("雪/a").results.is_empty(),
+            "punctuation is literal, not an automaton operator"
+        );
+        let before = RegexIndex::new(store.regex_sidecar_root().unwrap())
+            .metadata(&row.repo_uid)
+            .unwrap()
+            .unwrap();
+        let conn = store.conn().unwrap();
+        let mut stmt = conn
+            .prepare("MATCH (s:Symbol {uid:$uid}) SET s.file_path=$path")
+            .unwrap();
+        conn.execute(
+            &mut stmt,
+            vec![
+                ("uid", Value::String(row.uid.clone())),
+                ("path", Value::String("moved/雪.rs".into())),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        store.mark_regex_scope_dirty(&row.repo_uid, false).unwrap();
+        store.refresh_trigram_index(false).unwrap();
+        let after = RegexIndex::new(store.regex_sidecar_root().unwrap())
+            .metadata(&row.repo_uid)
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            before.candidate_digest, after.candidate_digest,
+            "same UID/text but changed eligibility must refresh metadata"
+        );
+        assert!(query("雪/[a]+").results.is_empty());
+        let moved = query("moved/");
+        assert!(!moved.scanned_fallback, "repaired scoped shard is trusted");
+        assert!(moved.results.iter().any(|hit| hit.uid == row.uid));
+    }
+
+    #[test]
+    fn review_regex_candidate_cap_applies_after_path_and_kind_scope() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
+        let store = store_with_text();
+        let prototype = store.lookup_symbol("sym:1").unwrap();
+        let candidates = [
+            ("sym:scope:a", "unique-a/a.rs"),
+            ("sym:scope:b", "unique-b/b.rs"),
+            ("sym:scope:c", "unique-c/c.rs"),
+        ];
+        let kinds = vec!["Symbol".to_string()];
+        for (uid, path) in candidates {
+            let mut candidate = prototype.clone();
+            candidate.uid = uid.into();
+            candidate.file_path = path.into();
+            candidate.name = "boundNeedle".into();
+            candidate.signature = "fn boundNeedle()".into();
+            store.insert_symbol(&candidate).unwrap();
+            let fallback = store
+                .regex_search_cancellable_with_candidate_cap(
+                    "boundNeedle",
+                    Some(path),
+                    Some(&kinds),
+                    Some(1),
+                    Some(5000),
+                    None,
+                    2,
+                )
+                .unwrap();
+            assert!(
+                fallback.results.iter().any(|hit| hit.uid == uid),
+                "fallback scope counterweight"
+            );
+        }
+        store.build_trigram_index().unwrap();
+        let prefix = store
+            .regex_search_cancellable_with_candidate_cap(
+                "boundNeedle",
+                None,
+                Some(&kinds),
+                Some(2),
+                Some(5000),
+                None,
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            prefix.results.len(),
+            2,
+            "exercise an actually saturated posting prefix"
+        );
+        // Tantivy tie order is not a UID-order contract. Select an actual
+        // omitted candidate, without rewriting the index and changing that order.
+        let (target, path) = candidates
+            .into_iter()
+            .find(|(uid, _)| !prefix.results.iter().any(|hit| hit.uid == *uid))
+            .unwrap();
+        let indexed = store
+            .regex_search_cancellable_with_candidate_cap(
+                "boundNeedle",
+                Some(path),
+                Some(&kinds),
+                Some(1),
+                Some(5000),
+                None,
+                2,
+            )
+            .unwrap();
+        assert!(!indexed.scanned_fallback, "exercise ready posting path");
+        assert!(
+            indexed.results.iter().any(|hit| hit.uid == target),
+            "out-of-scope posting prefix must not starve eligible candidate: target={target} prefix={prefix:?}"
+        );
+    }
+
+    #[test]
     fn regex_search_uses_trigram_index_when_built() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         let written = store.build_trigram_index().unwrap();
         assert!(written > 0, "expected trigram postings to be written");
@@ -3327,8 +3729,173 @@ mod tests {
         assert!(!res.results.is_empty());
     }
 
+    fn correction_many_scope_fixture() -> GraphStore {
+        let store = store_with_text();
+        for index in 0..8 {
+            let mut symbol = store.lookup_symbol("sym:1").unwrap();
+            symbol.uid = format!("sym:scope:{index}");
+            symbol.repo_uid = format!("repo:scope:{index}");
+            store.insert_symbol(&symbol).unwrap();
+        }
+        store.build_trigram_index().unwrap();
+        let mut symbol = store.lookup_symbol("sym:1").unwrap();
+        symbol.uid = "sym:scope:new".into();
+        symbol.repo_uid = "repo:scope:new".into();
+        store.insert_symbol(&symbol).unwrap();
+        store
+    }
+
+    #[test]
+    fn correction_budget_regex_scope_inventory_state_and_work_share_small_allowance() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
+        let store = correction_many_scope_fixture();
+        let clauses = required_trigram_clauses("authenticateUser").unwrap();
+        let full = store
+            .regex_v3_candidate_uids(&clauses, Instant::now(), 60_000, None, 200_000, false)
+            .unwrap()
+            .unwrap();
+        assert!(
+            full.ready_scopes.len() >= 8,
+            "actual native ready scope population"
+        );
+        assert!(
+            full.dirty_scopes.contains("repo:scope:new"),
+            "actual nonready scope must be present"
+        );
+        assert!(full.ready_scopes.len() + full.dirty_scopes.len() >= 10);
+        let guard = planning_allocation_witness::Guard::new();
+        let plan = store
+            .regex_v3_candidate_uids(&clauses, Instant::now(), 60_000, None, 2, true)
+            .unwrap()
+            .unwrap();
+        let events = guard.events.borrow();
+        assert!(events.iter().any(|(kind, _)| *kind == "inventory"));
+        assert!(events.iter().any(|(kind, _)| *kind == "states"));
+        assert!(events.iter().any(|(kind, _)| *kind == "metadata"));
+        assert!(events.iter().any(|(kind, _)| *kind == "posting"));
+        for kind in ["inventory", "states", "metadata", "posting"] {
+            let count: usize = events
+                .iter()
+                .filter(|(event, _)| *event == kind)
+                .map(|(_, n)| *n)
+                .sum();
+            let cap = if kind == "inventory" { 3 } else { 2 };
+            assert!(
+                count <= cap,
+                "native {kind} allocation/work {count} exceeds {cap}: {events:?}"
+            );
+        }
+        assert!(
+            plan.candidate_cap_reached,
+            "partial scope population must not imply complete search"
+        );
+        assert!(plan.ready_scopes.len() + plan.dirty_scopes.len() <= 2);
+    }
+
+    #[test]
+    fn correction_budget_regex_scope_order_and_incomplete_population_are_explicit() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
+        let store = correction_many_scope_fixture();
+        let first = store.active_regex_scopes_bounded(2).unwrap();
+        let second = store.active_regex_scopes_bounded(2).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.0, vec!["repo:1", "repo:scope:0"]);
+        assert!(!first.1);
+        let result = store
+            .regex_search_cancellable_with_candidate_cap(
+                "authenticateUser",
+                None,
+                None,
+                Some(50),
+                Some(60_000),
+                None,
+                2,
+            )
+            .unwrap();
+        assert!(
+            !result.results.is_empty(),
+            "admitted candidates survive scope work stop"
+        );
+        assert!(result.truncated);
+        let note = result.note.as_deref().unwrap();
+        assert!(note.contains("lower bounds") && note.contains("population is unknown"));
+    }
+
+    #[test]
+    fn correction_budget_regex_many_scope_exact_counts_remain_exhaustive() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
+        let store = correction_many_scope_fixture();
+        let patterns = ["authenticateUser".to_string()];
+        let complete = store.count_patterns(&patterns, None, None).unwrap();
+        assert_eq!(
+            complete[0].total_matches, 11,
+            "one section plus ten symbols"
+        );
+        assert!(complete[0].ready_scopes >= 8);
+        assert!(complete[0].dirty_scopes >= 1);
+        let small = store
+            .count_patterns_with_planning_cap(&patterns, None, None, 2)
+            .unwrap();
+        assert_eq!(small[0].total_matches, complete[0].total_matches);
+        assert_eq!(small[0].files_matched, complete[0].files_matched);
+    }
+
+    #[test]
+    fn exact_count_planning_cap_saturation_preserves_occurrences() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
+        let store = store_with_text();
+        for uid in ["sym:extra:a", "sym:extra:b"] {
+            let mut symbol = store.lookup_symbol("sym:1").unwrap();
+            symbol.uid = uid.into();
+            symbol.name = uid.into();
+            store.insert_symbol(&symbol).unwrap();
+        }
+        store.build_trigram_index().unwrap();
+        let patterns = ["authenticateUser".to_string()];
+        let exhaustive = store.count_patterns(&patterns, None, None).unwrap();
+        assert_eq!(
+            exhaustive[0].total_matches, 4,
+            "manual section + three symbol occurrences"
+        );
+        let bounded_plan = store
+            .count_patterns_with_planning_cap(&patterns, None, None, 1)
+            .unwrap();
+        assert_eq!(
+            bounded_plan[0].total_matches, 4,
+            "posting saturation must widen to complete counts"
+        );
+        assert_eq!(bounded_plan[0].files_matched, exhaustive[0].files_matched);
+        assert_eq!(bounded_plan[0].top_files, exhaustive[0].top_files);
+    }
+
+    #[test]
+    fn exact_count_planning_cap_is_per_scope_for_multiple_ready_scopes() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
+        let store = store_with_text();
+        store.build_trigram_index().unwrap();
+        let patterns = ["authenticateUser".to_string()];
+        let exhaustive = store.count_patterns(&patterns, None, None).unwrap();
+        assert_eq!(
+            exhaustive[0].ready_scopes, 2,
+            "fixture has a ready vault and repo"
+        );
+        assert_eq!(
+            exhaustive[0].total_matches, 2,
+            "one section and one symbol occurrence"
+        );
+        let bounded_plan = store
+            .count_patterns_with_planning_cap(&patterns, None, None, 1)
+            .unwrap();
+        assert_eq!(
+            bounded_plan[0].total_matches, 2,
+            "exact counts cannot use a shared search UID allowance"
+        );
+        assert_eq!(bounded_plan[0].files_matched, exhaustive[0].files_matched);
+    }
+
     #[test]
     fn count_patterns_counts_occurrences_not_nodes() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         // nw-300 / F-VAULT-4: 449 occurrences in one file were reported as
         // `total_matches: 2` because the verification loop increments once per
         // matching NODE. Five occurrences inside ONE section must count as 5.
@@ -3385,6 +3952,7 @@ mod tests {
     /// results with five distinct line numbers, not one.
     #[test]
     fn regex_search_returns_every_occurrence_within_a_node() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = GraphStore::in_memory().unwrap();
         store
             .insert_note(&Note {
@@ -3441,6 +4009,7 @@ mod tests {
     /// what it matched. Counterweight: a single match is still a single row.
     #[test]
     fn regex_search_rows_on_one_line_carry_a_distinct_span() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = GraphStore::in_memory().unwrap();
         store
             .insert_note(&Note {
@@ -3507,6 +4076,7 @@ mod tests {
 
     #[test]
     fn count_patterns_matches_manual_count() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         // "token" appears in the section body and the symbol signature (Token).
         // Case-sensitive "token" → only the section (lowercase) matches.
@@ -3535,6 +4105,7 @@ mod tests {
 
     #[test]
     fn count_filters_do_not_make_complete_scopes_look_stale() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         store.build_trigram_index().unwrap();
         let counts = store
@@ -3552,6 +4123,7 @@ mod tests {
 
     #[test]
     fn symbol_match_reports_real_start_line_not_one() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         // QA bug B: a Symbol's text is its signature, but the reported `line`
         // must be the symbol's real start_line in the file, not 1.
         let store = store_with_text();
@@ -3579,6 +4151,7 @@ mod tests {
 
     #[test]
     fn section_match_reports_line_offset_by_section_start() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         // QA bug B: a Section body match reports the line *within the file*,
         // offset by the section's start_line (5). The match is on the section's
         // first body line, so the reported line should be 5.
@@ -3606,6 +4179,7 @@ mod tests {
 
     #[test]
     fn kinds_filter_restricts_candidates() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         let res = store
             .regex_search(
@@ -3652,6 +4226,7 @@ mod tests {
 
     #[test]
     fn regex_search_does_not_drop_a_match_ordered_late_in_the_candidate_set() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         // nw-076: the fallback scan used to pre-truncate the candidate list to
         // the first 5000 nodes in collect order (Sections → Notes → Symbols), so
         // a match on a symbol ordered past the cap was silently dropped and
@@ -3739,6 +4314,7 @@ mod tests {
     /// on one unreadable row.
     #[test]
     fn a_corpus_that_lost_rows_is_reported_partial_and_still_returns_its_matches() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         // The clean corpus answers definitively.
         let clean = store
@@ -3812,6 +4388,7 @@ mod tests {
     /// set must be identical to the full-scan result set across the matrix.
     #[test]
     fn alternation_prefilter_matches_full_scan() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let patterns = [
             "(login|token)",
             "(alpha|beta|gamma)",
@@ -3855,6 +4432,7 @@ mod tests {
     /// branch.
     #[test]
     fn alternation_with_unusable_branch_disables_prefilter() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         store.build_trigram_index().unwrap();
         for pattern in ["(tokenize|ok)", "(authenticateUser|x.*)"] {
@@ -4009,6 +4587,7 @@ mod tests {
 
     #[test]
     fn moving_a_node_to_an_earlier_scope_cannot_erase_new_postings() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         store.refresh_trigram_index(false).unwrap();
 
@@ -4217,6 +4796,7 @@ mod tests {
     /// PREFIX in the indexed text must survive the trigram pre-filter.
     #[test]
     fn greek_final_sigma_prefilter_does_not_drop_matches() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = GraphStore::in_memory().unwrap();
         store
             .insert_note(&Note {
@@ -4266,6 +4846,7 @@ mod tests {
     /// before a match is pushed, not after (previously one slipped through).
     #[test]
     fn limit_zero_returns_no_results() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         let res = store
             .regex_search("authenticateUser", None, None, Some(0), None)
@@ -4281,6 +4862,7 @@ mod tests {
     /// (`SEARCH_PRESENTATION_LIMIT_MAX`) instead of accepting any limit.
     #[test]
     fn limit_above_presentation_max_is_rejected() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = store_with_text();
         let err = store
             .regex_search(
@@ -4314,6 +4896,7 @@ mod tests {
     /// match actually is.
     #[test]
     fn location_points_at_match_line_not_section_start() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = GraphStore::in_memory().unwrap();
         store
             .insert_note(&Note {
@@ -4389,6 +4972,7 @@ mod tests {
     #[test]
     #[ignore = "wall-clock perf harness; run explicitly with --ignored --nocapture"]
     fn perf_verification_budget_stays_within_the_callers_deadline() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
         let store = GraphStore::in_memory().unwrap();
         // ~4000 symbols x ~2.6KB signature, each with 8 embedded date-shaped
         // occurrences: big enough that collecting + regex-scanning the whole

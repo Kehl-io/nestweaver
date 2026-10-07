@@ -11,13 +11,13 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tantivy::collector::TopDocs;
-use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, TermQuery};
+use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, RegexQuery, TermQuery};
 use tantivy::schema::{Field, IndexRecordOption, STORED, STRING, Schema, Value};
 use tantivy::{DocAddress, DocSet, Index, ReloadPolicy, TERMINATED, TantivyDocument, Term, doc};
 
 use crate::error::StoreError;
 
-pub const REGEX_INDEX_SCHEMA_VERSION: u32 = 3;
+pub const REGEX_INDEX_SCHEMA_VERSION: u32 = 4;
 pub const REGEX_TOKENIZER_FINGERPRINT: &str =
     "nestweaver-unicode-scalar-lowercase-distinct-trigram-v1";
 const METADATA_KIND: &str = "__nestweaver_regex_metadata__";
@@ -74,6 +74,7 @@ impl RegexShardMetadata {
 pub struct RegexShardDocument<'a> {
     pub uid: &'a str,
     pub kind: &'a str,
+    pub path: String,
     pub text_hash: &'a str,
     pub trigrams: &'a HashSet<String>,
 }
@@ -144,6 +145,7 @@ enum MissingCurrentRecovery {
 struct Fields {
     uid: Field,
     kind: Field,
+    path: Field,
     trigram: Field,
     text_hash: Field,
     metadata: Field,
@@ -195,6 +197,7 @@ fn build_schema() -> (Schema, Fields) {
     let mut builder = Schema::builder();
     let uid = builder.add_text_field("uid", STRING | STORED);
     let kind = builder.add_text_field("kind", STRING | STORED);
+    let path = builder.add_text_field("path", STRING | STORED);
     let trigram = builder.add_text_field("trigram", STRING);
     let text_hash = builder.add_text_field("text_hash", STORED);
     let metadata = builder.add_text_field("metadata", STORED);
@@ -204,6 +207,7 @@ fn build_schema() -> (Schema, Fields) {
         Fields {
             uid,
             kind,
+            path,
             trigram,
             text_hash,
             metadata,
@@ -220,6 +224,7 @@ fn inspect_fields(schema: &Schema) -> Result<Fields, StoreError> {
     Ok(Fields {
         uid: field("uid")?,
         kind: field("kind")?,
+        path: field("path")?,
         trigram: field("trigram")?,
         text_hash: field("text_hash")?,
         metadata: field("metadata")?,
@@ -428,6 +433,7 @@ impl RegexIndex {
             let mut tantivy_document = TantivyDocument::default();
             tantivy_document.add_text(fields.uid, document.uid);
             tantivy_document.add_text(fields.kind, document.kind);
+            tantivy_document.add_text(fields.path, &document.path);
             tantivy_document.add_text(fields.text_hash, document.text_hash);
             for trigram in document.trigrams {
                 tantivy_document.add_text(fields.trigram, trigram);
@@ -557,6 +563,7 @@ impl RegexIndex {
             let mut tantivy_document = TantivyDocument::default();
             tantivy_document.add_text(fields.uid, document.uid);
             tantivy_document.add_text(fields.kind, document.kind);
+            tantivy_document.add_text(fields.path, &document.path);
             tantivy_document.add_text(fields.text_hash, document.text_hash);
             for trigram in document.trigrams {
                 tantivy_document.add_text(fields.trigram, trigram);
@@ -601,6 +608,43 @@ impl RegexIndex {
         clauses: &[HashSet<String>],
         cap: usize,
     ) -> Result<Option<HashSet<String>>, StoreError> {
+        Ok(self
+            .candidate_uids_policy(expected, clauses, cap, false, None, None)?
+            .and_then(|(uids, cut)| (!cut).then_some(uids)))
+    }
+
+    /// Retain a bounded posting prefix with explicit saturation. A ready
+    /// shard remains ready when a caller's work allowance is smaller.
+    pub fn candidate_uids_bounded(
+        &self,
+        expected: &RegexShardMetadata,
+        clauses: &[HashSet<String>],
+        cap: usize,
+    ) -> Result<Option<(HashSet<String>, bool)>, StoreError> {
+        self.candidate_uids_policy(expected, clauses, cap, true, None, None)
+    }
+
+    pub fn candidate_uids_bounded_scoped(
+        &self,
+        expected: &RegexShardMetadata,
+        clauses: &[HashSet<String>],
+        cap: usize,
+        path_prefix: Option<&str>,
+        kinds: Option<&[String]>,
+    ) -> Result<Option<(HashSet<String>, bool)>, StoreError> {
+        self.candidate_uids_policy(expected, clauses, cap, true, path_prefix, kinds)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn candidate_uids_policy(
+        &self,
+        expected: &RegexShardMetadata,
+        clauses: &[HashSet<String>],
+        cap: usize,
+        keep_prefix: bool,
+        path_prefix: Option<&str>,
+        kinds: Option<&[String]>,
+    ) -> Result<Option<(HashSet<String>, bool)>, StoreError> {
         let Some((index, fields, observed)) = self.open_current(&expected.scope_uid)? else {
             return Ok(None);
         };
@@ -645,19 +689,47 @@ impl RegexIndex {
         } else {
             Box::new(BooleanQuery::new(branches))
         };
+        // Eligibility participates in the query before TopDocs applies its
+        // retained-prefix budget, so foreign paths/kinds cannot consume it.
+        let mut eligible: Vec<(Occur, Box<dyn Query>)> = vec![(Occur::Must, query)];
+        if let Some(prefix) = path_prefix {
+            let path_query =
+                RegexQuery::from_pattern(&format!("{}.*", regex::escape(prefix)), fields.path)
+                    .map_err(|error| StoreError::Query(format!("regex path scope: {error}")))?;
+            eligible.push((Occur::Must, Box::new(path_query)));
+        }
+        if let Some(kinds) = kinds {
+            let terms: Vec<(Occur, Box<dyn Query>)> = ["Symbol", "Note", "Section", "Frontmatter"]
+                .into_iter()
+                .filter(|kind| kinds.iter().any(|wanted| wanted.eq_ignore_ascii_case(kind)))
+                .map(|kind| {
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(fields.kind, kind),
+                            IndexRecordOption::Basic,
+                        )) as Box<dyn Query>,
+                    )
+                })
+                .collect();
+            eligible.push((Occur::Must, Box::new(BooleanQuery::new(terms))));
+        }
+        let query: Box<dyn Query> = Box::new(BooleanQuery::new(eligible));
         // Tantivy's collector reports only the retained hits, not whether more
         // matches existed. Probe one past the caller's budget so saturation is
         // explicit and the caller can conservatively widen this scope to the
         // graph instead of silently dropping regex matches.
-        let hits = searcher
+        let mut hits = searcher
             .search(
                 &*query,
                 &TopDocs::with_limit(cap.saturating_add(1)).order_by_score(),
             )
             .map_err(|error| StoreError::Query(format!("query regex shard: {error}")))?;
-        if hits.len() > cap {
+        let cut = hits.len() > cap;
+        if cut && !keep_prefix {
             return Ok(None);
         }
+        hits.truncate(cap);
         let mut uids = HashSet::with_capacity(hits.len());
         for (_, address) in hits {
             let document: TantivyDocument = searcher.doc(address).map_err(|error| {
@@ -668,7 +740,7 @@ impl RegexIndex {
                 uids.insert(uid);
             }
         }
-        Ok(Some(uids))
+        Ok(Some((uids, cut)))
     }
 
     pub fn metadata(&self, scope_uid: &str) -> Result<Option<RegexShardMetadata>, StoreError> {
@@ -1271,6 +1343,7 @@ mod tests {
         let old = HashSet::from(["abc".into(), "bcd".into()]);
         let new = HashSet::from(["bcd".into(), "cde".into(), "def".into()]);
         let first = RegexShardDocument {
+            path: "fixture.rs".into(),
             uid: "one",
             kind: "Symbol",
             text_hash: "old",
@@ -1292,6 +1365,7 @@ mod tests {
             .unwrap();
         assert_eq!(index.posting_delta("repo:test", &[first]).unwrap(), (0, 0));
         let edited = RegexShardDocument {
+            path: "fixture.rs".into(),
             uid: "one",
             kind: "Symbol",
             text_hash: "new",
@@ -1322,6 +1396,7 @@ mod tests {
             .replace_scope(metadata(3, 1, "two"), &[edited])
             .unwrap();
         let renamed = RegexShardDocument {
+            path: "fixture.rs".into(),
             uid: "renamed",
             kind: "Symbol",
             text_hash: "new",
@@ -1347,6 +1422,7 @@ mod tests {
         let index = RegexIndex::new(temp.path());
         let first_trigrams = HashSet::from(["alp".to_string(), "lph".to_string()]);
         let first = RegexShardDocument {
+            path: "fixture.rs".into(),
             uid: "sym:one",
             kind: "Symbol",
             text_hash: "hash-one",
@@ -1362,6 +1438,7 @@ mod tests {
 
         let second_trigrams = HashSet::from(["bet".to_string(), "eta".to_string()]);
         let second = RegexShardDocument {
+            path: "fixture.rs".into(),
             uid: "sym:two",
             kind: "Symbol",
             text_hash: "hash-two",
@@ -1394,6 +1471,44 @@ mod tests {
     }
 
     #[test]
+    fn bounded_candidate_prefix_reports_saturation_and_exact_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = RegexIndex::new(temp.path());
+        let trigrams = HashSet::from(["alp".to_string()]);
+        let documents: Vec<_> = ["one", "two", "three"]
+            .into_iter()
+            .map(|uid| RegexShardDocument {
+                path: "fixture.rs".into(),
+                uid,
+                kind: "Symbol",
+                text_hash: uid,
+                trigrams: &trigrams,
+            })
+            .collect();
+        let published = metadata(1, documents.len(), "bounded-three");
+        index.replace_scope(published.clone(), &documents).unwrap();
+        let clauses = [HashSet::from(["alp".to_string()])];
+        let (uids, cut) = index
+            .candidate_uids_bounded(&published, &clauses, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(uids.len(), 2);
+        assert!(cut);
+        let (uids, cut) = index
+            .candidate_uids_bounded(&published, &clauses, 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(uids.len(), 3);
+        assert!(!cut);
+        let (uids, cut) = index
+            .candidate_uids_bounded(&published, &clauses, 0)
+            .unwrap()
+            .unwrap();
+        assert!(uids.is_empty());
+        assert!(cut);
+    }
+
+    #[test]
     fn saturated_candidate_query_widens_instead_of_dropping_matches() {
         let temp = tempfile::tempdir().unwrap();
         let index = RegexIndex::new(temp.path());
@@ -1402,6 +1517,7 @@ mod tests {
         let documents = uids
             .iter()
             .map(|uid| RegexShardDocument {
+                path: "fixture.rs".into(),
                 uid,
                 kind: "Symbol",
                 text_hash: uid,
@@ -1443,6 +1559,7 @@ mod tests {
         // Document contains "alp" but NOT "lph".
         let doc_trigrams = HashSet::from(["alp".to_string(), "zzz".to_string()]);
         let document = RegexShardDocument {
+            path: "fixture.rs".into(),
             uid: "sym:partial",
             kind: "Symbol",
             text_hash: "h",
@@ -1473,6 +1590,7 @@ mod tests {
         let index = RegexIndex::new(temp.path());
         let trigrams = HashSet::from(["alp".to_string()]);
         let document = RegexShardDocument {
+            path: "fixture.rs".into(),
             uid: "sym:one",
             kind: "Symbol",
             text_hash: "hash-one",
@@ -1505,6 +1623,7 @@ mod tests {
         let index = RegexIndex::new(temp.path());
         let trigrams = HashSet::from(["alp".to_string()]);
         let document = RegexShardDocument {
+            path: "fixture.rs".into(),
             uid: "sym:one",
             kind: "Symbol",
             text_hash: "hash-one",
@@ -1564,6 +1683,7 @@ mod tests {
         let index = RegexIndex::new(temp.path());
         let trigrams = HashSet::from(["alp".to_string()]);
         let document = RegexShardDocument {
+            path: "fixture.rs".into(),
             uid: "sym:one",
             kind: "Symbol",
             text_hash: "hash-one",
@@ -1605,6 +1725,7 @@ mod tests {
             let scope_uid = format!("repo:scope-{ordinal}");
             let trigrams = HashSet::from(["alp".to_string()]);
             let document = RegexShardDocument {
+                path: "fixture.rs".into(),
                 uid: "sym:one",
                 kind: "Symbol",
                 text_hash: "hash-one",
@@ -1627,6 +1748,7 @@ mod tests {
         let index = RegexIndex::new(temp.path());
         let trigrams = HashSet::from(["alp".to_string()]);
         let document = RegexShardDocument {
+            path: "fixture.rs".into(),
             uid: "sym:one",
             kind: "Symbol",
             text_hash: "hash-one",
@@ -1672,6 +1794,7 @@ mod tests {
         let index = RegexIndex::new(temp.path());
         let trigrams = HashSet::from(["alp".to_string()]);
         let document = RegexShardDocument {
+            path: "fixture.rs".into(),
             uid: "sym:one",
             kind: "Symbol",
             text_hash: "hash-one",
@@ -1732,6 +1855,7 @@ mod tests {
         let index = RegexIndex::new(temp.path());
         let trigrams = HashSet::from(["alp".to_string()]);
         let document = RegexShardDocument {
+            path: "fixture.rs".into(),
             uid: "sym:one",
             kind: "Symbol",
             text_hash: "hash-one",

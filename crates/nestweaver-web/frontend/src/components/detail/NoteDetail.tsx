@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../../api/client";
 import type {
   BacklinkRow,
@@ -16,6 +16,15 @@ interface NoteDetailProps {
 }
 
 export function NoteDetail({ uid }: NoteDetailProps) {
+  const graphEpoch = useStore((s) => s.graphEpoch);
+  const workspaceId = useStore((s) => s.activeWorkspaceId);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const navigationSeq = useRef(0);
+  const loadedNote = useRef<string | null>(null);
+  const errorNote = useRef<string | null>(null);
+  const destination = useStore((s) => s.noteHeadingDestination);
+  const setDestination = useStore((s) => s.setNoteHeadingDestination);
+  const [linkError, setLinkError] = useState<string | null>(null);
   const exploreNode = useStore((s) => s.exploreNode);
   const detailFocus = useStore((s) => s.detailFocus);
 
@@ -27,10 +36,12 @@ export function NoteDetail({ uid }: NoteDetailProps) {
 
   useEffect(() => {
     const controller = new AbortController();
-    setDetail(null);
-    setBacklinks([]);
-    setUnlinked([]);
-    setLoading(true);
+    setLinkError(null);
+    navigationSeq.current += 1;
+    const noteKey = JSON.stringify([workspaceId, uid]);
+    const revalidating = loadedNote.current === noteKey;
+    if (!revalidating) { loadedNote.current = null; setDetail(null); setBacklinks([]); setUnlinked([]); }
+    setLoading(!revalidating);
     setError(null);
 
     const init = { signal: controller.signal };
@@ -40,26 +51,44 @@ export function NoteDetail({ uid }: NoteDetailProps) {
       api.brainUnlinkedMentions(uid, init).catch(() => [] as UnlinkedMention[]),
     ])
       .then(([note, bl, um]) => {
-        if (!controller.signal.aborted) {
+        if (!controller.signal.aborted && useStore.getState().graphEpoch === graphEpoch && useStore.getState().activeWorkspaceId === workspaceId) {
+          loadedNote.current = noteKey;
           setDetail(note);
           setBacklinks(bl);
           setUnlinked(um);
         }
       })
       .catch((e) => {
-        if (!controller.signal.aborted) setError(e.message ?? "Failed to load note");
+        if (!controller.signal.aborted && useStore.getState().graphEpoch === graphEpoch && useStore.getState().activeWorkspaceId === workspaceId) { errorNote.current = noteKey; setError(e.message ?? "Failed to load note"); }
       })
       .finally(() => {
-        if (!controller.signal.aborted) setLoading(false);
+        if (!controller.signal.aborted && useStore.getState().graphEpoch === graphEpoch && useStore.getState().activeWorkspaceId === workspaceId) setLoading(false);
       });
-    return () => controller.abort();
-  }, [uid]);
+    return () => { navigationSeq.current += 1; controller.abort(); };
+  }, [uid, graphEpoch, workspaceId]);
 
-  const handleWikilink = (target: string) => {
-    exploreNode(target, "note");
-  };
+  useEffect(() => {
+    if (loading || !destination?.heading || destination.uid !== uid) return;
+    const heading = bodyRef.current?.querySelector<HTMLElement>(`[data-heading-uid="${CSS.escape(destination.heading)}"]`);
+    if (heading) { heading.focus(); heading.scrollIntoView({ block: "nearest" }); setDestination(null); }
+  }, [loading, destination, uid, detail, setDestination]);
 
-  if (loading) {
+  const handleWikilink = useCallback(async (target: string) => {
+    const sequence = ++navigationSeq.current;
+    setLinkError(null);
+    try {
+      const resolved = await api.resolveWikilink(uid, target);
+      if (sequence !== navigationSeq.current || useStore.getState().graphEpoch !== graphEpoch || useStore.getState().activeWorkspaceId !== workspaceId || useStore.getState().selectedNodeId !== uid) return;
+      exploreNode(resolved.note_uid, "note");
+      setDestination({ uid: resolved.note_uid, heading: resolved.heading_uid });
+    } catch (error) {
+      if (sequence !== navigationSeq.current || useStore.getState().graphEpoch !== graphEpoch || useStore.getState().activeWorkspaceId !== workspaceId || useStore.getState().selectedNodeId !== uid) return;
+      setLinkError(error instanceof Error ? error.message : "Wikilink could not be resolved.");
+    }
+  }, [uid, graphEpoch, workspaceId, exploreNode, setDestination]);
+
+  const visibleNoteKey = JSON.stringify([workspaceId, uid]);
+  if (loading || (loadedNote.current !== visibleNoteKey && !(error && errorNote.current === visibleNoteKey))) {
     return (
       <div className="flex h-full items-center justify-center text-sm text-[var(--color-text-muted)]">
         Loading note...
@@ -67,7 +96,7 @@ export function NoteDetail({ uid }: NoteDetailProps) {
     );
   }
 
-  if (error) {
+  if (error && errorNote.current === visibleNoteKey) {
     return (
       <div className="flex h-full items-center justify-center p-4 text-sm text-red-500">
         {error}
@@ -86,16 +115,16 @@ export function NoteDetail({ uid }: NoteDetailProps) {
   const { note, headings, body } = detail;
 
   return (
-    <div className="flex h-full flex-col overflow-y-auto p-4">
+    <div className="flex min-w-0 h-full flex-col overflow-x-hidden overflow-y-auto p-4">
       {/* Top: Identity */}
       <div className="mb-4">
-        <div className="mb-1 flex items-center gap-2">
+        <div className="mb-1 flex min-w-0 items-start gap-2">
           <KindBadge kind="Note" />
-          <span className="text-sm font-semibold text-[var(--color-text)]">
+          <span className="min-w-0 break-all text-sm font-semibold text-[var(--color-text)]">
             {note.title}
           </span>
         </div>
-        <div className="mb-2 text-xs text-[var(--color-text-muted)]">
+        <div className="mb-2 min-w-0 break-all text-xs text-[var(--color-text-muted)]">
           {note.file_path}
         </div>
         <div className="flex gap-4 text-xs text-[var(--color-text-muted)]">
@@ -144,6 +173,8 @@ export function NoteDetail({ uid }: NoteDetailProps) {
         </Collapsible>
       </div>
 
+      {linkError && <div role="alert" className="mb-2 min-w-0 break-all text-xs text-red-500">{linkError}</div>}
+
       {/* Bottom: Body */}
       <div
         className={`mb-4 ${
@@ -155,8 +186,8 @@ export function NoteDetail({ uid }: NoteDetailProps) {
         <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
           Note Evidence
         </h3>
-        <div className="rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] p-3">
-          <MarkdownPreview body={body} onWikilink={handleWikilink} />
+        <div ref={bodyRef} className="min-w-0 rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] p-3">
+          <MarkdownPreview body={body} headings={headings} onWikilink={handleWikilink} />
         </div>
       </div>
 

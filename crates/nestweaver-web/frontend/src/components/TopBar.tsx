@@ -56,6 +56,7 @@ export function TopBar() {
   const [prefersDark, setPrefersDark] = useState(false);
 
   const theme = useStore((s) => s.theme);
+  const graphEpoch = useStore((s) => s.graphEpoch);
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
   const searchQuery = useStore((s) => s.searchQuery);
   const searchOpen = useStore((s) => s.searchOpen);
@@ -96,7 +97,7 @@ export function TopBar() {
       );
   }
 
-  function beginSearch(q: string, workspaceId: string | null) {
+  function beginSearch(q: string, workspaceId: string | null, open = true) {
     const generation = searchGenerationRef.current + 1;
     searchGenerationRef.current = generation;
     if (!q.trim()) {
@@ -105,9 +106,9 @@ export function TopBar() {
       setSearchOpen(false);
       return;
     }
-    setSearchOpen(true);
+    if (open) setSearchOpen(true);
     setSearchLoading(true);
-    debouncedSearch(q, workspaceId, scopeFilter, generation);
+    debouncedSearch(q, workspaceId, scopeFilter, generation, useStore.getState().graphEpoch);
   }
 
   const debouncedSearch = useDebouncedCallback(async (
@@ -115,8 +116,9 @@ export function TopBar() {
     workspaceId: string | null,
     scope: typeof scopeFilter,
     generation: number,
+    epoch: number,
   ) => {
-    if (!isCurrentSearch(generation, q, workspaceId, scope)) return;
+    if (useStore.getState().graphEpoch !== epoch || !isCurrentSearch(generation, q, workspaceId, scope)) return;
     if (!q.trim()) {
       setSearchOpen(false);
       return;
@@ -129,7 +131,7 @@ export function TopBar() {
         const brainPromise =
           scope === "code_only" ? Promise.resolve([]) : api.brainSearch(q, 5);
         const [symbols, brain] = await Promise.all([symbolsPromise, brainPromise]);
-        if (!isCurrentSearch(generation, q, workspaceId, scope)) return;
+        if (useStore.getState().graphEpoch !== epoch || !isCurrentSearch(generation, q, workspaceId, scope)) return;
         setSearchResults(symbols, brain);
         announceSearch(q, symbols.length + brain.length);
       } else {
@@ -137,7 +139,7 @@ export function TopBar() {
           workspaceId,
           limit: 15,
         });
-        if (!isCurrentSearch(generation, q, workspaceId, scope)) return;
+        if (useStore.getState().graphEpoch !== epoch || !isCurrentSearch(generation, q, workspaceId, scope)) return;
         const split = splitScopedSearchResults(scoped.results);
         const symbols = scope === "notes_only" ? [] : split.symbols.slice(0, 10);
         const brain = scope === "code_only" ? [] : split.brain.slice(0, 5);
@@ -145,7 +147,7 @@ export function TopBar() {
         announceSearch(q, symbols.length + brain.length);
       }
     } catch (error) {
-      if (!isCurrentSearch(generation, q, workspaceId, scope)) return;
+      if (useStore.getState().graphEpoch !== epoch || !isCurrentSearch(generation, q, workspaceId, scope)) return;
       useStore.getState().notify({
         kind: "error",
         title: "Search failed",
@@ -153,7 +155,7 @@ export function TopBar() {
       });
       setSearchResults([], []);
     } finally {
-      if (isCurrentSearch(generation, q, workspaceId, scope)) {
+      if (useStore.getState().graphEpoch === epoch && isCurrentSearch(generation, q, workspaceId, scope)) {
         setSearchLoading(false);
       }
     }
@@ -172,6 +174,12 @@ export function TopBar() {
     // Scope changes must re-issue the same query against the matching APIs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scopeFilter]);
+
+  useEffect(() => {
+    if (searchQuery.trim()) beginSearch(searchQuery, activeWorkspaceId, false);
+    // A committed refresh updates held results without reopening dismissed search.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [graphEpoch]);
 
   function handleInputChange(e: React.ChangeEvent<HTMLInputElement>) {
     const q = e.target.value;
@@ -255,7 +263,7 @@ export function TopBar() {
   const darkLogo = theme === "dark" || (theme === "system" && prefersDark);
 
   return (
-    <header data-testid="top-bar" className="sticky top-0 z-50 flex h-12 shrink-0 items-center gap-2 overflow-visible border-b border-[var(--color-border)] bg-[var(--color-surface)] px-2 sm:gap-3 sm:px-4">
+    <header data-testid="top-bar" className="sticky top-0 z-50 flex min-w-0 h-12 shrink-0 items-center gap-2 overflow-visible border-b border-[var(--color-border)] bg-[var(--color-surface)] px-2 sm:gap-3 sm:px-4">
       <img
         src={darkLogo ? "/logo-icon-dark.svg" : "/logo-icon-light.svg"}
         alt="NestWeaver"
@@ -264,7 +272,7 @@ export function TopBar() {
       <img
         src={darkLogo ? "/logo-horizontal-dark.svg" : "/logo-horizontal-light.svg"}
         alt="NestWeaver"
-        className="hidden h-8 shrink-0 sm:block"
+        className="hidden h-8 max-w-[8rem] shrink-0 sm:block"
       />
 
       <WorkspaceSwitcher />

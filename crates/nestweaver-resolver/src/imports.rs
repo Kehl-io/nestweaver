@@ -9,15 +9,20 @@ use crate::workspace::WorkspaceContext;
 /// Tracks an aliased import binding (e.g., `use a::b as c;`).
 ///
 /// Populated from [`ReferenceKind::ImportAlias`] references emitted by the
-/// parser (currently only Rust `use ... as ...` clauses produce them).
+/// parser for Rust paths and exact JS/TS/Python imported bindings.
 #[derive(Debug, Clone)]
 pub struct NamedBinding {
+    pub scope: Option<nestweaver_parser::LexicalScope>,
     /// The local alias used in the importing file.
     pub local_name: String,
     /// The original exported name from the source file.
     pub original_name: String,
-    /// The file that exports the original name.
-    pub source_file: String,
+    /// The file that exports the original name, or a failed JS/TS import.
+    pub source_file: Option<String>,
+    /// Exact inline module tail after a Rust import consumes its source file.
+    pub rust_inline_modules: Option<Vec<String>>,
+    /// Import location, used to keep function-local bindings inside their owner.
+    pub start_line: u32,
 }
 
 /// Tracks what each file exports and what it imports.
@@ -28,6 +33,13 @@ pub struct ImportGraph {
     exports: HashMap<String, Vec<String>>,
     /// file → [named bindings (aliased imports)]
     named_bindings: HashMap<String, Vec<NamedBinding>>,
+    export_aliases: HashMap<String, HashMap<String, (String, Option<String>)>>,
+    /// Exact literal-method declaration keyed by terminal exported name.
+    literal_export_lines: HashMap<String, HashMap<String, u32>>,
+    star_exports: HashMap<String, Vec<String>>,
+    go_packages: HashMap<String, String>,
+    unresolved_exports: HashMap<String, HashSet<String>>,
+    incomplete_stars: HashSet<String>,
 }
 
 impl ImportGraph {
@@ -53,11 +65,185 @@ impl ImportGraph {
     }
 
     /// Returns the named bindings (aliased imports) for the given file.
-    pub fn bindings_of(&self, file: &str) -> Vec<&NamedBinding> {
+    pub fn bindings_of(&self, file: &str) -> &[NamedBinding] {
         self.named_bindings
             .get(file)
-            .map(|v| v.iter().collect())
-            .unwrap_or_default()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Add an AST-proven same-file inline type route without a file/name fallback.
+    pub(crate) fn register_rust_inline_type_imports(
+        &mut self,
+        file: &str,
+        imports: &[nestweaver_parser::parse::ScopedRustInlineTypeImport],
+    ) {
+        for import in imports {
+            let routes = self.resolved_imports.entry(file.into()).or_default();
+            if !routes
+                .iter()
+                .any(|(specifier, target)| specifier == &import.specifier && target == file)
+            {
+                routes.push((import.specifier.clone(), file.into()));
+            }
+            let bindings = self.named_bindings.entry(file.into()).or_default();
+            let binding = NamedBinding {
+                scope: Some(import.scope),
+                local_name: import.local_name.clone(),
+                original_name: import.original_name.clone(),
+                source_file: Some(file.into()),
+                rust_inline_modules: Some(import.module_path.clone()),
+                start_line: import.line,
+            };
+            if let Some(existing) = bindings.iter_mut().find(|binding| {
+                binding.local_name == import.local_name
+                    && binding
+                        .scope
+                        .is_some_and(|scope| scope.position == import.scope.position)
+            }) {
+                // The AST inline declaration defeats a physical file guess
+                // for this use byte; other declarations retain their routes.
+                *existing = binding;
+            } else {
+                bindings.push(binding);
+            }
+        }
+    }
+
+    /// Follow only exact named public exports, bounded like the existing barrel walk.
+    /// A public declaration name is not automatically another public export key.
+    pub fn exported_target<'a>(
+        &'a self,
+        file: &'a str,
+        name: &'a str,
+    ) -> Option<(&'a str, &'a str, usize)> {
+        self.exported_target_with_declaration(file, name)
+            .map(|(file, name, depth, _)| (file, name, depth))
+    }
+
+    pub(crate) fn exported_target_with_declaration<'a>(
+        &'a self,
+        file: &'a str,
+        name: &'a str,
+    ) -> Option<(&'a str, &'a str, usize, Option<u32>)> {
+        let mut targets = HashMap::new();
+        let complete =
+            self.collect_export_targets(file, name, 0, &mut HashSet::new(), &mut targets, &mut 256);
+        if complete && targets.len() == 1 {
+            targets
+                .into_iter()
+                .next()
+                .map(|((file, name, line), depth)| (file, name, depth, line))
+        } else {
+            None
+        }
+    }
+
+    fn collect_export_targets<'a>(
+        &'a self,
+        file: &'a str,
+        name: &'a str,
+        depth: usize,
+        visited: &mut HashSet<(&'a str, &'a str)>,
+        targets: &mut HashMap<(&'a str, &'a str, Option<u32>), usize>,
+        remaining: &mut usize,
+    ) -> bool {
+        if depth > 3 || *remaining == 0 || targets.len() > 1 {
+            return false;
+        }
+        *remaining -= 1;
+        if !visited.insert((file, name)) {
+            return true;
+        }
+        let mut complete = true;
+        if self
+            .unresolved_exports
+            .get(file)
+            .is_some_and(|names| names.contains(name))
+        {
+            visited.remove(&(file, name));
+            return false;
+        }
+        if let Some((local, source)) = self
+            .export_aliases
+            .get(file)
+            .and_then(|aliases| aliases.get(name))
+        {
+            if let Some(source) = source {
+                complete = self.collect_export_targets(
+                    source,
+                    local,
+                    depth + 1,
+                    visited,
+                    targets,
+                    remaining,
+                );
+            } else {
+                targets
+                    .entry((
+                        file,
+                        local,
+                        self.literal_export_lines
+                            .get(file)
+                            .and_then(|lines| lines.get(name))
+                            .copied(),
+                    ))
+                    .and_modify(|old| *old = (*old).min(depth))
+                    .or_insert(depth);
+            }
+        } else if name != "default" {
+            if self.incomplete_stars.contains(file) {
+                visited.remove(&(file, name));
+                return false;
+            }
+            for source in self.star_exports.get(file).into_iter().flatten() {
+                if !self.collect_export_targets(
+                    source,
+                    name,
+                    depth + 1,
+                    visited,
+                    targets,
+                    remaining,
+                ) {
+                    complete = false;
+                    break;
+                }
+                if targets.len() > 1 {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        visited.remove(&(file, name));
+        complete
+    }
+
+    pub(crate) fn same_go_package(&self, from: &str, to: &str) -> bool {
+        self.go_packages
+            .get(from)
+            .is_some_and(|package| self.go_packages.get(to) == Some(package))
+    }
+
+    /// Only a resolved `super` import grants access to its parent module's private items.
+    pub(crate) fn resolves_parent(&self, from: &str, to: &str) -> bool {
+        fn module_path(file: &str) -> &str {
+            for suffix in ["/mod.rs", "/lib.rs", "/main.rs"] {
+                if let Some(module) = file.strip_suffix(suffix) {
+                    return module;
+                }
+            }
+            file.strip_suffix(".rs").unwrap_or(file)
+        }
+        let parent = module_path(to);
+        let child = module_path(from);
+        child
+            .strip_prefix(parent)
+            .is_some_and(|rest| rest.starts_with('/'))
+            && self.resolved_imports.get(from).is_some_and(|imports| {
+                imports.iter().any(|(specifier, target)| {
+                    target == to && (specifier == "super" || specifier.starts_with("super::"))
+                })
+            })
     }
 
     /// Returns all resolved imports across all files as (source_file, specifier, target_file) triples.
@@ -95,12 +281,66 @@ pub(crate) fn build_import_graph_with_languages(
     let mut exports: HashMap<String, Vec<String>> = HashMap::new();
     let mut resolved_imports: HashMap<String, Vec<(String, String)>> = HashMap::new();
     let mut named_bindings: HashMap<String, Vec<NamedBinding>> = HashMap::new();
+    let mut export_aliases = HashMap::new();
+    let mut literal_export_lines = HashMap::new();
+    let mut star_exports = HashMap::new();
+    let mut go_packages = HashMap::new();
+    let mut unresolved_exports: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut incomplete_stars = HashSet::new();
 
     for (file_path, symbols, references) in files {
         let language = file_languages
             .and_then(|languages| languages.get(file_path))
             .copied()
             .unwrap_or(fallback_language);
+        if language == Language::Go {
+            let packages: Vec<_> = references
+                .iter()
+                .filter(|reference| reference.kind == ReferenceKind::PackageBinding)
+                .collect();
+            if packages.len() == 1 {
+                go_packages.insert(file_path.clone(), packages[0].name.clone());
+            }
+        }
+        let literal_methods: HashSet<_> = symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.kind == nestweaver_schema::SymbolKind::Method
+                    && symbol.parent_name.as_deref() == Some("module.exports")
+            })
+            .map(|symbol| (symbol.name.as_str(), symbol.start_line))
+            .collect();
+        let is_literal_export = |reference: &RawReference| {
+            reference.scope.is_some()
+                && reference.receiver.is_none()
+                && literal_methods.contains(&(reference.context.as_str(), reference.start_line))
+        };
+        let mut lines = HashMap::new();
+        let mut seen = HashSet::new();
+        let mut duplicates = HashSet::new();
+        let mut literal_names = HashSet::new();
+        for reference in references
+            .iter()
+            .filter(|reference| reference.kind == ReferenceKind::ExportAlias)
+        {
+            if !seen.insert(reference.name.clone()) {
+                duplicates.insert(reference.name.clone());
+            }
+            if is_literal_export(reference) {
+                literal_names.insert(reference.name.clone());
+                lines.insert(reference.name.clone(), reference.start_line);
+            }
+        }
+        // The AST traversal does not promise overwrite order. Repeated
+        // aliases involving a literal method refuse instead of selecting one.
+        for name in duplicates.intersection(&literal_names) {
+            lines.remove(name);
+            unresolved_exports
+                .entry(file_path.clone())
+                .or_default()
+                .insert(name.clone());
+        }
+        literal_export_lines.insert(file_path.clone(), lines);
         // v2: filter by visibility — only non-private symbols are exported
         let exported_names: Vec<String> = symbols
             .iter()
@@ -108,6 +348,121 @@ pub(crate) fn build_import_graph_with_languages(
             .map(|s| s.name.clone())
             .collect();
         exports.insert(file_path.clone(), exported_names);
+        for reference in references
+            .iter()
+            .filter(|reference| reference.kind == ReferenceKind::ExportAlias)
+        {
+            let specifier = reference.receiver.as_deref().or_else(|| {
+                if is_literal_export(reference) {
+                    return None;
+                }
+                references
+                    .iter()
+                    .find(|binding| {
+                        binding.kind == ReferenceKind::ImportAlias
+                            && binding.name == reference.context
+                            && !symbols.iter().any(|symbol| {
+                                matches!(
+                                    symbol.kind,
+                                    nestweaver_schema::SymbolKind::Function
+                                        | nestweaver_schema::SymbolKind::Method
+                                        | nestweaver_schema::SymbolKind::Class
+                                ) && symbol.start_line <= binding.start_line
+                                    && binding.start_line <= symbol.end_line
+                            })
+                    })
+                    .map(|binding| binding.context.as_str())
+            });
+            if specifier.is_some_and(|specifier| {
+                resolve_specifier(file_path, specifier, &known_files, language, workspace_ctx)
+                    .is_none()
+            }) {
+                if reference.name == "*" {
+                    incomplete_stars.insert(file_path.clone());
+                } else {
+                    unresolved_exports
+                        .entry(file_path.clone())
+                        .or_default()
+                        .insert(reference.name.clone());
+                }
+            }
+        }
+        star_exports.insert(
+            file_path.clone(),
+            references
+                .iter()
+                .filter(|reference| {
+                    reference.kind == ReferenceKind::ExportAlias && reference.name == "*"
+                })
+                .filter_map(|reference| {
+                    resolve_specifier(
+                        file_path,
+                        reference.receiver.as_deref()?,
+                        &known_files,
+                        language,
+                        workspace_ctx,
+                    )
+                })
+                .collect(),
+        );
+        export_aliases.insert(
+            file_path.clone(),
+            references
+                .iter()
+                .filter(|reference| {
+                    reference.kind == ReferenceKind::ExportAlias && reference.name != "*"
+                })
+                .filter_map(|reference| {
+                    // A module-local exported name can itself be a precise
+                    // imported binding. Function-local imports cannot forward
+                    // an unrelated declaration exported at module scope.
+                    let imported = if is_literal_export(reference) {
+                        None
+                    } else {
+                        references.iter().find(|binding| {
+                            binding.kind == ReferenceKind::ImportAlias
+                                && binding.name == reference.context
+                                && !symbols.iter().any(|symbol| {
+                                    matches!(
+                                        symbol.kind,
+                                        nestweaver_schema::SymbolKind::Function
+                                            | nestweaver_schema::SymbolKind::Method
+                                            | nestweaver_schema::SymbolKind::Class
+                                    ) && symbol.start_line <= binding.start_line
+                                        && binding.start_line <= symbol.end_line
+                                })
+                        })
+                    };
+                    let (local, source) = match reference.receiver.as_deref() {
+                        Some(specifier) => (
+                            reference.context.clone(),
+                            Some(resolve_specifier(
+                                file_path,
+                                specifier,
+                                &known_files,
+                                language,
+                                workspace_ctx,
+                            )?),
+                        ),
+                        None if imported.is_some() => {
+                            let imported = imported.expect("matched imported export");
+                            (
+                                imported.receiver.clone()?,
+                                Some(resolve_specifier(
+                                    file_path,
+                                    &imported.context,
+                                    &known_files,
+                                    language,
+                                    workspace_ctx,
+                                )?),
+                            )
+                        }
+                        None => (reference.context.clone(), None),
+                    };
+                    Some((reference.name.clone(), (local, source)))
+                })
+                .collect(),
+        );
 
         // Resolve import references
         let mut imports: Vec<(String, String)> = Vec::new();
@@ -119,25 +474,46 @@ pub(crate) fn build_import_graph_with_languages(
             // is already covered by its own Import reference, so it is not
             // added to `imports` again here.
             if reference.kind == ReferenceKind::ImportAlias {
-                if let Some(resolved) = resolve_specifier(
+                let resolved = resolve_specifier(
                     file_path,
                     &reference.context,
                     &known_files,
                     language,
                     workspace_ctx,
-                ) {
-                    let original_name = reference
-                        .context
-                        .rsplit("::")
-                        .next()
-                        .unwrap_or(reference.context.as_str())
-                        .to_string();
-                    bindings.push(NamedBinding {
-                        local_name: reference.name.clone(),
-                        original_name,
-                        source_file: resolved,
-                    });
+                );
+                if resolved.is_none()
+                    && !matches!(language, Language::JavaScript | Language::TypeScript)
+                {
+                    continue;
                 }
+                let original_name = reference
+                    .receiver
+                    .as_deref()
+                    .unwrap_or(&reference.context)
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(reference.context.as_str())
+                    .to_string();
+                let rust_inline_modules = if language == Language::Rust {
+                    resolved.as_deref().and_then(|file| {
+                        lang::rust::inline_type_modules(
+                            file_path,
+                            &reference.context,
+                            file,
+                            &known_files,
+                        )
+                    })
+                } else {
+                    None
+                };
+                bindings.push(NamedBinding {
+                    rust_inline_modules,
+                    scope: reference.scope,
+                    local_name: reference.name.clone(),
+                    original_name,
+                    source_file: resolved,
+                    start_line: reference.start_line,
+                });
                 continue;
             }
             if !matches!(
@@ -147,9 +523,41 @@ pub(crate) fn build_import_graph_with_languages(
                 continue;
             }
             let specifier = &reference.name;
-            if let Some(resolved) =
-                resolve_specifier(file_path, specifier, &known_files, language, workspace_ctx)
+            let resolved =
+                resolve_specifier(file_path, specifier, &known_files, language, workspace_ctx);
+            // A module import consumes the final path segment. An item
+            // import leaves the resolved module unchanged from its prefix,
+            // even when the item's spelling equals the module filename.
+            let rust_module_import = language == Language::Rust
+                && resolved.as_ref().is_some_and(|file| {
+                    specifier.rsplit_once("::").is_none_or(|(prefix, _)| {
+                        lang::rust::resolve_import(file_path, prefix, &known_files).as_ref()
+                            != Some(file)
+                    })
+                });
+            if language == Language::Rust
+                && reference.kind == ReferenceKind::Import
+                && reference.receiver.as_deref() != Some("*")
+                && !references.iter().any(|alias| {
+                    alias.kind == ReferenceKind::ImportAlias
+                        && alias.context == *specifier
+                        && alias.start_line == reference.start_line
+                })
             {
+                let name = specifier.rsplit("::").next().unwrap_or(specifier);
+                let rust_inline_modules = resolved.as_deref().and_then(|file| {
+                    lang::rust::inline_type_modules(file_path, specifier, file, &known_files)
+                });
+                bindings.push(NamedBinding {
+                    rust_inline_modules,
+                    scope: reference.scope,
+                    local_name: name.into(),
+                    original_name: if rust_module_import { "*" } else { name }.into(),
+                    source_file: resolved.clone(),
+                    start_line: reference.start_line,
+                });
+            }
+            if let Some(resolved) = resolved {
                 imports.push((specifier.clone(), resolved));
             }
         }
@@ -163,6 +571,12 @@ pub(crate) fn build_import_graph_with_languages(
         resolved_imports,
         exports,
         named_bindings,
+        export_aliases,
+        literal_export_lines,
+        star_exports,
+        go_packages,
+        unresolved_exports,
+        incomplete_stars,
     }
 }
 
@@ -240,6 +654,7 @@ mod tests {
 
     fn make_import_ref(specifier: &str) -> RawReference {
         RawReference {
+            scope: None,
             name: specifier.to_string(),
             kind: ReferenceKind::Import,
             start_line: 1,
@@ -250,6 +665,7 @@ mod tests {
 
     fn make_include_ref(specifier: &str) -> RawReference {
         RawReference {
+            scope: None,
             name: specifier.to_string(),
             kind: ReferenceKind::Includes,
             start_line: 1,
@@ -392,15 +808,24 @@ mod tests {
         bindings.insert(
             "src/main.js".to_string(),
             vec![NamedBinding {
+                rust_inline_modules: None,
+                scope: None,
                 local_name: "MyAlias".to_string(),
                 original_name: "OriginalName".to_string(),
-                source_file: "src/lib.js".to_string(),
+                source_file: Some("src/lib.js".to_string()),
+                start_line: 1,
             }],
         );
         let graph = ImportGraph {
+            literal_export_lines: HashMap::new(),
             resolved_imports: HashMap::new(),
             exports: HashMap::new(),
             named_bindings: bindings,
+            export_aliases: HashMap::new(),
+            star_exports: HashMap::new(),
+            go_packages: HashMap::new(),
+            unresolved_exports: HashMap::new(),
+            incomplete_stars: HashSet::new(),
         };
         let result = graph.bindings_of("src/main.js");
         assert_eq!(result.len(), 1);
@@ -411,6 +836,7 @@ mod tests {
     #[test]
     fn populates_named_bindings_from_import_alias_refs() {
         let make_alias_ref = |alias: &str, specifier: &str| RawReference {
+            scope: None,
             name: alias.to_string(),
             kind: ReferenceKind::ImportAlias,
             start_line: 1,
@@ -440,7 +866,7 @@ mod tests {
         assert_eq!(bindings.len(), 1, "only the resolved alias gets a binding");
         assert_eq!(bindings[0].local_name, "load_config");
         assert_eq!(bindings[0].original_name, "load");
-        assert_eq!(bindings[0].source_file, "src/config.rs");
+        assert_eq!(bindings[0].source_file.as_deref(), Some("src/config.rs"));
         // The ImportAlias reference must not duplicate the resolved import.
         assert_eq!(
             graph.imports_of("src/main.rs"),
@@ -477,6 +903,58 @@ mod tests {
         assert!(
             !imports.iter().any(|(spec, _)| spec == "lodash"),
             "lodash should not be resolved"
+        );
+    }
+
+    #[test]
+    fn review_star_walk_budget_fails_closed_after_a_known_target() {
+        let mut graph = ImportGraph {
+            literal_export_lines: HashMap::new(),
+            resolved_imports: HashMap::new(),
+            exports: HashMap::new(),
+            named_bindings: HashMap::new(),
+            go_packages: HashMap::new(),
+            unresolved_exports: HashMap::new(),
+            incomplete_stars: HashSet::new(),
+            export_aliases: HashMap::from([(
+                "leaf.js".into(),
+                HashMap::from([("helper".into(), ("helper".into(), None))]),
+            )]),
+            star_exports: HashMap::new(),
+        };
+        let mut branches = vec!["leaf.js".into()];
+        branches.extend((0..300).map(|index| format!("branch{index}.js")));
+        graph.star_exports.insert("index.js".into(), branches);
+        assert_eq!(
+            graph.exported_target("index.js", "helper"),
+            None,
+            "one discovered export is insufficient when uniqueness search exceeds its budget"
+        );
+    }
+
+    #[test]
+    fn review_star_walk_duplicate_paths_keep_one_target() {
+        let graph = ImportGraph {
+            literal_export_lines: HashMap::new(),
+            resolved_imports: HashMap::new(),
+            exports: HashMap::new(),
+            named_bindings: HashMap::new(),
+            go_packages: HashMap::new(),
+            unresolved_exports: HashMap::new(),
+            incomplete_stars: HashSet::new(),
+            export_aliases: HashMap::from([(
+                "leaf.js".into(),
+                HashMap::from([("helper".into(), ("helper".into(), None))]),
+            )]),
+            star_exports: HashMap::from([
+                ("index.js".into(), vec!["a.js".into(), "b.js".into()]),
+                ("a.js".into(), vec!["leaf.js".into()]),
+                ("b.js".into(), vec!["leaf.js".into()]),
+            ]),
+        };
+        assert_eq!(
+            graph.exported_target("index.js", "helper"),
+            Some(("leaf.js", "helper", 2))
         );
     }
 }

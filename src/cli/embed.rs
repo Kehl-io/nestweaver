@@ -191,6 +191,8 @@ where
     let t0 = std::time::Instant::now();
     let default = default_db_path();
     let path = db.unwrap_or(&default);
+    let selected = selected_db_path(path)?;
+    require_openable_db(&selected)?;
     let local_model_id = local_embedding_model_id(model_id);
 
     // ── Daemon path (configured embedding backend) ─────────────────────────
@@ -329,7 +331,6 @@ where
     // Held for the whole pass, which can run for hours.
     // The direct pass embeds what the daemon would serve, not a base database
     // a publication rebuild left behind.
-    let selected = selected_db_path(path)?;
     let path = selected.as_path();
     let write_lease = require_exclusive_store_access(path, "embed")?;
 

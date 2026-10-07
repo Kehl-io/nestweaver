@@ -1,0 +1,195 @@
+---
+source: crates/nestweaver-parser/src/parse.rs
+expression: parsed
+---
+path: src/main.js
+symbols:
+  - name: Store
+    kind: Class
+    start_line: 1
+    end_line: 1
+    signature: "class Store { query() {} }"
+    content_hash: 84f045ad46b52c05130501afafdb1820eca255529d8278f7cc25b15426895e2a
+    is_entry_point: true
+    entry_point_kind: Main
+    visibility: Private
+    type_info: ~
+    parent_name: ~
+    scope_chain: ~
+  - name: query
+    kind: Method
+    start_line: 1
+    end_line: 1
+    signature: "query() {}"
+    content_hash: 40d5d34657046679e16696627659c649a48f4bbdf58eedddba8c514f05e6da24
+    is_entry_point: false
+    entry_point_kind: ~
+    visibility: Private
+    type_info: ~
+    parent_name: Store
+    scope_chain: Store
+  - name: Service
+    kind: Class
+    start_line: 1
+    end_line: 1
+    signature: "class Service { constructor() { this.store = new Store(); } run() { this.store.query(); } }"
+    content_hash: 2c3298f73c03023f025d8904b0196bbced2cf4ca1d9fb4506748a2e797f593ce
+    is_entry_point: true
+    entry_point_kind: Main
+    visibility: Private
+    type_info: ~
+    parent_name: ~
+    scope_chain: ~
+  - name: constructor
+    kind: Method
+    start_line: 1
+    end_line: 1
+    signature: "constructor() { this.store = new Store(); }"
+    content_hash: ca8750bfcf64a6ccf932e0ba202dd96055871744c357adc60cc47b7f027825f4
+    is_entry_point: false
+    entry_point_kind: ~
+    visibility: Private
+    type_info: ~
+    parent_name: Service
+    scope_chain: Service
+  - name: store
+    kind: Property
+    start_line: 1
+    end_line: 1
+    signature: this.store = new Store()
+    content_hash: 0228f45ca13a8cf01ad8444634f309cab351cddbc9b147522f216e218f918fc5
+    is_entry_point: false
+    entry_point_kind: ~
+    visibility: Private
+    type_info:
+      declared_type: Store
+      parameter_types: []
+      return_type: ~
+    parent_name: Service
+    scope_chain: "Service::constructor"
+  - name: run
+    kind: Method
+    start_line: 1
+    end_line: 1
+    signature: "run() { this.store.query(); }"
+    content_hash: 4e7a3551f0b5e1267f7678d40016296c155fadc27d5a8d5764d362c918a59ea9
+    is_entry_point: false
+    entry_point_kind: ~
+    visibility: Private
+    type_info: ~
+    parent_name: Service
+    scope_chain: Service
+  - name: shadow
+    kind: Function
+    start_line: 1
+    end_line: 1
+    signature: "function shadow(module) { return module.exports; }"
+    content_hash: 7281439f08f91998a3588f8cdef3b8fdd4b6f1553f33d2fac3723a79dc83e779
+    is_entry_point: true
+    entry_point_kind: Main
+    visibility: Private
+    type_info: ~
+    parent_name: ~
+    scope_chain: ~
+references:
+  - scope:
+      start: 57
+      end: 86
+      position: 59
+      initialized_at: 59
+      hoisted_var: false
+    name: store
+    kind: ReadAccess
+    start_line: 1
+    context: this.store = new Store()
+    receiver: this
+  - scope:
+      start: 57
+      end: 86
+      position: 72
+      initialized_at: 72
+      hoisted_var: false
+    name: Store
+    kind: Call
+    start_line: 1
+    context: this.store = new Store()
+    receiver: ~
+  - scope:
+      start: 93
+      end: 116
+      position: 95
+      initialized_at: 95
+      hoisted_var: false
+    name: store
+    kind: ReadAccess
+    start_line: 1
+    context: this.store.query
+    receiver: this
+  - scope:
+      start: 93
+      end: 116
+      position: 95
+      initialized_at: 95
+      hoisted_var: false
+    name: query
+    kind: Call
+    start_line: 1
+    context: this.store.query();
+    receiver: this.store
+  - scope:
+      start: 93
+      end: 116
+      position: 95
+      initialized_at: 95
+      hoisted_var: false
+    name: query
+    kind: ReadAccess
+    start_line: 1
+    context: this.store.query()
+    receiver: this.store
+  - scope:
+      start: 0
+      end: 200
+      position: 119
+      initialized_at: 119
+      hoisted_var: false
+    name: exports
+    kind: ReadAccess
+    start_line: 1
+    context: "module.exports = { run() {} }"
+    receiver: module
+  - scope:
+      start: 174
+      end: 200
+      position: 183
+      initialized_at: 183
+      hoisted_var: false
+    name: exports
+    kind: ReadAccess
+    start_line: 1
+    context: return module.exports;
+    receiver: module
+  - scope:
+      start: 0
+      end: 200
+      position: 138
+      initialized_at: 138
+      hoisted_var: false
+    name: run
+    kind: ExportAlias
+    start_line: 1
+    context: run
+    receiver: ~
+  - scope:
+      start: 150
+      end: 200
+      position: 166
+      initialized_at: 166
+      hoisted_var: false
+    name: module
+    kind: LocalBinding
+    start_line: 1
+    context: ""
+    receiver: ~
+type_bindings: []
+has_syntax_errors: false

@@ -114,6 +114,7 @@ export function DetailPanel() {
           node={{
             uid: selectedNodeId,
             kind: selectedNodeKind,
+            label: symbolQuery.detail?.symbol.name,
             missing: symbolQuery.status === "missing",
           }}
           compact
