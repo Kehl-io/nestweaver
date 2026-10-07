@@ -5,7 +5,7 @@
 
 ### ⚠ BREAKING CHANGES
 
-* resolver generation advances from 8 to 9. Force reindex each existing repository before stale checks or dead-code analysis. Parsed cache version 4 reparses prior cached references.
+* Resolver generation advances from 8 to 9. After upgrading, run `nestweaver index --repo <path> --db <existing-db-path> --force` for each existing repository before stale checks or dead-code analysis. Parsed cache version 5 automatically reparses prior cached references during indexing.
 
 ### Bug Fixes
 
