@@ -915,7 +915,7 @@ nestweaver suggest-links --db ./all.lbug
 nestweaver context --feature device-pairing --config ./nestweaver-instance.toml --db ./all.lbug
 ```
 
-**Runtime-configurable defaults** — set `[limits]` in your instance config to replace each command's own builtin page size. Unset, `search` uses 10, `brain search` uses 20, and `brain context` uses 30. Other tools use 50 (`DEFAULT_RESULT_LIMIT`):
+**Runtime-configurable defaults** — set `[limits]` in your instance config to replace the builtin a command passes into `resolve_limit`. That builtin is not one number. Unset, `search` uses 10, `brain search` uses 20, and `brain context` uses 30. Commands whose builtin is `DEFAULT_RESULT_LIMIT` use 50. `code_context` is not in that set: it returns up to 500 connected symbols. `brain_context` is sized by `token_budget` (default 2000), not by a page size.
 
 ```toml
 [limits]
