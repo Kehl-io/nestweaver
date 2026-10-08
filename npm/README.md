@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="media/logo.svg" width="360" alt="NestWeaver">
+  <img src="https://raw.githubusercontent.com/Kehl-io/nestweaver/main/npm/media/logo.svg" width="360" alt="NestWeaver">
 </p>
 
 <p align="center">
@@ -15,7 +15,7 @@
 NestWeaver indexes a repository into a structural graph: symbols, calls, imports, and notes. Agents query that graph instead of reading the tree file by file. This package installs the CLI. It does not download anything at install time.
 
 <p align="center">
-  <img src="media/demo.svg" width="700" alt="Terminal: index a repo, then ask for context around a symbol">
+  <img src="https://raw.githubusercontent.com/Kehl-io/nestweaver/main/npm/media/demo.svg" width="700" alt="Terminal: index a repo, then ask for context around a symbol">
 </p>
 
 ## Install and query
@@ -38,11 +38,11 @@ The database defaults to `./nestweaver.lbug` in the current directory. Pass `--d
 `nestweaver ui` opens a local workspace on port 3000: an overview of what is indexed, then the source and callers for the symbol you pick.
 
 <p align="center">
-  <img src="media/web-ui.png" width="720" alt="NestWeaver web UI showing the sample-graph overview">
+  <img src="https://raw.githubusercontent.com/Kehl-io/nestweaver/main/npm/media/web-ui.png" width="720" alt="NestWeaver web UI showing the sample-graph overview">
 </p>
 
 <p align="center">
-  <img src="media/web-ui-symbol.png" width="720" alt="NestWeaver web UI with run_query selected, its source, and its callees">
+  <img src="https://raw.githubusercontent.com/Kehl-io/nestweaver/main/npm/media/web-ui-symbol.png" width="720" alt="NestWeaver web UI with run_query selected, its source, and its callees">
 </p>
 
 ## What agents get

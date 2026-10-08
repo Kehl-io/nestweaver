@@ -44,6 +44,8 @@
     <tspan class="cmd"> nestweaver index </tspan>
     <tspan class="cmd">--repo </tspan>
     <tspan class="blue">./my-project</tspan>
+    <tspan class="cmd"> --db </tspan>
+    <tspan class="blue">./nestweaver.lbug</tspan>
   </text>
 
   <text class="out" y="92" x="24">Indexing <tspan class="blue">./my-project</tspan><tspan class="out"> &#x2192; </tspan><tspan class="blue">./nestweaver.lbug</tspan></text>
@@ -59,6 +61,8 @@
     <tspan class="prompt">$</tspan>
     <tspan class="cmd"> nestweaver context </tspan>
     <tspan class="cyan">greet</tspan>
+    <tspan class="cmd"> --db </tspan>
+    <tspan class="blue">./nestweaver.lbug</tspan>
   </text>
 
   <text class="out" y="212" x="24">Seeds (1 resolved):</text>
@@ -98,7 +102,8 @@
   <text y="342" x="24">
     <tspan class="prompt">$</tspan>
     <tspan class="cmd"> nestweaver repo-map </tspan>
-    <tspan class="cmd">--token-budget 200</tspan>
+    <tspan class="cmd">--token-budget 200 --db </tspan>
+    <tspan class="blue">./nestweaver.lbug</tspan>
   </text>
 
   <text y="362" x="24">
