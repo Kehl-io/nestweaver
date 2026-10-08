@@ -1,73 +1,78 @@
-# nestweaver
+<p align="center">
+  <img src="media/logo.svg" width="360" alt="NestWeaver">
+</p>
 
-Code knowledge graph for AI agents — 43 MCP tools, 32 languages, graph
-visualization.
+<p align="center">
+  <strong>Your codebase as a queryable graph, built for AI agents.</strong>
+</p>
 
-This package is a thin wrapper with **no install-time (`postinstall`) script**.
-It ships one prebuilt-binary package per platform —
-`nestweaver-darwin-arm64`, `nestweaver-darwin-x64`, `nestweaver-linux-arm64`,
-`nestweaver-linux-x64` — as an `optionalDependencies` entry, the same pattern
-esbuild, swc, and Rollup use. npm, pnpm, and Yarn each install only the one
-matching your machine's `os`/`cpu` through their own ordinary dependency
-resolution; the `nestweaver` executable on your PATH resolves and runs
-whichever one actually landed, at invocation time.
+<p align="center">
+  <a href="https://docs.nestweaver.kehl.io">Docs</a> ·
+  <a href="https://nestweaver.kehl.io">Website</a> ·
+  <a href="https://github.com/Kehl-io/nestweaver">Source</a>
+</p>
 
-**No lifecycle scripts to allow.** There is nothing for
-`npm install --ignore-scripts` to skip, and pnpm 10+'s default block on
-lifecycle scripts (which used to leave a wrapper with no binary and no
-`pnpm.onlyBuiltDependencies` clue why) no longer applies — there is no script
-to block.
+NestWeaver indexes a repository into a structural graph: symbols, calls, imports, and notes. Agents query that graph instead of reading the tree file by file. This package installs the CLI. It does not download anything at install time.
 
-If your package manager skipped optional dependencies entirely
-(`--omit=optional`, `--no-optional`, or a lockfile resolved without one),
-`nestweaver` exits 1 and names the exact optional package to install instead
-of silently doing nothing. If your organisation disallows this platform
-package entirely, install a release archive from GitHub or build from source
-(`cargo install --locked --path .`) instead.
+<p align="center">
+  <img src="media/demo.svg" width="700" alt="Terminal: index a repo, then ask for context around a symbol">
+</p>
 
-## Platforms
+## Install and query
 
-macOS and Linux, on x86_64 and arm64. Every other platform has no published
-optional package, so `nestweaver` FAILS with the supported-targets list at
-invocation time rather than leaving you with a wrapper that silently cannot
-run; use a release archive or a source build instead. The two Linux platform
-packages additionally declare `libc: ["glibc"]` (musl/Alpine is not
-currently supported). Declaring `libc` is safe on a Linux-only package; it was
-not safe on the earlier combined macOS+Linux wrapper, where it made npm reject
-every macOS install with `EBADPLATFORM` because `libc` is not a concept on
-macOS. The field itself was never the problem — the package it sat on was.
+```sh
+npm install --global nestweaver
 
-Linux builds target **glibc 2.35**, which covers Ubuntu 22.04 LTS and newer and
-Debian 12. The platform package includes the GCC 13 runtime LadybugDB needs
-beside the binary. Check your glibc with `ldd --version`; on anything older
-the binary will not start and the error names a missing `GLIBC_` symbol.
-macOS builds target **13.3**.
+nestweaver index --repo .
+nestweaver search "main"
+nestweaver context processPayment
+nestweaver setup
+```
 
-## Upgrading an existing graph
+`index` takes `--repo`. `search` matches symbol names. `context` returns the symbols around a name, a UID, or a repo-relative file path. `setup` writes the MCP config for the agent it detects. Cursor gets six tools (`--lite`); other agents get the full set of 43.
 
-NestWeaver 9.0.0 raised the resolver generation, so a graph built by an earlier
-release has stale rankings and is missing C/C++ `MEMBER_OF` and C++ `IMPORTS`
-edges. Check with:
+The database defaults to `./nestweaver.lbug` in the current directory. Pass `--db` when you query from somewhere else.
+
+## See the graph
+
+`nestweaver ui` opens a local workspace on port 3000: an overview of what is indexed, then the source and callers for the symbol you pick.
+
+<p align="center">
+  <img src="media/web-ui.png" width="720" alt="NestWeaver web UI showing the sample-graph overview">
+</p>
+
+<p align="center">
+  <img src="media/web-ui-symbol.png" width="720" alt="NestWeaver web UI with run_query selected, its source, and its callees">
+</p>
+
+## What agents get
+
+- **43 MCP tools** for context, impact, tests, and vault notes. The six-tool lite set is `brain_context`, `brain_search`, `brain_impact`, `brain_status`, `brain_guide`, and `detect_changes`.
+- **32 languages**, parsed with Tree-sitter, including JavaScript, TypeScript, Python, Go, Rust, Java, C, and C++.
+- **Impact and review.** `pr-impact` scores a diff. `affected-tests` lists tests to run. `dead-code` is a review list, not a deletion list.
+- **Markdown vaults** indexed next to the code, so notes and symbols share one graph.
+
+Full command and tool reference: [docs.nestweaver.kehl.io](https://docs.nestweaver.kehl.io).
+
+## How this package installs
+
+There is no `postinstall` script. The package depends on one platform binary (`nestweaver-darwin-arm64`, `nestweaver-darwin-x64`, `nestweaver-linux-arm64`, or `nestweaver-linux-x64`). npm, pnpm, and Yarn install the one that matches your machine.
+
+macOS and Linux, x86_64 and arm64. Linux builds need glibc 2.35 (Ubuntu 22.04 and Debian 12, or newer). macOS builds need 13.3. There is no Windows build, no musl/Alpine build, no crates.io package, and no Homebrew formula.
+
+If optional dependencies were skipped, `nestweaver` exits 1 and names the platform package to install. A verified GitHub Release archive, or a source build, is documented in [INSTALL.md](https://github.com/Kehl-io/nestweaver/blob/main/INSTALL.md).
+
+## After you upgrade
+
+The current resolver generation is **9**. A graph recorded at any other generation has stale edges. Check, then re-index with `--force`. A plain `index` does nothing when the repo is already at HEAD.
 
 ```sh
 nestweaver stale-check
+nestweaver index --repo . --force
 ```
 
-It exits `2` and reports `outdated_resolver` when a re-index is needed. The
-remedy needs `--force`, because a generation-stale repo is at HEAD with nothing
-modified and a plain re-index takes the incremental path and writes nothing:
+`stale-check` exits 2 and reports `outdated_resolver` when a re-index is required.
 
-```sh
-nestweaver index --repo <path> --force
-```
+## License
 
-## Other installation paths
-
-Verified GitHub Release archives, and building from a source checkout with Rust
-1.85+, are documented in [INSTALL.md](https://github.com/Kehl-io/nestweaver/blob/main/INSTALL.md).
-
-## Links
-
-- [Repository and documentation](https://github.com/Kehl-io/nestweaver)
-- [Issue tracker](https://github.com/Kehl-io/nestweaver/issues)
-- MIT licensed
+MIT. Issues and source: [github.com/Kehl-io/nestweaver](https://github.com/Kehl-io/nestweaver).

@@ -105,7 +105,7 @@ verify_main_contract() {
   jq -e --arg version "$npm_version" '
     .bin.nestweaver == "bin/nestweaver" and
     (.scripts // {} | length) == 0 and
-    (.files | sort) == ["README.md", "bin/"] and
+    (.files | sort) == ["README.md", "bin/", "media/"] and
     (.os | sort) == ["darwin", "linux"] and
     (.cpu | sort) == ["arm64", "x64"] and
     (has("libc") | not) and

@@ -1,0 +1,158 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 570" width="720" height="570">
+  <defs>
+    <style>
+      .bg { fill: #0d1117; }
+      .titlebar { fill: #161b22; }
+      .dot-red { fill: #ff5f57; }
+      .dot-yellow { fill: #febc2e; }
+      .dot-green { fill: #28c840; }
+      .prompt { fill: #4dff00; font-family: 'JetBrains Mono','Fira Code','Cascadia Code',monospace; font-size: 13.5px; }
+      .cmd { fill: #e6edf3; font-family: 'JetBrains Mono','Fira Code','Cascadia Code',monospace; font-size: 13.5px; }
+      .out { fill: #8b949e; font-family: 'JetBrains Mono','Fira Code','Cascadia Code',monospace; font-size: 13.5px; }
+      .cyan { fill: #5ed0fe; }
+      .purple { fill: #d2a8ff; }
+      .blue { fill: #79c0ff; }
+      .white { fill: #e6edf3; }
+      .title-text { fill: #8b949e; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px; }
+      .cursor { animation: blink 1.2s step-end infinite; }
+      @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+    </style>
+  </defs>
+
+  <!-- Window frame -->
+  <rect class="bg" width="720" height="570" rx="12" ry="12"/>
+
+  <!-- Title bar -->
+  <rect class="titlebar" width="720" height="40" rx="12" ry="12"/>
+  <rect class="titlebar" y="28" width="720" height="12"/>
+
+  <!-- Window dots -->
+  <circle class="dot-red" cx="24" cy="20" r="6.5"/>
+  <circle class="dot-yellow" cx="46" cy="20" r="6.5"/>
+  <circle class="dot-green" cx="68" cy="20" r="6.5"/>
+
+  <!-- Title text -->
+  <text class="title-text" x="360" y="24" text-anchor="middle">nestweaver</text>
+
+  <!-- Separator line -->
+  <line x1="0" y1="40" x2="720" y2="40" stroke="#30363d" stroke-width="1"/>
+
+  <!-- Command 1: index -->
+  <text y="72" x="24">
+    <tspan class="prompt">$</tspan>
+    <tspan class="cmd"> nestweaver index </tspan>
+    <tspan class="cmd">--repo </tspan>
+    <tspan class="blue">./my-project</tspan>
+  </text>
+
+  <text class="out" y="92" x="24">Indexing <tspan class="blue">./my-project</tspan><tspan class="out"> &#x2192; </tspan><tspan class="blue">./nestweaver.lbug</tspan></text>
+
+  <text class="out" y="112" x="24">Incremental: no prior index found, performed full index.</text>
+
+  <text class="out" y="132" x="24">Computing PageRank...</text>
+
+  <text class="out" y="152" x="24">PageRank complete.</text>
+
+  <!-- Command 2: context -->
+  <text y="192" x="24">
+    <tspan class="prompt">$</tspan>
+    <tspan class="cmd"> nestweaver context </tspan>
+    <tspan class="cyan">greet</tspan>
+  </text>
+
+  <text class="out" y="212" x="24">Seeds (1 resolved):</text>
+
+  <text y="232" x="24">
+    <tspan class="out">  </tspan>
+    <tspan class="cyan">greet</tspan>
+    <tspan class="out">  </tspan>
+    <tspan class="purple">Function</tspan>
+    <tspan class="out">  </tspan>
+    <tspan class="blue">simple.js:5</tspan>
+  </text>
+
+  <text class="out" y="262" x="24">Connected (2 symbols, ranked by relevance):</text>
+
+  <text y="282" x="24">
+    <tspan class="out">  </tspan>
+    <tspan class="white">speak</tspan>
+    <tspan class="out">  </tspan>
+    <tspan class="purple">Method</tspan>
+    <tspan class="out">  </tspan>
+    <tspan class="blue">simple.js:22</tspan>
+    <tspan class="out">  0.4417</tspan>
+  </text>
+
+  <text y="302" x="24">
+    <tspan class="out">  </tspan>
+    <tspan class="white">speak</tspan>
+    <tspan class="out">  </tspan>
+    <tspan class="purple">Method</tspan>
+    <tspan class="out">  </tspan>
+    <tspan class="blue">simple.js:16</tspan>
+    <tspan class="out">  0.2042</tspan>
+  </text>
+
+  <!-- Command 3: repo map -->
+  <text y="342" x="24">
+    <tspan class="prompt">$</tspan>
+    <tspan class="cmd"> nestweaver repo-map </tspan>
+    <tspan class="cmd">--token-budget 200</tspan>
+  </text>
+
+  <text y="362" x="24">
+    <tspan class="blue">simple.js</tspan>
+  </text>
+
+  <text y="382" x="24">
+    <tspan class="out">  </tspan>
+    <tspan class="purple">Method</tspan>
+    <tspan class="out"> speak() {</tspan>
+  </text>
+
+  <text y="402" x="24">
+    <tspan class="out">  </tspan>
+    <tspan class="purple">Function</tspan>
+    <tspan class="out"> function </tspan>
+    <tspan class="cyan">greet</tspan>
+    <tspan class="out">(name) {</tspan>
+  </text>
+
+  <text y="422" x="24">
+    <tspan class="out">  </tspan>
+    <tspan class="purple">Method</tspan>
+    <tspan class="out"> speak() {</tspan>
+  </text>
+
+  <text y="442" x="24">
+    <tspan class="out">  </tspan>
+    <tspan class="purple">Function</tspan>
+    <tspan class="out"> const add = (a, b) =&gt; a + b;</tspan>
+  </text>
+
+  <text y="462" x="24">
+    <tspan class="out">  </tspan>
+    <tspan class="purple">Class</tspan>
+    <tspan class="out"> class Animal {</tspan>
+  </text>
+
+  <text y="482" x="24">
+    <tspan class="out">  </tspan>
+    <tspan class="purple">Method</tspan>
+    <tspan class="out"> constructor(name) {</tspan>
+  </text>
+
+  <text y="502" x="24">
+    <tspan class="out">  </tspan>
+    <tspan class="purple">Class</tspan>
+    <tspan class="out"> class Dog extends Animal {</tspan>
+  </text>
+
+  <!-- Cursor -->
+  <text y="542" x="24">
+    <tspan class="prompt">$</tspan>
+    <tspan class="cmd"> </tspan>
+    <tspan class="cmd cursor">&#9608;</tspan>
+  </text>
+</svg>
