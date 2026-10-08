@@ -1,5 +1,50 @@
 # Changelog
 
+## [12.0.0](https://github.com/Kehl-io/nestweaver/compare/v11.0.1...v12.0.0) (2026-10-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* Resolver generation advances from 8 to 9. After upgrading, run `nestweaver index --repo <path> --db <existing-db-path> --force` for each existing repository before stale checks or dead-code analysis. Parsed cache version 5 automatically reparses prior cached references during indexing.
+
+### Bug Fixes
+
+* **app:** discover published databases and forward selected config ([b4c7059](https://github.com/Kehl-io/nestweaver/commit/b4c7059aaf6eb4a821d4e203e1cc39e5779b408a))
+* **app:** recognize CRLF configuration line boundaries ([7b13f5d](https://github.com/Kehl-io/nestweaver/commit/7b13f5d65e9a677f9273a81248943945a5ac56c0))
+* **app:** retain logical publication aliases when selecting databases ([042b9b0](https://github.com/Kehl-io/nestweaver/commit/042b9b081c197ddd90f74bde4f5f6e8534c427ad))
+* attribute imports to actual binding users ([5233ae6](https://github.com/Kehl-io/nestweaver/commit/5233ae65730f13afbe453827d6f7cb0388b0b84d))
+* **cli:** preserve logical publication aliases in index targets ([9e6bc08](https://github.com/Kehl-io/nestweaver/commit/9e6bc0809addd027ad4dc8cef68345e5e78d5207))
+* **cli:** resolve publication status to the logical journal root ([d69dace](https://github.com/Kehl-io/nestweaver/commit/d69dace53b948e814131daa609f02ff80d254c2b))
+* **cli:** validate existing databases and honor pinned configs ([649546f](https://github.com/Kehl-io/nestweaver/commit/649546f0c0c9d62432c8921bc47adfbd2c543c03))
+* keep context reads and UI health observations responsive ([4cee496](https://github.com/Kehl-io/nestweaver/commit/4cee496f0909a188d2a4dc0fa5caa2926346e290))
+* make project retrieval bounded and deterministic ([b55723b](https://github.com/Kehl-io/nestweaver/commit/b55723b8ddb7f0983dcceabc6875e9a6d4d6cd82))
+* **mcp:** enforce total error budget and describe exact project selection ([7eedb85](https://github.com/Kehl-io/nestweaver/commit/7eedb853faaae0fe9c07af2bb42145b337b9d852))
+* preserve affordable project context categories ([728facc](https://github.com/Kehl-io/nestweaver/commit/728faccbe99476a5648f789aa4adb2f8184bb8dc))
+* preserve context workspace read timeout classification ([97227f5](https://github.com/Kehl-io/nestweaver/commit/97227f569840202de8e0abf5eabc26ad8f87c636))
+* preserve exact imported local export forwarding ([ff54c72](https://github.com/Kehl-io/nestweaver/commit/ff54c727e4f930f31e0e7552ce338d3d98e45cb4))
+* preserve Rust associated calls and publisher-owned ranks ([6be7442](https://github.com/Kehl-io/nestweaver/commit/6be7442fd16e7372d8f5a4732ff5690808dc577a))
+* preserve watcher repair debts and isolate freshness probes ([081988e](https://github.com/Kehl-io/nestweaver/commit/081988e7c3402f8675e81fb238aa1d5d982c77b9))
+* reconcile watcher downtime and report local freshness ([35adf47](https://github.com/Kehl-io/nestweaver/commit/35adf471e396e8da648beef215ddb6c94c613bb2))
+* **release:** accept actions app author for changelog dedupe ([155ef0f](https://github.com/Kehl-io/nestweaver/commit/155ef0f75f96c52d28def610b0f73e99a64d9831))
+* repair resolution, indexing recovery and client review regressions ([bdefc33](https://github.com/Kehl-io/nestweaver/commit/bdefc33f60e75c3b402bbd80a4c51df62454f203))
+* require exact public import names during resolution ([dbd0181](https://github.com/Kehl-io/nestweaver/commit/dbd0181b79a06aaa5da00402847c8543f7555e18))
+* resolve delivery regression contracts and test fixtures ([34d01c0](https://github.com/Kehl-io/nestweaver/commit/34d01c07884ba62f5078f5151bb7e25ab64eb8bb))
+* resolve sibling inline Rust types and reuse indexing evidence ([1957620](https://github.com/Kehl-io/nestweaver/commit/195762084374c22515a454b625c7cb2a18c0662e))
+* **resolver:** avoid donating receiver types to composed expressions ([c45dae1](https://github.com/Kehl-io/nestweaver/commit/c45dae1ce5695693675deddc3cef2bbe6300931a))
+* **resolver:** preserve direct parent type constructor calls ([fc45647](https://github.com/Kehl-io/nestweaver/commit/fc4564704d1caf51e902d3a2a3422d13aff01711))
+* restore exact receiver provenance and complete tool summaries ([c3f72db](https://github.com/Kehl-io/nestweaver/commit/c3f72db1f5de8c68bd8574d18196cce0a5eaf4b1))
+* restore precise callers and complete MCP note access ([5afa781](https://github.com/Kehl-io/nestweaver/commit/5afa781b953bedf487e827c7576936984226bc75))
+* retain Rust macro method receiver evidence ([5e987c9](https://github.com/Kehl-io/nestweaver/commit/5e987c91a7172b87ea7c32d8c5829b2b03276895))
+* retain UI listener when pidfile ownership is unknown ([30571a8](https://github.com/Kehl-io/nestweaver/commit/30571a87b4c06b7c48e716ea451c2fcab37125bc))
+* satisfy required lint checks for user-pain delivery ([134bf37](https://github.com/Kehl-io/nestweaver/commit/134bf377f15afcbd67b1b29efa98f44fdbb4b1fb))
+* **store:** narrow project membership compatibility errors ([20ca125](https://github.com/Kehl-io/nestweaver/commit/20ca12591d87b9c15d9a390c0a220cc20d721b44))
+* **ui:** isolate detail inspection and scope repository catalogs ([6447d2d](https://github.com/Kehl-io/nestweaver/commit/6447d2d559fd713601c45c34b48b35c0b06e3194))
+* **ui:** preserve scenes and refresh scoped evidence after commits ([ed246e3](https://github.com/Kehl-io/nestweaver/commit/ed246e3be17eec9f7559d0f7e3e3cdd404fc98a1))
+* **ui:** retain active lens during Impact refresh ([21bfa17](https://github.com/Kehl-io/nestweaver/commit/21bfa17b06d2a21ea69e0505d7f48723034f10b6))
+* **web:** bound workspace retrieval before hydration ([eb2c415](https://github.com/Kehl-io/nestweaver/commit/eb2c4158bc7ee6d6a8ecbf9beb87a6e0fd9489b7))
+* **web:** classify native context interruptions as retryable timeouts ([e2e74c9](https://github.com/Kehl-io/nestweaver/commit/e2e74c924d647e1fc271e82942584a960f185eb5))
+* **web:** preserve authoritative scoped top rankings ([e27892b](https://github.com/Kehl-io/nestweaver/commit/e27892b5c98c4abc9f9630261bb160fb3937e6ef))
+
 ## [11.0.1](https://github.com/Kehl-io/nestweaver/compare/v11.0.0...v11.0.1) (2026-10-05)
 
 
