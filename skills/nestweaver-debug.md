@@ -43,10 +43,9 @@ was **0/15**, and it remains poor on C++.
 
 ## Before you trust a ranking
 
-NestWeaver 9.0.0 bumped `RESOLVER_GENERATION` to 4, so **any graph indexed by an
-earlier release is ranked over stale edges** until it is re-indexed
-(`nestweaver index --repo <path> --force` — plain `index` is incremental and
-does nothing on a repo already at HEAD).
+`RESOLVER_GENERATION` is 9. A repo is stale when its recorded generation is not exactly 9.
+Re-index with `nestweaver index --repo <path> --force` — plain `index` is incremental and
+does nothing on a repo already at HEAD.
 
 `stale_check` DOES tell you: as of 9.0.0 it consults the resolver-generation
 sidecar and reports `status: "outdated_resolver"` with `resolver_stale: true`,
@@ -54,10 +53,18 @@ exiting 2. (It compared indexed SHA against git HEAD only through 8.x, which is
 what this section used to say.)
 
 `hub_nodes`, `bridge_nodes`, `repo_map`, `ranking rank` and hub-level
-`get_summary` disclose it via `rankings_stale` / `stale_repos`. `clusters`,
-`blast_radius`, `affected_tests`, `pr_impact` and PPR-backed context disclose
-nothing, so on those the absence of a staleness field is not evidence of
-freshness.
+`get_summary` disclose it via `rankings_stale` / `stale_repos`.
+
+`blast_radius` and `pr-impact` do not stay silent. A generation-stale repo that
+owns a changed file, or is linked to one, degrades the run: `status` is at
+least `degraded`, `gate_state` is `degraded-unknown`, and `resolver_stale_repos`
+lists those repos. An unrelated stale repo is a
+`resolver-generation-stale-unrelated` warning and does not degrade the answer.
+`affected-tests` refuses instead of returning a selection when the indexed repo
+for the diff is generation-stale (`refused: true`, exit 2). When the analysis
+does run, the same relevant-versus-unrelated split is on the result.
+`clusters`, PPR-backed context, and the web UI still do not disclose resolver
+staleness, so a missing field there is not evidence of freshness.
 
 **`stale_repos` does not mean the same thing everywhere.** On `stale_check`'s
 `--json` it is behind-HEAD git URLs, and the generation-stale set is the

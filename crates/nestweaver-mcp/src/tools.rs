@@ -795,8 +795,8 @@ fn all_tool_schemas() -> Vec<Value> {
     // `MUTATING_TOOLS` for exactly the reason the cache decoration above is
     // derived from `CACHEABLE_TOOLS`: the classification already exists and is
     // already authoritative (it is the gate both the HTTP surface and the
-    // daemon's gRPC surface enforce), so hand-annotating 42 schemas would
-    // create a second list that drifts the moment a seventh mutator lands.
+    // daemon's gRPC surface enforce), so hand-annotating every schema would
+    // create a second list that drifts the moment another mutator lands.
     // Zero of the 42 declared any annotation, which made `prune_stale`
     // indistinguishable from `brain_status` on the wire.
     //
@@ -2161,7 +2161,7 @@ mod tool_schema_validation_tests {
         assert_eq!(
             schemas.len(),
             43,
-            "registry must contain exactly 42 schemas"
+            "registry must contain exactly 43 schemas"
         );
         let names: BTreeSet<&str> = schemas
             .iter()

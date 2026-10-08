@@ -42,12 +42,17 @@ directly, so a path-deboosted test/mirror file is still pinned.
 
 ## Before you trust a ranking
 
-NestWeaver 9.0.0 bumped `RESOLVER_GENERATION` to 4, so **any graph indexed by an
-earlier release is ranked over stale edges** until it is re-indexed
+`RESOLVER_GENERATION` is 9. **Any graph whose recorded generation is not exactly 9
+is ranked over stale edges** until it is re-indexed
 (`nestweaver index --repo <path> --force` — plain `index` is incremental and a
 no-op on a repo already at HEAD). `stale_check` reports it as
 `status: "outdated_resolver"` with `resolver_stale: true`. `hub_nodes`,
 `bridge_nodes`, `repo_map`, `ranking rank` and `get_summary` at hub level
-disclose it via `rankings_stale` / `stale_repos`; `clusters`, `blast_radius`,
-`generate-guide`, PPR-backed context and the web UI disclose nothing, so on
-those the absence of a staleness field is not evidence of freshness.
+disclose it via `rankings_stale` / `stale_repos`. `blast_radius` and
+`pr-impact` degrade when a generation-stale repo owns a changed file or is
+linked to one (`resolver_stale_repos`, `status` at least `degraded`,
+`gate_state: degraded-unknown`). An unrelated stale repo is only a
+`resolver-generation-stale-unrelated` warning. `affected-tests` refuses, exit 2,
+when the indexed repo for the diff is generation-stale. `clusters`,
+`generate-guide`, PPR-backed context, and the web UI still disclose nothing, so
+on those a missing staleness field is not evidence of freshness.

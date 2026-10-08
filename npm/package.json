@@ -7,8 +7,10 @@
   },
   "files": [
     "bin/",
+    "media/",
     "README.md"
   ],
+  "homepage": "https://docs.nestweaver.kehl.io",
   "os": [
     "darwin",
     "linux"
@@ -38,6 +40,5 @@
     "type": "git",
     "url": "git+https://github.com/Kehl-io/nestweaver.git"
   },
-  "license": "MIT",
-  "homepage": "https://github.com/Kehl-io/nestweaver"
+  "license": "MIT"
 }

@@ -29,7 +29,7 @@ To clean up everything: `rm -rf /private/tmp/nestweaver-bench/`
 | Metric | NestWeaver command | Description |
 |--------|-------------------|-------------|
 | Fresh indexing | `nestweaver index` | Time to parse + build knowledge graph from scratch |
-| NL query latency | `nestweaver search` | Text/semantic search response time |
+| NL query latency | `nestweaver search` | Symbol-name substring lookup. Semantic questions are `nestweaver investigate` |
 | Exact query latency | `nestweaver context` | Structural graph traversal from seed symbols |
 | Token savings | `token_savings.py` | NestWeaver response tokens vs raw source file tokens |
 
@@ -87,5 +87,5 @@ Token savings: `(1 - response_tokens / raw_tokens) * 100`
 
 ### Query types
 
-- **NL queries** ("process scheduler", "hooks implementation") → routed to `nestweaver search` for text/semantic matching
+- **NL queries** ("process scheduler", "hooks implementation") → routed to `nestweaver search` for symbol-name substring matching. A semantic question belongs on `nestweaver investigate`.
 - **Exact queries** ("createElement", "Schedule") → routed to `nestweaver context` for structural graph traversal from seed symbols

@@ -1,7 +1,7 @@
 # NestWeaver `context` Command — Design Spec
 
 **Date:** 2026-05-22
-**Status:** Approved
+**Status:** Superseded by the shipped CLI. The interface below is the current contract.
 
 ---
 
@@ -11,8 +11,9 @@ The `context` command extracts a task-focused subgraph from the knowledge graph
 using Personalized PageRank. Given seed inputs (symbol names, UIDs, or file
 paths), it returns only the structurally relevant symbols ranked by relevance.
 
-Pure graph math — no AI, no network calls, no token budgeting. The agent
-controls how much it reads.
+`--limit` caps the walk (default 500). `--token-budget` then truncates that list (1–16000). `--intent` accepts `find-definition`, `understand-architecture`, `analyze-impact`, `general-context`, and `project-context`, plus their short aliases.
+
+Name seeds are exact-name resolution. Several symbols with the same name are refused as ambiguous. A natural-language question belongs on `nestweaver investigate`.
 
 ---
 
@@ -25,6 +26,9 @@ Arguments:
   [SEEDS]...  Symbol names, UIDs, or file paths (not required when --feature is set)
 
 Options:
+  --intent <INTENT>   find-definition, understand-architecture, analyze-impact, general-context, project-context
+  --limit <N>         Maximum connected nodes (1-5000, default 500). Applied before --token-budget
+  --token-budget <N>  Approximate output cap (1-16000). Applied after --limit
   --feature <NAME>    Resolve a declared feature bundle from the instance config
   --config <PATH>     Path to instance config file (required with --feature)
   --json              Output as JSON
@@ -35,7 +39,7 @@ Input auto-detection (for positional seeds):
 - Starts with `sym:` or `repo:` → UID (direct graph lookup)
 - Contains `/` or has a source file extension (`.js`, `.ts`, `.py`, `.java`,
   `.go`) → file path (seed from all symbols in that file)
-- Otherwise → symbol name (BM25 search, use top matches as seeds)
+- Otherwise → symbol name (exact match; ambiguous names are refused)
 
 When `--feature <name>` is given, the feature's `entry_points` are resolved as
 seeds across all repos listed in the feature bundle. See the

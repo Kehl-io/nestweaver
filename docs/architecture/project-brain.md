@@ -1,8 +1,10 @@
 # NestWeaver Project Brain — Architecture & Design
 
-**Status:** Design draft
+**Status:** Historical design draft. Not the shipped CLI.
 **Date:** 2026-05-23
 **Audience:** Engineers implementing the system; reviewers evaluating the approach
+
+The shipped commands are `nestweaver brain add <path>`, default database `./nestweaver.lbug`, and `nestweaver daemon` / `nestweaver brain watch`. This draft's onboarding contract (`brain pause`, `index-vault`, `sources.toml`, `nestweaverd`, `brain add --no-watch`) was not what shipped.
 **Companion doc:** `docs/plans/markdown-brain-extension.md` (effort and phasing plan)
 
 ---
