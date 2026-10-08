@@ -42,8 +42,8 @@ directly, so a path-deboosted test/mirror file is still pinned.
 
 ## Before you trust a ranking
 
-NestWeaver 9.0.0 bumped `RESOLVER_GENERATION` to 4, so **any graph indexed by an
-earlier release is ranked over stale edges** until it is re-indexed
+`RESOLVER_GENERATION` is 9. **Any graph whose recorded generation is not exactly 9
+is ranked over stale edges** until it is re-indexed
 (`nestweaver index --repo <path> --force` — plain `index` is incremental and a
 no-op on a repo already at HEAD). `stale_check` reports it as
 `status: "outdated_resolver"` with `resolver_stale: true`. `hub_nodes`,

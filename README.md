@@ -96,6 +96,7 @@ Opt-in usage tracking that learns from agent query patterns to improve PPR ranki
 
 ```sh
 # From a source checkout (requires Rust 1.85+)
+eval "$(scripts/fetch-lbug-source.sh)"
 cargo install --locked --path .
 
 # Index a repository into an explicit database
@@ -356,7 +357,7 @@ nestweaver connect grpcs://nestweaver.internal:9378 --token "$NESTWEAVER_AUTH_TO
 | 9378 | gRPC | Query API (TCP + TLS) |
 | 9379 | HTTP | MCP-over-HTTP (AI agents) + `/webhook` + `/admin/api/*` + Prometheus `/metrics` |
 
-In server mode the daemon serves Prometheus `/metrics` on the MCP HTTP port (9379) — gRPC port + 1, inheriting the `--bind` IP. The same metrics are also exposed on 9377 when the web UI is running (`nestweaver ui`).
+In server mode the daemon serves Prometheus `/metrics` on the MCP HTTP port (9379) — gRPC port + 1, inheriting the `--bind` IP. `nestweaver ui` serves the same route on its own listen port (default 3000). The macOS app serves the UI, including `/metrics`, on 9377.
 
 ### Docker
 
@@ -409,6 +410,7 @@ support select CPU for `auto`.
 
 ```sh
 # After cloning the source repository (Rust 1.85+)
+eval "$(scripts/fetch-lbug-source.sh)"
 cargo install --locked --path .
 ```
 
@@ -432,6 +434,7 @@ Download a pre-built CLI archive and its matching `.sha256` file from [GitHub Re
 ```sh
 git clone https://github.com/Kehl-io/nestweaver.git
 cd nestweaver
+eval "$(scripts/fetch-lbug-source.sh)"
 cargo install --locked --path .
 # On macOS with Metal embeddings:
 # cargo install --locked --path . --features metal
@@ -448,11 +451,11 @@ The first build compiles LadybugDB from source and may take several minutes.
 
 | Command | Description |
 |---------|-------------|
-| `index` | Parse and index a repository (auto-detects repo root from `.git`). Use `--name` to set a custom repo name for multi-repo setups. Indexing does NOT refresh trigrams implicitly — the daemon's reconcile loop owns that (see `[indexing] trigram_reconcile_interval`). `--with-trigrams` forces an inline refresh for one run (CI, scripted reindex), `--no-trigrams` suppresses it (and conflicts with `--rebuild-trigrams`), `--rebuild-trigrams` forces a full rebuild. The direct `--local` path still refreshes inline, since no daemon exists there to drain for it. |
+| `index` | Parse and index a repository (auto-detects repo root from `.git`). Use `--name` to set a custom repo name for multi-repo setups. Indexing does NOT refresh trigrams implicitly — the daemon's reconcile loop owns that (see `[indexing] trigram_reconcile_interval`). `--with-trigrams` forces an inline refresh for one run (CI, scripted reindex), `--no-trigrams` suppresses it (and conflicts with `--rebuild-trigrams`), `--rebuild-trigrams` forces a full rebuild. A direct index (no daemon) refreshes trigrams only with `--with-trigrams`, `--rebuild-trigrams`, or `[indexing] with_trigrams = true`. |
 | `watch` | Live re-indexing via filesystem watcher with debouncing. Runs daemon-side (no instance config required; unsafe roots are denylisted); `--force` replaces an existing watcher. Incremental reindex preserves CALLS/IMPORTS edges (reverse dependents are re-resolved) and reports per-file failures instead of dying |
 | `watch-stop` | Stop the daemon's active watcher. The watcher slot is global and the daemon keeps no liveness check on the CLI that registered it, so a watch killed without a clean shutdown (SIGKILL, or a closed terminal) leaves the slot occupied and every later watch refused; this releases it without restarting the daemon |
 | `context` | Get task-focused context via PPR (supports `--intent` for tuned retrieval) |
-| `search` | Full-text search across indexed symbols and notes |
+| `search` | Symbol-name substring lookup. Notes and BM25 full-text search are `brain search` |
 | `symbol` | Look up a symbol by name and display its metadata |
 | `impact` | Trace the blast radius of a symbol through the dependency graph (fails closed on unknown/foreign UIDs, exit 2; `--depth` 1–15; `--limit` 1–1000, default 50 on **both** routes — `--no-daemon` used to be uncapped and now matches the daemon, so a symbol with more than 1000 depth-1 dependents has rows unreachable at any limit; pruning by impact-score threshold or depth is disclosed, `--min-score 0` opts out) |
 | `blast-radius` | Assess blast radius for a set of changed files; reports `gate_state`/`status` and blind spots, and never reports `ok` for a truncated traversal |
@@ -481,12 +484,12 @@ The first build compiles LadybugDB from source and may take several minutes.
 | `brain list` | List all registered vaults |
 | `brain status` | Show vault counts, per-vault staleness, and index health |
 | `brain watch` | Watch vaults for changes and re-index automatically. `--force` adopts an existing watcher registration instead of being refused by it — the vault counterpart of `watch --force` |
-| `brain refresh` | Force re-index of all registered vaults |
+| `brain refresh` | Force a full re-index of one vault directory (`nestweaver brain refresh <path>`) |
 | `brain remove` | Remove a vault from the brain (cascade-deletes nodes; does not touch files on disk) |
 | `brain stale-check` | Check whether the indexed graph reflects reality (also available top-level as `stale-check`). **Exit 0** nothing to do · **1** the check itself failed · **2** at least one repo needs re-indexing. Gate CI on `any_needs_reindex` (or exit 2) — that is the actionable union of `stale`, `incomplete`, and `missing`. A repo that indexed successfully with **zero eligible source files** is `no_indexable_content` (human: `empty`) and does **not** pin exit 2. `any_stale` / `is_stale` mean *behind HEAD* specifically |
 | `brain diff <repo>` | Show what changed in the graph since a commit (`--since-sha <sha>`, `--limit` 1–1000 default 50, `--json`, `--db`, `--config`). Local repos only; the CLI twin of the MCP `brain_diff` tool |
 | `brain reindex-search` | Rebuild the Tantivy BM25 search index from current graph state |
-| `brain broken-links` | List wikilinks with ambiguous or low-confidence targets, with suggested fixes |
+| `brain broken-links` | List unresolved and ambiguous wikilinks, with suggested fixes. `low_confidence` is a separate list of links that did resolve and is not counted in `total` |
 | `brain orphans` | List notes with zero inbound and zero outbound wikilinks |
 | `brain topic-clusters` | Detect topic clusters via Louvain-style local-moving community detection over note wikilinks |
 | `brain tag-graph` | Show a tag's note count and co-occurring tags (or dump the full tag graph) |
@@ -912,7 +915,7 @@ nestweaver suggest-links --db ./all.lbug
 nestweaver context --feature device-pairing --config ./nestweaver-instance.toml --db ./all.lbug
 ```
 
-**Runtime-configurable defaults** — set `[limits]` in your instance config to override the built-in pagination default (50) for all MCP tools and CLI commands:
+**Runtime-configurable defaults** — set `[limits]` in your instance config to replace each command's own builtin page size. Unset, `search` uses 10, `brain search` uses 20, and `brain context` uses 30. Other tools use 50 (`DEFAULT_RESULT_LIMIT`):
 
 ```toml
 [limits]

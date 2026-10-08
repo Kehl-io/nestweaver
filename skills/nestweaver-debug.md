@@ -43,10 +43,9 @@ was **0/15**, and it remains poor on C++.
 
 ## Before you trust a ranking
 
-NestWeaver 9.0.0 bumped `RESOLVER_GENERATION` to 4, so **any graph indexed by an
-earlier release is ranked over stale edges** until it is re-indexed
-(`nestweaver index --repo <path> --force` — plain `index` is incremental and
-does nothing on a repo already at HEAD).
+`RESOLVER_GENERATION` is 9. A repo is stale when its recorded generation is not exactly 9.
+Re-index with `nestweaver index --repo <path> --force` — plain `index` is incremental and
+does nothing on a repo already at HEAD.
 
 `stale_check` DOES tell you: as of 9.0.0 it consults the resolver-generation
 sidecar and reports `status: "outdated_resolver"` with `resolver_stale: true`,

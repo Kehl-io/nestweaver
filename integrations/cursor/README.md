@@ -21,7 +21,7 @@ Restart Cursor to detect the MCP server.
 
 ## Lite Mode
 
-Cursor has a 40-tool cap across all MCP servers. NestWeaver uses `--lite` mode by default for Cursor, exposing 6 core tools: `brain_context`, `brain_search`, `brain_impact`, `brain_status`, `brain_guide`, `detect_changes`.
+The checked-in template includes `--lite`, and `nestweaver setup cursor` writes the same flag. The six tools are `brain_context`, `brain_search`, `brain_impact`, `brain_status`, `brain_guide`, and `detect_changes`.
 
 NestWeaver advertises **43** tools (registry:
 `all_tool_schemas_undecorated()` in `crates/nestweaver-mcp/src/tools.rs`; read it

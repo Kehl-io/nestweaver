@@ -569,7 +569,7 @@ pub fn generate_guide_with_tools(
     out.push_str(
         "| \"Orient on unfamiliar topic\" | MCP `investigate` | One-call map with summaries |\n",
     );
-    out.push_str("| Ask a QUESTION, not a name | MCP `investigate` | `context` / `brain context` resolve a NAME (symbol name, UID, note title, tag, or file path); a natural-language question resolves to nothing there. `investigate` falls back to full-text search. Both not-found errors now say this and print a pasteable `nestweaver investigate <q>` |\n");
+    out.push_str("| Ask a QUESTION, not a name | MCP `investigate` | `nestweaver context` resolves a symbol name, UID, or repo-relative file path. `brain context` resolves a title, tag, symbol name, or UID, and does not expand file paths. A question goes to `investigate` |\n");
     out.push_str("| \"Find text by regex\" | MCP `regex_search` | Searches indexed text — NOT `grep`/`rg` |\n");
     out.push_str(
         "| \"Is the index stale?\" | MCP `stale_check` | Per-repo SHA-vs-HEAD **and** resolver generation |\n",
@@ -789,7 +789,7 @@ pub fn generate_skill_with_tools(
     out.push_str("- **`brain_search`** for locating named symbols or notes by keyword — direct BM25/substring lookup, cheaper than a full PPR walk. Returns both notes and code symbols in one call (per-kind cap, not cross-kind), so you never need separate queries.\n");
     out.push_str("- **`brain_context`** for structural exploration — when you need to understand what's *connected* to something, not just find it by name.\n");
     out.push_str("- **`get_summary`** for token-efficient overviews of files or clusters — much cheaper than reading entire source files.\n");
-    out.push_str("- **Name vs. question.** `context` / `brain context` (and their MCP tools) resolve a NAME: a UID, symbol name, note title, tag, or repo-relative file path. A natural-language question is not a name and resolves to nothing there — no partial credit. Send a QUESTION to `investigate`, which falls back to full-text search. Both not-found errors state this and emit a copy-pasteable `nestweaver investigate <q>` you can run directly.\n\n");
+    out.push_str("- **Name vs. question.** `nestweaver context` / `code_context` resolve a symbol name, UID, or repo-relative file path. `brain_context` / `nestweaver brain context` resolve a note title, tag, symbol name, or UID, and do not expand file paths. A natural-language question is not a name — send it to `investigate`.\n\n");
 
     out.push_str("### Progressive disclosure with investigate\n\n");
     out.push_str("Use the investigate chain to go from broad orientation to precise source without reading every file upfront:\n\n");
@@ -814,7 +814,7 @@ pub fn generate_skill_with_tools(
         "- **Symbol name**: `seeds: [\"handleLogin\"]` — best for function-level exploration\n",
     );
     out.push_str("- **Multiple seeds**: `seeds: [\"auth\", \"session\", \"token\"]` — broader topic exploration; PPR walks from all seeds simultaneously\n");
-    out.push_str("- **File path**: `seeds: [\"src/auth/handler.rs\"]` — all symbols in that file become seeds\n");
+    out.push_str("- **File path**: seed `code_context` or `nestweaver context` with a repo-relative path such as `src/auth/handler.rs`. `brain_context` does not expand file paths.\n");
     out.push_str("- **Note title**: `seeds: [\"Architecture Decision Records\"]` — anchor on vault knowledge\n");
     out.push_str("- **Tag**: `seeds: [\"#deprecated\"]` — all nodes with that tag\n");
     out.push_str("- **UID**: `seeds: [\"sym:abc123\"]` — precise node targeting when you have a UID from a previous call\n\n");
