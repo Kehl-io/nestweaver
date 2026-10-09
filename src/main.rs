@@ -1485,6 +1485,7 @@ fn report_ambiguous_name_payload(
     symbol: &str,
     payload: &serde_json::Value,
     json: bool,
+    stderr: &mut impl std::io::Write,
 ) -> anyhow::Result<(i32, Option<String>)> {
     if json {
         print_json_payload(payload)?;
@@ -1499,22 +1500,28 @@ fn report_ambiguous_name_payload(
         } else {
             "symbols"
         };
-        eprint_best_effort(format_args!(
-            "Ambiguous: '{}' matches {} {entity}:",
-            symbol,
-            candidates.len()
-        ))?;
+        eprint_best_effort_to(
+            stderr,
+            format_args!(
+                "Ambiguous: '{}' matches {} {entity}:",
+                symbol,
+                candidates.len()
+            ),
+        )?;
         for c in &candidates {
-            eprint_best_effort(format_args!(
-                "  {} [{}] {}:{}",
-                c.get("uid").and_then(|v| v.as_str()).unwrap_or("?"),
-                c.get("kind").and_then(|v| v.as_str()).unwrap_or("Symbol"),
-                c.get("file_path").and_then(|v| v.as_str()).unwrap_or("?"),
-                c.get("start_line").and_then(|v| v.as_u64()).unwrap_or(0)
-            ))?;
+            eprint_best_effort_to(
+                stderr,
+                format_args!(
+                    "  {} [{}] {}:{}",
+                    c.get("uid").and_then(|v| v.as_str()).unwrap_or("?"),
+                    c.get("kind").and_then(|v| v.as_str()).unwrap_or("Symbol"),
+                    c.get("file_path").and_then(|v| v.as_str()).unwrap_or("?"),
+                    c.get("start_line").and_then(|v| v.as_u64()).unwrap_or(0)
+                ),
+            )?;
         }
         if let Some(note) = payload.get("note").and_then(|v| v.as_str()) {
-            eprint_best_effort(note)?;
+            eprint_best_effort_to(stderr, note)?;
         }
     }
     Ok((EXIT_AMBIGUOUS, None))
@@ -15368,8 +15375,20 @@ mod broken_pipe_policy_tests {
             }
         }
 
-        assert!(eprint_best_effort_to(&mut ClosedPipe, "candidate").is_ok());
-        assert_eq!(EXIT_AMBIGUOUS, 3);
+        let payload = serde_json::json!({
+            "status": "ambiguous",
+            "entity_kind": "symbol",
+            "candidates": [{
+                "uid": "sym:first",
+                "kind": "Function",
+                "file_path": "src/first.rs",
+                "start_line": 1
+            }]
+        });
+        let result =
+            report_ambiguous_name_payload("duplicateName", &payload, false, &mut ClosedPipe)
+                .expect("closed stderr should not fail an ambiguous report");
+        assert_eq!(result, (EXIT_AMBIGUOUS, None));
     }
 }
 
@@ -17027,7 +17046,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Err(error) => return Err(error),
             };
             if payload_is_ambiguous(&payload) {
-                return report_ambiguous_name_payload(&symbol, &payload, json);
+                return report_ambiguous_name_payload(
+                    &symbol,
+                    &payload,
+                    json,
+                    &mut std::io::stderr().lock(),
+                );
             }
             if json {
                 print_json_payload(&payload)?;
@@ -17120,7 +17144,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Err(error) => return Err(error),
             };
             if payload_is_ambiguous(&payload) {
-                return report_ambiguous_name_payload(&target, &payload, json);
+                return report_ambiguous_name_payload(
+                    &target,
+                    &payload,
+                    json,
+                    &mut std::io::stderr().lock(),
+                );
             }
             if json {
                 print_json_payload(&payload)?;
@@ -17219,7 +17248,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 return Ok((EXIT_NOT_FOUND, None));
             }
             if payload_is_ambiguous(&payload) {
-                return report_ambiguous_name_payload(&target, &payload, json);
+                return report_ambiguous_name_payload(
+                    &target,
+                    &payload,
+                    json,
+                    &mut std::io::stderr().lock(),
+                );
             }
             if json {
                 print_json_payload(&payload)?;
@@ -17324,7 +17358,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Err(error) => return Err(error),
             };
             if payload_is_ambiguous(&payload) {
-                return report_ambiguous_name_payload(&name_or_uid, &payload, json);
+                return report_ambiguous_name_payload(
+                    &name_or_uid,
+                    &payload,
+                    json,
+                    &mut std::io::stderr().lock(),
+                );
             }
             if json {
                 print_json_payload(&payload)?;
@@ -19950,7 +19989,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
 
             if payload_is_ambiguous(&payload) {
-                return report_ambiguous_name_payload(&symbol, &payload, json);
+                return report_ambiguous_name_payload(
+                    &symbol,
+                    &payload,
+                    json,
+                    &mut std::io::stderr().lock(),
+                );
             }
 
             if json {

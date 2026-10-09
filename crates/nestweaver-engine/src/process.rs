@@ -409,14 +409,15 @@ fn adopt_blast_verdict(
     impact.status = impact.status.max(verdict.status);
     for notification in &verdict.notifications {
         if notification.descriptor == "changed-file-no-symbols"
-            && let Some(existing) = impact
-                .notifications
-                .iter_mut()
-                .find(|existing| existing.descriptor == notification.descriptor)
+            && let Some(path) = changed_file_no_symbols_path(&notification.message)
+            && let Some(existing) = impact.notifications.iter_mut().find(|existing| {
+                existing.descriptor == notification.descriptor
+                    && changed_file_no_symbols_path(&existing.message) == Some(path)
+            })
         {
             // The process pass has the generic coverage warning; blast radius
             // has the user-facing diagnostic for the same file. Keep the more
-            // specific version instead of printing both for one finding.
+            // specific version for that file instead of printing both.
             *existing = notification.clone();
             continue;
         }
@@ -433,6 +434,15 @@ fn adopt_blast_verdict(
     } else {
         GateState::DegradedUnknown
     };
+}
+
+fn changed_file_no_symbols_path(message: &str) -> Option<&str> {
+    let message = message
+        .strip_prefix("changed source file ")
+        .unwrap_or(message);
+    message
+        .split_once(" has no indexed symbols (new file, stale index, or path drift)")
+        .map(|(path, _)| path)
 }
 
 fn deadline_notification() -> Notification {
@@ -830,27 +840,38 @@ mod tests {
     #[test]
     fn detect_changes_impact_marks_unknown_source_incomplete() {
         let store = GraphStore::in_memory().expect("in_memory store");
-        let impact = detect_changes_impact(&store, &["nonexistent/file.rs".to_string()], 10, None)
-            .expect("detect_changes_impact");
+        let changed_files = [
+            "nonexistent/a.rs".to_string(),
+            "nonexistent/b.rs".to_string(),
+        ];
+        let impact =
+            detect_changes_impact(&store, &changed_files, 10, None).expect("detect_changes_impact");
         assert_eq!(impact.risk, RiskLevel::Unknown);
         // nw-544: the empty store also trips blast radius's `index-empty`.
         assert_eq!(impact.status, AnalysisStatus::Degraded);
         assert_eq!(impact.gate_state, GateState::DegradedUnknown);
-        assert!(
-            impact
-                .notifications
-                .iter()
-                .any(|n| n.descriptor == "changed-file-no-symbols")
-        );
+        let notices = impact
+            .notifications
+            .iter()
+            .filter(|n| n.descriptor == "changed-file-no-symbols")
+            .collect::<Vec<_>>();
         assert_eq!(
-            impact
-                .notifications
-                .iter()
-                .filter(|n| n.descriptor == "changed-file-no-symbols")
-                .count(),
-            1,
-            "the process and blast-radius passes should disclose this file once"
+            notices.len(),
+            2,
+            "each changed source file needs one notice"
         );
+        for file in &changed_files {
+            let matching = notices
+                .iter()
+                .filter(|notice| notice.message.contains(file))
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1, "expected one notice for {file}");
+            assert!(
+                matching[0].message.starts_with("changed source file "),
+                "the blast-radius diagnostic should replace the generic process notice: {}",
+                matching[0].message
+            );
+        }
         assert!(impact.affected_symbols.is_empty());
         assert!(impact.affected_processes.is_empty());
     }

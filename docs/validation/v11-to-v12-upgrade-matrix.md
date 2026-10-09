@@ -27,9 +27,13 @@ fixtures are not implicitly supported.
    both fixture queries.
 5. Save and inspect a v12 snapshot. Restore it to a separate directory and
    repeat the stale-check/reindex/query sequence.
-6. Attempt to open the migrated database with v11.0.1. Confirm refusal and
-   verify the database bytes are unchanged. Restore the pre-upgrade snapshot to
-   return to v11; do not use the migrated database for rollback.
+6. Retain the pre-upgrade snapshot for rollback. Reopen that snapshot with v11
+   only; do not try to roll back by opening the migrated database with v11.
+
+The migrated-database-with-v11 refusal check is not part of this completed
+procedure: it remains unvalidated against the released v11 binary, as recorded
+in the matrix above. Interrupted reindex recovery and macOS artifact behavior
+are also unvalidated.
 
 The checked run for this backlog item used verified v11.0.1 and v12.0.0 Linux
 x86_64 artifacts. It created and indexed a v11 fixture, upgraded/reindexed it
