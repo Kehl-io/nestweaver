@@ -27,8 +27,9 @@ fixtures are not implicitly supported.
    both fixture queries.
 5. Save and inspect a v12 snapshot. Restore it to a separate directory and
    repeat the stale-check/reindex/query sequence.
-6. Retain the pre-upgrade snapshot for rollback. Reopen that snapshot with v11
-   only; do not try to roll back by opening the migrated database with v11.
+6. Rollback guidance (not exercised in this run): if rollback is needed, restore
+   the pre-upgrade snapshot and use that copy with v11. Never open the migrated
+   database with v11.
 
 The migrated-database-with-v11 refusal check is not part of this completed
 procedure: it remains unvalidated against the released v11 binary, as recorded
