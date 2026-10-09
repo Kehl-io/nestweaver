@@ -8383,7 +8383,7 @@ impl NestWeaverDaemon for DaemonService {
                                 trigram_refresh = Some(trigram_refresh_detail(&stats));
                                 let _ = tx.blocking_send(Ok(IndexProgress {
                                     message: format!(
-                                        "Trigram refresh: {} scope(s) refreshed, {} unchanged; {} node(s) changed; {} posting(s) added, {} deleted in {} ms{}{}.",
+                                        "Trigram refresh: {} scope(s) refreshed, {} unchanged; {} node(s) affected (added, changed, or deleted); {} posting(s) added, {} deleted in {} ms{}{}.",
                                         stats.scopes_refreshed,
                                         stats.scopes_unchanged,
                                         stats.nodes_added + stats.nodes_changed + stats.nodes_deleted,
@@ -30471,6 +30471,11 @@ external_model = "unavailable-test-model"
             .expect("WatchVault RPC")
             .into_inner();
         assert!(response.ok, "watcher failed to start: {}", response.message);
+        assert_eq!(
+            state.store.list_notes(None).unwrap().len(),
+            1,
+            "WatchVault must not report success until the initial vault scan has indexed its seed note"
+        );
 
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {

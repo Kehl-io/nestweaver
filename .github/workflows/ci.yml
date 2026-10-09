@@ -24,6 +24,10 @@ on:
         description: Run the scoped backlog benchmarks on an isolated runner
         type: boolean
         default: false
+      coverage_validation:
+        description: Run instrumented workspace coverage on this branch
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -994,10 +998,9 @@ jobs:
     timeout-minutes: 180
     needs: changes
     # Coverage is informational (uploads an lcov artifact; nothing gates on it)
-    # and is the single slowest job — a full *instrumented* recompile that can't
-    # reuse the build job's cache. Run it only when landing on main, not on
-    # every PR, so it's off the PR critical path.
-    if: github.event_name == 'push' && needs.changes.outputs.rust == 'true'
+    # and is the single slowest job — a full *instrumented* recompile. Keep it
+    # main-only by default, with an explicit branch validation for backlog work.
+    if: (github.event_name == 'push' && needs.changes.outputs.rust == 'true') || (github.event_name == 'workflow_dispatch' && inputs.coverage_validation)
     runs-on: ubuntu-latest
     steps:
       - name: Free disk space
@@ -1018,7 +1021,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
-          key: coverage
+          shared-key: coverage-deps-only
+          cache-targets: false
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@2af88edc33c2d5ff8a473fd1c5ab83052f77afee # cargo-llvm-cov 2026-09-02
         with:
@@ -1043,13 +1047,10 @@ jobs:
             target/**/build/openssl-sys-*/out
           key: native-${{ runner.os }}-${{ runner.arch }}-${{ steps.nativekey.outputs.key }}
           restore-keys: native-${{ runner.os }}-${{ runner.arch }}-
-      - name: Build (triggers lbug prebuilt download on first run)
-        # --locked: fail the PR (not the release build) when Cargo.lock drifts
-        # out of sync with the manifests.
+      - name: Record coverage runner disk before instrumentation
         run: |
-          cargo build --locked -p nestweaver-store 2>/dev/null || true
-          sleep 2
-          cargo build --locked --tests --features ci-direct-tests
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP" | tee -a "$GITHUB_STEP_SUMMARY"
+          du -sh target 2>/dev/null | tee -a "$GITHUB_STEP_SUMMARY" || true
       - name: Generate coverage
         # --workspace so coverage reflects the whole codebase, not just the root
         # package (see the Tests step note on the [package]+[workspace] manifest).
@@ -1061,6 +1062,11 @@ jobs:
           # the escape hatch now says so.
           NESTWEAVER_ALLOW_NO_DAEMON: "1"
           NESTWEAVER_NO_DAEMON: "1"
+      - name: Report coverage runner disk usage
+        if: always()
+        run: |
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP" | tee -a "$GITHUB_STEP_SUMMARY"
+          du -sh target 2>/dev/null | tee -a "$GITHUB_STEP_SUMMARY" || true
       - name: Upload coverage artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

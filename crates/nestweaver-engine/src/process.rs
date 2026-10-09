@@ -408,6 +408,18 @@ fn adopt_blast_verdict(
     impact.risk = verdict.risk_level;
     impact.status = impact.status.max(verdict.status);
     for notification in &verdict.notifications {
+        if notification.descriptor == "changed-file-no-symbols"
+            && let Some(existing) = impact
+                .notifications
+                .iter_mut()
+                .find(|existing| existing.descriptor == notification.descriptor)
+        {
+            // The process pass has the generic coverage warning; blast radius
+            // has the user-facing diagnostic for the same file. Keep the more
+            // specific version instead of printing both for one finding.
+            *existing = notification.clone();
+            continue;
+        }
         let already = impact.notifications.iter().any(|existing| {
             existing.descriptor == notification.descriptor
                 && existing.message == notification.message
@@ -829,6 +841,15 @@ mod tests {
                 .notifications
                 .iter()
                 .any(|n| n.descriptor == "changed-file-no-symbols")
+        );
+        assert_eq!(
+            impact
+                .notifications
+                .iter()
+                .filter(|n| n.descriptor == "changed-file-no-symbols")
+                .count(),
+            1,
+            "the process and blast-radius passes should disclose this file once"
         );
         assert!(impact.affected_symbols.is_empty());
         assert!(impact.affected_processes.is_empty());

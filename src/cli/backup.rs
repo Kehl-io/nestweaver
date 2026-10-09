@@ -81,8 +81,11 @@ pub(crate) fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                 eprintln!("  Version:      {}", resp.nestweaver_version);
                 eprintln!("  Repos:        {}", resp.repo_count);
                 eprintln!("  Symbols:      {}", resp.symbol_count);
-                eprintln!("  DB size:      {}", format_bytes(resp.db_size_bytes));
-                eprintln!("  Compressed:   {}", format_bytes(resp.total_compressed));
+                eprintln!("  Graph DB file: {}", format_bytes(resp.db_size_bytes));
+                eprintln!(
+                    "  Snapshot archive: {}",
+                    format_bytes(resp.total_compressed)
+                );
                 return Ok(EXIT_SUCCESS);
             }
 
@@ -98,10 +101,14 @@ pub(crate) fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
             eprintln!("  Tier:         {}", m.tier);
             eprintln!("  Version:      {}", m.nestweaver_version);
             eprintln!("  Created:      {}", m.created_at);
-            eprintln!("  DB size:      {}", format_bytes(m.sizes.db));
+            eprintln!("  Graph DB file: {}", format_bytes(m.sizes.db));
             eprintln!(
-                "  Uncompressed: {}",
+                "  Snapshot contents: {}",
                 format_bytes(m.sizes.total_uncompressed)
+            );
+            eprintln!(
+                "  Snapshot archive: {}",
+                format_bytes(m.sizes.total_compressed)
             );
             eprintln!(
                 "  Write pause:  {}ms",
@@ -134,11 +141,11 @@ pub(crate) fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
             println!("  Repos:        {}", manifest.repo_count);
             println!("  Symbols:      {}", manifest.symbol_count);
             println!(
-                "  Uncompressed: {}",
+                "  Snapshot contents: {}",
                 format_bytes(manifest.sizes.total_uncompressed)
             );
             println!(
-                "  Compressed:   {}",
+                "  Snapshot archive: {}",
                 format_bytes(manifest.sizes.total_compressed)
             );
             println!("  Checksums:    {} file(s)", manifest.checksums.len());

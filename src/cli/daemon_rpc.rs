@@ -728,9 +728,8 @@ pub(crate) fn pattern_count_from_tool_json(
 /// the signal in-band via the `stale_index` field instead.
 pub(crate) fn print_stale_index_note() {
     println!(
-        "(one or more trigram scopes are stale — only dirty scopes were scanned; refresh with \
-         `index --with-trigrams`, or set `[indexing] with_trigrams = true` so indexing keeps \
-         them fresh)"
+        "(one or more trigram scopes are stale — dirty scopes were scanned safely; if this \
+         persists, rebuild with `index --with-trigrams`)"
     );
 }
 
