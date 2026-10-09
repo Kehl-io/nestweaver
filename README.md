@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <a href="https://nestweaver.kehl.io">Website</a> · <a href="https://docs.nestweaver.kehl.io">Docs</a> · <a href="https://github.com/Kehl-io/nestweaver/releases">Releases</a>
+  <a href="https://nestweaver.kehl.io">Website</a> · <a href="https://docs.nestweaver.kehl.io">Docs</a> · <a href="https://www.npmjs.com/package/nestweaver">npm</a> · <a href="https://github.com/Kehl-io/nestweaver/releases">Releases</a>
 </p>
 
 <p align="center">
@@ -384,7 +384,7 @@ The `.app` bundle gives you a menubar status icon, Metal GPU acceleration (~5x f
 
 ### All platforms (CLI)
 
-Install the release-matched CLI wrapper from npm:
+Install the release-matched CLI wrapper from [npm](https://www.npmjs.com/package/nestweaver):
 
 ```sh
 npm install --global nestweaver
