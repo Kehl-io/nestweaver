@@ -712,11 +712,11 @@ jobs:
             target/**/build/openssl-sys-*/out
           key: native-${{ runner.os }}-${{ runner.arch }}-${{ steps.nativekey.outputs.key }}
           restore-keys: native-${{ runner.os }}-${{ runner.arch }}-
-      - name: Validate lockfile and warm native dependencies
-        run: |
-          cargo metadata --locked --no-deps --format-version 1 >/dev/null
-          cargo build --locked -p nestweaver-store 2>/dev/null || true
-          sleep 2
+      - name: Validate lockfile
+        # Build dependencies with the real CLI/workspace feature graph below.
+        # A standalone store build omits cc/parallel, producing another native
+        # build-script configuration and paying for a redundant C++ build.
+        run: cargo metadata --locked --no-deps --format-version 1 >/dev/null
       - name: Build CLI
         run: |
           cargo build --locked
@@ -940,11 +940,11 @@ jobs:
             target/**/build/openssl-sys-*/out
           key: native-${{ runner.os }}-${{ runner.arch }}-${{ steps.nativekey.outputs.key }}
           restore-keys: native-${{ runner.os }}-${{ runner.arch }}-
-      - name: Validate lockfile and warm native dependencies
-        run: |
-          cargo metadata --locked --no-deps --format-version 1 >/dev/null
-          cargo build --locked -p nestweaver-store 2>/dev/null || true
-          sleep 2
+      - name: Validate lockfile
+        # Build dependencies with the real CLI/workspace feature graph below.
+        # A standalone store build omits cc/parallel, producing another native
+        # build-script configuration and paying for a redundant C++ build.
+        run: cargo metadata --locked --no-deps --format-version 1 >/dev/null
       - name: Record real model cache baseline (nw-483)
         # nw-483: a test can still reach EmbedConfig::default() /
         # EmbeddingConfig::default() and download into the REAL platform
