@@ -1,5 +1,14 @@
 # Changelog
 
+## [12.0.1](https://github.com/Kehl-io/nestweaver/compare/v12.0.0...v12.0.1) (2026-10-10)
+
+
+### Bug Fixes
+
+* address review feedback on backlog PR ([3cfb793](https://github.com/Kehl-io/nestweaver/commit/3cfb7935271e7434edefb72fc4f121c2668fa0eb))
+* address unblocked NestWeaver backlog ([b723640](https://github.com/Kehl-io/nestweaver/commit/b723640c63ea2b91e828784f3a96b167ef928a43))
+* address unblocked NestWeaver backlog ([054f4ac](https://github.com/Kehl-io/nestweaver/commit/054f4aced5496343b2e2e054fad55f52b3428412))
+
 ## [12.0.0](https://github.com/Kehl-io/nestweaver/compare/v11.0.1...v12.0.0) (2026-10-07)
 
 
