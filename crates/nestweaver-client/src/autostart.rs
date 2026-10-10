@@ -851,6 +851,8 @@ fn daemon_start_command(
     db_path: &Path,
     config_path: Option<&Path>,
     usage: DaemonUsage,
+    real_db_under_temp_root: bool,
+    ephemeral_timeout_secs: u64,
 ) -> std::process::Command {
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["daemon", "--db"]).arg(db_path).arg("start");
@@ -869,11 +871,11 @@ fn daemon_start_command(
     // either, it is the strongest signal available, and it applies
     // regardless of where `db_path` lives.
     if matches!(usage, DaemonUsage::OneShot)
-        && !caller_asserts_real_db_under_temp_root()
+        && !real_db_under_temp_root
         && nestweaver_daemon::lifecycle::is_temp_db_path(db_path)
     {
         cmd.arg("--idle-timeout")
-            .arg(ephemeral_idle_timeout_secs().to_string());
+            .arg(ephemeral_timeout_secs.to_string());
     }
     if let Some(cfg) = config_path {
         cmd.arg("--config").arg(cfg);
@@ -933,7 +935,14 @@ fn spawn_daemon(
 
     debug!(exe = %exe.display(), db = %db_path.display(), "spawning daemon");
 
-    let mut cmd = daemon_start_command(&exe, db_path, config_path, usage);
+    let mut cmd = daemon_start_command(
+        &exe,
+        db_path,
+        config_path,
+        usage,
+        caller_asserts_real_db_under_temp_root(),
+        ephemeral_idle_timeout_secs(),
+    );
     spawn_lock.configure_child_handoff(&mut cmd)?;
     let mut child = cmd
         .stdin(std::process::Stdio::null())
@@ -1714,6 +1723,8 @@ credential_method = "gh"
             Path::new("/tmp/brain.lbug"),
             None,
             DaemonUsage::OneShot,
+            false,
+            DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS,
         );
 
         assert!(
@@ -1724,20 +1735,8 @@ credential_method = "gh"
         );
     }
 
-    /// Serialises every test that sets, clears or depends on
-    /// `NESTWEAVER_REAL_DB_UNDER_TEMP_ROOT`. The process environment is
-    /// shared by the whole test binary, so a test that sets the override
-    /// while another builds a command for a temp path makes that other test
-    /// lose its `--idle-timeout`.
-    fn real_db_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     #[test]
     fn daemon_start_command_forwards_db_and_config() {
-        let _env = real_db_env_lock();
         // `tempfile::tempdir()` lives under the OS temp root by construction,
         // so this exercises the SAME `is_temp_db_path(db)` branch nw-088 leg
         // (2) added — the assertion below expects `--idle-timeout` for
@@ -1750,6 +1749,8 @@ credential_method = "gh"
             &db,
             Some(Path::new("/tmp/nestweaver-instance.toml")),
             DaemonUsage::OneShot,
+            false,
+            DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS,
         );
         spawn_lock.configure_child_handoff(&mut command).unwrap();
 
@@ -1794,8 +1795,14 @@ credential_method = "gh"
             !nestweaver_daemon::lifecycle::is_temp_db_path(db),
             "precondition: this path must not be classified as ephemeral"
         );
-        let command =
-            daemon_start_command(Path::new("/opt/nestweaver"), db, None, DaemonUsage::OneShot);
+        let command = daemon_start_command(
+            Path::new("/opt/nestweaver"),
+            db,
+            None,
+            DaemonUsage::OneShot,
+            false,
+            DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS,
+        );
         let args = command
             .get_args()
             .map(std::ffi::OsStr::to_owned)
@@ -1813,7 +1820,6 @@ credential_method = "gh"
     /// path itself is unambiguously temp-shaped.
     #[test]
     fn daemon_start_command_honours_the_real_db_under_temp_root_escape() {
-        let _env = real_db_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("brain.lbug");
         assert!(
@@ -1821,16 +1827,14 @@ credential_method = "gh"
             "precondition: this path must be classified as ephemeral"
         );
 
-        // SAFETY: `real_db_env_lock` is held, so no other test reads or
-        // writes the override while it is set.
-        unsafe { std::env::set_var(REAL_DB_UNDER_TEMP_ROOT_ENV, "1") };
         let command = daemon_start_command(
             Path::new("/opt/nestweaver"),
             &db,
             None,
             DaemonUsage::OneShot,
+            true,
+            DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS,
         );
-        unsafe { std::env::remove_var(REAL_DB_UNDER_TEMP_ROOT_ENV) };
 
         let args = command
             .get_args()
@@ -1850,17 +1854,16 @@ credential_method = "gh"
     /// `--idle-timeout` for temp paths altogether, override or not.
     #[test]
     fn daemon_start_command_still_shortens_the_timeout_without_the_escape() {
-        let _env = real_db_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("brain.lbug");
 
-        // SAFETY: `real_db_env_lock` is held.
-        unsafe { std::env::remove_var(REAL_DB_UNDER_TEMP_ROOT_ENV) };
         let command = daemon_start_command(
             Path::new("/opt/nestweaver"),
             &db,
             None,
             DaemonUsage::OneShot,
+            false,
+            DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS,
         );
 
         let args = command
@@ -1881,6 +1884,36 @@ credential_method = "gh"
         );
     }
 
+    #[test]
+    fn daemon_start_command_uses_the_supplied_ephemeral_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let command = daemon_start_command(
+            Path::new("/opt/nestweaver"),
+            &db,
+            None,
+            DaemonUsage::OneShot,
+            false,
+            17,
+        );
+        let args = command
+            .get_args()
+            .map(std::ffi::OsStr::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "daemon",
+                "--db",
+                db.to_str().unwrap(),
+                "start",
+                "--idle-timeout",
+                "17"
+            ]
+            .map(std::ffi::OsString::from)
+        );
+    }
+
     /// nw-088 leg (2) FOLLOW-UP (this fix). A LONG-RUNNING caller must NOT
     /// get the shortened idle-timeout no matter how temp-shaped `db_path`
     /// is — the exact case `ui --db <path under /tmp>` hits, and the exact
@@ -1888,7 +1921,6 @@ credential_method = "gh"
     /// one-shot `index` against the same path.
     #[test]
     fn daemon_start_command_never_shortens_the_timeout_for_a_long_running_caller() {
-        let _env = real_db_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("brain.lbug");
         assert!(
@@ -1898,13 +1930,13 @@ credential_method = "gh"
              the path stopped looking temporary"
         );
 
-        // SAFETY: `real_db_env_lock` is held.
-        unsafe { std::env::remove_var(REAL_DB_UNDER_TEMP_ROOT_ENV) };
         let command = daemon_start_command(
             Path::new("/opt/nestweaver"),
             &db,
             None,
             DaemonUsage::LongRunning,
+            false,
+            DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS,
         );
 
         let args = command
@@ -1926,16 +1958,16 @@ credential_method = "gh"
     /// the timeout for temp paths at all, `DaemonUsage` or not.
     #[test]
     fn daemon_start_command_still_shortens_the_timeout_for_a_one_shot_caller_on_the_same_path() {
-        let _env = real_db_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("brain.lbug");
 
-        unsafe { std::env::remove_var(REAL_DB_UNDER_TEMP_ROOT_ENV) };
         let command = daemon_start_command(
             Path::new("/opt/nestweaver"),
             &db,
             None,
             DaemonUsage::OneShot,
+            false,
+            DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS,
         );
 
         let args = command

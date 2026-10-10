@@ -2583,7 +2583,12 @@ pub(crate) fn run_brain(
                 if let Some(result_json) = context_response {
                     if payload_is_ambiguous(&result_json) {
                         let label = seeds.first().map(String::as_str).unwrap_or("seed");
-                        return report_ambiguous_name_payload(label, &result_json, json);
+                        return report_ambiguous_name_payload(
+                            label,
+                            &result_json,
+                            json,
+                            &mut std::io::stderr().lock(),
+                        );
                     }
                     let source = hybrid_source_label(&result_json);
                     // Read the daemon's disclosure BEFORE `from_value` narrows

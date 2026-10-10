@@ -1485,6 +1485,7 @@ fn report_ambiguous_name_payload(
     symbol: &str,
     payload: &serde_json::Value,
     json: bool,
+    stderr: &mut impl std::io::Write,
 ) -> anyhow::Result<(i32, Option<String>)> {
     if json {
         print_json_payload(payload)?;
@@ -1499,22 +1500,28 @@ fn report_ambiguous_name_payload(
         } else {
             "symbols"
         };
-        eprintln!(
-            "Ambiguous: '{}' matches {} {entity}:",
-            symbol,
-            candidates.len()
-        );
+        eprint_best_effort_to(
+            stderr,
+            format_args!(
+                "Ambiguous: '{}' matches {} {entity}:",
+                symbol,
+                candidates.len()
+            ),
+        )?;
         for c in &candidates {
-            eprintln!(
-                "  {} [{}] {}:{}",
-                c.get("uid").and_then(|v| v.as_str()).unwrap_or("?"),
-                c.get("kind").and_then(|v| v.as_str()).unwrap_or("Symbol"),
-                c.get("file_path").and_then(|v| v.as_str()).unwrap_or("?"),
-                c.get("start_line").and_then(|v| v.as_u64()).unwrap_or(0)
-            );
+            eprint_best_effort_to(
+                stderr,
+                format_args!(
+                    "  {} [{}] {}:{}",
+                    c.get("uid").and_then(|v| v.as_str()).unwrap_or("?"),
+                    c.get("kind").and_then(|v| v.as_str()).unwrap_or("Symbol"),
+                    c.get("file_path").and_then(|v| v.as_str()).unwrap_or("?"),
+                    c.get("start_line").and_then(|v| v.as_u64()).unwrap_or(0)
+                ),
+            )?;
         }
         if let Some(note) = payload.get("note").and_then(|v| v.as_str()) {
-            eprintln!("{note}");
+            eprint_best_effort_to(stderr, note)?;
         }
     }
     Ok((EXIT_AMBIGUOUS, None))
@@ -15270,8 +15277,55 @@ fn run_with_stdout_boundary<T>(operation: impl FnOnce() -> T) -> Result<T, Stdou
         Ok(value) => Ok(value),
         Err(payload) => match payload.downcast::<StdoutWriteFailure>() {
             Ok(stdout) => Err(*stdout),
+            Err(payload) if panic_was_broken_pipe(payload.as_ref()) => Err(StdoutWriteFailure(
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "output pipe closed"),
+            )),
             Err(payload) => std::panic::resume_unwind(payload),
         },
+    }
+}
+
+fn panic_was_broken_pipe(payload: &(dyn std::any::Any + Send)) -> bool {
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied())
+        .unwrap_or_default();
+    message.contains("failed printing to stderr: Broken pipe")
+        || message.contains("failed printing to stdout: Broken pipe")
+}
+
+fn suppress_broken_pipe_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if !panic_was_broken_pipe(info.payload()) {
+            previous(info);
+        }
+    }));
+}
+
+fn write_stderr(message: impl std::fmt::Display) -> std::io::Result<()> {
+    write_stderr_to(&mut std::io::stderr().lock(), message)
+}
+
+fn eprint_best_effort(message: impl std::fmt::Display) -> anyhow::Result<()> {
+    eprint_best_effort_to(&mut std::io::stderr().lock(), message).map_err(Into::into)
+}
+
+fn write_stderr_to(
+    writer: &mut impl std::io::Write,
+    message: impl std::fmt::Display,
+) -> std::io::Result<()> {
+    writeln!(writer, "{message}")
+}
+
+fn eprint_best_effort_to(
+    writer: &mut impl std::io::Write,
+    message: impl std::fmt::Display,
+) -> std::io::Result<()> {
+    match write_stderr_to(writer, message) {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
     }
 }
 
@@ -15296,6 +15350,45 @@ mod broken_pipe_policy_tests {
                 expected_normal
             );
         }
+    }
+
+    #[test]
+    fn boundary_treats_stderr_broken_pipe_as_normal_termination() {
+        let outcome = run_with_stdout_boundary(|| {
+            std::panic::panic_any(String::from(
+                "failed printing to stderr: Broken pipe (os error 32)",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(outcome.0.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn closed_stderr_does_not_replace_the_ambiguous_result_with_a_write_error() {
+        struct ClosedPipe;
+        impl std::io::Write for ClosedPipe {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+        }
+
+        let payload = serde_json::json!({
+            "status": "ambiguous",
+            "entity_kind": "symbol",
+            "candidates": [{
+                "uid": "sym:first",
+                "kind": "Function",
+                "file_path": "src/first.rs",
+                "start_line": 1
+            }]
+        });
+        let result =
+            report_ambiguous_name_payload("duplicateName", &payload, false, &mut ClosedPipe)
+                .expect("closed stderr should not fail an ambiguous report");
+        assert_eq!(result, (EXIT_AMBIGUOUS, None));
     }
 }
 
@@ -15459,20 +15552,34 @@ fn main() {
     // failures use `resume_unwind`, so they never invoke the panic hook;
     // unrelated panics retain normal behavior and resume unwinding.
 
+    // `eprintln!` panics on EPIPE. Suppress only that panic's default report
+    // so the boundary below can convert it to the same successful termination
+    // used for a closed stdout pipe.
+    suppress_broken_pipe_panic_hook();
     let run_result = match run_with_stdout_boundary(|| run(cli, &out)) {
         Ok(result) => result,
         Err(error) if error.0.kind() == std::io::ErrorKind::BrokenPipe => {
             process::exit(EXIT_SUCCESS)
         }
         Err(error) => {
-            eprintln!("{error}");
+            if let Err(write_error) = write_stderr(error)
+                && write_error.kind() == std::io::ErrorKind::BrokenPipe
+            {
+                process::exit(EXIT_SUCCESS);
+            }
             process::exit(EXIT_ERROR)
         }
     };
     let exit_code = match run_result {
         Ok((code, summary)) => {
-            if let (true, Some(s)) = (show_stats, summary) {
-                eprintln!("stats: {s}");
+            if let (true, Some(s)) = (show_stats, summary)
+                && let Err(error) = write_stderr(format_args!("stats: {s}"))
+            {
+                process::exit(if error.kind() == std::io::ErrorKind::BrokenPipe {
+                    EXIT_SUCCESS
+                } else {
+                    EXIT_ERROR
+                });
             }
             code
         }
@@ -15481,7 +15588,13 @@ fn main() {
                 if stdout.kind() == std::io::ErrorKind::BrokenPipe {
                     process::exit(EXIT_SUCCESS);
                 }
-                eprintln!("{stdout}");
+                if let Err(error) = write_stderr(stdout) {
+                    process::exit(if error.kind() == std::io::ErrorKind::BrokenPipe {
+                        EXIT_SUCCESS
+                    } else {
+                        EXIT_ERROR
+                    });
+                }
                 process::exit(EXIT_ERROR);
             }
             // nw-660: a schema violation is the caller's input mistake, so it
@@ -15492,7 +15605,13 @@ fn main() {
                 EXIT_ERROR
             };
             let report = into_diagnostic(e);
-            eprintln!("{report:?}");
+            if let Err(error) = write_stderr(format_args!("{report:?}")) {
+                process::exit(if error.kind() == std::io::ErrorKind::BrokenPipe {
+                    EXIT_SUCCESS
+                } else {
+                    EXIT_ERROR
+                });
+            }
             code
         }
     };
@@ -16927,7 +17046,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Err(error) => return Err(error),
             };
             if payload_is_ambiguous(&payload) {
-                return report_ambiguous_name_payload(&symbol, &payload, json);
+                return report_ambiguous_name_payload(
+                    &symbol,
+                    &payload,
+                    json,
+                    &mut std::io::stderr().lock(),
+                );
             }
             if json {
                 print_json_payload(&payload)?;
@@ -17020,7 +17144,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Err(error) => return Err(error),
             };
             if payload_is_ambiguous(&payload) {
-                return report_ambiguous_name_payload(&target, &payload, json);
+                return report_ambiguous_name_payload(
+                    &target,
+                    &payload,
+                    json,
+                    &mut std::io::stderr().lock(),
+                );
             }
             if json {
                 print_json_payload(&payload)?;
@@ -17119,7 +17248,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 return Ok((EXIT_NOT_FOUND, None));
             }
             if payload_is_ambiguous(&payload) {
-                return report_ambiguous_name_payload(&target, &payload, json);
+                return report_ambiguous_name_payload(
+                    &target,
+                    &payload,
+                    json,
+                    &mut std::io::stderr().lock(),
+                );
             }
             if json {
                 print_json_payload(&payload)?;
@@ -17224,7 +17358,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Err(error) => return Err(error),
             };
             if payload_is_ambiguous(&payload) {
-                return report_ambiguous_name_payload(&name_or_uid, &payload, json);
+                return report_ambiguous_name_payload(
+                    &name_or_uid,
+                    &payload,
+                    json,
+                    &mut std::io::stderr().lock(),
+                );
             }
             if json {
                 print_json_payload(&payload)?;
@@ -19850,7 +19989,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
 
             if payload_is_ambiguous(&payload) {
-                return report_ambiguous_name_payload(&symbol, &payload, json);
+                return report_ambiguous_name_payload(
+                    &symbol,
+                    &payload,
+                    json,
+                    &mut std::io::stderr().lock(),
+                );
             }
 
             if json {
@@ -22020,16 +22164,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     .get("candidates")
                                     .and_then(|v| serde_json::from_value(v.clone()).ok())
                                     .unwrap_or_default();
-                                eprintln!(
+                                eprint_best_effort(format_args!(
                                     "Ambiguous: '{}' matches {} symbols:",
                                     name_or_uid,
                                     candidates.len()
-                                );
+                                ))?;
                                 for c in &candidates {
-                                    eprintln!(
+                                    eprint_best_effort(format_args!(
                                         "  {} [{}] {}:{}",
                                         c.uid, c.kind, c.file_path, c.start_line
-                                    );
+                                    ))?;
                                 }
                             }
                             return Ok((EXIT_AMBIGUOUS, None));
@@ -22115,13 +22259,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&candidates)?);
                     } else {
-                        eprintln!(
+                        eprint_best_effort(format_args!(
                             "Ambiguous: '{}' matches {} symbols:",
                             name_or_uid,
                             candidates.len()
-                        );
+                        ))?;
                         for c in &candidates {
-                            eprintln!("  {} [{}] {}:{}", c.uid, c.kind, c.file_path, c.start_line);
+                            eprint_best_effort(format_args!(
+                                "  {} [{}] {}:{}",
+                                c.uid, c.kind, c.file_path, c.start_line
+                            ))?;
                         }
                     }
                     Ok((EXIT_AMBIGUOUS, None))
