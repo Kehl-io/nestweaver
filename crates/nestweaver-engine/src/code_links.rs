@@ -1542,14 +1542,37 @@ repos = ["file:///fixture/repo"]
     fn plant_many_old_links(fx: &Fixture, count: usize) {
         let note = note_uid_of(&fx.store, "a.md");
         let symbol = fx.store.list_all_symbols_lite().unwrap().remove(0).0;
+        // This fixture exercises the purge, not the live-watcher insertion
+        // path. Bulk-load the same duplicate edges: UNWIND/MATCH/CREATE took
+        // tens of minutes on CI before the migration assertion even ran.
+        let csv = fx._dir.path().join("old-links.csv");
+        let row = format!(
+            "\"{}\",\"{}\",0.6,name-match\n",
+            note.replace('"', "\"\""),
+            symbol.replace('"', "\"\"")
+        );
+        std::fs::write(&csv, row.repeat(count)).unwrap();
+        let path = csv
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('\'', "\\'");
         let conn = fx.store.begin_transaction().unwrap();
-        for chunk in (0..count).collect::<Vec<_>>().chunks(10_000) {
-            let rows: Vec<(&str, &str, f32, &str)> = chunk
-                .iter()
-                .map(|_| (note.as_str(), symbol.as_str(), 0.6, "name-match"))
-                .collect();
-            GraphStore::batch_insert_note_to_symbol_edges_on(&conn, &rows).unwrap();
-        }
+        let edge_count = || {
+            let mut rows = conn
+                .query("MATCH ()-[r:REFERENCES_CODE_NOTE_TO_SYMBOL]->() RETURN count(r)")
+                .unwrap();
+            rows.next().unwrap()[0]
+                .to_string()
+                .parse::<usize>()
+                .unwrap()
+        };
+        let original_count = edge_count();
+        conn.query(&format!(
+            "COPY REFERENCES_CODE_NOTE_TO_SYMBOL FROM '{path}' \
+                 (PARALLEL=FALSE, DELIM=',', QUOTE='\"', ESCAPE='\"', HEADER=false)"
+        ))
+        .unwrap();
+        assert_eq!(edge_count(), original_count + count);
         fx.store.commit_transaction(&conn).unwrap();
     }
 
@@ -1565,7 +1588,7 @@ repos = ["file:///fixture/repo"]
         let at_relink = std::cell::Cell::new(None);
         let report = CodeLinkReconciler::new(CrossDomainConfig::default())
             .reconcile(&fx.store, None, &|| {
-                if edges(&fx.store).is_empty() {
+                if !fx.store.has_references_code_edges().unwrap() {
                     at_relink.set(Some(fx.store.graph_generation()));
                     return true;
                 }

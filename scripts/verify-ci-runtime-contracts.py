@@ -37,6 +37,19 @@ def first_cargo_command(section):
 
 
 class RuntimeContracts(unittest.TestCase):
+    def test_native_dependencies_use_the_acceptance_build_shape(self):
+        # A store-only prebuild changes host dependency feature unification
+        # (notably cc/parallel) and recompiles the native build-script graph.
+        # The acceptance commands already build every dependency they need.
+        for name, first_step in (('build-and-check', 'Build CLI'),
+                                 ('daemon-tests', 'Daemon-named tests (skipped in the main job)')):
+            lane = job(CI, name)
+            self.assertIn('cargo metadata --locked --no-deps', lane)
+            self.assertNotRegex(lane, r'cargo build[^\n]*-p nestweaver-store')
+            self.assertEqual(first_cargo_command(lane),
+                             lane.index(step(lane, first_step)) +
+                             first_cargo_command(step(lane, first_step)))
+
     def test_standard_artifact_staged_before_internal_compile(self):
         build = job(CI, 'build-and-check')
         standard = step(build, 'Build CLI')
