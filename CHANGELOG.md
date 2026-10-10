@@ -1,5 +1,13 @@
 # Changelog
 
+## [12.0.2](https://github.com/Kehl-io/nestweaver/compare/v12.0.1...v12.0.2) (2026-10-10)
+
+
+### Performance Improvements
+
+* **ci:** avoid duplicate native builds and speed migration fixtures ([5c01603](https://github.com/Kehl-io/nestweaver/commit/5c01603b8203487bcd069133384c06393fd0cb0e))
+* **ci:** avoid duplicate native builds and speed migration fixtures ([c7f0cdf](https://github.com/Kehl-io/nestweaver/commit/c7f0cdfd4c6ddbf6b13d14ffb38a6482006b6058))
+
 ## [12.0.1](https://github.com/Kehl-io/nestweaver/compare/v12.0.0...v12.0.1) (2026-10-10)
 
 
