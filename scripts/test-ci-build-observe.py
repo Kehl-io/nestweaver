@@ -13,6 +13,27 @@ SCRIPT = Path(__file__).with_name('ci-build-observe.py')
 
 
 class ObservationTests(unittest.TestCase):
+    def test_required_test_rejects_zero_ignored_and_missing_results(self):
+        name = 'server::cache_only'
+        for output, expected in [('running 0 tests', 1),
+                                 (f'test {name} ... ignored', 1),
+                                 (f'test {name}_different ... ok', 1),
+                                 (f'\x1b[32mtest {name} ... ok\x1b[0m', 0)]:
+            with self.subTest(output=output), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                cargo = root / 'cargo'
+                cargo.write_text('#!' + sys.executable + '\nprint(' + repr(output) + ')\n')
+                cargo.chmod(0o755)
+                env = dict(os.environ, PATH=tmp + os.pathsep + os.environ['PATH'],
+                           RUNNER_TEMP=tmp, CARGO_TARGET_DIR=str(root / 'target'))
+                result = subprocess.run([sys.executable, str(SCRIPT), 'probe', '--require-test', name,
+                                         '--', 'cargo', 'test', '--', name, '--exact'],
+                                        env=env, capture_output=True, text=True, timeout=20)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                record = json.loads((root / 'metal-build-evidence/probe.json').read_text())
+                self.assertEqual(record['child_exit_code'], 0)
+                self.assertEqual(record['required_test_passed'], expected == 0)
+
     def test_incomplete_fingerprint_is_evidence_not_a_build_failure(self):
         spec = importlib.util.spec_from_file_location('observe', SCRIPT)
         observe = importlib.util.module_from_spec(spec)

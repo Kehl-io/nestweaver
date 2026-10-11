@@ -36,9 +36,13 @@ mkdir -p "$output"
 cp "$packages" "$output/packages.txt"
 cp "$diff" "$output/input.diff"
 pkg_args=()
+test_pkg_args=()
 while IFS= read -r pkg; do
-  [[ "$pkg" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo 'invalid package name' >&2; exit 1; }
+  [[ "$pkg" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_-]*$ ]] || { echo 'invalid package name' >&2; exit 1; }
   pkg_args+=(-p "$pkg")
+  # Every mutant uses the same selected-package union as prewarm. Otherwise
+  # changing the mutated package also changes dependency feature unification.
+  test_pkg_args+=(--test-package "$pkg")
 done < "$packages"
 filter_args=()
 if [ -n "$filter" ]; then
@@ -87,10 +91,11 @@ PY_CHECK
     remaining=$((seconds - elapsed))
     if [ "$remaining" -gt 0 ]; then
       set +e
-      timeout --signal=INT --kill-after="$kill_grace" "${remaining}s" \
-        cargo-mutants mutants "${pkg_args[@]}" --in-diff "$diff" "${filter_args[@]}" \
+      CARGO_INCREMENTAL=1 timeout --signal=INT --kill-after="$kill_grace" "${remaining}s" \
+        cargo-mutants mutants "${pkg_args[@]}" "${test_pkg_args[@]}" --in-diff "$diff" "${filter_args[@]}" \
           --output "$output" --in-place --build-timeout 300 \
-          --baseline skip --timeout "$test_timeout" --no-shuffle -- --no-fail-fast \
+          --baseline skip --timeout "$test_timeout" --no-shuffle \
+          --test-tool nextest --cargo-test-arg=--fail-fast \
         2>&1 | tee "$output/console.log"
       pipeline_status=("${PIPESTATUS[@]}")
       set -e

@@ -17,6 +17,28 @@ def load(name):
 
 
 class Canary(unittest.TestCase):
+    def test_trace_rejects_package_graph_and_runner_drift(self):
+        helper = load('mutation-canary')
+        packages = ['--package=nestweaver@0.0.0', '--package=nestweaver-canary-sibling@0.0.0']
+        phases = []
+        records = []
+        for phase in ('Build', 'Test'):
+            argv = ['nextest', 'run', *packages] + (['--no-run'] if phase == 'Build' else ['--fail-fast'])
+            phases.append(dict(phase=phase, argv=['/shim/cargo', *argv]))
+            records.append(dict(original_argv=argv, effective_argv=[*argv, '--features', 'ci-direct-tests'],
+                                injected_feature=True))
+        result = dict(verdicts=[dict(phase_results=copy.deepcopy(phases)) for _ in range(2)])
+        helper.check_trace(records, result)
+        for replacement in (['test', *packages], ['nextest', 'run', packages[0]]):
+            altered = copy.deepcopy(result)
+            altered['verdicts'][0]['phase_results'][0]['argv'] = ['/shim/cargo', *replacement]
+            with self.assertRaises(ValueError):
+                helper.check_trace(records, altered)
+        altered = copy.deepcopy(records)
+        altered[0]['injected_feature'] = False
+        with self.assertRaises(ValueError):
+            helper.check_trace(altered, result)
+
     def test_prerequisite_binds_all_runtime_jobs_and_current_attempt(self):
         helper = load('verify-mutation-prerequisite')
         sha = 'a' * 40

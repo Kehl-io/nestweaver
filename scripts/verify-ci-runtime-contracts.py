@@ -32,9 +32,13 @@ def first_cargo_command(section):
     """Offset of the first cargo invocation in a job, ignoring comments."""
     match = re.search(r'^(?!\s*#)[^\n]*?\bcargo (?:build|test|bench|check|clippy|run|llvm-cov|mutants)\b',
                       section, re.M)
-    if match is None:
+    offsets = [match.start()] if match else []
+    helper = 'python3 scripts/prewarm-mutation-build.py'
+    if helper in section:
+        offsets.append(section.index(helper))
+    if not offsets:
         raise AssertionError('job runs no cargo command')
-    return match.start()
+    return min(offsets)
 
 
 class RuntimeContracts(unittest.TestCase):
@@ -64,12 +68,43 @@ class RuntimeContracts(unittest.TestCase):
         metal = job(CI, 'metal-smoke')
         for label in ('metal-cli', 'metal-daemon-contract', 'metal-workspace-units',
                       'metal-daemon-integration-build'):
-            self.assertIn('scripts/ci-build-observe.py ' + label + ' -- cargo ', metal)
+            self.assertIn('scripts/ci-build-observe.py ' + label + ' ', metal)
         self.assertIn('id: metal-cache', metal)
         self.assertIn('steps.metal-cache.outputs.cache-hit', metal)
         self.assertIn('if: always()', step(metal, 'Retain Metal build evidence'))
         self.assertIn('target/cargo-timings', step(metal, 'Retain Metal build evidence'))
         subprocess.run(['python3', str(ROOT / 'scripts/test-ci-build-observe.py')],
+                       check=True, capture_output=True, text=True, timeout=30)
+
+    def test_metal_contract_and_units_share_features_and_execute_the_named_test(self):
+        metal = job(CI, 'metal-smoke')
+        contract = step(metal, 'Verify daemon cache-only contract')
+        units = step(metal, 'Workspace unit tests (macOS portability gate)')
+        self.assertIn('--workspace --lib --features metal,ci-direct-tests', contract)
+        self.assertIn('--features metal,ci-direct-tests --workspace --lib', units)
+        self.assertNotIn('-p nestweaver-daemon', contract)
+        name = 'server::embedding_load_config_tests::daemon_embedding_startup_constructs_cached_model_offline'
+        self.assertIn('--require-test ' + name, contract)
+        self.assertIn('-- ' + name + ' --exact', contract)
+        self.assertLess(metal.index('Standard Metal artifact daemon acceptance'),
+                        metal.index('--workspace --lib --features metal,ci-direct-tests'))
+
+    def test_mutation_prewarm_and_tests_use_the_same_package_union(self):
+        mutations = job(CI, 'mutants')
+        self.assertIn('cargo-nextest@0.9.140', mutations)
+        self.assertIn('scripts/prewarm-mutation-build.py /tmp/pr.pkgs', mutations)
+        self.assertNotIn('for pkg in', step(mutations, 'Warm the -p build shape before the mutation budget starts'))
+        helper = (ROOT / 'scripts/run-mutation-scope.sh').read_text()
+        self.assertIn('test_pkg_args+=(--test-package "$pkg")', helper)
+        self.assertIn('"${pkg_args[@]}" "${test_pkg_args[@]}"', helper)
+        self.assertIn('CARGO_INCREMENTAL=1 timeout', helper)
+        self.assertIn('--test-tool nextest --cargo-test-arg=--fail-fast', helper)
+        self.assertNotIn('--no-fail-fast', helper)
+        self.assertIn('--build-timeout 300', helper)
+        self.assertIn('--budget "$MUTANTS_BUDGET"', mutations)
+        shim = (ROOT / 'scripts/ci-direct-cargo.sh').read_text()
+        self.assertIn('ci-nextest-with-docs.py', shim)
+        subprocess.run(['python3', str(ROOT / 'scripts/test-mutation-build-reuse.py')],
                        check=True, capture_output=True, text=True, timeout=30)
 
     def test_native_dependencies_use_the_acceptance_build_shape(self):
@@ -157,6 +192,10 @@ class RuntimeContracts(unittest.TestCase):
         transform = shim.split('# BEGIN ARGUMENT TRANSFORM', 1)[1].split('\n', 1)[1].split('# END ARGUMENT TRANSFORM', 1)[0]
         transform += 'printf "%s\\0" "${args[@]}"\n'
         cases = [
+            (['nextest', 'run', '--package=nestweaver@1.0.0', '--no-run'],
+             ['nextest', 'run', '--package=nestweaver@1.0.0', '--no-run', '--features', 'ci-direct-tests']),
+            (['nextest', 'run', '-p', 'nestweaver-store', '--fail-fast'],
+             ['nextest', 'run', '-p', 'nestweaver-store', '--fail-fast']),
             (['test', '--package=nestweaver@1.0.0', '--no-run'],
              ['test', '--package=nestweaver@1.0.0', '--no-run', '--features', 'ci-direct-tests']),
             (['test', '-p', 'nestweaver', '--', '--no-fail-fast'],

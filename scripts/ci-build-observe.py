@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record Cargo compile evidence without changing build features or exit status."""
+"""Record Cargo build evidence and optionally require a named test to pass."""
 import json
 import os
 from pathlib import Path
@@ -30,7 +30,14 @@ def snapshot(target):
 def main():
     if len(sys.argv) < 5:
         raise SystemExit('usage: ci-build-observe.py LABEL -- cargo build|test ...')
-    label, separator, *command = sys.argv[1:]
+    label, *arguments = sys.argv[1:]
+    required_test = None
+    if arguments[:1] == ['--require-test']:
+        if len(arguments) < 3:
+            raise SystemExit('missing required test name')
+        required_test = arguments[1]
+        arguments = arguments[2:]
+    separator, *command = arguments
     if separator != '--' or not re.fullmatch(r'[a-z0-9-]+', label):
         raise SystemExit('usage: ci-build-observe.py LABEL -- cargo build|test ...')
     if len(command) < 2 or command[:1] != ['cargo'] or command[1] not in ('build', 'test'):
@@ -42,6 +49,7 @@ def main():
     evidence.mkdir(parents=True, exist_ok=True)
     target = Path(os.environ.get('CARGO_TARGET_DIR', 'target'))
     record = {'command': command, 'before': snapshot(target)}
+    observed_test = False
     for name, probe in (('rustc', ['rustc', '-vV']), ('clang', ['clang', '--version']),
                         ('cmake', ['cmake', '--version']), ('disk', ['df', '-h', '.']),
                         ('target_kib_before', ['du', '-sk', str(target)])):
@@ -69,7 +77,16 @@ def main():
         for line in process.stdout:
             log.write(line)
             print(line, end='', flush=True)
+            plain = re.sub(r'\x1b\[[0-9;]*m', '', line).strip()
+            if required_test and plain == f'test {required_test} ... ok':
+                observed_test = True
         code = process.wait()
+    if required_test:
+        record.update(required_test=required_test, required_test_passed=observed_test,
+                      child_exit_code=code)
+        if code == 0 and not observed_test:
+            print(f'required test did not pass: {required_test}', file=sys.stderr)
+            code = 1
     record.update(seconds=time.monotonic() - start, exit_code=code, after=snapshot(target))
     result = subprocess.run(['du', '-sk', str(target)], capture_output=True, text=True, check=False)
     record['target_kib_after'] = result.stdout + result.stderr
