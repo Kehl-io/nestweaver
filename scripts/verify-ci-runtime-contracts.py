@@ -89,6 +89,17 @@ class RuntimeContracts(unittest.TestCase):
         self.assertLess(metal.index('Standard Metal artifact daemon acceptance'),
                         metal.index('--workspace --lib --features metal,ci-direct-tests'))
 
+    def test_metal_cache_cannot_publish_failed_or_cancelled_builds(self):
+        metal = job(CI, 'metal-smoke')
+        cache = re.search(r'        id: metal-cache\n(.*?)(?=^      - |\Z)',
+                          metal, re.M | re.S)
+        self.assertIsNotNone(cache)
+        self.assertIn('cache-on-failure: false', cache[1])
+        self.assertNotIn('cache-on-failure: true', cache[1])
+        # Isolate from immutable incomplete caches saved under the old key.
+        self.assertIn('shared-key: metal-smoke-complete-v1', cache[1])
+        self.assertNotRegex(cache[1], r'shared-key: metal-smoke\s*$')
+
     def test_mutation_prewarm_and_tests_use_the_same_package_union(self):
         mutations = job(CI, 'mutants')
         self.assertIn('cargo-nextest@0.9.140', mutations)
