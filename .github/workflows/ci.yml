@@ -138,6 +138,8 @@ jobs:
               - 'scripts/verify-release-bundle.sh'
               - 'scripts/verify-release-package.sh'
               - 'scripts/verify-required-ci.sh'
+              - 'scripts/mutation-canary.py'
+              - 'scripts/verify-mutation-prerequisite.py'
               - 'scripts/verify-main-rules.sh'
               - 'scripts/verify-linux-archive.py'
               - 'scripts/verify-release-fault.py'
@@ -1476,6 +1478,7 @@ jobs:
           bash scripts/verify-main-rules.sh --self-test
           python3 scripts/test-verify-release-fault.py
           python3 scripts/test-release-publication-gates.py
+          python3 scripts/test-mutation-canary.py
           python3 scripts/test-changelog-upload.py
           python3 -m unittest discover -s tests/support -p test_isolated_daemon.py -v
           python3 -m unittest discover -s tests/support -p test_release_publication_failure.py -v

@@ -67,6 +67,8 @@ jobs:
               - 'scripts/verify-release-bundle.sh'
               - 'scripts/verify-release-package.sh'
               - 'scripts/verify-required-ci.sh'
+              - 'scripts/mutation-canary.py'
+              - 'scripts/verify-mutation-prerequisite.py'
               - 'scripts/verify-main-rules.sh'
               - 'scripts/verify-linux-archive.py'
               - 'scripts/verify-release-fault.py'
