@@ -10,6 +10,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 CI = (ROOT / '.github/workflows/ci.yml').read_text()
+COVERAGE = (ROOT / '.github/workflows/coverage.yml').read_text()
 RELEASE = (ROOT / '.github/workflows/release-please.yml').read_text()
 
 
@@ -37,6 +38,40 @@ def first_cargo_command(section):
 
 
 class RuntimeContracts(unittest.TestCase):
+    def test_coverage_scheduling_is_independent(self):
+        self.assertNotRegex(CI, r'(?m)^  coverage:')
+        self.assertNotIn('coverage_validation:', CI)
+        self.assertIn('name: Coverage\n', COVERAGE)
+        self.assertIn('branches: [main]', COVERAGE)
+        self.assertIn('workflow_dispatch:', COVERAGE)
+        self.assertIn('group: coverage-${{ github.ref }}', COVERAGE)
+        self.assertIn('paths: [.github/workflows/coverage.yml]', COVERAGE)
+        self.assertNotIn('cancel-in-progress: true', COVERAGE)
+        self.assertNotIn('- coverage\n', job(CI, 'required-ci'))
+        lane = job(COVERAGE, 'coverage')
+        self.assertIn("if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true'", lane)
+        self.assertIn('cache-targets: false', lane)
+        self.assertIn('NESTWEAVER_NO_DAEMON: "1"', lane)
+        self.assertIn('NESTWEAVER_ALLOW_NO_DAEMON: "1"', lane)
+        self.assertIn('--no-fail-fast --lcov --output-path lcov.info -- --skip daemon_', lane)
+        def rust_paths(source):
+            section = source.split('            rust:\n', 1)[1]
+            section = re.split(r'^            \w+:|^  \w[\w-]*:', section, flags=re.M)[0]
+            return set(re.findall(r"- '([^']+)'", section))
+        self.assertEqual(rust_paths(CI), rust_paths(COVERAGE))
+
+    def test_metal_observation_preserves_commands_and_failure_evidence(self):
+        metal = job(CI, 'metal-smoke')
+        for label in ('metal-cli', 'metal-daemon-contract', 'metal-workspace-units',
+                      'metal-daemon-integration-build'):
+            self.assertIn('scripts/ci-build-observe.py ' + label + ' -- cargo ', metal)
+        self.assertIn('id: metal-cache', metal)
+        self.assertIn('steps.metal-cache.outputs.cache-hit', metal)
+        self.assertIn('if: always()', step(metal, 'Retain Metal build evidence'))
+        self.assertIn('target/cargo-timings', step(metal, 'Retain Metal build evidence'))
+        subprocess.run(['python3', str(ROOT / 'scripts/test-ci-build-observe.py')],
+                       check=True, capture_output=True, text=True, timeout=30)
+
     def test_native_dependencies_use_the_acceptance_build_shape(self):
         # A store-only prebuild changes host dependency feature unification
         # (notably cc/parallel) and recompiles the native build-script graph.
@@ -96,7 +131,7 @@ class RuntimeContracts(unittest.TestCase):
         self.assertIn('staged/ci-direct/nestweaver', step(metal, 'Populate model cache on CPU'))
 
     def test_advisory_legacy_builds_enable_feature(self):
-        self.assertIn('cargo llvm-cov --workspace --features ci-direct-tests', job(CI, 'coverage'))
+        self.assertIn('cargo llvm-cov --workspace --features ci-direct-tests', job(COVERAGE, 'coverage'))
         self.assertIn('scripts/ci-direct-cargo.sh', job(CI, 'mutants'))
         self.assertIn('scripts/run-mutation-scope.sh', job(CI, 'mutants'))
 
@@ -189,10 +224,12 @@ class RuntimeContracts(unittest.TestCase):
             self.assertIn(path, rust)
         self.assertIn("'scripts/fetch-lbug-source.sh'", metal)
         for name in ('backlog-performance', 'metal-smoke', 'build-and-check', 'clippy',
-                     'daemon-tests', 'coverage', 'mutants', 'e2e'):
+                     'daemon-tests', 'mutants', 'e2e'):
             section = job(CI, name)
             self.assertLess(section.index('scripts/fetch-lbug-source.sh'),
                             first_cargo_command(section), name)
+        coverage = job(COVERAGE, 'coverage')
+        self.assertLess(coverage.index('scripts/fetch-lbug-source.sh'), first_cargo_command(coverage))
         build = job(RELEASE, 'build')
         self.assertLess(build.index('scripts/fetch-lbug-source.sh'), first_cargo_command(build))
 

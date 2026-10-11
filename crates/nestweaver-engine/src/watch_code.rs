@@ -27,7 +27,7 @@ use crate::index::is_minified_or_bundled;
 use crate::watch_tree::TreeWatch;
 use crate::watcher::{
     RawWatchResult, ShutdownHandle, WatchMutationLease, WatchMutationLeaseFactory,
-    WatchMutationRefused, WatchReceive, event_kind_can_mutate, receive_debounced_paths,
+    WatchMutationRefused, WatchReceive, event_should_be_queued, receive_debounced_paths,
 };
 
 /// Live file-watcher for a code repository. Construct via `new`, then
@@ -376,7 +376,7 @@ impl CodeWatcher {
         let (tx, rx) = std::sync::mpsc::channel::<RawWatchResult>();
         let watcher =
             notify::recommended_watcher(move |result: Result<Event, notify::Error>| match result {
-                Ok(event) if event_kind_can_mutate(&event.kind) => {
+                Ok(event) if event_should_be_queued(&event) => {
                     let _ = tx.send(Ok(event.paths));
                 }
                 Ok(_) => {}

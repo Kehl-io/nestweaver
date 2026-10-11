@@ -751,7 +751,7 @@ impl BrainWatcher {
         let (tx, rx) = std::sync::mpsc::channel::<RawWatchResult>();
         let watcher =
             notify::recommended_watcher(move |result: Result<Event, notify::Error>| match result {
-                Ok(event) if event_kind_can_mutate(&event.kind) => {
+                Ok(event) if event_should_be_queued(&event) => {
                     let _ = tx.send(Ok(event.paths));
                 }
                 Ok(_) => {}
@@ -1929,6 +1929,21 @@ pub(crate) enum WatchReceive {
     Timeout,
     Disconnected,
     Stop,
+}
+
+/// Directory permissions affect watch registration, even without a content
+/// edit. File permission and access events remain filtered to avoid feedback
+/// from parser reads. A backend may classify chmod specifically as Permissions
+/// rather than Any; dropping it strands an unwatchable directory's debt row.
+pub(crate) fn event_should_be_queued(event: &Event) -> bool {
+    event_kind_can_mutate(&event.kind)
+        || (matches!(
+            event.kind,
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Permissions))
+        ) && event
+            .paths
+            .iter()
+            .any(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())))
 }
 
 pub(crate) fn event_kind_can_mutate(kind: &EventKind) -> bool {
@@ -4173,6 +4188,26 @@ mod tests {
              before the age ceiling, not discard them"
         );
         let _ = sender.join();
+    }
+
+    #[test]
+    fn directory_permission_recovery_reaches_watch_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note.md");
+        std::fs::write(&file, "# Note").unwrap();
+        let kind = EventKind::Modify(ModifyKind::Metadata(MetadataKind::Permissions));
+        let event = Event::new(kind).add_path(dir.path().to_path_buf());
+        assert!(
+            event_should_be_queued(&event),
+            "permission recovery must reach TreeWatch::adopt_new_dirs"
+        );
+        assert!(!event_should_be_queued(&Event::new(kind).add_path(file)));
+        assert!(!event_should_be_queued(
+            &Event::new(EventKind::Modify(ModifyKind::Metadata(
+                MetadataKind::AccessTime
+            )))
+            .add_path(dir.path().to_path_buf())
+        ));
     }
 
     #[test]
