@@ -93,38 +93,40 @@ def trace_records(path):
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
-def selected_package(argv):
+def selected_packages(argv):
+    packages = []
     for n, arg in enumerate(argv):
         if arg == '--':
             break
         if arg in ('-p', '--package'):
-            return argv[n+1].split('@')[0]
-        if arg.startswith('--package='):
-            return arg.split('=', 1)[1].split('@')[0]
-    return None
+            packages.append(argv[n+1].split('@')[0])
+        elif arg.startswith('--package='):
+            packages.append(arg.split('=', 1)[1].split('@')[0])
+    return set(packages)
 
 
 def check_trace(records, result):
-    # Join start-only exec traces to authentic successful/failed phase records.
-    phases = set()
+    # Every mutant must compile and test the same union through the guarded shim.
+    phase_count = {'Build': 0, 'Test': 0}
     for verdict in result['verdicts']:
         for phase in verdict['phase_results'] or []:
-            if phase['phase'] not in ('Build', 'Test'):
+            if phase['phase'] not in phase_count:
                 continue
             argv = phase['argv'][1:]
-            package = selected_package(argv)
+            packages = selected_packages(argv)
+            if packages != {ROOT_PACKAGE, SIBLING} or argv[:2] != ['nextest', 'run']:
+                raise ValueError('mutation phase changed its test graph or runner')
             matches = [r for r in records if r['original_argv'] == argv]
             if not matches:
                 raise ValueError('mutation phase did not use the shared wrapper')
             for record in matches:
                 effective = record['effective_argv']
                 before_separator = effective[:effective.index('--')] if '--' in effective else effective
-                injected = 'ci-direct-tests' in before_separator
-                if injected != (package == ROOT_PACKAGE) or record['injected_feature'] != injected:
-                    raise ValueError('incorrect package feature interception')
-            phases.add((package, phase['phase']))
-    if phases != {(p, phase) for p in (ROOT_PACKAGE, SIBLING) for phase in ('Build', 'Test')}:
-        raise ValueError('missing root/sibling actual mutation build/test interception')
+                if 'ci-direct-tests' not in before_separator or not record['injected_feature']:
+                    raise ValueError('missing root feature interception in the package union')
+            phase_count[phase['phase']] += 1
+    if phase_count != {'Build': 2, 'Test': 2}:
+        raise ValueError('missing actual mutation build/test interception')
 
 
 def check_identity(plan, expected):
@@ -166,13 +168,15 @@ def run_cases(evidence):
     env.update(NW_REAL_CARGO=real_cargo, CARGO=str(shim / 'cargo'), PATH=str(shim) + os.pathsep + env['PATH'],
                NESTWEAVER_ALLOW_NO_DAEMON='1')
     versions = {name: subprocess.check_output([exe, '--version'], text=True).strip()
-                for name, exe in [('cargo', real_cargo), ('rustc', 'rustc'), ('cargo-mutants', 'cargo-mutants')]}
+                for name, exe in [('cargo', real_cargo), ('rustc', 'rustc'), ('cargo-mutants', 'cargo-mutants'), ('cargo-nextest', 'cargo-nextest')]}
+    if not versions['cargo-nextest'].startswith('cargo-nextest 0.9.140 '):
+        raise ValueError('expected pinned cargo-nextest 0.9.140')
     if versions['cargo-mutants'] != 'cargo-mutants 27.1.0':
         raise ValueError('unexpected mutation tool version')
     write_json(evidence / 'versions.json', versions)
     executables = {'cargo': real_cargo,
                    'rustc': subprocess.check_output(['rustup', 'which', 'rustc'], text=True).strip(),
-                   'cargo-mutants': shutil.which('cargo-mutants')}
+                   'cargo-mutants': shutil.which('cargo-mutants'), 'cargo-nextest': shutil.which('cargo-nextest')}
     write_json(evidence / 'tools.json', {name: dict(path=str(Path(path).resolve()), sha256=digest(Path(path)))
                                       for name, path in executables.items()})
     run([env['CARGO'], 'generate-lockfile', '--offline'], fixture, env, evidence / 'lockfile.log')
@@ -253,7 +257,7 @@ def run_cases(evidence):
         records = trace_records(inputs / 'wrapper.jsonl')[trace_before:]
         write_json(inputs / 'mutation-trace.json', records)
         if case == 'comment':
-            if any(r['original_argv'][0] in ('test', 'build', 'check', 'rustc') for r in records):
+            if any(r['original_argv'][0] in ('test', 'build', 'check', 'rustc', 'nextest') for r in records):
                 raise ValueError('comment-only scenario compiled or tested')
         else:
             check_identity(json.loads((evidence / case / 'mutants.out/mutants.json').read_text()), selected[case])
@@ -270,7 +274,7 @@ def run_cases(evidence):
             raise ValueError('mutation source restoration failed')
     write_json(evidence / 'selected.json', selected)
     helper_paths = sorted([p for p in SCRIPTS.glob('*mutation*.py')] +
-                          [SCRIPTS / 'ci-direct-cargo.sh', SCRIPTS / 'run-mutation-scope.sh',
+                          [SCRIPTS / 'ci-direct-cargo.sh', SCRIPTS / 'ci-nextest-with-docs.py', SCRIPTS / 'run-mutation-scope.sh',
                            ROOT / '.github/workflows/mutation-canary.yml', ROOT / '.github/workflows/ci.yml',
                            SCRIPTS / 'verify-release-required-ci.py'])
     helpers = {str(p.relative_to(ROOT)): digest(p) for p in helper_paths}
@@ -311,7 +315,7 @@ def verify(evidence, upstream):
     for case in ('complete', 'exhausted'):
         check_identity(json.loads((evidence / case / 'mutants.out/mutants.json').read_text()), selected[case])
     check_trace(json.loads((evidence / 'complete-inputs/mutation-trace.json').read_text()), results['complete'])
-    if any(r['original_argv'][0] in ('test', 'build', 'check', 'rustc') for r in
+    if any(r['original_argv'][0] in ('test', 'build', 'check', 'rustc', 'nextest') for r in
            json.loads((evidence / 'comment-inputs/mutation-trace.json').read_text())):
         raise ValueError('zero case compiled or tested')
     baselines = json.loads((evidence / 'baselines.json').read_text())

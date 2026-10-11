@@ -36,7 +36,7 @@ for arg in "$@"; do
     --package=nestweaver|--package=nestweaver@*|-pnestweaver|-pnestweaver@*) root=true ;;
   esac
 done
-case "$command" in build|test|check|rustc|clippy) ;; *) root=false ;; esac
+case "$command" in build|test|check|rustc|clippy|nextest) ;; *) root=false ;; esac
 args=()
 added=false
 for arg in "$@"; do
@@ -84,5 +84,9 @@ try:
 finally:
     os.close(fd)
 PY
+fi
+if [ "$command" = nextest ]; then
+  adapter="$(python3 -c 'import os,sys; print(os.path.join(os.path.dirname(os.path.realpath(sys.argv[1])), "ci-nextest-with-docs.py"))' "$0")"
+  exec python3 "$adapter" "$NW_REAL_CARGO" "${args[@]}"
 fi
 exec "$NW_REAL_CARGO" "${args[@]}"
