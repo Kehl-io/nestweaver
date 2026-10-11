@@ -141,6 +141,17 @@ def github_runner_context(environment):
         environment.get(key) for key in ('RUNNER_TEMP', 'RUNNER_OS', 'GITHUB_RUN_ID'))
 
 
+def tool_versions(real_cargo):
+    commands = {
+        'cargo': [real_cargo, '--version'],
+        'rustc': ['rustc', '--version'],
+        'cargo-mutants': ['cargo-mutants', 'mutants', '--version'],
+        'cargo-nextest': ['cargo-nextest', '--version'],
+    }
+    return {name: subprocess.check_output(argv, text=True).strip()
+            for name, argv in commands.items()}
+
+
 def run_cases(evidence):
     if not github_runner_context(os.environ):
         raise ValueError('canary execution requires GitHub Actions runner context')
@@ -167,8 +178,7 @@ def run_cases(evidence):
     (shim / 'cargo').symlink_to(SCRIPTS / 'ci-direct-cargo.sh')
     env.update(NW_REAL_CARGO=real_cargo, CARGO=str(shim / 'cargo'), PATH=str(shim) + os.pathsep + env['PATH'],
                NESTWEAVER_ALLOW_NO_DAEMON='1')
-    versions = {name: subprocess.check_output([exe, '--version'], text=True).strip()
-                for name, exe in [('cargo', real_cargo), ('rustc', 'rustc'), ('cargo-mutants', 'cargo-mutants'), ('cargo-nextest', 'cargo-nextest')]}
+    versions = tool_versions(real_cargo)
     if not versions['cargo-nextest'].startswith('cargo-nextest 0.9.140 '):
         raise ValueError('expected pinned cargo-nextest 0.9.140')
     if versions['cargo-mutants'] != 'cargo-mutants 27.1.0':

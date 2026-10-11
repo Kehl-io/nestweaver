@@ -5,6 +5,8 @@ import subprocess
 import importlib.util
 from pathlib import Path
 import unittest
+import tempfile
+from unittest.mock import patch
 
 
 def load(name):
@@ -17,6 +19,24 @@ def load(name):
 
 
 class Canary(unittest.TestCase):
+    def test_versions_use_each_tools_cli_protocol(self):
+        helper = load('mutation-canary')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, args, output in (
+                ('cargo', '--version', 'cargo 1.99.0'),
+                ('rustc', '--version', 'rustc 1.99.0'),
+                ('cargo-mutants', 'mutants --version', 'cargo-mutants 27.1.0'),
+                ('cargo-nextest', '--version', 'cargo-nextest 0.9.140 (fixture)'),
+            ):
+                executable = root / name
+                executable.write_text('#!/bin/sh\n[ "$*" = "' + args + '" ] || exit 2\nprintf "%s\\n" "' + output + '"\n')
+                executable.chmod(0o755)
+            with patch.dict('os.environ', {'PATH': str(root)}):
+                versions = helper.tool_versions(str(root / 'cargo'))
+            self.assertEqual(versions['cargo-mutants'], 'cargo-mutants 27.1.0')
+            self.assertEqual(versions['cargo-nextest'], 'cargo-nextest 0.9.140 (fixture)')
+
     def test_trace_rejects_package_graph_and_runner_drift(self):
         helper = load('mutation-canary')
         packages = ['--package=nestweaver@0.0.0', '--package=nestweaver-canary-sibling@0.0.0']
