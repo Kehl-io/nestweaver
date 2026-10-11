@@ -16,6 +16,22 @@ def load(name):
 
 
 class BuildReuse(unittest.TestCase):
+    def test_binary_only_packages_do_not_create_false_caught_mutants(self):
+        helper = load('ci-nextest-with-docs')
+        binary = dict(name='cli', id='cli-id', targets=[dict(kind=['bin'], doctest=False)])
+        library = dict(name='engine', id='engine-id', targets=[dict(kind=['lib'], doctest=True)])
+        metadata = dict(packages=[binary, library], workspace_members=['cli-id', 'engine-id'],
+                        workspace_default_members=['cli-id'])
+        self.assertFalse(helper.has_doctest_targets(metadata, ['/cargo', 'test', '--doc', '-p', 'cli@1.0.0']))
+        self.assertTrue(helper.has_doctest_targets(metadata, ['/cargo', 'test', '--doc', '-p', 'cli', '-p', 'engine']))
+        self.assertTrue(helper.has_doctest_targets(metadata, ['/cargo', 'test', '--doc', '--workspace']))
+        with self.assertRaises(ValueError):
+            helper.has_doctest_targets(metadata, ['/cargo', 'test', '--doc', '-p', 'unknown'])
+        commands = []
+        self.assertEqual(helper.run_commands('/cargo', ['nextest', 'run', '-p', 'cli'],
+            lambda command: commands.append(command) or 0, lambda command: metadata), 0)
+        self.assertEqual(len(commands), 1)
+
     def test_internal_entry_points_refuse_missing_runner_context(self):
         environment = dict(os.environ)
         for key in ('GITHUB_ACTIONS', 'RUNNER_TEMP', 'RUNNER_OS', 'GITHUB_RUN_ID'):
@@ -40,6 +56,11 @@ class BuildReuse(unittest.TestCase):
 
     def test_docs_keep_package_feature_target_and_profile_selection(self):
         helper = load('ci-nextest-with-docs')
+        self.assertEqual(helper.metadata_command('/cargo', ['/cargo', 'test', '--doc',
+            '--locked', '--offline', '--manifest-path', '/fixture/Cargo.toml', '-p', 'engine',
+            '--features', 'embed', '--profile', 'test']),
+            ['/cargo', 'metadata', '--format-version', '1', '--no-deps', '--locked',
+             '--offline', '--manifest-path', '/fixture/Cargo.toml'])
         self.assertEqual(helper.doctest_command('/cargo', ['nextest', 'run', '--locked',
             '--package=engine', '-p', 'store', '--features', 'embed', '--all-features',
             '--cargo-profile=test', '--target', 'example', '--fail-fast']),
@@ -61,7 +82,8 @@ class BuildReuse(unittest.TestCase):
                 commands.append(command)
                 return next(statuses)
             self.assertEqual(helper.run_commands('/cargo', ['nextest', 'run', '-p', 'engine',
-                                  '--fail-fast'], run), expected)
+                                  '--fail-fast'], run, lambda command: dict(packages=[dict(name='engine',
+                                      targets=[dict(kind=['lib'], doctest=True)])])), expected)
             self.assertEqual(len(commands), calls)
             if calls == 2:
                 self.assertEqual(commands[1], ['/cargo', 'test', '--doc', '-p', 'engine'])
