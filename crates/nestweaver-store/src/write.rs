@@ -3532,7 +3532,7 @@ impl GraphStore {
             )?;
             Self::batch_insert_unresolved_wikilinks_on(&conn, unresolved_wikilinks)?;
             Self::batch_insert_edges_on(&conn, typed_edges)?;
-            Self::batch_insert_project_note_edges_on(&conn, project_note_edges)?;
+            Self::restore_incremental_project_note_edges_on(&conn, project_note_edges)?;
             if prune_tags {
                 exec_params(
                     &conn,
@@ -5666,6 +5666,43 @@ impl GraphStore {
                 ("lt", lbug::Value::String(link_type.to_string())),
             ],
         )
+    }
+
+    /// Restore incremental memberships without COPY's forced checkpoint.
+    /// Watchers commit one complete note per writer lease, so even a one-row
+    /// COPY would otherwise checkpoint the whole graph for every changed file.
+    /// Bulk materialization keeps its COPY path. Missing endpoints must still
+    /// fail, rather than silently dropping an expected membership via MATCH.
+    fn restore_incremental_project_note_edges_on(
+        conn: &crate::db::StoreConnection<'_>,
+        edges: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+        let mut statement = conn
+            .prepare(
+                "MATCH (p:Project {uid: $pid}), (n:Note {uid: $nid}) \
+                 CREATE (p)-[r:PROJECT_INCLUDES_NOTE {confidence: 1.0}]->(n) RETURN count(r)",
+            )
+            .map_err(|e| StoreError::Query(format!("prepare project membership: {e}")))?;
+        for (project_uid, note_uid) in edges {
+            let mut rows = conn
+                .execute(
+                    &mut statement,
+                    vec![
+                        ("pid", lbug::Value::String((*project_uid).to_string())),
+                        ("nid", lbug::Value::String((*note_uid).to_string())),
+                    ],
+                )
+                .map_err(|e| StoreError::Query(format!("restore project membership: {e}")))?;
+            if !matches!(rows.next().as_deref(), Some([lbug::Value::Int64(1)])) {
+                return Err(StoreError::Query(format!(
+                    "missing endpoint restoring project membership {project_uid} -> {note_uid}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub fn batch_insert_project_note_edges(
@@ -11058,6 +11095,65 @@ mod tests {
                 vec!["proj:txn:child"]
             );
         }
+    }
+
+    #[test]
+    fn incremental_project_membership_does_not_force_a_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("incremental.lbug");
+        let store = GraphStore::open_or_create(&path).unwrap();
+        let conn = store.conn().unwrap();
+        conn.query("CALL auto_checkpoint=true").unwrap();
+        conn.query("CALL checkpoint_threshold=1073741824").unwrap();
+        conn.query(
+            "CREATE (:Project {uid: 'proj:incremental'}), (:Note {uid: 'note:incremental'})",
+        )
+        .unwrap();
+        drop(conn);
+        store.checkpoint().unwrap();
+        let checkpoint = std::fs::read(&path).unwrap();
+        let conn = store.begin_transaction().unwrap();
+        GraphStore::restore_incremental_project_note_edges_on(
+            &conn,
+            &[("proj:incremental", "note:incremental")],
+        )
+        .unwrap();
+        store.commit_transaction(&conn).unwrap();
+        drop(conn);
+        assert!(
+            std::fs::read(&path).unwrap() == checkpoint,
+            "one membership must remain in the WAL, not force a full checkpoint"
+        );
+        let conn = store.conn().unwrap();
+        let mut rows = conn.query("MATCH (:Project {uid: 'proj:incremental'})-[r:PROJECT_INCLUDES_NOTE]->(:Note {uid: 'note:incremental'}) RETURN r.confidence").unwrap();
+        assert_eq!(rows.next().unwrap(), vec![lbug::Value::Float(1.0)]);
+        drop(rows);
+        drop(conn);
+        let conn = store.begin_transaction().unwrap();
+        let error = GraphStore::restore_incremental_project_note_edges_on(
+            &conn,
+            &[
+                ("proj:incremental", "note:incremental"),
+                ("proj:missing", "note:incremental"),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("missing endpoint"));
+        store.rollback_transaction(&conn).unwrap();
+        drop(conn);
+        assert_eq!(
+            store
+                .list_project_edge_pairs("PROJECT_INCLUDES_NOTE")
+                .unwrap()
+                .len(),
+            1,
+            "a missing endpoint rolls back the earlier insertion too"
+        );
+        store.checkpoint().unwrap();
+        assert!(
+            std::fs::read(&path).unwrap() != checkpoint,
+            "an explicit checkpoint still persists the membership"
+        );
     }
 
     #[test]
