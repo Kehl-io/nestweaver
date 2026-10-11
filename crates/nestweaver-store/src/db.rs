@@ -5079,6 +5079,58 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Checkpoint after existing connections finish, excluding new connections
+    /// through native checkpoint and connection destruction. `max_wait` bounds
+    /// connection drain only; it does not change the native checkpoint timeout.
+    ///
+    /// Unlike an immediate checkpoint, this tolerates transient background
+    /// readers. While waiting it holds neither native admission nor a pending
+    /// blocking write lock, so existing transactions can commit, close, or open
+    /// another connection. A caller retaining its own connection times out.
+    pub fn checkpoint_waiting(&self, max_wait: std::time::Duration) -> Result<(), StoreError> {
+        let deadline = std::time::Instant::now()
+            .checked_add(max_wait)
+            .ok_or_else(|| {
+                StoreError::Query("checkpoint connection wait exceeds clock range".into())
+            })?;
+        let _open = loop {
+            match self.db.gate.try_write() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(StoreError::Query(
+                            "checkpoint: store connections did not close within the wait budget"
+                                .into(),
+                        ));
+                    }
+                    std::thread::sleep(remaining.min(std::time::Duration::from_millis(2)));
+                }
+            }
+        };
+        // SAFETY: exclusive handle guard excludes every StoreConnection and
+        // reopen. The native connection and result are destroyed before it.
+        let db = unsafe { &*self.db.cell.get() }.as_ref().ok_or_else(|| {
+            StoreError::Database("cannot checkpoint a store closed for reopen".into())
+        })?;
+        let _native = self.db.native_admission.acquire(Mode::Exclusive, None)?;
+        let conn = lbug::Connection::new(db)?;
+        #[cfg(test)]
+        self.db
+            .native_admission
+            .observe(Mode::Exclusive, "checkpoint");
+        conn.query("CHECKPOINT").map(|_| ()).map_err(|e| {
+            let message = e.to_string();
+            if classify_checkpoint_failure(&message)
+                == Some(crate::error::CheckpointFailure::CommittedCheckpointDeferred)
+            {
+                self.note_checkpoint_deferred(&message);
+            }
+            StoreError::Query(format!("checkpoint: {message}"))
+        })
+    }
+
     /// nw-670 (review H1): remove EVERY REFERENCES_CODE edge, note- and
     /// section-level, in one short transaction by dropping and recreating the
     /// two REL tables with the same DDL [`Self::init_schema`] uses. Deleting
@@ -5931,6 +5983,128 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn backup_checkpoint_waits_for_transaction_cleanup_and_preserves_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = GraphStore::create(&directory.path().join("waiting.lbug")).unwrap();
+        std::thread::scope(|scope| {
+            let transaction = store.conn().unwrap();
+            transaction.query("BEGIN TRANSACTION").unwrap();
+            transaction
+                .query("CREATE (:Meta {key: 'waiting_commit', value: 'saved'})")
+                .unwrap();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+            let store_ref = &store;
+            let worker = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = store_ref.checkpoint_waiting(std::time::Duration::from_secs(2));
+                finished_tx.send(()).unwrap();
+                result
+            });
+            started_rx.recv().unwrap();
+            assert!(matches!(
+                finished_rx.recv_timeout(std::time::Duration::from_millis(20)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            // Immediate checkpoints still refuse; waiting must leave native
+            // admission available for this transaction's commit and cleanup.
+            assert!(store.checkpoint().is_err());
+            transaction.query("COMMIT").unwrap();
+            drop(transaction);
+            worker.join().unwrap().unwrap();
+        });
+        drop(store);
+        let reopened = GraphStore::open(&directory.path().join("waiting.lbug")).unwrap();
+        let conn = reopened.conn().unwrap();
+        let rows = conn
+            .query("MATCH (m:Meta {key: 'waiting_commit'}) RETURN m.value")
+            .unwrap();
+        assert_eq!(rows.count(), 1);
+    }
+
+    #[test]
+    fn backup_checkpoint_excludes_new_connections_until_native_cleanup() {
+        let store = GraphStore::in_memory().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let observer =
+            store
+                .db
+                .native_admission
+                .set_observer(std::sync::Arc::new(move |_, operation| {
+                    if operation == "checkpoint" {
+                        entered_tx.send(()).unwrap();
+                        release_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(std::time::Duration::from_secs(2))
+                            .unwrap();
+                    }
+                }));
+        std::thread::scope(|scope| {
+            let checkpoint =
+                scope.spawn(|| store.checkpoint_waiting(std::time::Duration::from_secs(1)));
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+            let store_ref = &store;
+            let reader = scope.spawn(move || {
+                let conn = store_ref.conn().unwrap();
+                opened_tx.send(()).unwrap();
+                conn.query("RETURN 1").unwrap();
+            });
+            let opened_early = opened_rx.recv_timeout(std::time::Duration::from_millis(20));
+            release_tx.send(()).unwrap();
+            assert!(matches!(
+                opened_early,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            checkpoint.join().unwrap().unwrap();
+            opened_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            reader.join().unwrap();
+        });
+        drop(observer);
+    }
+
+    #[test]
+    fn backup_checkpoint_preserves_frozen_wal_failure_and_reopen_flag() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("frozen.lbug");
+        let store = GraphStore::create(&path).unwrap();
+        std::fs::write(directory.path().join("frozen.lbug.wal.checkpoint"), b"").unwrap();
+        let error = store
+            .checkpoint_waiting(std::time::Duration::from_secs(1))
+            .unwrap_err();
+        assert_eq!(
+            error.checkpoint_failure(),
+            Some(crate::error::CheckpointFailure::CommittedCheckpointDeferred)
+        );
+        assert!(store.reopen_required());
+    }
+
+    #[test]
+    fn backup_checkpoint_timeout_releases_admission_for_live_connection() {
+        let store = GraphStore::in_memory().unwrap();
+        let conn = store.conn().unwrap();
+        let started = std::time::Instant::now();
+        let error = store
+            .checkpoint_waiting(std::time::Duration::from_millis(20))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("connections did not close"),
+            "{error}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        conn.query("RETURN 1").unwrap();
+        drop(conn);
+        store.checkpoint_waiting(std::time::Duration::ZERO).unwrap();
     }
 
     #[test]

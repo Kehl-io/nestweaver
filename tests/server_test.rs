@@ -3112,23 +3112,17 @@ async fn server_backup_rpc_produces_snapshot() {
     let repo_dir = dir.path().join("repo");
     write_test_repo(&repo_dir);
 
-    let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
-        .env("NESTWEAVER_NO_DAEMON", "1")
-        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
-        .args([
-            "index",
-            "--repo",
-            &repo_dir.display().to_string(),
-            "--db",
-            &db_path.display().to_string(),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "index failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    // Build this RPC fixture through the library with its real write lease.
+    // The shipping CLI intentionally auto-starts a daemon for indexing, which
+    // would retain this private database's pidfile before ServerGuard owns it.
+    nestweaver_engine::index::index_directory(
+        &repo_dir,
+        &db_path,
+        "test",
+        "file:///backup-rpc-fixture",
+        "sha",
+    )
+    .expect("index private backup fixture");
 
     // Backup is admin-gated; use distinct >=32-byte tokens (startup rejects
     // short or equal tokens) and authenticate as admin.

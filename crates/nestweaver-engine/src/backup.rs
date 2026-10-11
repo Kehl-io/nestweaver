@@ -300,8 +300,9 @@ pub fn backup_logical_instance_id(store: &nestweaver_store::GraphStore) -> anyho
 
 /// Stage a backup from an ALREADY-OPEN store: flush embeddings, `CHECKPOINT` the
 /// WAL into the main file, copy the on-disk files to a temp staging dir, and
-/// gather manifest stats. Reuses the caller's live connection — it never opens a
-/// second one. It also owns the store's publication lease through checkpoint,
+/// gather manifest stats. Reuses the caller's live database handle, draining
+/// existing connections before opening the checkpoint connection. It also owns
+/// the store's publication lease through checkpoint,
 /// copy, and statistics collection, so UI watchers and other publishers cannot
 /// mutate the graph mid-copy. The configured path must resolve to this store;
 /// all database and sidecar reads derive from `store.db_path()`. An inherited
@@ -394,7 +395,7 @@ fn stage_backup_with_statistics(
             .compact_embedding_index()
             .map_err(|e| anyhow::anyhow!("failed to compact embedding index: {e}"))?;
         store
-            .checkpoint()
+            .checkpoint_waiting(Duration::from_secs(5))
             .map_err(|e| anyhow::anyhow!("CHECKPOINT failed: {e}"))?;
     }
 
@@ -3455,6 +3456,45 @@ mod tests {
             "and it must be classifiable, so a caller can tell 'older generation \
              of this graph' from 'belongs to another graph': {message}"
         );
+    }
+
+    #[test]
+    fn backup_waits_for_an_idle_connection_then_packages_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("overlap.lbug");
+        let store = std::sync::Arc::new(nestweaver_store::GraphStore::create(&db_path).unwrap());
+        let config = BackupConfig {
+            db_path,
+            output_path: dir.path().join("overlap.nwsnap.zst"),
+            include_clones: false,
+            instance_id: "default".into(),
+            workspace_path: None,
+            overwrite: false,
+        };
+        // An idle connection counts too, just like a daemon background read
+        // between its final native query and connection destruction.
+        let reader = store.begin_transaction().unwrap();
+        store.commit_transaction(&reader).unwrap();
+        let backup_store = std::sync::Arc::clone(&store);
+        let backup_config = config.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(stage_backup_from_store(&backup_store, &backup_config))
+                .unwrap();
+        });
+        let early = rx.recv_timeout(Duration::from_millis(100));
+        drop(reader);
+        let staged = match early {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            }
+            other => other.unwrap(),
+        }
+        .expect("backup must tolerate the temporary idle connection");
+        worker.join().unwrap();
+        package_staged(&config, staged).unwrap();
+        assert_eq!(backup_inspect(&config.output_path).unwrap().symbol_count, 0);
+        assert!(store.count_symbols().is_ok());
     }
 
     #[test]
