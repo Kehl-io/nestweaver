@@ -586,27 +586,55 @@ jobs:
               echo "::error::release PR number is not numeric" >&2
               exit 1
             }
-            PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$NUM")"
-            jq -e \
-              --arg base "$DEFAULT_BRANCH" \
-              --arg branch "$EXPECTED_BRANCH" \
-              --arg repo "$GITHUB_REPOSITORY" '
-                .state == "open" and
-                .base.ref == $base and
-                .head.ref == $branch and
-                .head.repo.full_name == $repo and
-                .head.repo.fork == false and
-                .user.login == "github-actions[bot]"
-              ' <<< "$PR_JSON" >/dev/null || {
-                echo "::error::candidate release PR failed trusted base/head/repository/author validation" >&2
-                jq '{number, state, author: .user.login, base: .base.ref,
-                     head: .head.ref, head_repo: .head.repo.full_name,
-                     head_repo_fork: .head.repo.fork}' <<< "$PR_JSON" >&2
-                exit 1
-              }
-            BRANCH="$(jq -er '.head.ref' <<< "$PR_JSON")"
-            HEAD_SHA="$(jq -er '.head.sha' <<< "$PR_JSON")"
+            # The contents API update above advances the git ref before the
+            # pulls API necessarily reflects it. Bind to the ref and wait for
+            # the PR view to converge; never chase a moving mutation target.
+            HEAD_SHA="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$EXPECTED_BRANCH" --jq '.object.sha')"
             [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+            INITIAL_PR_SHA=""
+            CONVERGED=false
+            for attempt in {1..10}; do
+              PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$NUM")"
+              jq -e \
+                --arg base "$DEFAULT_BRANCH" \
+                --arg branch "$EXPECTED_BRANCH" \
+                --arg repo "$GITHUB_REPOSITORY" '
+                  .state == "open" and
+                  .base.ref == $base and
+                  .head.ref == $branch and
+                  .head.repo.full_name == $repo and
+                  .head.repo.fork == false and
+                  .user.login == "github-actions[bot]"
+                ' <<< "$PR_JSON" >/dev/null || {
+                  echo "::error::candidate release PR failed trusted base/head/repository/author validation" >&2
+                  jq '{number, state, author: .user.login, base: .base.ref,
+                       head: .head.ref, head_repo: .head.repo.full_name,
+                       head_repo_fork: .head.repo.fork}' <<< "$PR_JSON" >&2
+                  exit 1
+                }
+              PR_SHA="$(jq -er '.head.sha' <<< "$PR_JSON")"
+              [[ "$PR_SHA" =~ ^[0-9a-f]{40}$ ]]
+              if [ -z "$INITIAL_PR_SHA" ]; then INITIAL_PR_SHA="$PR_SHA"; fi
+              if [ "$PR_SHA" != "$HEAD_SHA" ] && [ "$PR_SHA" != "$INITIAL_PR_SHA" ]; then
+                echo "::error::release PR moved to an unexpected head while waiting for convergence" >&2
+                exit 1
+              fi
+              CURRENT_REF="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$EXPECTED_BRANCH" --jq '.object.sha')"
+              if [ "$CURRENT_REF" != "$HEAD_SHA" ]; then
+                echo "::error::release branch moved while locating the exact release PR head" >&2
+                exit 1
+              fi
+              if [ "$PR_SHA" = "$HEAD_SHA" ]; then
+                CONVERGED=true
+                break
+              fi
+              if [ "$attempt" -lt 10 ]; then sleep 3; fi
+            done
+            if [ "$CONVERGED" != true ]; then
+              echo "::error::release PR API did not converge to the branch head within the bounded wait" >&2
+              exit 1
+            fi
+            BRANCH="$(jq -er '.head.ref' <<< "$PR_JSON")"
             if [ -n "$ACTION_BRANCH" ] && [ "$ACTION_BRANCH" != "$BRANCH" ]; then
               echo "::error::release-please output branch $ACTION_BRANCH disagrees with validated PR branch $BRANCH" >&2
               exit 1
