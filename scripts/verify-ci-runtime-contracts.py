@@ -42,6 +42,12 @@ def first_cargo_command(section):
 
 
 class RuntimeContracts(unittest.TestCase):
+    def test_canary_helper_changes_supply_runtime_prerequisites(self):
+        rust = CI.split('            rust:\n', 1)[1].split('            metal:', 1)[0]
+        for script in ('mutation-canary.py', 'verify-mutation-prerequisite.py'):
+            self.assertIn("'scripts/" + script + "'", rust)
+        self.assertIn('python3 scripts/test-mutation-canary.py', job(CI, 'required-ci'))
+
     def test_coverage_scheduling_is_independent(self):
         self.assertNotRegex(CI, r'(?m)^  coverage:')
         self.assertNotIn('coverage_validation:', CI)
