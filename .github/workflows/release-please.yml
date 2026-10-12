@@ -503,12 +503,17 @@ jobs:
           fi
 
           echo "duplicate changelog entries found; rewriting CHANGELOG.md on $BRANCH"
+          # Keep the full changelog out of exec arguments: Linux limits each
+          # argument to about 128KiB, below the generated file's base64 size.
+          # --rawfile preserves its exact text, including trailing newlines.
+          jq -n --arg message 'fix(release): deduplicate merge-commit changelog entries (nw-096)' \
+            --rawfile content CHANGELOG.md.deduped \
+            --arg sha "$original_sha" --arg branch "$BRANCH" \
+            '{message: $message, content: ($content | @base64), sha: $sha, branch: $branch}' \
+            > CHANGELOG.md.upload.json
           gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/CHANGELOG.md" \
-            -f message='fix(release): deduplicate merge-commit changelog entries (nw-096)' \
-            -f content="$(base64 -w 0 CHANGELOG.md.deduped)" \
-            -f sha="$original_sha" \
-            -f branch="$BRANCH" >/dev/null
-          rm -f -- CHANGELOG.md.orig CHANGELOG.md.deduped contents-error.txt
+            --input CHANGELOG.md.upload.json >/dev/null
+          rm -f -- CHANGELOG.md.orig CHANGELOG.md.deduped CHANGELOG.md.upload.json contents-error.txt
       # Find the open release PR by LABEL, not by `prs_created`.
       #
       # `prs_created` is true only when release-please CREATES the PR. When it
