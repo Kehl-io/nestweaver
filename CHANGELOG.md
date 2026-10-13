@@ -1,5 +1,29 @@
 # Changelog
 
+## [12.0.2](https://github.com/Kehl-io/nestweaver/compare/v12.0.1...v12.0.2) (2026-10-13)
+
+
+### Bug Fixes
+
+* **backup:** drain live connections before snapshot checkpoint ([aab4da8](https://github.com/Kehl-io/nestweaver/commit/aab4da86143e18ac8d71a7f625e3c44265a0f41d))
+* **ci:** bound changelog uploads and seed complete Metal caches ([09e36d2](https://github.com/Kehl-io/nestweaver/commit/09e36d236e01069555daa5d699150b2cad7a51ab))
+* **ci:** require runtime evidence for mutation canary helpers ([2c6de87](https://github.com/Kehl-io/nestweaver/commit/2c6de8712ec69beadf0fe42c7d2f1dca32fed4db))
+* **ci:** require runtime evidence for mutation canary helpers ([bd264e6](https://github.com/Kehl-io/nestweaver/commit/bd264e6307d2be21344ed05d158c5ef4dea61860))
+* **ci:** use cargo-mutants subcommand for canary version probe ([b805795](https://github.com/Kehl-io/nestweaver/commit/b8057959eef77a5d4f42edcb93cbc1570149515b))
+* **ci:** use cargo-mutants subcommand for canary version probe ([8d7d661](https://github.com/Kehl-io/nestweaver/commit/8d7d66176bb338437558bf948f098d6bbf8ab54c))
+* **deps:** patch quinn-proto security advisories ([2fb0928](https://github.com/Kehl-io/nestweaver/commit/2fb092820efcd2f7445d141fec7fb6c18e2066d0))
+* **deps:** update quinn-proto for security advisories ([6eff982](https://github.com/Kehl-io/nestweaver/commit/6eff98225a89df07c9a4fd4d03146d643cca323c))
+* **release:** bind PR locator to stable branch head ([2e8f496](https://github.com/Kehl-io/nestweaver/commit/2e8f496e23a2500429dec49cc9656f8cf03b4aff))
+* **release:** wait for exact release PR head convergence ([df84ca2](https://github.com/Kehl-io/nestweaver/commit/df84ca2f35779e2b13b394d0711b16a85ed2d23e))
+
+
+### Performance Improvements
+
+* **ci:** avoid duplicate native builds and speed migration fixtures ([5c01603](https://github.com/Kehl-io/nestweaver/commit/5c01603b8203487bcd069133384c06393fd0cb0e))
+* **ci:** avoid duplicate native builds and speed migration fixtures ([c7f0cdf](https://github.com/Kehl-io/nestweaver/commit/c7f0cdfd4c6ddbf6b13d14ffb38a6482006b6058))
+* **ci:** separate coverage and observe Metal builds ([f0b0d69](https://github.com/Kehl-io/nestweaver/commit/f0b0d69ea64853ad4507cb62f01a365f81282cd7))
+* **store:** avoid forced checkpoints for incremental memberships ([2ec509d](https://github.com/Kehl-io/nestweaver/commit/2ec509d170699db18546cd543c02b8563682198c))
+
 ## [12.0.1](https://github.com/Kehl-io/nestweaver/compare/v12.0.0...v12.0.1) (2026-10-10)
 
 
