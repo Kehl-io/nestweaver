@@ -6,6 +6,8 @@ build from source. There is currently no published crates.io package.
 
 ## npm
 
+Requires Node.js 18+ and one of the supported macOS/Linux platforms below.
+
 ```sh
 npm install --global nestweaver
 nestweaver --version
@@ -100,7 +102,8 @@ accelerator = "cpu"
 
 ## Build from source
 
-Building from source requires Rust 1.85+, CMake, a C++20 compiler, Python 3.9
+Building from source requires the current stable Rust toolchain (as used in
+CI), CMake, a C++20 compiler, Python 3.9
 or newer (LadybugDB's build generates a header with it), OpenSSL and zstd
 development files, `pkg-config`, and Protocol Buffers:
 
@@ -180,84 +183,42 @@ bash app/build.sh
 open target/release/NestWeaver.app
 ```
 
-## Upgrading to this release — re-index every graph
+## Upgrading an existing database
 
-**This release bumps `RESOLVER_GENERATION` to 8.** Installing the new binary
-does not repair a graph already on disk. Until each repo is re-indexed, its
-rankings, edges and `dead-code` results are computed from data the old resolver
-wrote, and `dead-code` refuses outright rather than reporting from it.
+**Storage compatibility comes first.** A database built before LadybugDB 0.21
+is refused with `nestweaver::db_rebuild_required`. Back it up and follow the
+[publication rebuild guide](docs/guide/publication-rebuild.md#storage-engine-upgrade-ladybugdb-021-rebuild-required)
+and the error's recovery command. A forced re-index alone is not the remedy
+for an incompatible storage format.
 
-Generation 8 (nw-688) renames JavaScript/TypeScript test-runner blocks to
-`<runner> <title>` (`describe getTier`), so a test title no longer shadows the
-real definition it tests. Generation 7 (nw-687) adds definitions and call edges for CommonJS
-`module.exports.X` and `exports.X` functions in JavaScript and TypeScript.
-An older graph is missing those edges, so `dead-code` may call their live
-callees unreachable until the repo is re-indexed. Generation 6 changed which
-symbols are ENTRY POINTS, and
-`is_entry_point`/`entry_point_kind` are persisted per-symbol columns read
-straight off disk rather than re-derived at query time — so a symbol indexed
-before this release keeps `is_entry_point: false` forever, no matter which
-binary asks. It covers bash and Python top-level-call rooting, Swift
-`main.swift`/shebang rooting, bash `trap` handlers, `package.json` entry points
-discovered at any depth in a monorepo, and a C++ span-anchoring and
-struct-typed-local fix that changes symbol UIDs (and therefore edge endpoints)
-in error-recovered, macro-prefixed declarations.
+For a compatible database, the current **`RESOLVER_GENERATION` is 9**.
+Compatibility requires an exact match: a graph written by an older or newer
+resolver must be fully re-indexed before you trust its edges and rankings.
 
 ```sh
-nestweaver index --repo <path> --force   # per repo — a full index, not incremental
+nestweaver stale-check --db /path/to/nestweaver.lbug
+nestweaver index --repo /path/to/repo --db /path/to/nestweaver.lbug --force
 ```
 
-**`--force` is required, not a suggestion.** A generation-stale repo is at HEAD
-with nothing modified, so a plain `nestweaver index --repo <path>` takes the
-incremental path, reports `0 modified`, writes nothing, and leaves both the old
-data and the old generation in place. Vaults are not repos, carry no resolver
-generation, and do not need refreshing for this.
+`stale-check` reports `outdated_resolver` and exits 2 for a resolver mismatch.
+**`--force` is required** for each repository: an incremental index at git
+HEAD can report no changes and leave the old generation in place. Vaults are
+not repositories and carry no code resolver generation.
 
-## Upgrading from 8.x — re-index every graph
-
-**9.0.0 bumps `RESOLVER_GENERATION` from 3 to 4.** Installing the new binary
-does not repair edges already on disk. Until each repo is re-indexed, its
-rankings, C/C++ `MEMBER_OF` edges and C++ `IMPORTS` edges are wrong, and `.h`
-files carry symbols extracted by the C grammar rather than C++.
-
-```sh
-nestweaver index --repo <path> --force   # per repo — a full index, not incremental
-```
-
-**`--force` is not optional.** A generation-stale repo is at HEAD with every
-file unchanged, so plain `nestweaver index --repo <path>` reports `0 modified`,
-writes nothing, and leaves the old edges — and the old generation — in place.
-Vaults carry no resolver generation and do not need refreshing for this.
-
-**`nestweaver stale-check` detects it as of 9.0.0** (in 8.x it did not — its
-ladder was SHA-vs-HEAD only, so a generation-3 graph exited 0):
-
-```sh
-nestweaver stale-check                 # status: outdated_resolver, exit 2
-nestweaver stale-check --json | jq '{any_needs_reindex, resolver_stale_repos}'
-# or read the sidecar directly — any repo whose generation DIFFERS from the
-# running binary's `RESOLVER_GENERATION` (7 in this release) needs a re-index.
-# As of 9.1.0 compatibility is an exact match, not a floor: a graph written by
-# a NEWER resolver than the running binary understands is just as untrustworthy
-# as an older one, so it reads as stale too.
-cat <db>.resolver_generation.json
-```
-
-`hubs`, `bridges`, `repo-map`, `ranking rank` and `summary --level hub` also
-disclose it. `clusters`, `blast-radius`, `generate-guide`, PPR-backed `context`
-and the web UI still do not — on those, treat the absence of a warning as no
-evidence either way.
+See the [README upgrade notes](README.md#upgrading--re-index-before-you-trust-a-ranking)
+for the resolver history, Markdown derivation changes, and script/HTTP-client
+migration details.
 
 ## Configure for your AI tool
 
 ```sh
-nestweaver setup
+nestweaver setup --db "$(pwd)/nestweaver.lbug"
 ```
 
 ## Index and verify
 
 ```sh
-nestweaver index --repo . --db ./nestweaver.lbug
+nestweaver index --repo . --db "$(pwd)/nestweaver.lbug"
 nestweaver search "main" --db ./nestweaver.lbug
 ```
 
@@ -267,7 +228,7 @@ use that same absolute path with `--db` for search and MCP.
 ## Start the MCP server
 
 ```sh
-nestweaver mcp --db ./nestweaver.lbug
+nestweaver mcp --db "$(pwd)/nestweaver.lbug"
 ```
 
 The daemon owns the database exclusively. It auto-starts on first use and logs
