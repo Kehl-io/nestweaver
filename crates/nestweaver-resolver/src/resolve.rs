@@ -896,6 +896,7 @@ fn resolve_single_reference(
     // same name, so this check runs on the reference's own name, before any
     // alias rewriting. nw-113: a block-scoped declaration shadows only inside
     // its block, and the innermost visible declaration wins.
+    let mut same_file_out_of_scope = false;
     if let Some(syms) = symbol_map.get(name.as_str())
         && let Some((_, sym)) = syms
             .iter()
@@ -912,8 +913,10 @@ fn resolve_single_reference(
                     && candidate_matches(reference, file_path, f, sym, language, graph)
             })
             .filter_map(|candidate| {
-                same_file_declaration_scope(local_bindings, candidate.1, reference, language)
-                    .map(|width| (width, candidate))
+                let width =
+                    same_file_declaration_scope(local_bindings, candidate.1, reference, language);
+                same_file_out_of_scope |= width.is_none();
+                width.map(|width| (width, candidate))
             })
             .min_by_key(|(width, _)| *width)
             .map(|(_, candidate)| candidate)
@@ -1384,20 +1387,14 @@ fn resolve_single_reference(
     }
 
     // nw-113: the name is declared in this file, but only inside blocks that
-    // do not contain this call. An ES module cannot see a sibling file's
-    // function without importing it, so the same-directory fallback below
-    // would fabricate the edge.
-    if matches!(language, Language::JavaScript | Language::TypeScript)
-        && reference.receiver.is_none()
-        && symbol_map.get(name.as_str()).is_some_and(|syms| {
-            syms.iter().any(|(f, sym)| {
-                *f == file_path
-                    && candidate_matches(reference, file_path, f, sym, language, graph)
-                    && same_file_declaration_scope(local_bindings, sym, reference, language)
-                        .is_none()
-            })
-        })
-    {
+    // do not contain this call (Priority 1 rejected every such candidate for
+    // scope). An ES module cannot see a sibling file's function without
+    // importing it, so the same-directory fallback below would fabricate the
+    // edge. Only reachable when the JS/TS file has no imports at all: a file
+    // with imports already returned unresolved above for an unbound name, so
+    // this does not protect import resolution. A name not declared in this
+    // file at all still takes the same-directory fallback.
+    if same_file_out_of_scope {
         return Some(unresolved_edge(source_uid, name, edge_type));
     }
 
@@ -1983,12 +1980,18 @@ fn active_lexical_binding<'a>(
 ///
 /// A `const f = () => …` declared in a block is a graph `Function` whose
 /// declaring `LocalBinding` carries that block's byte range. Returns:
-/// - `None` when the declaration is not visible at the call (every declaring
-///   binding's block excludes the call position);
-/// - `Some(width)` with the tightest declaring block's width when it is;
-/// - `Some(usize::MAX)` when `sym` has no declaring binding (a module-scope
-///   declaration or a `function` declaration), so scoped declarations rank
-///   ahead of it.
+/// - `None` when the declaration is not visible at the call (its own
+///   declarator's block excludes the call position);
+/// - `Some(width)` with that block's width when it is (a module-level
+///   `const f = () =>` gets its program-scope width);
+/// - `Some(usize::MAX)` when `sym` has no declarator of its own: function
+///   declarations, methods, class fields and every non-`Function` kind. A
+///   same-named local declared inside such a symbol's body is not its
+///   declaration, so it must never scope the symbol.
+///
+/// A declarator symbol's own name precedes any same-named local declared in
+/// its initializer, so only the in-span declarator binding with the smallest
+/// position is the symbol's declaration.
 ///
 /// Gated to bare JS/TS calls (plan validation): Rust has its own exact gate
 /// and receiver calls (`Api.get()`, `this.x()`) are matched by
@@ -2005,13 +2008,15 @@ fn same_file_declaration_scope(
 ) -> Option<usize> {
     if !matches!(language, Language::JavaScript | Language::TypeScript)
         || reference.receiver.is_some()
+        || sym.kind != SymbolKind::Function
+        || is_function_declaration_form(&sym.signature)
     {
         return Some(usize::MAX);
     }
     let Some(call) = reference.scope else {
         return Some(usize::MAX);
     };
-    let mut declarations = local_bindings
+    let Some(declaration) = local_bindings
         .iter()
         // The declarator may sit on a later line than the declaration
         // (`const a = 1,\n  b = () => 2;`), so join by the symbol's span,
@@ -2023,14 +2028,26 @@ fn same_file_declaration_scope(
         })
         .filter_map(|binding| binding.scope)
         .filter(|scope| scope.initialized_at > scope.position)
-        .peekable();
-    if declarations.peek().is_none() {
+        .min_by_key(|scope| scope.position)
+    else {
         return Some(usize::MAX);
+    };
+    (declaration.start <= call.position && call.position < declaration.end)
+        .then(|| declaration.end - declaration.start)
+}
+
+/// A JS/TS `function` / `function*` declaration (its signature, after any
+/// `export`/`default`/`declare`/`async` modifiers, starts with `function`),
+/// as opposed to a `const f = …` declarator.
+fn is_function_declaration_form(signature: &str) -> bool {
+    let mut rest = signature.trim_start();
+    while let Some(next) = ["export ", "default ", "declare ", "async "]
+        .iter()
+        .find_map(|modifier| rest.strip_prefix(modifier))
+    {
+        rest = next.trim_start();
     }
-    declarations
-        .filter(|scope| scope.start <= call.position && call.position < scope.end)
-        .map(|scope| scope.end - scope.start)
-        .min()
+    rest.starts_with("function")
 }
 
 fn name_is_locally_bound(
@@ -8592,15 +8609,101 @@ export function multi() {
         let (files, edges) = review_edges(&[a, b], Language::TypeScript);
         let sibling = uid(&files, "src/b.ts", "helper");
         let targets = call_targets(&files, &edges, "src/a.ts", "caller");
-        assert!(
-            targets
-                .iter()
-                .all(|target| target.starts_with("unresolved:")),
-            "{targets:?}"
-        );
+        assert_eq!(targets, vec!["unresolved:helper".to_string()]);
         assert!(
             !edges.iter().any(|edge| edge.target_uid == sibling),
             "{edges:#?}"
+        );
+    }
+
+    /// nw-113 counterweight (code review). A `function` declaration has no
+    /// declarator binding of its own, so a same-named local declared inside
+    /// its body must not scope the function to that body.
+    #[test]
+    fn a_function_declaration_is_not_scoped_by_a_same_named_local_in_its_body() {
+        let body = r#"function format(x: number) {
+  const format = new Intl.NumberFormat();
+  return format.format(x);
+}
+"#;
+        let lib = ("src/lib.ts", "export function other() { return 1; }\n");
+        let with_import = format!(
+            "import {{ other }} from \"./lib\";\n{body}export function caller() {{ other(); return format(1); }}\n"
+        );
+        let (files, edges) = review_edges(&[lib, ("src/a.ts", &with_import)], Language::TypeScript);
+        let mut expected = vec![
+            uid(&files, "src/lib.ts", "other"),
+            uid_at(&files, "src/a.ts", "format", 2),
+        ];
+        expected.sort();
+        assert_eq!(call_targets(&files, &edges, "src/a.ts", "caller"), expected);
+
+        let without_import = format!("{body}export function caller() {{ return format(1); }}\n");
+        let (files, edges) = review_edges(&[("src/a.ts", &without_import)], Language::TypeScript);
+        assert_eq!(
+            call_targets(&files, &edges, "src/a.ts", "caller"),
+            vec![uid_at(&files, "src/a.ts", "format", 1)]
+        );
+
+        let method = "class C { items() { const items = [1]; return items; } }\nexport function useIt(c: C) { return c.items(); }\n";
+        let (files, edges) = review_edges(&[("src/c.ts", method)], Language::TypeScript);
+        assert_eq!(
+            call_targets(&files, &edges, "src/c.ts", "useIt"),
+            vec![uid(&files, "src/c.ts", "items")],
+            "a method is not scoped by a same-named local in its body"
+        );
+    }
+
+    /// nw-113 counterweights (code review): unchanged from main. A receiver
+    /// call is never filtered by a block-declared same-file candidate, and a
+    /// parameter binding never counts as a declarator.
+    #[test]
+    fn block_scope_filter_ignores_receiver_calls_and_parameter_bindings() {
+        let receiver = (
+            "src/r.ts",
+            r#"export function make() {
+  {
+    const get = () => 1;
+  }
+}
+export function use(o: any) {
+  return o.get();
+}
+"#,
+        );
+        let parameter = (
+            "src/p.ts",
+            r#"function value(value: number) {
+  return value;
+}
+export function readIt() {
+  return value();
+}
+"#,
+        );
+        let (files, edges) = review_edges(&[receiver, parameter], Language::TypeScript);
+        assert_eq!(
+            call_targets(&files, &edges, "src/r.ts", "use"),
+            vec!["unresolved:get".to_string()],
+            "a receiver call is not filtered by block scope"
+        );
+        // Discriminating receiver case: `this` matches any same-file
+        // candidate, so the block-declared `get` is bound today. The
+        // declaration-scope filter must not reject it.
+        let this_call = (
+            "src/t.ts",
+            "export function use() {\n  {\n    const get = () => 1;\n  }\n  return this.get();\n}\n",
+        );
+        let (this_files, this_edges) = review_edges(&[this_call], Language::TypeScript);
+        assert_eq!(
+            call_targets(&this_files, &this_edges, "src/t.ts", "use"),
+            vec![uid(&this_files, "src/t.ts", "get")],
+            "a `this` receiver call keeps its same-file candidate"
+        );
+        assert_eq!(
+            call_targets(&files, &edges, "src/p.ts", "readIt"),
+            vec![uid(&files, "src/p.ts", "value")],
+            "a same-named parameter is not a declarator"
         );
     }
 
