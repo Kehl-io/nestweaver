@@ -14,7 +14,7 @@
   <a href="https://github.com/Kehl-io/nestweaver/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Kehl-io/nestweaver/ci.yml?branch=main&label=CI&style=flat-square" alt="CI"></a>
   <a href="https://github.com/Kehl-io/nestweaver/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="MIT License"></a>
   <a href="https://github.com/Kehl-io/nestweaver/releases"><img src="https://img.shields.io/github/v/release/Kehl-io/nestweaver?style=flat-square&label=release" alt="Latest Release"></a>
-  <img src="https://img.shields.io/badge/rust-1.85%2B-orange?style=flat-square" alt="Rust 1.85+">
+  <img src="https://img.shields.io/badge/rust-stable-orange?style=flat-square" alt="Stable Rust for source builds">
 </p>
 
 <p align="center">
@@ -22,10 +22,20 @@
 </p>
 
 <p align="center">
-  NestWeaver parses 32 languages, resolves cross-file references with confidence scoring,<br>
-  and gives agents precomputed answers about symbols, dependencies, call graphs,<br>
-  type usage, and field access — no source reading required.
+  NestWeaver indexes source code and Markdown into a local knowledge graph.<br>
+  Search symbols, trace callers and dependencies, and get task-focused context<br>
+  from the CLI or your AI coding tool through MCP.
 </p>
+
+NestWeaver uses Tree-sitter to parse 32 languages and resolves cross-file
+references with confidence scores. Its graph helps you explore an unfamiliar
+repository, assess a change's impact, and give an agent relevant symbols and
+relationships. Indexing and structural queries run locally; semantic embeddings
+and shared-server connections are optional.
+
+[Quick Start](#quick-start) · [Install options](#install) ·
+[CLI reference](#cli-reference) · [MCP server](#mcp-server) ·
+[Upgrade guidance](#upgrading--re-index-before-you-trust-a-ranking)
 
 ---
 
@@ -94,40 +104,95 @@ Opt-in usage tracking that learns from agent query patterns to improve PPR ranki
 
 ## Quick Start
 
+### 1. Install the CLI
+
+With **Node.js 18+** on macOS 13.3+ or Linux with glibc 2.35+ (x86_64 or
+arm64):
+
 ```sh
-# From a source checkout (requires Rust 1.85+)
-eval "$(scripts/fetch-lbug-source.sh)"
-cargo install --locked --path .
-
-# Index a repository into an explicit database
-nestweaver index --repo ./my-project --db ./nestweaver.lbug
-
-# Search and get task-focused context using the same database
-nestweaver search "main" --db ./nestweaver.lbug
-nestweaver context processPayment --db ./nestweaver.lbug
-
-# Live re-indexing as you code
-nestweaver watch ./my-project --db ./nestweaver.lbug
+npm install --global nestweaver
+nestweaver --version
 ```
+
+npm installs the matching prebuilt binary as an optional dependency; no Rust
+compiler or install-time script is needed. Keep optional dependencies enabled.
+Windows and musl/Alpine do not have published binaries. For a verified GitHub
+Release archive or a source build, see [Install](#install) and
+[INSTALL.md](INSTALL.md).
+
+### 2. Index and query your repository
+
+Run these commands **from your repository root**:
+
+```sh
+nestweaver index --repo . --db "$(pwd)/nestweaver.lbug"
+nestweaver search "main" --db ./nestweaver.lbug
+# Replace processPayment with a symbol name found in your search results
+nestweaver context processPayment --db ./nestweaver.lbug
+```
+
+`search` finds symbols by name; `context` returns related symbols and their
+relationships around a name, UID, or repo-relative file path. The database and
+its sidecars stay on disk so subsequent queries can reuse the index. A local
+background daemon owns the database and starts automatically on first use.
 
 Index reports its selected database target on stderr unless `--quiet` is set;
 the target is not a field in the `--json` payload. When querying from another
-directory, pass the same absolute database path with `--db`.
+directory, pass the same **absolute database path** with `--db`. The first
+command uses an absolute path for daemon startup. Explicit
+`--db` keeps these examples bound to the same graph even if you have other
+instances configured.
+
+### 3. Connect your AI coding tool (optional)
+
+From the same repository root:
 
 ```sh
-# Configure for your AI tool (16 supported: Claude Code, Cursor, Codex, Gemini CLI, and more)
-nestweaver setup
-nestweaver setup --force   # regenerate skill/guide files even if customized
+nestweaver setup --db "$(pwd)/nestweaver.lbug"
+# Or choose a specific installed integration:
+nestweaver setup claude-code --db "$(pwd)/nestweaver.lbug"
 ```
 
-> Running `nestweaver index` interactively from inside your repo also offers to
-> configure your AI tools on the first index (skipped in CI, scripts, and
-> non-TTY runs; force it with `nestweaver index --setup`). Config files are
-> always written to the repo root.
+`setup` detects supported tools and writes their MCP registration and
+instructions. Use an absolute database path so clients launched from another
+directory still query the same graph. It supports 16 integrations, including Claude Code, Cursor,
+Codex, Gemini CLI, and Copilot CLI. Most config files are written in the repo;
+Windsurf uses its user-level config. Restart or reload your client and check
+its tool list to confirm activation. Cursor gets the six-tool lite set; other
+MCP integrations use the full set. For a client you configure manually, launch
+`nestweaver mcp --db /absolute/path/to/nestweaver.lbug` as its stdio server; see
+[MCP Server](#mcp-server) for tool filtering and lifecycle details.
 
-Run `nestweaver --help` for the full command list. Most commands support `--json` for machine-readable output.
+> The first interactive `index` run from inside your repo also offers setup.
+> The prompt is skipped in CI, scripts, and non-TTY runs; `index --setup`
+> explicitly requests setup at the indexed repo root. Use `setup --force` only
+> when you want to overwrite customized skill/guide files.
+
+```sh
+# Keep the graph current as you edit (runs until interrupted)
+nestweaver watch . --db ./nestweaver.lbug
+```
+
+Run `nestweaver --help` for the full command list. Most commands support
+`--json` for machine-readable output. Existing users should read the upgrade
+notes below before using an older database with a new binary.
 
 ## Upgrading — re-index before you trust a ranking
+
+**Upgrading an existing database?** Check compatibility before querying it:
+
+- A database from before LadybugDB 0.21 needs a **publication rebuild**, not
+  just a forced index. Back it up and follow the error's recovery command and
+  [storage-engine upgrade guide](docs/guide/publication-rebuild.md#storage-engine-upgrade-ladybugdb-021-rebuild-required).
+- For a compatible database, run `nestweaver stale-check --db <db>`. The
+  current resolver generation is **9**; any other generation requires
+  `nestweaver index --repo <path> --db <db> --force` for each repository.
+  A plain incremental index does not repair generation-stale graphs.
+- New databases do not need migration. Vaults do not carry a code resolver
+  generation; see the detailed notes for separate Markdown derivation changes.
+
+<details>
+<summary>Detailed migration notes and changes for scripts and server clients</summary>
 
 **`RESOLVER_GENERATION` is 9. Every graph indexed by another generation must be
 re-indexed.** Compatibility is an EXACT MATCH, not a floor, so a graph written
@@ -330,6 +395,8 @@ Also changing behaviour in this release, in ways a script may notice:
 | `hubs --json` / `bridges --json` are objects, not bare arrays | Read `.hubs` / `.bridges`, not `.[0]` |
 | `NESTWEAVER_NO_DAEMON` alone no longer permits a daemon bypass | Standard artifacts always use the daemon; even the unpublished CI artifact requires a GitHub Actions runner context, not a local `CI=true` |
 
+</details>
+
 ## Server Mode
 
 NestWeaver can run as a centralized server, indexing repos for your entire team and serving queries to AI agents via gRPC and MCP-over-HTTP.
@@ -382,7 +449,7 @@ open target/release/NestWeaver.app
 
 The `.app` bundle gives you a menubar status icon, Metal GPU acceleration (~5x faster embeddings via a launchd-managed daemon), a persistent daemon shared with the CLI/MCP, web UI on port 9377, and launchd-managed restart. See [macOS App](#macos-app) below.
 
-### All platforms (CLI)
+### Supported platforms (CLI)
 
 Install the release-matched CLI wrapper from [npm](https://www.npmjs.com/package/nestweaver):
 
@@ -409,12 +476,12 @@ support select CPU for `auto`.
 | macOS Apple Silicon | `aarch64-apple-darwin` |
 
 ```sh
-# After cloning the source repository (Rust 1.85+)
+# After cloning the source repository (current stable Rust)
 eval "$(scripts/fetch-lbug-source.sh)"
 cargo install --locked --path .
 ```
 
-Source builds also require CMake, a C++20 compiler, OpenSSL and zstd
+Source builds also require CMake, a C++20 compiler, Python 3.9+, OpenSSL and zstd
 development files, `pkg-config`, and Protocol Buffers. The checkout builds
 LadybugDB from source rather than downloading a prebuilt archive; keep
 `.cargo/config.toml` intact. See
@@ -854,6 +921,8 @@ weight_semantic = 0.35
 ```
 
 </details>
+
+<a id="macos-app"></a>
 
 <details>
 <summary>macOS App</summary>
