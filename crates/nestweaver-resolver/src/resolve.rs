@@ -915,8 +915,13 @@ fn resolve_single_reference(
             // Records rejections as a side effect; `min_by_key` consumes the
             // whole iterator, so every candidate is seen.
             .filter_map(|candidate| {
-                let width =
-                    same_file_declaration_scope(local_bindings, candidate.1, reference, language);
+                let width = same_file_declaration_scope(
+                    local_bindings,
+                    sorted_syms,
+                    candidate.1,
+                    reference,
+                    language,
+                );
                 same_file_out_of_scope |= width.is_none();
                 width.map(|width| (width, candidate))
             })
@@ -1995,8 +2000,15 @@ fn active_lexical_binding<'a>(
 ///   declarator, which is visible everywhere. All-`MAX` ties keep the base
 ///   first-match order.
 ///
-/// Only a symbol whose signature (after `export`/`declare`) starts with a
-/// declarator keyword (`const`/`let`/`var`/`using`) is scoped. A same-named
+/// Module level is decided by symbol nesting: a declarator is module-level
+/// when no code-bearing symbol other than `sym` contains its own binding's
+/// line. A declarator inside a function, method or test-runner callback is
+/// scoped. Residual (base behaviour): a bare top-level block
+/// `{ const f = … }` has no enclosing symbol, so it reads as module-level
+/// and ties with a module `function f`, falling back to source order.
+///
+/// Only a symbol whose signature (after `export`/`declare`/`await`) starts
+/// with a declarator keyword (`const`/`let`/`var`/`using`) is scoped. A same-named
 /// local declared inside any other symbol's body is not that symbol's
 /// declaration and must never scope it. The signature is the node's first
 /// line, which for a declaration always starts with that keyword.
@@ -2013,6 +2025,7 @@ fn active_lexical_binding<'a>(
 /// `candidate_matches`, so neither may be filtered here.
 fn same_file_declaration_scope(
     local_bindings: &[&RawReference],
+    sorted_syms: &[&RawSymbol],
     sym: &RawSymbol,
     reference: &RawReference,
     language: Language,
@@ -2037,22 +2050,23 @@ fn same_file_declaration_scope(
                 && sym.start_line <= binding.start_line
                 && binding.start_line <= sym.end_line.max(sym.start_line)
         })
-        .filter_map(|binding| binding.scope)
-        .max_by_key(|scope| scope.end - scope.start)
+        .filter_map(|binding| binding.scope.map(|scope| (binding.start_line, scope)))
+        .max_by_key(|(_, scope)| scope.end - scope.start)
     else {
         return Some(usize::MAX);
     };
+    let (line, declaration) = declaration;
     if !(declaration.start <= call.position && call.position < declaration.end) {
         return None;
     }
-    // Module level: the declarator's scope encloses every scope in the file,
-    // so it is visible everywhere and ranks like an unscoped symbol.
-    let encloses = |start: usize, end: usize| declaration.start <= start && end <= declaration.end;
-    let module_level = encloses(call.start, call.end)
-        && local_bindings
-            .iter()
-            .filter_map(|binding| binding.scope)
-            .all(|scope| encloses(scope.start, scope.end));
+    // Module level: no other code-bearing symbol contains the declarator, so
+    // it is visible everywhere and ranks like an unscoped symbol.
+    let module_level = !sorted_syms.iter().any(|other| {
+        !std::ptr::eq(*other, sym)
+            && can_contain_code(other.kind)
+            && other.start_line <= line
+            && line <= other.end_line.max(other.start_line)
+    });
     Some(if module_level {
         usize::MAX
     } else {
@@ -2061,11 +2075,11 @@ fn same_file_declaration_scope(
 }
 
 /// A JS/TS `const`/`let`/`var`/`using` declaration's first line, after any
-/// `export`/`declare` modifiers.
+/// `export`/`declare`/`await` modifiers (`await using f = …`).
 fn is_declarator_form(signature: &str) -> bool {
     signature
         .split_whitespace()
-        .find(|word| !matches!(*word, "export" | "declare"))
+        .find(|word| !matches!(*word, "export" | "declare" | "await"))
         .is_some_and(|word| matches!(word, "const" | "let" | "var" | "using"))
 }
 
@@ -8732,6 +8746,59 @@ export function multi() {
             call_targets(&files, &edges, "src/n.ts", "g"),
             vec![uid_at(&files, "src/n.ts", "f", 3)]
         );
+    }
+
+    /// nw-113 (code review 3): module level is decided by symbol nesting, not
+    /// by which bindings happen to exist. A declarator inside `g` (directly or
+    /// in a block) is scoped to `g` even when nothing outside `g` binds a name,
+    /// so it outranks the unscoped module `function f`.
+    #[test]
+    fn a_function_local_declarator_outranks_a_module_function_declaration() {
+        // Multi-line: a call on the same line as a one-line arrow is credited
+        // to the arrow (the known caller-by-line residual).
+        for (path, source, line) in [
+            (
+                "src/m1.ts",
+                "function f() { return 1; }\nexport function g() {\n  const f = () => 2;\n  return f();\n}\n",
+                3,
+            ),
+            (
+                "src/m2.ts",
+                "function f() { return 1; }\nexport function g() {\n  {\n    const f = () => 2;\n    return f();\n  }\n}\n",
+                4,
+            ),
+        ] {
+            let (files, edges) = review_edges(&[(path, source)], Language::TypeScript);
+            assert_eq!(
+                call_targets(&files, &edges, path, "g"),
+                vec![uid_at(&files, path, "f", line)],
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn declarator_form_recognises_declaration_keywords_after_modifiers() {
+        for signature in [
+            "const f = () => 1;",
+            "export const f = () => 1;",
+            "let f = () => 1;",
+            "var f = function () {};",
+            "using f = open();",
+            "await using f = open();",
+            "export declare const f: () => void;",
+        ] {
+            assert!(is_declarator_form(signature), "{signature}");
+        }
+        for signature in [
+            "function f() {}",
+            "async function f() {}",
+            "exports.f = function () {}",
+            "obj.f = function () {}",
+            "f() {}",
+        ] {
+            assert!(!is_declarator_form(signature), "{signature}");
+        }
     }
 
     /// nw-113 (code review): a declarator's own scope is the widest same-named
