@@ -12,7 +12,6 @@
 * **daemon:** only an explicit start may rewrite an existing launch agent (nw-729) ([558192e](https://github.com/Kehl-io/nestweaver/commit/558192e32d19da477f05b9ea1439e8b5cad7f27a))
 * **daemon:** review follow-ups for launch agent ownership (nw-729) ([ba5c82d](https://github.com/Kehl-io/nestweaver/commit/ba5c82d02555fe8431d8f402f5851a20ea7688b6))
 * **deps:** update rustls for security advisories ([9e5a38c](https://github.com/Kehl-io/nestweaver/commit/9e5a38c0fb137537c0bfedab50d08729f63c53d2))
-* **deps:** update rustls for security advisories ([f190f19](https://github.com/Kehl-io/nestweaver/commit/f190f1954a69c26d397b279dc66819aa716de6d2))
 * **engine:** queue directory ownership changes so watchability recovers on macOS (nw-783) ([fa90d73](https://github.com/Kehl-io/nestweaver/commit/fa90d7341f5619274c3cc9f3d6fccab194e1e2e4))
 * silent release lockfile failure and macOS watcher recovery flake ([7e72da6](https://github.com/Kehl-io/nestweaver/commit/7e72da6e74936265012f80953ecc92d07456c904))
 
