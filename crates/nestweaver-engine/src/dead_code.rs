@@ -803,6 +803,20 @@ fn detect_dead_code_inner(
         .iter()
         .filter(|s| is_excluded_from_dead_code(s) || function_local.contains(&s.uid))
         .count();
+    // nw-113: a file's `<module>` owner is a `Module`, so it is excluded from
+    // the report and the totals like every other module, but it is still an
+    // entry point: it owns the calls the file makes at load time. Seed it
+    // here, before the exclusion drops it, or a function called only at
+    // module load reads as dead.
+    let module_owners: Vec<(String, String)> = raw_symbols
+        .iter()
+        .filter(|s| {
+            s.kind == SymbolKind::Module
+                && s.name == nestweaver_schema::MODULE_OWNER_NAME
+                && s.is_entry_point
+        })
+        .map(|s| (s.uid.clone(), s.file_path.clone()))
+        .collect();
     let all_symbols: Vec<_> = raw_symbols
         .into_iter()
         .filter(|s| !is_excluded_from_dead_code(s) && !function_local.contains(&s.uid))
@@ -951,6 +965,16 @@ fn detect_dead_code_inner(
             if is_entry {
                 *lang_entries.entry(label).or_insert(0) += 1;
             }
+        }
+    }
+    for (uid, file_path) in module_owners {
+        entry_point_uids.push(uid);
+        if let Some(lang) = detect_language(std::path::Path::new(&file_path))
+            && language_has_entry_point_model(lang)
+        {
+            *lang_entries
+                .entry(format!("{lang:?}").to_lowercase())
+                .or_insert(0) += 1;
         }
     }
     let mut languages_without_entry_points: Vec<String> = lang_totals
@@ -1498,6 +1522,52 @@ mod tests {
     use super::*;
     use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
     use nestweaver_store::GraphStore;
+
+    /// nw-113, end to end through the real index pipeline: a function called
+    /// only at a file's top level has a caller (the file's `<module>` owner,
+    /// an entry point), so it is live. The owner itself is never reported.
+    #[test]
+    fn a_function_called_only_at_module_load_is_not_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("src/lib.ts"),
+            "export function flushBuffer() { return 8; }\nfunction orphan() { return 9; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/ownerless.ts"),
+            "import { flushBuffer } from \"./lib\";\nflushBuffer();\n",
+        )
+        .unwrap();
+        let db = dir.path().join("graph.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        crate::index::index_directory_with_store(
+            &store,
+            &repo,
+            &db,
+            "default",
+            "https://example.com/acme/ownerless.git",
+            "sha",
+            false,
+            None,
+        )
+        .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        let dead: Vec<&str> = result
+            .unreachable_symbols
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect();
+        assert!(!dead.contains(&"flushBuffer"), "{dead:?}");
+        assert!(dead.contains(&"orphan"), "{dead:?}");
+        assert!(
+            !dead.contains(&nestweaver_schema::MODULE_OWNER_NAME),
+            "{dead:?}"
+        );
+    }
 
     fn make_symbol(uid: &str, name: &str, is_entry: bool) -> Symbol {
         Symbol {
