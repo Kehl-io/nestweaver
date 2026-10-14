@@ -42,7 +42,9 @@ use serde::{Deserialize, Serialize};
 ///     declaration byte scopes. These changes share one unreleased cache version.
 /// 5 — Rust inline-module functions and exact unit/member-return evidence;
 ///     CommonJS literal methods and implicit constructor fields.
-const CACHE_VERSION: u32 = 5;
+/// 6 — nw-113: a JS/TS/Python/PHP file with a call outside every
+///     code-bearing span gains a `<module>` owner symbol (`module_init`).
+const CACHE_VERSION: u32 = 6;
 
 /// A log larger than this (and than the base) is folded into the base.
 const LOG_COMPACT_MIN_BYTES: u64 = 64 * 1024 * 1024;
