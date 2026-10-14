@@ -856,6 +856,9 @@ fn daemon_start_command(
 ) -> std::process::Command {
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["daemon", "--db"]).arg(db_path).arg("start");
+    // nw-729: a client start never rewrites an existing launch agent; it
+    // starts what is registered. Only an explicit `daemon start` may change it.
+    cmd.arg("--client-autostart");
     // nw-088 leg (2). One predicate governs "is this path ephemeral" across
     // the whole daemon lifecycle — macOS launchd-vs-foreground-child routing
     // and the gc sweep's reclaimability already use
@@ -1736,6 +1739,26 @@ credential_method = "gh"
     }
 
     #[test]
+    fn daemon_start_command_marks_every_client_start() {
+        // nw-729: the one flag that tells `daemon start` an existing launch
+        // agent is not this caller's to rewrite. Every client-initiated start
+        // (cold autostart and the version-mismatch restart) is built here.
+        for usage in [DaemonUsage::OneShot, DaemonUsage::LongRunning] {
+            let command = daemon_start_command(
+                Path::new("/opt/nestweaver"),
+                Path::new("/home/kory/projects/brain/brain.lbug"),
+                None,
+                usage,
+                false,
+                DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS,
+            );
+            let args: Vec<_> = command.get_args().collect();
+            assert_eq!(args[3], "start");
+            assert_eq!(args[4], "--client-autostart");
+        }
+    }
+
+    #[test]
     fn daemon_start_command_forwards_db_and_config() {
         // `tempfile::tempdir()` lives under the OS temp root by construction,
         // so this exercises the SAME `is_temp_db_path(db)` branch nw-088 leg
@@ -1765,6 +1788,7 @@ credential_method = "gh"
                 "--db",
                 db.to_str().unwrap(),
                 "start",
+                "--client-autostart",
                 "--idle-timeout",
                 &DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS.to_string(),
                 "--config",
@@ -1809,7 +1833,14 @@ credential_method = "gh"
             .collect::<Vec<_>>();
         assert_eq!(
             args,
-            ["daemon", "--db", db.to_str().unwrap(), "start"].map(std::ffi::OsString::from)
+            [
+                "daemon",
+                "--db",
+                db.to_str().unwrap(),
+                "start",
+                "--client-autostart"
+            ]
+            .map(std::ffi::OsString::from)
         );
     }
 
@@ -1842,7 +1873,14 @@ credential_method = "gh"
             .collect::<Vec<_>>();
         assert_eq!(
             args,
-            ["daemon", "--db", db.to_str().unwrap(), "start"].map(std::ffi::OsString::from),
+            [
+                "daemon",
+                "--db",
+                db.to_str().unwrap(),
+                "start",
+                "--client-autostart"
+            ]
+            .map(std::ffi::OsString::from),
             "an explicit override must suppress --idle-timeout even for a \
              path the heuristic alone would call ephemeral"
         );
@@ -1877,6 +1915,7 @@ credential_method = "gh"
                 "--db",
                 db.to_str().unwrap(),
                 "start",
+                "--client-autostart",
                 "--idle-timeout",
                 &DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS.to_string(),
             ]
@@ -1907,6 +1946,7 @@ credential_method = "gh"
                 "--db",
                 db.to_str().unwrap(),
                 "start",
+                "--client-autostart",
                 "--idle-timeout",
                 "17"
             ]
@@ -1945,7 +1985,14 @@ credential_method = "gh"
             .collect::<Vec<_>>();
         assert_eq!(
             args,
-            ["daemon", "--db", db.to_str().unwrap(), "start"].map(std::ffi::OsString::from),
+            [
+                "daemon",
+                "--db",
+                db.to_str().unwrap(),
+                "start",
+                "--client-autostart"
+            ]
+            .map(std::ffi::OsString::from),
             "a declared long-running caller must suppress --idle-timeout \
              over a temp-shaped path exactly as the explicit env-var escape \
              does — usage, not path, decides this now"
@@ -1981,6 +2028,7 @@ credential_method = "gh"
                 "--db",
                 db.to_str().unwrap(),
                 "start",
+                "--client-autostart",
                 "--idle-timeout",
                 &DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS.to_string(),
             ]

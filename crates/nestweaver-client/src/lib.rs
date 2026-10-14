@@ -899,6 +899,50 @@ pub async fn connect_verified_replacement(
     Ok(client)
 }
 
+/// Does the launch agent serving this instance run a binary other than `exe`?
+/// Both are compared by canonical path, so a symlink to this binary is this
+/// binary. No agent at all is `false`: the restart then starts one normally.
+fn agent_runs_another_binary(agent_program: Option<&Path>, exe: &Path) -> bool {
+    let Some(program) = agent_program else {
+        return false;
+    };
+    let canonical = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical(program) != canonical(exe)
+}
+
+/// nw-729. A version-mismatch restart relaunches the instance's launch agent
+/// as written; a client never rewrites it. When that agent runs a different
+/// binary from this client, restarting would only bring the same version
+/// back, so refuse BEFORE shutting anything down and name the explicit
+/// command that moves the daemon to this binary.
+fn refuse_restart_that_cannot_change_the_version(
+    db_path: &Path,
+    daemon_version: &str,
+    our_version: &str,
+) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
+        let program = nestweaver_daemon::launchd::agent_program(&instance_id);
+        let exe = std::env::current_exe().context("cannot determine this client's binary")?;
+        if agent_runs_another_binary(program.as_deref(), &exe) {
+            let program = program.unwrap_or_default();
+            anyhow::bail!(
+                "the daemon for {db} is version {daemon_version} and this client is \
+                 {our_version}. Its launch agent runs {program}, not this binary ({exe}), so an \
+                 automatic restart would bring version {daemon_version} back. Run `{exe} daemon \
+                 --db {db} start` to move the daemon to this binary, or update {program}.",
+                db = db_path.display(),
+                program = program.display(),
+                exe = exe.display(),
+            );
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (db_path, daemon_version, our_version);
+    Ok(())
+}
+
 impl DaemonClient {
     /// Connect to the daemon for the given database, auto-starting if needed.
     ///
@@ -959,6 +1003,7 @@ impl DaemonClient {
 
         let our_version = env!("CARGO_PKG_VERSION");
         if resp.version != our_version {
+            refuse_restart_that_cannot_change_the_version(db_path, &resp.version, our_version)?;
             warn!(
                 daemon_version = %resp.version,
                 client_version = %our_version,
@@ -3023,5 +3068,35 @@ mod bounded_existing_connection_tests {
             Ok(_) => panic!("must not autostart a missing daemon"),
         };
         assert!(message.contains("daemon socket not found"), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod agent_binary_tests {
+    use super::*;
+
+    /// nw-729: a version-mismatch restart may proceed only when relaunching the
+    /// agent would run THIS binary — the in-place upgrade every install does.
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_is_refused_only_when_the_agent_runs_another_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("nestweaver");
+        std::fs::write(&exe, b"").unwrap();
+        let other = dir.path().join("app-nestweaver-cli");
+        std::fs::write(&other, b"").unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&exe, &alias).unwrap();
+
+        assert!(agent_runs_another_binary(Some(&other), &exe));
+        assert!(!agent_runs_another_binary(Some(&exe), &exe));
+        assert!(
+            !agent_runs_another_binary(Some(&alias), &exe),
+            "a symlink to this binary is this binary"
+        );
+        assert!(
+            !agent_runs_another_binary(None, &exe),
+            "no launch agent: the restart starts one the ordinary way"
+        );
     }
 }
