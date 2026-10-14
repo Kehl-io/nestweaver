@@ -888,9 +888,13 @@ fn resolve_single_reference(
                 }
         })
     });
-    if binding.is_some_and(|binding| binding.source_file.is_none()) {
-        return Some(unresolved_edge(source_uid, &reference.name, edge_type));
-    }
+    // nw-113: an unresolved import binding still shadows every same-file
+    // declaration except a block-scoped one declared strictly inside the
+    // binding's own scope. Single-file passes (watcher, incremental index)
+    // see an import of a sibling file as unresolved because the sibling is
+    // not in the resolution set, so without that exception they dropped the
+    // block-local edge the full index keeps.
+    let unresolved_binding = binding.filter(|binding| binding.source_file.is_none());
 
     // Priority 1: Same file. A local symbol shadows an import alias of the
     // same name, so this check runs on the reference's own name, before any
@@ -927,6 +931,13 @@ fn resolve_single_reference(
             })
             // Ties keep the first in source order: the base `.find` order.
             .min_by_key(|(width, _)| *width)
+            .filter(|(width, _)| {
+                unresolved_binding.is_none_or(|binding| {
+                    binding
+                        .scope
+                        .is_some_and(|scope| *width < scope.end - scope.start)
+                })
+            })
             .map(|(_, candidate)| candidate)
     {
         let target_uid = symbol_uid(repo_uid, file_path, &sym.name, sym.start_line);
@@ -943,6 +954,12 @@ fn resolve_single_reference(
                 note: None,
             }],
         });
+    }
+
+    // Otherwise an import whose source is not in this resolution set binds
+    // nothing: no sibling homonym or later tier may stand in for it.
+    if unresolved_binding.is_some() {
+        return Some(unresolved_edge(source_uid, &reference.name, edge_type));
     }
 
     if exact_rust_call.is_some_and(|assignment| {
@@ -8571,6 +8588,37 @@ export function innerOnly() {
         assert_eq!(
             call_targets(&files, &edges, "src/lexical.ts", "innerOnly"),
             vec![inner_only_local]
+        );
+    }
+
+    /// nw-113 (watcher parity). The watcher and the CLI incremental index
+    /// resolve a changed file ALONE before re-resolving cross-file edges, so
+    /// the import's source file is absent and its binding is unresolved. The
+    /// block-local declaration must still shadow that binding inside its
+    /// block, exactly as it does when the imported file is present.
+    #[test]
+    fn a_block_local_callable_shadows_an_import_whose_source_is_absent() {
+        let lexical = (
+            "src/lexical.ts",
+            r#"import { sendPacket } from "./lib";
+export function lexicalCaller() {
+  {
+    const sendPacket = () => 42;
+    sendPacket();
+  }
+  return sendPacket();
+}
+"#,
+        );
+        let (files, edges) = review_edges(&[lexical], Language::TypeScript);
+        let block_local = uid_at(&files, "src/lexical.ts", "sendPacket", 4);
+        assert_eq!(
+            call_targets(&files, &edges, "src/lexical.ts", "lexicalCaller")
+                .into_iter()
+                .filter(|target| target.starts_with("sym:"))
+                .collect::<Vec<_>>(),
+            vec![block_local],
+            "{edges:#?}"
         );
     }
 

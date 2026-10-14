@@ -3451,6 +3451,68 @@ mod tests {
         assert_eq!(symbols(&store), symbols(&fresh));
     }
 
+    /// nw-113 (watcher parity). A watcher batch resolves the saved file on
+    /// its own before re-resolving cross-file edges, so the imported file is
+    /// absent from that pass. The same-file CALLS edge to a block-local
+    /// callable that shadows an import must survive the batch, matching a
+    /// fresh index of the same tree.
+    #[test]
+    fn watcher_keeps_same_file_call_to_block_local_that_shadows_an_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        std::fs::write(
+            repo_root.join("lib.ts"),
+            "export function sendPacket(): number { return 7; }\n",
+        )
+        .unwrap();
+        let lexical = |value: u32| {
+            format!(
+                "import {{sendPacket}} from \"./lib\";\nexport function lexicalCaller() {{\n  {{\n    const sendPacket = () => {value};\n    sendPacket();\n  }}\n  return sendPacket();\n}}\n"
+            )
+        };
+        std::fs::write(repo_root.join("lexical.ts"), lexical(42)).unwrap();
+        let root = std::fs::canonicalize(&repo_root).unwrap();
+        let repo_url = format!("file://{}", root.display());
+        let r_uid = nestweaver_schema::repo_uid("test", &repo_url);
+        let (_, store) =
+            crate::index::index_directory_in_memory(&root, "test", &repo_url, "sha1").unwrap();
+        let block_local = store
+            .symbols_in_file("lexical.ts")
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "sendPacket" && s.start_line == 4)
+            .expect("block-local sendPacket should be indexed")
+            .uid;
+        let lexical_caller = uid_of(&store, &r_uid, "lexicalCaller");
+        let calls_block_local = |db: &GraphStore| {
+            db.callees_with_edge_types_of(&lexical_caller)
+                .unwrap()
+                .iter()
+                .any(|(s, kind)| s.uid == block_local && kind == "CALLS")
+        };
+        assert!(calls_block_local(&store), "precondition: index binds it");
+
+        std::fs::write(root.join("lexical.ts"), lexical(43)).unwrap();
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        process_fixture_batch(&watcher, &store, &r_uid, &root, &[root.join("lexical.ts")]);
+        assert!(
+            calls_block_local(&store),
+            "the watcher batch dropped lexicalCaller -> block-local sendPacket"
+        );
+
+        let (_, fresh) =
+            crate::index::index_directory_in_memory(&root, "test", &repo_url, "fresh").unwrap();
+        let topology = |db: &GraphStore| {
+            db.load_typed_edges()
+                .unwrap()
+                .into_iter()
+                .map(|(a, b, kind, _, _)| (a, b, kind))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(topology(&store), topology(&fresh));
+    }
+
     #[test]
     fn directory_move_rebuilds_mixed_controller_and_spec_contracts() {
         let dir = tempfile::tempdir().unwrap();

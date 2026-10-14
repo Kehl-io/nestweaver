@@ -14562,6 +14562,83 @@ module.exports = { check, plain };\n";
         );
     }
 
+    /// nw-113 (incremental parity). The git-diff incremental path resolves
+    /// each changed file alone, then re-resolves only cross-file edges, so
+    /// the same-file edge to a block-local callable that shadows an import
+    /// must come out of the single-file pass.
+    #[test]
+    fn incremental_index_keeps_same_file_call_to_block_local_that_shadows_an_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("lib.ts"),
+            "export function sendPacket(): number { return 7; }\n",
+        )
+        .unwrap();
+        let lexical = |value: u32| {
+            format!(
+                "import {{sendPacket}} from \"./lib\";\nexport function lexicalCaller() {{\n  {{\n    const sendPacket = () => {value};\n    sendPacket();\n  }}\n  return sendPacket();\n}}\n"
+            )
+        };
+        fs::write(repo.join("lexical.ts"), lexical(42)).unwrap();
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        let repo_url = "https://example.com/nw-113-incremental";
+        index_directory(
+            &repo,
+            &db_path,
+            "test",
+            repo_url,
+            &git(&["rev-parse", "HEAD"]),
+        )
+        .unwrap();
+
+        let calls_block_local = || {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            let symbols = store.symbols_in_file("lexical.ts").unwrap();
+            let block_local = symbols
+                .iter()
+                .find(|s| s.name == "sendPacket" && s.start_line == 4)
+                .expect("block-local sendPacket should be indexed");
+            let caller = symbols
+                .iter()
+                .find(|s| s.name == "lexicalCaller")
+                .expect("lexicalCaller should be indexed");
+            store
+                .callees_with_edge_types_of(&caller.uid)
+                .unwrap()
+                .iter()
+                .any(|(s, kind)| s.uid == block_local.uid && kind == "CALLS")
+        };
+        assert!(calls_block_local(), "precondition: full index binds it");
+
+        fs::write(repo.join("lexical.ts"), lexical(43)).unwrap();
+        git(&["commit", "-q", "-am", "edit lexical.ts"]);
+        let result = incremental_index(&repo, &db_path, "test", repo_url).unwrap();
+        assert!(
+            !result.fell_back_to_full,
+            "must exercise the incremental path"
+        );
+        assert!(
+            calls_block_local(),
+            "the incremental index dropped lexicalCaller -> block-local sendPacket"
+        );
+    }
+
     /// nw-204. The acceptance criterion that matters, and the one the original
     /// backlog item did NOT have: assert on SEARCH RESULTS, not on the vector
     /// count or the file size. Compaction alone satisfies "the count drops and
