@@ -2251,7 +2251,10 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
 ///
 /// Coverage is one difference-array sweep, O(lines + symbols + calls). The
 /// owner's hash covers only the uncovered (top-level) lines, so an edit inside
-/// a function body does not read as a change to `<module>`.
+/// a function body does not read as a change to `<module>`. Only code-bearing
+/// spans count as covered: lines inside a data symbol (a multi-line
+/// `const cfg = { ... }`, a module-level `Variable` or `Constant`) are
+/// top-level code that runs at load, so they count toward the hash.
 fn module_owner_symbol(
     source: &str,
     symbols: &[RawSymbol],
