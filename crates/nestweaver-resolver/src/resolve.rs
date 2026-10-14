@@ -146,11 +146,12 @@ pub fn resolve_references_with_file_languages(
         .iter()
         .map(|(_, symbols, _)| {
             let mut v: Vec<&RawSymbol> = symbols.iter().collect();
-            v.sort_by_key(|s| s.start_line);
-            // nw-113: the parser inserts the `<module>` owner at index 0 with
-            // `start_line` 1 and this sort is stable, so the owner, when
-            // present, is always first. `resolve_single_reference` relies on
-            // that to find it in O(1).
+            // nw-113: the `<module>` owner sorts ahead of any symbol on its
+            // line, so it is always first whatever order the symbols arrive
+            // in (the parser's, or the store's when `build_reresolve_edges`
+            // rebuilds them). `resolve_single_reference` relies on that to
+            // find it in O(1).
+            v.sort_by_key(|s| (s.start_line, !s.is_module_owner()));
             debug_assert!(
                 v.iter().skip(1).all(|s| !s.is_module_owner()),
                 "the <module> owner must sort first"
@@ -9741,6 +9742,30 @@ export function readIt() { return value(); }
                 .any(|s| s.name == nestweaver_schema::MODULE_OWNER_NAME),
             "{:?}",
             files[0].1
+        );
+    }
+
+    /// nw-113 review: symbols rebuilt from the store (`build_reresolve_edges`)
+    /// arrive in DB order, not parser order, so a same-line symbol can precede
+    /// the owner. The owner must still sort first and own the call.
+    #[test]
+    fn the_module_owner_sorts_first_from_symbols_in_db_order() {
+        let path = "src/db_order.ts";
+        let source = "function f() {}\nf();\n";
+        let parsed = parse_source(Path::new(path), source).unwrap();
+        let mut symbols = parsed.symbols;
+        assert!(symbols[0].is_module_owner(), "{symbols:?}");
+        assert_eq!(
+            symbols[1].start_line, 1,
+            "fixture: f shares the owner's line"
+        );
+        symbols.swap(0, 1);
+        let files = vec![(path.to_string(), symbols, parsed.references)];
+        let edges = resolve_references(&files, Language::TypeScript, "repo:test:abc");
+        assert_eq!(
+            call_targets(&files, &edges, path, nestweaver_schema::MODULE_OWNER_NAME),
+            vec![uid(&files, path, "f")],
+            "{edges:#?}"
         );
     }
 }
