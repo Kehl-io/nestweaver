@@ -912,12 +912,15 @@ fn resolve_single_reference(
                     })
                     && candidate_matches(reference, file_path, f, sym, language, graph)
             })
+            // Records rejections as a side effect; `min_by_key` consumes the
+            // whole iterator, so every candidate is seen.
             .filter_map(|candidate| {
                 let width =
                     same_file_declaration_scope(local_bindings, candidate.1, reference, language);
                 same_file_out_of_scope |= width.is_none();
                 width.map(|width| (width, candidate))
             })
+            // Ties keep the first in source order: the base `.find` order.
             .min_by_key(|(width, _)| *width)
             .map(|(_, candidate)| candidate)
     {
@@ -1982,36 +1985,32 @@ fn active_lexical_binding<'a>(
 /// declaring `LocalBinding` carries that block's byte range. Returns:
 /// - `None` when the declaration is not visible at the call (its own
 ///   declarator's block excludes the call position);
-/// - `Some(width)` with that block's width when it is (a module-level
-///   `const f = () =>` gets its program-scope width);
-/// - `Some(usize::MAX)` when `sym` has no declarator of its own: function
-///   declarations, methods, class fields and every non-`Function` kind. A
-///   same-named local declared inside such a symbol's body is not its
-///   declaration, so it must never scope the symbol.
+/// - `Some(width)` with that block's width when it is, so the innermost
+///   visible declarator wins;
+/// - `Some(usize::MAX)` (unfiltered, base behaviour) for everything that
+///   carries no shadowing information: a symbol that is not a declarator
+///   (function declarations, nested or not; methods; class fields;
+///   assignment forms such as `exports.f = function …` and
+///   `obj.f = function …`; every non-`Function` kind), and a module-level
+///   declarator, which is visible everywhere. All-`MAX` ties keep the base
+///   first-match order.
+///
+/// Only a symbol whose signature (after `export`/`declare`) starts with a
+/// declarator keyword (`const`/`let`/`var`/`using`) is scoped. A same-named
+/// local declared inside any other symbol's body is not that symbol's
+/// declaration and must never scope it. The signature is the node's first
+/// line, which for a declaration always starts with that keyword.
 ///
 /// A declarator's own block encloses any same-named local declared inside
 /// an initializer in its span (`let a = { g() { let f = 1; return f; } },
 /// f = () => 2;` puts the inner `f` ahead of `f`'s own declarator), so among
 /// the in-span same-named declarator bindings the one with the WIDEST scope
-/// is the symbol's declaration.
+/// is the symbol's declaration. A same-named parameter in that span is
+/// always narrower than the declarator's own binding, so it is never chosen.
 ///
-/// The signature is the node's first line. A modifier on its own line
-/// (`async\nfunction f() {}`) is not part of the node, whose signature then
-/// starts at `function`, so the declaration-form check still sees it.
-///
-/// A CommonJS `exports.f = function () {…}` has no declarator binding of its
-/// own, so it keeps the unfiltered behaviour: a bare `f()` in that file still
-/// binds it, as before nw-113.
-///
-/// Gated to bare JS/TS calls (plan validation): Rust has its own exact gate
+/// Gated to bare JS/TS calls (plan validation): Rust has its own exact gate,
 /// and receiver calls (`Api.get()`, `this.x()`) are matched by
-/// `candidate_matches`, so neither may be filtered here. Only declarator
-/// bindings count. A parameter's binding has `initialized_at == position`
-/// (the same test `name_is_locally_bound` uses), and a same-named parameter
-/// on the declaration line must not hide the symbol: for
-/// `exports.value = function (value) {…}` the parameter is the only in-span
-/// binding. Everything outside
-/// that gate gets `Some(usize::MAX)`: behaviour unchanged.
+/// `candidate_matches`, so neither may be filtered here.
 fn same_file_declaration_scope(
     local_bindings: &[&RawReference],
     sym: &RawSymbol,
@@ -2021,7 +2020,7 @@ fn same_file_declaration_scope(
     if !matches!(language, Language::JavaScript | Language::TypeScript)
         || reference.receiver.is_some()
         || sym.kind != SymbolKind::Function
-        || is_function_declaration_form(&sym.signature)
+        || !is_declarator_form(&sym.signature)
     {
         return Some(usize::MAX);
     }
@@ -2039,27 +2038,35 @@ fn same_file_declaration_scope(
                 && binding.start_line <= sym.end_line.max(sym.start_line)
         })
         .filter_map(|binding| binding.scope)
-        .filter(|scope| scope.initialized_at > scope.position)
         .max_by_key(|scope| scope.end - scope.start)
     else {
         return Some(usize::MAX);
     };
-    (declaration.start <= call.position && call.position < declaration.end)
-        .then(|| declaration.end - declaration.start)
+    if !(declaration.start <= call.position && call.position < declaration.end) {
+        return None;
+    }
+    // Module level: the declarator's scope encloses every scope in the file,
+    // so it is visible everywhere and ranks like an unscoped symbol.
+    let encloses = |start: usize, end: usize| declaration.start <= start && end <= declaration.end;
+    let module_level = encloses(call.start, call.end)
+        && local_bindings
+            .iter()
+            .filter_map(|binding| binding.scope)
+            .all(|scope| encloses(scope.start, scope.end));
+    Some(if module_level {
+        usize::MAX
+    } else {
+        declaration.end - declaration.start
+    })
 }
 
-/// A JS/TS `function` / `function*` declaration (its signature, after any
-/// `export`/`default`/`declare`/`async` modifiers, starts with `function`),
-/// as opposed to a `const f = …` declarator.
-fn is_function_declaration_form(signature: &str) -> bool {
-    let mut rest = signature.trim_start();
-    while let Some(next) = ["export ", "default ", "declare ", "async "]
-        .iter()
-        .find_map(|modifier| rest.strip_prefix(modifier))
-    {
-        rest = next.trim_start();
-    }
-    rest.starts_with("function")
+/// A JS/TS `const`/`let`/`var`/`using` declaration's first line, after any
+/// `export`/`declare` modifiers.
+fn is_declarator_form(signature: &str) -> bool {
+    signature
+        .split_whitespace()
+        .find(|word| !matches!(*word, "export" | "declare"))
+        .is_some_and(|word| matches!(word, "const" | "let" | "var" | "using"))
 }
 
 fn name_is_locally_bound(
@@ -8676,6 +8683,57 @@ export function multi() {
         );
     }
 
+    /// nw-113 (code review 2): an assignment-form function (`exports.f =`,
+    /// `module.exports.f =`, `obj.f =`) has no declarator of its own, so a
+    /// same-named local inside its body must not scope it. The parser mints
+    /// no symbol for `obj.f = function` (only CommonJS exports, nw-687), so
+    /// that case is unresolved on base too; it is pinned unchanged.
+    #[test]
+    fn assignment_form_functions_are_not_scoped_by_a_same_named_inner_local() {
+        for (path, target, has_symbol) in [
+            ("src/exp.js", "exports.format = function (x) {", true),
+            ("src/mod.js", "module.exports.format = function (x) {", true),
+            ("src/obj.js", "obj.format = function (x) {", false),
+        ] {
+            let source = format!(
+                "const obj = {{}};\n{target}\n  const format = new Intl.NumberFormat();\n  return format.format(x);\n}};\nfunction caller() {{ return format(1); }}\n"
+            );
+            let (files, edges) = review_edges(&[(path, &source)], Language::JavaScript);
+            let expected: Vec<String> = files[0]
+                .1
+                .iter()
+                .filter(|symbol| symbol.name == "format" && symbol.kind == SymbolKind::Function)
+                .map(|symbol| symbol_uid("repo:test:abc", path, "format", symbol.start_line))
+                .collect();
+            let expected = if has_symbol {
+                assert_eq!(expected.len(), 1, "{path}: {:#?}", files[0].1);
+                expected
+            } else {
+                assert!(expected.is_empty(), "{path}: {:#?}", files[0].1);
+                vec!["unresolved:format".to_string()]
+            };
+            assert_eq!(
+                call_targets(&files, &edges, path, "caller"),
+                expected,
+                "{path}: {:#?}",
+                files[0].1
+            );
+        }
+    }
+
+    /// nw-113 (code review 2): a module-level declarator is visible everywhere
+    /// and carries no shadowing information, so it must not outrank a nested
+    /// `function` declaration that the call actually reaches.
+    #[test]
+    fn a_module_level_declarator_does_not_outrank_a_nested_function_declaration() {
+        let source = "// header\nfunction g() {\n  function f() { return 1; }\n  return f();\n}\nconst f = () => 2;\n";
+        let (files, edges) = review_edges(&[("src/n.ts", source)], Language::TypeScript);
+        assert_eq!(
+            call_targets(&files, &edges, "src/n.ts", "g"),
+            vec![uid_at(&files, "src/n.ts", "f", 3)]
+        );
+    }
+
     /// nw-113 (code review): a declarator's own scope is the widest same-named
     /// declarator binding in its span, not the earliest. An earlier
     /// declarator's local `f` must not scope the later `f`. One line on
@@ -8749,9 +8807,8 @@ export function readIt() {
             vec![uid(&files, "src/p.ts", "value")],
             "a same-named parameter is not a declarator"
         );
-        // Parameter filter (discriminating): the CommonJS function has no
-        // declarator binding, so its same-named parameter is the only in-span
-        // binding and must not scope it to the function body.
+        // A CommonJS function is not a declarator, so its same-named
+        // parameter (the only in-span binding) never scopes it.
         let commonjs = (
             "src/cjs.js",
             "exports.value = function (value) { return value; };\nfunction readIt() { return value(); }\n",

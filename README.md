@@ -208,9 +208,10 @@ shadows the real `getTier`. Generation 9 replaces file-level import proxies with
 actual binding users, corrects receiver and export resolution, and persists
 exported executable roots. Upgrading from generation 8 requires a forced
 re-index of every repository; `stale-check` exits 2 and `dead-code` refuses
-until the graph matches. Generation 10 (nw-113) restricts a block-scoped JS/TS callable to its block. Graphs indexed at generation 9
-need the same forced re-index. All these kinds of
-staleness have the same remedy and the same symptom list. Until you re-index:
+until the graph matches. Generation 10 (nw-113) restricts a block-scoped
+JS/TS callable to its block; graphs indexed at generation 9 need the same
+forced re-index. All these kinds of staleness have the same remedy and the
+same symptom list. Until you re-index:
 
 - **Rankings are stale.** `hubs`, `bridges`, `repo-map`, `clusters`, and every
   PageRank-ordered result are computed over edges the old resolver wrote.

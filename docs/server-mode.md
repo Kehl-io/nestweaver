@@ -973,9 +973,11 @@ immediately in normal operation.
 > definitions, and generation 8 (nw-688) renames JS/TS test-runner blocks so
 > a test title no longer shadows a real definition. Generation 9 corrects
 > binding-user imports, receiver/export resolution and exported executable
-> roots. Generation 10 (nw-113) restricts a block-scoped JS/TS callable to its block. A generation-8 or generation-9 graph must also be rebuilt: `stale-check` exits 2 and
-> `dead-code` refuses until it matches. Re-index every repo — `nestweaver index --repo
-> <path> --force` — before trusting any ranking on this server.
+> roots. Generation 10 (nw-113) restricts a block-scoped JS/TS callable to
+> its block. A generation-8 or generation-9 graph must also be rebuilt:
+> `stale-check` exits 2 and `dead-code` refuses until it matches. Re-index
+> every repo — `nestweaver index --repo <path> --force` — before trusting any
+> ranking on this server.
 >
 > **`stale-check` detects this as of 9.0.0.** A generation-stale repo reports
 > `status: "outdated_resolver"` with `resolver_stale: true` and

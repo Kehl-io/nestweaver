@@ -269,14 +269,17 @@ use std::path::Path;
 /// 10 — nw-113: a JS/TS `const f = () => …` declared inside a block used to
 ///     win same-file resolution for every bare call to `f` in the file, so a
 ///     call outside the block bound to the block-local instead of the
-///     imported `f` it actually reaches. A same-file declarator candidate is
-///     now scoped by its own declarator's block, and the innermost visible
-///     declaration wins. Function declarations, methods and receiver calls
-///     are unaffected. In a JS/TS file with no imports, a name declared only
-///     in blocks that do not contain the call is now unresolved instead of
-///     falling back to a same-directory sibling's function. Edges written by
-///     generation 9 keep the wrong target until re-indexed:
-///     `nestweaver index --repo <path> --force`.
+///     imported `f` it actually reaches. A same-file candidate declared by a
+///     `const`/`let`/`var`/`using` declarator inside a block is now scoped
+///     by that block, and the innermost visible declaration wins. Everything
+///     else keeps the generation-9 first-match order: function declarations
+///     (nested or not), methods, CommonJS and other assignment forms
+///     (`exports.f = function …`), module-level declarators, which are
+///     visible everywhere, and receiver calls. In a JS/TS file with no
+///     imports, a name declared only in blocks that do not contain the call
+///     is now unresolved instead of falling back to a same-directory
+///     sibling's function. Edges written by generation 9 keep the wrong
+///     target until re-indexed: `nestweaver index --repo <path> --force`.
 pub const RESOLVER_GENERATION: u32 = 10;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
