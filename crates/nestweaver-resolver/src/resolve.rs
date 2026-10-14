@@ -147,6 +147,14 @@ pub fn resolve_references_with_file_languages(
         .map(|(_, symbols, _)| {
             let mut v: Vec<&RawSymbol> = symbols.iter().collect();
             v.sort_by_key(|s| s.start_line);
+            // nw-113: the parser inserts the `<module>` owner at index 0 with
+            // `start_line` 1 and this sort is stable, so the owner, when
+            // present, is always first. `resolve_single_reference` relies on
+            // that to find it in O(1).
+            debug_assert!(
+                v.iter().skip(1).all(|s| !is_module_owner(s)),
+                "the <module> owner must sort first"
+            );
             v
         })
         .collect();
@@ -497,13 +505,17 @@ fn resolve_single_reference(
     // there is always module-level code. Other reference kinds keep today's
     // behaviour: the owner is for executed calls, not type mentions or field
     // reads.
-    let module_owner = (edge_type == EdgeType::Calls)
-        .then(|| sorted_syms.iter().copied().find(|s| is_module_owner(s)))
-        .flatten();
+    // The owner always sorts first (asserted where `sorted_syms` is built).
+    let module_owner = || {
+        sorted_syms
+            .first()
+            .copied()
+            .filter(|s| edge_type == EdgeType::Calls && is_module_owner(s))
+    };
     let source_sym = match find_enclosing_symbol(sorted_syms, reference.start_line) {
         Enclosing::Exact(s) => s,
-        Enclosing::Degenerate(s) => module_owner.unwrap_or(s),
-        Enclosing::ModuleScope => module_owner?,
+        Enclosing::Degenerate(s) => module_owner().unwrap_or(s),
+        Enclosing::ModuleScope => module_owner()?,
     };
     let source_uid = symbol_uid(repo_uid, file_path, &source_sym.name, source_sym.start_line);
 
@@ -9610,15 +9622,132 @@ export function readIt() { return value(); }
             "import { handle } from \"./lib\";\napp.get('/', () => {\n  handle();\n});\n",
         );
         let (files, edges) = review_edges(&[lib, app], Language::TypeScript);
-        assert!(
+        let mut expected = vec![
+            uid(&files, "src/lib.ts", "handle"),
+            "unresolved:get".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(
             call_targets(
                 &files,
                 &edges,
                 "src/app.ts",
                 nestweaver_schema::MODULE_OWNER_NAME
-            )
-            .contains(&uid(&files, "src/lib.ts", "handle")),
+            ),
+            expected,
             "{edges:#?}"
+        );
+    }
+
+    /// PHP: the degenerate guess (a one-line function above a top-level call)
+    /// becomes the module owner, not a self-edge.
+    #[test]
+    fn a_php_top_level_call_after_a_one_line_function_is_owned_by_the_module() {
+        let file = (
+            "src/boot.php",
+            "<?php\nfunction helper() { return 1; }\nhelper();\n",
+        );
+        let (files, edges) = review_edges(&[file], Language::Php);
+        assert_eq!(
+            call_targets(
+                &files,
+                &edges,
+                "src/boot.php",
+                nestweaver_schema::MODULE_OWNER_NAME
+            ),
+            vec![uid(&files, "src/boot.php", "helper")],
+            "{edges:#?}"
+        );
+        assert!(
+            call_targets(&files, &edges, "src/boot.php", "helper").is_empty(),
+            "{edges:#?}"
+        );
+    }
+
+    /// Non-call references keep today's degenerate guess even when the file
+    /// has an owner: a module-level type reference (Uses) and property reads
+    /// (Accesses) after a one-line function stay on that function. Pinned so
+    /// a later change to the guess is deliberate.
+    #[test]
+    fn module_level_uses_and_accesses_keep_the_degenerate_guess() {
+        let lib = (
+            "src/lib.ts",
+            "export function a(): number { return 1; }\nexport interface User { id: number }\n",
+        );
+        let ts = (
+            "src/m.ts",
+            "import { a, User } from \"./lib\";\nexport function one() { return 1; }\nconst u: User = { id: 1 };\na();\n",
+        );
+        let (files, edges) = review_edges(&[lib, ts], Language::TypeScript);
+        let one = uid(&files, "src/m.ts", "one");
+        let user = uid(&files, "src/lib.ts", "User");
+        assert!(
+            edges.iter().any(|e| e.edge_type == EdgeType::Uses
+                && e.source_uid == one
+                && e.target_uid == user),
+            "{edges:#?}"
+        );
+        let js = (
+            "src/m.js",
+            "function one() { return 1; }\nconst c = make();\nconsole.log(c.port);\none();\n",
+        );
+        let (files, edges) = review_edges(&[js], Language::JavaScript);
+        let one = uid(&files, "src/m.js", "one");
+        let owner = uid(&files, "src/m.js", nestweaver_schema::MODULE_OWNER_NAME);
+        let accesses: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Accesses)
+            .collect();
+        assert!(!accesses.is_empty(), "{edges:#?}");
+        assert!(
+            accesses.iter().all(|e| e.source_uid == one),
+            "{accesses:#?}"
+        );
+        assert!(
+            edges
+                .iter()
+                .filter(|e| e.source_uid == owner)
+                .all(|e| matches!(e.edge_type, EdgeType::Calls | EdgeType::Imports))
+        );
+    }
+
+    /// Languages outside the owner gate keep the degenerate guess unchanged:
+    /// no `<module>` symbol, and a Lua one-line function still owns the
+    /// module-level calls after it.
+    #[test]
+    fn languages_without_an_owner_keep_the_degenerate_guess() {
+        let lua = (
+            "boot.lua",
+            "local function helper() return 1 end\nprint('x')\nhelper()\n",
+        );
+        let (files, edges) = review_edges(&[lua], Language::Lua);
+        assert!(
+            !files[0]
+                .1
+                .iter()
+                .any(|s| s.name == nestweaver_schema::MODULE_OWNER_NAME)
+        );
+        let helper = uid(&files, "boot.lua", "helper");
+        let mut expected = vec![helper.clone(), "unresolved:print".to_string()];
+        expected.sort();
+        assert_eq!(
+            call_targets(&files, &edges, "boot.lua", "helper"),
+            expected,
+            "{edges:#?}"
+        );
+
+        let vue = (
+            "src/App.vue",
+            "<script>\nfunction helper() { return 1; }\nhelper();\n</script>\n",
+        );
+        let (files, _) = review_edges(&[vue], Language::Vue);
+        assert!(
+            !files[0]
+                .1
+                .iter()
+                .any(|s| s.name == nestweaver_schema::MODULE_OWNER_NAME),
+            "{:?}",
+            files[0].1
         );
     }
 }
