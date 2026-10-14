@@ -25473,8 +25473,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 anyhow::bail!(
                                     "the launch agent {} exists but its program cannot be read \
                                      from it. A client start does not replace an existing agent; \
-                                     run `nestweaver daemon --db {} start` to reinstall it",
+                                     run `{} daemon --db {} start` to reinstall it",
                                     plist_path.display(),
+                                    binary_path.display(),
                                     db_path.display()
                                 );
                             }
@@ -25493,7 +25494,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 };
                                 let wanted = effective_config_abs.as_deref().map(canonical);
                                 let has = agent_config.as_deref().map(Path::new).map(canonical);
-                                if wanted != has {
+                                // An agent with no --config (written before
+                                // agents carried one) lets `daemon run` resolve
+                                // the saved startup record itself; attestation
+                                // checks the result. Only an explicit --config
+                                // that differs is a known mismatch.
+                                if has.is_some() && wanted != has {
                                     let show = |path: Option<PathBuf>| {
                                         path.map_or("(none)".to_string(), |path| {
                                             path.display().to_string()
@@ -25501,12 +25507,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     };
                                     anyhow::bail!(
                                         "the launch agent {} starts this database with --config \
-                                         {}, but this command asked for {}. A client start does not \
-                                         rewrite an existing agent; run `nestweaver daemon --db {} \
+                                         {}, but this command (or its saved startup configuration) asked for {}. A \
+                                         client start does not \
+                                         rewrite an existing agent; run `{} daemon --db {} \
                                          start` with the configuration you want to change it",
                                         plist_path.display(),
                                         show(has),
                                         show(wanted),
+                                        binary_path.display(),
                                         db_path.display()
                                     );
                                 }
@@ -25514,11 +25522,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             if let LaunchAgentPlan::RefuseMissingProgram(program) = &agent_plan {
                                 anyhow::bail!(
                                     "the launch agent {} runs {}, which no longer exists. A client \
-                                     start does not rewrite an existing agent; run `nestweaver \
+                                     start does not rewrite an existing agent; run `{} \
                                      daemon --db {} start` to reinstall it",
                                     plist_path.display(),
                                     program.display(),
+                                    binary_path.display(),
                                     db_path.display()
+                                );
+                            }
+                            if agent_plan == LaunchAgentPlan::Install
+                                && plist_path.exists()
+                                && existing_plist
+                                    .as_deref()
+                                    .and_then(nestweaver_daemon::launchd::parse_program_from_plist)
+                                    .is_none()
+                            {
+                                eprintln!(
+                                    "Replacing launch agent {} (its contents could not be read).",
+                                    plist_path.display()
                                 );
                             }
                             if agent_plan == LaunchAgentPlan::Install

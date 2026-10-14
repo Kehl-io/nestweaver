@@ -159,10 +159,28 @@ pub fn start_existing(instance_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// The program `instance_id`'s launch agent runs, if it has one.
-pub fn agent_program(instance_id: &str) -> Option<PathBuf> {
-    let content = std::fs::read_to_string(lifecycle::launchd_plist_path(instance_id)).ok()?;
-    parse_program_from_plist(&content)
+/// What `instance_id`'s launch agent runs, as far as its plist says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentProgram {
+    /// No plist: there is no agent.
+    Absent,
+    /// A plist exists but its program cannot be read from it.
+    Unreadable,
+    /// The agent runs this program.
+    Program(PathBuf),
+}
+
+/// The program `instance_id`'s launch agent runs. "No agent" and "an agent
+/// whose plist cannot be read" are different answers (nw-729): only the first
+/// leaves a client free to create one.
+pub fn agent_program(instance_id: &str) -> AgentProgram {
+    let path = lifecycle::launchd_plist_path(instance_id);
+    match std::fs::read_to_string(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => AgentProgram::Absent,
+        Err(_) => AgentProgram::Unreadable,
+        Ok(content) => parse_program_from_plist(&content)
+            .map_or(AgentProgram::Unreadable, AgentProgram::Program),
+    }
 }
 
 /// Result of a [`gc_orphaned_agents`] pass.
