@@ -582,30 +582,6 @@ fn is_top_level_reference(node: &tree_sitter::Node, lang_str: &str) -> bool {
             "class_declaration",
             "protocol_declaration",
         ],
-        // nw-113: JS/TS and PHP feed only the `<module>` owner gate, never
-        // nw-435's rooting (its call site stays Python/bash/Swift). A class
-        // body is listed so field initialisers and static blocks read as
-        // class code; the resolver's span test would exclude them anyway.
-        "javascript" | "typescript" => &[
-            "function_declaration",
-            "generator_function_declaration",
-            "function_expression",
-            "generator_function",
-            "arrow_function",
-            "method_definition",
-            "class_body",
-        ],
-        // Node kinds checked against tree-sitter-php 0.24.2's
-        // `node-types.json`: closures are `anonymous_function` (there is no
-        // `anonymous_function_creation_expression`), and class, interface and
-        // trait bodies are all `declaration_list`.
-        "php" => &[
-            "function_definition",
-            "method_declaration",
-            "anonymous_function",
-            "arrow_function",
-            "declaration_list",
-        ],
         _ => return false,
     };
     let mut current = node.parent();
@@ -1524,9 +1500,9 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     // than recovered afterward from `references` (which does not retain the
     // AST node).
     let mut top_level_called: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // nw-113: rows (1-based) of top-level calls, checked against symbol spans
-    // after the capture loop. `require(...)` is an import mechanism, not
-    // executable module code worth an owner.
+    // nw-113: rows (1-based) of JS/TS/Python/PHP calls, checked against
+    // symbol spans after the capture loop. `require(...)` is an import
+    // mechanism, not executable module code worth an owner.
     let mut top_level_call_lines: Vec<u32> = Vec::new();
 
     let mut cursor = QueryCursor::new();
@@ -1967,7 +1943,6 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 if kind == ReferenceKind::Call
                     && matches!(lang_str, "javascript" | "typescript" | "python" | "php")
                     && name != "require"
-                    && is_top_level_reference(&node, lang_str)
                 {
                     top_level_call_lines.push(node.start_position().row as u32 + 1);
                 }
@@ -2247,37 +2222,9 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     }
 
     // nw-113: top-level code has an owner, and the owner is the module
-    // (CodeQL: JS `TopLevel`, Python `Module`). Minted only when some call
-    // lies outside every code-bearing span: the same rule the resolver uses,
-    // so the owner exists exactly when the resolver would otherwise drop or
-    // misattribute that call.
-    let outside_every_span = |line: u32| {
-        !symbols.iter().any(|symbol| {
-            symbol.kind.contains_code() && symbol.start_line <= line && line <= symbol.end_line
-        })
-    };
-    if top_level_call_lines
-        .iter()
-        .any(|line| outside_every_span(*line))
-    {
-        let end_line = source.lines().count().max(1) as u32;
-        symbols.insert(
-            0,
-            RawSymbol {
-                name: MODULE_OWNER_NAME.to_string(),
-                kind: SymbolKind::Module,
-                start_line: 1,
-                end_line,
-                signature: String::new(),
-                content_hash: sha256_hex(source),
-                is_entry_point: true,
-                entry_point_kind: Some(EntryPointKind::ModuleInit),
-                visibility: Visibility::Private,
-                type_info: None,
-                parent_name: None,
-                scope_chain: None,
-            },
-        );
+    // (CodeQL: JS `TopLevel`, Python `Module`).
+    if let Some(owner) = module_owner_symbol(source, &symbols, &top_level_call_lines) {
+        symbols.insert(0, owner);
     }
 
     // Type extraction: walk the same tree with type-specific queries
@@ -2290,6 +2237,76 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         references,
         type_bindings,
         has_syntax_errors: tree.root_node().has_error(),
+    })
+}
+
+/// nw-113: the per-file `<module>` owner, when some call line lies outside
+/// every code-bearing symbol span. That is the resolver's attribution rule
+/// (by line, `SymbolKind::contains_code`), so the owner exists exactly when
+/// the resolver would otherwise drop or misattribute a call. A call inside an
+/// anonymous function at module level (an IIFE, an Express handler, a Python
+/// lambda) counts: it runs, or is registered, at load time and has no named
+/// container. Class bodies and calls inside named functions are covered by
+/// their symbols' spans.
+///
+/// Coverage is one difference-array sweep, O(lines + symbols + calls). The
+/// owner's hash covers only the uncovered (top-level) lines, so an edit inside
+/// a function body does not read as a change to `<module>`.
+fn module_owner_symbol(
+    source: &str,
+    symbols: &[RawSymbol],
+    call_lines: &[u32],
+) -> Option<RawSymbol> {
+    if call_lines.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = source.lines().collect();
+    let line_count = lines.len();
+    let mut delta = vec![0i32; line_count + 1];
+    for symbol in symbols.iter().filter(|symbol| symbol.kind.contains_code()) {
+        let start = (symbol.start_line.max(1) as usize - 1).min(line_count);
+        let end = (symbol.end_line.max(symbol.start_line) as usize).min(line_count);
+        if start < end {
+            delta[start] += 1;
+            delta[end] -= 1;
+        }
+    }
+    let mut depth = 0;
+    let covered: Vec<bool> = delta[..line_count]
+        .iter()
+        .map(|change| {
+            depth += change;
+            depth > 0
+        })
+        .collect();
+    let top_level = |line: u32| {
+        (line as usize)
+            .checked_sub(1)
+            .and_then(|index| covered.get(index))
+            .is_some_and(|covered| !covered)
+    };
+    if !call_lines.iter().any(|line| top_level(*line)) {
+        return None;
+    }
+    let region: String = lines
+        .iter()
+        .zip(&covered)
+        .filter(|(_, covered)| !**covered)
+        .flat_map(|(text, _)| [*text, "\n"])
+        .collect();
+    Some(RawSymbol {
+        name: MODULE_OWNER_NAME.to_string(),
+        kind: SymbolKind::Module,
+        start_line: 1,
+        end_line: line_count.max(1) as u32,
+        signature: String::new(),
+        content_hash: sha256_hex(&region),
+        is_entry_point: true,
+        entry_point_kind: Some(EntryPointKind::ModuleInit),
+        visibility: Visibility::Private,
+        type_info: None,
+        parent_name: None,
+        scope_chain: None,
     })
 }
 
@@ -13656,6 +13673,97 @@ mod module_owner_tests {
                 "{path}"
             );
         }
+    }
+
+    /// nw-113 review: one rule for the gate and the attribution. A call line
+    /// outside every code-bearing span mints the owner even when the call sits
+    /// in an anonymous function: that code runs, or is registered, at load
+    /// time, and the resolver credits it to `<module>` by line.
+    #[test]
+    fn load_time_code_mints_an_owner_spanning_the_whole_file() {
+        for (path, source) in [
+            ("iife.js", "(function () {\n  foo();\n})();\n"),
+            ("arrow_iife.ts", "(() => {\n  foo();\n})();\n"),
+            (
+                "express.ts",
+                "import { handle } from './lib';\napp.get('/', () => {\n  handle();\n});\n",
+            ),
+            ("lambda.py", "x = lambda: foo()\n"),
+            (
+                "deco.py",
+                "import functools\n\n@functools.lru_cache(maxsize=1)\ndef f():\n    return 1\n",
+            ),
+            (
+                "main_guard.py",
+                "def main():\n    pass\n\nif __name__ == \"__main__\":\n    main()\n",
+            ),
+            ("await.ts", "import { main } from './lib';\nawait main();\n"),
+            (
+                "main.tsx",
+                "import { createRoot } from 'react-dom/client';\nimport { App } from './App';\ncreateRoot(document.getElementById('root')!).render(<App />);\n",
+            ),
+            ("boot.php", "<?php\nrequire_once 'lib.php';\nhelper();\n"),
+        ] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            let owner = module_owner(&parsed)
+                .unwrap_or_else(|| panic!("{path}: owner expected, symbols: {:?}", parsed.symbols));
+            assert_eq!(owner.start_line, 1, "{path}");
+            assert_eq!(
+                owner.end_line,
+                source.lines().count() as u32,
+                "{path}: spans exactly the file"
+            );
+        }
+    }
+
+    /// Declarations only: a `.d.ts` file executes nothing, and an anonymous
+    /// callback inside a named function is that function's code.
+    #[test]
+    fn declarations_and_callbacks_inside_functions_mint_nothing() {
+        for (path, source) in [
+            (
+                "types.d.ts",
+                "export declare function f(): void;\ndeclare const x: number;\nexport interface I { m(): void }\n",
+            ),
+            (
+                "callback.ts",
+                "import { a } from './lib';\nexport function f() {\n  [1].forEach(() => a());\n}\n",
+            ),
+            (
+                "lambda_in_def.py",
+                "def f():\n    g = lambda: a()\n    return g\n",
+            ),
+        ] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            assert!(
+                module_owner(&parsed).is_none(),
+                "{path}: no owner expected, symbols: {:?}",
+                parsed.symbols
+            );
+        }
+    }
+
+    /// nw-113 review: the owner's hash covers only its own (top-level) lines,
+    /// so editing a function body does not read as a change to `<module>`.
+    #[test]
+    fn the_owner_hash_covers_only_top_level_lines() {
+        let hash = |source: &str| {
+            module_owner(&parse_source(Path::new("hash.ts"), source).unwrap())
+                .expect("owner")
+                .content_hash
+                .clone()
+        };
+        let base = hash("export function f() {\n  return 1;\n}\nf();\n");
+        assert_eq!(
+            base,
+            hash("export function f() {\n  const two = 2;\n  return two;\n}\nf();\n"),
+            "a function-body edit must not change the owner hash"
+        );
+        assert_ne!(
+            base,
+            hash("export function f() {\n  return 1;\n}\nf(1);\n"),
+            "a top-level edit must change the owner hash"
+        );
     }
 
     /// Counterweights from validation: no owner for calls that already have
