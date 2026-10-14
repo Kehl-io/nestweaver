@@ -89,7 +89,7 @@ jobs:
         run: bash scripts/run-backlog-benchmarks.sh
       - name: Preserve raw benchmark evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: backlog-performance-${{ github.sha }}
           path: backlog-performance/
@@ -271,7 +271,7 @@ jobs:
           python3 tests/support/isolated_daemon.py --binary "$PWD/staged/standard/nestweaver" --ci-policy-test
       - name: Retain standard Metal daemon evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: standard-metal-daemon-evidence
           path: |
@@ -411,7 +411,7 @@ jobs:
           done
       - name: Upload macOS crash reports
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: macos-crash-reports-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/crash-reports
@@ -613,7 +613,7 @@ jobs:
           fi
       - name: Upload Metal smoke evidence
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: metal-smoke-evidence
           path: ${{ runner.temp }}/nestweaver-metal-evidence-${{ github.run_id }}-${{ github.run_attempt }}-metal-smoke
@@ -652,7 +652,7 @@ jobs:
 
       - name: Retain Metal build evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: metal-build-evidence
           path: |
@@ -740,7 +740,7 @@ jobs:
           cp target/debug/nestweaver staged/standard/nestweaver
           chmod a-w staged/standard/nestweaver
       - name: Stage standard acceptance artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ci-standard-linux
           path: staged/standard/nestweaver
@@ -836,7 +836,7 @@ jobs:
           python3 tests/support/release_selectors.py --binary "$PWD/staged/standard/nestweaver" --during-index
       - name: Retain owned daemon evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: standard-daemon-evidence
           path: |
@@ -1184,7 +1184,7 @@ jobs:
           python3 scripts/report-mutation-results.py --evidence "$PWD/mutation-evidence" "${args[@]}"
       - name: Upload mutants report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: mutants-report
           path: mutation-evidence/
@@ -1426,7 +1426,7 @@ jobs:
             --browser "$browser_executable"
       - name: Upload test results
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: playwright-report
           path: |
