@@ -1046,7 +1046,11 @@ fn detect_node_route_handlers(source: &str, symbols: &[HandlerSymbol]) -> Vec<Ha
         let owner = symbols
             .iter()
             .enumerate()
-            .filter(|(_, symbol)| symbol.start_line <= line_no)
+            // nw-113: the whole-file `<module>` owner is never a route's
+            // implementer.
+            .filter(|(_, symbol)| {
+                symbol.start_line <= line_no && symbol.name != nestweaver_schema::MODULE_OWNER_NAME
+            })
             .max_by_key(|(_, symbol)| symbol.start_line)
             .map(|(index, _)| index);
         let Some(symbol_index) = owner else {
@@ -1939,6 +1943,22 @@ pub fn diff_openapi(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// nw-113: the whole-file `<module>` owner is never a route's
+    /// implementer; a top-level route with no named symbol above it stays
+    /// unowned, as before the owner existed.
+    #[test]
+    fn a_route_is_never_owned_by_the_module_owner() {
+        let source = "app.get('/health', (req, res) => res.send('ok'));\n";
+        let symbols = vec![HandlerSymbol {
+            name: nestweaver_schema::MODULE_OWNER_NAME.into(),
+            signature: String::new(),
+            start_line: 1,
+            kind: nestweaver_schema::SymbolKind::Module,
+        }];
+        let found = detect_handlers("express", source, &symbols);
+        assert!(found.is_empty(), "{found:?}");
+    }
 
     fn finding(uid: &str, category: &str) -> DriftFinding {
         DriftFinding {

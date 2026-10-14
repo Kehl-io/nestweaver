@@ -3757,8 +3757,15 @@ fn specifier_names_package(specifier: &str, package: &str) -> bool {
 }
 
 fn containing_symbol_for_line(symbols: &[RawSymbol], line: u32) -> Option<&RawSymbol> {
-    symbols
-        .iter()
+    // nw-113: the per-file `<module>` owner spans the whole file and would
+    // otherwise claim every line; it owns only top-level CALLS, which the
+    // resolver attributes itself.
+    let candidates = || {
+        symbols
+            .iter()
+            .filter(|s| s.name != nestweaver_schema::MODULE_OWNER_NAME)
+    };
+    candidates()
         .filter(|s| s.start_line <= line && line <= s.end_line)
         .max_by_key(|s| s.start_line)
         .or_else(|| {
@@ -3767,8 +3774,7 @@ fn containing_symbol_for_line(symbols: &[RawSymbol], line: u32) -> Option<&RawSy
             // ends before `line` must NOT claim module-level code that comes
             // after it (same misattribution class as the resolver's
             // find_enclosing_symbol fix).
-            symbols
-                .iter()
+            candidates()
                 .filter(|s| s.start_line <= line && s.end_line <= s.start_line)
                 .max_by_key(|s| s.start_line)
         })
@@ -8675,6 +8681,49 @@ fn content_hash_hex(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nw-113: cross-repo inference attributes a line to a real symbol, never
+    /// to the whole-file module owner.
+    #[test]
+    fn containing_symbol_for_line_skips_the_module_owner() {
+        use nestweaver_schema::{EntryPointKind, SymbolKind};
+        let symbol = |name: &str,
+                      kind: SymbolKind,
+                      start_line: u32,
+                      end_line: u32,
+                      entry: Option<EntryPointKind>| RawSymbol {
+            name: name.to_string(),
+            kind,
+            start_line,
+            end_line,
+            signature: String::new(),
+            content_hash: String::new(),
+            is_entry_point: entry.is_some(),
+            entry_point_kind: entry,
+            visibility: nestweaver_schema::Visibility::Private,
+            type_info: None,
+            parent_name: None,
+            scope_chain: None,
+        };
+        let symbols = vec![
+            symbol(
+                nestweaver_schema::MODULE_OWNER_NAME,
+                SymbolKind::Module,
+                1,
+                20,
+                Some(EntryPointKind::ModuleInit),
+            ),
+            symbol("f", SymbolKind::Function, 3, 5, None),
+        ];
+        assert_eq!(
+            containing_symbol_for_line(&symbols, 4).map(|s| s.name.as_str()),
+            Some("f")
+        );
+        assert!(containing_symbol_for_line(&symbols, 10).is_none());
+        // The degenerate fallback must not pick it either.
+        let owner_only = &symbols[..1];
+        assert!(containing_symbol_for_line(owner_only, 2).is_none());
+    }
 
     /// A symlink row is disclosed by a vault only, and only when it could
     /// have held a note; a code repo keeps its silent skip.

@@ -1472,6 +1472,11 @@ impl GraphStore {
             if !lower.contains(&needle) {
                 continue;
             }
+            // nw-113: one `<module>` per file would flood substring searches
+            // for "module"; it is listed only when asked for by its exact name.
+            if sym.name == nestweaver_schema::MODULE_OWNER_NAME && *lower != needle {
+                continue;
+            }
             if counted < count_cap {
                 counted += 1;
                 if counted == count_cap {
@@ -1766,6 +1771,32 @@ mod tests {
             path_deboost: Vec::new(),
             kind_priority: Vec::new(),
         }
+    }
+
+    /// nw-113: one `<module>` per file would flood substring searches for
+    /// "module"; the owner is listed only when asked for by its exact name.
+    #[test]
+    fn name_search_hides_the_module_owner_unless_asked_for_exactly() {
+        let store = GraphStore::in_memory().unwrap();
+        let mut owner = make_symbol("s1", nestweaver_schema::MODULE_OWNER_NAME);
+        owner.kind = SymbolKind::Module;
+        store.insert_symbol(&owner).unwrap();
+        store
+            .insert_symbol(&make_symbol("s2", "moduleLoader"))
+            .unwrap();
+
+        let page = store
+            .search_symbols_by_name_page("module", 10, &no_rules())
+            .unwrap();
+        let names: Vec<&str> = page.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["moduleLoader"]);
+        assert_eq!(page.total.value, 1, "the hidden owner is not counted");
+
+        let exact = store
+            .search_symbols_by_name(nestweaver_schema::MODULE_OWNER_NAME, 10, &no_rules())
+            .unwrap();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].uid, "s1");
     }
 
     #[test]
