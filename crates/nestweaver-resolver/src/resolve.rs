@@ -2003,9 +2003,16 @@ fn active_lexical_binding<'a>(
 /// Module level is decided by symbol nesting: a declarator is module-level
 /// when no code-bearing symbol other than `sym` contains its own binding's
 /// line. A declarator inside a function, method or test-runner callback is
-/// scoped. Residual (base behaviour): a bare top-level block
-/// `{ const f = … }` has no enclosing symbol, so it reads as module-level
-/// and ties with a module `function f`, falling back to source order.
+/// scoped. Residuals:
+/// - (base behaviour) a declarator with no enclosing symbol reads as
+///   module-level and ties with a module `function f`, falling back to
+///   source order: a bare top-level block `{ const f = … }`, an IIFE
+///   `(() => { const f = … })()`, or an anonymous top-level callback
+///   `app.get('/', () => { const f = … })`;
+/// - containment is decided per LINE, so a module-level declarator that
+///   shares a line with another symbol's span (a sibling function on the
+///   same line, a function's closing-brace line, minified code) counts as
+///   scoped, and can then outrank a nested `function` declaration.
 ///
 /// Only a symbol whose signature (after `export`/`declare`/`await`) starts
 /// with a declarator keyword (`const`/`let`/`var`/`using`) is scoped. A same-named
@@ -2061,12 +2068,17 @@ fn same_file_declaration_scope(
     }
     // Module level: no other code-bearing symbol contains the declarator, so
     // it is visible everywhere and ranks like an unscoped symbol.
-    let module_level = !sorted_syms.iter().any(|other| {
-        !std::ptr::eq(*other, sym)
-            && can_contain_code(other.kind)
-            && other.start_line <= line
-            && line <= other.end_line.max(other.start_line)
-    });
+    // `sorted_syms` is sorted by `start_line`: stop at the first symbol that
+    // starts after the declarator's line.
+    let module_level = !sorted_syms
+        .iter()
+        .take_while(|other| other.start_line <= line)
+        .any(|other| {
+            !std::ptr::eq(*other, sym)
+                && can_contain_code(other.kind)
+                && other.start_line <= line
+                && line <= other.end_line.max(other.start_line)
+        });
     Some(if module_level {
         usize::MAX
     } else {
@@ -8799,6 +8811,20 @@ export function multi() {
         ] {
             assert!(!is_declarator_form(signature), "{signature}");
         }
+    }
+
+    /// Documented residual (nw-113): containment is decided per line, so a
+    /// module-level `const f` sharing line 1 with `function h` reads as
+    /// scoped and outranks `g`'s nested `function f`. Pins today's binding to
+    /// the module const; a column-aware fix must update this deliberately.
+    #[test]
+    fn residual_same_line_module_declarator_outranks_a_nested_function_declaration() {
+        let source = "function h() { return 0; } const f = () => 2;\nfunction g() {\n  function f() { return 1; }\n  return f();\n}\n";
+        let (files, edges) = review_edges(&[("src/n1.ts", source)], Language::TypeScript);
+        assert_eq!(
+            call_targets(&files, &edges, "src/n1.ts", "g"),
+            vec![uid_at(&files, "src/n1.ts", "f", 1)]
+        );
     }
 
     /// nw-113 (code review): a declarator's own scope is the widest same-named
