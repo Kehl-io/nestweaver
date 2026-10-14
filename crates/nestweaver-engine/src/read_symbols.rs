@@ -436,6 +436,8 @@ pub fn read_symbols_budgeted(
     for sym in primary {
         if neighbors > 0 {
             let mut in_file = store.symbols_in_file(&sym.file_path).unwrap_or_default();
+            // nw-113: the whole-file `<module>` owner is never a neighbour.
+            in_file.retain(|s| !s.is_module_owner() || s.uid == sym.uid);
             in_file.sort_by_key(|s| s.start_line);
             if let Some(idx) = in_file.iter().position(|s| s.uid == sym.uid) {
                 let lo = idx.saturating_sub(neighbors as usize);
@@ -482,10 +484,9 @@ pub fn read_symbols_budgeted(
                 let owner = parsed
                     .as_ref()
                     .and_then(|parsed| module_owner_body(text, parsed));
-                if let Some((current_end, _)) = owner
-                    && current_end != end_line
-                {
-                    relocated_from_line = Some(start_line);
+                // The owner always spans the whole file, so a changed line
+                // count is not a relocation: follow the file's end only.
+                if let Some((current_end, _)) = owner {
                     end_line = current_end;
                 }
                 stale_span = owner.is_none();
@@ -893,6 +894,46 @@ mod tests {
         let res = read_symbols(store, &[name.to_string()], &reader, 0, None);
         assert_eq!(res.symbols.len(), 1, "{name} must resolve: {res:?}");
         res.symbols.into_iter().next().unwrap()
+    }
+
+    /// nw-113 review: the owner is never a neighbour window; reading the
+    /// first real symbol with neighbours does not drag in `<module>`.
+    #[test]
+    fn neighbour_expansion_skips_the_module_owner() {
+        let (dir, store) = fixture_file(
+            "src/app.ts",
+            "export function f() {\n  return 1;\n}\nexport function g() {\n  return 2;\n}\nf();\n",
+        );
+        let reader = FilesystemReader::new(dir.path());
+        let res = read_symbols(&store, &["f".to_string()], &reader, 1, None);
+        let names: Vec<&str> = res.symbols.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, vec!["f", "g"], "{res:?}");
+    }
+
+    /// nw-113 review: the owner always spans the whole file, so a changed line
+    /// count is not a relocation; only `end_line` follows the file.
+    #[test]
+    fn an_owner_read_never_reports_a_relocation() {
+        let (dir, store) = fixture_file(
+            "src/app.ts",
+            "export function f() {\n  return 1;\n}\nf();\n",
+        );
+        let owner = store
+            .symbols_in_file("src/app.ts")
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.is_module_owner())
+            .expect("fixture mints an owner");
+        assert_eq!(owner.end_line, 4);
+        std::fs::write(
+            dir.path().join("src/app.ts"),
+            "export function f() {\n  return 1;\n}\nf();\nf();\n",
+        )
+        .unwrap();
+        let w = read_one(&dir, &store, &owner.uid);
+        assert_eq!(w.relocated_from_line, None, "{w:?}");
+        assert_eq!((w.start_line, w.end_line), (1, 5), "{w:?}");
+        assert!(!w.stale_span && w.body_available, "{w:?}");
     }
 
     /// nw-113: reading `<module>` returns the file's top-level code: the lines
