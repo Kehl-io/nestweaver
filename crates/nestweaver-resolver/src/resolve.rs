@@ -894,20 +894,29 @@ fn resolve_single_reference(
 
     // Priority 1: Same file. A local symbol shadows an import alias of the
     // same name, so this check runs on the reference's own name, before any
-    // alias rewriting.
+    // alias rewriting. nw-113: a block-scoped declaration shadows only inside
+    // its block, and the innermost visible declaration wins.
     if let Some(syms) = symbol_map.get(name.as_str())
-        && let Some((_, sym)) = syms.iter().find(|(f, sym)| {
-            *f == file_path
-                && !(language == Language::Rust
-                    && reference.receiver.is_some()
-                    && binding.is_some())
-                && exact_rust_call.is_none_or(|assignment| {
-                    assignment
-                        .local_callee_line
-                        .is_some_and(|line| sym.start_line == line)
-                })
-                && candidate_matches(reference, file_path, f, sym, language, graph)
-        })
+        && let Some((_, sym)) = syms
+            .iter()
+            .filter(|(f, sym)| {
+                *f == file_path
+                    && !(language == Language::Rust
+                        && reference.receiver.is_some()
+                        && binding.is_some())
+                    && exact_rust_call.is_none_or(|assignment| {
+                        assignment
+                            .local_callee_line
+                            .is_some_and(|line| sym.start_line == line)
+                    })
+                    && candidate_matches(reference, file_path, f, sym, language, graph)
+            })
+            .filter_map(|candidate| {
+                same_file_declaration_scope(local_bindings, candidate.1, reference, language)
+                    .map(|width| (width, candidate))
+            })
+            .min_by_key(|(width, _)| *width)
+            .map(|(_, candidate)| candidate)
     {
         let target_uid = symbol_uid(repo_uid, file_path, &sym.name, sym.start_line);
         let confidence = confidence_score(MatchType::SameFileExact, language);
@@ -1371,6 +1380,24 @@ fn resolve_single_reference(
     }
 
     if binding.is_some() {
+        return Some(unresolved_edge(source_uid, name, edge_type));
+    }
+
+    // nw-113: the name is declared in this file, but only inside blocks that
+    // do not contain this call. An ES module cannot see a sibling file's
+    // function without importing it, so the same-directory fallback below
+    // would fabricate the edge.
+    if matches!(language, Language::JavaScript | Language::TypeScript)
+        && reference.receiver.is_none()
+        && symbol_map.get(name.as_str()).is_some_and(|syms| {
+            syms.iter().any(|(f, sym)| {
+                *f == file_path
+                    && candidate_matches(reference, file_path, f, sym, language, graph)
+                    && same_file_declaration_scope(local_bindings, sym, reference, language)
+                        .is_none()
+            })
+        })
+    {
         return Some(unresolved_edge(source_uid, name, edge_type));
     }
 
@@ -1950,6 +1977,60 @@ fn active_lexical_binding<'a>(
                 }),
             )
         })
+}
+
+/// nw-113: where a same-file callable `sym` is visible from `reference`.
+///
+/// A `const f = () => …` declared in a block is a graph `Function` whose
+/// declaring `LocalBinding` carries that block's byte range. Returns:
+/// - `None` when the declaration is not visible at the call (every declaring
+///   binding's block excludes the call position);
+/// - `Some(width)` with the tightest declaring block's width when it is;
+/// - `Some(usize::MAX)` when `sym` has no declaring binding (a module-scope
+///   declaration or a `function` declaration), so scoped declarations rank
+///   ahead of it.
+///
+/// Gated to bare JS/TS calls (plan validation): Rust has its own exact gate
+/// and receiver calls (`Api.get()`, `this.x()`) are matched by
+/// `candidate_matches`, so neither may be filtered here. Only declarator
+/// bindings count. A parameter's binding has `initialized_at == position`
+/// (the same test `name_is_locally_bound` uses), and a same-named parameter
+/// on the declaration line must not hide the symbol. Everything outside
+/// that gate gets `Some(usize::MAX)`: behaviour unchanged.
+fn same_file_declaration_scope(
+    local_bindings: &[&RawReference],
+    sym: &RawSymbol,
+    reference: &RawReference,
+    language: Language,
+) -> Option<usize> {
+    if !matches!(language, Language::JavaScript | Language::TypeScript)
+        || reference.receiver.is_some()
+    {
+        return Some(usize::MAX);
+    }
+    let Some(call) = reference.scope else {
+        return Some(usize::MAX);
+    };
+    let mut declarations = local_bindings
+        .iter()
+        // The declarator may sit on a later line than the declaration
+        // (`const a = 1,\n  b = () => 2;`), so join by the symbol's span,
+        // not its first line.
+        .filter(|binding| {
+            binding.name == sym.name
+                && sym.start_line <= binding.start_line
+                && binding.start_line <= sym.end_line.max(sym.start_line)
+        })
+        .filter_map(|binding| binding.scope)
+        .filter(|scope| scope.initialized_at > scope.position)
+        .peekable();
+    if declarations.peek().is_none() {
+        return Some(usize::MAX);
+    }
+    declarations
+        .filter(|scope| scope.start <= call.position && call.position < scope.end)
+        .map(|scope| scope.end - scope.start)
+        .min()
 }
 
 fn name_is_locally_bound(
@@ -8458,6 +8539,13 @@ export function nested() {
   }
   return sendPacket();
 }
+export function multi() {
+  {
+    const first = 1,
+      sendPacket = () => 5;
+  }
+  return sendPacket();
+}
 "#,
         );
         let (files, edges) = review_edges(&[lib, scopes], Language::TypeScript);
@@ -8476,6 +8564,43 @@ export function nested() {
             call_targets(&files, &edges, "src/scopes.ts", "nested"),
             expected,
             "inner call binds the inner declaration, outer call the function-level one"
+        );
+        assert_eq!(
+            call_targets(&files, &edges, "src/scopes.ts", "multi"),
+            vec![uid(&files, "src/lib.ts", "sendPacket")],
+            "a declarator on a later line of its declaration is still block-scoped"
+        );
+    }
+
+    /// nw-113 (block scope). A name declared in this file only inside a block
+    /// that does not contain the call is unresolved: an ES module cannot see a
+    /// sibling file's function without importing it, so the same-directory
+    /// fallback must not bind it.
+    #[test]
+    fn an_out_of_scope_block_local_does_not_fall_back_to_a_sibling_file() {
+        let a = (
+            "src/a.ts",
+            r#"export function caller() {
+  {
+    const helper = () => 1;
+  }
+  return helper();
+}
+"#,
+        );
+        let b = ("src/b.ts", "export function helper() { return 2; }\n");
+        let (files, edges) = review_edges(&[a, b], Language::TypeScript);
+        let sibling = uid(&files, "src/b.ts", "helper");
+        let targets = call_targets(&files, &edges, "src/a.ts", "caller");
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.starts_with("unresolved:")),
+            "{targets:?}"
+        );
+        assert!(
+            !edges.iter().any(|edge| edge.target_uid == sibling),
+            "{edges:#?}"
         );
     }
 
@@ -8549,12 +8674,17 @@ export function readIt() { return value(); }
             vec![uid_at(&files, "src/box.ts", "value", 2)],
             "a same-line parameter binding does not change same-file selection"
         );
-        let mut expected = vec![
-            uid_at(&files, "src/oneline.ts", "sendPacket", 3),
-            uid(&files, "src/lib.ts", "sendPacket"),
-        ];
-        expected.sort();
-        assert_eq!(before("src/oneline.ts", "lexicalCaller"), expected);
+        // Known residual (tracked on nw-113): the caller is chosen by LINE, so a call on the same line as a one-line arrow declaration is credited to the arrow (a sendPacket -> sendPacket self-edge), not to lexicalCaller. This assertion pins the nw-113 fix itself: the call AFTER the block binds the import, not the block-local.
+        assert_eq!(
+            before("src/oneline.ts", "lexicalCaller"),
+            vec![uid(&files, "src/lib.ts", "sendPacket")]
+        );
+        let one_line_local = uid_at(&files, "src/oneline.ts", "sendPacket", 3);
+        assert_eq!(
+            before("src/oneline.ts", "sendPacket"),
+            vec![one_line_local],
+            "today's same-line self-edge; a caller-attribution fix must update this deliberately"
+        );
     }
 
     #[test]
