@@ -73,6 +73,7 @@ jobs:
               - 'scripts/verify-linux-archive.py'
               - 'scripts/verify-release-fault.py'
               - 'scripts/test-verify-release-fault.py'
+              - 'scripts/test-release-lockfile-publication.py'
               - 'scripts/run-backlog-benchmarks.sh'
               # The pinned LadybugDB source every compiling job builds from,
               # and the other build entry points that fetch it.
