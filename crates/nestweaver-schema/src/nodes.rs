@@ -50,6 +50,20 @@ pub enum SymbolKind {
 /// declaration.
 pub const MODULE_OWNER_NAME: &str = "<module>";
 
+/// nw-113: whether a symbol is the parser's per-file `<module>` owner of
+/// top-level calls. The single definition every consumer uses: kind `Module`,
+/// name [`MODULE_OWNER_NAME`] and entry kind `ModuleInit` together, so a real
+/// module (a Rust `mod`, a Python package) is never mistaken for it.
+pub fn is_module_owner(
+    kind: SymbolKind,
+    name: &str,
+    entry_point_kind: Option<EntryPointKind>,
+) -> bool {
+    kind == SymbolKind::Module
+        && name == MODULE_OWNER_NAME
+        && entry_point_kind == Some(EntryPointKind::ModuleInit)
+}
+
 impl SymbolKind {
     /// Kinds that have a body and can therefore be the source of a call
     /// (nw-349/nw-435). Data kinds (`Constant`, `Variable`, `Property`,
@@ -222,6 +236,13 @@ pub struct Symbol {
     /// `None` for symbols that haven't been re-indexed with scope-chain extraction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_id: Option<String>,
+}
+
+impl Symbol {
+    /// nw-113: see [`is_module_owner`].
+    pub fn is_module_owner(&self) -> bool {
+        is_module_owner(self.kind, &self.name, self.entry_point_kind)
+    }
 }
 
 // ── Brain extension: markdown nodes ────────────────────────────────────────
@@ -409,6 +430,31 @@ pub struct Contract {
 #[cfg(test)]
 mod tests {
     use super::{Repo, SymbolKind};
+
+    /// nw-113: one predicate identifies the per-file `<module>` owner; a real
+    /// symbol of the same kind or name is never mistaken for it.
+    #[test]
+    fn module_owner_needs_its_kind_name_and_entry_kind() {
+        use super::{EntryPointKind, MODULE_OWNER_NAME, is_module_owner};
+        let init = Some(EntryPointKind::ModuleInit);
+        assert!(is_module_owner(SymbolKind::Module, MODULE_OWNER_NAME, init));
+        assert!(!is_module_owner(
+            SymbolKind::Function,
+            MODULE_OWNER_NAME,
+            init
+        ));
+        assert!(!is_module_owner(SymbolKind::Module, "utils", init));
+        assert!(!is_module_owner(
+            SymbolKind::Module,
+            MODULE_OWNER_NAME,
+            None
+        ));
+        assert!(!is_module_owner(
+            SymbolKind::Module,
+            MODULE_OWNER_NAME,
+            Some(EntryPointKind::Main)
+        ));
+    }
 
     /// The resolver and the parser share one code-bearing rule (nw-113).
     #[test]

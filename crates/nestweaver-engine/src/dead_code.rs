@@ -810,11 +810,7 @@ fn detect_dead_code_inner(
     // module load reads as dead.
     let module_owners: Vec<(String, String)> = raw_symbols
         .iter()
-        .filter(|s| {
-            s.kind == SymbolKind::Module
-                && s.name == nestweaver_schema::MODULE_OWNER_NAME
-                && s.is_entry_point
-        })
+        .filter(|s| s.is_module_owner() && s.is_entry_point)
         .map(|s| (s.uid.clone(), s.file_path.clone()))
         .collect();
     let all_symbols: Vec<_> = raw_symbols

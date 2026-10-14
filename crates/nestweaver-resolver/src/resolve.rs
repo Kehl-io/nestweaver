@@ -152,7 +152,7 @@ pub fn resolve_references_with_file_languages(
             // present, is always first. `resolve_single_reference` relies on
             // that to find it in O(1).
             debug_assert!(
-                v.iter().skip(1).all(|s| !is_module_owner(s)),
+                v.iter().skip(1).all(|s| !s.is_module_owner()),
                 "the <module> owner must sort first"
             );
             v
@@ -510,7 +510,7 @@ fn resolve_single_reference(
         sorted_syms
             .first()
             .copied()
-            .filter(|s| edge_type == EdgeType::Calls && is_module_owner(s))
+            .filter(|s| edge_type == EdgeType::Calls && s.is_module_owner())
     };
     let source_sym = match find_enclosing_symbol(sorted_syms, reference.start_line) {
         Enclosing::Exact(s) => s,
@@ -2408,14 +2408,7 @@ impl<'a> Enclosing<'a> {
 /// only the CALLS source for module-level calls (see
 /// `resolve_single_reference`), so every container test goes through here.
 fn can_contain_code(symbol: &RawSymbol) -> bool {
-    symbol.kind.contains_code() && !is_module_owner(symbol)
-}
-
-/// nw-113: the parser's per-file `<module>` owner of top-level calls.
-fn is_module_owner(symbol: &RawSymbol) -> bool {
-    symbol.kind == SymbolKind::Module
-        && symbol.name == nestweaver_schema::MODULE_OWNER_NAME
-        && symbol.entry_point_kind == Some(nestweaver_schema::EntryPointKind::ModuleInit)
+    symbol.kind.contains_code() && !symbol.is_module_owner()
 }
 
 /// Find the enclosing symbol: the innermost symbol whose span contains the

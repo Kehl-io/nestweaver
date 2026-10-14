@@ -1047,9 +1047,12 @@ fn detect_node_route_handlers(source: &str, symbols: &[HandlerSymbol]) -> Vec<Ha
             .iter()
             .enumerate()
             // nw-113: the whole-file `<module>` owner is never a route's
-            // implementer.
+            // implementer. `HandlerSymbol` carries no entry kind, so this is
+            // the kind-and-name half of `nestweaver_schema::is_module_owner`.
             .filter(|(_, symbol)| {
-                symbol.start_line <= line_no && symbol.name != nestweaver_schema::MODULE_OWNER_NAME
+                symbol.start_line <= line_no
+                    && !(symbol.kind == nestweaver_schema::SymbolKind::Module
+                        && symbol.name == nestweaver_schema::MODULE_OWNER_NAME)
             })
             .max_by_key(|(_, symbol)| symbol.start_line)
             .map(|(index, _)| index);

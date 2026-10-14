@@ -3760,11 +3760,7 @@ fn containing_symbol_for_line(symbols: &[RawSymbol], line: u32) -> Option<&RawSy
     // nw-113: the per-file `<module>` owner spans the whole file and would
     // otherwise claim every line; it owns only top-level CALLS, which the
     // resolver attributes itself.
-    let candidates = || {
-        symbols
-            .iter()
-            .filter(|s| s.name != nestweaver_schema::MODULE_OWNER_NAME)
-    };
+    let candidates = || symbols.iter().filter(|s| !s.is_module_owner());
     candidates()
         .filter(|s| s.start_line <= line && line <= s.end_line)
         .max_by_key(|s| s.start_line)

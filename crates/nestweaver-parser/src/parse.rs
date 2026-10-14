@@ -164,6 +164,13 @@ pub struct RawSymbol {
     pub scope_chain: Option<String>,
 }
 
+impl RawSymbol {
+    /// nw-113: see [`nestweaver_schema::is_module_owner`].
+    pub fn is_module_owner(&self) -> bool {
+        nestweaver_schema::is_module_owner(self.kind, &self.name, self.entry_point_kind)
+    }
+}
+
 /// Byte positions for JS/TS lexical binding selection, including same-line scopes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LexicalScope {

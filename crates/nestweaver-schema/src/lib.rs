@@ -23,7 +23,7 @@ pub use limits::{DEFAULT_DRAIN_CEILING_SECS, drain_ceiling_from_env, parse_drain
 pub use nodes::{
     Contract, EntryPointKind, File, FrameworkHint, Heading, MODULE_OWNER_NAME, Note, NoteKind,
     Project, Repo, ResolvedType, Section, Service, Symbol, SymbolKind, Tag, TypeInfo, Vault,
-    Visibility,
+    Visibility, is_module_owner,
 };
 pub use repo_url::{normalized_repo_key, repo_name};
 pub use uid::{

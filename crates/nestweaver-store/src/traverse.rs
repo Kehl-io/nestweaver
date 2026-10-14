@@ -1474,7 +1474,7 @@ impl GraphStore {
             }
             // nw-113: one `<module>` per file would flood substring searches
             // for "module"; it is listed only when asked for by its exact name.
-            if sym.name == nestweaver_schema::MODULE_OWNER_NAME && *lower != needle {
+            if sym.is_module_owner() && *lower != needle {
                 continue;
             }
             if counted < count_cap {
@@ -1780,6 +1780,8 @@ mod tests {
         let store = GraphStore::in_memory().unwrap();
         let mut owner = make_symbol("s1", nestweaver_schema::MODULE_OWNER_NAME);
         owner.kind = SymbolKind::Module;
+        owner.is_entry_point = true;
+        owner.entry_point_kind = Some(nestweaver_schema::EntryPointKind::ModuleInit);
         store.insert_symbol(&owner).unwrap();
         store
             .insert_symbol(&make_symbol("s2", "moduleLoader"))
