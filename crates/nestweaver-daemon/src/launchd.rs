@@ -140,10 +140,48 @@ fn agent_daemon_is_live(label: &str) -> bool {
     false
 }
 
-/// Remove orphaned nestweaver launch agents. An agent is reaped when its `--db`
-/// path is under a temp dir, is unparseable, or is gone AND no live daemon holds
-/// its pidfile flock. Agents whose DB exists are kept; agents whose DB is gone
-/// but whose daemon is still alive (transient unmount) are spared.
+/// The instance id in a per-instance daemon agent label, or `None` when
+/// `label` is not one.
+///
+/// `lifecycle::launchd_label` is the only writer of these labels and an
+/// instance id is exactly eight lowercase hex digits (both the SHA-256 form and
+/// the legacy one). The prefix alone is not ownership: installs hang other
+/// agents off the same reverse-DNS name, and nw-781 deleted two of them — a
+/// login item and a running `brain watch`.
+fn daemon_agent_instance_id(label: &str) -> Option<&str> {
+    let id = label.strip_prefix("io.kehl.nestweaver.")?;
+    (id.len() == 8 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))).then_some(id)
+}
+
+/// Decide one launch agent's fate from its label and plist text, or `None`
+/// when the agent is not a per-instance daemon agent and gc must not look at it.
+fn agent_gc_verdict(
+    label: &str,
+    plist: &str,
+    daemon_is_live: impl Fn(&str) -> bool,
+) -> Option<GcVerdict> {
+    daemon_agent_instance_id(label)?;
+    let db = parse_db_path_from_plist(plist);
+    let (db_parsed, is_temp, db_exists) = match &db {
+        Some(p) => (
+            true,
+            lifecycle::is_recorded_temp_db_path(p),
+            lifecycle::database_present(p),
+        ),
+        None => (false, false, false),
+    };
+    // Only probe liveness when it actually decides the outcome (DB gone,
+    // non-temp) — avoids a flock syscall on every kept/temp agent.
+    let daemon_live = db_parsed && !is_temp && !db_exists && daemon_is_live(label);
+    Some(gc_verdict(db_parsed, is_temp, db_exists, daemon_live))
+}
+
+/// Remove orphaned nestweaver launch agents. Only per-instance daemon agents
+/// (`io.kehl.nestweaver.<instance id>`) are considered at all. One is reaped
+/// when its `--db` path is under a temp dir, is unparseable, or is gone AND no
+/// live daemon holds its pidfile flock. Agents whose DB is present — a file, or
+/// a publication `CURRENT` beside a logical anchor — are kept; agents whose DB
+/// is gone but whose daemon is still alive (transient unmount) are spared.
 pub fn gc_orphaned_agents() -> Result<GcReport> {
     gc_orphaned_agents_for(None)
 }
@@ -173,11 +211,7 @@ pub fn gc_orphaned_agents_for(only_db: Option<&std::path::Path>) -> Result<GcRep
         let Some(fname) = path.file_name().and_then(|f| f.to_str()) else {
             continue;
         };
-        // Only per-instance daemon agents: io.kehl.nestweaver.<hash>.plist.
-        let Some(label) = fname
-            .strip_suffix(".plist")
-            .filter(|l| l.starts_with("io.kehl.nestweaver."))
-        else {
+        let Some(label) = fname.strip_suffix(".plist") else {
             continue;
         };
         if let Some(want) = only_instance.as_deref() {
@@ -187,17 +221,17 @@ pub fn gc_orphaned_agents_for(only_db: Option<&std::path::Path>) -> Result<GcRep
             }
         }
 
+        // Decide ownership from the label before reading anything: other
+        // agents in this directory are not ours to open.
+        if daemon_agent_instance_id(label).is_none() {
+            continue;
+        }
         let content = std::fs::read_to_string(&path).unwrap_or_default();
-        let db = parse_db_path_from_plist(&content);
-        let (db_parsed, is_temp, db_exists) = match &db {
-            Some(p) => (true, is_temp_db_path(p), p.exists()),
-            None => (false, false, false),
+        let Some(verdict) = agent_gc_verdict(label, &content, agent_daemon_is_live) else {
+            continue;
         };
-        // Only probe liveness when it actually decides the outcome (DB gone,
-        // non-temp) — avoids a flock syscall on every kept/temp agent.
-        let daemon_live = db_parsed && !is_temp && !db_exists && agent_daemon_is_live(label);
 
-        match gc_verdict(db_parsed, is_temp, db_exists, daemon_live) {
+        match verdict {
             GcVerdict::Reap => {
                 let _ = Command::new("launchctl")
                     .args(["bootout", &format!("gui/{uid}/{label}")])
@@ -1122,6 +1156,160 @@ mod tests {
         assert!(!is_temp_db_path(Path::new(
             "/home/user/.local/share/nestweaver/my-brain/brain.lbug"
         )));
+    }
+
+    /// A plist as an operator (or an installer script) writes one: nothing in
+    /// it is a `daemon ... run` invocation, and the label is not an instance id.
+    fn foreign_plist(label: &str, program_arguments: &[&str]) -> String {
+        let args: String = program_arguments
+            .iter()
+            .map(|a| format!("        <string>{a}</string>\n"))
+            .collect();
+        format!(
+            "<plist version=\"1.0\"><dict>\n    <key>Label</key>\n    \
+             <string>{label}</string>\n    <key>ProgramArguments</key>\n    \
+             <array>\n{args}    </array>\n</dict></plist>\n"
+        )
+    }
+
+    /// nw-781. `daemon gc` deleted `io.kehl.nestweaver.app` (a login item that
+    /// runs `open -g NestWeaver.app`, so it has no `--db`) and
+    /// `io.kehl.nestweaver.watch.brain` (a KeepAlive `brain watch`, running at
+    /// that moment) because the sweep matched on the label PREFIX and both read
+    /// as cruft. Neither is a per-instance daemon agent, so gc has no opinion.
+    #[test]
+    fn gc_never_judges_an_agent_that_is_not_a_per_instance_daemon_agent() {
+        let never_live = |_: &str| false;
+        let app = foreign_plist(
+            "io.kehl.nestweaver.app",
+            &["/usr/bin/open", "-g", "/Applications/NestWeaver.app"],
+        );
+        assert!(agent_gc_verdict("io.kehl.nestweaver.app", &app, never_live).is_none());
+
+        let watcher = foreign_plist(
+            "io.kehl.nestweaver.watch.brain",
+            &[
+                "/usr/local/bin/nestweaver",
+                "brain",
+                "watch",
+                "/home/user/brain",
+                "--db",
+                "/home/user/.local/share/nestweaver/gone/brain.lbug",
+            ],
+        );
+        assert!(
+            agent_gc_verdict("io.kehl.nestweaver.watch.brain", &watcher, never_live).is_none(),
+            "a watcher's missing --db is not gc's to judge"
+        );
+        for label in [
+            "io.kehl.nestweaver.",
+            "io.kehl.nestweaver.c37ccf0",
+            "io.kehl.nestweaver.c37ccf011",
+            "io.kehl.nestweaver.C37CCF01",
+            "io.kehl.nestweaver.zzzzzzzz",
+            "com.example.c37ccf01",
+        ] {
+            assert!(
+                agent_gc_verdict(label, "", never_live).is_none(),
+                "{label} is not an instance label"
+            );
+        }
+    }
+
+    /// nw-781. A publication-layout database has no file at its logical anchor.
+    /// The agent that serves it must be kept, live daemon or not.
+    #[test]
+    fn gc_keeps_the_agent_of_a_logical_publication_database() {
+        // Beside the test binary rather than in the system temp dir: every
+        // temp root is reaped by rule, which would decide this case first.
+        let exe = std::env::current_exe().unwrap();
+        let dir = tempfile::tempdir_in(exe.parent().unwrap()).unwrap();
+        let anchor = dir.path().join("brain.lbug");
+        let render = |db: &Path| {
+            generate_plist(
+                "c37ccf01",
+                Path::new("/usr/local/bin/nestweaver"),
+                db,
+                Path::new("/tmp/x.log"),
+                None,
+            )
+        };
+        let label = "io.kehl.nestweaver.c37ccf01";
+        // The verdict can only be observed outside a temp root. A checkout or
+        // target directory that lives under one still pins the presence facts.
+        let verdict_observable = !is_temp_db_path(&anchor);
+        if verdict_observable {
+            assert!(
+                matches!(
+                    agent_gc_verdict(label, &render(&anchor), |_| false),
+                    Some(GcVerdict::Reap)
+                ),
+                "an anchor with nothing behind it and no live daemon is an orphan"
+            );
+        }
+        assert!(!lifecycle::database_present(&anchor));
+
+        let root = nestweaver_engine::publication::default_publication_root(&anchor);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            nestweaver_engine::publication::current_pointer_path(&root),
+            b"{}",
+        )
+        .unwrap();
+        assert!(!anchor.exists(), "the anchor itself is never a file");
+        assert!(lifecycle::database_present(&anchor));
+        assert!(!lifecycle::database_present(&dir.path().join("typo.lbug")));
+        if !verdict_observable {
+            return;
+        }
+        assert!(
+            matches!(
+                agent_gc_verdict(label, &render(&anchor), |_| false),
+                Some(GcVerdict::Keep)
+            ),
+            "CURRENT selects a graph, so the agent's database is present"
+        );
+        // A plist pinned to a slot that a later publication pruned (nw-729)
+        // still names a present database.
+        let pruned_slot = root.join("slots/00000000-0000-4000-8000-000000000001/graph.lbug");
+        assert!(matches!(
+            agent_gc_verdict(label, &render(&pruned_slot), |_| false),
+            Some(GcVerdict::Keep)
+        ));
+    }
+
+    /// The counterweights nw-781 must not weaken: a genuine instance agent is
+    /// still reaped when it is temp-dir cruft, unparseable, or its database is
+    /// gone with no live daemon — and still spared when a daemon is alive.
+    #[test]
+    fn gc_still_reaps_genuine_instance_orphans() {
+        let label = "io.kehl.nestweaver.0a1b2c3d";
+        let render = |db: &str| {
+            generate_plist(
+                "0a1b2c3d",
+                Path::new("/usr/local/bin/nestweaver"),
+                Path::new(db),
+                Path::new("/tmp/x.log"),
+                None,
+            )
+        };
+        assert!(matches!(
+            agent_gc_verdict(label, &render("/tmp/scratch/test.lbug"), |_| true),
+            Some(GcVerdict::Reap)
+        ));
+        assert!(matches!(
+            agent_gc_verdict(label, "not a plist", |_| true),
+            Some(GcVerdict::Reap)
+        ));
+        let gone = "/nonexistent-root-13579/definitely/not/here/brain.lbug";
+        assert!(matches!(
+            agent_gc_verdict(label, &render(gone), |_| false),
+            Some(GcVerdict::Reap)
+        ));
+        assert!(matches!(
+            agent_gc_verdict(label, &render(gone), |_| true),
+            Some(GcVerdict::Spare)
+        ));
     }
 
     #[test]
