@@ -1481,6 +1481,7 @@ jobs:
           python3 scripts/test-mutation-canary.py
           python3 scripts/test-changelog-upload.py
           python3 scripts/test-release-pr-locator.py
+          python3 scripts/test-release-lockfile-publication.py
           python3 -m unittest discover -s tests/support -p test_isolated_daemon.py -v
           python3 -m unittest discover -s tests/support -p test_release_publication_failure.py -v
           python3 scripts/verify-ci-runtime-contracts.py

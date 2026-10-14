@@ -858,7 +858,11 @@ jobs:
           current_blob="$(jq -er '.sha' <<< "$current_lock")"
           [ "$current_blob" = "$original_blob" ] || fail lockfile-blob-lease \
             "Cargo.lock on $RELEASE_PR_BRANCH is now blob $current_blob but the artifact was prepared against $original_blob — the branch's lockfile changed under the lease"
-          changed="$(jq -er '.changed' lockfile-artifact/lockfile-state.json)"
+          # nw-784: `-r`, never `-e`. `jq -e` exits 1 when its output is
+          # `false`, so under `set -e` an already-synchronized lockfile ended
+          # the step silently on every main push after the sync. The
+          # state-shape check above has already proved `.changed` a boolean.
+          changed="$(jq -r '.changed' lockfile-artifact/lockfile-state.json)"
           expected_head="$RELEASE_PR_HEAD_SHA"
           if [ "$changed" = true ]; then
             branch_head="$(gh api \
