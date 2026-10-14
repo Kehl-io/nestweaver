@@ -1989,16 +1989,28 @@ fn active_lexical_binding<'a>(
 ///   same-named local declared inside such a symbol's body is not its
 ///   declaration, so it must never scope the symbol.
 ///
-/// A declarator symbol's own name precedes any same-named local declared in
-/// its initializer, so only the in-span declarator binding with the smallest
-/// position is the symbol's declaration.
+/// A declarator's own block encloses any same-named local declared inside
+/// an initializer in its span (`let a = { g() { let f = 1; return f; } },
+/// f = () => 2;` puts the inner `f` ahead of `f`'s own declarator), so among
+/// the in-span same-named declarator bindings the one with the WIDEST scope
+/// is the symbol's declaration.
+///
+/// The signature is the node's first line. A modifier on its own line
+/// (`async\nfunction f() {}`) is not part of the node, whose signature then
+/// starts at `function`, so the declaration-form check still sees it.
+///
+/// A CommonJS `exports.f = function () {…}` has no declarator binding of its
+/// own, so it keeps the unfiltered behaviour: a bare `f()` in that file still
+/// binds it, as before nw-113.
 ///
 /// Gated to bare JS/TS calls (plan validation): Rust has its own exact gate
 /// and receiver calls (`Api.get()`, `this.x()`) are matched by
 /// `candidate_matches`, so neither may be filtered here. Only declarator
 /// bindings count. A parameter's binding has `initialized_at == position`
 /// (the same test `name_is_locally_bound` uses), and a same-named parameter
-/// on the declaration line must not hide the symbol. Everything outside
+/// on the declaration line must not hide the symbol: for
+/// `exports.value = function (value) {…}` the parameter is the only in-span
+/// binding. Everything outside
 /// that gate gets `Some(usize::MAX)`: behaviour unchanged.
 fn same_file_declaration_scope(
     local_bindings: &[&RawReference],
@@ -2028,7 +2040,7 @@ fn same_file_declaration_scope(
         })
         .filter_map(|binding| binding.scope)
         .filter(|scope| scope.initialized_at > scope.position)
-        .min_by_key(|scope| scope.position)
+        .max_by_key(|scope| scope.end - scope.start)
     else {
         return Some(usize::MAX);
     };
@@ -8645,12 +8657,44 @@ export function multi() {
             vec![uid_at(&files, "src/a.ts", "format", 1)]
         );
 
+        // Receiver-gate case (not the declaration-form check): `c.items()` has
+        // a receiver, so the declaration-scope filter never sees it.
         let method = "class C { items() { const items = [1]; return items; } }\nexport function useIt(c: C) { return c.items(); }\n";
         let (files, edges) = review_edges(&[("src/c.ts", method)], Language::TypeScript);
         assert_eq!(
             call_targets(&files, &edges, "src/c.ts", "useIt"),
             vec![uid(&files, "src/c.ts", "items")],
-            "a method is not scoped by a same-named local in its body"
+            "a receiver call to a method is not filtered by block scope"
+        );
+
+        // `async` on its own line: the symbol's signature starts at `function`.
+        let split_modifier = "async\nfunction format(x: number) {\n  const format = new Intl.NumberFormat();\n  return format.format(x);\n}\nexport function caller() { return format(1); }\n";
+        let (files, edges) = review_edges(&[("src/s.ts", split_modifier)], Language::TypeScript);
+        assert_eq!(
+            call_targets(&files, &edges, "src/s.ts", "caller"),
+            vec![uid_at(&files, "src/s.ts", "format", 2)]
+        );
+    }
+
+    /// nw-113 (code review): a declarator's own scope is the widest same-named
+    /// declarator binding in its span, not the earliest. An earlier
+    /// declarator's local `f` must not scope the later `f`. One line on
+    /// purpose: a later-line declarator called within its own scope is
+    /// already unresolved on main (`name_is_locally_bound` joins a binding to
+    /// its symbol by start line), and `let`/an object method on purpose: an
+    /// inner `const f` would share the symbol's uid and replace it.
+    #[test]
+    fn a_declarator_is_scoped_by_its_own_binding_not_an_earlier_inner_local() {
+        let source = "let a = { g() { let f = 1; return f; } }, f = () => 2;\nexport function readIt() {\n  return f();\n}\n";
+        let (files, edges) = review_edges(&[("src/d.ts", source)], Language::TypeScript);
+        let f = files[0]
+            .1
+            .iter()
+            .find(|symbol| symbol.name == "f" && symbol.kind == SymbolKind::Function)
+            .unwrap();
+        assert_eq!(
+            call_targets(&files, &edges, "src/d.ts", "readIt"),
+            vec![symbol_uid("repo:test:abc", "src/d.ts", "f", f.start_line)]
         );
     }
 
@@ -8687,7 +8731,7 @@ export function readIt() {
             vec!["unresolved:get".to_string()],
             "a receiver call is not filtered by block scope"
         );
-        // Discriminating receiver case: `this` matches any same-file
+        // Receiver-gate case (discriminating): `this` matches any same-file
         // candidate, so the block-declared `get` is bound today. The
         // declaration-scope filter must not reject it.
         let this_call = (
@@ -8704,6 +8748,19 @@ export function readIt() {
             call_targets(&files, &edges, "src/p.ts", "readIt"),
             vec![uid(&files, "src/p.ts", "value")],
             "a same-named parameter is not a declarator"
+        );
+        // Parameter filter (discriminating): the CommonJS function has no
+        // declarator binding, so its same-named parameter is the only in-span
+        // binding and must not scope it to the function body.
+        let commonjs = (
+            "src/cjs.js",
+            "exports.value = function (value) { return value; };\nfunction readIt() { return value(); }\n",
+        );
+        let (cjs_files, cjs_edges) = review_edges(&[commonjs], Language::JavaScript);
+        assert_eq!(
+            call_targets(&cjs_files, &cjs_edges, "src/cjs.js", "readIt"),
+            vec![uid(&cjs_files, "src/cjs.js", "value")],
+            "a parameter binding does not scope a symbol"
         );
     }
 
