@@ -1935,11 +1935,15 @@ pub(crate) enum WatchReceive {
 /// edit. File permission and access events remain filtered to avoid feedback
 /// from parser reads. A backend may classify chmod specifically as Permissions
 /// rather than Any; dropping it strands an unwatchable directory's debt row.
+/// macOS never says Permissions at all: FSEvents reports a chmod or chown as
+/// `ItemChangeOwner`, which notify maps to Ownership (nw-783).
 pub(crate) fn event_should_be_queued(event: &Event) -> bool {
     event_kind_can_mutate(&event.kind)
         || (matches!(
             event.kind,
-            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Permissions))
+            EventKind::Modify(ModifyKind::Metadata(
+                MetadataKind::Permissions | MetadataKind::Ownership
+            ))
         ) && event
             .paths
             .iter()
@@ -4205,6 +4209,37 @@ mod tests {
         assert!(!event_should_be_queued(
             &Event::new(EventKind::Modify(ModifyKind::Metadata(
                 MetadataKind::AccessTime
+            )))
+            .add_path(dir.path().to_path_buf())
+        ));
+    }
+
+    /// nw-783. macOS never reports a chmod as `Permissions`: notify's FSEvents
+    /// backend maps it to `Metadata(Ownership)` (`ItemChangeOwner`) plus
+    /// `Metadata(Extended)`, measured on macOS 27 for a directory created 000
+    /// and then made 755. Recovery only worked when FSEvents happened to
+    /// repeat the directory's sticky `ItemCreated` flag on the same event;
+    /// when it did not, nothing reached `adopt_new_dirs` and the debt row
+    /// stayed until restart — the `code_watcher_stays_live_when_a_subdirectory_
+    /// cannot_be_watched` CI timeout.
+    #[test]
+    fn a_directory_ownership_change_reaches_watch_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note.md");
+        std::fs::write(&file, "# Note").unwrap();
+        let ownership = EventKind::Modify(ModifyKind::Metadata(MetadataKind::Ownership));
+        assert!(
+            event_should_be_queued(&Event::new(ownership).add_path(dir.path().to_path_buf())),
+            "macOS reports a directory chmod as Ownership; it must reach adopt_new_dirs"
+        );
+        // Counterweights: on a file it is still filtered (parser-read
+        // feedback), and xattr churn on a directory changes no watchability.
+        assert!(!event_should_be_queued(
+            &Event::new(ownership).add_path(file)
+        ));
+        assert!(!event_should_be_queued(
+            &Event::new(EventKind::Modify(ModifyKind::Metadata(
+                MetadataKind::Extended
             )))
             .add_path(dir.path().to_path_buf())
         ));
