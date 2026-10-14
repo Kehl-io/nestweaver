@@ -2081,7 +2081,33 @@ pub fn log_hint_for_dir(dir: &Path) -> String {
 /// launchd-specific and `launchd` is macOS-gated, while state directories
 /// accumulate on every platform.
 pub fn is_temp_db_path(db_path: &Path) -> bool {
-    is_temp_db_path_from(db_path, std::env::current_dir().ok().as_deref())
+    // Classify the database's identity, not its spelling (nw-729): the
+    // canonical path resolves a symlink into (or out of) a temp root, so every
+    // spelling of one database gets one kind of supervisor. The lexical pass
+    // first makes a relative path absolute against this process's directory.
+    let absolute = lexically_absolute(db_path, std::env::current_dir().ok().as_deref());
+    is_temp_db_path_from(&canonical_db_path(&absolute), None)
+}
+
+/// `db_path` made absolute against `cwd` (when relative and `cwd` is known),
+/// with `.`/`..` folded lexically. No filesystem access.
+fn lexically_absolute(db_path: &Path, cwd: Option<&Path>) -> PathBuf {
+    use std::path::Component;
+    let joined = match cwd {
+        Some(cwd) if db_path.is_relative() => cwd.join(db_path),
+        _ => db_path.to_path_buf(),
+    };
+    let mut resolved = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            other => resolved.push(other),
+        }
+    }
+    resolved
 }
 
 /// [`is_temp_db_path`] for a path READ BACK from a launch agent or a boot log
@@ -2103,21 +2129,7 @@ pub fn is_recorded_temp_db_path(db_path: &Path) -> bool {
 /// folding is lexical — no filesystem access, and symlinks are not followed —
 /// so a path that does not exist yet classifies the same as one that does.
 fn is_temp_db_path_from(db_path: &Path, cwd: Option<&Path>) -> bool {
-    use std::path::Component;
-    let joined = match cwd {
-        Some(cwd) if db_path.is_relative() => cwd.join(db_path),
-        _ => db_path.to_path_buf(),
-    };
-    let mut resolved = PathBuf::new();
-    for component in joined.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                resolved.pop();
-            }
-            other => resolved.push(other),
-        }
-    }
+    let resolved = lexically_absolute(db_path, cwd);
     let mut bases: Vec<PathBuf> = vec![
         PathBuf::from("/tmp"),
         PathBuf::from("/private/tmp"),
@@ -5099,6 +5111,29 @@ mod tests {
             db_write_lock(&dir.path().join("typo.lbug")),
             DbWriteLock::Free
         );
+    }
+
+    /// nw-729: supervision must not depend on which spelling of a database a
+    /// caller used. A symlink from a real directory into a temp root names a
+    /// database whose identity (`canonical_db_path`) is under that temp root,
+    /// so it is classified as one.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_into_a_temp_root_is_classified_by_its_target() {
+        let exe = std::env::current_exe().unwrap();
+        let real = tempfile::tempdir_in(exe.parent().unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let link = real.path().join("into-temp");
+        std::os::unix::fs::symlink(temp.path(), &link).unwrap();
+        if is_temp_db_path(&real.path().join("x.lbug")) {
+            return; // the build directory itself is under a temp root
+        }
+        assert!(is_temp_db_path(&temp.path().join("graph.lbug")));
+        assert!(
+            is_temp_db_path(&link.join("graph.lbug")),
+            "the same database through a symlink must get the same supervision"
+        );
+        assert!(!is_temp_db_path(&real.path().join("graph.lbug")));
     }
 
     /// nw-729. Supervision is chosen from this predicate, and it tested the
