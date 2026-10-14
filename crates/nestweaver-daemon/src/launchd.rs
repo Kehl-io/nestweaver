@@ -65,6 +65,124 @@ pub fn parse_db_path_from_plist(content: &str) -> Option<PathBuf> {
     strings.get(pos + 1).map(|s| PathBuf::from(xml_unescape(s)))
 }
 
+/// The program a nestweaver launch agent runs: the first `<string>` of its
+/// `ProgramArguments`.
+pub fn parse_program_from_plist(content: &str) -> Option<PathBuf> {
+    let after_key = content.split_once("<key>ProgramArguments</key>")?.1;
+    let after_open = after_key.split_once("<string>")?.1;
+    let (program, _) = after_open.split_once("</string>")?;
+    Some(PathBuf::from(xml_unescape(program)))
+}
+
+/// The value after `flag` in a nestweaver launch agent's `ProgramArguments`.
+pub fn parse_flag_from_plist(content: &str, flag: &str) -> Option<String> {
+    let mut strings = Vec::new();
+    let mut rest = content.split_once("<key>ProgramArguments</key>")?.1;
+    while let Some((_, after)) = rest.split_once("<string>") {
+        let (value, tail) = after.split_once("</string>")?;
+        strings.push(xml_unescape(value));
+        rest = tail;
+    }
+    let position = strings.iter().position(|value| value == flag)?;
+    strings.get(position + 1).cloned()
+}
+
+/// What an explicit `daemon start` is about to change in an existing launch
+/// agent, one line per changed field (nw-729). Rewriting is that command's
+/// job, but it should never be silent.
+pub fn describe_agent_change(old: &str, new: &str) -> Vec<String> {
+    let program = |plist: &str| parse_program_from_plist(plist).map(|p| p.display().to_string());
+    let fields = [
+        ("program", program(old), program(new)),
+        (
+            "--db",
+            parse_flag_from_plist(old, "--db"),
+            parse_flag_from_plist(new, "--db"),
+        ),
+        (
+            "--config",
+            parse_flag_from_plist(old, "--config"),
+            parse_flag_from_plist(new, "--config"),
+        ),
+    ];
+    fields
+        .into_iter()
+        .filter(|(_, before, after)| before != after)
+        .map(|(name, before, after)| {
+            let show = |value: Option<String>| value.unwrap_or_else(|| "(none)".to_string());
+            format!("{name}: {} -> {}", show(before), show(after))
+        })
+        .collect()
+}
+
+/// Start `instance_id`'s existing launch agent exactly as written: register
+/// it if launchd has not, then kickstart it. Never writes or boots out the
+/// plist — the client-autostart path (nw-729), where rewriting is not the
+/// caller's to do.
+pub fn start_existing(instance_id: &str) -> Result<()> {
+    let plist_path = lifecycle::launchd_plist_path(instance_id);
+    let label = lifecycle::launchd_label(instance_id);
+    let uid = unsafe { libc::getuid() };
+    anyhow::ensure!(
+        plist_path.exists(),
+        "no launch agent to start at {}",
+        plist_path.display()
+    );
+    let _ = Command::new("launchctl")
+        .args(["enable", &format!("gui/{uid}/{label}")])
+        .output();
+    if !is_running(instance_id) {
+        let output = Command::new("launchctl")
+            .args([
+                "bootstrap",
+                &format!("gui/{uid}"),
+                &plist_path.to_string_lossy(),
+            ])
+            .output()
+            .context("failed to run launchctl bootstrap")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("already loaded") && !stderr.contains("already bootstrapped") {
+                anyhow::bail!("launchctl bootstrap failed: {stderr}");
+            }
+        }
+    }
+    let kick = Command::new("launchctl")
+        .args(["kickstart", &format!("gui/{uid}/{label}")])
+        .output()
+        .context("failed to run launchctl kickstart")?;
+    anyhow::ensure!(
+        kick.status.success(),
+        "launchctl kickstart failed: {}",
+        String::from_utf8_lossy(&kick.stderr)
+    );
+    Ok(())
+}
+
+/// What `instance_id`'s launch agent runs, as far as its plist says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentProgram {
+    /// No plist: there is no agent.
+    Absent,
+    /// A plist exists but its program cannot be read from it.
+    Unreadable,
+    /// The agent runs this program.
+    Program(PathBuf),
+}
+
+/// The program `instance_id`'s launch agent runs. "No agent" and "an agent
+/// whose plist cannot be read" are different answers (nw-729): only the first
+/// leaves a client free to create one.
+pub fn agent_program(instance_id: &str) -> AgentProgram {
+    let path = lifecycle::launchd_plist_path(instance_id);
+    match std::fs::read_to_string(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => AgentProgram::Absent,
+        Err(_) => AgentProgram::Unreadable,
+        Ok(content) => parse_program_from_plist(&content)
+            .map_or(AgentProgram::Unreadable, AgentProgram::Program),
+    }
+}
+
 /// Result of a [`gc_orphaned_agents`] pass.
 pub struct GcReport {
     /// Labels whose plist was booted out and deleted.
@@ -1156,6 +1274,69 @@ mod tests {
         assert!(!is_temp_db_path(Path::new(
             "/home/user/.local/share/nestweaver/my-brain/brain.lbug"
         )));
+    }
+
+    #[test]
+    fn an_explicit_rewrite_says_what_it_changes() {
+        let render = |program: &str, db: &str| {
+            generate_plist(
+                "c37ccf01",
+                Path::new(program),
+                Path::new(db),
+                Path::new("/tmp/x.log"),
+                None,
+            )
+        };
+        let old = render(
+            "/Applications/NestWeaver.app/Contents/MacOS/nestweaver-cli",
+            "/b/brain.lbug",
+        );
+        let new = render("/usr/local/bin/nestweaver", "/b/brain.lbug");
+        assert_eq!(
+            describe_agent_change(&old, &new),
+            vec![
+                "program: /Applications/NestWeaver.app/Contents/MacOS/nestweaver-cli -> /usr/local/bin/nestweaver"
+                    .to_string()
+            ]
+        );
+        assert!(describe_agent_change(&old, &old).is_empty());
+        assert_eq!(
+            parse_flag_from_plist(&old, "--db").as_deref(),
+            Some("/b/brain.lbug")
+        );
+    }
+
+    /// nw-729: a client starts an existing agent as written, so it must be
+    /// able to read which binary that agent runs.
+    #[test]
+    fn an_agents_program_is_read_back_from_its_plist() {
+        let plist = generate_plist_with_config(
+            "c37ccf01",
+            Path::new("/Applications/NestWeaver.app/Contents/MacOS/nestweaver-cli"),
+            Path::new("/home/user/brain.lbug"),
+            Path::new("/tmp/x.log"),
+            None,
+            Some(Path::new("/home/user/instance & co.toml")),
+            true,
+        );
+        assert_eq!(
+            parse_program_from_plist(&plist),
+            Some(PathBuf::from(
+                "/Applications/NestWeaver.app/Contents/MacOS/nestweaver-cli"
+            ))
+        );
+        let escaped = generate_plist(
+            "c37ccf01",
+            Path::new("/opt/a&b/nestweaver"),
+            Path::new("/home/user/brain.lbug"),
+            Path::new("/tmp/x.log"),
+            None,
+        );
+        assert_eq!(
+            parse_program_from_plist(&escaped),
+            Some(PathBuf::from("/opt/a&b/nestweaver"))
+        );
+        assert_eq!(parse_program_from_plist("not a plist"), None);
     }
 
     /// A plist as an operator (or an installer script) writes one: nothing in

@@ -8328,6 +8328,11 @@ enum DaemonAction {
         /// Hidden: redirect users who pass this flag here to the correct command.
         #[arg(long, hide = true)]
         track_interactions: bool,
+        /// Hidden: set by client autostart and version-mismatch restarts. An
+        /// existing launch agent is then started exactly as written and never
+        /// rewritten; only an explicit `daemon start` may change it (nw-729).
+        #[arg(long, hide = true)]
+        client_autostart: bool,
     },
     /// Stop the running daemon, draining in-flight writes first.
     ///
@@ -12058,6 +12063,95 @@ mod daemon_lifecycle_db_path_tests {
         ] {
             assert_eq!(daemon_lifecycle_db_path(unchanged), unchanged);
         }
+    }
+}
+
+/// What `daemon start` does with this instance's launch agent (nw-729).
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LaunchAgentPlan {
+    /// Render the agent from this invocation and (re)install it.
+    Install,
+    /// Start the existing agent exactly as written.
+    StartExisting,
+    /// The existing agent runs a program that is gone; a client cannot repair
+    /// that without rewriting the agent, so it refuses and names the command.
+    RefuseMissingProgram(PathBuf),
+    /// An agent exists but its program cannot be read from it (a binary or
+    /// hand-written plist). Not knowing what it runs is no licence to replace
+    /// it, so a client refuses.
+    RefuseUnreadable,
+}
+
+/// One owner per launch agent. An explicit `daemon start` owns it and may
+/// rewrite it (that is the upgrade path). A client autostart or
+/// version-mismatch restart creates one only when none exists; an existing
+/// agent is started as written.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn launch_agent_plan(
+    client_autostart: bool,
+    agent_exists: bool,
+    existing_program: Option<&Path>,
+) -> LaunchAgentPlan {
+    if !client_autostart || !agent_exists {
+        return LaunchAgentPlan::Install;
+    }
+    match existing_program {
+        None => LaunchAgentPlan::RefuseUnreadable,
+        Some(program) if program.exists() => LaunchAgentPlan::StartExisting,
+        Some(program) => LaunchAgentPlan::RefuseMissingProgram(program.to_path_buf()),
+    }
+}
+
+#[cfg(test)]
+mod launch_agent_plan_tests {
+    use super::*;
+
+    /// nw-729, decided 2026-10-14: an explicit start may rewrite, a client may
+    /// only create. Before this, the vault watcher's autostart rewrote the app's
+    /// agent to a different binary and a publication slot path.
+    #[test]
+    fn only_an_explicit_start_rewrites_an_existing_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("nestweaver-cli");
+        std::fs::write(&program, b"").unwrap();
+        let gone = dir.path().join("deleted-app/nestweaver-cli");
+
+        // Explicit `daemon start`: always installs, existing agent or not.
+        assert_eq!(
+            launch_agent_plan(false, false, None),
+            LaunchAgentPlan::Install
+        );
+        assert_eq!(
+            launch_agent_plan(false, true, Some(&program)),
+            LaunchAgentPlan::Install
+        );
+        assert_eq!(
+            launch_agent_plan(false, true, Some(&gone)),
+            LaunchAgentPlan::Install
+        );
+        assert_eq!(
+            launch_agent_plan(false, true, None),
+            LaunchAgentPlan::Install
+        );
+        // Client: creates on first run, otherwise starts what is there.
+        assert_eq!(
+            launch_agent_plan(true, false, None),
+            LaunchAgentPlan::Install
+        );
+        assert_eq!(
+            launch_agent_plan(true, true, Some(&program)),
+            LaunchAgentPlan::StartExisting
+        );
+        assert_eq!(
+            launch_agent_plan(true, true, Some(&gone)),
+            LaunchAgentPlan::RefuseMissingProgram(gone.clone())
+        );
+        // An agent the client cannot read is still not the client's to replace.
+        assert_eq!(
+            launch_agent_plan(true, true, None),
+            LaunchAgentPlan::RefuseUnreadable
+        );
     }
 }
 
@@ -24917,7 +25011,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     config,
                     reset,
                     track_interactions,
+                    client_autostart,
                 } => {
+                    // Only the launchd branch below has an agent to protect.
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = client_autostart;
                     // Serialize every direct start from incumbent preflight
                     // through readiness and final config attestation. Parents
                     // in autostart/restart already hold this exact lock and
@@ -25355,6 +25453,108 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 effective_config_abs.as_deref(),
                                 start_at_login,
                             );
+                            // nw-729: one owner per launch agent. A client
+                            // start (autostart, version-mismatch restart)
+                            // starts an existing agent as written; only an
+                            // explicit `daemon start` rewrites it, and says
+                            // what it changes.
+                            let plist_path =
+                                nestweaver_daemon::lifecycle::launchd_plist_path(&instance_id);
+                            let existing_plist = std::fs::read_to_string(&plist_path).ok();
+                            let agent_plan = launch_agent_plan(
+                                client_autostart,
+                                plist_path.exists(),
+                                existing_plist
+                                    .as_deref()
+                                    .and_then(nestweaver_daemon::launchd::parse_program_from_plist)
+                                    .as_deref(),
+                            );
+                            if agent_plan == LaunchAgentPlan::RefuseUnreadable {
+                                anyhow::bail!(
+                                    "the launch agent {} exists but its program cannot be read \
+                                     from it. A client start does not replace an existing agent; \
+                                     run `{} daemon --db {} start` to reinstall it",
+                                    plist_path.display(),
+                                    binary_path.display(),
+                                    db_path.display()
+                                );
+                            }
+                            // A client asking for a different configuration than
+                            // the agent carries would start the agent's and then
+                            // fail attestation; say so before starting anything.
+                            if agent_plan == LaunchAgentPlan::StartExisting {
+                                let agent_config = existing_plist.as_deref().and_then(|plist| {
+                                    nestweaver_daemon::launchd::parse_flag_from_plist(
+                                        plist, "--config",
+                                    )
+                                });
+                                let canonical = |path: &Path| {
+                                    std::fs::canonicalize(path)
+                                        .unwrap_or_else(|_| path.to_path_buf())
+                                };
+                                let wanted = effective_config_abs.as_deref().map(canonical);
+                                let has = agent_config.as_deref().map(Path::new).map(canonical);
+                                // An agent with no --config (written before
+                                // agents carried one) lets `daemon run` resolve
+                                // the saved startup record itself; attestation
+                                // checks the result. Only an explicit --config
+                                // that differs is a known mismatch.
+                                if has.is_some() && wanted != has {
+                                    let show = |path: Option<PathBuf>| {
+                                        path.map_or("(none)".to_string(), |path| {
+                                            path.display().to_string()
+                                        })
+                                    };
+                                    anyhow::bail!(
+                                        "the launch agent {} starts this database with --config \
+                                         {}, but this command (or its saved startup configuration) asked for {}. A \
+                                         client start does not \
+                                         rewrite an existing agent; run `{} daemon --db {} \
+                                         start` with the configuration you want to change it",
+                                        plist_path.display(),
+                                        show(has),
+                                        show(wanted),
+                                        binary_path.display(),
+                                        db_path.display()
+                                    );
+                                }
+                            }
+                            if let LaunchAgentPlan::RefuseMissingProgram(program) = &agent_plan {
+                                anyhow::bail!(
+                                    "the launch agent {} runs {}, which no longer exists. A client \
+                                     start does not rewrite an existing agent; run `{} \
+                                     daemon --db {} start` to reinstall it",
+                                    plist_path.display(),
+                                    program.display(),
+                                    binary_path.display(),
+                                    db_path.display()
+                                );
+                            }
+                            if agent_plan == LaunchAgentPlan::Install
+                                && plist_path.exists()
+                                && existing_plist
+                                    .as_deref()
+                                    .and_then(nestweaver_daemon::launchd::parse_program_from_plist)
+                                    .is_none()
+                            {
+                                eprintln!(
+                                    "Replacing launch agent {} (its contents could not be read).",
+                                    plist_path.display()
+                                );
+                            }
+                            if agent_plan == LaunchAgentPlan::Install
+                                && let Some(existing) = existing_plist.as_deref()
+                            {
+                                let changes = nestweaver_daemon::launchd::describe_agent_change(
+                                    existing, &plist,
+                                );
+                                if !changes.is_empty() {
+                                    eprintln!("Updating launch agent {}:", plist_path.display());
+                                    for change in changes {
+                                        eprintln!("  {change}");
+                                    }
+                                }
+                            }
 
                             // nw-729. A client whose XDG_RUNTIME_DIR hides the
                             // supervised socket used to reach this bootout and
@@ -25392,18 +25592,22 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             // anyway. Surface it instead of silently
                             // overlaying a second registration on a job that
                             // may still be alive.
-                            nestweaver_daemon::launchd::stop_and_uninstall(&instance_id)
-                                .with_context(|| {
-                                    format!(
-                                        "cannot install a new launchd agent for {} while the \
+                            if agent_plan == LaunchAgentPlan::Install {
+                                nestweaver_daemon::launchd::stop_and_uninstall(&instance_id)
+                                    .with_context(|| {
+                                        format!(
+                                            "cannot install a new launchd agent for {} while the \
                                          previous registration has not confirmed it stopped — \
                                          verify with `launchctl print gui/{}/{}`, then retry \
                                          `daemon start`",
-                                        db_path.display(),
-                                        unsafe { libc::getuid() },
-                                        nestweaver_daemon::lifecycle::launchd_label(&instance_id),
-                                    )
-                                })?;
+                                            db_path.display(),
+                                            unsafe { libc::getuid() },
+                                            nestweaver_daemon::lifecycle::launchd_label(
+                                                &instance_id
+                                            ),
+                                        )
+                                    })?;
+                            }
 
                             // nw-359 leg (1). Nothing above this point proved
                             // ownership of a LIVE incumbent — every path that
@@ -25449,7 +25653,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 }
                             }
 
-                            nestweaver_daemon::launchd::install_and_start(&instance_id, &plist)?;
+                            if agent_plan == LaunchAgentPlan::StartExisting {
+                                eprintln!(
+                                    "Starting the existing launch agent unchanged (a client start \
+                                     never rewrites it; an explicit `nestweaver daemon --db {} \
+                                     start` does).",
+                                    db_path.display()
+                                );
+                                nestweaver_daemon::launchd::start_existing(&instance_id)?;
+                            } else {
+                                nestweaver_daemon::launchd::install_and_start(
+                                    &instance_id,
+                                    &plist,
+                                )?;
+                            }
 
                             eprintln!(
                                 "Starting daemon via launchd for {} (instance {})...",
