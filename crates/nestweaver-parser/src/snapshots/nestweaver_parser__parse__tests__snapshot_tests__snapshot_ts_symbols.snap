@@ -2,6 +2,18 @@
 source: crates/nestweaver-parser/src/parse.rs
 expression: "parsed_symbols(\"simple.ts\", &source)"
 ---
+- name: "<module>"
+  kind: Module
+  start_line: 1
+  end_line: 38
+  signature: ""
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: true
+  entry_point_kind: ModuleInit
+  visibility: Private
+  type_info: ~
+  parent_name: ~
+  scope_chain: ~
 - name: Greeter
   kind: Interface
   start_line: 3

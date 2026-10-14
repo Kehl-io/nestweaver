@@ -2,7 +2,9 @@ use crate::entry_points::detect_entry_point;
 use crate::language::detect_language;
 use crate::scope_chain::extract_scope_chain;
 use bumpalo::Bump;
-use nestweaver_schema::{EntryPointKind, Language, SymbolKind, TypeInfo, Visibility};
+use nestweaver_schema::{
+    EntryPointKind, Language, MODULE_OWNER_NAME, SymbolKind, TypeInfo, Visibility,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -579,6 +581,30 @@ fn is_top_level_reference(node: &tree_sitter::Node, lang_str: &str) -> bool {
             "computed_property",
             "class_declaration",
             "protocol_declaration",
+        ],
+        // nw-113: JS/TS and PHP feed only the `<module>` owner gate, never
+        // nw-435's rooting (its call site stays Python/bash/Swift). A class
+        // body is listed so field initialisers and static blocks read as
+        // class code; the resolver's span test would exclude them anyway.
+        "javascript" | "typescript" => &[
+            "function_declaration",
+            "generator_function_declaration",
+            "function_expression",
+            "generator_function",
+            "arrow_function",
+            "method_definition",
+            "class_body",
+        ],
+        // Node kinds checked against tree-sitter-php 0.24.2's
+        // `node-types.json`: closures are `anonymous_function` (there is no
+        // `anonymous_function_creation_expression`), and class, interface and
+        // trait bodies are all `declaration_list`.
+        "php" => &[
+            "function_definition",
+            "method_declaration",
+            "anonymous_function",
+            "arrow_function",
+            "declaration_list",
         ],
         _ => return false,
     };
@@ -1498,6 +1524,10 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     // than recovered afterward from `references` (which does not retain the
     // AST node).
     let mut top_level_called: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // nw-113: rows (1-based) of top-level calls, checked against symbol spans
+    // after the capture loop. `require(...)` is an import mechanism, not
+    // executable module code worth an owner.
+    let mut top_level_call_lines: Vec<u32> = Vec::new();
 
     let mut cursor = QueryCursor::new();
     let source_bytes = source.as_bytes();
@@ -1934,6 +1964,14 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     top_level_called.insert(name.clone());
                 }
 
+                if kind == ReferenceKind::Call
+                    && matches!(lang_str, "javascript" | "typescript" | "python" | "php")
+                    && name != "require"
+                    && is_top_level_reference(&node, lang_str)
+                {
+                    top_level_call_lines.push(node.start_position().row as u32 + 1);
+                }
+
                 // Filter out HTML elements from JSX patterns: lowercase
                 // identifiers in jsx_opening_element / jsx_self_closing_element
                 // are native HTML tags (div, span, etc.), not component references.
@@ -2206,6 +2244,40 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 symbol.entry_point_kind = Some(EntryPointKind::Main);
             }
         }
+    }
+
+    // nw-113: top-level code has an owner, and the owner is the module
+    // (CodeQL: JS `TopLevel`, Python `Module`). Minted only when some call
+    // lies outside every code-bearing span: the same rule the resolver uses,
+    // so the owner exists exactly when the resolver would otherwise drop or
+    // misattribute that call.
+    let outside_every_span = |line: u32| {
+        !symbols.iter().any(|symbol| {
+            symbol.kind.contains_code() && symbol.start_line <= line && line <= symbol.end_line
+        })
+    };
+    if top_level_call_lines
+        .iter()
+        .any(|line| outside_every_span(*line))
+    {
+        let end_line = source.lines().count().max(1) as u32;
+        symbols.insert(
+            0,
+            RawSymbol {
+                name: MODULE_OWNER_NAME.to_string(),
+                kind: SymbolKind::Module,
+                start_line: 1,
+                end_line,
+                signature: String::new(),
+                content_hash: sha256_hex(source),
+                is_entry_point: true,
+                entry_point_kind: Some(EntryPointKind::ModuleInit),
+                visibility: Visibility::Private,
+                type_info: None,
+                parent_name: None,
+                scope_chain: None,
+            },
+        );
     }
 
     // Type extraction: walk the same tree with type-specific queries
@@ -13526,5 +13598,116 @@ mod review_macro_mapping_tests {
                 .expect("macro value call captured");
             assert_eq!(call.receiver.as_deref(), receiver, "{call:#?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod module_owner_tests {
+    use super::*;
+
+    fn module_owner(parsed: &ParsedFile) -> Option<&RawSymbol> {
+        parsed
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == MODULE_OWNER_NAME)
+    }
+
+    /// nw-113: a call outside every function/class/method gets one owner.
+    #[test]
+    fn a_top_level_call_mints_one_module_owner() {
+        for (path, source) in [
+            (
+                "ownerless.ts",
+                "import { flushBuffer } from './lib';\nflushBuffer();\n",
+            ),
+            (
+                "ownerless.js",
+                "import { flushBuffer } from './lib.js';\nflushBuffer();\n",
+            ),
+            (
+                "ownerless.py",
+                "from lib import flush_buffer\nflush_buffer()\n",
+            ),
+            (
+                "ownerless.php",
+                "<?php\nfunction helper() { return 1; }\nflush_buffer();\n",
+            ),
+            // A one-line function above the call must not absorb it.
+            (
+                "oneline.ts",
+                "export const add = (a: number, b: number) => a + b;\nflushBuffer();\n",
+            ),
+        ] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            let owners: Vec<_> = parsed
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.name == MODULE_OWNER_NAME)
+                .collect();
+            assert_eq!(owners.len(), 1, "{path}: exactly one owner");
+            let owner = owners[0];
+            assert_eq!(owner.kind, SymbolKind::Module, "{path}");
+            assert_eq!(owner.start_line, 1, "{path}");
+            assert!(owner.end_line >= 2, "{path}: spans the file");
+            assert!(owner.is_entry_point, "{path}");
+            assert_eq!(
+                owner.entry_point_kind,
+                Some(EntryPointKind::ModuleInit),
+                "{path}"
+            );
+        }
+    }
+
+    /// Counterweights from validation: no owner for calls that already have
+    /// a code-bearing owner, for `require`, or for files with no calls.
+    #[test]
+    fn calls_with_an_owner_or_require_only_mint_nothing() {
+        for (path, source) in [
+            (
+                "inside.ts",
+                "import { a } from './lib';\nexport function f() {\n  a();\n}\nconst g = () => {\n  a();\n};\nclass C {\n  m() { a(); }\n}\n",
+            ),
+            (
+                "cjs.js",
+                "const lib = require('./lib');\nmodule.exports = { lib };\n",
+            ),
+            (
+                "spec.test.ts",
+                "import { a } from './lib';\ndescribe('a', () => {\n  it('works', () => {\n    a();\n  });\n});\n",
+            ),
+            (
+                "klass.py",
+                "class C:\n    x = compute()\n    def m(self):\n        a()\n",
+            ),
+            (
+                "inside.php",
+                "<?php\nfunction f() { a(); }\nclass C { function m() { a(); } }\n",
+            ),
+            ("plain.ts", "export const x = 1;\n"),
+        ] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            assert!(
+                module_owner(&parsed).is_none(),
+                "{path}: no owner expected, symbols: {:?}",
+                parsed.symbols
+            );
+        }
+    }
+
+    /// The owner sorts first, keeping `symbols` ordered by `start_line`.
+    #[test]
+    fn the_module_owner_keeps_symbols_sorted() {
+        let parsed = parse_source(
+            Path::new("mixed.ts"),
+            "export function f() {\n  return 1;\n}\nf();\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.symbols[0].name, MODULE_OWNER_NAME);
+        assert!(
+            parsed
+                .symbols
+                .windows(2)
+                .all(|w| w[0].start_line <= w[1].start_line)
+        );
     }
 }
