@@ -1027,6 +1027,36 @@ mod tests {
         );
     }
 
+    /// nw-113: a test file whose own top level calls a changed function (a
+    /// fixture loader, a smoke script) covers it: its `<module>` owner is the
+    /// caller, and the owner lives in the test file.
+    #[test]
+    fn a_test_file_top_level_call_selects_that_test_file() {
+        use crate::index::index_directory_in_memory;
+        use std::fs;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).expect("mkdir");
+        fs::write(
+            src.join("lib.ts"),
+            "export function flushBuffer(): number {\n  return 8;\n}\n",
+        )
+        .expect("write lib");
+        fs::write(
+            src.join("lib.test.ts"),
+            "import { flushBuffer } from './lib';\nflushBuffer();\n",
+        )
+        .expect("write test");
+        let (_result, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/repo", "abc123")
+                .expect("index");
+
+        let result = affected_tests(&store, &["src/lib.ts".to_string()]).expect("affected");
+        let t1_files: Vec<&str> = result.tier_1.iter().map(|f| f.test_file.as_str()).collect();
+        assert_eq!(t1_files, vec!["src/lib.test.ts"], "{result:#?}");
+    }
+
     #[test]
     fn jest_style_test_calling_changed_symbol_is_tier_1() {
         // End-to-end: a Jest/Vitest-style `test('...', () => greet(...))` that

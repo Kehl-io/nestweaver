@@ -438,7 +438,15 @@ fn derive_cluster_name(members: &[ClusterMember]) -> String {
     {
         return common;
     }
-    members[0].name.clone()
+    // nw-113: never name a cluster after a file's `<module>` owner.
+    // `ClusterMember` carries no entry kind, so this is the kind-and-name half
+    // of `nestweaver_schema::is_module_owner`.
+    members
+        .iter()
+        .find(|m| !(m.kind == "Module" && m.name == nestweaver_schema::MODULE_OWNER_NAME))
+        .unwrap_or(&members[0])
+        .name
+        .clone()
 }
 
 /// Find the longest common directory prefix of a set of file paths.
@@ -694,6 +702,24 @@ mod tests {
             },
         ];
         assert_eq!(derive_cluster_name(&members), "src/auth");
+    }
+
+    /// nw-113: a cluster's name never falls back to the `<module>` owner.
+    #[test]
+    fn derive_cluster_name_skips_the_module_owner() {
+        let member = |name: &str, kind: &str| ClusterMember {
+            uid: name.to_string(),
+            name: name.to_string(),
+            // A root-level file has no common directory, so the name falls
+            // back to a member's name.
+            file_path: "ownerless.ts".to_string(),
+            kind: kind.to_string(),
+        };
+        let members = vec![
+            member(nestweaver_schema::MODULE_OWNER_NAME, "Module"),
+            member("flushBuffer", "Function"),
+        ];
+        assert_eq!(derive_cluster_name(&members), "flushBuffer");
     }
 
     #[test]

@@ -280,7 +280,14 @@ pub fn generate_symbol_summaries_bounded(
     if let Some(t) = target {
         let needle = t.to_lowercase();
         symbols.retain(|s| {
-            s.name.to_lowercase().contains(&needle)
+            // nw-113: a `<module>` owner matches by its exact name, file path
+            // or uid, never as a "module" substring hit.
+            let name_hit = if s.is_module_owner() {
+                s.name.eq_ignore_ascii_case(t)
+            } else {
+                s.name.to_lowercase().contains(&needle)
+            };
+            name_hit
                 || s.file_path.to_lowercase().contains(&needle)
                 || s.uid.eq_ignore_ascii_case(t)
         });
@@ -352,10 +359,15 @@ fn generate_file_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
         .list_all_symbols()
         .map_err(|e| anyhow::anyhow!("list_all_symbols: {e}"))?;
 
-    // Group symbols by file path.
+    // Group symbols by file path. nw-113: a `<module>` owner is not an export,
+    // but its file still gets a summary, and its calls (below) still count
+    // as the file's imports.
     let mut by_file: BTreeMap<String, Vec<&nestweaver_schema::Symbol>> = BTreeMap::new();
     for sym in &symbols {
-        by_file.entry(sym.file_path.clone()).or_default().push(sym);
+        let entry = by_file.entry(sym.file_path.clone()).or_default();
+        if !sym.is_module_owner() {
+            entry.push(sym);
+        }
     }
 
     // Build a set of file paths that each file imports from, by checking
@@ -831,6 +843,60 @@ pub fn render_text(summaries: &[Summary]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nw-113: the `<module>` owner is not an export. A file summary lists
+    /// only real symbols, while the owner's calls still count as imports, and
+    /// a "module" target does not pull in every file's owner.
+    #[test]
+    fn summaries_do_not_list_the_module_owner() {
+        use crate::index::index_directory_in_memory;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("lib.ts"),
+            "export function flushBuffer() { return 8; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("ownerless.ts"),
+            "import { flushBuffer } from './lib';\nflushBuffer();\n",
+        )
+        .unwrap();
+        let (_r, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/r", "sha").unwrap();
+
+        let files = generate_summaries(&store, SummaryLevel::File).unwrap();
+        let ownerless = files
+            .iter()
+            .find(|summary| summary.target_name == "src/ownerless.ts")
+            .expect("file summary");
+        assert!(
+            ownerless.content.contains("exports 0 symbols"),
+            "{}",
+            ownerless.content
+        );
+        assert!(
+            !ownerless.content.contains("<module>"),
+            "{}",
+            ownerless.content
+        );
+        assert!(
+            ownerless.content.contains("imports from: [src/lib.ts]"),
+            "{}",
+            ownerless.content
+        );
+
+        let targeted = generate_symbol_summaries_bounded(&store, Some("module"), 100).unwrap();
+        assert!(
+            targeted
+                .summaries
+                .iter()
+                .all(|summary| summary.target_name != "<module>"),
+            "{:?}",
+            targeted.summaries
+        );
+    }
 
     #[test]
     fn summary_level_roundtrip() {
