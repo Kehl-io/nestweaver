@@ -862,7 +862,40 @@ fn db_write_lock_probe(local_store_held: bool, db_path: &Path) -> DbWriteLock {
         return DbWriteLock::Unknown;
     }
 
-    fcntl_write_lock_state(&canonical_db_path(db_path))
+    match write_lock_probe_target_with(db_path, |anchor| {
+        nestweaver_engine::publication::resolve_selected_database(anchor)
+    }) {
+        Some(target) => fcntl_write_lock_state(&target),
+        None => DbWriteLock::Unknown,
+    }
+}
+
+/// The file whose write lock answers "is this database held?".
+///
+/// That is the path itself whenever it exists. A published brain has no file
+/// at its logical anchor, and the daemon's lock is on the graph `CURRENT`
+/// selects, so an absent path is resolved the way the daemon's boot resolves
+/// it. Without this, every `stop`/`status`/`restart` probe of a published
+/// brain named by its anchor read `Free` from a file that was never there.
+///
+/// `None` when `CURRENT` exists and cannot be resolved: which file to ask
+/// about is then unknowable, and [`DbWriteLock::Unknown`] is the fail-closed
+/// answer. A path with no `CURRENT` resolves to itself and probes as `Free`.
+fn write_lock_probe_target_with(
+    db_path: &Path,
+    resolve: impl FnOnce(&Path) -> anyhow::Result<PathBuf>,
+) -> Option<PathBuf> {
+    let canonical = canonical_db_path(db_path);
+    if canonical.exists() {
+        return Some(canonical);
+    }
+    match resolve(&preflight_anchor(db_path)) {
+        Ok(selected) => Some(selected),
+        Err(error) => {
+            tracing::warn!("write-lock probe could not resolve CURRENT: {error:#}");
+            None
+        }
+    }
 }
 
 /// `F_GETLK` for a whole-file write lock on one path.
@@ -941,7 +974,7 @@ pub enum CheckpointArtifacts {
 /// what produces the crash-restart loop, and step 1 of the runbook the product
 /// prints for this state is "stop everything that opens this database".
 pub fn db_wal_unreadable(db_path: &Path) -> Option<nestweaver_store::StoreError> {
-    if !db_path.exists() {
+    if !database_present(db_path) {
         return None;
     }
     // Probe what the daemon would serve: the publication `CURRENT`, not a
@@ -1000,7 +1033,7 @@ pub fn db_rebuild_required(db_path: &Path) -> Option<nestweaver_store::StoreErro
             }
         })
     }
-    if !db_path.exists() {
+    if !database_present(db_path) {
         return None;
     }
     let selected =
@@ -1030,7 +1063,7 @@ pub fn db_rebuild_required(db_path: &Path) -> Option<nestweaver_store::StoreErro
 /// checkpoint exactly as the daemon would have. If the lease is held, someone
 /// else owns the database and this declines. Every other outcome is `None`.
 pub fn db_frozen_checkpoint_applied(db_path: &Path) -> Option<nestweaver_store::StoreError> {
-    if !db_path.exists() {
+    if !database_present(db_path) {
         return None;
     }
     let (selected, expected) =
@@ -2048,16 +2081,82 @@ pub fn log_hint_for_dir(dir: &Path) -> String {
 /// launchd-specific and `launchd` is macOS-gated, while state directories
 /// accumulate on every platform.
 pub fn is_temp_db_path(db_path: &Path) -> bool {
+    is_temp_db_path_from(db_path, std::env::current_dir().ok().as_deref())
+}
+
+/// [`is_temp_db_path`] for a path READ BACK from a launch agent or a boot log
+/// rather than typed by the caller. Such a record is judged as written: this
+/// process's working directory has nothing to do with where that daemon ran,
+/// and gc reaps temp records without a liveness probe, so resolving a relative
+/// record against wherever `daemon gc` happens to be invoked could reap a
+/// live instance.
+pub fn is_recorded_temp_db_path(db_path: &Path) -> bool {
+    is_temp_db_path_from(db_path, None)
+}
+
+/// [`is_temp_db_path`] with the working directory supplied, so the relative
+/// spellings can be tested without changing the process's own.
+///
+/// The path is made absolute against `cwd` and its `.`/`..` components are
+/// folded before the prefix test (nw-729): supervision is chosen from this
+/// answer, so two spellings of one database must not get two answers. The
+/// folding is lexical — no filesystem access, and symlinks are not followed —
+/// so a path that does not exist yet classifies the same as one that does.
+fn is_temp_db_path_from(db_path: &Path, cwd: Option<&Path>) -> bool {
+    use std::path::Component;
+    let joined = match cwd {
+        Some(cwd) if db_path.is_relative() => cwd.join(db_path),
+        _ => db_path.to_path_buf(),
+    };
+    let mut resolved = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            other => resolved.push(other),
+        }
+    }
     let mut bases: Vec<PathBuf> = vec![
         PathBuf::from("/tmp"),
         PathBuf::from("/private/tmp"),
         PathBuf::from("/var/folders"),
         PathBuf::from("/private/var/folders"),
     ];
-    if let Some(t) = std::env::var_os("TMPDIR") {
-        bases.push(PathBuf::from(t));
+    // An empty or relative TMPDIR is not a root: `starts_with("")` is true of
+    // every path, which would classify every database as temporary.
+    if let Some(t) = std::env::var_os("TMPDIR").map(PathBuf::from)
+        && t.is_absolute()
+    {
+        bases.push(t);
     }
-    bases.iter().any(|b| db_path.starts_with(b))
+    bases.iter().any(|b| resolved.starts_with(b))
+}
+
+/// Is the database `db_path` names still there?
+///
+/// `Path::exists` is the wrong question for a published brain. Its graph lives
+/// in `<anchor>.publications/slots/<uuid>/graph.lbug`, `CURRENT` selects it, and
+/// nothing is ever written at the logical anchor itself. Asking only whether
+/// the anchor exists made `daemon gc` report a healthy production daemon as
+/// "database is gone" and treat its launch agent as an orphan (nw-781).
+///
+/// A `CURRENT` beside the anchor counts as present whether or not it resolves:
+/// this answer decides what gc may REMOVE and whether a preflight looks any
+/// further, so everything it cannot interpret has to read as "keep" and
+/// "look". It is not a diagnosis — a caller that must tell a healthy selector
+/// from a broken one resolves `CURRENT` itself. It follows that a plist still naming a slot a later
+/// publication pruned is present too.
+pub fn database_present(db_path: &Path) -> bool {
+    if db_path.exists() {
+        return true;
+    }
+    let anchor = nestweaver_engine::publication::instance_anchor_database(db_path);
+    let root = nestweaver_engine::publication::default_publication_root(&anchor);
+    nestweaver_engine::publication::current_pointer_path(&root)
+        .try_exists()
+        .unwrap_or(true)
 }
 
 /// Unlink every per-instance directory a TEMP-database daemon created, on its
@@ -2810,7 +2909,7 @@ fn gc_orphaned_daemon_dirs_filtered(
             // and directory ownership, never whether `--db` still exists.
             // Name the gap and the remedy, in addition to (not instead of)
             // the ownership facts already recorded above.
-            if !db_path.exists() {
+            if !database_present(&db_path) {
                 tracing::info!(
                     instance = name.as_str(),
                     db = %db_path.display(),
@@ -2825,7 +2924,7 @@ fn gc_orphaned_daemon_dirs_filtered(
             continue;
         }
 
-        if !is_temp_db_path(&db_path) && db_path.exists() {
+        if !is_recorded_temp_db_path(&db_path) && database_present(&db_path) {
             report.kept.push(name);
             continue;
         }
@@ -4950,6 +5049,147 @@ mod tests {
         assert!(
             report.spared_daemon_database_gone.is_empty(),
             "the database still exists, so this must stay empty"
+        );
+    }
+
+    /// nw-779 follow-up. The daemon's write lock is on the graph `CURRENT`
+    /// selects; a published brain named by its anchor has no file to probe.
+    #[cfg(unix)]
+    #[test]
+    fn write_lock_probe_follows_an_absent_anchor_to_its_selected_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("brain.lbug");
+        let graph = dir.path().join("selected-graph.lbug");
+        std::fs::write(&graph, b"not really a database").unwrap();
+
+        let target = write_lock_probe_target_with(&anchor, |_| Ok(graph.clone())).unwrap();
+        let holder = fork_write_lock_holder(&graph);
+        assert_eq!(
+            fcntl_write_lock_state(&target),
+            DbWriteLock::Held { pid: Some(holder) },
+            "the holder of the selected graph is the holder of the brain"
+        );
+        reap(holder);
+
+        // An existing path is probed as itself and never resolved.
+        let plain = dir.path().join("plain.lbug");
+        std::fs::write(&plain, b"x").unwrap();
+        assert_eq!(
+            write_lock_probe_target_with(&plain, |_| panic!("must not resolve")),
+            Some(canonical_db_path(&plain))
+        );
+    }
+
+    /// A `CURRENT` that cannot be resolved leaves the lock holder unknowable.
+    /// `Free` here would tell `stop --force` and gc that nothing owns the brain.
+    #[test]
+    fn write_lock_probe_is_unknown_when_current_cannot_be_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("brain.lbug");
+        let root = nestweaver_engine::publication::default_publication_root(&anchor);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            nestweaver_engine::publication::current_pointer_path(&root),
+            b"{ not json",
+        )
+        .unwrap();
+        assert_eq!(db_write_lock(&anchor), DbWriteLock::Unknown);
+        // No CURRENT at all is still simply free.
+        assert_eq!(
+            db_write_lock(&dir.path().join("typo.lbug")),
+            DbWriteLock::Free
+        );
+    }
+
+    /// nw-729. Supervision is chosen from this predicate, and it tested the
+    /// path as SPELLED: `--db graph.lbug` from inside a temp directory read as
+    /// a real database, went to launchd, and the client then waited 30s on a
+    /// socket launchd's environment never created. The same database named
+    /// absolutely worked.
+    #[test]
+    fn a_relative_spelling_is_classified_like_the_absolute_one() {
+        let tmp = Path::new("/private/tmp/nw-scratch");
+        let home = Path::new("/home/user/project");
+        assert!(is_temp_db_path_from(Path::new("graph.lbug"), Some(tmp)));
+        assert!(is_temp_db_path_from(
+            Path::new("./sub/graph.lbug"),
+            Some(tmp)
+        ));
+        assert!(is_temp_db_path_from(
+            Path::new("../../../tmp/x/graph.lbug"),
+            Some(home)
+        ));
+        // Counterweights: a relative path outside every temp root stays real,
+        // `..` that climbs OUT of a temp root is not temp, and absolute
+        // spellings answer as they always did.
+        assert!(!is_temp_db_path_from(Path::new("graph.lbug"), Some(home)));
+        assert!(!is_temp_db_path_from(
+            Path::new("../../home/user/brain.lbug"),
+            Some(tmp)
+        ));
+        assert!(is_temp_db_path_from(
+            Path::new("/tmp/x/graph.lbug"),
+            Some(home)
+        ));
+        assert!(!is_temp_db_path_from(
+            Path::new("/home/user/brain.lbug"),
+            Some(tmp)
+        ));
+        // No working directory to resolve against: judge the spelling alone.
+        // This is also how a path read back from a plist or boot log is judged.
+        assert!(!is_temp_db_path_from(Path::new("graph.lbug"), None));
+        assert!(!is_recorded_temp_db_path(Path::new("graph.lbug")));
+        assert!(is_recorded_temp_db_path(Path::new("/tmp/x/graph.lbug")));
+    }
+
+    /// nw-781. A publication-layout database has no file at its logical
+    /// anchor, so the live production daemon was reported as "database is gone"
+    /// with `daemon stop` offered as the way to reclaim it.
+    #[cfg(unix)]
+    #[test]
+    fn gc_state_dirs_does_not_flag_a_live_daemon_on_a_logical_publication_database() {
+        use std::os::unix::io::AsRawFd;
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = db_dir.path().join("brain.lbug");
+        let root = nestweaver_engine::publication::default_publication_root(&db);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            nestweaver_engine::publication::current_pointer_path(&root),
+            b"{}",
+        )
+        .unwrap();
+        assert!(!db.exists(), "the anchor itself is never a file");
+
+        let report = with_xdg_state_and_runtime(state.path(), runtime.path(), || {
+            seed_state_dir("cafecafe", db.to_str().unwrap());
+            let pidfile = pidfile_path("cafecafe");
+            std::fs::create_dir_all(pidfile.parent().unwrap()).unwrap();
+            std::fs::write(&pidfile, b"").unwrap();
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pidfile)
+                .unwrap();
+            assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+            let report = gc_orphaned_daemon_dirs_in(&scratch_gc_roots(
+                state.path(),
+                runtime.path(),
+                fallback.path(),
+            ))
+            .unwrap();
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) };
+            report
+        });
+
+        assert_eq!(report.spared, vec!["cafecafe".to_string()]);
+        assert!(
+            report.spared_daemon_database_gone.is_empty(),
+            "CURRENT selects a graph, so this database is not gone: {:?}",
+            report.spared_daemon_database_gone
         );
     }
 
