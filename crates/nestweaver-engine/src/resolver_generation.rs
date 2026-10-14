@@ -279,9 +279,10 @@ use std::path::Path;
 ///     imports, a name declared only in blocks that do not contain the call
 ///     is now unresolved instead of falling back to a same-directory
 ///     sibling's function. A call inside a block to a block-local declarator
-///     (or inside a function to a nested function declaration) that shadows
-///     an import whose source cannot be resolved (an npm package or a
-///     missing file) now binds the local instead of being unresolved, so
+///     (or to a function declaration whose innermost enclosing function or
+///     method also contains the call) that shadows an import whose source
+///     cannot be resolved (an npm package or a missing file) now binds the
+///     local instead of being unresolved, so
 ///     watcher and incremental passes keep that same-file edge. Edges written
 ///     by generation 9 keep the wrong target until re-indexed:
 ///     `nestweaver index --repo <path> --force`.

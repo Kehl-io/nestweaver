@@ -891,11 +891,11 @@ fn resolve_single_reference(
     // nw-113: an unresolved import binding still shadows every same-file
     // declaration except a nested one: a strictly narrower visible
     // declarator (both scopes contain the call, so the widths nest), or a
-    // declaration nested in a function inside the binding's scope (see
-    // `nested_inside_binding`). Single-file passes (watcher, incremental
-    // index) see an import of a sibling file as unresolved because the
-    // sibling is not in the resolution set, so without that exception they
-    // dropped the nested edge the full index keeps.
+    // function declaration whose innermost enclosing function or method also
+    // contains the call (see `nested_inside_binding`). Single-file passes
+    // (watcher, incremental index) see an import of a sibling file as
+    // unresolved because the sibling is not in the resolution set, so without
+    // that exception they dropped the nested edge the full index keeps.
     let unresolved_binding = binding.filter(|binding| binding.source_file.is_none());
 
     // Priority 1: Same file. A local symbol shadows an import alias of the
@@ -2106,36 +2106,58 @@ fn same_file_declaration_scope(
     })
 }
 
-/// nw-113: whether same-file `sym` is declared inside a code-bearing symbol
-/// (other than `sym`) that also contains the call and lies strictly within the
-/// owner of the import `binding` (or anywhere, for a module-level import). Such
-/// a declaration shadows the import at that call even without a declarator
-/// width, e.g. a nested `function f` inside `g`. Containment is by line, as in
+/// nw-113: whether same-file function `sym` is lexically visible at the call
+/// in place of the unresolved import `binding`. Only a `Function` qualifies
+/// (a bare call never reaches a method). Its INNERMOST enclosing code-bearing
+/// symbol (other than itself) must be a function or method (a lexical
+/// function scope, never a class, interface, trait or extension), must
+/// contain the call, and must lie strictly within the binding's owner (or
+/// anywhere, for a module-level import). Containment is by line, as in
 /// `same_file_declaration_scope`'s module-level test.
+///
+/// Residuals:
+/// - (nw-787) a block-nested `function f` binds a call after its block, which
+///   is sloppy-mode semantics, not strict-mode block scoping;
+/// - (nw-787) the full index binds by name regardless of this rule when the
+///   import resolves, so a sibling function's nested `f`, a callback's nested
+///   `f`, or a method `f` still binds there; single-file passes now leave
+///   those unresolved and so differ from the full index for those shapes.
 fn nested_inside_binding(
     sorted_syms: &[&RawSymbol],
     sym: &RawSymbol,
     reference: &RawReference,
     binding: &NamedBinding,
 ) -> bool {
+    if sym.kind != SymbolKind::Function {
+        return false;
+    }
     let contains = |outer: &RawSymbol, line: u32| {
         outer.start_line <= line && line <= outer.end_line.max(outer.start_line)
     };
     let same = |a: &RawSymbol, b: &RawSymbol| a.name == b.name && a.start_line == b.start_line;
-    let binding_owner = find_enclosing_symbol(sorted_syms, binding.start_line).symbol();
-    sorted_syms
+    let Some(container) = sorted_syms
         .iter()
         .take_while(|other| other.start_line <= sym.start_line)
-        .any(|other| {
-            !same(other, sym)
-                && can_contain_code(other.kind)
-                && contains(other, sym.start_line)
-                && contains(other, reference.start_line)
-                && binding_owner.is_none_or(|owner| {
-                    !same(owner, other)
-                        && contains(owner, other.start_line)
-                        && contains(owner, other.end_line)
-                })
+        .filter(|other| {
+            !same(other, sym) && can_contain_code(other.kind) && contains(other, sym.start_line)
+        })
+        // Innermost: the narrowest span, the later start on a tie.
+        .min_by_key(|other| {
+            (
+                other.end_line.max(other.start_line) - other.start_line,
+                std::cmp::Reverse(other.start_line),
+            )
+        })
+    else {
+        return false;
+    };
+    let binding_owner = find_enclosing_symbol(sorted_syms, binding.start_line).symbol();
+    matches!(container.kind, SymbolKind::Function | SymbolKind::Method)
+        && contains(container, reference.start_line)
+        && binding_owner.is_none_or(|owner| {
+            !same(owner, container)
+                && contains(owner, container.start_line)
+                && contains(owner, container.end_line)
         })
 }
 
@@ -8679,6 +8701,88 @@ export function g() {
                 call_targets(&files, &edges, "src/nested.ts", "g"),
                 vec![uid_at(&files, "src/nested.ts", "f", 3)],
                 "{edges:#?}"
+            );
+        }
+    }
+
+    /// nw-113 (review of the nested-declaration rule). With an npm import of
+    /// `f` (never resolvable), a same-file `function f` binds a bare call only
+    /// when the innermost function or method enclosing `f` also contains the
+    /// call. `Some(line)` expects the `f` declared on that line; `None`
+    /// expects only `unresolved:f`.
+    #[test]
+    fn a_nested_function_shadows_an_npm_import_only_from_its_innermost_function() {
+        let cases: [(&str, &str, &str, Option<u32>); 8] = [
+            // S3: nested in g, called in g.
+            (
+                "S3",
+                "function g() {\n  function f() { return 1; }\n  return f();\n}\n",
+                "g",
+                Some(3),
+            ),
+            // S4: module-level f; the import cannot coexist with it, and it is
+            // not nested, so the unresolved import keeps the call.
+            (
+                "S4",
+                "function f() { return 1; }\nfunction g() {\n  return f();\n}\n",
+                "g",
+                None,
+            ),
+            // F1: f is visible only inside its sibling h.
+            (
+                "F1",
+                "function outer() {\n  function h() {\n    function f() { return 1; }\n  }\n  function g() {\n    return f();\n  }\n}\n",
+                "g",
+                None,
+            ),
+            // F2: f is local to the arrow callback.
+            (
+                "F2",
+                "function g() {\n  const cb = () => {\n    function f() { return 1; }\n  };\n  return f();\n}\n",
+                "g",
+                None,
+            ),
+            // F3: a bare call never reaches a method.
+            (
+                "F3",
+                "class C {\n  f() { return 1; }\n  m() {\n    return f();\n  }\n}\n",
+                "m",
+                None,
+            ),
+            // F6: f and g are siblings in outer, which contains the call.
+            (
+                "F6",
+                "function outer() {\n  function f() { return 1; }\n  function g() {\n    return f();\n  }\n}\n",
+                "g",
+                Some(3),
+            ),
+            // F7: f nested in method m, called in m.
+            (
+                "F7",
+                "class C {\n  m() {\n    function f() { return 1; }\n    return f();\n  }\n}\n",
+                "m",
+                Some(4),
+            ),
+            // F4 (known residual, nw-787): a block-nested function declaration
+            // binds after its block, which is sloppy-mode semantics.
+            (
+                "F4",
+                "function g() {\n  {\n    function f() { return 1; }\n  }\n  return f();\n}\n",
+                "g",
+                Some(4),
+            ),
+        ];
+        for (label, body, caller, expected) in cases {
+            let source = format!("import {{ f }} from \"react\";\n{body}");
+            let (files, edges) = review_edges(&[("src/app.ts", &source)], Language::TypeScript);
+            let expected = match expected {
+                Some(line) => vec![uid_at(&files, "src/app.ts", "f", line)],
+                None => vec!["unresolved:f".to_string()],
+            };
+            assert_eq!(
+                call_targets(&files, &edges, "src/app.ts", caller),
+                expected,
+                "{label}: {edges:#?}"
             );
         }
     }
