@@ -14086,10 +14086,34 @@ fn repo_matches_resolved_target(repo: &nestweaver_schema::Repo, target: &Resolve
 /// CREATES an empty DB (a typo'd `--db` must not false-green). The message is
 /// phrased so `into_diagnostic` maps it to `CliDiagnostic::DatabaseNotFound`.
 fn require_existing_db(db_path: &std::path::Path) -> anyhow::Result<()> {
-    if !db_path.exists() {
+    if selected_existing_database(db_path)?.is_none() {
         anyhow::bail!("database not found at {}", db_path.display());
     }
     Ok(())
+}
+
+/// The file that holds the database `db_path` names, or `None` when there is
+/// no database there.
+///
+/// nw-779. A published brain has NO file at its logical anchor — `CURRENT`
+/// selects a graph under `<anchor>.publications/` — so `Path::exists` on the
+/// anchor answered "missing" for a healthy production database, and every
+/// admission check built on it refused. An absent anchor is therefore put to
+/// the same selector `open_store` and the daemon use.
+///
+/// An anchor that exists is admitted as itself, without consulting the
+/// selector: `backup save` and `publication rebuild` must still get past
+/// admission with a rollback copy whose `CURRENT` names a slot an older engine
+/// sealed, and the store open that follows already selects.
+///
+/// A `CURRENT` that cannot be resolved is an ERROR, not `None`. "Your brain's
+/// selector is broken" and "you mistyped --db" need different remedies.
+fn selected_existing_database(db_path: &Path) -> anyhow::Result<Option<PathBuf>> {
+    if db_path.exists() {
+        return Ok(Some(db_path.to_path_buf()));
+    }
+    let selected = selected_db_path(db_path)?;
+    Ok((selected != db_path && selected.exists()).then_some(selected))
 }
 
 /// The four bytes every LadybugDB file starts with.
@@ -14122,7 +14146,10 @@ const LBUG_FILE_MAGIC: &[u8; 4] = b"LBUG";
 /// `nestweaver-store`'s `open_crash_guard` (nw-285) for why a header check
 /// cannot be that guard and must not be mistaken for one.
 fn require_openable_db(db_path: &std::path::Path) -> anyhow::Result<()> {
-    require_existing_db(db_path)?;
+    let Some(selected) = selected_existing_database(db_path)? else {
+        anyhow::bail!("database not found at {}", db_path.display());
+    };
+    let db_path = selected.as_path();
     if db_path.is_dir() {
         anyhow::bail!(
             "{} is a directory, not a NestWeaver database. Point --db at a \
@@ -14221,6 +14248,172 @@ fn no_bytes_refusal(db_path: &std::path::Path) -> anyhow::Error {
     })
 }
 
+#[cfg(test)]
+mod logical_publication_admission_tests {
+    use super::*;
+    use nestweaver_engine::publication;
+
+    /// Seal a resolvable publication for `base` WITHOUT creating a file at
+    /// `base` itself: the layout a production brain has after its first
+    /// `publication rebuild`, and the one nw-779 mistook for a missing database.
+    /// Built through the store and the real manifest/pointer types so the
+    /// selector validates it exactly as it validates a real slot.
+    fn publish_without_a_base_file(base: &Path) -> PathBuf {
+        let identity = nestweaver_store::PublicationIdentity::new_brain();
+        let root = publication::default_publication_root(base);
+        let slot = publication::slot_path(&root, &identity.publication_uuid).unwrap();
+        std::fs::create_dir_all(&slot).unwrap();
+        let graph_path = slot.join(publication::PUBLICATION_GRAPH_FILE);
+        let store = GraphStore::create_with_publication_identity(&graph_path, &identity).unwrap();
+        let generation = store.graph_generation();
+        drop(store);
+        let stamp_name = format!(
+            "{}{}",
+            publication::PUBLICATION_GRAPH_FILE,
+            nestweaver_store::engine_format::ENGINE_FORMAT_SIDECAR_SUFFIX
+        );
+        let descriptor = |path: &str, kind, fingerprint: &str| {
+            let bytes = std::fs::read(slot.join(path)).unwrap();
+            publication::ArtifactDescriptor {
+                path: path.to_string(),
+                kind,
+                artifact_schema_version: 1,
+                byte_size: bytes.len() as u64,
+                blake3: nestweaver_engine::hash::blake3_hex_bytes(&bytes),
+                brain_uuid: identity.brain_uuid.clone(),
+                publication_uuid: identity.publication_uuid.clone(),
+                producer_version: env!("CARGO_PKG_VERSION").to_string(),
+                source_graph_generation: generation,
+                algorithm_fingerprint: fingerprint.to_string(),
+            }
+        };
+        let bundle = publication::PublicationBundleV3 {
+            format_version: nestweaver_engine::snapshot::SNAPSHOT_FORMAT_VERSION,
+            brain_uuid: identity.brain_uuid.clone(),
+            publication_uuid: identity.publication_uuid.clone(),
+            producer_version: env!("CARGO_PKG_VERSION").to_string(),
+            source_graph_generation: generation,
+            artifacts: vec![
+                descriptor(
+                    publication::PUBLICATION_GRAPH_FILE,
+                    publication::ArtifactKind::Graph,
+                    "ladybugdb-graph-v1",
+                ),
+                descriptor(
+                    &stamp_name,
+                    publication::ArtifactKind::CompatibilityStamp,
+                    "nestweaver-engine-format-v1",
+                ),
+            ],
+        };
+        let manifest = serde_json::to_vec_pretty(&bundle).unwrap();
+        std::fs::write(slot.join(publication::PUBLICATION_MANIFEST_FILE), &manifest).unwrap();
+        let pointer = publication::CurrentPublicationPointer::new(
+            &identity,
+            None,
+            nestweaver_engine::hash::blake3_hex_bytes(&manifest),
+        )
+        .unwrap();
+        std::fs::write(
+            publication::current_pointer_path(&root),
+            serde_json::to_vec_pretty(&pointer).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !base.exists(),
+            "the logical anchor must stay a name, not a file"
+        );
+        graph_path
+    }
+
+    #[test]
+    fn a_publication_only_logical_anchor_is_an_existing_openable_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("brain.lbug");
+        let graph = publish_without_a_base_file(&base);
+
+        assert_eq!(
+            selected_existing_database(&base).unwrap(),
+            Some(graph.clone()),
+            "admission must follow CURRENT to the selected graph"
+        );
+        require_existing_db(&base).expect("a published brain exists");
+        require_openable_db(&base).expect("and its selected graph is a database");
+        assert!(
+            daemon_status_db_problem(&base).is_none(),
+            "`daemon status` must not call a published brain never-indexed"
+        );
+        // Handing the selected graph back in is a no-op, so commands that
+        // already resolved their path keep working unchanged.
+        assert_eq!(selected_existing_database(&graph).unwrap(), Some(graph));
+    }
+
+    #[test]
+    fn an_unresolvable_current_is_a_selection_error_not_a_missing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("brain.lbug");
+        let root = publication::default_publication_root(&base);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(publication::current_pointer_path(&root), b"{ not json").unwrap();
+
+        for error in [
+            require_existing_db(&base).unwrap_err(),
+            require_openable_db(&base).unwrap_err(),
+            selected_existing_database(&base).unwrap_err(),
+        ] {
+            let message = format!("{error:#}");
+            assert!(message.contains("CURRENT"), "{message}");
+            assert!(
+                !message.contains("database not found"),
+                "a brain with a broken selector is not a typo: {message}"
+            );
+        }
+    }
+
+    /// The counterweight nw-087 put here: a path with nothing behind it is
+    /// still refused, still by the typed not-found message, and admission
+    /// still creates nothing beside it.
+    #[test]
+    fn a_path_with_no_database_and_no_publication_is_still_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("typo.lbug");
+        assert_eq!(selected_existing_database(&missing).unwrap(), None);
+        for error in [
+            require_existing_db(&missing).unwrap_err(),
+            require_openable_db(&missing).unwrap_err(),
+        ] {
+            assert!(
+                error.to_string().contains("database not found at"),
+                "{error:#}"
+            );
+        }
+        let (is_error, note) = daemon_status_db_problem(&missing).unwrap();
+        assert!(!is_error && note.contains("does not exist yet"), "{note}");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "admission must not create a publication root or any other artifact"
+        );
+    }
+
+    /// A base file that exists is admitted as itself, exactly as before: the
+    /// selector is consulted only when the anchor is absent.
+    #[test]
+    fn an_existing_base_file_is_admitted_without_consulting_the_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("plain.lbug");
+        std::fs::write(&base, b"LBUG and then whatever").unwrap();
+        let root = publication::default_publication_root(&base);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(publication::current_pointer_path(&root), b"{ not json").unwrap();
+        assert_eq!(
+            selected_existing_database(&base).unwrap(),
+            Some(base.clone())
+        );
+        require_openable_db(&base).expect("the header probe still decides");
+    }
+}
+
 /// nw-396 leg (2). `daemon status` reaches this only after EVERY
 /// process-level check above it — launchd, pidfile, socket, lock holder, the
 /// pre-6.4 selected-slot identity — has already come back empty, which used
@@ -14244,7 +14437,7 @@ fn no_bytes_refusal(db_path: &std::path::Path) -> anyhow::Error {
 /// not wrong, only worth saying out loud) — the caller uses it to choose the
 /// exit code.
 fn daemon_status_db_problem(db_path: &Path) -> Option<(bool, String)> {
-    if !db_path.exists() {
+    if !nestweaver_daemon::lifecycle::database_present(db_path) {
         return Some((
             false,
             format!(

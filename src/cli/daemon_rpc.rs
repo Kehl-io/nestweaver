@@ -369,16 +369,18 @@ pub(crate) fn try_hybrid_json_rpc_checked(
     // one check turns a 30s boot-ceiling stall into an immediate, accurate
     // error for the whole read surface rather than for the one command that
     // was reported.
-    require_openable_db(db_path).or_else(|error| {
-        if db_path.exists() {
-            Err(error)
-        } else {
-            // Absent is handled by the arm below, which still routes to
-            // configured upstreams (federated read) rather than failing.
-            Ok(())
-        }
-    })?;
-    if !db_path.exists() {
+    // nw-779: admission asks the publication selector, not `Path::exists`. A
+    // published brain has no file at its logical anchor, so the raw test sent
+    // `symbol`, `list-services`, `affected-tests` and `investigate` down the
+    // absent arm below and they reported a healthy database as not found.
+    // A `CURRENT` that cannot be resolved is an error here, never "absent".
+    let local_db = selected_existing_database(db_path)?;
+    if let Some(local_db) = &local_db {
+        require_openable_db(local_db)?;
+    }
+    // Absent still routes to configured upstreams (federated read) rather
+    // than failing outright.
+    let Some(local_db) = local_db else {
         let effective = nestweaver_client::RestartConfig::for_automatic_cold_start(db_path, config)
             .context("load explicit instance config or persisted intent before missing-DB upstream routing")?;
         let config = effective.as_path();
@@ -401,7 +403,11 @@ pub(crate) fn try_hybrid_json_rpc_checked(
                 Err(error).context("configured upstream read failed; refusing direct fallback")
             }
         };
-    }
+    };
+    // From here on this is the same selected path `resolve_db_with_config`
+    // hands the commands that already worked; the client recovers the logical
+    // instance from it (`instance_anchor_database`).
+    let db_path = local_db.as_path();
     match rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
         db_path, config, &start_dir,
     )) {
