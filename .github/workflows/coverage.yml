@@ -121,7 +121,7 @@ jobs:
           shared-key: coverage-deps-only
           cache-targets: false
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@2af88edc33c2d5ff8a473fd1c5ab83052f77afee # cargo-llvm-cov 2026-09-02
+        uses: taiki-e/install-action@0758d235715de2f3551eacc980d9ae8fce9342c3 # cargo-llvm-cov 2026-09-02
         with:
           tool: cargo-llvm-cov
       - name: Install build dependencies
