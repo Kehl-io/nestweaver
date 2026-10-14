@@ -2060,6 +2060,29 @@ pub fn is_temp_db_path(db_path: &Path) -> bool {
     bases.iter().any(|b| db_path.starts_with(b))
 }
 
+/// Is the database `db_path` names still there?
+///
+/// `Path::exists` is the wrong question for a published brain. Its graph lives
+/// in `<anchor>.publications/slots/<uuid>/graph.lbug`, `CURRENT` selects it, and
+/// nothing is ever written at the logical anchor itself. Asking only whether
+/// the anchor exists made `daemon gc` report a healthy production daemon as
+/// "database is gone" and treat its launch agent as an orphan (nw-781).
+///
+/// A `CURRENT` beside the anchor counts as present whether or not it resolves:
+/// this answer decides what gc may REMOVE, so everything it cannot interpret
+/// has to read as "keep". It follows that a plist still naming a slot a later
+/// publication pruned is present too.
+pub fn database_present(db_path: &Path) -> bool {
+    if db_path.exists() {
+        return true;
+    }
+    let anchor = nestweaver_engine::publication::instance_anchor_database(db_path);
+    let root = nestweaver_engine::publication::default_publication_root(&anchor);
+    nestweaver_engine::publication::current_pointer_path(&root)
+        .try_exists()
+        .unwrap_or(true)
+}
+
 /// Unlink every per-instance directory a TEMP-database daemon created, on its
 /// clean shutdown: the runtime dir (socket, pidfile, spawnlock, live binding),
 /// the state dir (daemon logs), and the `/tmp` socket-fallback dir when one
@@ -2810,7 +2833,7 @@ fn gc_orphaned_daemon_dirs_filtered(
             // and directory ownership, never whether `--db` still exists.
             // Name the gap and the remedy, in addition to (not instead of)
             // the ownership facts already recorded above.
-            if !db_path.exists() {
+            if !database_present(&db_path) {
                 tracing::info!(
                     instance = name.as_str(),
                     db = %db_path.display(),
@@ -2825,7 +2848,7 @@ fn gc_orphaned_daemon_dirs_filtered(
             continue;
         }
 
-        if !is_temp_db_path(&db_path) && db_path.exists() {
+        if !is_temp_db_path(&db_path) && database_present(&db_path) {
             report.kept.push(name);
             continue;
         }
@@ -4950,6 +4973,57 @@ mod tests {
         assert!(
             report.spared_daemon_database_gone.is_empty(),
             "the database still exists, so this must stay empty"
+        );
+    }
+
+    /// nw-781. A publication-layout database has no file at its logical
+    /// anchor, so the live production daemon was reported as "database is gone"
+    /// with `daemon stop` offered as the way to reclaim it.
+    #[cfg(unix)]
+    #[test]
+    fn gc_state_dirs_does_not_flag_a_live_daemon_on_a_logical_publication_database() {
+        use std::os::unix::io::AsRawFd;
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = db_dir.path().join("brain.lbug");
+        let root = nestweaver_engine::publication::default_publication_root(&db);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            nestweaver_engine::publication::current_pointer_path(&root),
+            b"{}",
+        )
+        .unwrap();
+        assert!(!db.exists(), "the anchor itself is never a file");
+
+        let report = with_xdg_state_and_runtime(state.path(), runtime.path(), || {
+            seed_state_dir("cafecafe", db.to_str().unwrap());
+            let pidfile = pidfile_path("cafecafe");
+            std::fs::create_dir_all(pidfile.parent().unwrap()).unwrap();
+            std::fs::write(&pidfile, b"").unwrap();
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pidfile)
+                .unwrap();
+            assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+            let report = gc_orphaned_daemon_dirs_in(&scratch_gc_roots(
+                state.path(),
+                runtime.path(),
+                fallback.path(),
+            ))
+            .unwrap();
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) };
+            report
+        });
+
+        assert_eq!(report.spared, vec!["cafecafe".to_string()]);
+        assert!(
+            report.spared_daemon_database_gone.is_empty(),
+            "CURRENT selects a graph, so this database is not gone: {:?}",
+            report.spared_daemon_database_gone
         );
     }
 
