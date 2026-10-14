@@ -315,14 +315,16 @@ fn compute_rename_moves(
     let new_parsed = nestweaver_parser::parse_source(Path::new(new_path), new_content)?;
 
     // Build a set of (name, kind) for symbols in the new file.
+    // nw-113: the per-file `<module>` owner is not a symbol a rename moves.
     let new_symbols: std::collections::HashSet<(&str, nestweaver_schema::SymbolKind)> = new_parsed
         .symbols
         .iter()
+        .filter(|s| !s.is_module_owner())
         .map(|s| (s.name.as_str(), s.kind))
         .collect();
 
     let mut moves = Vec::new();
-    for old_sym in &old_parsed.symbols {
+    for old_sym in old_parsed.symbols.iter().filter(|s| !s.is_module_owner()) {
         if new_symbols.contains(&(old_sym.name.as_str(), old_sym.kind)) {
             let scope = old_sym.scope_chain.as_deref().unwrap_or("");
             let canonical_id = nestweaver_schema::uid::canonical_symbol_id(
@@ -345,6 +347,29 @@ fn compute_rename_moves(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nw-113: renaming a file moves its real symbols; the `<module>` owner is
+    /// a per-file artefact and must not be reported as a Breaking move.
+    #[test]
+    fn a_renamed_file_does_not_move_its_module_owner() {
+        let source = "export function f() { return 1; }\nf();\n";
+        let moves = compute_rename_moves(
+            source,
+            source,
+            "src/a.ts",
+            "src/b.ts",
+            "https://example.com/r.git",
+        )
+        .unwrap();
+        let names: Vec<&str> = moves
+            .iter()
+            .filter_map(|change| match change {
+                AtomicChange::SymbolMoved { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["f"], "{moves:?}");
+    }
 
     #[test]
     fn test_severity_filter() {
