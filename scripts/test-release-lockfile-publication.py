@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Execute the release lockfile publication step with offline GitHub responses."""
+import base64
 import hashlib
 import json
 import os
@@ -134,6 +135,11 @@ class LockfilePublication(unittest.TestCase):
         writes = self.writes(calls)
         self.assertEqual([c['args'][3].rsplit('/', 1)[-1] for c in writes],
                          ['blobs', 'trees', 'commits', BRANCH])
+        blob = json.loads(writes[0]['stdin'])
+        self.assertEqual((blob['encoding'], base64.b64decode(blob['content'])),
+                         ('base64', LOCK), 'the blob must carry the artifact lockfile')
+        tree = json.loads(writes[1]['stdin'])
+        self.assertEqual([entry['path'] for entry in tree['tree']], ['Cargo.lock'])
         self.assertEqual(json.loads(writes[2]['stdin'])['parents'], [HEAD])
         self.assertEqual(json.loads(writes[3]['stdin']), dict(sha=NEW, force=False))
 

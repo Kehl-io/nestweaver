@@ -293,12 +293,14 @@ class RuntimeContracts(unittest.TestCase):
         required = job(CI, 'required-ci')
         self.assertIn('if: always()', required)
         for command in ('python3 scripts/test-release-publication-gates.py',
+                        'python3 scripts/test-release-lockfile-publication.py',
                         'python3 -m unittest discover -s tests/support -p test_isolated_daemon.py -v',
                         'python3 scripts/verify-ci-runtime-contracts.py'):
             self.assertIn(command, required)
         filters = CI.split('filters: |', 1)[1].split('\n  metal-smoke:', 1)[0]
         self.assertIn("'tests/support/isolated_daemon.py'", filters)
         self.assertNotIn("'scripts/test-release-publication-gates.py'", filters)
+        self.assertNotIn("'scripts/test-release-lockfile-publication.py'", filters)
         self.assertNotIn("'tests/support/test_isolated_daemon.py'", filters)
 
     def test_no_ci_marker_is_forged(self):
