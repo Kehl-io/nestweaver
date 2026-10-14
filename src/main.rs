@@ -12002,6 +12002,65 @@ fn abs_for_daemon(p: &std::path::Path) -> std::path::PathBuf {
     })
 }
 
+/// The database path every `daemon` lifecycle action works with: the logical
+/// anchor, even when the caller passed the slot `CURRENT` selects.
+///
+/// The instance id was already derived from the anchor, so a slot path found
+/// the right label, socket and pidfile — and was then written into the launch
+/// agent as given (nw-729). That pins a supervised daemon to one publication
+/// slot; the next cutover replaces the slot and the agent restarts against a
+/// graph nothing selects any more. `daemon run` resolves `CURRENT` itself, so
+/// the anchor is the only path a launch agent should ever name.
+fn daemon_lifecycle_db_path(db_path: &Path) -> PathBuf {
+    nestweaver_engine::publication::instance_anchor_database(db_path)
+}
+
+#[cfg(test)]
+mod daemon_lifecycle_db_path_tests {
+    use super::*;
+
+    /// nw-729. Clients that resolve `CURRENT` first (`brain watch`, `search`)
+    /// autostart the daemon with the SELECTED SLOT as `--db`. The instance id
+    /// was already anchored, so the label was right, but the path went into the
+    /// launch agent verbatim — pinning the daemon to a slot the next
+    /// publication replaces.
+    #[test]
+    fn a_selected_slot_is_bound_back_to_its_logical_anchor() {
+        let anchor = Path::new("/home/user/.local/share/nestweaver/brain/brain.lbug");
+        let slot = nestweaver_engine::publication::default_publication_root(anchor)
+            .join("slots/42072d7e-b2e7-4934-a5f9-1909331caec2/graph.lbug");
+        assert_eq!(daemon_lifecycle_db_path(&slot), anchor);
+        assert_eq!(
+            nestweaver_daemon::instance_id_from_db_path(&daemon_lifecycle_db_path(&slot)),
+            nestweaver_daemon::instance_id_from_db_path(&slot),
+            "binding to the anchor must not move the instance"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            let plist = nestweaver_daemon::launchd::generate_plist(
+                "c37ccf01",
+                Path::new("/usr/local/bin/nestweaver"),
+                &daemon_lifecycle_db_path(&slot),
+                Path::new("/tmp/x.log"),
+                None,
+            );
+            assert!(!plist.contains("/slots/"), "{plist}");
+            assert!(plist.contains(&format!("<string>{}</string>", anchor.display())));
+        }
+
+        // Counterweights: an anchor, an ordinary database, and an unrelated
+        // file that merely happens to be called graph.lbug are left alone.
+        for unchanged in [
+            anchor,
+            Path::new("/home/user/project/nestweaver.lbug"),
+            Path::new("/home/user/project/graph.lbug"),
+            Path::new("relative/nestweaver.lbug"),
+        ] {
+            assert_eq!(daemon_lifecycle_db_path(unchanged), unchanged);
+        }
+    }
+}
+
 /// Is a daemon process for this DB currently running (per its pidfile)?
 ///
 /// Used to decide whether falling back to a direct store open is safe: while a
@@ -24770,6 +24829,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "No database path provided. Use --db, --config with db, or set NESTWEAVER_DB."
                 );
             }
+            let db_path = daemon_lifecycle_db_path(&db_path);
             let selected_slot_legacy_id =
                 nestweaver_daemon::lifecycle::selected_slot_identity_instance_id(&db_path);
             if matches!(

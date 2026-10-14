@@ -2048,6 +2048,33 @@ pub fn log_hint_for_dir(dir: &Path) -> String {
 /// launchd-specific and `launchd` is macOS-gated, while state directories
 /// accumulate on every platform.
 pub fn is_temp_db_path(db_path: &Path) -> bool {
+    is_temp_db_path_from(db_path, std::env::current_dir().ok().as_deref())
+}
+
+/// [`is_temp_db_path`] with the working directory supplied, so the relative
+/// spellings can be tested without changing the process's own.
+///
+/// The path is made absolute against `cwd` and its `.`/`..` components are
+/// folded before the prefix test (nw-729): supervision is chosen from this
+/// answer, so two spellings of one database must not get two answers. The
+/// folding is lexical — no filesystem access, and symlinks are not followed —
+/// so a path that does not exist yet classifies the same as one that does.
+fn is_temp_db_path_from(db_path: &Path, cwd: Option<&Path>) -> bool {
+    use std::path::Component;
+    let joined = match cwd {
+        Some(cwd) if db_path.is_relative() => cwd.join(db_path),
+        _ => db_path.to_path_buf(),
+    };
+    let mut resolved = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            other => resolved.push(other),
+        }
+    }
     let mut bases: Vec<PathBuf> = vec![
         PathBuf::from("/tmp"),
         PathBuf::from("/private/tmp"),
@@ -2057,7 +2084,7 @@ pub fn is_temp_db_path(db_path: &Path) -> bool {
     if let Some(t) = std::env::var_os("TMPDIR") {
         bases.push(PathBuf::from(t));
     }
-    bases.iter().any(|b| db_path.starts_with(b))
+    bases.iter().any(|b| resolved.starts_with(b))
 }
 
 /// Is the database `db_path` names still there?
@@ -4974,6 +5001,44 @@ mod tests {
             report.spared_daemon_database_gone.is_empty(),
             "the database still exists, so this must stay empty"
         );
+    }
+
+    /// nw-729. Supervision is chosen from this predicate, and it tested the
+    /// path as SPELLED: `--db graph.lbug` from inside a temp directory read as
+    /// a real database, went to launchd, and the client then waited 30s on a
+    /// socket launchd's environment never created. The same database named
+    /// absolutely worked.
+    #[test]
+    fn a_relative_spelling_is_classified_like_the_absolute_one() {
+        let tmp = Path::new("/private/tmp/nw-scratch");
+        let home = Path::new("/home/user/project");
+        assert!(is_temp_db_path_from(Path::new("graph.lbug"), Some(tmp)));
+        assert!(is_temp_db_path_from(
+            Path::new("./sub/graph.lbug"),
+            Some(tmp)
+        ));
+        assert!(is_temp_db_path_from(
+            Path::new("../../../tmp/x/graph.lbug"),
+            Some(home)
+        ));
+        // Counterweights: a relative path outside every temp root stays real,
+        // `..` that climbs OUT of a temp root is not temp, and absolute
+        // spellings answer as they always did.
+        assert!(!is_temp_db_path_from(Path::new("graph.lbug"), Some(home)));
+        assert!(!is_temp_db_path_from(
+            Path::new("../../home/user/brain.lbug"),
+            Some(tmp)
+        ));
+        assert!(is_temp_db_path_from(
+            Path::new("/tmp/x/graph.lbug"),
+            Some(home)
+        ));
+        assert!(!is_temp_db_path_from(
+            Path::new("/home/user/brain.lbug"),
+            Some(tmp)
+        ));
+        // No working directory to resolve against: judge the spelling alone.
+        assert!(!is_temp_db_path_from(Path::new("graph.lbug"), None));
     }
 
     /// nw-781. A publication-layout database has no file at its logical
