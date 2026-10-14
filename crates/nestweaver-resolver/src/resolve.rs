@@ -2121,7 +2121,12 @@ fn same_file_declaration_scope(
 /// - (nw-787) the full index binds by name regardless of this rule when the
 ///   import resolves, so a sibling function's nested `f`, a callback's nested
 ///   `f`, or a method `f` still binds there; single-file passes now leave
-///   those unresolved and so differ from the full index for those shapes.
+///   those unresolved and so differ from the full index for those shapes;
+/// - anonymous callbacks: in `function g() { [1].forEach(() => { function f()
+///   {} }); return f(); }` the unnamed callback is not a symbol, so `g` is
+///   `f`'s innermost container and the call binds `f` in every mode;
+/// - the shared boundary line: when `function f() {} } function h() {` sits
+///   on one line, the tie-break credits `f` to `h`.
 fn nested_inside_binding(
     sorted_syms: &[&RawSymbol],
     sym: &RawSymbol,
@@ -2141,7 +2146,8 @@ fn nested_inside_binding(
         .filter(|other| {
             !same(other, sym) && can_contain_code(other.kind) && contains(other, sym.start_line)
         })
-        // Innermost: the narrowest span, the later start on a tie.
+        // Innermost: the narrowest span, the later start on a tie. The tie
+        // assumes the candidate follows the shared line's boundary.
         .min_by_key(|other| {
             (
                 other.end_line.max(other.start_line) - other.start_line,
@@ -8712,7 +8718,7 @@ export function g() {
     /// expects only `unresolved:f`.
     #[test]
     fn a_nested_function_shadows_an_npm_import_only_from_its_innermost_function() {
-        let cases: [(&str, &str, &str, Option<u32>); 8] = [
+        let cases: [(&str, &str, &str, Option<u32>); 10] = [
             // S3: nested in g, called in g.
             (
                 "S3",
@@ -8720,13 +8726,28 @@ export function g() {
                 "g",
                 Some(3),
             ),
-            // S4: module-level f; the import cannot coexist with it, and it is
+            // Module-level f: the import cannot coexist with it, and it is
             // not nested, so the unresolved import keeps the call.
             (
-                "S4",
+                "module-level",
                 "function f() { return 1; }\nfunction g() {\n  return f();\n}\n",
                 "g",
                 None,
+            ),
+            // S4: f is nested in a separate top-level function h.
+            (
+                "S4",
+                "function h() {\n  function f() {}\n}\nfunction g() {\n  return f();\n}\n",
+                "g",
+                None,
+            ),
+            // A1 (known residual): the anonymous callback is not a symbol, so
+            // g reads as f's innermost container and the call binds f.
+            (
+                "A1",
+                "function g() {\n  [1].forEach(() => {\n    function f() {}\n  });\n  return f();\n}\n",
+                "g",
+                Some(4),
             ),
             // F1: f is visible only inside its sibling h.
             (
@@ -8779,11 +8800,12 @@ export function g() {
                 Some(line) => vec![uid_at(&files, "src/app.ts", "f", line)],
                 None => vec!["unresolved:f".to_string()],
             };
-            assert_eq!(
-                call_targets(&files, &edges, "src/app.ts", caller),
-                expected,
-                "{label}: {edges:#?}"
-            );
+            // Only the calls to `f` (A1's `forEach` call is not under test).
+            let targets: Vec<String> = call_targets(&files, &edges, "src/app.ts", caller)
+                .into_iter()
+                .filter(|target| !target.starts_with("unresolved:") || target == "unresolved:f")
+                .collect();
+            assert_eq!(targets, expected, "{label}: {edges:#?}");
         }
     }
 
