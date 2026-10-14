@@ -3472,6 +3472,13 @@ mod tests {
             )
         };
         std::fs::write(repo_root.join("lexical.ts"), lexical(42)).unwrap();
+        // A nested `function` declaration shadows the import the same way.
+        let nested = |value: u32| {
+            format!(
+                "import {{sendPacket}} from \"./lib\";\nexport function nestedCaller() {{\n  function sendPacket() {{ return {value}; }}\n  return sendPacket();\n}}\n"
+            )
+        };
+        std::fs::write(repo_root.join("nested.ts"), nested(1)).unwrap();
         let root = std::fs::canonicalize(&repo_root).unwrap();
         let repo_url = format!("file://{}", root.display());
         let r_uid = nestweaver_schema::repo_uid("test", &repo_url);
@@ -3494,11 +3501,33 @@ mod tests {
         assert!(calls_block_local(&store), "precondition: index binds it");
 
         std::fs::write(root.join("lexical.ts"), lexical(43)).unwrap();
+        std::fs::write(root.join("nested.ts"), nested(2)).unwrap();
         let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
-        process_fixture_batch(&watcher, &store, &r_uid, &root, &[root.join("lexical.ts")]);
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            &[root.join("lexical.ts"), root.join("nested.ts")],
+        );
         assert!(
             calls_block_local(&store),
             "the watcher batch dropped lexicalCaller -> block-local sendPacket"
+        );
+        let nested_local = store
+            .symbols_in_file("nested.ts")
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "sendPacket")
+            .expect("nested sendPacket should be indexed")
+            .uid;
+        assert!(
+            store
+                .callees_with_edge_types_of(&uid_of(&store, &r_uid, "nestedCaller"))
+                .unwrap()
+                .iter()
+                .any(|(s, kind)| s.uid == nested_local && kind == "CALLS"),
+            "the watcher batch dropped nestedCaller -> nested sendPacket"
         );
 
         let (_, fresh) =

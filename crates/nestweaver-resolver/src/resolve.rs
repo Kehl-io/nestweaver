@@ -5,7 +5,7 @@ use nestweaver_schema::{
 };
 use rayon::prelude::*;
 
-use crate::imports::{ImportGraph, build_import_graph_with_languages};
+use crate::imports::{ImportGraph, NamedBinding, build_import_graph_with_languages};
 use crate::types::TypeEnvironment;
 use crate::util::parent_dir;
 use crate::workspace::WorkspaceContext;
@@ -889,11 +889,13 @@ fn resolve_single_reference(
         })
     });
     // nw-113: an unresolved import binding still shadows every same-file
-    // declaration except a block-scoped one declared strictly inside the
-    // binding's own scope. Single-file passes (watcher, incremental index)
-    // see an import of a sibling file as unresolved because the sibling is
-    // not in the resolution set, so without that exception they dropped the
-    // block-local edge the full index keeps.
+    // declaration except a nested one: a strictly narrower visible
+    // declarator (both scopes contain the call, so the widths nest), or a
+    // declaration nested in a function inside the binding's scope (see
+    // `nested_inside_binding`). Single-file passes (watcher, incremental
+    // index) see an import of a sibling file as unresolved because the
+    // sibling is not in the resolution set, so without that exception they
+    // dropped the nested edge the full index keeps.
     let unresolved_binding = binding.filter(|binding| binding.source_file.is_none());
 
     // Priority 1: Same file. A local symbol shadows an import alias of the
@@ -931,11 +933,12 @@ fn resolve_single_reference(
             })
             // Ties keep the first in source order: the base `.find` order.
             .min_by_key(|(width, _)| *width)
-            .filter(|(width, _)| {
+            .filter(|(width, (_, sym))| {
                 unresolved_binding.is_none_or(|binding| {
                     binding
                         .scope
                         .is_some_and(|scope| *width < scope.end - scope.start)
+                        || nested_inside_binding(sorted_syms, sym, reference, binding)
                 })
             })
             .map(|(_, candidate)| candidate)
@@ -2101,6 +2104,39 @@ fn same_file_declaration_scope(
     } else {
         declaration.end - declaration.start
     })
+}
+
+/// nw-113: whether same-file `sym` is declared inside a code-bearing symbol
+/// (other than `sym`) that also contains the call and lies strictly within the
+/// owner of the import `binding` (or anywhere, for a module-level import). Such
+/// a declaration shadows the import at that call even without a declarator
+/// width, e.g. a nested `function f` inside `g`. Containment is by line, as in
+/// `same_file_declaration_scope`'s module-level test.
+fn nested_inside_binding(
+    sorted_syms: &[&RawSymbol],
+    sym: &RawSymbol,
+    reference: &RawReference,
+    binding: &NamedBinding,
+) -> bool {
+    let contains = |outer: &RawSymbol, line: u32| {
+        outer.start_line <= line && line <= outer.end_line.max(outer.start_line)
+    };
+    let same = |a: &RawSymbol, b: &RawSymbol| a.name == b.name && a.start_line == b.start_line;
+    let binding_owner = find_enclosing_symbol(sorted_syms, binding.start_line).symbol();
+    sorted_syms
+        .iter()
+        .take_while(|other| other.start_line <= sym.start_line)
+        .any(|other| {
+            !same(other, sym)
+                && can_contain_code(other.kind)
+                && contains(other, sym.start_line)
+                && contains(other, reference.start_line)
+                && binding_owner.is_none_or(|owner| {
+                    !same(owner, other)
+                        && contains(owner, other.start_line)
+                        && contains(owner, other.end_line)
+                })
+        })
 }
 
 /// A JS/TS `const`/`let`/`var`/`using` declaration's first line, after any
@@ -8612,12 +8648,67 @@ export function lexicalCaller() {
         );
         let (files, edges) = review_edges(&[lexical], Language::TypeScript);
         let block_local = uid_at(&files, "src/lexical.ts", "sendPacket", 4);
+        let mut expected = vec![block_local, "unresolved:sendPacket".to_string()];
+        expected.sort();
         assert_eq!(
-            call_targets(&files, &edges, "src/lexical.ts", "lexicalCaller")
-                .into_iter()
-                .filter(|target| target.starts_with("sym:"))
-                .collect::<Vec<_>>(),
-            vec![block_local],
+            call_targets(&files, &edges, "src/lexical.ts", "lexicalCaller"),
+            expected,
+            "{edges:#?}"
+        );
+    }
+
+    /// nw-113 (watcher parity). A nested `function` declaration carries no
+    /// declarator width, but it still shadows a module import inside its
+    /// enclosing function. Resolved alone (import source absent) the call
+    /// must bind it, exactly as the full index does with the source present.
+    #[test]
+    fn a_nested_function_shadows_an_import_whose_source_is_absent() {
+        let lib = ("src/lib.ts", "export function f(): number { return 7; }\n");
+        let nested = (
+            "src/nested.ts",
+            r#"import { f } from "./lib";
+export function g() {
+  function f() { return 1; }
+  return f();
+}
+"#,
+        );
+        for inputs in [&[nested][..], &[lib, nested][..]] {
+            let (files, edges) = review_edges(inputs, Language::TypeScript);
+            assert_eq!(
+                call_targets(&files, &edges, "src/nested.ts", "g"),
+                vec![uid_at(&files, "src/nested.ts", "f", 3)],
+                "{edges:#?}"
+            );
+        }
+    }
+
+    /// nw-113 (full index). An npm import never resolves to a file, so a
+    /// block-local declarator shadowing it binds inside its block, and the
+    /// call after the block stays unresolved.
+    #[test]
+    fn a_block_local_callable_shadows_an_npm_import_inside_its_block() {
+        let app = (
+            "src/app.ts",
+            r#"import { useState } from "react";
+export function component() {
+  {
+    const useState = () => 0;
+    useState();
+  }
+  return useState();
+}
+"#,
+        );
+        let (files, edges) = review_edges(&[app], Language::TypeScript);
+        let mut expected = vec![
+            uid_at(&files, "src/app.ts", "useState", 4),
+            "unresolved:useState".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(
+            call_targets(&files, &edges, "src/app.ts", "component"),
+            expected,
             "{edges:#?}"
         );
     }
