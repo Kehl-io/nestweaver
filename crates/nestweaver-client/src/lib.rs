@@ -902,6 +902,7 @@ pub async fn connect_verified_replacement(
 /// Does the launch agent serving this instance run a binary other than `exe`?
 /// Both are compared by canonical path, so a symlink to this binary is this
 /// binary. No agent at all is `false`: the restart then starts one normally.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 fn agent_runs_another_binary(agent_program: Option<&Path>, exe: &Path) -> bool {
     let Some(program) = agent_program else {
         return false;
@@ -910,11 +911,78 @@ fn agent_runs_another_binary(agent_program: Option<&Path>, exe: &Path) -> bool {
     canonical(program) != canonical(exe)
 }
 
+/// Whether a version-mismatch restart can bring the daemon to this client's
+/// version, given that it relaunches the instance's launch agent as written
+/// (nw-729: a client never rewrites the agent).
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AgentRestartCheck {
+    /// No agent, the agent runs this binary, or it runs another binary at
+    /// this version: relaunching it reaches this version.
+    Proceed,
+    /// The agent's program is gone; a relaunch could not start anything.
+    ProgramMissing(PathBuf),
+    /// The agent runs another binary at a different version; a relaunch
+    /// would bring that version back.
+    WouldRestoreVersion { program: PathBuf, version: String },
+}
+
+/// Decide [`AgentRestartCheck`]. `probe` reports the version a program
+/// prints; `None` (it could not be run) proceeds, as the restart did before
+/// this check, because the restart verifies the replacement anyway.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn check_agent_restart(
+    agent_program: Option<&Path>,
+    exe: &Path,
+    our_version: &str,
+    probe: impl FnOnce(&Path) -> Option<String>,
+) -> AgentRestartCheck {
+    let Some(program) = agent_program else {
+        return AgentRestartCheck::Proceed;
+    };
+    if !program.exists() {
+        return AgentRestartCheck::ProgramMissing(program.to_path_buf());
+    }
+    if !agent_runs_another_binary(Some(program), exe) {
+        return AgentRestartCheck::Proceed;
+    }
+    match probe(program) {
+        Some(version) if version != our_version => AgentRestartCheck::WouldRestoreVersion {
+            program: program.to_path_buf(),
+            version,
+        },
+        _ => AgentRestartCheck::Proceed,
+    }
+}
+
+/// The version `program --version` prints (`nestweaver X.Y.Z`), bounded so a
+/// wedged binary cannot hang a client connect.
+#[cfg(target_os = "macos")]
+fn probe_program_version(program: &Path) -> Option<String> {
+    let mut child = std::process::Command::new(program)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while child.try_wait().ok()?.is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut out).ok()?;
+    out.split_whitespace().nth(1).map(str::to_string)
+}
+
 /// nw-729. A version-mismatch restart relaunches the instance's launch agent
-/// as written; a client never rewrites it. When that agent runs a different
-/// binary from this client, restarting would only bring the same version
-/// back, so refuse BEFORE shutting anything down and name the explicit
-/// command that moves the daemon to this binary.
+/// as written. Refuse BEFORE shutting anything down when that cannot reach
+/// this client's version, and name the explicit command that can.
 fn refuse_restart_that_cannot_change_the_version(
     db_path: &Path,
     daemon_version: &str,
@@ -925,17 +993,38 @@ fn refuse_restart_that_cannot_change_the_version(
         let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
         let program = nestweaver_daemon::launchd::agent_program(&instance_id);
         let exe = std::env::current_exe().context("cannot determine this client's binary")?;
-        if agent_runs_another_binary(program.as_deref(), &exe) {
-            let program = program.unwrap_or_default();
-            anyhow::bail!(
+        let db = db_path.display();
+        let restart = format!("`{} daemon --db {db} restart`", exe.display());
+        match check_agent_restart(program.as_deref(), &exe, our_version, probe_program_version) {
+            AgentRestartCheck::Proceed => {}
+            AgentRestartCheck::ProgramMissing(program) => anyhow::bail!(
                 "the daemon for {db} is version {daemon_version} and this client is \
-                 {our_version}. Its launch agent runs {program}, not this binary ({exe}), so an \
-                 automatic restart would bring version {daemon_version} back. Run `{exe} daemon \
-                 --db {db} start` to move the daemon to this binary, or update {program}.",
-                db = db_path.display(),
-                program = program.display(),
-                exe = exe.display(),
-            );
+                 {our_version}, but its launch agent runs {}, which no longer exists, so an \
+                 automatic restart could not start a replacement. Run {restart} to reinstall \
+                 the agent with this binary.",
+                program.display()
+            ),
+            AgentRestartCheck::WouldRestoreVersion { program, version } => {
+                let app_owned = program.to_string_lossy().contains(".app/Contents/MacOS/");
+                let update = if app_owned {
+                    "Update the NestWeaver app and reopen it so its daemon matches this client, \
+                     or run {restart} to move the daemon to this binary (the app moves it back \
+                     the next time it starts)."
+                        .replace("{restart}", &restart)
+                } else {
+                    format!(
+                        "Update {}, or run {restart} to move the daemon to this binary.",
+                        program.display()
+                    )
+                };
+                anyhow::bail!(
+                    "the daemon for {db} is version {daemon_version} and this client is \
+                     {our_version}. Its launch agent runs {} (version {version}), and a client \
+                     restart relaunches that agent as written, so it cannot reach {our_version}. \
+                     {update}",
+                    program.display()
+                );
+            }
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -3079,7 +3168,7 @@ mod agent_binary_tests {
     /// agent would run THIS binary — the in-place upgrade every install does.
     #[cfg(unix)]
     #[test]
-    fn a_restart_is_refused_only_when_the_agent_runs_another_binary() {
+    fn a_restart_is_refused_only_when_it_cannot_reach_this_version() {
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("nestweaver");
         std::fs::write(&exe, b"").unwrap();
@@ -3087,16 +3176,45 @@ mod agent_binary_tests {
         std::fs::write(&other, b"").unwrap();
         let alias = dir.path().join("alias");
         std::os::unix::fs::symlink(&exe, &alias).unwrap();
+        let gone = dir.path().join("deleted/nestweaver-cli");
+        let never = |_: &Path| -> Option<String> { panic!("must not probe") };
 
-        assert!(agent_runs_another_binary(Some(&other), &exe));
-        assert!(!agent_runs_another_binary(Some(&exe), &exe));
-        assert!(
-            !agent_runs_another_binary(Some(&alias), &exe),
+        assert_eq!(
+            check_agent_restart(None, &exe, "12.0.4", never),
+            AgentRestartCheck::Proceed
+        );
+        assert_eq!(
+            check_agent_restart(Some(&exe), &exe, "12.0.4", never),
+            AgentRestartCheck::Proceed,
+            "the in-place upgrade: relaunching the agent runs this binary"
+        );
+        assert_eq!(
+            check_agent_restart(Some(&alias), &exe, "12.0.4", never),
+            AgentRestartCheck::Proceed,
             "a symlink to this binary is this binary"
         );
-        assert!(
-            !agent_runs_another_binary(None, &exe),
-            "no launch agent: the restart starts one the ordinary way"
+        assert_eq!(
+            check_agent_restart(Some(&other), &exe, "12.0.4", |_| Some("12.0.4".into())),
+            AgentRestartCheck::Proceed,
+            "another path already at this version reaches it"
         );
+        assert_eq!(
+            check_agent_restart(Some(&other), &exe, "12.0.4", |_| None),
+            AgentRestartCheck::Proceed,
+            "an unprobeable program falls back to the verified restart"
+        );
+        assert_eq!(
+            check_agent_restart(Some(&other), &exe, "12.0.4", |_| Some("12.0.3".into())),
+            AgentRestartCheck::WouldRestoreVersion {
+                program: other.clone(),
+                version: "12.0.3".into()
+            }
+        );
+        assert_eq!(
+            check_agent_restart(Some(&gone), &exe, "12.0.4", never),
+            AgentRestartCheck::ProgramMissing(gone.clone())
+        );
+        assert!(agent_runs_another_binary(Some(&other), &exe));
+        assert!(!agent_runs_another_binary(None, &exe));
     }
 }

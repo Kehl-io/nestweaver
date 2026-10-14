@@ -2077,16 +2077,17 @@ pub fn log_hint_for_dir(dir: &Path) -> String {
 /// throwaway repros): they must never receive a persistent launchd agent, and
 /// their state directories are always reclaimable.
 ///
+/// The test is made on the database's canonical path (`canonical_db_path`:
+/// absolute, symlinks resolved through the deepest existing ancestor) against
+/// canonicalized temp roots, so every spelling of one database — relative,
+/// `..`, or through a symlink into or out of a temp root — gets one kind of
+/// supervisor (nw-729).
+///
 /// Lives here rather than in `launchd` because the predicate is not
 /// launchd-specific and `launchd` is macOS-gated, while state directories
 /// accumulate on every platform.
 pub fn is_temp_db_path(db_path: &Path) -> bool {
-    // Classify the database's identity, not its spelling (nw-729): the
-    // canonical path resolves a symlink into (or out of) a temp root, so every
-    // spelling of one database gets one kind of supervisor. The lexical pass
-    // first makes a relative path absolute against this process's directory.
-    let absolute = lexically_absolute(db_path, std::env::current_dir().ok().as_deref());
-    is_temp_db_path_from(&canonical_db_path(&absolute), None)
+    under_temp_root(&canonical_db_path(db_path))
 }
 
 /// `db_path` made absolute against `cwd` (when relative and `cwd` is known),
@@ -2117,7 +2118,13 @@ fn lexically_absolute(db_path: &Path, cwd: Option<&Path>) -> PathBuf {
 /// record against wherever `daemon gc` happens to be invoked could reap a
 /// live instance.
 pub fn is_recorded_temp_db_path(db_path: &Path) -> bool {
-    is_temp_db_path_from(db_path, None)
+    if db_path.is_absolute() {
+        // The same canonical test `daemon start` applied when it chose the
+        // supervisor, so gc and start agree about one database.
+        is_temp_db_path(db_path)
+    } else {
+        is_temp_db_path_from(db_path, None)
+    }
 }
 
 /// [`is_temp_db_path`] with the working directory supplied, so the relative
@@ -2129,7 +2136,13 @@ pub fn is_recorded_temp_db_path(db_path: &Path) -> bool {
 /// folding is lexical — no filesystem access, and symlinks are not followed —
 /// so a path that does not exist yet classifies the same as one that does.
 fn is_temp_db_path_from(db_path: &Path, cwd: Option<&Path>) -> bool {
-    let resolved = lexically_absolute(db_path, cwd);
+    under_temp_root(&lexically_absolute(db_path, cwd))
+}
+
+/// Whether `path` is under a temp root. Each root is matched both as spelled
+/// and canonicalized, so a canonical database path matches `/tmp` on macOS
+/// (`/private/tmp`) and a `$TMPDIR` that is itself a symlink.
+fn under_temp_root(path: &Path) -> bool {
     let mut bases: Vec<PathBuf> = vec![
         PathBuf::from("/tmp"),
         PathBuf::from("/private/tmp"),
@@ -2143,7 +2156,12 @@ fn is_temp_db_path_from(db_path: &Path, cwd: Option<&Path>) -> bool {
     {
         bases.push(t);
     }
-    bases.iter().any(|b| resolved.starts_with(b))
+    let canonical: Vec<PathBuf> = bases
+        .iter()
+        .filter_map(|base| std::fs::canonicalize(base).ok())
+        .collect();
+    bases.extend(canonical);
+    bases.iter().any(|base| path.starts_with(base))
 }
 
 /// Is the database `db_path` names still there?

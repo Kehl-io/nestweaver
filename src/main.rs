@@ -12067,6 +12067,7 @@ mod daemon_lifecycle_db_path_tests {
 }
 
 /// What `daemon start` does with this instance's launch agent (nw-729).
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LaunchAgentPlan {
     /// Render the agent from this invocation and (re)install it.
@@ -12076,17 +12077,29 @@ enum LaunchAgentPlan {
     /// The existing agent runs a program that is gone; a client cannot repair
     /// that without rewriting the agent, so it refuses and names the command.
     RefuseMissingProgram(PathBuf),
+    /// An agent exists but its program cannot be read from it (a binary or
+    /// hand-written plist). Not knowing what it runs is no licence to replace
+    /// it, so a client refuses.
+    RefuseUnreadable,
 }
 
 /// One owner per launch agent. An explicit `daemon start` owns it and may
 /// rewrite it (that is the upgrade path). A client autostart or
 /// version-mismatch restart creates one only when none exists; an existing
 /// agent is started as written.
-fn launch_agent_plan(client_autostart: bool, existing_program: Option<&Path>) -> LaunchAgentPlan {
-    match (client_autostart, existing_program) {
-        (false, _) | (true, None) => LaunchAgentPlan::Install,
-        (true, Some(program)) if program.exists() => LaunchAgentPlan::StartExisting,
-        (true, Some(program)) => LaunchAgentPlan::RefuseMissingProgram(program.to_path_buf()),
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn launch_agent_plan(
+    client_autostart: bool,
+    agent_exists: bool,
+    existing_program: Option<&Path>,
+) -> LaunchAgentPlan {
+    if !client_autostart || !agent_exists {
+        return LaunchAgentPlan::Install;
+    }
+    match existing_program {
+        None => LaunchAgentPlan::RefuseUnreadable,
+        Some(program) if program.exists() => LaunchAgentPlan::StartExisting,
+        Some(program) => LaunchAgentPlan::RefuseMissingProgram(program.to_path_buf()),
     }
 }
 
@@ -12105,24 +12118,39 @@ mod launch_agent_plan_tests {
         let gone = dir.path().join("deleted-app/nestweaver-cli");
 
         // Explicit `daemon start`: always installs, existing agent or not.
-        assert_eq!(launch_agent_plan(false, None), LaunchAgentPlan::Install);
         assert_eq!(
-            launch_agent_plan(false, Some(&program)),
+            launch_agent_plan(false, false, None),
             LaunchAgentPlan::Install
         );
         assert_eq!(
-            launch_agent_plan(false, Some(&gone)),
+            launch_agent_plan(false, true, Some(&program)),
+            LaunchAgentPlan::Install
+        );
+        assert_eq!(
+            launch_agent_plan(false, true, Some(&gone)),
+            LaunchAgentPlan::Install
+        );
+        assert_eq!(
+            launch_agent_plan(false, true, None),
             LaunchAgentPlan::Install
         );
         // Client: creates on first run, otherwise starts what is there.
-        assert_eq!(launch_agent_plan(true, None), LaunchAgentPlan::Install);
         assert_eq!(
-            launch_agent_plan(true, Some(&program)),
+            launch_agent_plan(true, false, None),
+            LaunchAgentPlan::Install
+        );
+        assert_eq!(
+            launch_agent_plan(true, true, Some(&program)),
             LaunchAgentPlan::StartExisting
         );
         assert_eq!(
-            launch_agent_plan(true, Some(&gone)),
+            launch_agent_plan(true, true, Some(&gone)),
             LaunchAgentPlan::RefuseMissingProgram(gone.clone())
+        );
+        // An agent the client cannot read is still not the client's to replace.
+        assert_eq!(
+            launch_agent_plan(true, true, None),
+            LaunchAgentPlan::RefuseUnreadable
         );
     }
 }
@@ -24985,6 +25013,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     track_interactions,
                     client_autostart,
                 } => {
+                    // Only the launchd branch below has an agent to protect.
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = client_autostart;
                     // Serialize every direct start from incumbent preflight
                     // through readiness and final config attestation. Parents
                     // in autostart/restart already hold this exact lock and
@@ -25432,11 +25463,54 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             let existing_plist = std::fs::read_to_string(&plist_path).ok();
                             let agent_plan = launch_agent_plan(
                                 client_autostart,
+                                plist_path.exists(),
                                 existing_plist
                                     .as_deref()
                                     .and_then(nestweaver_daemon::launchd::parse_program_from_plist)
                                     .as_deref(),
                             );
+                            if agent_plan == LaunchAgentPlan::RefuseUnreadable {
+                                anyhow::bail!(
+                                    "the launch agent {} exists but its program cannot be read \
+                                     from it. A client start does not replace an existing agent; \
+                                     run `nestweaver daemon --db {} start` to reinstall it",
+                                    plist_path.display(),
+                                    db_path.display()
+                                );
+                            }
+                            // A client asking for a different configuration than
+                            // the agent carries would start the agent's and then
+                            // fail attestation; say so before starting anything.
+                            if agent_plan == LaunchAgentPlan::StartExisting {
+                                let agent_config = existing_plist.as_deref().and_then(|plist| {
+                                    nestweaver_daemon::launchd::parse_flag_from_plist(
+                                        plist, "--config",
+                                    )
+                                });
+                                let canonical = |path: &Path| {
+                                    std::fs::canonicalize(path)
+                                        .unwrap_or_else(|_| path.to_path_buf())
+                                };
+                                let wanted = effective_config_abs.as_deref().map(canonical);
+                                let has = agent_config.as_deref().map(Path::new).map(canonical);
+                                if wanted != has {
+                                    let show = |path: Option<PathBuf>| {
+                                        path.map_or("(none)".to_string(), |path| {
+                                            path.display().to_string()
+                                        })
+                                    };
+                                    anyhow::bail!(
+                                        "the launch agent {} starts this database with --config \
+                                         {}, but this command asked for {}. A client start does not \
+                                         rewrite an existing agent; run `nestweaver daemon --db {} \
+                                         start` with the configuration you want to change it",
+                                        plist_path.display(),
+                                        show(has),
+                                        show(wanted),
+                                        db_path.display()
+                                    );
+                                }
+                            }
                             if let LaunchAgentPlan::RefuseMissingProgram(program) = &agent_plan {
                                 anyhow::bail!(
                                     "the launch agent {} runs {}, which no longer exists. A client \
@@ -25561,7 +25635,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             if agent_plan == LaunchAgentPlan::StartExisting {
                                 eprintln!(
                                     "Starting the existing launch agent unchanged (a client start \
-                                     never rewrites it; `nestweaver daemon --db {} start` does).",
+                                     never rewrites it; an explicit `nestweaver daemon --db {} \
+                                     start` does).",
                                     db_path.display()
                                 );
                                 nestweaver_daemon::launchd::start_existing(&instance_id)?;
