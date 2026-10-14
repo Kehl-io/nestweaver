@@ -8346,6 +8346,217 @@ function varAfterInitialization() { var svc = new Service(); return svc.run(); }
         );
     }
 
+    /// Targets of the CALLS edges whose source is `caller` in `path`.
+    fn call_targets(
+        files: &ReviewParsedFiles,
+        edges: &[ResolvedEdge],
+        path: &str,
+        caller: &str,
+    ) -> Vec<String> {
+        let source = uid(files, path, caller);
+        let mut targets: Vec<String> = edges
+            .iter()
+            .filter(|edge| edge.source_uid == source && edge.edge_type == EdgeType::Calls)
+            .map(|edge| edge.target_uid.clone())
+            .collect();
+        targets.sort();
+        targets.dedup();
+        targets
+    }
+
+    /// `uid` for the symbol named `name` declared on `line` (1-based) in `path`.
+    fn uid_at(files: &ReviewParsedFiles, path: &str, name: &str, line: u32) -> String {
+        let symbol = files
+            .iter()
+            .find(|(file, _, _)| file == path)
+            .unwrap()
+            .1
+            .iter()
+            .find(|symbol| symbol.name == name && symbol.start_line == line)
+            .unwrap_or_else(|| panic!("no {name} declared on line {line} of {path}"));
+        symbol_uid("repo:test:abc", path, name, symbol.start_line)
+    }
+
+    /// nw-113 (block scope). The block-local `sendPacket` exists only inside
+    /// its block; after the block the name is the import again (a JS runtime
+    /// control returns the imported provider's 7).
+    #[test]
+    fn a_block_local_callable_does_not_shadow_an_import_outside_its_block() {
+        let lib = (
+            "src/lib.ts",
+            "export function sendPacket(): number { return 7; }\n",
+        );
+        let lexical = (
+            "src/lexical.ts",
+            r#"import { sendPacket } from "./lib";
+export function namedCaller() {
+  return sendPacket();
+}
+export function lexicalCaller() {
+  {
+    const sendPacket = () => 42;
+    sendPacket();
+  }
+  return sendPacket();
+}
+export function innerOnly() {
+  {
+    const sendPacket = () => 1;
+    return sendPacket();
+  }
+}
+"#,
+        );
+        let (files, edges) = review_edges(&[lib, lexical], Language::TypeScript);
+        let imported = uid(&files, "src/lib.ts", "sendPacket");
+        let block_local = uid_at(&files, "src/lexical.ts", "sendPacket", 7);
+        let inner_only_local = uid_at(&files, "src/lexical.ts", "sendPacket", 14);
+
+        // Control: plain import resolution works in this fixture.
+        assert_eq!(
+            call_targets(&files, &edges, "src/lexical.ts", "namedCaller"),
+            vec![imported.clone()]
+        );
+        // Inside the block: the block-local. After it: the import.
+        let mut expected = vec![block_local, imported.clone()];
+        expected.sort();
+        assert_eq!(
+            call_targets(&files, &edges, "src/lexical.ts", "lexicalCaller"),
+            expected
+        );
+        // Counterweight: a call that never leaves the block stays local.
+        assert_eq!(
+            call_targets(&files, &edges, "src/lexical.ts", "innerOnly"),
+            vec![inner_only_local]
+        );
+    }
+
+    /// nw-113 (block scope). Sibling and nested blocks: each call binds the
+    /// innermost declaration whose block contains it, never a sibling's.
+    #[test]
+    fn same_file_callables_bind_the_innermost_containing_declaration() {
+        let lib = (
+            "src/lib.ts",
+            "export function sendPacket(): number { return 7; }\n",
+        );
+        let scopes = (
+            "src/scopes.ts",
+            r#"import { sendPacket } from "./lib";
+export function siblings() {
+  {
+    const sendPacket = () => 1;
+  }
+  {
+    return sendPacket();
+  }
+}
+export function nested() {
+  const sendPacket = () => 2;
+  {
+    const sendPacket = () => 3;
+    sendPacket();
+  }
+  return sendPacket();
+}
+"#,
+        );
+        let (files, edges) = review_edges(&[lib, scopes], Language::TypeScript);
+        let imported = uid(&files, "src/lib.ts", "sendPacket");
+        let outer = uid_at(&files, "src/scopes.ts", "sendPacket", 11);
+        let inner = uid_at(&files, "src/scopes.ts", "sendPacket", 13);
+
+        assert_eq!(
+            call_targets(&files, &edges, "src/scopes.ts", "siblings"),
+            vec![imported],
+            "a sibling block's declaration is not visible"
+        );
+        let mut expected = vec![outer, inner];
+        expected.sort();
+        assert_eq!(
+            call_targets(&files, &edges, "src/scopes.ts", "nested"),
+            expected,
+            "inner call binds the inner declaration, outer call the function-level one"
+        );
+    }
+
+    /// Counterweight: a module-scope callable still wins over any import
+    /// lookup, and a function declared elsewhere in the file still resolves
+    /// same-file (no LocalBinding exists for a `function` declaration).
+    #[test]
+    fn module_scope_same_file_callables_still_resolve_first() {
+        let source = r#"const helper = () => 1;
+function declared() { return 2; }
+export function caller() {
+  helper();
+  return declared();
+}
+"#;
+        let (files, edges) = review_edges(&[("src/m.ts", source)], Language::TypeScript);
+        let mut expected = vec![
+            uid(&files, "src/m.ts", "helper"),
+            uid(&files, "src/m.ts", "declared"),
+        ];
+        expected.sort();
+        assert_eq!(call_targets(&files, &edges, "src/m.ts", "caller"), expected);
+    }
+
+    /// Counterweights from plan validation: the filter must not reject
+    /// (a) a receiver call into a namespace body (a `statement_block`), or
+    /// (b) a symbol whose declaration line also declares a same-named
+    /// parameter. The same block as one line must behave like the multiline one.
+    #[test]
+    fn block_scope_filter_spares_receivers_parameters_and_one_line_blocks() {
+        let namespace = (
+            "src/api.ts",
+            r#"export namespace Api {
+  export const get = () => 1;
+}
+export function useApi() {
+  return Api.get();
+}
+"#,
+        );
+        let setter = (
+            "src/box.ts",
+            r#"export class Box {
+  set value(value: number) { this.v = value; }
+  v = 0;
+}
+function value() { return 2; }
+export function readIt() { return value(); }
+"#,
+        );
+        let lib = (
+            "src/lib.ts",
+            "export function sendPacket(): number { return 7; }\n",
+        );
+        let one_line = (
+            "src/oneline.ts",
+            "import { sendPacket } from \"./lib\";\nexport function lexicalCaller() {\n  { const sendPacket = () => 42; sendPacket(); }\n  return sendPacket();\n}\n",
+        );
+        let (files, edges) =
+            review_edges(&[namespace, setter, lib, one_line], Language::TypeScript);
+        let before = |path: &str, caller: &str| call_targets(&files, &edges, path, caller);
+        // Known residual (tracked separately): the parser emits no symbol for a TS namespace, so Api.get() is unresolved today. This test only pins that nw-113 leaves it unchanged.
+        assert_eq!(
+            before("src/api.ts", "useApi"),
+            vec!["unresolved:get".to_string()],
+            "a receiver call into a namespace body is not touched by the block-scope filter"
+        );
+        // Known residual (tracked separately): a bare JS/TS call can bind a same-named setter/method. This test only pins that nw-113 leaves it unchanged; the declaration-scope filter must not affect candidates without declarator bindings.
+        assert_eq!(
+            before("src/box.ts", "readIt"),
+            vec![uid_at(&files, "src/box.ts", "value", 2)],
+            "a same-line parameter binding does not change same-file selection"
+        );
+        let mut expected = vec![
+            uid_at(&files, "src/oneline.ts", "sendPacket", 3),
+            uid(&files, "src/lib.ts", "sendPacket"),
+        ];
+        expected.sort();
+        assert_eq!(before("src/oneline.ts", "lexicalCaller"), expected);
+    }
+
     #[test]
     fn review_unresolved_exports_cannot_prove_a_star_target() {
         let mut failures = Vec::new();
