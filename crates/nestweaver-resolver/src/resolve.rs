@@ -488,9 +488,22 @@ fn resolve_single_reference(
     //   ModuleScope — the line belongs to no symbol. There is no source symbol to
     //                name, and this pass declines to invent one. See the note on
     //                `Enclosing` for why the obvious candidates were rejected.
+    //
+    // nw-113: in a file that has a `<module>` owner (the parser minted one
+    // because a call there sits outside every code-bearing span), a CALL at
+    // module scope, or one the degenerate fallback would pin on a one-line
+    // function above it, belongs to the module (CodeQL: JS `TopLevel`, Python
+    // `Module`). In JS/TS/Python/PHP spans are exact, so a degenerate guess
+    // there is always module-level code. Other reference kinds keep today's
+    // behaviour: the owner is for executed calls, not type mentions or field
+    // reads.
+    let module_owner = (edge_type == EdgeType::Calls)
+        .then(|| sorted_syms.iter().copied().find(|s| is_module_owner(s)))
+        .flatten();
     let source_sym = match find_enclosing_symbol(sorted_syms, reference.start_line) {
-        Enclosing::Exact(s) | Enclosing::Degenerate(s) => s,
-        Enclosing::ModuleScope => return None,
+        Enclosing::Exact(s) => s,
+        Enclosing::Degenerate(s) => module_owner.unwrap_or(s),
+        Enclosing::ModuleScope => module_owner?,
     };
     let source_uid = symbol_uid(repo_uid, file_path, &source_sym.name, source_sym.start_line);
 
@@ -2095,7 +2108,7 @@ fn same_file_declaration_scope(
         .take_while(|other| other.start_line <= line)
         .any(|other| {
             !std::ptr::eq(*other, sym)
-                && can_contain_code(other.kind)
+                && can_contain_code(other)
                 && other.start_line <= line
                 && line <= other.end_line.max(other.start_line)
         });
@@ -2144,7 +2157,7 @@ fn nested_inside_binding(
         .iter()
         .take_while(|other| other.start_line <= sym.start_line)
         .filter(|other| {
-            !same(other, sym) && can_contain_code(other.kind) && contains(other, sym.start_line)
+            !same(other, sym) && can_contain_code(other) && contains(other, sym.start_line)
         })
         // Innermost: the narrowest span, the later start on a tie. The tie
         // assumes the candidate follows the shared line's boundary.
@@ -2376,8 +2389,21 @@ impl<'a> Enclosing<'a> {
 ///
 /// The rule itself lives on `SymbolKind::contains_code` so the parser's
 /// `<module>` minting gate applies the same definition (nw-113).
-fn can_contain_code(kind: SymbolKind) -> bool {
-    kind.contains_code()
+///
+/// nw-113: the per-file `<module>` owner is code-bearing by kind but is never
+/// a container. Its whole-file span would otherwise enclose every line, make
+/// every declaration look nested, and own every module-level reference. It is
+/// only the CALLS source for module-level calls (see
+/// `resolve_single_reference`), so every container test goes through here.
+fn can_contain_code(symbol: &RawSymbol) -> bool {
+    symbol.kind.contains_code() && !is_module_owner(symbol)
+}
+
+/// nw-113: the parser's per-file `<module>` owner of top-level calls.
+fn is_module_owner(symbol: &RawSymbol) -> bool {
+    symbol.kind == SymbolKind::Module
+        && symbol.name == nestweaver_schema::MODULE_OWNER_NAME
+        && symbol.entry_point_kind == Some(nestweaver_schema::EntryPointKind::ModuleInit)
 }
 
 /// Find the enclosing symbol: the innermost symbol whose span contains the
@@ -2431,7 +2457,7 @@ fn find_enclosing_symbol<'a>(symbols: &'a [&'a RawSymbol], ref_line: u32) -> Enc
     if let Some(enclosing) = symbols[..idx]
         .iter()
         .rev()
-        .find(|s| ref_line <= s.end_line.max(s.start_line) && can_contain_code(s.kind))
+        .find(|s| ref_line <= s.end_line.max(s.start_line) && can_contain_code(s))
         .copied()
     {
         return Enclosing::Exact(enclosing);
@@ -2439,7 +2465,7 @@ fn find_enclosing_symbol<'a>(symbols: &'a [&'a RawSymbol], ref_line: u32) -> Enc
     symbols[..idx]
         .iter()
         .rev()
-        .find(|s| s.end_line <= s.start_line && can_contain_code(s.kind))
+        .find(|s| s.end_line <= s.start_line && can_contain_code(s))
         .copied()
         .map_or(Enclosing::ModuleScope, Enclosing::Degenerate)
 }
@@ -9407,5 +9433,192 @@ export function readIt() { return value(); }
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// nw-113 (ownerless): a top-level call is owned by the file's `<module>`,
+    /// and the call still yields its IMPORTS by-product.
+    #[test]
+    fn a_top_level_call_is_owned_by_the_module() {
+        let lib = (
+            "src/lib.ts",
+            "export function flushBuffer(): number { return 8; }\n",
+        );
+        let ownerless = (
+            "src/ownerless.ts",
+            "import { flushBuffer } from \"./lib\";\nflushBuffer();\n",
+        );
+        let (files, edges) = review_edges(&[lib, ownerless], Language::TypeScript);
+        let owner = nestweaver_schema::MODULE_OWNER_NAME;
+        assert_eq!(
+            call_targets(&files, &edges, "src/ownerless.ts", owner),
+            vec![uid(&files, "src/lib.ts", "flushBuffer")],
+            "{edges:#?}"
+        );
+        let owner_uid = uid(&files, "src/ownerless.ts", owner);
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.source_uid == owner_uid && edge.edge_type == EdgeType::Imports),
+            "{edges:#?}"
+        );
+    }
+
+    /// Validation case: a one-line function above the call used to become
+    /// its fabricated caller through the degenerate fallback.
+    #[test]
+    fn a_one_line_function_above_a_top_level_call_does_not_own_it() {
+        let lib = (
+            "src/lib.ts",
+            "export function flushBuffer(): number { return 8; }\n",
+        );
+        let file = (
+            "src/oneline.ts",
+            "import { flushBuffer } from \"./lib\";\nexport const add = (a: number, b: number) => a + b;\nflushBuffer();\n",
+        );
+        let (files, edges) = review_edges(&[lib, file], Language::TypeScript);
+        let target = vec![uid(&files, "src/lib.ts", "flushBuffer")];
+        assert_eq!(
+            call_targets(
+                &files,
+                &edges,
+                "src/oneline.ts",
+                nestweaver_schema::MODULE_OWNER_NAME
+            ),
+            target,
+            "{edges:#?}"
+        );
+        assert!(call_targets(&files, &edges, "src/oneline.ts", "add").is_empty());
+    }
+
+    /// E2: a one-line function called at top level is called by the module,
+    /// not by itself.
+    #[test]
+    fn a_top_level_call_of_a_one_line_function_is_not_a_self_edge() {
+        let file = ("src/e2.ts", "function helper() {}\nhelper();\n");
+        let (files, edges) = review_edges(&[file], Language::TypeScript);
+        let helper = uid(&files, "src/e2.ts", "helper");
+        assert_eq!(
+            call_targets(
+                &files,
+                &edges,
+                "src/e2.ts",
+                nestweaver_schema::MODULE_OWNER_NAME
+            ),
+            vec![helper.clone()],
+            "{edges:#?}"
+        );
+        assert!(
+            call_targets(&files, &edges, "src/e2.ts", "helper").is_empty(),
+            "{edges:#?}"
+        );
+    }
+
+    /// E7: Python's `__main__` guard is module code; the module calls `main`.
+    #[test]
+    fn a_python_main_guard_call_is_owned_by_the_module() {
+        let file = (
+            "app.py",
+            "def main():\n    pass\n\nif __name__ == \"__main__\":\n    main()\n",
+        );
+        let (files, edges) = review_edges(&[file], Language::Python);
+        assert_eq!(
+            call_targets(
+                &files,
+                &edges,
+                "app.py",
+                nestweaver_schema::MODULE_OWNER_NAME
+            ),
+            vec![uid(&files, "app.py", "main")],
+            "{edges:#?}"
+        );
+    }
+
+    /// Counterweights: calls inside functions keep their function owner, and
+    /// non-call references at module scope (a type annotation) get NO edge
+    /// from the owner.
+    #[test]
+    fn the_owner_takes_only_top_level_calls() {
+        let lib = (
+            "src/lib.ts",
+            "export function a(): number { return 1; }\nexport interface User { id: number }\n",
+        );
+        let mixed = (
+            "src/mixed.ts",
+            "import { a, User } from \"./lib\";\nexport function f() {\n  return a();\n}\nconst u: User = { id: 1 };\na();\n",
+        );
+        let (files, edges) = review_edges(&[lib, mixed], Language::TypeScript);
+        let target = vec![uid(&files, "src/lib.ts", "a")];
+        assert_eq!(call_targets(&files, &edges, "src/mixed.ts", "f"), target);
+        let owner = uid(&files, "src/mixed.ts", nestweaver_schema::MODULE_OWNER_NAME);
+        let owner_edges: Vec<_> = edges.iter().filter(|e| e.source_uid == owner).collect();
+        assert!(
+            owner_edges
+                .iter()
+                .all(|e| matches!(e.edge_type, EdgeType::Calls | EdgeType::Imports)),
+            "the owner must not collect Uses/Accesses: {owner_edges:?}"
+        );
+        let user = uid(&files, "src/lib.ts", "User");
+        assert!(
+            !owner_edges.iter().any(|e| e.target_uid == user),
+            "a module-level type reference is not owned by <module>: {owner_edges:?}"
+        );
+        assert_eq!(
+            call_targets(
+                &files,
+                &edges,
+                "src/mixed.ts",
+                nestweaver_schema::MODULE_OWNER_NAME
+            ),
+            target
+        );
+    }
+
+    /// E1: the whole-file owner is never a container. With a top-level call
+    /// present (so the owner exists), the nested `f` is still `g`'s binding
+    /// and the module-level declarator `f` is still module level.
+    #[test]
+    fn the_module_owner_is_not_a_declaration_container() {
+        let file = (
+            "src/e1.ts",
+            "function g() {\n  function f() { return 1; }\n  return f();\n}\nconst f = () => 2;\nboot();\n",
+        );
+        let (files, edges) = review_edges(&[file], Language::TypeScript);
+        assert!(
+            files[0]
+                .1
+                .iter()
+                .any(|s| s.name == nestweaver_schema::MODULE_OWNER_NAME),
+            "fixture must mint the owner"
+        );
+        assert_eq!(
+            call_targets(&files, &edges, "src/e1.ts", "g"),
+            vec![uid_at(&files, "src/e1.ts", "f", 2)],
+            "{edges:#?}"
+        );
+    }
+
+    /// Express-style registration: a call inside an anonymous callback at
+    /// module scope has no named container, so the module owns it.
+    #[test]
+    fn a_call_in_a_module_level_callback_is_owned_by_the_module() {
+        let lib = (
+            "src/lib.ts",
+            "export function handle(): number { return 1; }\n",
+        );
+        let app = (
+            "src/app.ts",
+            "import { handle } from \"./lib\";\napp.get('/', () => {\n  handle();\n});\n",
+        );
+        let (files, edges) = review_edges(&[lib, app], Language::TypeScript);
+        assert!(
+            call_targets(
+                &files,
+                &edges,
+                "src/app.ts",
+                nestweaver_schema::MODULE_OWNER_NAME
+            )
+            .contains(&uid(&files, "src/lib.ts", "handle")),
+            "{edges:#?}"
+        );
     }
 }
