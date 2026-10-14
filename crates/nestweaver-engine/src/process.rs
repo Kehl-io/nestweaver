@@ -288,6 +288,14 @@ fn derive_process_name(entry_point: &nestweaver_schema::Symbol) -> String {
         Some(EntryPointKind::EventListener) => format!("event::{}", entry_point.name),
         Some(EntryPointKind::CronJob) => format!("cron::{}", entry_point.name),
         Some(EntryPointKind::CliCommand) => format!("cli::{}", entry_point.name),
+        Some(EntryPointKind::ModuleInit) => {
+            let file = entry_point
+                .file_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&entry_point.file_path);
+            format!("{file}::{}", entry_point.name)
+        }
         None => format!("process::{}", entry_point.name),
     }
 }
@@ -691,6 +699,36 @@ fn detect_changes_impact_with_work_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nw-113: a file's top-level code is its own process, named after the
+    /// file, not folded into the directory's `main` bucket.
+    #[test]
+    fn module_init_process_is_named_after_its_file() {
+        use nestweaver_schema::{
+            EntryPointKind, MODULE_OWNER_NAME, Symbol, SymbolKind, Visibility,
+        };
+        let symbol = Symbol {
+            uid: "sym:module".to_string(),
+            name: MODULE_OWNER_NAME.to_string(),
+            kind: SymbolKind::Module,
+            repo_uid: "repo:1".to_string(),
+            file_path: "src/app/ownerless.ts".to_string(),
+            start_line: 1,
+            end_line: 2,
+            signature: String::new(),
+            summary: None,
+            content_hash: "h".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: true,
+            entry_point_kind: Some(EntryPointKind::ModuleInit),
+            visibility: Visibility::Private,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        assert_eq!(derive_process_name(&symbol), "ownerless.ts::<module>");
+    }
 
     #[test]
     fn expired_database_budget_is_unknown_not_empty_success_and_does_not_leak() {

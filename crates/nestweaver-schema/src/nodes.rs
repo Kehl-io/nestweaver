@@ -10,6 +10,8 @@ pub enum EntryPointKind {
     LambdaHandler,
     CronJob,
     CliCommand,
+    /// nw-113: a file's top-level code, run when the module is loaded.
+    ModuleInit,
 }
 
 impl fmt::Display for EntryPointKind {
@@ -22,6 +24,7 @@ impl fmt::Display for EntryPointKind {
             Self::LambdaHandler => write!(f, "lambda_handler"),
             Self::CronJob => write!(f, "cron_job"),
             Self::CliCommand => write!(f, "cli_command"),
+            Self::ModuleInit => write!(f, "module_init"),
         }
     }
 }
@@ -42,7 +45,31 @@ pub enum SymbolKind {
     Variable,
 }
 
+/// nw-113: name of the per-file symbol that owns top-level calls. Not a valid
+/// identifier in JS, TS, Python or PHP, so it cannot collide with a real
+/// declaration.
+pub const MODULE_OWNER_NAME: &str = "<module>";
+
 impl SymbolKind {
+    /// Kinds that have a body and can therefore be the source of a call
+    /// (nw-349/nw-435). Data kinds (`Constant`, `Variable`, `Property`,
+    /// `Enum`, `TypeAlias`) have no body and cannot call anything. The
+    /// resolver uses this to pick enclosing symbols and the parser uses it to
+    /// decide whether a top-level call needs a `<module>` owner (nw-113), so
+    /// both apply the same rule.
+    pub fn contains_code(self) -> bool {
+        matches!(
+            self,
+            Self::Function
+                | Self::Method
+                | Self::Class
+                | Self::Module
+                | Self::Interface
+                | Self::Trait
+                | Self::Extension
+        )
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             SymbolKind::Function => "Function",
@@ -381,7 +408,27 @@ pub struct Contract {
 
 #[cfg(test)]
 mod tests {
-    use super::Repo;
+    use super::{Repo, SymbolKind};
+
+    /// The resolver and the parser share one code-bearing rule (nw-113).
+    #[test]
+    fn code_bearing_kinds_are_the_ones_with_bodies() {
+        use SymbolKind as K;
+        for kind in [
+            K::Function,
+            K::Method,
+            K::Class,
+            K::Module,
+            K::Interface,
+            K::Trait,
+            K::Extension,
+        ] {
+            assert!(kind.contains_code(), "{kind:?}");
+        }
+        for kind in [K::Enum, K::Constant, K::Variable, K::Property, K::TypeAlias] {
+            assert!(!kind.contains_code(), "{kind:?}");
+        }
+    }
 
     fn repo(url: &str, root_path: Option<&str>) -> Repo {
         Repo {

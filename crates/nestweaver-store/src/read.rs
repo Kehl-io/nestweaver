@@ -525,6 +525,7 @@ fn parse_entry_point_kind(s: &str) -> Option<EntryPointKind> {
         "lambda_handler" => Some(EntryPointKind::LambdaHandler),
         "cron_job" => Some(EntryPointKind::CronJob),
         "cli_command" => Some(EntryPointKind::CliCommand),
+        "module_init" => Some(EntryPointKind::ModuleInit),
         _ => None,
     }
 }
@@ -5390,6 +5391,29 @@ impl GraphStore {
             }
         }
         Ok(out.into_iter().collect())
+    }
+}
+
+#[cfg(test)]
+mod entry_kind_tests {
+    use super::*;
+
+    /// nw-113: every entry kind survives the string round trip the store uses.
+    #[test]
+    fn every_entry_point_kind_round_trips_through_its_stored_string() {
+        use nestweaver_schema::EntryPointKind as K;
+        for kind in [
+            K::Main,
+            K::HttpHandler,
+            K::EventListener,
+            K::TestEntry,
+            K::LambdaHandler,
+            K::CronJob,
+            K::CliCommand,
+            K::ModuleInit,
+        ] {
+            assert_eq!(parse_entry_point_kind(&kind.to_string()), Some(kind));
+        }
     }
 }
 

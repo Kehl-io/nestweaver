@@ -2373,17 +2373,11 @@ impl<'a> Enclosing<'a> {
 /// Those are not missing edges — they are edges with fabricated sources, which
 /// is worse, because a caller cannot tell them from real ones. A `Constant`,
 /// `Variable`, `Property` or `Field` has no body and cannot call anything.
+///
+/// The rule itself lives on `SymbolKind::contains_code` so the parser's
+/// `<module>` minting gate applies the same definition (nw-113).
 fn can_contain_code(kind: SymbolKind) -> bool {
-    matches!(
-        kind,
-        SymbolKind::Function
-            | SymbolKind::Method
-            | SymbolKind::Class
-            | SymbolKind::Module
-            | SymbolKind::Interface
-            | SymbolKind::Trait
-            | SymbolKind::Extension
-    )
+    kind.contains_code()
 }
 
 /// Find the enclosing symbol: the innermost symbol whose span contains the
