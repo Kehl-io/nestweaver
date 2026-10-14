@@ -286,6 +286,17 @@ use std::path::Path;
 ///     watcher and incremental passes keep that same-file edge. Edges written
 ///     by generation 9 keep the wrong target until re-indexed:
 ///     `nestweaver index --repo <path> --force`.
+///
+///     Folded into the same bump (nw-113 part 2): a JS/TS/Python/PHP file in
+///     which a call sits outside every function, class and method (a bare
+///     top-level call, an IIFE, an Express-style handler registered at load,
+///     a decorator, a `__main__` guard) gains one `<module>` symbol
+///     (`Module`, entry point `module_init`) that owns those calls. A
+///     function invoked at module load has a caller and is no longer
+///     reported dead, and a one-line function above such a call no longer
+///     owns it. The owner is never an enclosing container and is the source
+///     of CALLS (and their IMPORTS by-product) only. Each owner is also a
+///     `<file>::<module>` process. Parsed cache 6 reparses older records.
 pub const RESOLVER_GENERATION: u32 = 10;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
