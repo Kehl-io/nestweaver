@@ -88,6 +88,10 @@ pub struct BudgetOverrun {
 }
 
 /// Read lines `start..=end` (1-based, inclusive) from one already-read file.
+/// nw-113: the line placed between runs of top-level code when reading a
+/// `<module>` owner, where function, class and method bodies were skipped.
+pub const ELISION: &str = "⋮";
+
 fn read_span(text: &str, start: u32, end: u32) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
     if start == 0 || start as usize > lines.len() {
@@ -287,6 +291,42 @@ fn relocate(text: &str, name: &str, len: u32) -> Option<(u32, u32)> {
     Some((start, start + len.max(1) - 1))
 }
 
+/// nw-113: the current top-level code of a file whose parse still has a
+/// `<module>` owner: the lines outside every code-bearing span, as runs
+/// joined by [`ELISION`]. Whitespace-only runs are dropped. `None` when the
+/// file no longer has top-level calls (the owner is gone), which reads as a
+/// stale span like any other vanished symbol.
+fn module_owner_body(text: &str, parsed: &nestweaver_parser::ParsedFile) -> Option<(u32, String)> {
+    let owner = parsed.symbols.iter().find(|raw| raw.is_module_owner())?;
+    let lines: Vec<&str> = text.lines().collect();
+    let mut covered = vec![false; lines.len()];
+    for raw in parsed
+        .symbols
+        .iter()
+        .filter(|raw| raw.kind.contains_code() && !raw.is_module_owner())
+    {
+        let start = (raw.start_line.max(1) as usize - 1).min(lines.len());
+        let end = (raw.end_line.max(raw.start_line) as usize).min(lines.len());
+        covered[start..end].iter_mut().for_each(|line| *line = true);
+    }
+    let mut runs: Vec<Vec<&str>> = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    for (line, is_covered) in lines.iter().zip(&covered) {
+        if *is_covered {
+            runs.push(std::mem::take(&mut current));
+        } else {
+            current.push(line);
+        }
+    }
+    runs.push(current);
+    let runs: Vec<String> = runs
+        .into_iter()
+        .filter(|run| run.iter().any(|line| !line.trim().is_empty()))
+        .map(|run| run.join("\n").trim_matches('\n').to_string())
+        .collect();
+    Some((owner.end_line, runs.join(&format!("\n{ELISION}\n"))))
+}
+
 /// Re-parse the current file to verify the symbol's actual start and end.
 /// The indexed line count is not safe after a file edit: a shorter definition
 /// can pull the next symbol into the window, and a longer one is truncated.
@@ -438,6 +478,19 @@ pub fn read_symbols_budgeted(
                 })
         });
         let body_opt = current.as_ref().and_then(|(text, parsed)| {
+            if sym.is_module_owner() {
+                let owner = parsed
+                    .as_ref()
+                    .and_then(|parsed| module_owner_body(text, parsed));
+                if let Some((current_end, _)) = owner
+                    && current_end != end_line
+                {
+                    relocated_from_line = Some(start_line);
+                    end_line = current_end;
+                }
+                stale_span = owner.is_none();
+                return owner.map(|(_, body)| body);
+            }
             match parsed
                 .as_ref()
                 .and_then(|parsed| verified_current_span(text, parsed, &sym))
@@ -840,6 +893,29 @@ mod tests {
         let res = read_symbols(store, &[name.to_string()], &reader, 0, None);
         assert_eq!(res.symbols.len(), 1, "{name} must resolve: {res:?}");
         res.symbols.into_iter().next().unwrap()
+    }
+
+    /// nw-113: reading `<module>` returns the file's top-level code: the lines
+    /// outside every function, class and method, with an elision marker
+    /// between runs, not the whole file and not an empty stale window.
+    #[test]
+    fn reading_the_module_owner_returns_only_top_level_code() {
+        let (dir, store) = fixture_file(
+            "src/app.ts",
+            "import { flushBuffer } from './lib';\nexport function f() {\n  return 1;\n}\n\nflushBuffer();\nf();\n",
+        );
+        let owner = store
+            .symbols_in_file("src/app.ts")
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.is_module_owner())
+            .expect("fixture mints an owner");
+        let w = read_one(&dir, &store, &owner.uid);
+        assert!(w.body_available && !w.stale_span, "{w:?}");
+        assert_eq!(
+            w.body,
+            format!("import {{ flushBuffer }} from './lib';\n{ELISION}\nflushBuffer();\nf();")
+        );
     }
 
     /// nw-689: the repo changed since indexing, so the stored span now holds
