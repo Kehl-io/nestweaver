@@ -1,5 +1,20 @@
 # Changelog
 
+## [12.0.4](https://github.com/Kehl-io/nestweaver/compare/v12.0.3...v12.0.4) (2026-10-14)
+
+
+### Bug Fixes
+
+* **ci:** stop the release lockfile step failing silently when unchanged (nw-784) ([e07b1e4](https://github.com/Kehl-io/nestweaver/commit/e07b1e41de0821723dde9ba4f90611e56a8a025a))
+* **daemon:** classify a database's supervision by its identity, not its spelling (nw-729) ([c6c590b](https://github.com/Kehl-io/nestweaver/commit/c6c590b4ea80ccb3508d407ff75cdd3773f10234))
+* **daemon:** keep a restart from stranding the daemon on an unreadable agent (nw-729) ([6bfae35](https://github.com/Kehl-io/nestweaver/commit/6bfae35b0f6adc3bcbacaca1758fcfcdb324b64d))
+* **daemon:** only an explicit start may rewrite an existing launch agent ([8b03c19](https://github.com/Kehl-io/nestweaver/commit/8b03c19ce3255d73f228060960877f593e3c1f2b))
+* **daemon:** only an explicit start may rewrite an existing launch agent (nw-729) ([558192e](https://github.com/Kehl-io/nestweaver/commit/558192e32d19da477f05b9ea1439e8b5cad7f27a))
+* **daemon:** review follow-ups for launch agent ownership (nw-729) ([ba5c82d](https://github.com/Kehl-io/nestweaver/commit/ba5c82d02555fe8431d8f402f5851a20ea7688b6))
+* **deps:** update rustls for security advisories ([9e5a38c](https://github.com/Kehl-io/nestweaver/commit/9e5a38c0fb137537c0bfedab50d08729f63c53d2))
+* **engine:** queue directory ownership changes so watchability recovers on macOS (nw-783) ([fa90d73](https://github.com/Kehl-io/nestweaver/commit/fa90d7341f5619274c3cc9f3d6fccab194e1e2e4))
+* silent release lockfile failure and macOS watcher recovery flake ([7e72da6](https://github.com/Kehl-io/nestweaver/commit/7e72da6e74936265012f80953ecc92d07456c904))
+
 ## [12.0.3](https://github.com/Kehl-io/nestweaver/compare/v12.0.2...v12.0.3) (2026-10-14)
 
 
