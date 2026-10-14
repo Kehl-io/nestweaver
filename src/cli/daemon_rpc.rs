@@ -404,9 +404,10 @@ pub(crate) fn try_hybrid_json_rpc_checked(
             }
         };
     };
-    // From here on this is the same selected path `resolve_db_with_config`
-    // hands the commands that already worked; the client recovers the logical
-    // instance from it (`instance_anchor_database`).
+    // For a published brain named by its anchor this is the selected slot, the
+    // same path `resolve_db_with_config` hands the commands that already
+    // worked; the client recovers the logical instance from it
+    // (`instance_anchor_database`). A path that exists is passed on unchanged.
     let db_path = local_db.as_path();
     match rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
         db_path, config, &start_dir,

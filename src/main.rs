@@ -12826,10 +12826,20 @@ fn argv_is_our_daemon(argv: &[String], db_path: &std::path::Path) -> bool {
         spellings.push(canonical.to_string_lossy().into_owned());
     }
     spellings.retain(|spelling| !spelling.is_empty());
+    // A client that resolved `CURRENT` first starts the daemon with the
+    // selected slot as `--db`, and where the daemon forks in-process that is
+    // what its argv keeps. Lifecycle commands work with the logical anchor
+    // (nw-729), so compare anchors: a slot of this brain is this brain.
+    let anchored = |value: &str| {
+        nestweaver_engine::publication::instance_anchor_database(Path::new(value))
+            .to_string_lossy()
+            .into_owned()
+    };
     argv.iter().skip(1).any(|arg| {
+        let value = arg.strip_prefix("--db=").unwrap_or(arg);
         spellings
             .iter()
-            .any(|spelling| arg == spelling || arg.as_str() == format!("--db={spelling}"))
+            .any(|spelling| value == spelling || anchored(value) == *spelling)
     })
 }
 
@@ -14402,6 +14412,13 @@ mod logical_publication_admission_tests {
             daemon_status_db_problem(&base).is_none(),
             "`daemon status` must not call a published brain never-indexed"
         );
+        // The lifecycle probes that used to stop at the absent anchor now
+        // reach the selected graph: nothing holds it, and it is not corrupt.
+        assert_eq!(
+            nestweaver_daemon::lifecycle::db_write_lock(&base),
+            nestweaver_daemon::lifecycle::DbWriteLock::Free
+        );
+        assert!(nestweaver_daemon::lifecycle::db_wal_unreadable(&base).is_none());
         // Handing the selected graph back in is a no-op, so commands that
         // already resolved their path keep working unchanged.
         assert_eq!(selected_existing_database(&graph).unwrap(), Some(graph));
@@ -14421,12 +14438,30 @@ mod logical_publication_admission_tests {
             selected_existing_database(&base).unwrap_err(),
         ] {
             let message = format!("{error:#}");
-            assert!(message.contains("CURRENT"), "{message}");
+            assert!(message.contains("parse CURRENT pointer"), "{message}");
             assert!(
                 !message.contains("database not found"),
                 "a brain with a broken selector is not a typo: {message}"
             );
         }
+        let (is_error, problem) = daemon_status_db_problem(&base).unwrap();
+        assert!(
+            is_error && problem.contains("cannot be resolved"),
+            "`daemon status` must not report a broken selector as merely stopped: {problem}"
+        );
+        // The daemon-route funnel refuses it as well, before any dial and
+        // without mistaking it for an absent database to route upstream.
+        let error = try_hybrid_json_rpc_checked(
+            true,
+            &base,
+            None,
+            "symbol_lookup",
+            serde_json::json!({ "name_or_uid": "x" }),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("parse CURRENT pointer"), "{message}");
+        assert!(!message.contains("database not found"), "{message}");
     }
 
     /// The counterweight nw-087 put here: a path with nothing behind it is
@@ -14496,18 +14531,36 @@ mod logical_publication_admission_tests {
 /// not wrong, only worth saying out loud) — the caller uses it to choose the
 /// exit code.
 fn daemon_status_db_problem(db_path: &Path) -> Option<(bool, String)> {
-    if !nestweaver_daemon::lifecycle::database_present(db_path) {
-        return Some((
-            false,
-            format!(
-                "note: {} does not exist yet, so nothing has ever indexed \
-                 there. If you expected an existing database here, check \
-                 --db for a typo.",
-                db_path.display()
-            ),
-        ));
-    }
-    if db_path.is_dir() {
+    // nw-779: ask the selector, not `Path::exists`. A published brain has no
+    // file at its anchor and is not "never indexed"; one whose `CURRENT`
+    // cannot be resolved is broken, and saying only "not running" about it
+    // would hide the reason every read command is failing.
+    let database = match selected_existing_database(db_path) {
+        Ok(Some(database)) => database,
+        Ok(None) => {
+            return Some((
+                false,
+                format!(
+                    "note: {} does not exist yet, so nothing has ever indexed \
+                     there. If you expected an existing database here, check \
+                     --db for a typo.",
+                    db_path.display()
+                ),
+            ));
+        }
+        Err(error) => {
+            return Some((
+                true,
+                format!(
+                    "{} is a published database whose selected publication \
+                     cannot be resolved ({error:#}). Every command that reads \
+                     it fails with the same error.",
+                    db_path.display()
+                ),
+            ));
+        }
+    };
+    if database.is_dir() {
         return Some((
             true,
             format!(
@@ -14518,7 +14571,7 @@ fn daemon_status_db_problem(db_path: &Path) -> Option<(bool, String)> {
             ),
         ));
     }
-    if std::fs::metadata(db_path).is_ok_and(|meta| meta.len() == 0) {
+    if std::fs::metadata(&database).is_ok_and(|meta| meta.len() == 0) {
         return Some((
             true,
             format!(
@@ -33080,6 +33133,20 @@ mod abs_for_daemon_tests {
         // `--db=<path>` is the same invocation spelled differently.
         assert!(argv_is_our_daemon(
             &argv("nestweaver daemon --db=/tmp/nw-f06/brain.lbug start"),
+            db
+        ));
+        // nw-729: a daemon started with the slot `CURRENT` selected is this
+        // brain's daemon; a slot of another brain is not.
+        assert!(argv_is_our_daemon(
+            &argv(
+                "nestweaver daemon --db /tmp/nw-f06/brain.lbug.publications/slots/42072d7e-b2e7-4934-a5f9-1909331caec2/graph.lbug start"
+            ),
+            db
+        ));
+        assert!(!argv_is_our_daemon(
+            &argv(
+                "nestweaver daemon --db /tmp/other/brain.lbug.publications/slots/42072d7e-b2e7-4934-a5f9-1909331caec2/graph.lbug start"
+            ),
             db
         ));
         // Foreign process reusing the PID.

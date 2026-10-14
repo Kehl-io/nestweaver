@@ -163,7 +163,11 @@ fn agent_gc_verdict(
     daemon_agent_instance_id(label)?;
     let db = parse_db_path_from_plist(plist);
     let (db_parsed, is_temp, db_exists) = match &db {
-        Some(p) => (true, is_temp_db_path(p), lifecycle::database_present(p)),
+        Some(p) => (
+            true,
+            lifecycle::is_recorded_temp_db_path(p),
+            lifecycle::database_present(p),
+        ),
         None => (false, false, false),
     };
     // Only probe liveness when it actually decides the outcome (DB gone,
@@ -217,6 +221,11 @@ pub fn gc_orphaned_agents_for(only_db: Option<&std::path::Path>) -> Result<GcRep
             }
         }
 
+        // Decide ownership from the label before reading anything: other
+        // agents in this directory are not ours to open.
+        if daemon_agent_instance_id(label).is_none() {
+            continue;
+        }
         let content = std::fs::read_to_string(&path).unwrap_or_default();
         let Some(verdict) = agent_gc_verdict(label, &content, agent_daemon_is_live) else {
             continue;
@@ -1226,16 +1235,19 @@ mod tests {
             )
         };
         let label = "io.kehl.nestweaver.c37ccf01";
-        if is_temp_db_path(&anchor) {
-            return;
+        // The verdict can only be observed outside a temp root. A checkout or
+        // target directory that lives under one still pins the presence facts.
+        let verdict_observable = !is_temp_db_path(&anchor);
+        if verdict_observable {
+            assert!(
+                matches!(
+                    agent_gc_verdict(label, &render(&anchor), |_| false),
+                    Some(GcVerdict::Reap)
+                ),
+                "an anchor with nothing behind it and no live daemon is an orphan"
+            );
         }
-        assert!(
-            matches!(
-                agent_gc_verdict(label, &render(&anchor), |_| false),
-                Some(GcVerdict::Reap)
-            ),
-            "an anchor with nothing behind it and no live daemon is an orphan"
-        );
+        assert!(!lifecycle::database_present(&anchor));
 
         let root = nestweaver_engine::publication::default_publication_root(&anchor);
         std::fs::create_dir_all(&root).unwrap();
@@ -1246,6 +1258,10 @@ mod tests {
         .unwrap();
         assert!(!anchor.exists(), "the anchor itself is never a file");
         assert!(lifecycle::database_present(&anchor));
+        assert!(!lifecycle::database_present(&dir.path().join("typo.lbug")));
+        if !verdict_observable {
+            return;
+        }
         assert!(
             matches!(
                 agent_gc_verdict(label, &render(&anchor), |_| false),
@@ -1260,7 +1276,6 @@ mod tests {
             agent_gc_verdict(label, &render(&pruned_slot), |_| false),
             Some(GcVerdict::Keep)
         ));
-        assert!(!lifecycle::database_present(&dir.path().join("typo.lbug")));
     }
 
     /// The counterweights nw-781 must not weaken: a genuine instance agent is
@@ -1286,7 +1301,7 @@ mod tests {
             agent_gc_verdict(label, "not a plist", |_| true),
             Some(GcVerdict::Reap)
         ));
-        let gone = "/home/user/definitely/not/here/brain.lbug";
+        let gone = "/nonexistent-root-13579/definitely/not/here/brain.lbug";
         assert!(matches!(
             agent_gc_verdict(label, &render(gone), |_| false),
             Some(GcVerdict::Reap)
