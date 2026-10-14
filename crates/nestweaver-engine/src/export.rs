@@ -612,6 +612,16 @@ fn mermaid_label(s: &str) -> String {
     format!("\"{escaped}\"")
 }
 
+/// nw-113: a `<module>` owner's label, `file::<module>`. The file name goes
+/// through [`mermaid_label`]; the angle brackets use Mermaid's `#lt;`/`#gt;`
+/// entity codes, which render as `<`/`>` inside a quoted label, instead of
+/// being mangled to `_module_`.
+fn mermaid_owner_label(file_path: &str) -> String {
+    let file = file_path.rsplit('/').next().unwrap_or(file_path);
+    let quoted = mermaid_label(&format!("{file}::"));
+    format!("{}#lt;module#gt;\"", &quoted[..quoted.len() - 1])
+}
+
 /// Export the top-N symbols (by PageRank) as a Mermaid flowchart, grouped by file.
 ///
 /// Only symbols that appear in the top-N set and edges between them are included.
@@ -673,8 +683,12 @@ pub fn export_mermaid(
         )?;
         for sym in syms {
             let node_id = mermaid_id(&sym.uid);
-            let label = format!("{} ({})", sym.name, sym.kind);
-            writeln!(writer, "    {}[{}]", node_id, mermaid_label(&label))?;
+            let label = if sym.is_module_owner() {
+                mermaid_owner_label(&sym.file_path)
+            } else {
+                mermaid_label(&format!("{} ({})", sym.name, sym.kind))
+            };
+            writeln!(writer, "    {node_id}[{label}]")?;
         }
         writeln!(writer, "  end")?;
     }
@@ -1362,6 +1376,30 @@ mod tests {
         assert!(output.contains("fn_beta"));
         // Edge from sym-a to sym-b should be present
         assert!(output.contains("-->"));
+    }
+
+    /// nw-113: a `<module>` owner reads `file::<module>` in a Mermaid label,
+    /// escaped with Mermaid entity codes, instead of the mangled `_module_`.
+    #[test]
+    fn mermaid_labels_the_module_owner_by_file() {
+        let store = test_store();
+        let mut owner = make_symbol(
+            "sym-m",
+            nestweaver_schema::MODULE_OWNER_NAME,
+            "src/app/ownerless.ts",
+        );
+        owner.kind = SymbolKind::Module;
+        owner.is_entry_point = true;
+        owner.entry_point_kind = Some(nestweaver_schema::EntryPointKind::ModuleInit);
+        store.insert_symbol(&owner).unwrap();
+        let mut buf = Vec::new();
+        export_mermaid(&store, 50, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("[\"ownerless.ts::#lt;module#gt;\"]"),
+            "{output}"
+        );
+        assert!(!output.contains("_module_"), "{output}");
     }
 
     #[test]
