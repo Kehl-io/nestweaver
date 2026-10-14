@@ -185,7 +185,7 @@ notes below before using an older database with a new binary.
   just a forced index. Back it up and follow the error's recovery command and
   [storage-engine upgrade guide](docs/guide/publication-rebuild.md#storage-engine-upgrade-ladybugdb-021-rebuild-required).
 - For a compatible database, run `nestweaver stale-check --db <db>`. The
-  current resolver generation is **9**; any other generation requires
+  current resolver generation is **10**; any other generation requires
   `nestweaver index --repo <path> --db <db> --force` for each repository.
   A plain incremental index does not repair generation-stale graphs.
 - New databases do not need migration. Vaults do not carry a code resolver
@@ -194,7 +194,7 @@ notes below before using an older database with a new binary.
 <details>
 <summary>Detailed migration notes and changes for scripts and server clients</summary>
 
-**`RESOLVER_GENERATION` is 9. Every graph indexed by another generation must be
+**`RESOLVER_GENERATION` is 10. Every graph indexed by another generation must be
 re-indexed.** Compatibility is an EXACT MATCH, not a floor, so a graph written
 by any other generation — older or newer — is treated as untrustworthy.
 
@@ -208,7 +208,8 @@ shadows the real `getTier`. Generation 9 replaces file-level import proxies with
 actual binding users, corrects receiver and export resolution, and persists
 exported executable roots. Upgrading from generation 8 requires a forced
 re-index of every repository; `stale-check` exits 2 and `dead-code` refuses
-until the graph matches. All these kinds of
+until the graph matches. Generation 10 (nw-113) restricts a block-scoped JS/TS callable to its block. Graphs indexed at generation 9
+need the same forced re-index. All these kinds of
 staleness have the same remedy and the same symptom list. Until you re-index:
 
 - **Rankings are stale.** `hubs`, `bridges`, `repo-map`, `clusters`, and every

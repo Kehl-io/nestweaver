@@ -191,7 +191,7 @@ is refused with `nestweaver::db_rebuild_required`. Back it up and follow the
 and the error's recovery command. A forced re-index alone is not the remedy
 for an incompatible storage format.
 
-For a compatible database, the current **`RESOLVER_GENERATION` is 9**.
+For a compatible database, the current **`RESOLVER_GENERATION` is 10**.
 Compatibility requires an exact match: a graph written by an older or newer
 resolver must be fully re-indexed before you trust its edges and rankings.
 
