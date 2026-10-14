@@ -1,5 +1,16 @@
 # Changelog
 
+## [12.0.3](https://github.com/Kehl-io/nestweaver/compare/v12.0.2...v12.0.3) (2026-10-14)
+
+
+### Bug Fixes
+
+* **cli:** admit a published database by its logical anchor (nw-779) ([7185b53](https://github.com/Kehl-io/nestweaver/commit/7185b534e3300405b0a2c96ca393a5f1b1ae6da7))
+* **daemon:** follow a published anchor in preflights and lock probes ([d3a089a](https://github.com/Kehl-io/nestweaver/commit/d3a089a9bca5c3e049ed1605a837cc78da312d1f))
+* **daemon:** keep live launch agents and published databases in gc (nw-781) ([04866f6](https://github.com/Kehl-io/nestweaver/commit/04866f6ab70e25908bda58a6d2f09b5e1546852d))
+* **daemon:** supervise one database the same under every spelling (nw-729) ([06bcd29](https://github.com/Kehl-io/nestweaver/commit/06bcd29ffcd6e8872b421fa4bf7753cc2cc8d87a))
+* treat a published database as present in gc, CLI admission and daemon supervision ([4988e16](https://github.com/Kehl-io/nestweaver/commit/4988e16c1b6bc3de22f579ba55c9323af4d903ec))
+
 ## [12.0.2](https://github.com/Kehl-io/nestweaver/compare/v12.0.1...v12.0.2) (2026-10-13)
 
 
