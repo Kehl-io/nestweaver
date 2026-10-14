@@ -4521,7 +4521,7 @@ impl DaemonService {
             let limit: usize = 64; // Max nodes per watcher cycle
 
             // Symbols
-            if let Ok(symbols) = store.list_all_symbols() {
+            if let Ok(symbols) = store.list_embeddable_symbols() {
                 for sym in symbols
                     .iter()
                     .filter(|s| !store.has_embedding(&s.uid))
@@ -6578,7 +6578,7 @@ fn plan_embeddings(store: &GraphStore, scope: &str, force: bool) -> Result<Embed
 
     if scopes.symbols {
         let symbols = store
-            .list_all_symbols()
+            .list_embeddable_symbols()
             .map_err(|error| embedding_store_status("symbols", error.into()))?;
         scoped += symbols.len() as u64;
         eligible += symbols
@@ -11670,7 +11670,7 @@ impl NestWeaverDaemon for DaemonService {
 
                 if do_symbols {
                     let symbols = store
-                        .list_all_symbols()
+                        .list_embeddable_symbols()
                         .map_err(|error| embedding_store_status("symbols", error.into()))?;
                     scoped += symbols.len() as u64;
                     let to_embed: Vec<_> = symbols

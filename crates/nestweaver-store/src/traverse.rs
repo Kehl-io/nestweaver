@@ -1773,6 +1773,28 @@ mod tests {
         }
     }
 
+    /// nw-113: the owner's embed text would be `Module <module>`, which says
+    /// nothing; embedding passes select from `list_embeddable_symbols`.
+    #[test]
+    fn embeddable_symbols_exclude_the_module_owner() {
+        let store = GraphStore::in_memory().unwrap();
+        let mut owner = make_symbol("s1", nestweaver_schema::MODULE_OWNER_NAME);
+        owner.kind = SymbolKind::Module;
+        owner.is_entry_point = true;
+        owner.entry_point_kind = Some(nestweaver_schema::EntryPointKind::ModuleInit);
+        store.insert_symbol(&owner).unwrap();
+        store
+            .insert_symbol(&make_symbol("s2", "flushBuffer"))
+            .unwrap();
+        let uids: Vec<String> = store
+            .list_embeddable_symbols()
+            .unwrap()
+            .into_iter()
+            .map(|symbol| symbol.uid)
+            .collect();
+        assert_eq!(uids, vec!["s2".to_string()]);
+    }
+
     /// nw-113: one `<module>` per file would flood substring searches for
     /// "module"; the owner is listed only when asked for by its exact name.
     #[test]

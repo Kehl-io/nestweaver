@@ -2598,6 +2598,15 @@ impl GraphStore {
         Ok(self.list_all_symbols_with_integrity()?.0)
     }
 
+    /// Symbols an embedding pass should embed: every symbol except the
+    /// per-file `<module>` owners (nw-113), whose embed text would be only
+    /// `Module <module>` and carry no meaning.
+    pub fn list_embeddable_symbols(&self) -> Result<Vec<nestweaver_schema::Symbol>, StoreError> {
+        let mut symbols = self.list_all_symbols()?;
+        symbols.retain(|symbol| !symbol.is_module_owner());
+        Ok(symbols)
+    }
+
     /// [`Self::list_all_symbols`] plus what the scan actually covered.
     pub fn list_all_symbols_with_integrity(
         &self,
