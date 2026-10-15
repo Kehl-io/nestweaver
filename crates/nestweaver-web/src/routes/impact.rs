@@ -447,7 +447,8 @@ fn out_of_scope_response(
 fn target_graph_node(symbol: &Symbol) -> ImpactGraphNode {
     ImpactGraphNode {
         uid: symbol.uid.clone(),
-        name: symbol.name.clone(),
+        // nw-113: an owner reads `path::<module>`, never bare.
+        name: nestweaver_schema::symbol_display_name(&symbol.name, &symbol.file_path).into_owned(),
         file_path: symbol.file_path.clone(),
         start_line: symbol.start_line,
         layer: 0,
@@ -462,7 +463,8 @@ fn target_graph_node(symbol: &Symbol) -> ImpactGraphNode {
 fn impact_graph_node(node: &ImpactNode) -> ImpactGraphNode {
     ImpactGraphNode {
         uid: node.uid.clone(),
-        name: node.name.clone(),
+        // nw-113: an owner reads `path::<module>`, never bare.
+        name: nestweaver_schema::symbol_display_name(&node.name, &node.file_path).into_owned(),
         file_path: node.file_path.clone(),
         start_line: node.start_line,
         layer: node.depth,
@@ -546,6 +548,44 @@ fn target_repo_is_stale(state: &Arc<AppState>, target: &Symbol) -> Result<bool, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nw-113: the impact graph labels an owner `path::<module>`, as the
+    /// target and as an impacted node.
+    #[test]
+    fn impact_graph_labels_module_owners_by_file() {
+        let owner = ImpactNode {
+            uid: "sym:owner".to_string(),
+            name: nestweaver_schema::MODULE_OWNER_NAME.to_string(),
+            file_path: "src/a.js".to_string(),
+            start_line: 1,
+            edge_type: "CALLS".to_string(),
+            confidence: 1.0,
+            depth: 1,
+            impact_score: 1.0,
+        };
+        assert_eq!(impact_graph_node(&owner).name, "src/a.js::<module>");
+        let target = Symbol {
+            uid: owner.uid.clone(),
+            name: owner.name.clone(),
+            kind: nestweaver_schema::SymbolKind::Module,
+            repo_uid: "repo:r".to_string(),
+            file_path: owner.file_path.clone(),
+            start_line: 1,
+            end_line: 1,
+            signature: String::new(),
+            summary: None,
+            content_hash: String::new(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: true,
+            entry_point_kind: Some(nestweaver_schema::EntryPointKind::ModuleInit),
+            visibility: nestweaver_schema::Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        assert_eq!(target_graph_node(&target).name, "src/a.js::<module>");
+    }
 
     #[test]
     fn source_evidence_names_the_symbol_repo() {
