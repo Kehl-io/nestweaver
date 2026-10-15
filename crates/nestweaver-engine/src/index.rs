@@ -3780,34 +3780,45 @@ fn containing_symbol_for_line(symbols: &[RawSymbol], line: u32) -> Option<&RawSy
 /// names a class, interface, enum or trait declared in the same file to that
 /// container. Shared by the index and the live watcher (nw-113 P1), so a
 /// watcher pass over a file with a class keeps its members.
+///
+/// nw-787: when several containers share the name (a nested `class Inner`
+/// and a top-level `class Inner`), the member belongs to the innermost one
+/// whose span encloses it. A member outside every same-named span (a Rust
+/// `impl` block, or a degenerate span) keeps the last-declared one, as before.
 pub(crate) fn file_member_of_edges(
     r_uid: &str,
     rel_path: &str,
     raw_symbols: &[RawSymbol],
 ) -> Vec<nestweaver_schema::ResolvedEdge> {
     use nestweaver_schema::SymbolKind;
-    let containers: HashMap<&str, String> = raw_symbols
-        .iter()
-        .filter(|symbol| {
-            matches!(
-                symbol.kind,
-                SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum | SymbolKind::Trait
-            )
-        })
-        .map(|symbol| {
-            (
-                symbol.name.as_str(),
-                symbol_uid(r_uid, rel_path, &symbol.name, symbol.start_line),
-            )
-        })
-        .collect();
+    let mut containers: HashMap<&str, Vec<&RawSymbol>> = HashMap::new();
+    for symbol in raw_symbols.iter().filter(|symbol| {
+        matches!(
+            symbol.kind,
+            SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum | SymbolKind::Trait
+        )
+    }) {
+        containers
+            .entry(symbol.name.as_str())
+            .or_default()
+            .push(symbol);
+    }
     raw_symbols
         .iter()
         .filter_map(|symbol| {
-            let parent_uid = containers.get(symbol.parent_name.as_deref()?)?;
+            let named = containers.get(symbol.parent_name.as_deref()?)?;
+            let parent = named
+                .iter()
+                .filter(|container| {
+                    container.start_line <= symbol.start_line
+                        && symbol.start_line <= container.end_line
+                        && !std::ptr::eq(**container, symbol)
+                })
+                .min_by_key(|container| container.end_line - container.start_line)
+                .or_else(|| named.last())?;
             Some(nestweaver_schema::ResolvedEdge {
                 source_uid: symbol_uid(r_uid, rel_path, &symbol.name, symbol.start_line),
-                target_uid: parent_uid.clone(),
+                target_uid: symbol_uid(r_uid, rel_path, &parent.name, parent.start_line),
                 edge_type: nestweaver_schema::EdgeType::MemberOf,
                 confidence: 1.0,
                 link_type: None,
@@ -4420,10 +4431,10 @@ where
     // Immutable borrow of the parsed cache for the parallel phase.
     let pc_ref: Option<&crate::parsed_cache::ParsedCache> = parsed_cache.as_deref();
 
-    // Rolling-window CPU budget for the CPU-bound phases below (parse +
-    // type-env build) — keeps an indexing daemon under runningboardd's CPU
-    // limit. Both phases run before the write gate is taken (nw-812). The
-    // budget is process-wide: the kill limit counts the whole daemon.
+    // Opt-in rolling-window CPU budget for the CPU-bound phases below (parse
+    // + type-env build); inert unless NESTWEAVER_INDEX_CPU_PERCENT enables it
+    // (nw-814). Both phases run before the write gate is taken (nw-812). The
+    // budget is process-wide, shared by every index in the daemon.
     let cpu_throttle = crate::cpu_throttle::CpuThrottle::global();
 
     let parse_one = |(path, lang): &(PathBuf, Language)| -> ParseOutcome {
@@ -8868,6 +8879,75 @@ fn content_hash_hex(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nw-787 (also nw-113 last-round QA): a Python nested class's method is a
+    /// member of the nested class, not of a same-named top-level class, and
+    /// each top-level member keeps its own class.
+    #[test]
+    fn member_of_picks_the_enclosing_same_named_class() {
+        let source = "class Outer:\n    class Inner:\n        def m(self):\n            return 1\n\n\nclass Inner:\n    def m(self):\n        return 2\n";
+        let parsed = nestweaver_parser::parse_source(Path::new("n.py"), source).unwrap();
+        let edges = file_member_of_edges("repo:test:abc", "n.py", &parsed.symbols);
+        let at = |name: &str, line: u32| symbol_uid("repo:test:abc", "n.py", name, line);
+        for (member, class) in [(at("m", 3), at("Inner", 2)), (at("m", 8), at("Inner", 7))] {
+            assert!(
+                edges
+                    .iter()
+                    .any(|edge| edge.source_uid == member && edge.target_uid == class),
+                "{member} -> {class}: {edges:#?} {:#?}",
+                parsed.symbols
+            );
+        }
+        assert!(
+            !edges
+                .iter()
+                .any(|edge| edge.source_uid == at("m", 3) && edge.target_uid == at("Inner", 7)),
+            "{edges:#?}"
+        );
+    }
+
+    /// nw-811: cargo-run tests must not grow the account authority registry.
+    /// A test database lives under the system temp dir, so a debug build puts
+    /// its records in the override registry. A release build ignores the
+    /// override (CI's macOS job runs `cargo test --release`), so there the
+    /// record goes to the account registry, where gc reclaims it once the
+    /// scope is gone.
+    #[test]
+    fn an_index_under_the_authority_override_writes_nothing_to_the_default_registry() {
+        use nestweaver_store::stable_anchor::{
+            anchor_key, authority_registry_root_for, default_authority_registry_root,
+        };
+        let override_dir = PathBuf::from(
+            std::env::var_os("NESTWEAVER_AUTHORITY_DIR")
+                .expect("cargo [env] sets NESTWEAVER_AUTHORITY_DIR for tests"),
+        );
+        let account = default_authority_registry_root().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let scope = std::fs::canonicalize(dir.path()).unwrap();
+        let (expected, other) = if cfg!(debug_assertions) {
+            (&override_dir, &account)
+        } else {
+            (&account, &override_dir)
+        };
+        // Checked before indexing so a missing override cannot write a record
+        // into the real registry.
+        assert_eq!(&authority_registry_root_for(&scope).unwrap(), expected);
+
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("app.py"), "def app_main():\n    return 1\n").unwrap();
+        let db = dir.path().join("graph.lbug");
+        index_directory_with_opts(
+            &repo,
+            &db,
+            &IndexOptions::new("test", "https://example.test/nw-811", "sha").force(true),
+        )
+        .unwrap();
+
+        let key = anchor_key("database-namespace", &scope);
+        assert!(expected.join(&key).exists());
+        assert!(!other.join(&key).exists());
+    }
 
     /// nw-113: cross-repo inference attributes a line to a real symbol, never
     /// to the whole-file module owner.

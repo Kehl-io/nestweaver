@@ -46,5 +46,6 @@ serde_json = { workspace = true }
 toml = "1.1"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
 tempfile = "3"
 toml = "1.1"

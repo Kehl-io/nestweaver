@@ -1,19 +1,39 @@
-//! CPU budget for the parallel indexing phases.
+//! Optional CPU budget for the parallel indexing phases.
 //!
-//! A daemon that saturates every core with tree-sitter parses can trip
-//! runningboardd's CPU limit on macOS (observed: killed after a 90 s-CPU /
-//! 180 s-window violation mid-index). `CpuThrottle` enforces that limit the
-//! way it is defined: it tracks the daemon's process CPU time
+//! OFF by default (nw-814). Setting `NESTWEAVER_INDEX_CPU_PERCENT` to 1–40
+//! opts in: `CpuThrottle` then tracks the daemon's process CPU time
 //! (`getrusage(RUSAGE_SELF)`, all threads summed) over a rolling 180 s window
-//! and only sleeps when the window's total would exceed a budget set safely
-//! below the kill line.
-//!
-//! The limit is per PROCESS, so there is one budget per process
-//! ([`CpuThrottle::global`]): back-to-back indexes (boot reconcile of several
-//! repos, a watcher batch plus a forced index, code then vault) share it, and
-//! CPU spent before the throttle is first consulted is billed too. The daemon
+//! and only sleeps when the window's total would exceed the budget. One
+//! budget is shared by the whole process ([`CpuThrottle::global`]):
+//! back-to-back indexes (boot reconcile of several repos, a watcher batch plus
+//! a forced index, code then vault) share it, and CPU spent before the
+//! throttle is first consulted is billed too. While enabled, the daemon
 //! samples the window every [`SAMPLE_INTERVAL`], so CPU spent between indexes
 //! is billed where it happened.
+//!
+//! Why it is off: the budget was added (PR #173) on the belief that macOS
+//! (runningboardd) kills a process that uses 90 s of CPU in 180 s. That is not
+//! what macOS does (nw-814 investigation). The real mechanism is the kernel
+//! CPU usage monitor:
+//! - It is PER THREAD. `posix_spawn` arms it as "a task-wide, per-thread CPU
+//!   usage limit, which will generate a resource exceeded exception if any
+//!   one thread exceeds the limit" (XNU `bsd/kern/kern_exec.c`); the defaults
+//!   are 50% of one core over 180 s (`DEFAULT_CPUMON_PERCENTAGE`,
+//!   `DEFAULT_CPUMON_INTERVAL` in `osfmk/kern/task_policy.c`).
+//! - It is armed only when the spawner asks for it, which launchd does for its
+//!   jobs. A process started from a shell has no monitor.
+//! - It is NON-FATAL unless the process opts in with
+//!   `proc_rlimit_control(RLIMIT_CPU_USAGE_MONITOR, CPUMON_MAKE_FATAL)`, which
+//!   NestWeaver never calls. Otherwise it only raises `EXC_RESOURCE`
+//!   (`FLAVOR_CPU_MONITOR`); the system writes a `*.cpu_resource.diag` with
+//!   "Action taken: none" and the process keeps running. Apple's EXC_RESOURCE
+//!   documentation (<https://developer.apple.com/documentation/xcode/exc_resource>):
+//!   a `NON-FATAL CONDITION` report means "the operating system generated a
+//!   crash report without actually terminating the process".
+//!
+//! A process-wide budget therefore guards against a kill that does not happen
+//! and slows indexing for nothing. What keeps the machine responsive is the
+//! utility QoS on the parse workers, which stays on regardless.
 //!
 //! nw-812: this replaced a 5 s duty-cycle window that budgeted half of ONE
 //! core for the whole multi-threaded process and billed nothing for the first
@@ -36,26 +56,36 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-/// Environment variable selecting the budget, as the average percentage of
-/// ONE core the daemon process may use over the rolling 180 s window (the
-/// same unit macOS reports for its own limit: 90 s / 180 s is 50%). `0` or
-/// `>= 100` disables the throttle; values above [`MAX_PERCENT`] fall back to
-/// the default.
+/// Environment variable opting in to the budget, as the average percentage
+/// of ONE core the daemon process may use over the rolling 180 s window.
+/// Unset, unparsable, `0` or `>= 100` leaves the throttle disabled; values
+/// above [`MAX_PERCENT`] fall back to the default (disabled), and 1–11 are
+/// raised to [`MIN_PERCENT`].
 #[cfg_attr(test, allow(dead_code))] // unit tests use an inert global
 const ENV_VAR: &str = "NESTWEAVER_INDEX_CPU_PERCENT";
 
-/// Default budget: 40% of one core over 180 s = 72 s of CPU per window,
-/// 20% under the 90 s kill line and enough that a forced index of a large
-/// repo (an 11-core burst of a few seconds) runs unthrottled.
-const DEFAULT_PERCENT: u32 = 40;
+/// Default budget: none (nw-814). macOS enforces no process-wide CPU limit
+/// on the daemon, so the budget is opt-in; see the module docs.
+const DEFAULT_PERCENT: u32 = 0;
 
-/// Ceiling for configured values: 40% = 72 s per window, the same as the
-/// default. The write phase after the gate is not throttled and adds up to
-/// [`WRITE_RESERVE`] on top of the budget, so anything higher could carry the
-/// window past the 90 s kill line. Values above it — notably the old default
-/// `50` that existing launchd plists bake — are treated as unset (the
-/// default), not as "as much as allowed".
+/// Ceiling for configured values: 40% = 72 s per window. The write phase
+/// after the gate is not throttled and adds up to [`WRITE_RESERVE`] on top of
+/// the budget, so 40% keeps even the write phase under half a core averaged.
+/// Values above it — notably `50`, the pre-nw-812 default an older plist may
+/// carry — are treated as unset (the default, disabled), not as "as much as
+/// allowed".
 const MAX_PERCENT: u32 = 40;
+
+/// Floor for configured values: 12% = 21.6 s per window, the smallest
+/// percent whose budget exceeds [`WRITE_RESERVE`] with a margin. At 1–11%
+/// the budget is at or under the reserve, so the pre-write wait for
+/// `budget - WRITE_RESERVE` of headroom could never be satisfied by
+/// anything but an empty window. Values 1–11 are raised to it.
+const MIN_PERCENT: u32 = 12;
+const _: () = assert!(
+    WINDOW.as_millis() * MIN_PERCENT as u128 / 100 > WRITE_RESERVE.as_millis() + 1000,
+    "MIN_PERCENT must leave room beyond the write reserve"
+);
 
 /// CPU kept free for the write/epilogue phase, which runs under the write
 /// gate and therefore is never throttled (~10–15 s for a large repo). Before
@@ -63,7 +93,7 @@ const MAX_PERCENT: u32 = 40;
 /// `budget - WRITE_RESERVE`; see [`CpuThrottle::reserve_write_headroom`].
 const WRITE_RESERVE: Duration = Duration::from_secs(20);
 
-/// The rolling window runningboardd measures CPU over.
+/// The rolling window the budget is measured over.
 const WINDOW: Duration = Duration::from_secs(180);
 
 /// Bucket width for the rolling window.
@@ -231,9 +261,9 @@ impl CpuThrottle {
         THROTTLE.get_or_init(Self::from_env)
     }
 
-    /// Build from `NESTWEAVER_INDEX_CPU_PERCENT` (default 40; `0` or
-    /// `>= 100` produces an inert throttle whose [`check`](Self::check)
-    /// never sleeps).
+    /// Build from `NESTWEAVER_INDEX_CPU_PERCENT` (default disabled; only
+    /// 1–40 enable it). A disabled throttle is inert: [`check`](Self::check)
+    /// never sleeps.
     #[cfg_attr(test, allow(dead_code))] // unit tests use an inert global
     fn from_env() -> Self {
         Self::from_env_value(std::env::var(ENV_VAR).ok().as_deref())
@@ -245,6 +275,8 @@ impl CpuThrottle {
             .unwrap_or(DEFAULT_PERCENT);
         let percent = if percent > MAX_PERCENT && percent < 100 {
             DEFAULT_PERCENT
+        } else if percent > 0 && percent < MIN_PERCENT {
+            MIN_PERCENT
         } else {
             percent
         };
@@ -290,6 +322,12 @@ impl CpuThrottle {
             #[cfg(test)]
             checks: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Whether a budget is in force. When it is not, the daemon does not run
+    /// the [`sample`](Self::sample) loop at all.
+    pub fn is_enabled(&self) -> bool {
+        self.target.is_some()
     }
 
     /// Called from parallel workers before a unit of CPU-bound work. Cheap
@@ -649,15 +687,29 @@ mod tests {
     }
 
     #[test]
-    fn env_default_is_seventy_two_seconds_per_window() {
+    fn env_default_is_disabled() {
+        // nw-814: the budget is opt-in. Unset means no budget at all.
         let t = CpuThrottle::from_env_value(None);
-        assert_eq!(t.target, secs(72));
+        assert_eq!(t.target, None);
+        assert!(!t.is_enabled());
     }
 
     #[test]
     fn env_unparsable_falls_back_to_default() {
         let t = CpuThrottle::from_env_value(Some("garbage"));
+        assert_eq!(t.target, None);
+    }
+
+    #[test]
+    fn explicit_value_enables_the_budget() {
+        // 1–40 opt in to the rolling 180 s budget, unchanged from nw-812.
+        assert_eq!(
+            CpuThrottle::from_env_value(Some("12")).target,
+            Some(Duration::from_millis(21_600))
+        );
+        let t = CpuThrottle::from_env_value(Some("40"));
         assert_eq!(t.target, secs(72));
+        assert!(t.is_enabled());
     }
 
     #[test]
@@ -676,9 +728,9 @@ mod tests {
 
     #[test]
     fn legacy_values_over_the_max_map_to_the_default() {
-        // Existing plists bake the old default `50`, which is exactly
-        // runningboardd's 90 s / 180 s kill line. Anything over the max is
-        // treated as unset, not as "as much as allowed".
+        // Plists written by older releases may carry `50`, the pre-nw-812
+        // default. Anything over the max is treated as unset (now: no
+        // budget), not as "as much as allowed".
         let default = CpuThrottle::from_env_value(None).target;
         for legacy in ["50", "41", "45", "99"] {
             assert_eq!(
@@ -688,6 +740,21 @@ mod tests {
             );
         }
         assert_eq!(CpuThrottle::from_env_value(Some("40")).target, secs(72));
+    }
+
+    /// 1–11% budgets (1.8–19.8 s) leave no room beyond the 20 s write
+    /// reserve, so they are raised to the 12% floor (21.6 s).
+    #[test]
+    fn values_below_the_floor_are_raised_to_it() {
+        for low in ["1", "5", "11"] {
+            let t = CpuThrottle::from_env_value(Some(low));
+            assert_eq!(t.target, Some(Duration::from_millis(21_600)), "{low}");
+            assert!(t.target.unwrap() > WRITE_RESERVE, "{low}");
+        }
+        assert_eq!(
+            CpuThrottle::from_env_value(Some("13")).target,
+            Some(Duration::from_millis(23_400))
+        );
     }
 
     #[test]
@@ -762,7 +829,7 @@ mod tests {
             let cpu = Arc::clone(&cpu);
             let sleeps = Arc::clone(&sleeps);
             CpuThrottle::with_clocks(
-                CpuThrottle::from_env_value(None).target,
+                CpuThrottle::from_env_value(Some("40")).target,
                 Box::new(move || *wall_c.lock().unwrap_or_else(|p| p.into_inner())),
                 Box::new(move || *cpu.lock().unwrap_or_else(|p| p.into_inner())),
                 Box::new(move |d| {
@@ -806,9 +873,9 @@ mod tests {
         max
     }
 
-    /// The default budget is 72 s of CPU per rolling 180 s window (40% of one
-    /// core averaged), 20% under runningboardd's 90 s / 180 s kill line.
-    const DEFAULT_BUDGET_SECS: f64 = 72.0;
+    /// The budget the simulations run at: `NESTWEAVER_INDEX_CPU_PERCENT=40`,
+    /// 72 s of CPU per rolling 180 s window (40% of one core averaged).
+    const SIM_BUDGET_SECS: f64 = 72.0;
 
     #[test]
     fn eleven_core_burst_of_six_seconds_never_sleeps() {
@@ -843,13 +910,13 @@ mod tests {
         }
         let peak = max_rolling_cpu(&trace, Duration::from_secs(180));
         assert!(
-            peak.as_secs_f64() <= DEFAULT_BUDGET_SECS + 1.0,
-            "rolling 180 s CPU peaked at {peak:?}, over the {DEFAULT_BUDGET_SECS} s budget"
+            peak.as_secs_f64() <= SIM_BUDGET_SECS + 1.0,
+            "rolling 180 s CPU peaked at {peak:?}, over the {SIM_BUDGET_SECS} s budget"
         );
         // ...while still making real progress (not starved far below cap).
         let total = rig.now().1.as_secs_f64();
         assert!(
-            total >= DEFAULT_BUDGET_SECS * 5.0,
+            total >= SIM_BUDGET_SECS * 5.0,
             "throughput collapsed: only {total:.1} s CPU in 1200 s"
         );
     }
@@ -893,7 +960,7 @@ mod tests {
 
     #[test]
     fn cpu_spent_before_the_throttle_existed_is_billed() {
-        // runningboardd counts the PROCESS, so CPU burned before this
+        // The budget is process-wide, so CPU burned before this
         // throttle was first consulted (an earlier index, boot work) must
         // count against the window rather than being forgiven at creation.
         let rig = rig(secs(72));

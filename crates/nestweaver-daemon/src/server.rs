@@ -14338,18 +14338,23 @@ pub async fn run_server(
     )?;
     // nw-812: start the process-wide index CPU budget with the daemon, so CPU
     // spent before the first index is billed across the time it was spent.
-    nestweaver_engine::cpu_throttle::CpuThrottle::global();
+    // nw-814: the budget is opt-in (`NESTWEAVER_INDEX_CPU_PERCENT`), so only
+    // an enabled budget gets the sampler below.
+    let cpu_throttle = nestweaver_engine::cpu_throttle::CpuThrottle::global();
     // ...and keep it sampled, so CPU spent between indexes (embedding,
     // watcher batches, reconcilers, queries) lands in the window where it
     // happened instead of being spread over the gap until the next index.
-    tokio::spawn(async {
-        let mut interval = tokio::time::interval(nestweaver_engine::cpu_throttle::SAMPLE_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            interval.tick().await;
-            nestweaver_engine::cpu_throttle::CpuThrottle::global().sample();
-        }
-    });
+    if cpu_throttle.is_enabled() {
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(nestweaver_engine::cpu_throttle::SAMPLE_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                cpu_throttle.sample();
+            }
+        });
+    }
     // Idle-timeout counts only gRPC/UDS reads+writes (active_reads/active_writes)
     // and indexing — the MCP-over-HTTP path (server mode only) does NOT bump them,
     // so an idle timer would treat an actively-querying MCP client as idle and

@@ -49,7 +49,10 @@ use serde::{Deserialize, Serialize};
 ///     `.js` bare-parameter arrows are functions, `catch`/`for` bindings are
 ///     clause-scoped, ESM imports are hoisted, TS `import x = require` binds,
 ///     and `.ts`/`.tsx` keep their own type bindings.
-const CACHE_VERSION: u32 = 6;
+/// 7 — nw-787: nested JS/TS function declarations emit a
+///     `HoistedDeclaration` reference recording the region they are visible
+///     in (function-body hoisting, or the block in strict code).
+const CACHE_VERSION: u32 = 7;
 
 /// A log larger than this (and than the base) is folded into the base.
 const LOG_COMPACT_MIN_BYTES: u64 = 64 * 1024 * 1024;

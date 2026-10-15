@@ -64,7 +64,7 @@ If optional dependencies were skipped, `nestweaver` exits 1 and names the platfo
 
 ## After you upgrade
 
-The current resolver generation is **10**. A graph recorded at any other generation has stale edges. Check, then re-index with `--force`. A plain `index` does nothing when the repo is already at HEAD.
+The current resolver generation is **11**. A graph recorded at any other generation has stale edges. Check, then re-index with `--force`. A plain `index` does nothing when the repo is already at HEAD.
 
 ```sh
 nestweaver stale-check

@@ -23,12 +23,22 @@ LBUG_BUILD_FROM_SOURCE = { value = "1", force = true }
 # for released binaries — cargo only injects this into processes it spawns.
 NESTWEAVER_LBUG_MAX_DB_SIZE = { value = "17179869184" }
 
-# nw-812: the index CPU budget is process-wide (runningboardd counts the whole
-# process), so a test binary running many indexes in parallel would make them
-# wait on each other's CPU. Disable it for anything cargo runs (tests, test
-# daemons they spawn, `cargo run`). NOT `force`, so a test that exercises the
-# throttle can set its own value; released binaries never see this.
+# The index CPU budget is opt-in and off by default (nw-814: macOS's CPU
+# monitor is per-thread and non-fatal, so it never killed the daemon). When a
+# developer exports a value, the budget is process-wide, so a test binary
+# running many indexes in parallel would make them wait on each other's CPU.
+# Pin it off for anything cargo runs (tests, test daemons they spawn,
+# `cargo run`). NOT `force`, so a test that exercises the throttle can set its
+# own value; released binaries never see this.
 NESTWEAVER_INDEX_CPU_PERCENT = { value = "0" }
+
+# nw-811: keep test authority records out of the account registry
+# (~/.local/state/nestweaver/authority), which every tempdir database otherwise
+# grew by one or more permanent entries. Honoured by debug builds only, and
+# only for scopes under the system temp dir: a real database always uses the
+# account registry, even under `cargo run`, so a `cargo run` CLI and the
+# launchd daemon (or two worktrees) still exclude each other on it.
+NESTWEAVER_AUTHORITY_DIR = { value = "target/test-authority", relative = true }
 
 # No linker workaround is needed here, and none should be added. liblbug.a
 # vendors zstd, exports its ZSTD_* symbols, and is linked +whole-archive, so

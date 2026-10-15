@@ -185,11 +185,12 @@ notes below before using an older database with a new binary.
   just a forced index. Back it up and follow the error's recovery command and
   [storage-engine upgrade guide](docs/guide/publication-rebuild.md#storage-engine-upgrade-ladybugdb-021-rebuild-required).
 - For a compatible database, run `nestweaver stale-check --db <db>`. The
-  current resolver generation is **10**; any other generation requires
+  current resolver generation is **11**; any other generation requires
   `nestweaver index --repo <path> --db <db> --force` for each repository.
   A plain incremental index does not repair generation-stale graphs.
 - **This release needs a forced re-index of every repository.** It moves the
-  resolver generation to 10 and the parsed cache to 6: run
+  resolver generation to 11 and the parsed cache to 7 (generation 10 never
+  shipped, so one forced re-index covers both): run
   `nestweaver index --repo <path> --force` for each repo. `stale-check` exits 2
   until you do.
 - New databases do not need migration. Vaults do not carry a code resolver
@@ -198,7 +199,7 @@ notes below before using an older database with a new binary.
 <details>
 <summary>Detailed migration notes and changes for scripts and server clients</summary>
 
-**`RESOLVER_GENERATION` is 10. Every graph indexed by another generation must be
+**`RESOLVER_GENERATION` is 11. Every graph indexed by another generation must be
 re-indexed.** Compatibility is an EXACT MATCH, not a floor, so a graph written
 by any other generation — older or newer — is treated as untrustworthy.
 
@@ -232,7 +233,11 @@ carries these JS/TS parser and resolver fixes:
 | A member access or call through an imported receiver (`Modal.latestProps` after `import { Modal }`) never binds a same-file symbol of the member's name | The false self-`ACCESSES` edge in a file named like its import (`Modal.test.js`) is gone |
 | `.mjs`/`.cjs` files are indexed as JavaScript and `.mts`/`.cts` as TypeScript; an extensionless import also reaches them, a directory import reaches its `index.mjs`/`.cjs`/`.mts`/`.cts`, and `index`, `main`, `app` and `server` files in those extensions are entry files like their `.js`/`.ts` twins | Those files, and the calls into them, appear in the graph |
 
-Graphs indexed at generation 9 need the same forced re-index. All these kinds of staleness have the same remedy and the
+Generation 11 (nw-787, nw-789) scopes a nested JS/TS `function` declaration to
+where it is visible, stops a bare JS/TS call binding a method or accessor,
+scopes a Python `def` nested in a function to that function, and gives a nested
+class's members `MEMBER_OF` their own class (parsed cache 7). Graphs indexed at
+generation 9 or 10 need the same forced re-index. All these kinds of staleness have the same remedy and the
 same symptom list. Until you re-index:
 
 - **Rankings are stale.** `hubs`, `bridges`, `repo-map`, `clusters`, and every
@@ -354,6 +359,9 @@ Also changing behaviour in this release, in ways a script may notice:
 | `affected-tests` lists each test file once, in the best tier any of its tests reached, with all of its affected tests there (nw-799). A file used to appear in both tier 1 and tier 2 | Count files per tier, not tests |
 | `read-symbols --token-budget` (MCP `token_budget`) cuts a first symbol larger than the budget to its leading lines, closed by a marker line, and sets `body_truncated: true`; it used to return it whole. The text output then ends with `body truncated to fit the token budget`, not `truncated: 0 symbol(s) dropped`. A budget of 0 still returns the first symbol whole | Check `body_truncated` before treating a body as complete |
 | After an edit, the watcher and incremental index always re-resolve a changed file's direct importers; the 200-file cap now bounds only the transitive expansion. Past 5,000 direct dependents the pass is skipped with a warning naming `index` and `index --force`; past 200 the count and time are logged. Barrel files that only re-export are re-resolved too, so their `reexport_resolved` edges survive edits | Nothing to change |
+| A nested JS/TS `function` declaration binds only where it is visible: inside its enclosing function (including nested functions and callbacks there) and, in strict code (TypeScript, an ES module including any `.mjs`/`.mts` file, a `"use strict"` directive in the file's or an enclosing function's prologue), only inside its block. A call before it in that scope still binds it (hoisting); a module-level declaration still binds file-wide. A Python `def` nested in a function binds only inside it. A bare JS/TS call never binds a method, getter or setter (`this.x()` and `obj.x()` are unchanged), so a same-named free function wins. A nested class's members are `MEMBER_OF` that class, not a same-named top-level one. The full index and the watcher now agree on all of these (nw-787, nw-789) | Calls that bound a sibling's nested function, a block function after its block, or a same-file method now bind the import, the caller's own function or nothing. Re-index with `--force` (generation 11) |
+| The index CPU budget (`NESTWEAVER_INDEX_CPU_PERCENT`) is off by default (nw-814). It was added because macOS was believed to kill a daemon using 90s of CPU in 180s; it does not. macOS's CPU usage monitor is per thread, armed only by a spawner that asks (launchd does), and non-fatal: it writes a `*.cpu_resource.diag` report ("Action taken: none") and the daemon keeps running. Parse workers still run at utility QoS on macOS, which keeps the machine responsive. An explicitly set `1`–`40` still applies the budget, with `1`–`11` raised to `12` (the smallest budget with room beyond the 20s write reserve); `41`–`99`, including an older plist's `50`, mean off | Nothing to change. To keep a budget, set `NESTWEAVER_INDEX_CPU_PERCENT` to `12`–`40` and re-run `daemon start` so the launchd plist carries it |
+| `daemon gc` also prunes the authority registry (`~/.local/state/nestweaver/authority`), which grew one lock record per database scope ever locked (nw-811). It removes records whose database, publication root or operation journal is gone, and empty records from earlier releases that are older than 24h, unheld and match no live database; a record some process holds is never removed. `--dry-run` reports what would go and changes nothing (it skips the launch-agent and directory sweeps). `--db X` limits the prune to X's records and leaves the older empty records alone. A registry gc cannot sweep is a warning, not a failure | Run `nestweaver daemon gc --dry-run` to preview, then `nestweaver daemon gc` |
 | A watcher pass over a file with a class keeps its `MEMBER_OF` edges and resolves `this.m()` / `self.m()` as `type_aware`, as a fresh index does. Before, it dropped every `MEMBER_OF` edge of the edited file, so `dead-code` on a watcher-maintained graph could list constructors | Nothing to change; graphs kept by an older watcher regain the edges on the file's next edit or a `--force` index |
 | A code watcher keeps running when a committed batch's evidence cannot be saved. It notifies the committed graph and discloses the outstanding repair, retaining replay paths in memory across retries. Successfully persisted replay debt also survives restart; startup repairs imports across bounded source batches. | Restore access to the reported evidence files and let the watcher retry. If replay debt itself could not be persisted, keep the watcher running until repair completes; after interruption, run `nestweaver index --repo <path> --force` to rebuild missing evidence and relationships. |
 | **Rebuild required.** LadybugDB 0.21 (this release ships 0.21.1) changes how text keys are hashed and its on-disk format marker did not change, so NestWeaver now refuses a database built by an earlier version before opening it: exit **1**, `nestweaver::db_rebuild_required`, the exact rebuild command, no daemon started, no byte changed. Snapshot format is now **4**; older snapshots are refused, and `backup restore` of a pre-upgrade archive warns that the result needs a rebuild | Stop the daemon, run `nestweaver backup save <file>` (it reads the old database read-only and marks the archive as pre-upgrade), then `nestweaver publication rebuild --config <instance.toml>`; the old database stays in place until the new one validates. To roll back, reinstall the previous version and restore your backup. Do not open a rebuilt database with an older NestWeaver. See `docs/guide/publication-rebuild.md` |

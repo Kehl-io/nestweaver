@@ -1,12 +1,13 @@
 //! Dedicated rayon pool for the CPU-bound parse phase.
 //!
 //! Running the parse `par_iter` on rayon's global pool starves the daemon's
-//! query serving, and its workers inherit the default scheduling priority —
-//! on macOS that contributed to runningboardd killing the daemon for a CPU
-//! violation mid-index. A private pool keeps parse work off the global pool
-//! and, on macOS, demotes its workers to `QOS_CLASS_UTILITY` so the
-//! scheduler prefers foreground work (and the power-efficient cores) for
-//! everything else.
+//! query serving, and its workers inherit the default scheduling priority,
+//! which competes with the user's foreground work. A private pool keeps parse
+//! work off the global pool and, on macOS, demotes its workers to
+//! `QOS_CLASS_UTILITY` so the scheduler prefers foreground work (and the
+//! power-efficient cores) for everything else. (macOS's CPU usage monitor is
+//! per-thread and non-fatal, so this is about responsiveness, not about
+//! avoiding a kill; see `cpu_throttle`.)
 
 use std::sync::OnceLock;
 
