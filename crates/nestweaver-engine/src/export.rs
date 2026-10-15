@@ -612,13 +612,13 @@ fn mermaid_label(s: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-/// nw-113: a `<module>` owner's label, `file::<module>`. The file name goes
-/// through [`mermaid_label`]; the angle brackets use Mermaid's `#lt;`/`#gt;`
-/// entity codes, which render as `<`/`>` inside a quoted label, instead of
-/// being mangled to `_module_`.
+/// nw-113: a `<module>` owner's label, `<repo-relative path>::<module>`, the
+/// same name every other surface uses. The path goes through
+/// [`mermaid_label`]; the angle brackets use Mermaid's `#lt;`/`#gt;` entity
+/// codes, which render as `<`/`>` inside a quoted label, instead of being
+/// mangled to `_module_`.
 fn mermaid_owner_label(file_path: &str) -> String {
-    let file = file_path.rsplit('/').next().unwrap_or(file_path);
-    let quoted = mermaid_label(&format!("{file}::"));
+    let quoted = mermaid_label(&format!("{file_path}::"));
     format!("{}#lt;module#gt;\"", &quoted[..quoted.len() - 1])
 }
 
@@ -1396,7 +1396,7 @@ mod tests {
         export_mermaid(&store, 50, &mut buf).unwrap();
         let output = String::from_utf8(buf).unwrap();
         assert!(
-            output.contains("[\"ownerless.ts::#lt;module#gt;\"]"),
+            output.contains("[\"src/app/ownerless.ts::#lt;module#gt;\"]"),
             "{output}"
         );
         assert!(!output.contains("_module_"), "{output}");
