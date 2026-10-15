@@ -9893,6 +9893,42 @@ export function readIt() { return value(); }
         );
     }
 
+    /// nw-800: a `catch (f)` parameter and a `for (const f of …)` /
+    /// `for (const f in …)` / `for (let f = …; …)` loop variable are local
+    /// bindings scoped to their clause or loop. A bare `f()` inside one is
+    /// local and never binds the same-file `function f`; a bare `f()` after
+    /// it, outside that clause or loop, still does.
+    #[test]
+    fn catch_and_loop_variables_are_local_to_their_clause() {
+        for (path, language) in [
+            ("src/clauses.js", Language::JavaScript),
+            ("src/clauses.ts", Language::TypeScript),
+        ] {
+            let source = "function f() {}\n\
+                export function viaCatch() { try { work(); } catch (f) { f(); } }\n\
+                export function viaForOf(xs) { for (const f of xs) { f(); } }\n\
+                export function viaForIn(o) { for (const f in o) { f(); } }\n\
+                export function viaFor() { for (let f = make(); f; ) { f(); } }\n\
+                export function afterCatch() { try { work(); } catch (f) { log(f); } f(); }\n\
+                export function afterForOf(xs) { for (const f of xs) { log(f); } f(); }\n\
+                export function afterFor() { for (let f = make(); f; ) { log(f); } f(); }\n";
+            let (files, edges) = review_edges(&[(path, source)], language);
+            let f = uid(&files, path, "f");
+            for caller in ["viaCatch", "viaForOf", "viaForIn", "viaFor"] {
+                assert!(
+                    !call_targets(&files, &edges, path, caller).contains(&f),
+                    "{path}: {caller} must not bind the module f: {edges:#?}"
+                );
+            }
+            for caller in ["afterCatch", "afterForOf", "afterFor"] {
+                assert!(
+                    call_targets(&files, &edges, path, caller).contains(&f),
+                    "{path}: {caller} calls the module f outside the clause: {edges:#?}"
+                );
+            }
+        }
+    }
+
     /// nw-113 B1: a `.js` arrow with a bare parameter is a function: it owns
     /// its body's calls and its callers get an edge.
     #[test]

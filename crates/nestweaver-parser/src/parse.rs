@@ -3153,7 +3153,7 @@ fn collect_local_bindings(
     TEST_LOCAL_BINDING_WALK_COUNT.with(|count| count.set(count.get() + 1));
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if is_local_binding_site(node.kind()) {
+        if is_local_binding_site(node.kind()) || is_js_clause_binding_site(node, lang) {
             emit_binding_names(node, source_bytes, references, lang);
         }
         let mut cursor = node.walk();
@@ -3184,6 +3184,20 @@ fn is_local_binding_site(kind: &str) -> bool {
     )
 }
 
+/// nw-800: a JS/TS `catch (f)` parameter and the declared variable of a
+/// `for (const f of …)` / `for (let f in …)` loop bind `f` for that clause or
+/// loop. A loop without a declaration keyword (`for (f of xs)`) assigns an
+/// existing name and binds nothing. The classic `for (let f = …; …)` header
+/// is an ordinary `variable_declarator`, already a binding site.
+fn is_js_clause_binding_site(node: tree_sitter::Node<'_>, lang: Language) -> bool {
+    matches!(lang, Language::JavaScript | Language::TypeScript)
+        && match node.kind() {
+            "catch_clause" => node.child_by_field_name("parameter").is_some(),
+            "for_in_statement" => node.child_by_field_name("kind").is_some(),
+            _ => false,
+        }
+}
+
 fn emit_binding_names(
     node: tree_sitter::Node<'_>,
     source_bytes: &[u8],
@@ -3193,6 +3207,8 @@ fn emit_binding_names(
     let root = match node.kind() {
         "let_declaration" | "for_expression" => node.child_by_field_name("pattern"),
         "variable_declarator" => node.child_by_field_name("name"),
+        "catch_clause" => node.child_by_field_name("parameter"),
+        "for_in_statement" => node.child_by_field_name("left"),
         _ => Some(node),
     };
     let Some(root) = root else {
@@ -3260,7 +3276,7 @@ fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
         if matches!(parent.kind(), "variable_declarator" | "let_declaration") {
             initialized_at = parent.end_byte();
         }
-        if parent.kind() == "variable_declaration" {
+        if parent.kind() == "variable_declaration" || is_var_loop_variable(parent, node) {
             function_scoped = true;
             hoisted_var = true;
         }
@@ -3293,9 +3309,17 @@ fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
                 hoisted_var,
             });
         }
+        // nw-800: a `catch` parameter is scoped to its clause, and a `let` or
+        // `const` declared in a loop header to that loop. A declaration in
+        // the loop body or the catch body stops at its own block first.
         if matches!(
             parent.kind(),
-            "statement_block" | "block" | "declaration_list"
+            "statement_block"
+                | "block"
+                | "declaration_list"
+                | "catch_clause"
+                | "for_statement"
+                | "for_in_statement"
         ) && !function_scoped
             || matches!(parent.kind(), "program" | "source_file")
         {
@@ -3310,6 +3334,18 @@ fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
         current = parent.parent();
     }
     None
+}
+
+/// `for (var f of …)`: `var` hoists `f` to the enclosing function like any
+/// other `var` declaration, rather than scoping it to the loop.
+fn is_var_loop_variable(parent: tree_sitter::Node<'_>, node: tree_sitter::Node<'_>) -> bool {
+    parent.kind() == "for_in_statement"
+        && parent
+            .child_by_field_name("kind")
+            .is_some_and(|kind| kind.kind() == "var")
+        && parent.child_by_field_name("left").is_some_and(|left| {
+            left.start_byte() <= node.start_byte() && node.end_byte() <= left.end_byte()
+        })
 }
 
 fn is_type_node(kind: &str) -> bool {
