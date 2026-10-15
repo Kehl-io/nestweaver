@@ -824,11 +824,17 @@ pub fn investigate(
     // the UID-only predicate here (before retrieval) and passing it as
     // `RenderCap::admit` applies it inside the render loop, before either
     // partition's cap counter increments.
-    let admit_uid = scope_filter
-        .as_ref()
-        .map(|filter| move |uid: &str| uid_in_scope(uid, filter));
-    let admit: Option<&dyn Fn(&str) -> bool> =
-        admit_uid.as_ref().map(|f| f as &dyn Fn(&str) -> bool);
+    //
+    // nw-113: a `<module>` owner is never an entry, so it is refused here too,
+    // before it can consume a render slot or count toward `total`. It stays a
+    // caller neighbour on expansion.
+    let admit_uid = |uid: &str| {
+        !nestweaver_schema::uid::is_module_owner_uid(uid)
+            && scope_filter
+                .as_ref()
+                .is_none_or(|filter| uid_in_scope(uid, filter))
+    };
+    let admit: Option<&dyn Fn(&str) -> bool> = Some(&admit_uid);
 
     // Graceful empty handling: when no seed resolves (e.g. a natural-language
     // multi-word query like "indexing pipeline" that matches no symbol/note
@@ -1055,6 +1061,8 @@ pub fn investigate(
         // state.
         connected.retain(|n| node_in_scope(n, filter));
     }
+    // nw-113: the BM25 fallback has no `admit`; an owner is never an entry.
+    connected.retain(|n| !nestweaver_schema::uid::is_module_owner_uid(&n.uid));
     // Reviewed disclosure fix (nw-322/nw-362(b), same defect one layer down):
     // `connected.len()` here is the RENDERED count — already smaller than the
     // true in-scope population whenever `RenderCap` truncated something
@@ -2336,11 +2344,12 @@ fn fetch_neighbors(store: &GraphStore, uid: &str, of: &str) -> Vec<NeighborRef> 
     if uid.starts_with("sym:") {
         if let Ok(callers) = store.callers_of(uid) {
             for c in callers {
+                // nw-113: an owner caller reads `path::<module>`.
                 out.push(NeighborRef {
                     of: of.to_string(),
+                    title: c.display_name().into_owned(),
                     uid: c.uid,
                     kind: "Symbol".to_string(),
-                    title: c.name,
                     relation: "caller".to_string(),
                 });
             }
@@ -2349,9 +2358,9 @@ fn fetch_neighbors(store: &GraphStore, uid: &str, of: &str) -> Vec<NeighborRef> 
             for c in callees {
                 out.push(NeighborRef {
                     of: of.to_string(),
+                    title: c.display_name().into_owned(),
                     uid: c.uid,
                     kind: "Symbol".to_string(),
-                    title: c.name,
                     relation: "callee".to_string(),
                 });
             }
@@ -3046,6 +3055,74 @@ mod tests {
             load_bundle(&db_path, &result.bundle_id).is_some(),
             "bundle should be persisted to the sidecar"
         );
+    }
+
+    /// nw-113: an owner is never an investigate entry, even for a query that
+    /// names it, and as an expand neighbour it reads `path::<module>`.
+    #[test]
+    fn investigate_never_lists_an_owner_and_labels_owner_neighbours() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(src.join("server")).unwrap();
+        fs::write(
+            src.join("server").join("listen.js"),
+            "function listen(app) { return app; }\nmodule.exports = { listen };\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("index.js"),
+            "const { listen } = require('./server/listen');\nlisten(1);\n",
+        )
+        .unwrap();
+        let (_r, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let db_path = dir.path().join("nestweaver.lbug");
+
+        for query in ["listen", "<module>", "index.js"] {
+            let result = investigate(
+                &store,
+                None,
+                Some(&db_path),
+                &src,
+                query,
+                "vault",
+                Some(4000),
+                None,
+            )
+            .unwrap();
+            assert!(
+                result
+                    .entries
+                    .iter()
+                    .all(|e| !nestweaver_schema::uid::is_module_owner_uid(&e.uid)
+                        && !e.title.contains("<module>")),
+                "{query}: {:?}",
+                result.entries
+            );
+            if query != "listen" {
+                continue;
+            }
+            let listen = result
+                .entries
+                .iter()
+                .find(|e| e.title == "listen")
+                .expect("listen entry");
+            let expanded = investigate_expand(
+                &store,
+                &db_path,
+                Some(&src),
+                &result.bundle_id,
+                std::slice::from_ref(&listen.asset_id),
+            )
+            .unwrap();
+            let callers: Vec<&str> = expanded
+                .neighbors
+                .iter()
+                .filter(|n| n.relation == "caller")
+                .map(|n| n.title.as_str())
+                .collect();
+            assert_eq!(callers, ["index.js::<module>"], "{:?}", expanded.neighbors);
+        }
     }
 
     // ── nw-384: the index-publication fail-closed guard ──────────────────
