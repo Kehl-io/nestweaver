@@ -10195,6 +10195,57 @@ export function readIt() { return value(); }
         }
     }
 
+    /// nw-113 final review Minor 7: the receiver rule in Python.
+    /// `helpers.run()` inside a function named `run`, after `import helpers`,
+    /// never binds the same-file `run`.
+    #[test]
+    fn a_receiver_call_never_binds_a_same_file_name_in_python() {
+        let (files, edges) = review_edges(
+            &[
+                ("helpers.py", "def run():\n    return 1\n"),
+                (
+                    "main.py",
+                    "import helpers\n\n\ndef run():\n    return helpers.run()\n",
+                ),
+            ],
+            Language::Python,
+        );
+        let same_file = uid(&files, "main.py", "run");
+        assert!(
+            !edges.iter().any(|edge| edge.target_uid == same_file),
+            "{edges:#?}"
+        );
+    }
+
+    /// nw-113 final review Minor 7: the receiver rule in PHP. `X::m()` after
+    /// `use Lib\X;` must not bind the same-file `m`, but it does: the parser
+    /// records no receiver for a `scoped_call_expression`, so the rule never
+    /// sees one. Fixing it changes parser output (a parsed-cache bump) and
+    /// every PHP static call's resolution (`self::`, `static::`, `parent::`),
+    /// so it is reported rather than fixed in nw-113.
+    #[test]
+    #[ignore = "PHP static calls carry no receiver; see the doc comment"]
+    fn a_receiver_call_never_binds_a_same_file_name_in_php() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "src/Lib/X.php",
+                    "<?php\nnamespace Lib;\nclass X { public static function m() { return 1; } }\n",
+                ),
+                (
+                    "src/main.php",
+                    "<?php\nuse Lib\\X;\nfunction m() { return X::m(); }\n",
+                ),
+            ],
+            Language::Php,
+        );
+        let same_file = uid(&files, "src/main.php", "m");
+        assert!(
+            !edges.iter().any(|edge| edge.target_uid == same_file),
+            "{edges:#?}"
+        );
+    }
+
     /// nw-113 final watch parity O3: a member access with a receiver
     /// (`Modal.latestProps`) never falls back to a same-file symbol of the
     /// bare member name, so `latestProps` gets no self-ACCESSES edge. The
