@@ -10905,8 +10905,16 @@ impl NestWeaverDaemon for DaemonService {
                 nestweaver_engine::LookupResult::Found(detail) => {
                     serde_json::json!({ "status": "found", "detail": *detail })
                 }
+                // nw-113: the same suggestions `impact` gives a miss.
                 nestweaver_engine::LookupResult::NotFound => {
-                    serde_json::json!({ "status": "not_found" })
+                    nestweaver_schema::responses::with_did_you_mean(
+                        serde_json::json!({ "status": "not_found" }),
+                        &nestweaver_engine::symbol_lookup_suggestions(
+                            &state.store,
+                            name_or_uid,
+                            instance,
+                        ),
+                    )
                 }
                 nestweaver_engine::LookupResult::Ambiguous(candidates) => {
                     serde_json::json!({ "status": "ambiguous", "candidates": candidates })

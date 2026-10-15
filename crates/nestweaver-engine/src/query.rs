@@ -178,6 +178,42 @@ pub enum LookupResult {
     Ambiguous(Vec<SymbolCandidate>),
 }
 
+/// nw-113: `did_you_mean` for a [`lookup_symbol`] miss: the shared nw-481
+/// builder `impact` uses, scoped to `instance`'s repos when one is given. A
+/// UID-shaped miss gets nothing. Best-effort: a lookup failure is logged and
+/// yields no suggestions.
+pub fn symbol_lookup_suggestions(
+    store: &GraphStore,
+    name_or_uid: &str,
+    instance: Option<&str>,
+) -> Vec<String> {
+    let qualified = !name_or_uid.starts_with("sym:")
+        && nestweaver_schema::QualifiedSpec::parse(name_or_uid).is_some();
+    if name_or_uid.contains(':') && !qualified {
+        return Vec::new();
+    }
+    let instance_repos: Option<std::collections::HashSet<String>> = instance.map(|inst| {
+        store
+            .list_repos(None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.instance_id == inst)
+            .map(|r| r.uid)
+            .collect()
+    });
+    crate::did_you_mean::did_you_mean_candidates(store, name_or_uid, |s| {
+        instance_repos
+            .as_ref()
+            .is_none_or(|repos| repos.contains(&s.repo_uid))
+    })
+    .unwrap_or_else(|error| {
+        tracing::warn!(
+            "symbol: did_you_mean_candidates lookup failed for '{name_or_uid}': {error:#}"
+        );
+        Vec::new()
+    })
+}
+
 /// Look up a symbol by name or UID.
 ///
 /// - If `name_or_uid` contains `':'` it is treated as a UID and looked up exactly.
@@ -1582,6 +1618,24 @@ mod context_tests {
                 ("styles/s2.style.js::<module>", "Module")
             ]
         );
+    }
+
+    /// nw-113 final round: a `symbol` miss gets the same suggestions as
+    /// `impact`; a UID miss gets none.
+    #[test]
+    fn symbol_lookup_suggestions_match_impact() {
+        let (_dir, src) = qualified_seed_repo();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        assert_eq!(
+            super::symbol_lookup_suggestions(&store, "nope.js::fromTemplate", None),
+            ["theme.js::fromTemplate"]
+        );
+        assert_eq!(
+            super::symbol_lookup_suggestions(&store, "Wrong::makeListener", None),
+            ["hub.js::Hub::makeListener", "hub.js::makeListener"]
+        );
+        assert!(super::symbol_lookup_suggestions(&store, "sym:repo:x:1", None).is_empty());
     }
 
     /// nw-113: `path::<module>` seeds context with that file's owner.

@@ -2962,6 +2962,15 @@ pub(crate) fn run_brain(
                     } else if msg.contains(nestweaver_engine::query::EMPTY_SEED_CONTAINER) {
                         Ok((report_brain_context_empty(&e, json, &seeds)?, None))
                     } else if msg.contains("No seeds resolved") {
+                        // nw-113: the same envelope, and so the same
+                        // suggestions, as the `brain_context` tool.
+                        let e = nestweaver_mcp::tools::seeds_not_found(
+                            &store,
+                            e,
+                            &seeds,
+                            &["No seeds resolved."],
+                            None,
+                        );
                         Ok((report_brain_context_not_found(&e, json, &seeds)?, None))
                     } else {
                         eprintln!("Error: {msg}");
@@ -3670,13 +3679,21 @@ pub(crate) fn report_brain_context_not_found(
     seeds: &[String],
 ) -> anyhow::Result<i32> {
     let message = brain_context_not_found_message(error);
+    // nw-113: a qualified seed that named nothing carries the same
+    // `path::name` suggestions `impact` gives.
+    let candidates = envelope_did_you_mean(error);
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&brain_context_not_found_payload(&message, seeds))?
+            serde_json::to_string_pretty(&brain_context_not_found_payload(
+                &message,
+                seeds,
+                &candidates
+            ))?
         );
     } else {
         eprintln!("{message}");
+        eprint_did_you_mean(&candidates);
     }
     Ok(EXIT_NOT_FOUND)
 }
@@ -3698,15 +3715,19 @@ pub(crate) fn brain_context_not_found_message(error: &anyhow::Error) -> String {
 pub(crate) fn brain_context_not_found_payload(
     message: &str,
     seeds: &[String],
+    did_you_mean: &[String],
 ) -> serde_json::Value {
-    serde_json::json!({
-        "error": "not found",
-        "status": "not_found",
-        "message": message,
-        "seeds_expanded": 0,
-        "connected": [],
-        "unresolved_seeds": seeds,
-    })
+    nestweaver_schema::responses::with_did_you_mean(
+        serde_json::json!({
+            "error": "not found",
+            "status": "not_found",
+            "message": message,
+            "seeds_expanded": 0,
+            "connected": [],
+            "unresolved_seeds": seeds,
+        }),
+        did_you_mean,
+    )
 }
 
 /// A seed naming a vault with no notes (or a repo with no symbols) is not a
@@ -3764,7 +3785,7 @@ mod brain_context_not_found_tests {
             .context("brain_context RPC failed");
         let message = brain_context_not_found_message(&wrapped);
         assert_eq!(message, ENGINE);
-        let payload = brain_context_not_found_payload(&message, &seeds);
+        let payload = brain_context_not_found_payload(&message, &seeds, &[]);
         assert!(
             payload["message"]
                 .as_str()

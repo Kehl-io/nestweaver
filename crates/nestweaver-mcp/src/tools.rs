@@ -4321,7 +4321,7 @@ fn dispatch_tool_arm(
 ) -> Result<Value, anyhow::Error> {
     match name {
         "brain_context" => tool_brain_context(store, tantivy, args, embed_model, cancel, visible),
-        "code_context" => tool_code_context(store, args),
+        "code_context" => tool_code_context(store, args, visible),
         "brain_search" => tool_brain_search(store, tantivy, args, visible),
         "note_get" => tool_note_get(store, args),
         "backlinks" => tool_backlinks(store, args),
@@ -6707,13 +6707,34 @@ fn note_did_you_mean(store: &GraphStore, title: &str) -> Vec<String> {
 /// no dependency on this crate's type). Re-raise exactly that failure, and
 /// nothing else, as a [`ToolTargetNotFound`] keyed on `seeds`. The message,
 /// which carries the `nestweaver investigate` hint (nw-511), is kept whole.
-fn seeds_not_found(error: anyhow::Error, seeds: &[String], prefixes: &[&str]) -> anyhow::Error {
+///
+/// nw-113: a qualified seed (`path::name`, `Class::method`) that named
+/// nothing gets the same `path::name` suggestions as `brain_impact`, scoped
+/// to what the caller may see. Public so the CLI's direct route reports a
+/// miss through the same envelope as the daemon route.
+pub fn seeds_not_found(
+    store: &GraphStore,
+    error: anyhow::Error,
+    seeds: &[String],
+    prefixes: &[&str],
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> anyhow::Error {
     let matched = error
         .chain()
         .map(ToString::to_string)
         .find(|message| prefixes.iter().any(|prefix| message.starts_with(prefix)));
     match matched {
-        Some(message) => target_not_found(message, "seeds", json!(seeds), &[]),
+        Some(message) => {
+            let did_you_mean =
+                nestweaver_engine::did_you_mean::qualified_seed_suggestions(store, seeds, |s| {
+                    repo_is_visible(&s.repo_uid, visible)
+                })
+                .unwrap_or_else(|error| {
+                    tracing::warn!("qualified_seed_suggestions lookup failed: {error:#}");
+                    Vec::new()
+                });
+            target_not_found(message, "seeds", json!(seeds), &did_you_mean)
+        }
         None => error,
     }
 }
@@ -7095,7 +7116,11 @@ fn truncate_reporting<T>(items: &mut Vec<T>, limit: usize) -> bool {
 /// help says "structural subgraph around seed symbols", so the direct path was
 /// the correct one and the daemon route was silently substituting a different
 /// capability.
-fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+fn tool_code_context(
+    store: &GraphStore,
+    args: Value,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<Value, anyhow::Error> {
     let seeds: Vec<String> = args
         .get("seeds")
         .and_then(|v| v.as_array())
@@ -7149,9 +7174,11 @@ fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     )
     .map_err(|error| {
         seeds_not_found(
+            store,
             error,
             &seeds,
             &["No matching symbols found.", "No symbols found in file(s):"],
+            visible,
         )
     })?;
     let truncated = truncate_reporting(&mut result.connected, limit);
@@ -7380,7 +7407,7 @@ fn tool_brain_context(
         embed_model,
         cancel,
     )
-    .map_err(|error| seeds_not_found(error, &seeds, &["No seeds resolved."]))?;
+    .map_err(|error| seeds_not_found(store, error, &seeds, &["No seeds resolved."], visible))?;
 
     // Feature F6 (per-path ranking priors) is a deliberate no-op here: the MCP
     // server holds no InstanceConfig at the call site (same as F8, which uses
@@ -20272,6 +20299,53 @@ mod project_context_bug12_tests {
         assert!(!project_member_uid("tag:shared", &members));
     }
 
+    /// nw-113 final round: a qualified seed that names nothing is the
+    /// not-found envelope with the same `path::name` suggestions
+    /// `brain_impact` gives, on `brain_context` and `code_context` alike.
+    #[test]
+    fn a_qualified_context_seed_miss_carries_did_you_mean() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&mk_symbol(
+                "sym:repo:a:order_total:1",
+                "repo:a",
+                "shop/pricing.py",
+                "order_total",
+            ))
+            .unwrap();
+        for tool in ["brain_context", "code_context"] {
+            let miss = dispatch(
+                &store,
+                None,
+                tool,
+                json!({ "seeds": ["nope.py::order_total"] }),
+                None,
+            )
+            .unwrap_err();
+            let envelope = not_found_envelope(&miss).unwrap_or_else(|| panic!("{tool}: {miss:#}"));
+            assert_eq!(
+                envelope["did_you_mean"],
+                json!(["shop/pricing.py::order_total"]),
+                "{tool}: {envelope}"
+            );
+        }
+        let bare = dispatch(
+            &store,
+            None,
+            "code_context",
+            json!({ "seeds": ["totally_bogus_xyz"] }),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            not_found_envelope(&bare)
+                .unwrap()
+                .get("did_you_mean")
+                .is_none(),
+            "a bare miss with no hits carries no suggestions"
+        );
+    }
+
     /// A `vlt:` seed for a vault with no notes is a business error
     /// (`isError: true` with the engine's "Seed container is empty" text),
     /// not the not-found envelope a bogus uid gets.
@@ -32405,7 +32479,7 @@ mod seed_cap_disclosure_tests {
         [
             (
                 "code_context",
-                tool_code_context(store, json!({ "seeds": ["validate"] })).unwrap(),
+                tool_code_context(store, json!({ "seeds": ["validate"] }), None).unwrap(),
             ),
             (
                 "brain_context",
@@ -32501,7 +32575,7 @@ mod seed_cap_disclosure_tests {
         for (tool, payload) in [
             (
                 "code_context",
-                tool_code_context(&store, json!({ "seeds": [uid] })).unwrap(),
+                tool_code_context(&store, json!({ "seeds": [uid] }), None).unwrap(),
             ),
             (
                 "brain_context",

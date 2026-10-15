@@ -1416,10 +1416,20 @@ fn report_context_lookup_failure(error: &anyhow::Error, json: bool, seeds: &[Str
     // uses; the direct route has no gRPC status and keeps its chain.
     let message = daemon_application_error(error).unwrap_or_else(|| format!("{error:#}"));
     if message.contains("No matching symbols") || message.contains("No symbols found") {
+        // nw-113: a qualified seed that named nothing carries the same
+        // `path::name` suggestions `impact` gives.
+        let candidates = envelope_did_you_mean(error);
         if json {
-            print_json_not_found_detail("seeds", &serde_json::json!(seeds), Some(&message));
+            println!(
+                "{}",
+                nestweaver_schema::responses::with_did_you_mean(
+                    json_not_found_payload("seeds", &serde_json::json!(seeds), Some(&message)),
+                    &candidates,
+                )
+            );
         }
         eprintln!("{message}");
+        eprint_did_you_mean(&candidates);
         EXIT_NOT_FOUND
     } else if message.contains("Ambiguous") {
         if json {
@@ -3139,11 +3149,52 @@ fn impact_json_not_found(symbol: &str) -> serde_json::Value {
 /// stayed silent about any suggestions found). Always stderr: `--json` is
 /// the parseable contract, and clig.dev's "send messaging to stderr" is the
 /// standing convention every other not-found text line in this file follows.
-fn eprint_impact_not_found(name_or_uid: &str, candidates: &[String]) {
+///
+/// nw-113: `symbol` and `flow-trace` print their misses through this too,
+/// so every symbol-lookup command answers a miss with the same sentence and
+/// the same `path::name` suggestions.
+fn eprint_symbol_not_found(name_or_uid: &str, candidates: &[String]) {
     eprintln!("Symbol '{name_or_uid}' not found.");
-    if !candidates.is_empty() {
-        eprintln!("Did you mean: {}?", candidates.join(", "));
+    eprint_did_you_mean(candidates);
+}
+
+/// nw-113: the shared "Did you mean" line, printed only when there are
+/// suggestions. `context` and `brain context` add it under their own
+/// not-found message.
+fn eprint_did_you_mean(candidates: &[String]) {
+    if let Some(line) = nestweaver_engine::did_you_mean::did_you_mean_line(candidates) {
+        eprintln!("{line}");
     }
+}
+
+/// nw-113: the `did_you_mean` suggestions a lookup miss carries in its
+/// not-found envelope, in-process or across the daemon. Empty when there
+/// are none.
+fn envelope_did_you_mean(error: &anyhow::Error) -> Vec<String> {
+    nestweaver_mcp::tools::not_found_envelope(error)
+        .as_ref()
+        .map(value_did_you_mean)
+        .unwrap_or_default()
+}
+
+/// The `did_you_mean` array of a JSON payload, or empty.
+fn value_did_you_mean(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("did_you_mean")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// [`print_json_not_found`] plus the miss's `did_you_mean` (absent when
+/// empty, the nw-481 convention).
+fn print_json_not_found_suggesting(target_key: &str, target: &str, candidates: &[String]) {
+    println!(
+        "{}",
+        nestweaver_schema::responses::with_did_you_mean(
+            json_not_found_payload(target_key, &serde_json::json!(target), None),
+            candidates,
+        )
+    );
 }
 
 /// Render a `dead-code` result as text from its JSON payload.
@@ -18334,6 +18385,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         result.truncated = Some(truncated);
                         result
                     })
+                    // nw-113: the same envelope, and so the same suggestions,
+                    // as the `code_context` tool on the daemon route.
+                    .map_err(|error| {
+                        nestweaver_mcp::tools::seeds_not_found(
+                            &store,
+                            error,
+                            &seeds,
+                            &["No matching symbols found.", "No symbols found in file(s):"],
+                            None,
+                        )
+                    })
                 }
             };
             match built {
@@ -20464,10 +20526,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         rendered.contains("not found") || rendered.contains("no symbol found")
                     } =>
                 {
+                    // nw-113: the tool's envelope carries the same
+                    // suggestions `impact` gives a miss.
+                    let candidates = envelope_did_you_mean(&error);
                     if json {
-                        print_json_not_found("symbol", &symbol);
+                        print_json_not_found_suggesting("symbol", &symbol, &candidates);
                     }
-                    eprintln!("Symbol '{symbol}' not found.");
+                    eprint_symbol_not_found(&symbol, &candidates);
                     return Ok((EXIT_NOT_FOUND, None));
                 }
                 Err(error) => return Err(error),
@@ -22675,14 +22740,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                         _ => {
                             // not_found
+                            // nw-113: the daemon sends the same suggestions
+                            // `impact` gives a miss.
+                            let candidates = value_did_you_mean(&value);
                             if json {
                                 // nw-399: through the shared emitter. These
                                 // bytes are the MODEL every other not-found arm
                                 // was changed to copy, so they must not be a
                                 // second, independent copy of the shape.
-                                print_json_not_found("name", &name_or_uid);
+                                print_json_not_found_suggesting("name", &name_or_uid, &candidates);
                             } else {
-                                eprintln!("Symbol '{name_or_uid}' not found.");
+                                eprint_symbol_not_found(&name_or_uid, &candidates);
                             }
                             return Ok((EXIT_NOT_FOUND, None));
                         }
@@ -22759,10 +22827,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_SUCCESS, None))
                 }
                 LookupResult::NotFound => {
+                    let candidates = nestweaver_engine::symbol_lookup_suggestions(
+                        &store,
+                        &name_or_uid,
+                        instance.as_deref(),
+                    );
                     if json {
-                        print_json_not_found("name", &name_or_uid);
+                        print_json_not_found_suggesting("name", &name_or_uid, &candidates);
                     } else {
-                        eprintln!("Symbol '{name_or_uid}' not found.");
+                        eprint_symbol_not_found(&name_or_uid, &candidates);
                     }
                     Ok((EXIT_NOT_FOUND, None))
                 }
@@ -23347,7 +23420,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                             .collect()
                                     })
                                     .unwrap_or_default();
-                                eprint_impact_not_found(&name_or_uid, &candidates);
+                                eprint_symbol_not_found(&name_or_uid, &candidates);
                             }
                             return Ok((EXIT_NOT_FOUND, None));
                         }
@@ -23668,7 +23741,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             )?
                         );
                     } else {
-                        eprint_impact_not_found(&name_or_uid, &candidates);
+                        eprint_symbol_not_found(&name_or_uid, &candidates);
                     }
                     Ok((EXIT_NOT_FOUND, None))
                 }
@@ -41211,6 +41284,37 @@ mod cli_honesty_sweep_tests {
             publication_text_note(None).is_none(),
             "an ordinary read must print no publication note"
         );
+    }
+
+    // ── nw-113 ───────────────────────────────────────────────────────────
+
+    /// A miss's `did_you_mean` is read from the tool's not-found envelope,
+    /// so `flow-trace`, `context` and `brain context` print the suggestions
+    /// the tool computed; a miss without them yields none.
+    #[test]
+    fn did_you_mean_is_read_from_the_not_found_envelope() {
+        let with = nestweaver_mcp::tools::target_not_found(
+            "no symbol found: 'nope.py::f'",
+            "symbol",
+            serde_json::json!("nope.py::f"),
+            &["shop/a.py::f".to_string()],
+        )
+        .context("flow_trace failed");
+        assert_eq!(envelope_did_you_mean(&with), ["shop/a.py::f"]);
+        let without = nestweaver_mcp::tools::target_not_found(
+            "no symbol found: 'x'",
+            "symbol",
+            serde_json::json!("x"),
+            &[],
+        );
+        assert!(envelope_did_you_mean(&without).is_empty());
+        assert!(envelope_did_you_mean(&anyhow::anyhow!("boom")).is_empty());
+        let payload = cli::brain::brain_context_not_found_payload(
+            "No seeds resolved.",
+            &["nope.py::f".to_string()],
+            &["shop/a.py::f".to_string()],
+        );
+        assert_eq!(payload["did_you_mean"], serde_json::json!(["shop/a.py::f"]));
     }
 
     // ── nw-399 ───────────────────────────────────────────────────────────
