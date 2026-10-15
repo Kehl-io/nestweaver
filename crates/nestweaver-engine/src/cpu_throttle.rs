@@ -59,7 +59,8 @@ use std::time::Duration;
 /// Environment variable opting in to the budget, as the average percentage
 /// of ONE core the daemon process may use over the rolling 180 s window.
 /// Unset, unparsable, `0` or `>= 100` leaves the throttle disabled; values
-/// above [`MAX_PERCENT`] fall back to the default (disabled).
+/// above [`MAX_PERCENT`] fall back to the default (disabled), and 1–11 are
+/// raised to [`MIN_PERCENT`].
 #[cfg_attr(test, allow(dead_code))] // unit tests use an inert global
 const ENV_VAR: &str = "NESTWEAVER_INDEX_CPU_PERCENT";
 
@@ -74,6 +75,17 @@ const DEFAULT_PERCENT: u32 = 0;
 /// carry — are treated as unset (the default, disabled), not as "as much as
 /// allowed".
 const MAX_PERCENT: u32 = 40;
+
+/// Floor for configured values: 12% = 21.6 s per window, the smallest
+/// percent whose budget exceeds [`WRITE_RESERVE`] with a margin. At 1–11%
+/// the budget is at or under the reserve, so the pre-write wait for
+/// `budget - WRITE_RESERVE` of headroom could never be satisfied by
+/// anything but an empty window. Values 1–11 are raised to it.
+const MIN_PERCENT: u32 = 12;
+const _: () = assert!(
+    WINDOW.as_millis() * MIN_PERCENT as u128 / 100 > WRITE_RESERVE.as_millis() + 1000,
+    "MIN_PERCENT must leave room beyond the write reserve"
+);
 
 /// CPU kept free for the write/epilogue phase, which runs under the write
 /// gate and therefore is never throttled (~10–15 s for a large repo). Before
@@ -263,6 +275,8 @@ impl CpuThrottle {
             .unwrap_or(DEFAULT_PERCENT);
         let percent = if percent > MAX_PERCENT && percent < 100 {
             DEFAULT_PERCENT
+        } else if percent > 0 && percent < MIN_PERCENT {
+            MIN_PERCENT
         } else {
             percent
         };
@@ -690,8 +704,8 @@ mod tests {
     fn explicit_value_enables_the_budget() {
         // 1–40 opt in to the rolling 180 s budget, unchanged from nw-812.
         assert_eq!(
-            CpuThrottle::from_env_value(Some("1")).target,
-            Some(Duration::from_millis(1800))
+            CpuThrottle::from_env_value(Some("12")).target,
+            Some(Duration::from_millis(21_600))
         );
         let t = CpuThrottle::from_env_value(Some("40"));
         assert_eq!(t.target, secs(72));
@@ -726,6 +740,21 @@ mod tests {
             );
         }
         assert_eq!(CpuThrottle::from_env_value(Some("40")).target, secs(72));
+    }
+
+    /// 1–11% budgets (1.8–19.8 s) leave no room beyond the 20 s write
+    /// reserve, so they are raised to the 12% floor (21.6 s).
+    #[test]
+    fn values_below_the_floor_are_raised_to_it() {
+        for low in ["1", "5", "11"] {
+            let t = CpuThrottle::from_env_value(Some(low));
+            assert_eq!(t.target, Some(Duration::from_millis(21_600)), "{low}");
+            assert!(t.target.unwrap() > WRITE_RESERVE, "{low}");
+        }
+        assert_eq!(
+            CpuThrottle::from_env_value(Some("13")).target,
+            Some(Duration::from_millis(23_400))
+        );
     }
 
     #[test]
