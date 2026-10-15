@@ -127,11 +127,51 @@ impl Default for HybridSearchConfig {
 }
 
 /// Full details for a single symbol, including its call graph neighbours.
+///
+/// nw-113: each symbol serializes with an added `display_name` (an owner's
+/// `path::<module>` label; otherwise its name) beside its raw `name`, which
+/// is kept for compatibility. `display_name` is ignored when read back.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SymbolDetail {
+    #[serde(serialize_with = "serialize_labelled")]
     pub symbol: Symbol,
+    #[serde(serialize_with = "serialize_labelled_list")]
     pub callers: Vec<Symbol>,
+    #[serde(serialize_with = "serialize_labelled_list")]
     pub callees: Vec<Symbol>,
+}
+
+/// A symbol's JSON object plus its `display_name`.
+fn labelled_symbol_value(symbol: &Symbol) -> Result<serde_json::Value, serde_json::Error> {
+    let mut value = serde_json::to_value(symbol)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "display_name".to_string(),
+            serde_json::Value::String(symbol.display_name().into_owned()),
+        );
+    }
+    Ok(value)
+}
+
+fn serialize_labelled<S: serde::Serializer>(
+    symbol: &Symbol,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    labelled_symbol_value(symbol)
+        .map_err(serde::ser::Error::custom)?
+        .serialize(serializer)
+}
+
+fn serialize_labelled_list<S: serde::Serializer>(
+    symbols: &[Symbol],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    symbols
+        .iter()
+        .map(labelled_symbol_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(serde::ser::Error::custom)?
+        .serialize(serializer)
 }
 
 /// A lightweight summary used for disambiguation and search results.
@@ -1824,6 +1864,36 @@ mod context_tests {
                 ("styles/s2.style.js::<module>", "Module")
             ]
         );
+    }
+
+    /// nw-113 final round: `symbol --json` keeps each neighbour's raw
+    /// `name` and adds a labelled `display_name`, so an owner caller reads
+    /// `path::<module>` there as on every other surface; the payload still
+    /// deserializes (the daemon route reads it back).
+    #[test]
+    fn symbol_detail_json_labels_owner_neighbours() {
+        let (_dir, src) = owner_heavy_repo();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let super::LookupResult::Found(detail) =
+            super::lookup_symbol(&store, "fromTemplate", None).unwrap()
+        else {
+            panic!("fromTemplate resolves")
+        };
+        let json = serde_json::to_value(&*detail).unwrap();
+        let owner = json["callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == nestweaver_schema::MODULE_OWNER_NAME)
+            .unwrap_or_else(|| panic!("{json}"));
+        assert_eq!(
+            owner["display_name"],
+            format!("{}::<module>", owner["file_path"].as_str().unwrap())
+        );
+        assert_eq!(json["symbol"]["display_name"], "fromTemplate");
+        let back: super::SymbolDetail = serde_json::from_value(json).unwrap();
+        assert_eq!(back.callers.len(), detail.callers.len());
     }
 
     /// nw-113 final round: a `symbol` miss gets the same suggestions as

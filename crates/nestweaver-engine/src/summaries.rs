@@ -360,7 +360,9 @@ pub fn generate_symbol_summaries_bounded(
 
 /// File-level: exports and import sources per file.
 ///
-/// Format: `{file}: exports {n} symbols: {name1} ({kind}), ... | imports from: [files]`
+/// Format: `{file}: exports {n} symbols: {name1} ({kind}), ... | imports from: [files]`,
+/// or `{file}: imports from: [files]` for a file that exports nothing (nw-113:
+/// a file that is only top-level code).
 fn generate_file_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
     let symbols = store
         .list_all_symbols()
@@ -423,13 +425,22 @@ fn generate_file_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
             })
             .unwrap_or_default();
 
-        let content = format!(
-            "{file}: exports {n} symbols: {exports} | imports from: [{imports}]",
-            file = file_path,
-            n = file_symbols.len(),
-            exports = export_list.join(", "),
-            imports = import_files.join(", "),
-        );
+        // nw-113: a file that is only top-level code exports nothing; it
+        // gets no empty `exports 0 symbols:` clause.
+        let content = if file_symbols.is_empty() {
+            format!(
+                "{file_path}: imports from: [{imports}]",
+                imports = import_files.join(", "),
+            )
+        } else {
+            format!(
+                "{file}: exports {n} symbols: {exports} | imports from: [{imports}]",
+                file = file_path,
+                n = file_symbols.len(),
+                exports = export_list.join(", "),
+                imports = import_files.join(", "),
+            )
+        };
 
         let token_estimate = content.len().div_ceil(4);
 
@@ -878,8 +889,10 @@ mod tests {
             .iter()
             .find(|summary| summary.target_name == "src/ownerless.ts")
             .expect("file summary");
-        assert!(
-            ownerless.content.contains("exports 0 symbols"),
+        // nw-113 final round: no empty `exports 0 symbols:  |` clause for a
+        // file that is only top-level code.
+        assert_eq!(
+            ownerless.content, "src/ownerless.ts: imports from: [src/lib.ts]",
             "{}",
             ownerless.content
         );

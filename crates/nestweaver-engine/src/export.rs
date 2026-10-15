@@ -346,7 +346,9 @@ pub fn export_graphml_scoped(
       <data key="pagerank">{:.6}</data>
     </node>"#,
             xml_escape(&sym.uid),
-            xml_escape(&sym.name),
+            // nw-113: an owner is labelled `path::<module>`, like everywhere
+            // else; every other symbol's label is its name, as before.
+            xml_escape(&sym.display_name()),
             xml_escape(&sym.kind.to_string()),
             xml_escape(&sym.file_path),
             pr,
@@ -1342,6 +1344,34 @@ mod tests {
         assert!(output.contains("fn_alpha"));
         assert!(output.contains("fn_beta"));
         assert!(output.contains("</graphml>"));
+    }
+
+    /// nw-113 final round: a `<module>` owner's GraphML label is its
+    /// `path::<module>` display name, so Gephi and yEd do not show thousands
+    /// of identical `<module>` labels.
+    #[test]
+    fn graphml_labels_owners_by_path() {
+        let store = populated_store();
+        let mut owner = make_symbol(
+            "sym-owner",
+            nestweaver_schema::MODULE_OWNER_NAME,
+            "src/a.js",
+        );
+        owner.kind = nestweaver_schema::SymbolKind::Module;
+        owner.is_entry_point = true;
+        owner.entry_point_kind = Some(nestweaver_schema::EntryPointKind::ModuleInit);
+        store.insert_symbol(&owner).unwrap();
+        let mut buf = Vec::new();
+        export_graphml(&store, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains(r#"<data key="label">src/a.js::&lt;module&gt;</data>"#),
+            "{output}"
+        );
+        assert!(
+            !output.contains(r#"<data key="label">&lt;module&gt;</data>"#),
+            "{output}"
+        );
     }
 
     #[test]
