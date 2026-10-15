@@ -3033,6 +3033,11 @@ fn begin_shutdown_drain(state: Arc<DaemonState>, trigger: &'static str) {
         return;
     }
 
+    // nw-812: release any index worker waiting on the CPU budget, so the
+    // drain is not held up to ~190 s by a throttle wait (the vault parse has
+    // no job cancel token to end it otherwise).
+    nestweaver_engine::cpu_throttle::CpuThrottle::global().interrupt_waits();
+
     // Stop any active watcher BEFORE the drain wait — an orphaned watcher's
     // blocking thread would otherwise pin shutdown (Tokio's runtime drop waits
     // for blocking threads) until someone kills the process.
@@ -14331,6 +14336,20 @@ pub async fn run_server(
         db_path,
         config_path.is_some() || server_opts.is_some(),
     )?;
+    // nw-812: start the process-wide index CPU budget with the daemon, so CPU
+    // spent before the first index is billed across the time it was spent.
+    nestweaver_engine::cpu_throttle::CpuThrottle::global();
+    // ...and keep it sampled, so CPU spent between indexes (embedding,
+    // watcher batches, reconcilers, queries) lands in the window where it
+    // happened instead of being spread over the gap until the next index.
+    tokio::spawn(async {
+        let mut interval = tokio::time::interval(nestweaver_engine::cpu_throttle::SAMPLE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            nestweaver_engine::cpu_throttle::CpuThrottle::global().sample();
+        }
+    });
     // Idle-timeout counts only gRPC/UDS reads+writes (active_reads/active_writes)
     // and indexing — the MCP-over-HTTP path (server mode only) does NOT bump them,
     // so an idle timer would treat an actively-querying MCP client as idle and

@@ -82,7 +82,7 @@ struct QueryCacheKey {
 ///
 /// `Query` is `Send + Sync` but not `Clone`, so we wrap in `Arc` to allow
 /// multiple callers to share the same compiled query without copying it.
-static QUERY_CACHE: OnceLock<Mutex<HashMap<QueryCacheKey, Arc<Query>>>> = OnceLock::new();
+static QUERY_CACHE: OnceLock<Mutex<HashMap<QueryCacheKey, QuerySlot<Query>>>> = OnceLock::new();
 
 /// Return a cached (or freshly compiled) `Query` wrapped in an `Arc`.
 ///
@@ -98,15 +98,45 @@ fn get_or_compile_query(
     query_src: &str,
 ) -> Result<Arc<Query>, ParseError> {
     let cache = QUERY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+    get_or_compile_in(cache, key, || Query::new(ts_lang, query_src))
+}
 
-    if let Some(q) = map.get(&key) {
+/// One cache slot per key. The outer map lock is held only to find or create
+/// a slot; the compile runs under the slot's own lock.
+type QuerySlot<V> = Arc<Mutex<Option<Arc<V>>>>;
+
+/// Cache lookup-or-compile over an arbitrary keyed cache (the seam the
+/// lock-scope test drives with a deliberately slow compile).
+///
+/// nw-812: the compile runs OUTSIDE the map lock. Holding the process-global
+/// map mutex across `Query::new` serialized every parse worker behind one
+/// compile on a fresh daemon. Workers needing the SAME key still wait on that
+/// key's slot (they need the result anyway, and it avoids N duplicate
+/// compiles); workers on any other key proceed. A failed compile leaves the
+/// slot empty, so the next caller retries, as before.
+fn get_or_compile_in<K, V, E>(
+    cache: &Mutex<HashMap<K, QuerySlot<V>>>,
+    key: K,
+    compile: impl FnOnce() -> Result<V, E>,
+) -> Result<Arc<V>, ParseError>
+where
+    K: std::hash::Hash + Eq,
+    ParseError: From<E>,
+{
+    let slot = Arc::clone(
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+            .or_default(),
+    );
+    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(q) = slot.as_ref() {
         return Ok(Arc::clone(q));
     }
-
-    let arc = Arc::new(Query::new(ts_lang, query_src)?);
-    map.insert(key, Arc::clone(&arc));
-    Ok(arc)
+    let compiled = Arc::new(compile()?);
+    *slot = Some(Arc::clone(&compiled));
+    Ok(compiled)
 }
 
 // ── output types ───────────────────────────────────────────────────────────
@@ -5713,6 +5743,56 @@ pub fn parse_batch(files: &[(&Path, &str)]) -> ParseResult {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// nw-812: a slow first compile of one query key must not block a
+    /// different key. The global cache mutex used to be held across
+    /// `Query::new`, serializing every parse worker behind one compile on a
+    /// fresh daemon.
+    #[test]
+    fn slow_compile_of_one_key_does_not_block_another_key() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let cache: Arc<Mutex<HashMap<&'static str, QuerySlot<u32>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let slow_cache = Arc::clone(&cache);
+        let slow = std::thread::spawn(move || {
+            get_or_compile_in(&slow_cache, "slow", || {
+                entered_tx.send(()).unwrap();
+                // Hold the "compile" open until the test releases it.
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                Ok::<_, tree_sitter::QueryError>(1)
+            })
+            .map(|v| *v)
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("slow compile started");
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let fast_cache = Arc::clone(&cache);
+        let fast = std::thread::spawn(move || {
+            let got =
+                get_or_compile_in(&fast_cache, "fast", || Ok::<_, tree_sitter::QueryError>(2))
+                    .map(|v| *v);
+            let _ = done_tx.send(got.is_ok());
+        });
+        let fast_finished = done_rx.recv_timeout(Duration::from_secs(2));
+        release_tx.send(()).ok();
+        assert_eq!(slow.join().unwrap().unwrap(), 1);
+        fast.join().unwrap();
+        assert_eq!(
+            fast_finished,
+            Ok(true),
+            "compiling another key must not wait on a slow compile of a different key"
+        );
+        // Both results are cached afterwards.
+        let map = cache.lock().unwrap();
+        assert_eq!(map.len(), 2);
+    }
 
     #[test]
     fn rust_parse_reuses_one_local_binding_inventory() {

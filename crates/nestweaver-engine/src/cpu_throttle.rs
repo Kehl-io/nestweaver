@@ -1,51 +1,241 @@
-//! CPU duty-cycle throttle for the parallel indexing phases.
+//! CPU budget for the parallel indexing phases.
 //!
-//! A daemon that saturates every core with tree-sitter parses trips
-//! runningboardd's CPU limits on macOS (observed: killed after a 90s-CPU /
-//! 180s-window violation mid-index). `CpuThrottle` keeps the process under a
-//! target duty cycle: over a rolling wall-clock window it compares consumed
-//! CPU time (`getrusage(RUSAGE_SELF)`, all threads summed) against elapsed
-//! wall time, and sleeps just enough to return to the target ratio.
+//! A daemon that saturates every core with tree-sitter parses can trip
+//! runningboardd's CPU limit on macOS (observed: killed after a 90 s-CPU /
+//! 180 s-window violation mid-index). `CpuThrottle` enforces that limit the
+//! way it is defined: it tracks the daemon's process CPU time
+//! (`getrusage(RUSAGE_SELF)`, all threads summed) over a rolling 180 s window
+//! and only sleeps when the window's total would exceed a budget set safely
+//! below the kill line.
+//!
+//! The limit is per PROCESS, so there is one budget per process
+//! ([`CpuThrottle::global`]): back-to-back indexes (boot reconcile of several
+//! repos, a watcher batch plus a forced index, code then vault) share it, and
+//! CPU spent before the throttle is first consulted is billed too. The daemon
+//! samples the window every [`SAMPLE_INTERVAL`], so CPU spent between indexes
+//! is billed where it happened.
+//!
+//! nw-812: this replaced a 5 s duty-cycle window that budgeted half of ONE
+//! core for the whole multi-threaded process and billed nothing for the first
+//! 5 s. A forced index that crossed 5 s was then billed for its entire
+//! 11-core burst, and every worker slept 250 ms per remaining file — a stall
+//! proportional to the file count, landing on the type-env build.
+//!
+//! Behaviour now:
+//! - A burst that stays under the budget (a forced index of a large repo is
+//!   ~45–60 s of CPU) never sleeps, however many cores it uses.
+//! - Sustained demand is held at the budget per rolling window.
+//! - Sleeping is time-based: a worker over budget waits until enough old CPU
+//!   rolls out of the window, so the stall after a burst is bounded by the
+//!   window and does not grow with the number of files left (all workers
+//!   wait out the same debt concurrently, instead of each paying a fixed
+//!   sleep per file).
 
-use std::sync::Mutex;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-/// Environment variable selecting the target duty cycle, as a percentage of
-/// one core (1–99). `0` or `>= 100` disables the throttle.
+/// Environment variable selecting the budget, as the average percentage of
+/// ONE core the daemon process may use over the rolling 180 s window (the
+/// same unit macOS reports for its own limit: 90 s / 180 s is 50%). `0` or
+/// `>= 100` disables the throttle; values above [`MAX_PERCENT`] fall back to
+/// the default.
+#[cfg_attr(test, allow(dead_code))] // unit tests use an inert global
 const ENV_VAR: &str = "NESTWEAVER_INDEX_CPU_PERCENT";
 
-/// Default duty-cycle target when the variable is unset or unparsable
-/// (mirrors the `env_secs` fallback convention in `git_cmd`).
-const DEFAULT_PERCENT: u32 = 50;
+/// Default budget: 40% of one core over 180 s = 72 s of CPU per window,
+/// 20% under the 90 s kill line and enough that a forced index of a large
+/// repo (an 11-core burst of a few seconds) runs unthrottled.
+const DEFAULT_PERCENT: u32 = 40;
 
-/// Wall-clock window over which CPU usage is averaged before correcting.
-const WINDOW: Duration = Duration::from_secs(5);
+/// Ceiling for configured values: 40% = 72 s per window, the same as the
+/// default. The write phase after the gate is not throttled and adds up to
+/// [`WRITE_RESERVE`] on top of the budget, so anything higher could carry the
+/// window past the 90 s kill line. Values above it — notably the old default
+/// `50` that existing launchd plists bake — are treated as unset (the
+/// default), not as "as much as allowed".
+const MAX_PERCENT: u32 = 40;
 
-/// Upper bound on a single throttle sleep so cancellation and progress
-/// reporting stay responsive.
+/// CPU kept free for the write/epilogue phase, which runs under the write
+/// gate and therefore is never throttled (~10–15 s for a large repo). Before
+/// taking the gate an index waits until the window is at most
+/// `budget - WRITE_RESERVE`; see [`CpuThrottle::reserve_write_headroom`].
+const WRITE_RESERVE: Duration = Duration::from_secs(20);
+
+/// The rolling window runningboardd measures CPU over.
+const WINDOW: Duration = Duration::from_secs(180);
+
+/// Bucket width for the rolling window.
+const SUB_WINDOW: Duration = Duration::from_secs(10);
+
+/// The most one [`CpuThrottle::check`] call will ever wait: the longest any
+/// debt can take to roll out of the window. Waiting longer could only mean
+/// CPU from outside the throttled work keeps refilling the window, and then
+/// the worker proceeds rather than block indefinitely.
+const MAX_WAIT_PER_CHECK: Duration = Duration::from_secs(190);
+
+/// How often the daemon calls [`CpuThrottle::sample`]: at most one
+/// sub-window, so a gap between measurements never spans more than one.
+pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// A wait expected to take longer than this is announced at `info`, so it
+/// is not mistaken for a hang (the nw-812 stall looked exactly like one).
+const ANNOUNCE_WAIT_OVER: Duration = Duration::from_secs(3);
+
+/// Upper bound on a single sleep slice, so a waiting worker re-measures and
+/// notices cancellation promptly.
 const MAX_SLEEP: Duration = Duration::from_millis(250);
 
-/// Shared duty-cycle throttle. Interior mutability (a `Mutex` over the
-/// window start) lets one `&CpuThrottle` be captured by every rayon worker.
+/// The process-wide throttle. See [`CpuThrottle::global`].
+static THROTTLE: OnceLock<CpuThrottle> = OnceLock::new();
+
+/// Shared rolling-window CPU budget. Interior mutability (a `Mutex` over the
+/// window) lets one `&CpuThrottle` be captured by every rayon worker.
 pub struct CpuThrottle {
-    /// Target ratio of CPU time to wall time; `None` disables the throttle.
-    target: Option<f64>,
+    /// CPU time allowed per rolling [`WINDOW`]; `None` disables the throttle.
+    target: Option<Duration>,
     wall_clock: Box<dyn Fn() -> Duration + Send + Sync>,
     cpu_clock: Box<dyn Fn() -> Duration + Send + Sync>,
     sleep: Box<dyn Fn(Duration) + Send + Sync>,
-    window: Mutex<WindowStart>,
+    window: Mutex<Window>,
+    /// Set by [`interrupt_waits`](Self::interrupt_waits): every current and
+    /// future wait returns at once.
+    interrupted: AtomicBool,
+    /// Long-wait announcements, recorded for tests.
+    #[cfg(test)]
+    notices: Mutex<Vec<String>>,
+    /// nw-812 test seam: how many times [`check`](Self::check) ran.
+    #[cfg(test)]
+    checks: std::sync::atomic::AtomicUsize,
 }
 
-struct WindowStart {
-    wall: Duration,
-    cpu: Duration,
+/// CPU consumed per [`SUB_WINDOW`] bucket.
+struct Window {
+    /// Wall time of the last measurement.
+    last_wall: Duration,
+    /// Process CPU time at the last measurement. Starts at ZERO: CPU the
+    /// process used before the throttle existed is billed, not forgiven.
+    last_cpu: Duration,
+    /// `(bucket index, CPU billed to it)`, oldest first. Bucket `i` covers
+    /// wall time `[i * SUB_WINDOW, (i + 1) * SUB_WINDOW)`.
+    buckets: VecDeque<(u64, Duration)>,
+    /// Wall time of the last "budget spent" debug line (rate limit).
+    last_log: Option<Duration>,
+    /// Write reserves currently claimed by indexes in their write phase.
+    claimed: Duration,
+    /// End of the last announced wait (one announcement per episode).
+    notice_until: Option<Duration>,
+    /// A wait timed out with the window still over budget (outside CPU);
+    /// waits are skipped until the total falls back under the budget.
+    saturated: bool,
+}
+
+impl Window {
+    /// Bill CPU used since the last measurement and drop buckets that have
+    /// rolled entirely out of the window.
+    ///
+    /// CPU used across a gap between measurements is spread evenly over the
+    /// gap's buckets (only the part still inside the window counts), so a
+    /// throttle first consulted long after boot does not bill hours of
+    /// background CPU as one burst. A gap of zero bills the current bucket.
+    /// A bucket is kept while any part of it is inside the window, so the
+    /// measured total covers up to WINDOW + SUB_WINDOW — conservative.
+    fn update(&mut self, now_wall: Duration, now_cpu: Duration) {
+        let used = now_cpu.saturating_sub(self.last_cpu);
+        self.last_cpu = self.last_cpu.max(now_cpu);
+        let from = self.last_wall.min(now_wall);
+        self.last_wall = now_wall;
+        let gap = now_wall - from;
+        let current = bucket_index(now_wall);
+        if gap.is_zero() || used.is_zero() {
+            self.bill(current, used);
+        } else {
+            // Only buckets that can still be inside the window get a share.
+            let horizon = now_wall.saturating_sub(WINDOW + SUB_WINDOW);
+            let first = bucket_index(from.max(horizon));
+            let rate = used.as_secs_f64() / gap.as_secs_f64();
+            for index in first..=current {
+                let start = bucket_start(index).max(from);
+                let end = bucket_start(index + 1).min(now_wall);
+                if end > start {
+                    self.bill(index, (end - start).mul_f64(rate));
+                }
+            }
+        }
+        while let Some(&(index, _)) = self.buckets.front() {
+            if bucket_expiry(index) <= now_wall {
+                self.buckets.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn bill(&mut self, index: u64, cpu: Duration) {
+        match self.buckets.back_mut() {
+            Some((last, total)) if *last == index => *total += cpu,
+            _ => self.buckets.push_back((index, cpu)),
+        }
+    }
+
+    fn total(&self) -> Duration {
+        self.buckets.iter().map(|(_, cpu)| *cpu).sum()
+    }
+
+    /// Wall time until enough of the oldest buckets expire to bring the
+    /// window back within `budget`.
+    fn wait_until_within(&self, budget: Duration, now_wall: Duration) -> Duration {
+        let mut remaining = self.total();
+        for &(index, cpu) in &self.buckets {
+            if remaining <= budget {
+                break;
+            }
+            remaining = remaining.saturating_sub(cpu);
+            if remaining <= budget {
+                return bucket_expiry(index).saturating_sub(now_wall);
+            }
+        }
+        Duration::ZERO
+    }
+}
+
+fn bucket_index(wall: Duration) -> u64 {
+    (wall.as_nanos() / SUB_WINDOW.as_nanos()) as u64
+}
+
+fn bucket_start(index: u64) -> Duration {
+    SUB_WINDOW * u32::try_from(index).unwrap_or(u32::MAX)
+}
+
+/// Wall time at which bucket `index` has fully left the rolling window.
+fn bucket_expiry(index: u64) -> Duration {
+    bucket_start(index + 1) + WINDOW
 }
 
 impl CpuThrottle {
-    /// Build from `NESTWEAVER_INDEX_CPU_PERCENT` (default 50; `0` or
+    /// The process-wide throttle, built from `NESTWEAVER_INDEX_CPU_PERCENT`
+    /// on first use (the env is read once). The daemon touches it at boot so
+    /// its wall clock starts with the process.
+    pub fn global() -> &'static CpuThrottle {
+        #[cfg(test)]
+        if let Some(installed) = test_seam::installed() {
+            return installed;
+        }
+        // Unit tests: the whole test binary is one process running thousands
+        // of indexes in parallel, so a real process-wide budget would make
+        // them wait on each other. Throttle behaviour is tested on rigs.
+        #[cfg(test)]
+        return THROTTLE.get_or_init(|| Self::new(None));
+        #[cfg(not(test))]
+        THROTTLE.get_or_init(Self::from_env)
+    }
+
+    /// Build from `NESTWEAVER_INDEX_CPU_PERCENT` (default 40; `0` or
     /// `>= 100` produces an inert throttle whose [`check`](Self::check)
     /// never sleeps).
-    pub fn from_env() -> Self {
+    #[cfg_attr(test, allow(dead_code))] // unit tests use an inert global
+    fn from_env() -> Self {
         Self::from_env_value(std::env::var(ENV_VAR).ok().as_deref())
     }
 
@@ -53,11 +243,17 @@ impl CpuThrottle {
         let percent = value
             .and_then(|s| s.trim().parse::<u32>().ok())
             .unwrap_or(DEFAULT_PERCENT);
-        let target = (percent > 0 && percent < 100).then(|| f64::from(percent) / 100.0);
+        let percent = if percent > MAX_PERCENT && percent < 100 {
+            DEFAULT_PERCENT
+        } else {
+            percent
+        };
+        let target =
+            (percent > 0 && percent < 100).then(|| WINDOW.mul_f64(f64::from(percent) / 100.0));
         Self::new(target)
     }
 
-    fn new(target: Option<f64>) -> Self {
+    fn new(target: Option<Duration>) -> Self {
         let start = std::time::Instant::now();
         Self::with_clocks(
             target,
@@ -68,14 +264,19 @@ impl CpuThrottle {
     }
 
     fn with_clocks(
-        target: Option<f64>,
+        target: Option<Duration>,
         wall_clock: Box<dyn Fn() -> Duration + Send + Sync>,
         cpu_clock: Box<dyn Fn() -> Duration + Send + Sync>,
         sleep: Box<dyn Fn(Duration) + Send + Sync>,
     ) -> Self {
-        let window = WindowStart {
-            wall: wall_clock(),
-            cpu: cpu_clock(),
+        let window = Window {
+            last_wall: wall_clock(),
+            last_cpu: Duration::ZERO,
+            buckets: VecDeque::new(),
+            last_log: None,
+            claimed: Duration::ZERO,
+            saturated: false,
+            notice_until: None,
         };
         Self {
             target,
@@ -83,44 +284,265 @@ impl CpuThrottle {
             cpu_clock,
             sleep,
             window: Mutex::new(window),
+            interrupted: AtomicBool::new(false),
+            #[cfg(test)]
+            notices: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            checks: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    /// Called from parallel workers before a unit of CPU-bound work. Cheap:
-    /// no-ops until the rolling window has elapsed, and entirely inert when
-    /// the throttle is disabled.
+    /// Called from parallel workers before a unit of CPU-bound work. Cheap
+    /// when under budget and entirely inert when disabled.
     pub fn check(&self) {
-        let Some(target) = self.target else { return };
+        self.check_with_cancel(None);
+    }
+
+    /// [`check`](Self::check) that stops waiting as soon as `cancel` is set.
+    pub fn check_with_cancel(&self, cancel: Option<&AtomicBool>) {
+        #[cfg(test)]
+        self.checks.fetch_add(1, Ordering::Relaxed);
+        let Some(budget) = self.target else { return };
+        self.wait_within(budget, cancel, false);
+    }
+
+    /// Called once before an index takes its write gate (never under it):
+    /// waits until the window is at most `budget - WRITE_RESERVE`, so the
+    /// unthrottled write phase cannot carry the window past the budget by
+    /// more than the reserve. Stops waiting as soon as `cancel` is set.
+    ///
+    /// The reserve is CLAIMED until the returned guard drops (hold it until
+    /// the write and epilogue finish): while claimed it counts against the
+    /// window for every other index's reserve, so concurrent indexes cannot
+    /// all pass the check together and then add their write CPU serially.
+    #[must_use = "the write reserve is released when the guard drops"]
+    pub fn reserve_write_headroom(&self, cancel: Option<&AtomicBool>) -> WriteReservation<'_> {
+        #[cfg(test)]
+        self.checks.fetch_add(1, Ordering::Relaxed);
+        let Some(budget) = self.target else {
+            return WriteReservation {
+                throttle: self,
+                claimed: Duration::ZERO,
+            };
+        };
+        self.wait_within(budget.saturating_sub(WRITE_RESERVE), cancel, true);
+        WriteReservation {
+            throttle: self,
+            claimed: WRITE_RESERVE,
+        }
+    }
+
+    /// End every current and future wait (sticky). The daemon calls this
+    /// when it begins shutting down: paths without a job cancel token (the
+    /// vault parse) would otherwise hold the drain for up to
+    /// [`MAX_WAIT_PER_CHECK`]. Work then runs unthrottled to its end, which
+    /// on a draining daemon is a short, bounded tail.
+    pub fn interrupt_waits(&self) {
+        self.interrupted.store(true, Ordering::Relaxed);
+    }
+
+    /// Wait (in [`MAX_SLEEP`] slices, at most [`MAX_WAIT_PER_CHECK`]) until
+    /// the window's total is at most `limit`. With `claim`, write reserves
+    /// already claimed by other indexes count against `limit`, and this
+    /// call's reserve is claimed (under the same lock) when it stops waiting
+    /// — including on cancellation or timeout, so the guard's release always
+    /// balances.
+    fn wait_within(&self, limit: Duration, cancel: Option<&AtomicBool>, claim: bool) {
+        let mut slept = Duration::ZERO;
+        let claim_now = || {
+            if claim {
+                self.window
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .claimed += WRITE_RESERVE;
+            }
+        };
+        while slept < MAX_WAIT_PER_CHECK {
+            if self.interrupted.load(Ordering::Relaxed)
+                || cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+            {
+                claim_now();
+                return;
+            }
+            let wait = {
+                // A poisoned lock only means another worker panicked
+                // mid-check; the window is still usable, so recover.
+                let mut window = self.window.lock().unwrap_or_else(|p| p.into_inner());
+                // Read both clocks under the lock, so measurements reach
+                // `update` in order and no worker bills a stale sample.
+                let now_wall = (self.wall_clock)();
+                let now_cpu = (self.cpu_clock)();
+                window.update(now_wall, now_cpu);
+                let total = window.total();
+                let limit = if claim {
+                    limit.saturating_sub(window.claimed)
+                } else {
+                    limit
+                };
+                if window.saturated && total <= self.target.unwrap_or(limit) {
+                    window.saturated = false;
+                }
+                // Under the limit, or the window is saturated by CPU from
+                // outside the throttled work, where waiting cannot help.
+                if total <= limit || window.saturated {
+                    if claim {
+                        window.claimed += WRITE_RESERVE;
+                    }
+                    return;
+                }
+                // Rate-limited: one line per sub-window, however many
+                // workers are waiting.
+                if window
+                    .last_log
+                    .is_none_or(|at| now_wall.saturating_sub(at) >= SUB_WINDOW)
+                {
+                    window.last_log = Some(now_wall);
+                    tracing::debug!(
+                        window_total_secs = total.as_secs_f64(),
+                        limit_secs = limit.as_secs_f64(),
+                        budget_secs = self.target.unwrap_or_default().as_secs_f64(),
+                        "index CPU budget for the rolling 180 s window spent; waiting"
+                    );
+                }
+                let wait = match window.wait_until_within(limit, now_wall) {
+                    // Only another index's claimed reserve is in the way:
+                    // poll until it is released.
+                    wait if wait.is_zero() && claim => MAX_SLEEP,
+                    wait => wait,
+                };
+                self.announce_long_wait(&mut window, now_wall, wait);
+                wait
+            };
+            let nap = wait.min(MAX_SLEEP).min(MAX_WAIT_PER_CHECK - slept);
+            if nap.is_zero() {
+                claim_now();
+                return;
+            }
+            (self.sleep)(nap);
+            slept += nap;
+        }
+        // Waited the longest any debt could take and the window still has not
+        // recovered: CPU outside the throttled work (embedding, queries,
+        // other reconcilers) keeps refilling it. Stop making every later
+        // check wait out another full window until the total falls back
+        // under budget.
+        {
+            let mut window = self.window.lock().unwrap_or_else(|p| p.into_inner());
+            if !window.saturated {
+                window.saturated = true;
+                tracing::warn!(
+                    window_total_secs = window.total().as_secs_f64(),
+                    budget_secs = self.target.unwrap_or_default().as_secs_f64(),
+                    "index CPU window stayed over budget for a full {}s wait (CPU from outside \
+                     indexing); index work proceeds unthrottled until it recovers",
+                    MAX_WAIT_PER_CHECK.as_secs()
+                );
+            }
+        }
+        claim_now();
+    }
+
+    /// Bill CPU used since the last measurement to the current bucket,
+    /// without waiting. The daemon calls this every [`SAMPLE_INTERVAL`]: CPU
+    /// spent between indexes (embedding, watcher batches, reconcilers,
+    /// queries) is then billed where it happened. Without it, a long gap's CPU
+    /// would be spread evenly over the gap and a burst at its end under-billed.
+    pub fn sample(&self) {
+        let mut window = self.window.lock().unwrap_or_else(|p| p.into_inner());
         let now_wall = (self.wall_clock)();
         let now_cpu = (self.cpu_clock)();
-        // A poisoned lock only means another worker panicked mid-check; the
-        // window state is still usable, so recover rather than fail.
-        let mut window = self.window.lock().unwrap_or_else(|p| p.into_inner());
-        let wall_delta = now_wall.saturating_sub(window.wall);
-        if wall_delta < WINDOW {
-            return;
-        }
-        let cpu_delta = now_cpu.saturating_sub(window.cpu);
+        window.update(now_wall, now_cpu);
+    }
 
-        // Wall time that *should* have elapsed for cpu_delta at the target
-        // ratio; the shortfall is made up by sleeping (capped per call).
-        let needed_wall = cpu_delta.as_secs_f64() / target;
-        let extra = needed_wall - wall_delta.as_secs_f64();
-        if extra <= 0.0 {
-            // Under budget: start a fresh window so the next burst is judged
-            // on its own WINDOW slice rather than ancient history.
-            window.wall = now_wall;
-            window.cpu = now_cpu;
+    /// Announcements made so far (tests).
+    #[cfg(test)]
+    fn notices(&self) -> Vec<String> {
+        self.notices
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Announce a wait long enough to be mistaken for a stall: an `info`
+    /// line naming the knob, once per wait episode across all workers (not
+    /// again until the announced wait has elapsed).
+    fn announce_long_wait(&self, window: &mut Window, now_wall: Duration, wait: Duration) {
+        if wait <= ANNOUNCE_WAIT_OVER || window.notice_until.is_some_and(|until| now_wall < until) {
             return;
         }
-        // Over budget: do NOT reset the window. With thousands of files per
-        // window and a 250ms per-call cap, resetting here would let every
-        // worker burn at 100% for the next WINDOW before anyone sleeps
-        // again — the correction could never reach the target duty cycle.
-        // Keeping the window open means every worker observing the surplus
-        // sleeps on each call until the ratio recovers.
-        drop(window);
-        (self.sleep)(Duration::from_secs_f64(extra).min(MAX_SLEEP));
+        window.notice_until = Some(now_wall + wait);
+        let notice = format!(
+            "waiting ~{}s for the index CPU budget (NESTWEAVER_INDEX_CPU_PERCENT; \
+             {:.0}s of daemon CPU in the last 180s, budget {:.0}s)",
+            wait.as_secs().max(1),
+            window.total().as_secs_f64(),
+            self.target.unwrap_or_default().as_secs_f64(),
+        );
+        tracing::info!("{notice}");
+        #[cfg(test)]
+        self.notices
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(notice);
+    }
+
+    /// The window's current total (tests).
+    #[cfg(test)]
+    fn window_total(&self) -> Duration {
+        let mut window = self.window.lock().unwrap_or_else(|p| p.into_inner());
+        window.update((self.wall_clock)(), (self.cpu_clock)());
+        window.total()
+    }
+}
+
+/// A claimed write reserve; see [`CpuThrottle::reserve_write_headroom`].
+pub struct WriteReservation<'a> {
+    throttle: &'a CpuThrottle,
+    claimed: Duration,
+}
+
+impl Drop for WriteReservation<'_> {
+    fn drop(&mut self) {
+        if !self.claimed.is_zero() {
+            let mut window = self
+                .throttle
+                .window
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            window.claimed = window.claimed.saturating_sub(self.claimed);
+        }
+    }
+}
+
+/// nw-812 test seam. A test installs its own throttle on its thread, and
+/// [`CpuThrottle::global`] returns it to code running on that thread (the
+/// index entry points, which hand the reference to their parse workers).
+/// Checks are counted per installed throttle, so parallel tests indexing
+/// through the real global never disturb the count.
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use super::CpuThrottle;
+    use std::cell::Cell;
+    use std::sync::atomic::Ordering;
+
+    thread_local! {
+        static INSTALLED: Cell<Option<&'static CpuThrottle>> = const { Cell::new(None) };
+    }
+
+    /// Install a disabled (never-sleeping) counting throttle for this thread.
+    pub(crate) fn install_counting_throttle() -> &'static CpuThrottle {
+        let throttle: &'static CpuThrottle = Box::leak(Box::new(CpuThrottle::new(None)));
+        INSTALLED.with(|cell| cell.set(Some(throttle)));
+        throttle
+    }
+
+    pub(super) fn installed() -> Option<&'static CpuThrottle> {
+        INSTALLED.with(Cell::get)
+    }
+
+    /// Checks made so far by `throttle`.
+    pub(crate) fn checks(throttle: &CpuThrottle) -> usize {
+        throttle.checks.load(Ordering::SeqCst)
     }
 }
 
@@ -161,9 +583,33 @@ mod tests {
         throttle: CpuThrottle,
     }
 
-    fn rig(target: Option<f64>) -> Rig {
+    fn rig(target: Option<Duration>) -> Rig {
         let wall = Arc::new(StdMutex::new(Duration::ZERO));
         let cpu = Arc::new(StdMutex::new(Duration::ZERO));
+        let sleeps = Arc::new(StdMutex::new(Vec::new()));
+        let throttle = {
+            let wall = Arc::clone(&wall);
+            let cpu = Arc::clone(&cpu);
+            let sleeps = Arc::clone(&sleeps);
+            CpuThrottle::with_clocks(
+                target,
+                Box::new(move || *wall.lock().unwrap_or_else(|p| p.into_inner())),
+                Box::new(move || *cpu.lock().unwrap_or_else(|p| p.into_inner())),
+                Box::new(move |d| sleeps.lock().unwrap_or_else(|p| p.into_inner()).push(d)),
+            )
+        };
+        Rig {
+            wall,
+            cpu,
+            sleeps,
+            throttle,
+        }
+    }
+
+    /// A fresh throttle over the same injected clocks as `other`.
+    fn rig_like(other: &Rig, target: Option<Duration>) -> Rig {
+        let wall = Arc::clone(&other.wall);
+        let cpu = Arc::clone(&other.cpu);
         let sleeps = Arc::new(StdMutex::new(Vec::new()));
         let throttle = {
             let wall = Arc::clone(&wall);
@@ -198,16 +644,20 @@ mod tests {
         }
     }
 
+    fn secs(s: u64) -> Option<Duration> {
+        Some(Duration::from_secs(s))
+    }
+
     #[test]
-    fn env_default_is_fifty_percent() {
+    fn env_default_is_seventy_two_seconds_per_window() {
         let t = CpuThrottle::from_env_value(None);
-        assert_eq!(t.target, Some(0.5));
+        assert_eq!(t.target, secs(72));
     }
 
     #[test]
     fn env_unparsable_falls_back_to_default() {
         let t = CpuThrottle::from_env_value(Some("garbage"));
-        assert_eq!(t.target, Some(0.5));
+        assert_eq!(t.target, secs(72));
     }
 
     #[test]
@@ -219,14 +669,31 @@ mod tests {
 
     #[test]
     fn env_partial_percent_is_honored() {
+        // 25% of one core over 180 s = 45 s of CPU per window.
         let t = CpuThrottle::from_env_value(Some("25"));
-        assert_eq!(t.target, Some(0.25));
+        assert_eq!(t.target, secs(45));
+    }
+
+    #[test]
+    fn legacy_values_over_the_max_map_to_the_default() {
+        // Existing plists bake the old default `50`, which is exactly
+        // runningboardd's 90 s / 180 s kill line. Anything over the max is
+        // treated as unset, not as "as much as allowed".
+        let default = CpuThrottle::from_env_value(None).target;
+        for legacy in ["50", "41", "45", "99"] {
+            assert_eq!(
+                CpuThrottle::from_env_value(Some(legacy)).target,
+                default,
+                "{legacy} must map to the default"
+            );
+        }
+        assert_eq!(CpuThrottle::from_env_value(Some("40")).target, secs(72));
     }
 
     #[test]
     fn env_value_is_trimmed() {
-        let t = CpuThrottle::from_env_value(Some(" 45 "));
-        assert_eq!(t.target, Some(0.45));
+        let t = CpuThrottle::from_env_value(Some(" 30 "));
+        assert_eq!(t.target, secs(54));
     }
 
     #[test]
@@ -240,65 +707,459 @@ mod tests {
     }
 
     #[test]
-    fn window_must_elapse_before_evaluating() {
-        let rig = rig(Some(0.5));
-        // Under the window length, even a huge CPU surplus is not judged yet.
-        rig.advance(Duration::from_secs(4), Duration::from_secs(30));
-        rig.throttle.check();
-        assert!(rig.sleeps().is_empty());
-    }
-
-    #[test]
-    fn over_budget_sleeps_capped_to_max() {
-        let rig = rig(Some(0.5));
-        // 4s CPU over 5s wall with a 0.5 target needs 8s wall → 3s short,
-        // but a single call may only sleep MAX_SLEEP.
-        rig.advance(Duration::from_secs(5), Duration::from_secs(4));
-        rig.throttle.check();
-        assert_eq!(rig.sleeps(), vec![MAX_SLEEP]);
-    }
-
-    #[test]
     fn under_budget_does_not_sleep() {
-        let rig = rig(Some(0.5));
-        // 1s CPU over 5s wall is a 0.2 ratio — comfortably under target.
-        rig.advance(Duration::from_secs(5), Duration::from_secs(1));
+        let rig = rig(secs(72));
+        rig.advance(Duration::from_secs(5), Duration::from_secs(70));
         rig.throttle.check();
         assert!(rig.sleeps().is_empty());
     }
 
     #[test]
-    fn window_resets_after_each_evaluation() {
-        let rig = rig(Some(0.5));
-        rig.advance(Duration::from_secs(5), Duration::from_secs(1));
+    fn over_budget_wait_is_sliced_and_bounded_per_check() {
+        // The injected sleep does not advance the wall clock here, so the
+        // window never recovers: one check must still give up after the
+        // longest any debt could take to clear, in MAX_SLEEP slices.
+        let rig = rig(secs(72));
+        rig.advance(Duration::from_secs(5), Duration::from_secs(80));
         rig.throttle.check();
-        assert!(rig.sleeps().is_empty());
-        // A second evaluation happens only after another full window.
-        rig.advance(Duration::from_secs(1), Duration::from_secs(10));
-        rig.throttle.check();
+        let sleeps = rig.sleeps();
+        assert!(sleeps.iter().all(|d| *d <= MAX_SLEEP));
+        assert_eq!(sleeps.iter().sum::<Duration>(), MAX_WAIT_PER_CHECK);
+    }
+
+    #[test]
+    fn cancellation_stops_waiting() {
+        let rig = rig(secs(72));
+        rig.advance(Duration::from_secs(5), Duration::from_secs(80));
+        let cancel = AtomicBool::new(true);
+        rig.throttle.check_with_cancel(Some(&cancel));
         assert!(rig.sleeps().is_empty());
     }
 
     #[test]
-    fn over_budget_window_stays_open_until_ratio_recovers() {
-        let rig = rig(Some(0.5));
-        // 4s CPU over 5s wall at target 0.5 → over budget; sleeps.
-        rig.advance(Duration::from_secs(5), Duration::from_secs(4));
+    fn usage_rolls_out_of_the_window() {
+        let rig = rig(secs(72));
+        rig.advance(Duration::from_secs(5), Duration::from_secs(70));
         rig.throttle.check();
-        // The window must NOT reset on over-budget: the very next call (even
-        // moments later) still sees the surplus and sleeps again. This is
-        // what lets the correction actually reach the target duty cycle.
-        rig.advance(Duration::from_millis(100), Duration::from_millis(100));
+        // 190 s later the first bucket has fully expired: a fresh 70 s burst
+        // is judged on its own.
+        rig.advance(Duration::from_secs(190), Duration::from_secs(70));
         rig.throttle.check();
-        assert_eq!(rig.sleeps(), vec![MAX_SLEEP, MAX_SLEEP]);
-        // Idle wall time (workers sleeping) pays down the surplus: 9.1s wall
-        // for 4.1s CPU is a ~0.45 ratio → under budget, window resets.
-        rig.advance(Duration::from_secs(4), Duration::ZERO);
+        assert!(rig.sleeps().is_empty());
+    }
+
+    // ── nw-812: rolling-window budget ────────────────────────────────────
+
+    /// Rig whose injected sleep advances the wall clock, so a simulated
+    /// worker that sleeps actually lets time pass.
+    fn sim_rig() -> Rig {
+        let wall = Arc::new(StdMutex::new(Duration::ZERO));
+        let cpu = Arc::new(StdMutex::new(Duration::ZERO));
+        let sleeps = Arc::new(StdMutex::new(Vec::new()));
+        let throttle = {
+            let wall_c = Arc::clone(&wall);
+            let wall_s = Arc::clone(&wall);
+            let cpu = Arc::clone(&cpu);
+            let sleeps = Arc::clone(&sleeps);
+            CpuThrottle::with_clocks(
+                CpuThrottle::from_env_value(None).target,
+                Box::new(move || *wall_c.lock().unwrap_or_else(|p| p.into_inner())),
+                Box::new(move || *cpu.lock().unwrap_or_else(|p| p.into_inner())),
+                Box::new(move |d| {
+                    *wall_s.lock().unwrap_or_else(|p| p.into_inner()) += d;
+                    sleeps.lock().unwrap_or_else(|p| p.into_inner()).push(d);
+                }),
+            )
+        };
+        Rig {
+            wall,
+            cpu,
+            sleeps,
+            throttle,
+        }
+    }
+
+    impl Rig {
+        fn now(&self) -> (Duration, Duration) {
+            (
+                *self.wall.lock().unwrap_or_else(|p| p.into_inner()),
+                *self.cpu.lock().unwrap_or_else(|p| p.into_inner()),
+            )
+        }
+
+        fn total_sleep(&self) -> Duration {
+            self.sleeps().iter().sum()
+        }
+    }
+
+    /// Largest CPU consumed in any `window` of wall time across a trace of
+    /// monotonically increasing `(wall, cpu)` samples.
+    fn max_rolling_cpu(trace: &[(Duration, Duration)], window: Duration) -> Duration {
+        let mut max = Duration::ZERO;
+        let mut lo = 0;
+        for hi in 0..trace.len() {
+            while trace[hi].0.saturating_sub(trace[lo].0) > window {
+                lo += 1;
+            }
+            max = max.max(trace[hi].1.saturating_sub(trace[lo].1));
+        }
+        max
+    }
+
+    /// The default budget is 72 s of CPU per rolling 180 s window (40% of one
+    /// core averaged), 20% under runningboardd's 90 s / 180 s kill line.
+    const DEFAULT_BUDGET_SECS: f64 = 72.0;
+
+    #[test]
+    fn eleven_core_burst_of_six_seconds_never_sleeps() {
+        // A forced index of a large repo: 11 parse workers flat out for 6 s
+        // (66 s of CPU), checking before every 0.1 s-CPU file. This is under
+        // the rolling budget, so no worker may ever sleep — the old 5 s
+        // duty-cycle window billed it as 16x over a half-core target.
+        let rig = sim_rig();
+        for _ in 0..660 {
+            rig.throttle.check();
+            rig.advance(
+                Duration::from_secs_f64(6.0 / 660.0),
+                Duration::from_millis(100),
+            );
+        }
+        assert!(
+            rig.sleeps().is_empty(),
+            "a 66 s-CPU burst must not sleep; slept {:?}",
+            rig.total_sleep()
+        );
+    }
+
+    #[test]
+    fn sustained_over_budget_use_is_held_at_the_rolling_cap() {
+        // 11 cores of demand for 20 simulated minutes (a long vault index).
+        let rig = sim_rig();
+        let mut trace = vec![rig.now()];
+        while rig.now().0 < Duration::from_secs(1200) {
+            rig.throttle.check();
+            rig.advance(Duration::from_millis(10), Duration::from_millis(110));
+            trace.push(rig.now());
+        }
+        let peak = max_rolling_cpu(&trace, Duration::from_secs(180));
+        assert!(
+            peak.as_secs_f64() <= DEFAULT_BUDGET_SECS + 1.0,
+            "rolling 180 s CPU peaked at {peak:?}, over the {DEFAULT_BUDGET_SECS} s budget"
+        );
+        // ...while still making real progress (not starved far below cap).
+        let total = rig.now().1.as_secs_f64();
+        assert!(
+            total >= DEFAULT_BUDGET_SECS * 5.0,
+            "throughput collapsed: only {total:.1} s CPU in 1200 s"
+        );
+    }
+
+    fn sleep_after_late_billed_burst(remaining_files: usize) -> (Duration, Duration) {
+        let rig = sim_rig();
+        // A burst billed late: 11 cores for 20 s with no check in between.
+        rig.advance(Duration::from_secs(20), Duration::from_secs(220));
+        let mut max_single_check = Duration::ZERO;
+        for _ in 0..remaining_files {
+            let before = rig.total_sleep();
+            rig.throttle.check();
+            max_single_check = max_single_check.max(rig.total_sleep() - before);
+            // Cheap remaining files (e.g. type-env builds): ~no CPU.
+            rig.advance(Duration::from_millis(1), Duration::ZERO);
+        }
+        (rig.total_sleep(), max_single_check)
+    }
+
+    #[test]
+    fn sleep_after_a_burst_is_bounded_and_independent_of_remaining_files() {
+        let (few, few_max) = sleep_after_late_billed_burst(2_000);
+        let (many, many_max) = sleep_after_late_billed_burst(20_000);
+        assert_eq!(
+            few, many,
+            "post-burst sleep must not scale with the number of remaining files"
+        );
+        // Debt clears as the burst rolls out of the window: never more than
+        // one window plus one sub-window of wall time, whatever the burst.
+        assert!(
+            many <= Duration::from_secs(190),
+            "post-burst sleep {many:?} exceeds one window"
+        );
+        // The whole debt is repaid by the first check that sees it; later
+        // checks proceed without paying anything per file.
+        assert_eq!(few_max, few);
+        assert_eq!(many_max, many);
+    }
+
+    // ── nw-812 review C1: one process-wide budget ────────────────────────
+
+    #[test]
+    fn cpu_spent_before_the_throttle_existed_is_billed() {
+        // runningboardd counts the PROCESS, so CPU burned before this
+        // throttle was first consulted (an earlier index, boot work) must
+        // count against the window rather than being forgiven at creation.
+        let rig = rig(secs(72));
+        rig.advance(Duration::ZERO, Duration::from_secs(80));
+        // Rebuild the throttle now that 80 s of CPU is already on the clock.
+        let rig = rig_like(&rig, secs(72));
         rig.throttle.check();
-        assert_eq!(rig.sleeps().len(), 2);
-        // Window has now reset; a fresh sub-window burst is not yet judged.
-        rig.advance(Duration::from_secs(1), Duration::from_secs(10));
+        assert!(
+            !rig.sleeps().is_empty(),
+            "80 s of prior process CPU against a 72 s budget must wait"
+        );
+    }
+
+    #[test]
+    fn back_to_back_indexes_share_one_budget() {
+        let rig = sim_rig();
+        let burst = |rig: &Rig| {
+            let before = rig.total_sleep();
+            for _ in 0..660 {
+                rig.throttle.check();
+                rig.advance(
+                    Duration::from_secs_f64(6.0 / 660.0),
+                    Duration::from_millis(100),
+                );
+            }
+            rig.total_sleep() - before
+        };
+        assert_eq!(burst(&rig), Duration::ZERO, "the first index runs free");
+        assert!(
+            burst(&rig) > Duration::ZERO,
+            "a second index right behind it must wait for the shared window"
+        );
+    }
+
+    #[test]
+    fn global_throttle_is_one_process_wide_instance() {
+        assert!(std::ptr::eq(CpuThrottle::global(), CpuThrottle::global()));
+    }
+
+    // ── nw-812 review C2: headroom for the unthrottled write phase ───────
+
+    #[test]
+    fn write_phase_starts_with_headroom() {
+        // Parse + type-env used 60 s: under the 72 s budget, so no worker
+        // waited. The write/epilogue phase is not throttled and adds ~10–15 s,
+        // so before the gate the window must come back to budget − reserve.
+        let rig = sim_rig();
+        for _ in 0..600 {
+            rig.throttle.check();
+            rig.advance(Duration::from_millis(10), Duration::from_millis(100));
+        }
+        assert!(rig.sleeps().is_empty(), "60 s is under budget");
+        let _reserve = rig.throttle.reserve_write_headroom(None);
+        assert!(!rig.sleeps().is_empty(), "60 s leaves no write reserve");
+        assert!(
+            rig.throttle.window_total() <= Duration::from_secs(72) - WRITE_RESERVE,
+            "the write phase must start with {WRITE_RESERVE:?} of headroom, window holds {:?}",
+            rig.throttle.window_total()
+        );
+    }
+
+    #[test]
+    fn write_headroom_needs_no_wait_when_already_available() {
+        let rig = sim_rig();
+        rig.advance(Duration::from_secs(5), Duration::from_secs(40));
+        let _reserve = rig.throttle.reserve_write_headroom(None);
+        assert!(rig.sleeps().is_empty());
+    }
+
+    // ── nw-812 review I2: waits are interruptible without a cancel token ─
+
+    #[test]
+    fn interrupt_waits_releases_a_waiting_worker() {
+        // The vault parse has no job cancel token; a daemon shutdown must
+        // still be able to end a throttle wait instead of blocking ~190 s.
+        let rig = rig(secs(72));
+        rig.advance(Duration::from_secs(5), Duration::from_secs(80));
+        rig.throttle.interrupt_waits();
         rig.throttle.check();
-        assert_eq!(rig.sleeps().len(), 2);
+        let _reserve = rig.throttle.reserve_write_headroom(None);
+        assert!(rig.sleeps().is_empty(), "slept {:?}", rig.sleeps().len());
+    }
+
+    #[test]
+    fn interrupt_waits_ends_a_wait_already_in_progress() {
+        let throttle = Arc::new(StdMutex::new(None::<Arc<CpuThrottle>>));
+        let slices = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let t = {
+            let throttle = Arc::clone(&throttle);
+            let slices = Arc::clone(&slices);
+            Arc::new(CpuThrottle::with_clocks(
+                secs(72),
+                Box::new(|| Duration::from_secs(5)),
+                Box::new(|| Duration::from_secs(80)),
+                Box::new(move |_| {
+                    // Shutdown arrives during the first sleep slice.
+                    slices.fetch_add(1, Ordering::SeqCst);
+                    if let Some(t) = throttle.lock().unwrap().as_ref() {
+                        t.interrupt_waits();
+                    }
+                }),
+            ))
+        };
+        *throttle.lock().unwrap() = Some(Arc::clone(&t));
+        t.check();
+        assert_eq!(slices.load(Ordering::SeqCst), 1);
+        // Break the Arc cycle.
+        throttle.lock().unwrap().take();
+    }
+
+    // ── nw-812 re-review N1: sampling between indexes ────────────────────
+
+    /// One hour idle, then 80 s of outside CPU (embedding, reconcilers) in
+    /// the final 100 s, then an index. `sample` is the daemon's periodic
+    /// sampler (every SUB_WINDOW or less).
+    fn hour_idle_then_late_burn(rig: &Rig, sampled: bool) {
+        for step in 0..360 {
+            let cpu = if step >= 350 { 8 } else { 0 };
+            rig.advance(Duration::from_secs(10), Duration::from_secs(cpu));
+            if sampled {
+                rig.throttle.sample();
+            }
+        }
+    }
+
+    fn eleven_core_burst(rig: &Rig) -> Duration {
+        let before = rig.total_sleep();
+        for _ in 0..660 {
+            rig.throttle.check();
+            rig.advance(
+                Duration::from_secs_f64(6.0 / 660.0),
+                Duration::from_millis(100),
+            );
+        }
+        rig.total_sleep() - before
+    }
+
+    #[test]
+    fn sampled_late_outside_cpu_is_billed_where_it_happened() {
+        let rig = sim_rig();
+        hour_idle_then_late_burn(&rig, true);
+        assert!(
+            eleven_core_burst(&rig) > Duration::ZERO,
+            "80 s of recent outside CPU + a 66 s burst is over budget and must wait"
+        );
+    }
+
+    #[test]
+    fn unsampled_gap_is_spread_evenly_until_the_first_sample() {
+        // Without a sampler the gap's CPU is spread over the whole gap, so
+        // only ~4 s of the late 80 s lands in the window: the burst runs free.
+        // This is why the daemon samples every sub-window; spreading only
+        // matters before the first sample (CPU since process start).
+        let rig = sim_rig();
+        hour_idle_then_late_burn(&rig, false);
+        assert_eq!(eleven_core_burst(&rig), Duration::ZERO);
+    }
+
+    // ── nw-812 re-review N3: one write reserve per index ─────────────────
+
+    #[test]
+    fn concurrent_indexes_cannot_share_one_write_reserve() {
+        // Two indexes reach their write gates together with the window at
+        // 40 s. Each write adds ~14 s unthrottled, so both passing a 52 s
+        // check would carry the window to 68 s+. The reserve is claimed per
+        // index until its write finishes.
+        let rig = sim_rig();
+        rig.advance(Duration::from_secs(5), Duration::from_secs(40));
+        let first = rig.throttle.reserve_write_headroom(None);
+        assert!(rig.sleeps().is_empty(), "the first index has headroom");
+        let second = rig.throttle.reserve_write_headroom(None);
+        assert!(
+            !rig.sleeps().is_empty(),
+            "the second index must wait while the first holds the reserve"
+        );
+        drop(second);
+        drop(first);
+        let slept = rig.sleeps().len();
+        let third = rig.throttle.reserve_write_headroom(None);
+        assert_eq!(rig.sleeps().len(), slept, "released reserves are reusable");
+        drop(third);
+    }
+
+    // ── nw-812 re-review N2: starvation by outside CPU ───────────────────
+
+    /// Rig where every sleep lets half a core of OUTSIDE CPU (embedding,
+    /// queries) run: the window can never fall back under 72 s by waiting.
+    fn outside_cpu_rig() -> Rig {
+        let wall = Arc::new(StdMutex::new(Duration::ZERO));
+        let cpu = Arc::new(StdMutex::new(Duration::ZERO));
+        let sleeps = Arc::new(StdMutex::new(Vec::new()));
+        let throttle = {
+            let (wall_c, wall_s) = (Arc::clone(&wall), Arc::clone(&wall));
+            let (cpu_c, cpu_s) = (Arc::clone(&cpu), Arc::clone(&cpu));
+            let sleeps = Arc::clone(&sleeps);
+            CpuThrottle::with_clocks(
+                secs(72),
+                Box::new(move || *wall_c.lock().unwrap_or_else(|p| p.into_inner())),
+                Box::new(move || *cpu_c.lock().unwrap_or_else(|p| p.into_inner())),
+                Box::new(move |d| {
+                    *wall_s.lock().unwrap_or_else(|p| p.into_inner()) += d;
+                    *cpu_s.lock().unwrap_or_else(|p| p.into_inner()) += d / 2;
+                    sleeps.lock().unwrap_or_else(|p| p.into_inner()).push(d);
+                }),
+            )
+        };
+        Rig {
+            wall,
+            cpu,
+            sleeps,
+            throttle,
+        }
+    }
+
+    #[test]
+    fn outside_cpu_saturation_stops_repeated_full_waits() {
+        let rig = outside_cpu_rig();
+        rig.advance(Duration::from_secs(5), Duration::from_secs(80));
+        rig.throttle.check();
+        let first = rig.total_sleep();
+        assert_eq!(first, MAX_WAIT_PER_CHECK, "the first check waits it out");
+        // Every later check would otherwise wait another 190 s per file.
+        for _ in 0..10 {
+            rig.throttle.check();
+        }
+        assert_eq!(
+            rig.total_sleep(),
+            first,
+            "once outside CPU saturates the window, checks stop waiting"
+        );
+        // Saturation clears once the window drops back under budget.
+        rig.advance(Duration::from_secs(400), Duration::ZERO);
+        rig.throttle.check();
+        rig.advance(Duration::from_secs(5), Duration::from_secs(80));
+        rig.throttle.check();
+        assert!(rig.total_sleep() > first, "waiting resumes after recovery");
+    }
+
+    // ── nw-812 re-review N5: a long wait is announced ────────────────────
+
+    #[test]
+    fn a_long_wait_is_announced_once() {
+        let rig = sim_rig();
+        rig.advance(Duration::from_secs(5), Duration::from_secs(80));
+        for _ in 0..5 {
+            rig.throttle.check();
+        }
+        let notices = rig.throttle.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].contains("NESTWEAVER_INDEX_CPU_PERCENT") && notices[0].contains("waiting"),
+            "{notices:?}"
+        );
+    }
+
+    #[test]
+    fn a_short_wait_is_not_announced() {
+        let rig = sim_rig();
+        rig.advance(Duration::ZERO, Duration::from_secs(10));
+        rig.throttle.check();
+        rig.advance(Duration::from_millis(188_500), Duration::ZERO);
+        rig.throttle.sample();
+        rig.advance(Duration::ZERO, Duration::from_secs(70));
+        rig.throttle.check();
+        assert!(!rig.sleeps().is_empty(), "control: it did wait");
+        assert!(rig.total_sleep() <= Duration::from_secs(2));
+        assert!(rig.throttle.notices().is_empty());
     }
 }

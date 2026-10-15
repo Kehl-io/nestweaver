@@ -3832,11 +3832,9 @@ struct PrepareIndexResolution<'a> {
     r_uid: &'a str,
     parsed_files_for_resolver: &'a [ParsedFileEntry],
     file_languages: &'a HashMap<String, Language>,
-    ast_bindings_by_file: &'a HashMap<String, Vec<AstTypeBinding>>,
     actually_changed_files: &'a std::collections::HashSet<String>,
     files_unchanged: usize,
     resolution_deps: Option<&'a crate::resolution_cache::ResolutionDeps>,
-    cpu_throttle: &'a crate::cpu_throttle::CpuThrottle,
 }
 
 impl IndexResolution {
@@ -3855,38 +3853,19 @@ impl IndexResolution {
     }
 }
 
-/// Resolve CALLS/IMPORTS/MEMBER_OF (and inferred cross-repo links) from the
-/// in-memory parse before any graph replacement. Force re-index commits these
-/// edges in the same transaction as the replacement symbols so concurrent
-/// readers never observe a published graph that has `releaseTarget` and zero
-/// callers.
-fn prepare_index_resolution(
-    prep: PrepareIndexResolution<'_>,
-) -> Result<IndexResolution, anyhow::Error> {
-    use nestweaver_schema::ResolvedEdge;
+/// Build per-file type environments on the parse pool (nw-812: split out of
+/// [`prepare_index_resolution`] so it runs BEFORE the write gate). It is the
+/// only CPU-throttled step after parse; throttling may sleep, and sleeping
+/// while holding the write gate blocked the watcher and reconcilers too.
+fn build_type_environments(
+    reader: &dyn crate::content_reader::ContentReader,
+    parsed_files_for_resolver: &[ParsedFileEntry],
+    file_languages: &HashMap<String, Language>,
+    ast_bindings_by_file: &HashMap<String, Vec<AstTypeBinding>>,
+    cpu_throttle: &crate::cpu_throttle::CpuThrottle,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<HashMap<String, nestweaver_resolver::types::TypeEnvironment>, anyhow::Error> {
     use rayon::prelude::*;
-
-    let PrepareIndexResolution {
-        store,
-        reader,
-        r_uid,
-        parsed_files_for_resolver,
-        file_languages,
-        ast_bindings_by_file,
-        actually_changed_files,
-        files_unchanged,
-        resolution_deps,
-        cpu_throttle,
-    } = prep;
-
-    let _phase_resolve_span = tracing::info_span!("index_phase_resolve").entered();
-    let resolve_pb = ProgressBar::new_spinner();
-    resolve_pb.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} {msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-    );
-    resolve_pb.set_message("Resolving cross-file references...");
-    resolve_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
     for (file_path, _, _, _) in parsed_files_for_resolver {
         anyhow::ensure!(
@@ -3895,27 +3874,13 @@ fn prepare_index_resolution(
         );
     }
 
-    let workspace_ctx = if file_languages.values().any(|language| {
-        matches!(
-            language,
-            Language::JavaScript
-                | Language::TypeScript
-                | Language::Vue
-                | Language::Svelte
-                | Language::Astro
-        )
-    }) {
-        discover_workspace_context_with(|rel_path| {
-            reader
-                .read_file(rel_path)
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        })
-    } else {
-        Default::default()
-    };
-
     let build_env = |(file_path, symbols, _references, source_opt): &ParsedFileEntry| {
-        cpu_throttle.check();
+        cpu_throttle.check_with_cancel(cancel);
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            // The index is abandoned at the pre-write cancellation check;
+            // skip the remaining type-env work.
+            return None;
+        }
         let source_owned;
         let source: &str = if let Some(s) = source_opt.as_deref() {
             s
@@ -3945,7 +3910,7 @@ fn prepare_index_resolution(
             None
         }
     };
-    let mut type_envs: HashMap<String, nestweaver_resolver::types::TypeEnvironment> =
+    let type_envs: HashMap<String, nestweaver_resolver::types::TypeEnvironment> =
         crate::parse_pool::install_parse_pool(|| {
             parsed_files_for_resolver
                 .par_iter()
@@ -3957,6 +3922,58 @@ fn prepare_index_resolution(
         total_bindings = type_envs.values().map(|e| e.binding_count()).sum::<usize>(),
         "type environments built"
     );
+    Ok(type_envs)
+}
+
+/// Resolve CALLS/IMPORTS/MEMBER_OF (and inferred cross-repo links) from the
+/// in-memory parse before any graph replacement. Force re-index commits these
+/// edges in the same transaction as the replacement symbols so concurrent
+/// readers never observe a published graph that has `releaseTarget` and zero
+/// callers.
+fn prepare_index_resolution(
+    prep: PrepareIndexResolution<'_>,
+    mut type_envs: HashMap<String, nestweaver_resolver::types::TypeEnvironment>,
+) -> Result<IndexResolution, anyhow::Error> {
+    use nestweaver_schema::ResolvedEdge;
+
+    let PrepareIndexResolution {
+        store,
+        reader,
+        r_uid,
+        parsed_files_for_resolver,
+        file_languages,
+        actually_changed_files,
+        files_unchanged,
+        resolution_deps,
+    } = prep;
+
+    let _phase_resolve_span = tracing::info_span!("index_phase_resolve").entered();
+    let resolve_pb = ProgressBar::new_spinner();
+    resolve_pb.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    resolve_pb.set_message("Resolving cross-file references...");
+    resolve_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    let workspace_ctx = if file_languages.values().any(|language| {
+        matches!(
+            language,
+            Language::JavaScript
+                | Language::TypeScript
+                | Language::Vue
+                | Language::Svelte
+                | Language::Astro
+        )
+    }) {
+        discover_workspace_context_with(|rel_path| {
+            reader
+                .read_file(rel_path)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        })
+    } else {
+        Default::default()
+    };
 
     {
         let all_symbols_with_returns: std::collections::HashMap<
@@ -4403,9 +4420,11 @@ where
     // Immutable borrow of the parsed cache for the parallel phase.
     let pc_ref: Option<&crate::parsed_cache::ParsedCache> = parsed_cache.as_deref();
 
-    // Duty-cycle throttle for the CPU-bound phases below (parse + type-env
-    // build) — keeps an indexing daemon under runningboardd's CPU limits.
-    let cpu_throttle = crate::cpu_throttle::CpuThrottle::from_env();
+    // Rolling-window CPU budget for the CPU-bound phases below (parse +
+    // type-env build) — keeps an indexing daemon under runningboardd's CPU
+    // limit. Both phases run before the write gate is taken (nw-812). The
+    // budget is process-wide: the kill limit counts the whole daemon.
+    let cpu_throttle = crate::cpu_throttle::CpuThrottle::global();
 
     let parse_one = |(path, lang): &(PathBuf, Language)| -> ParseOutcome {
         let display_name = path
@@ -4496,7 +4515,7 @@ where
         // Parse the file (CPU-bound tree-sitter work). Throttle first so
         // a saturated daemon yields often enough to stay under its CPU
         // budget (mirrors the cancellation check above).
-        cpu_throttle.check();
+        cpu_throttle.check_with_cancel(cancel.map(|c| c.as_ref()));
         match parse_source(path, &source) {
             Ok(parsed) => {
                 parse_pb.inc(1);
@@ -4876,6 +4895,22 @@ where
         prepare_incremental_contract_derivation(reader, &r_uid, repo_url)
     };
 
+    // nw-812: type environments are CPU-throttled parse-pool work. Build
+    // them before taking the write gate so a throttle wait can never hold it.
+    let type_envs = build_type_environments(
+        reader,
+        &parsed_files_for_resolver,
+        &file_languages,
+        &ast_bindings_by_file,
+        cpu_throttle,
+        cancel.map(|c| c.as_ref()),
+    )?;
+    // The write/epilogue phase below runs under the gate and is never
+    // throttled; leave it headroom in the window first (still outside it).
+    // The reserve stays claimed until this function returns (after the
+    // write and epilogue), so concurrent indexes cannot share it.
+    let _write_reservation = cpu_throttle.reserve_write_headroom(cancel.map(|c| c.as_ref()));
+
     let mut write_guard = Some(acquire_write_guard()?);
 
     // nw-246/nw-277: minted INSIDE the write guard, not ~600 lines earlier.
@@ -5094,18 +5129,19 @@ where
             .map(|(s, sym)| (s.as_str(), sym.as_str()))
             .collect();
 
-        let resolution = prepare_index_resolution(PrepareIndexResolution {
-            store,
-            reader,
-            r_uid: &r_uid,
-            parsed_files_for_resolver: &parsed_files_for_resolver,
-            file_languages: &file_languages,
-            ast_bindings_by_file: &ast_bindings_by_file,
-            actually_changed_files: &actually_changed_files,
-            files_unchanged,
-            resolution_deps: resolution_deps.as_deref(),
-            cpu_throttle: &cpu_throttle,
-        })?;
+        let resolution = prepare_index_resolution(
+            PrepareIndexResolution {
+                store,
+                reader,
+                r_uid: &r_uid,
+                parsed_files_for_resolver: &parsed_files_for_resolver,
+                file_languages: &file_languages,
+                actually_changed_files: &actually_changed_files,
+                files_unchanged,
+                resolution_deps: resolution_deps.as_deref(),
+            },
+            type_envs,
+        )?;
         let publication_edges = resolution.all_edges();
 
         if force_reindex {
@@ -18514,6 +18550,151 @@ module.exports = { check, plain };\n";
         fn version_id(&self) -> &str {
             "test"
         }
+    }
+
+    struct ThrottleProbeReader {
+        root: PathBuf,
+    }
+
+    impl crate::content_reader::ContentReader for ThrottleProbeReader {
+        fn read_file(&self, rel_path: &Path) -> Result<String, anyhow::Error> {
+            Ok(format!(
+                "export function f_{}(x: number): number {{ const y: number = x; return y; }}",
+                rel_path.file_stem().unwrap().to_string_lossy()
+            ))
+        }
+
+        fn list_files(&self) -> Result<Vec<PathBuf>, anyhow::Error> {
+            Ok((0..4)
+                .map(|i| PathBuf::from(format!("src/m{i}.ts")))
+                .collect())
+        }
+
+        fn file_meta_nanos(&self, _rel_path: &Path) -> Result<Option<(u64, u64)>, anyhow::Error> {
+            Ok(None)
+        }
+
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        fn version_id(&self) -> &str {
+            "test"
+        }
+    }
+
+    /// nw-812: the CPU throttle may sleep, so it must never be consulted
+    /// while the write gate is held — the type-env build used to inherit the
+    /// parse phase's CPU debt and sleep under the gate, blocking the watcher
+    /// and reconcilers too.
+    #[test]
+    fn cpu_throttle_is_not_consulted_while_the_write_gate_is_held() {
+        struct Probe {
+            throttle: &'static crate::cpu_throttle::CpuThrottle,
+            events: std::sync::Arc<std::sync::Mutex<Vec<(&'static str, usize)>>>,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let checks = crate::cpu_throttle::test_seam::checks(self.throttle);
+                self.events.lock().unwrap().push(("release", checks));
+            }
+        }
+
+        // The index entry point fetches `CpuThrottle::global()` on this
+        // thread, so it gets this counting throttle.
+        let throttle = crate::cpu_throttle::test_seam::install_counting_throttle();
+        let tmp = tempfile::tempdir().unwrap();
+        let reader = ThrottleProbeReader {
+            root: tmp.path().to_path_buf(),
+        };
+        let store = GraphStore::in_memory().unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        index_with_reader_and_write_gate(
+            &reader,
+            &store,
+            "test",
+            "file://throttle-gate",
+            "abc",
+            None,
+            None,
+            || {
+                let checks = crate::cpu_throttle::test_seam::checks(throttle);
+                events.lock().unwrap().push(("acquire", checks));
+                Ok::<_, anyhow::Error>(Probe {
+                    throttle,
+                    events: std::sync::Arc::clone(&events),
+                })
+            },
+        )
+        .unwrap();
+
+        let events = events.lock().unwrap().clone();
+        let acquired = events.iter().find(|(e, _)| *e == "acquire").unwrap().1;
+        let released = events
+            .iter()
+            .rev()
+            .find(|(e, _)| *e == "release")
+            .unwrap()
+            .1;
+        // Parse (4 files) and type-env build (4 files) both check per file,
+        // plus the write-headroom reserve: all before the gate.
+        assert!(
+            acquired >= 9,
+            "parse and type-env checks must all happen before the gate: {events:?}"
+        );
+        assert_eq!(
+            acquired, released,
+            "the throttle was consulted while the write gate was held: {events:?}"
+        );
+    }
+
+    /// nw-812 review M2: once the index is cancelled, the type-env build
+    /// stops doing work for the remaining files.
+    #[test]
+    fn type_env_build_stops_early_on_cancel() {
+        let throttle = crate::cpu_throttle::test_seam::install_counting_throttle();
+        let tmp = tempfile::tempdir().unwrap();
+        let reader = ThrottleProbeReader {
+            root: tmp.path().to_path_buf(),
+        };
+        let source =
+            "class Foo { bar() {} }\nfunction f() { const foo: Foo = new Foo(); foo.bar(); }\n";
+        let parsed = nestweaver_parser::parse_source(Path::new("src/a.ts"), source).unwrap();
+        let entries: Vec<ParsedFileEntry> = vec![(
+            "src/a.ts".to_string(),
+            parsed.symbols.clone(),
+            parsed.references.clone(),
+            Some(source.to_string()),
+        )];
+        let languages = HashMap::from([("src/a.ts".to_string(), Language::TypeScript)]);
+        let bindings = HashMap::new();
+        let live = std::sync::atomic::AtomicBool::new(false);
+        let built = build_type_environments(
+            &reader,
+            &entries,
+            &languages,
+            &bindings,
+            throttle,
+            Some(&live),
+        )
+        .unwrap();
+        assert_eq!(built.len(), 1, "control: the file has type bindings");
+
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let built = build_type_environments(
+            &reader,
+            &entries,
+            &languages,
+            &bindings,
+            throttle,
+            Some(&cancelled),
+        )
+        .unwrap();
+        assert!(
+            built.is_empty(),
+            "a cancelled index must not build type envs"
+        );
     }
 
     #[test]

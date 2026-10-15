@@ -3809,8 +3809,10 @@ where
     // multi-core execution.
     use rayon::prelude::*;
 
-    // Same duty-cycle budget as the code-parse phase (see index.rs).
-    let cpu_throttle = crate::cpu_throttle::CpuThrottle::from_env();
+    // Same rolling-window CPU budget as the code-parse phase (see
+    // `cpu_throttle`). Parse runs before the write gate is taken, so any
+    // wait here never blocks other writers.
+    let cpu_throttle = crate::cpu_throttle::CpuThrottle::global();
 
     let parse_one = |scanned: &ScannedNote| -> NoteOutcome {
         cpu_throttle.check();
@@ -4110,6 +4112,11 @@ where
     // gate closure also performs the job-cancellation check in server mode, so
     // a cancelled job returns here after the off-lock parse — matching the code
     // path's behaviour exactly.
+    //
+    // nw-812: the write region is not CPU-throttled, so leave it headroom in
+    // the process-wide window first — before, never under, the gate.
+    let _write_reservation =
+        crate::cpu_throttle::CpuThrottle::global().reserve_write_headroom(None);
     let _write_guard = acquire_write_guard()?;
 
     // Whether this vault was already indexed. If so, the atomic reindex write

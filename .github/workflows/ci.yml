@@ -48,6 +48,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # nw-812: the index CPU budget is process-wide; test binaries and the
+  # daemons they start run many indexes at once, so disable it for CI.
+  NESTWEAVER_INDEX_CPU_PERCENT: "0"
   LBUG_BUILD_FROM_SOURCE: "1"
   CFLAGS: "-DZSTD_DISABLE_ASM"
   # mold, purely for link speed. Set as an env override rather than appended to
