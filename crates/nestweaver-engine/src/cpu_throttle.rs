@@ -3,9 +3,15 @@
 //! A daemon that saturates every core with tree-sitter parses can trip
 //! runningboardd's CPU limit on macOS (observed: killed after a 90 s-CPU /
 //! 180 s-window violation mid-index). `CpuThrottle` enforces that limit the
-//! way it is defined: it tracks process CPU time (`getrusage(RUSAGE_SELF)`,
-//! all threads summed) over a rolling 180 s window and only sleeps when the
-//! window's total would exceed a budget set safely below the kill line.
+//! way it is defined: it tracks the daemon's process CPU time
+//! (`getrusage(RUSAGE_SELF)`, all threads summed) over a rolling 180 s window
+//! and only sleeps when the window's total would exceed a budget set safely
+//! below the kill line.
+//!
+//! The limit is per PROCESS, so there is one budget per process
+//! ([`CpuThrottle::global`]): back-to-back indexes (boot reconcile of several
+//! repos, a watcher batch plus a forced index, code then vault) share it, and
+//! CPU spent before the throttle is first consulted is billed too.
 //!
 //! nw-812: this replaced a 5 s duty-cycle window that budgeted half of ONE
 //! core for the whole multi-threaded process and billed nothing for the first
@@ -24,12 +30,12 @@
 //!   sleep per file).
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 /// Environment variable selecting the budget, as the average percentage of
-/// ONE core the indexing process may use over the rolling 180 s window (the
+/// ONE core the daemon process may use over the rolling 180 s window (the
 /// same unit macOS reports for its own limit: 90 s / 180 s is 50%). `0` or
 /// `>= 100` disables the throttle; values above [`MAX_PERCENT`] are clamped.
 const ENV_VAR: &str = "NESTWEAVER_INDEX_CPU_PERCENT";
@@ -60,6 +66,9 @@ const MAX_WAIT_PER_CHECK: Duration = Duration::from_secs(190);
 /// notices cancellation promptly.
 const MAX_SLEEP: Duration = Duration::from_millis(250);
 
+/// The process-wide throttle. See [`CpuThrottle::global`].
+static THROTTLE: OnceLock<CpuThrottle> = OnceLock::new();
+
 /// Shared rolling-window CPU budget. Interior mutability (a `Mutex` over the
 /// window) lets one `&CpuThrottle` be captured by every rayon worker.
 pub struct CpuThrottle {
@@ -71,12 +80,15 @@ pub struct CpuThrottle {
     window: Mutex<Window>,
     /// nw-812 test seam: how many times [`check`](Self::check) ran.
     #[cfg(test)]
-    checks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    checks: std::sync::atomic::AtomicUsize,
 }
 
-/// CPU consumed per [`SUB_WINDOW`] bucket since the throttle was created.
+/// CPU consumed per [`SUB_WINDOW`] bucket.
 struct Window {
-    /// Process CPU time at the last measurement.
+    /// Wall time of the last measurement.
+    last_wall: Duration,
+    /// Process CPU time at the last measurement. Starts at ZERO: CPU the
+    /// process used before the throttle existed is billed, not forgiven.
     last_cpu: Duration,
     /// `(bucket index, CPU billed to it)`, oldest first. Bucket `i` covers
     /// wall time `[i * SUB_WINDOW, (i + 1) * SUB_WINDOW)`.
@@ -84,17 +96,36 @@ struct Window {
 }
 
 impl Window {
-    /// Bill CPU used since the last measurement to the current bucket and
-    /// drop buckets that have rolled entirely out of the window. A bucket is
-    /// kept while any part of it is inside the window, so the measured total
-    /// covers up to WINDOW + SUB_WINDOW — conservative, never under-counting.
+    /// Bill CPU used since the last measurement and drop buckets that have
+    /// rolled entirely out of the window.
+    ///
+    /// CPU used across a gap between measurements is spread evenly over the
+    /// gap's buckets (only the part still inside the window counts), so a
+    /// throttle first consulted long after boot does not bill hours of
+    /// background CPU as one burst. A gap of zero bills the current bucket.
+    /// A bucket is kept while any part of it is inside the window, so the
+    /// measured total covers up to WINDOW + SUB_WINDOW — conservative.
     fn update(&mut self, now_wall: Duration, now_cpu: Duration) {
         let used = now_cpu.saturating_sub(self.last_cpu);
         self.last_cpu = self.last_cpu.max(now_cpu);
+        let from = self.last_wall.min(now_wall);
+        self.last_wall = now_wall;
+        let gap = now_wall - from;
         let current = bucket_index(now_wall);
-        match self.buckets.back_mut() {
-            Some((index, cpu)) if *index == current => *cpu += used,
-            _ => self.buckets.push_back((current, used)),
+        if gap.is_zero() || used.is_zero() {
+            self.bill(current, used);
+        } else {
+            // Only buckets that can still be inside the window get a share.
+            let horizon = now_wall.saturating_sub(WINDOW + SUB_WINDOW);
+            let first = bucket_index(from.max(horizon));
+            let rate = used.as_secs_f64() / gap.as_secs_f64();
+            for index in first..=current {
+                let start = bucket_start(index).max(from);
+                let end = bucket_start(index + 1).min(now_wall);
+                if end > start {
+                    self.bill(index, (end - start).mul_f64(rate));
+                }
+            }
         }
         while let Some(&(index, _)) = self.buckets.front() {
             if bucket_expiry(index) <= now_wall {
@@ -102,6 +133,13 @@ impl Window {
             } else {
                 break;
             }
+        }
+    }
+
+    fn bill(&mut self, index: u64, cpu: Duration) {
+        match self.buckets.back_mut() {
+            Some((last, total)) if *last == index => *total += cpu,
+            _ => self.buckets.push_back((index, cpu)),
         }
     }
 
@@ -130,16 +168,31 @@ fn bucket_index(wall: Duration) -> u64 {
     (wall.as_nanos() / SUB_WINDOW.as_nanos()) as u64
 }
 
+fn bucket_start(index: u64) -> Duration {
+    SUB_WINDOW * u32::try_from(index).unwrap_or(u32::MAX)
+}
+
 /// Wall time at which bucket `index` has fully left the rolling window.
 fn bucket_expiry(index: u64) -> Duration {
-    SUB_WINDOW * u32::try_from(index + 1).unwrap_or(u32::MAX) + WINDOW
+    bucket_start(index + 1) + WINDOW
 }
 
 impl CpuThrottle {
+    /// The process-wide throttle, built from `NESTWEAVER_INDEX_CPU_PERCENT`
+    /// on first use (the env is read once). The daemon touches it at boot so
+    /// its wall clock starts with the process.
+    pub fn global() -> &'static CpuThrottle {
+        #[cfg(test)]
+        if let Some(installed) = test_seam::installed() {
+            return installed;
+        }
+        THROTTLE.get_or_init(Self::from_env)
+    }
+
     /// Build from `NESTWEAVER_INDEX_CPU_PERCENT` (default 40; `0` or
     /// `>= 100` produces an inert throttle whose [`check`](Self::check)
     /// never sleeps).
-    pub fn from_env() -> Self {
+    fn from_env() -> Self {
         Self::from_env_value(std::env::var(ENV_VAR).ok().as_deref())
     }
 
@@ -169,21 +222,19 @@ impl CpuThrottle {
         sleep: Box<dyn Fn(Duration) + Send + Sync>,
     ) -> Self {
         let window = Window {
-            last_cpu: cpu_clock(),
+            last_wall: wall_clock(),
+            last_cpu: Duration::ZERO,
             buckets: VecDeque::new(),
         };
-        let throttle = Self {
+        Self {
             target,
             wall_clock,
             cpu_clock,
             sleep,
             window: Mutex::new(window),
             #[cfg(test)]
-            checks: std::sync::Arc::default(),
-        };
-        #[cfg(test)]
-        test_seam::register(&throttle.checks);
-        throttle
+            checks: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 
     /// Called from parallel workers before a unit of CPU-bound work. Cheap
@@ -231,25 +282,35 @@ impl CpuThrottle {
     }
 }
 
-/// nw-812 test seam: the most recently created throttle's check counter, per
-/// creating thread, so an index test can observe its own throttle.
+/// nw-812 test seam. A test installs its own throttle on its thread, and
+/// [`CpuThrottle::global`] returns it to code running on that thread (the
+/// index entry points, which hand the reference to their parse workers).
+/// Checks are counted per installed throttle, so parallel tests indexing
+/// through the real global never disturb the count.
 #[cfg(test)]
 pub(crate) mod test_seam {
-    use std::cell::RefCell;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use super::CpuThrottle;
+    use std::cell::Cell;
+    use std::sync::atomic::Ordering;
 
     thread_local! {
-        static LAST: RefCell<Option<Arc<AtomicUsize>>> = const { RefCell::new(None) };
+        static INSTALLED: Cell<Option<&'static CpuThrottle>> = const { Cell::new(None) };
     }
 
-    pub(super) fn register(checks: &Arc<AtomicUsize>) {
-        LAST.with(|last| *last.borrow_mut() = Some(Arc::clone(checks)));
+    /// Install a disabled (never-sleeping) counting throttle for this thread.
+    pub(crate) fn install_counting_throttle() -> &'static CpuThrottle {
+        let throttle: &'static CpuThrottle = Box::leak(Box::new(CpuThrottle::new(None)));
+        INSTALLED.with(|cell| cell.set(Some(throttle)));
+        throttle
     }
 
-    /// Checks made so far by the last throttle created on this thread.
-    pub(crate) fn last_throttle_checks() -> Option<usize> {
-        LAST.with(|last| last.borrow().as_ref().map(|c| c.load(Ordering::SeqCst)))
+    pub(super) fn installed() -> Option<&'static CpuThrottle> {
+        INSTALLED.with(Cell::get)
+    }
+
+    /// Checks made so far by `throttle`.
+    pub(crate) fn checks(throttle: &CpuThrottle) -> usize {
+        throttle.checks.load(Ordering::SeqCst)
     }
 }
 
@@ -293,6 +354,30 @@ mod tests {
     fn rig(target: Option<Duration>) -> Rig {
         let wall = Arc::new(StdMutex::new(Duration::ZERO));
         let cpu = Arc::new(StdMutex::new(Duration::ZERO));
+        let sleeps = Arc::new(StdMutex::new(Vec::new()));
+        let throttle = {
+            let wall = Arc::clone(&wall);
+            let cpu = Arc::clone(&cpu);
+            let sleeps = Arc::clone(&sleeps);
+            CpuThrottle::with_clocks(
+                target,
+                Box::new(move || *wall.lock().unwrap_or_else(|p| p.into_inner())),
+                Box::new(move || *cpu.lock().unwrap_or_else(|p| p.into_inner())),
+                Box::new(move |d| sleeps.lock().unwrap_or_else(|p| p.into_inner()).push(d)),
+            )
+        };
+        Rig {
+            wall,
+            cpu,
+            sleeps,
+            throttle,
+        }
+    }
+
+    /// A fresh throttle over the same injected clocks as `other`.
+    fn rig_like(other: &Rig, target: Option<Duration>) -> Rig {
+        let wall = Arc::clone(&other.wall);
+        let cpu = Arc::clone(&other.cpu);
         let sleeps = Arc::new(StdMutex::new(Vec::new()));
         let throttle = {
             let wall = Arc::clone(&wall);
@@ -561,5 +646,49 @@ mod tests {
         // checks proceed without paying anything per file.
         assert_eq!(few_max, few);
         assert_eq!(many_max, many);
+    }
+
+    // ── nw-812 review C1: one process-wide budget ────────────────────────
+
+    #[test]
+    fn cpu_spent_before_the_throttle_existed_is_billed() {
+        // runningboardd counts the PROCESS, so CPU burned before this
+        // throttle was first consulted (an earlier index, boot work) must
+        // count against the window rather than being forgiven at creation.
+        let rig = rig(secs(72));
+        rig.advance(Duration::ZERO, Duration::from_secs(80));
+        // Rebuild the throttle now that 80 s of CPU is already on the clock.
+        let rig = rig_like(&rig, secs(72));
+        rig.throttle.check();
+        assert!(
+            !rig.sleeps().is_empty(),
+            "80 s of prior process CPU against a 72 s budget must wait"
+        );
+    }
+
+    #[test]
+    fn back_to_back_indexes_share_one_budget() {
+        let rig = sim_rig();
+        let burst = |rig: &Rig| {
+            let before = rig.total_sleep();
+            for _ in 0..660 {
+                rig.throttle.check();
+                rig.advance(
+                    Duration::from_secs_f64(6.0 / 660.0),
+                    Duration::from_millis(100),
+                );
+            }
+            rig.total_sleep() - before
+        };
+        assert_eq!(burst(&rig), Duration::ZERO, "the first index runs free");
+        assert!(
+            burst(&rig) > Duration::ZERO,
+            "a second index right behind it must wait for the shared window"
+        );
+    }
+
+    #[test]
+    fn global_throttle_is_one_process_wide_instance() {
+        assert!(std::ptr::eq(CpuThrottle::global(), CpuThrottle::global()));
     }
 }

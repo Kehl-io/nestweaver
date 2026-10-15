@@ -3812,7 +3812,7 @@ where
     // Same rolling-window CPU budget as the code-parse phase (see
     // `cpu_throttle`). Parse runs before the write gate is taken, so any
     // wait here never blocks other writers.
-    let cpu_throttle = crate::cpu_throttle::CpuThrottle::from_env();
+    let cpu_throttle = crate::cpu_throttle::CpuThrottle::global();
 
     let parse_one = |scanned: &ScannedNote| -> NoteOutcome {
         cpu_throttle.check();

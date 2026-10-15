@@ -14331,6 +14331,9 @@ pub async fn run_server(
         db_path,
         config_path.is_some() || server_opts.is_some(),
     )?;
+    // nw-812: start the process-wide index CPU budget with the daemon, so CPU
+    // spent before the first index is billed across the time it was spent.
+    nestweaver_engine::cpu_throttle::CpuThrottle::global();
     // Idle-timeout counts only gRPC/UDS reads+writes (active_reads/active_writes)
     // and indexing — the MCP-over-HTTP path (server mode only) does NOT bump them,
     // so an idle timer would treat an actively-querying MCP client as idle and

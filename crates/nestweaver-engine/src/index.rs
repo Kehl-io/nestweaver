@@ -4417,8 +4417,9 @@ where
 
     // Rolling-window CPU budget for the CPU-bound phases below (parse +
     // type-env build) — keeps an indexing daemon under runningboardd's CPU
-    // limit. Both phases run before the write gate is taken (nw-812).
-    let cpu_throttle = crate::cpu_throttle::CpuThrottle::from_env();
+    // limit. Both phases run before the write gate is taken (nw-812). The
+    // budget is process-wide: the kill limit counts the whole daemon.
+    let cpu_throttle = crate::cpu_throttle::CpuThrottle::global();
 
     let parse_one = |(path, lang): &(PathBuf, Language)| -> ParseOutcome {
         let display_name = path
@@ -4896,10 +4897,9 @@ where
         &parsed_files_for_resolver,
         &file_languages,
         &ast_bindings_by_file,
-        &cpu_throttle,
+        cpu_throttle,
         cancel.map(|c| c.as_ref()),
     )?;
-    drop(cpu_throttle);
 
     let mut write_guard = Some(acquire_write_guard()?);
 
@@ -18580,15 +18580,19 @@ module.exports = { check, plain };\n";
     #[test]
     fn cpu_throttle_is_not_consulted_while_the_write_gate_is_held() {
         struct Probe {
+            throttle: &'static crate::cpu_throttle::CpuThrottle,
             events: std::sync::Arc<std::sync::Mutex<Vec<(&'static str, usize)>>>,
         }
         impl Drop for Probe {
             fn drop(&mut self) {
-                let checks = crate::cpu_throttle::test_seam::last_throttle_checks().unwrap();
+                let checks = crate::cpu_throttle::test_seam::checks(self.throttle);
                 self.events.lock().unwrap().push(("release", checks));
             }
         }
 
+        // The index entry point fetches `CpuThrottle::global()` on this
+        // thread, so it gets this counting throttle.
+        let throttle = crate::cpu_throttle::test_seam::install_counting_throttle();
         let tmp = tempfile::tempdir().unwrap();
         let reader = ThrottleProbeReader {
             root: tmp.path().to_path_buf(),
@@ -18605,10 +18609,10 @@ module.exports = { check, plain };\n";
             None,
             None,
             || {
-                let checks = crate::cpu_throttle::test_seam::last_throttle_checks()
-                    .expect("the index created its CPU throttle before the gate");
+                let checks = crate::cpu_throttle::test_seam::checks(throttle);
                 events.lock().unwrap().push(("acquire", checks));
                 Ok::<_, anyhow::Error>(Probe {
+                    throttle,
                     events: std::sync::Arc::clone(&events),
                 })
             },
