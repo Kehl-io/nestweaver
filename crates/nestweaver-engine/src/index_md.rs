@@ -4115,7 +4115,8 @@ where
     //
     // nw-812: the write region is not CPU-throttled, so leave it headroom in
     // the process-wide window first — before, never under, the gate.
-    crate::cpu_throttle::CpuThrottle::global().reserve_write_headroom(None);
+    let _write_reservation =
+        crate::cpu_throttle::CpuThrottle::global().reserve_write_headroom(None);
     let _write_guard = acquire_write_guard()?;
 
     // Whether this vault was already indexed. If so, the atomic reindex write

@@ -115,6 +115,8 @@ struct Window {
     buckets: VecDeque<(u64, Duration)>,
     /// Wall time of the last "budget spent" debug line (rate limit).
     last_log: Option<Duration>,
+    /// Write reserves currently claimed by indexes in their write phase.
+    claimed: Duration,
 }
 
 impl Window {
@@ -260,6 +262,7 @@ impl CpuThrottle {
             last_cpu: Duration::ZERO,
             buckets: VecDeque::new(),
             last_log: None,
+            claimed: Duration::ZERO,
         };
         Self {
             target,
@@ -284,18 +287,33 @@ impl CpuThrottle {
         #[cfg(test)]
         self.checks.fetch_add(1, Ordering::Relaxed);
         let Some(budget) = self.target else { return };
-        self.wait_within(budget, cancel);
+        self.wait_within(budget, cancel, false);
     }
 
     /// Called once before an index takes its write gate (never under it):
     /// waits until the window is at most `budget - WRITE_RESERVE`, so the
     /// unthrottled write phase cannot carry the window past the budget by
     /// more than the reserve. Stops waiting as soon as `cancel` is set.
-    pub fn reserve_write_headroom(&self, cancel: Option<&AtomicBool>) {
+    ///
+    /// The reserve is CLAIMED until the returned guard drops (hold it until
+    /// the write and epilogue finish): while claimed it counts against the
+    /// window for every other index's reserve, so concurrent indexes cannot
+    /// all pass the check together and then add their write CPU serially.
+    #[must_use = "the write reserve is released when the guard drops"]
+    pub fn reserve_write_headroom(&self, cancel: Option<&AtomicBool>) -> WriteReservation<'_> {
         #[cfg(test)]
         self.checks.fetch_add(1, Ordering::Relaxed);
-        let Some(budget) = self.target else { return };
-        self.wait_within(budget.saturating_sub(WRITE_RESERVE), cancel);
+        let Some(budget) = self.target else {
+            return WriteReservation {
+                throttle: self,
+                claimed: Duration::ZERO,
+            };
+        };
+        self.wait_within(budget.saturating_sub(WRITE_RESERVE), cancel, true);
+        WriteReservation {
+            throttle: self,
+            claimed: WRITE_RESERVE,
+        }
     }
 
     /// End every current and future wait (sticky). The daemon calls this
@@ -308,13 +326,26 @@ impl CpuThrottle {
     }
 
     /// Wait (in [`MAX_SLEEP`] slices, at most [`MAX_WAIT_PER_CHECK`]) until
-    /// the window's total is at most `limit`.
-    fn wait_within(&self, limit: Duration, cancel: Option<&AtomicBool>) {
+    /// the window's total is at most `limit`. With `claim`, write reserves
+    /// already claimed by other indexes count against `limit`, and this
+    /// call's reserve is claimed (under the same lock) when it stops waiting
+    /// — including on cancellation or timeout, so the guard's release always
+    /// balances.
+    fn wait_within(&self, limit: Duration, cancel: Option<&AtomicBool>, claim: bool) {
         let mut slept = Duration::ZERO;
+        let claim_now = || {
+            if claim {
+                self.window
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .claimed += WRITE_RESERVE;
+            }
+        };
         while slept < MAX_WAIT_PER_CHECK {
             if self.interrupted.load(Ordering::Relaxed)
                 || cancel.is_some_and(|c| c.load(Ordering::Relaxed))
             {
+                claim_now();
                 return;
             }
             let wait = {
@@ -327,7 +358,15 @@ impl CpuThrottle {
                 let now_cpu = (self.cpu_clock)();
                 window.update(now_wall, now_cpu);
                 let total = window.total();
+                let limit = if claim {
+                    limit.saturating_sub(window.claimed)
+                } else {
+                    limit
+                };
                 if total <= limit {
+                    if claim {
+                        window.claimed += WRITE_RESERVE;
+                    }
                     return;
                 }
                 // Rate-limited: one line per sub-window, however many
@@ -344,15 +383,22 @@ impl CpuThrottle {
                         "index CPU budget for the rolling 180 s window spent; waiting"
                     );
                 }
-                window.wait_until_within(limit, now_wall)
+                match window.wait_until_within(limit, now_wall) {
+                    // Only another index's claimed reserve is in the way:
+                    // poll until it is released.
+                    wait if wait.is_zero() && claim => MAX_SLEEP,
+                    wait => wait,
+                }
             };
             let nap = wait.min(MAX_SLEEP).min(MAX_WAIT_PER_CHECK - slept);
             if nap.is_zero() {
+                claim_now();
                 return;
             }
             (self.sleep)(nap);
             slept += nap;
         }
+        claim_now();
     }
 
     /// Bill CPU used since the last measurement to the current bucket,
@@ -373,6 +419,25 @@ impl CpuThrottle {
         let mut window = self.window.lock().unwrap_or_else(|p| p.into_inner());
         window.update((self.wall_clock)(), (self.cpu_clock)());
         window.total()
+    }
+}
+
+/// A claimed write reserve; see [`CpuThrottle::reserve_write_headroom`].
+pub struct WriteReservation<'a> {
+    throttle: &'a CpuThrottle,
+    claimed: Duration,
+}
+
+impl Drop for WriteReservation<'_> {
+    fn drop(&mut self) {
+        if !self.claimed.is_zero() {
+            let mut window = self
+                .throttle
+                .window
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            window.claimed = window.claimed.saturating_sub(self.claimed);
+        }
     }
 }
 
@@ -808,7 +873,7 @@ mod tests {
             rig.advance(Duration::from_millis(10), Duration::from_millis(100));
         }
         assert!(rig.sleeps().is_empty(), "60 s is under budget");
-        rig.throttle.reserve_write_headroom(None);
+        let _reserve = rig.throttle.reserve_write_headroom(None);
         assert!(!rig.sleeps().is_empty(), "60 s leaves no write reserve");
         assert!(
             rig.throttle.window_total() <= Duration::from_secs(72) - WRITE_RESERVE,
@@ -821,7 +886,7 @@ mod tests {
     fn write_headroom_needs_no_wait_when_already_available() {
         let rig = sim_rig();
         rig.advance(Duration::from_secs(5), Duration::from_secs(40));
-        rig.throttle.reserve_write_headroom(None);
+        let _reserve = rig.throttle.reserve_write_headroom(None);
         assert!(rig.sleeps().is_empty());
     }
 
@@ -835,7 +900,7 @@ mod tests {
         rig.advance(Duration::from_secs(5), Duration::from_secs(80));
         rig.throttle.interrupt_waits();
         rig.throttle.check();
-        rig.throttle.reserve_write_headroom(None);
+        let _reserve = rig.throttle.reserve_write_headroom(None);
         assert!(rig.sleeps().is_empty(), "slept {:?}", rig.sleeps().len());
     }
 
@@ -912,5 +977,30 @@ mod tests {
         let rig = sim_rig();
         hour_idle_then_late_burn(&rig, false);
         assert_eq!(eleven_core_burst(&rig), Duration::ZERO);
+    }
+
+    // ── nw-812 re-review N3: one write reserve per index ─────────────────
+
+    #[test]
+    fn concurrent_indexes_cannot_share_one_write_reserve() {
+        // Two indexes reach their write gates together with the window at
+        // 40 s. Each write adds ~14 s unthrottled, so both passing a 52 s
+        // check would carry the window to 68 s+. The reserve is claimed per
+        // index until its write finishes.
+        let rig = sim_rig();
+        rig.advance(Duration::from_secs(5), Duration::from_secs(40));
+        let first = rig.throttle.reserve_write_headroom(None);
+        assert!(rig.sleeps().is_empty(), "the first index has headroom");
+        let second = rig.throttle.reserve_write_headroom(None);
+        assert!(
+            !rig.sleeps().is_empty(),
+            "the second index must wait while the first holds the reserve"
+        );
+        drop(second);
+        drop(first);
+        let slept = rig.sleeps().len();
+        let third = rig.throttle.reserve_write_headroom(None);
+        assert_eq!(rig.sleeps().len(), slept, "released reserves are reusable");
+        drop(third);
     }
 }

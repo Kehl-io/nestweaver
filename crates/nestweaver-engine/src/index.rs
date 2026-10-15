@@ -4907,7 +4907,9 @@ where
     )?;
     // The write/epilogue phase below runs under the gate and is never
     // throttled; leave it headroom in the window first (still outside it).
-    cpu_throttle.reserve_write_headroom(cancel.map(|c| c.as_ref()));
+    // The reserve stays claimed until this function returns (after the
+    // write and epilogue), so concurrent indexes cannot share it.
+    let _write_reservation = cpu_throttle.reserve_write_headroom(cancel.map(|c| c.as_ref()));
 
     let mut write_guard = Some(acquire_write_guard()?);
 
