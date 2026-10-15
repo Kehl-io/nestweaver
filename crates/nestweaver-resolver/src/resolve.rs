@@ -904,7 +904,7 @@ fn resolve_single_reference(
     });
     let binding = module_binding.or_else(|| {
         graph.bindings_of(file_path).iter().find(|binding| {
-            let owner = find_enclosing_symbol(sorted_syms, binding.start_line).symbol();
+            let owner = scoping_owner(sorted_syms, binding.start_line, language);
             let in_scope =
                 if let (Some(binding_scope), Some(call_scope)) = (binding.scope, reference.scope) {
                     binding_scope.start <= call_scope.position
@@ -989,7 +989,7 @@ fn resolve_single_reference(
                     binding
                         .scope
                         .is_some_and(|scope| *width < scope.end - scope.start)
-                        || nested_inside_binding(sorted_syms, sym, reference, binding)
+                        || nested_inside_binding(sorted_syms, sym, reference, binding, language)
                 })
             })
             .map(|(_, candidate)| candidate)
@@ -2263,6 +2263,7 @@ fn nested_inside_binding(
     sym: &RawSymbol,
     reference: &RawReference,
     binding: &NamedBinding,
+    language: Language,
 ) -> bool {
     if sym.kind != SymbolKind::Function {
         return false;
@@ -2288,7 +2289,7 @@ fn nested_inside_binding(
     else {
         return false;
     };
-    let binding_owner = find_enclosing_symbol(sorted_syms, binding.start_line).symbol();
+    let binding_owner = scoping_owner(sorted_syms, binding.start_line, language);
     matches!(container.kind, SymbolKind::Function | SymbolKind::Method)
         && contains(container, reference.start_line)
         && binding_owner.is_none_or(|owner| {
@@ -2552,6 +2553,35 @@ fn can_contain_code(symbol: &RawSymbol) -> bool {
 /// start_line`) and report it as `Degenerate`. Symbols with real spans that
 /// ended before `ref_line` still yield `ModuleScope` — module-level code
 /// belongs to no symbol.
+/// nw-113: the symbol whose body scopes a binding declared on `line`, or
+/// `None` for module scope. Only an exact span scopes. JS/TS/Python/PHP spans
+/// are exact (the languages that mint a `<module>` owner), so a degenerate
+/// guess there is module-level code: it reads as module scope, mirroring how
+/// `resolve_single_reference` maps a degenerate call source to the owner. In
+/// other languages the guess stands, matching the source it is compared to.
+fn scoping_owner<'a>(
+    sorted_syms: &'a [&'a RawSymbol],
+    line: u32,
+    language: Language,
+) -> Option<&'a RawSymbol> {
+    match find_enclosing_symbol(sorted_syms, line) {
+        Enclosing::Exact(symbol) => Some(symbol),
+        Enclosing::Degenerate(_) if has_exact_spans(language) => None,
+        Enclosing::Degenerate(symbol) => Some(symbol),
+        Enclosing::ModuleScope => None,
+    }
+}
+
+/// The languages whose code-bearing spans always cover their bodies, so a
+/// line outside every span is module-level code (and may get a `<module>`
+/// owner).
+fn has_exact_spans(language: Language) -> bool {
+    matches!(
+        language,
+        Language::JavaScript | Language::TypeScript | Language::Python | Language::Php
+    )
+}
+
 fn find_enclosing_symbol<'a>(symbols: &'a [&'a RawSymbol], ref_line: u32) -> Enclosing<'a> {
     debug_assert!(
         symbols
@@ -10033,6 +10063,100 @@ export function readIt() { return value(); }
             !files[1].1.iter().any(|s| s.is_module_owner()),
             "{:?}",
             files[1].1
+        );
+    }
+
+    /// nw-113 final review I1: an aliased import below a one-line function is
+    /// module scope, not the one-line function's. The degenerate fallback
+    /// guesses that function as the binding's owner, while the call's source is
+    /// the `<module>` owner, so the binding read as out of scope and the call
+    /// had no edge (baseline: `one -> lib.helper`).
+    #[test]
+    fn an_aliased_python_import_after_a_one_line_function_still_binds() {
+        let lib = ("lib.py", "def helper():\n    return 1\n");
+        let main = (
+            "main3.py",
+            "def one(): return 1\nfrom lib import helper as h\nh()\n",
+        );
+        let (files, edges) = review_edges(&[lib, main], Language::Python);
+        assert_eq!(
+            call_targets(
+                &files,
+                &edges,
+                "main3.py",
+                nestweaver_schema::MODULE_OWNER_NAME
+            ),
+            vec![uid(&files, "lib.py", "helper")],
+            "{edges:#?}"
+        );
+        // The same import is module scope for a later function too, in a file
+        // with no top-level call (so no owner).
+        let later = (
+            "later.py",
+            "def one(): return 1\nfrom lib import helper as h\ndef two():\n    return h()\n",
+        );
+        let (files, edges) = review_edges(&[lib, later], Language::Python);
+        assert_eq!(
+            call_targets(&files, &edges, "later.py", "two"),
+            vec![uid(&files, "lib.py", "helper")],
+            "{edges:#?}"
+        );
+    }
+
+    /// nw-113 final review I1: an npm import below a one-line arrow is module
+    /// scope, so a function nested in `g` still shadows it inside `g`.
+    #[test]
+    fn a_nested_function_shadows_an_npm_import_below_a_one_line_function() {
+        for (path, language, head) in [
+            (
+                "src/degen.ts",
+                Language::TypeScript,
+                "export const id = (x: number) => x;\nimport { f } from \"react\";\n",
+            ),
+            (
+                "src/degen.js",
+                Language::JavaScript,
+                "export const id = (x) => x;\nimport { f } from \"react\";\n",
+            ),
+            (
+                "src/degen_cjs.js",
+                Language::JavaScript,
+                "const id = (x) => x;\nconst { f } = require(\"react\");\n",
+            ),
+        ] {
+            // Multi-line, so the call's line belongs to `g` alone (one-line
+            // code is credited per line, a known residual).
+            let source = format!(
+                "{head}function g() {{\n  function f() {{ return 1; }}\n  return f();\n}}\n"
+            );
+            let (files, edges) = review_edges(&[(path, &source)], language);
+            assert_eq!(
+                call_targets(&files, &edges, path, "g"),
+                vec![uid_at(&files, path, "f", 4)],
+                "{path}: {edges:#?}"
+            );
+        }
+    }
+
+    /// nw-113 final review I1 (JS): a module-level aliased import below a
+    /// one-line arrow binds a top-level call.
+    #[test]
+    fn an_aliased_js_import_after_a_one_line_function_still_binds() {
+        let lib = ("src/lib.js", "export function helper() { return 1; }\n");
+        let main = (
+            "src/main.js",
+            "export const one = () => 1;\nimport { helper as h } from './lib';\nh();\n",
+        );
+        let (files, edges) = review_edges(&[lib, main], Language::JavaScript);
+        assert_eq!(
+            call_targets(
+                &files,
+                &edges,
+                "src/main.js",
+                nestweaver_schema::MODULE_OWNER_NAME
+            ),
+            vec![uid(&files, "src/lib.js", "helper")],
+            "{edges:#?}"
         );
     }
 
