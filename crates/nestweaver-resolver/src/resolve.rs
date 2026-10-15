@@ -2543,6 +2543,35 @@ fn can_contain_code(symbol: &RawSymbol) -> bool {
     symbol.kind.contains_code() && !symbol.is_module_owner()
 }
 
+/// nw-113: the symbol whose body scopes a binding declared on `line`, or
+/// `None` for module scope. Only an exact span scopes. JS/TS/Python/PHP spans
+/// are exact (the languages that mint a `<module>` owner), so a degenerate
+/// guess there is module-level code: it reads as module scope, mirroring how
+/// `resolve_single_reference` maps a degenerate call source to the owner. In
+/// other languages the guess stands, matching the source it is compared to.
+fn scoping_owner<'a>(
+    sorted_syms: &'a [&'a RawSymbol],
+    line: u32,
+    language: Language,
+) -> Option<&'a RawSymbol> {
+    match find_enclosing_symbol(sorted_syms, line) {
+        Enclosing::Exact(symbol) => Some(symbol),
+        Enclosing::Degenerate(_) if has_exact_spans(language) => None,
+        Enclosing::Degenerate(symbol) => Some(symbol),
+        Enclosing::ModuleScope => None,
+    }
+}
+
+/// The languages whose code-bearing spans always cover their bodies, so a
+/// line outside every span is module-level code (and may get a `<module>`
+/// owner).
+fn has_exact_spans(language: Language) -> bool {
+    matches!(
+        language,
+        Language::JavaScript | Language::TypeScript | Language::Python | Language::Php
+    )
+}
+
 /// Find the enclosing symbol: the innermost symbol whose span contains the
 /// reference line (`start_line <= ref_line <= end_line`).
 ///
@@ -2577,35 +2606,6 @@ fn can_contain_code(symbol: &RawSymbol) -> bool {
 /// start_line`) and report it as `Degenerate`. Symbols with real spans that
 /// ended before `ref_line` still yield `ModuleScope` — module-level code
 /// belongs to no symbol.
-/// nw-113: the symbol whose body scopes a binding declared on `line`, or
-/// `None` for module scope. Only an exact span scopes. JS/TS/Python/PHP spans
-/// are exact (the languages that mint a `<module>` owner), so a degenerate
-/// guess there is module-level code: it reads as module scope, mirroring how
-/// `resolve_single_reference` maps a degenerate call source to the owner. In
-/// other languages the guess stands, matching the source it is compared to.
-fn scoping_owner<'a>(
-    sorted_syms: &'a [&'a RawSymbol],
-    line: u32,
-    language: Language,
-) -> Option<&'a RawSymbol> {
-    match find_enclosing_symbol(sorted_syms, line) {
-        Enclosing::Exact(symbol) => Some(symbol),
-        Enclosing::Degenerate(_) if has_exact_spans(language) => None,
-        Enclosing::Degenerate(symbol) => Some(symbol),
-        Enclosing::ModuleScope => None,
-    }
-}
-
-/// The languages whose code-bearing spans always cover their bodies, so a
-/// line outside every span is module-level code (and may get a `<module>`
-/// owner).
-fn has_exact_spans(language: Language) -> bool {
-    matches!(
-        language,
-        Language::JavaScript | Language::TypeScript | Language::Python | Language::Php
-    )
-}
-
 fn find_enclosing_symbol<'a>(symbols: &'a [&'a RawSymbol], ref_line: u32) -> Enclosing<'a> {
     debug_assert!(
         symbols
