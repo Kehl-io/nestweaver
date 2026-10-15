@@ -446,12 +446,21 @@ fn affected_tests_within(
         }
     }
 
-    // Step 4: bucket by depth and group by file.
+    // Step 4: bucket by depth and group by file. nw-799: a file is run
+    // whole, so it is listed once, in the best tier any of its tests reached,
+    // with every affected test it holds.
+    let mut file_depth: HashMap<String, u32> = HashMap::new();
+    for sym in best.values() {
+        file_depth
+            .entry(sym.test_file.clone())
+            .and_modify(|depth| *depth = (*depth).min(sym.depth))
+            .or_insert(sym.depth);
+    }
     let mut tier_1_syms = Vec::new();
     let mut tier_2_syms = Vec::new();
     let mut tier_3_syms = Vec::new();
     for sym in best.into_values() {
-        match sym.depth {
+        match file_depth.get(&sym.test_file).copied().unwrap_or(sym.depth) {
             0 | 1 => tier_1_syms.push(sym),
             2 => tier_2_syms.push(sym),
             _ => tier_3_syms.push(sym),
@@ -1044,6 +1053,49 @@ mod tests {
         assert_eq!(
             result.summary,
             "1 tier-1, 1 tier-2, 0 tier-3 tests affected"
+        );
+    }
+
+    /// nw-799: a test file whose tests reach the change at different depths
+    /// is listed once, in its best tier, with all its affected tests.
+    #[test]
+    fn a_test_file_is_listed_once_in_its_best_tier() {
+        let store = GraphStore::in_memory().expect("store");
+        let changed = sym("sym:changed", "computeTotal", "src/billing.rs");
+        let caller = sym("sym:caller", "invoice", "src/invoice.rs");
+        let direct_test = sym("sym:direct_test", "computes_total", "tests/billing_test.rs");
+        let caller_test = sym(
+            "sym:caller_test",
+            "renders_invoice",
+            "tests/billing_test.rs",
+        );
+        for s in [&changed, &caller, &direct_test, &caller_test] {
+            store.insert_symbol(s).expect("insert");
+        }
+        for (src, dst) in [
+            ("sym:direct_test", "sym:changed"),
+            ("sym:caller", "sym:changed"),
+            ("sym:caller_test", "sym:caller"),
+        ] {
+            store.insert_edge(&edge(src, dst)).expect("edge");
+        }
+
+        let result = affected_tests(&store, &["src/billing.rs".to_string()]).expect("ok");
+
+        let files: Vec<&str> = result
+            .tier_1
+            .iter()
+            .chain(&result.tier_2)
+            .chain(&result.tier_3)
+            .map(|f| f.test_file.as_str())
+            .collect();
+        assert_eq!(files, vec!["tests/billing_test.rs"], "{result:#?}");
+        let mut tests = result.tier_1[0].tests.clone();
+        tests.sort();
+        assert_eq!(tests, vec!["computes_total", "renders_invoice"]);
+        assert_eq!(
+            result.summary,
+            "2 tier-1, 0 tier-2, 0 tier-3 tests affected"
         );
     }
 
