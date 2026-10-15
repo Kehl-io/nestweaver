@@ -970,16 +970,17 @@ fn resolve_single_reference(
     // Priority 1: Same file. A local symbol shadows an import alias of the
     // same name, so this check runs on the reference's own name, before any
     // alias rewriting. nw-113: a block-scoped declaration shadows only inside
-    // its block, and the innermost visible declaration wins.
+    // its block, and the innermost visible declaration wins. A receiver that
+    // names an import (`Modal.latestProps` after `import { Modal }`) denotes
+    // that import's member, never a same-file symbol of the bare member name,
+    // even when the file stem matches the receiver (`Modal.test.js`).
     let mut same_file_out_of_scope = false;
     if let Some(syms) = symbol_map.get(name.as_str())
         && let Some((_, sym)) = syms
             .iter()
             .filter(|(f, sym)| {
                 *f == file_path
-                    && !(language == Language::Rust
-                        && reference.receiver.is_some()
-                        && binding.is_some())
+                    && !(reference.receiver.is_some() && binding.is_some())
                     && exact_rust_call.is_none_or(|assignment| {
                         assignment
                             .local_callee_line
@@ -10190,6 +10191,35 @@ export function readIt() { return value(); }
                 started.elapsed(),
                 edges.len()
             );
+        }
+    }
+
+    /// nw-113 final watch parity O3: a member access with a receiver
+    /// (`Modal.latestProps`) never falls back to a same-file symbol of the
+    /// bare member name, so `latestProps` gets no self-ACCESSES edge. The
+    /// same holds for a call through the import (`Modal.render()`).
+    #[test]
+    fn a_member_access_never_binds_a_same_file_name() {
+        for (ext, language) in [("js", Language::JavaScript), ("ts", Language::TypeScript)] {
+            let modal = format!("src/Modal.{ext}");
+            let test = format!("src/Modal.test.{ext}");
+            let (files, edges) = review_edges(
+                &[
+                    (&modal, "export function Modal(props) { return null; }\n"),
+                    (
+                        &test,
+                        "import { Modal } from './Modal';\nconst latestProps = () => Modal.latestProps;\nexport function render() { return Modal.render(); }\n",
+                    ),
+                ],
+                language,
+            );
+            for name in ["latestProps", "render"] {
+                let same_file = uid(&files, &test, name);
+                assert!(
+                    !edges.iter().any(|edge| edge.target_uid == same_file),
+                    "{test}: {name}: {edges:#?}"
+                );
+            }
         }
     }
 
