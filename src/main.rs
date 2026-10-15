@@ -23376,7 +23376,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         #[derive(serde::Serialize)]
                         struct ImpactNodeJson<'a> {
                             uid: &'a str,
-                            name: &'a str,
+                            name: std::borrow::Cow<'a, str>,
                             file_path: &'a str,
                             start_line: u32,
                             edge_type: &'a str,
@@ -23393,7 +23393,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             .iter()
                             .map(|&n| ImpactNodeJson {
                                 uid: &n.uid,
-                                name: &n.name,
+                                name: nestweaver_schema::symbol_display_name(
+                                    &n.name,
+                                    &n.file_path,
+                                ),
                                 file_path: &n.file_path,
                                 start_line: n.start_line,
                                 edge_type: &n.edge_type,
@@ -23481,7 +23484,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 println!(
                                     "  [depth {}] {} via {} ({:.2}) — {}:{} [{}]",
                                     n.depth,
-                                    n.name,
+                                    nestweaver_schema::symbol_display_name(&n.name, &n.file_path),
                                     n.edge_type,
                                     n.confidence,
                                     n.file_path,
@@ -23492,7 +23495,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 println!(
                                     "  [depth {}] {} via {} ({:.2}) — {}:{}",
                                     n.depth,
-                                    n.name,
+                                    nestweaver_schema::symbol_display_name(&n.name, &n.file_path),
                                     n.edge_type,
                                     n.confidence,
                                     n.file_path,
@@ -27156,7 +27159,10 @@ enum ResolveResult {
 /// Resolve a name-or-uid to a UID.
 /// Returns `Ambiguous` when the name matches multiple symbols (callers should report and exit 3).
 fn resolve_uid(store: &GraphStore, name_or_uid: &str) -> anyhow::Result<ResolveResult> {
-    if name_or_uid.contains(':') {
+    // nw-113: a `file::name` spec contains ':' but is a qualified name.
+    let qualified = !name_or_uid.starts_with("sym:")
+        && nestweaver_schema::split_file_qualifier(name_or_uid).is_some();
+    if name_or_uid.contains(':') && !qualified {
         // Treat as UID directly.
         match store.lookup_symbol(name_or_uid) {
             Ok(sym) => Ok(ResolveResult::Found(sym.uid)),
@@ -27165,7 +27171,7 @@ fn resolve_uid(store: &GraphStore, name_or_uid: &str) -> anyhow::Result<ResolveR
         }
     } else {
         let mut matches = store
-            .lookup_symbols_by_name(name_or_uid)
+            .lookup_symbols_by_spec(name_or_uid)
             .map_err(|e| anyhow::anyhow!(e))?;
         match matches.len() {
             0 => Ok(ResolveResult::NotFound),
@@ -27538,10 +27544,17 @@ fn render_read_symbols(
         }
         for a in &res.ambiguous {
             eprintln!(
-                "ambiguous: {} \u{2192} {} candidates (pass a UID)",
+                "ambiguous: {} \u{2192} {} candidates (pass a UID or path::name)",
                 a.query,
                 a.candidate_uids.len()
             );
+            // nw-113: name each candidate's file, so `path::name` can pick one.
+            for c in &a.candidates {
+                eprintln!(
+                    "  {} [{}] {} {}:{}",
+                    c.uid, c.kind, c.name, c.file_path, c.start_line
+                );
+            }
         }
         if res.truncated {
             eprintln!(

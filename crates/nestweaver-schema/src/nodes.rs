@@ -64,6 +64,80 @@ pub fn is_module_owner(
         && entry_point_kind == Some(EntryPointKind::ModuleInit)
 }
 
+/// nw-113: the one display label of a `<module>` owner,
+/// `<repo-relative path>::<module>`. Every user-facing surface that names an
+/// owner uses this, so an owner is never shown as a bare `<module>` (which
+/// cannot be told apart from the owners of other files) or with a blank name.
+pub fn module_owner_label(file_path: &str) -> String {
+    format!("{file_path}::{MODULE_OWNER_NAME}")
+}
+
+/// nw-113: a symbol's display name when only its name and path are at hand
+/// (a JSON row, a transport struct). `<module>` is not an identifier in any
+/// indexed language, so the name alone identifies an owner here; with a full
+/// [`Symbol`] prefer [`Symbol::display_name`].
+pub fn symbol_display_name<'a>(name: &'a str, file_path: &str) -> std::borrow::Cow<'a, str> {
+    if name == MODULE_OWNER_NAME {
+        std::borrow::Cow::Owned(module_owner_label(file_path))
+    } else {
+        std::borrow::Cow::Borrowed(name)
+    }
+}
+
+/// nw-113: split a `file::name` lookup spec into its file qualifier and
+/// name. `None` when the spec has no `::` or either half is empty.
+pub fn split_file_qualifier(spec: &str) -> Option<(&str, &str)> {
+    spec.rsplit_once("::")
+        .filter(|(qualifier, name)| !qualifier.is_empty() && !name.is_empty())
+}
+
+/// How closely a `file::name` qualifier names a symbol's file: an exact
+/// repo-relative path beats a path suffix, which beats a suffix without the
+/// extension (`conftest` for `tests/conftest.py`). Suffixes only match on a
+/// `/` boundary, so `x.js` never matches `index.js`.
+fn file_qualifier_rank(qualifier: &str, file_path: &str) -> Option<u8> {
+    let qualifier = qualifier.strip_prefix("./").unwrap_or(qualifier);
+    let suffix_of = |path: &str| {
+        path == qualifier
+            || path
+                .strip_suffix(qualifier)
+                .is_some_and(|head| head.ends_with('/'))
+    };
+    if file_path == qualifier {
+        return Some(0);
+    }
+    if suffix_of(file_path) {
+        return Some(1);
+    }
+    let file_name_start = file_path.rfind('/').map_or(0, |slash| slash + 1);
+    let stem = match file_path[file_name_start..].rfind('.') {
+        Some(dot) if dot > 0 => &file_path[..file_name_start + dot],
+        _ => return None,
+    };
+    suffix_of(stem).then_some(2)
+}
+
+/// nw-113: narrow name-lookup candidates by a `file::name` qualifier.
+///
+/// Keeps the candidates whose file best matches `qualifier` (see
+/// [`file_qualifier_rank`]). When no candidate's file matches, the qualifier
+/// is not a path (`Class::method`, a Rust module path), and every candidate
+/// is returned unchanged, so those forms keep resolving by their last
+/// segment as before.
+pub fn narrow_by_file_qualifier(candidates: Vec<Symbol>, qualifier: &str) -> Vec<Symbol> {
+    let best = candidates
+        .iter()
+        .filter_map(|symbol| file_qualifier_rank(qualifier, &symbol.file_path))
+        .min();
+    match best {
+        Some(best) => candidates
+            .into_iter()
+            .filter(|symbol| file_qualifier_rank(qualifier, &symbol.file_path) == Some(best))
+            .collect(),
+        None => candidates,
+    }
+}
+
 impl SymbolKind {
     /// Kinds that have a body and can therefore be the source of a call
     /// (nw-349/nw-435). Data kinds (`Constant`, `Variable`, `Property`,
@@ -242,6 +316,16 @@ impl Symbol {
     /// nw-113: see [`is_module_owner`].
     pub fn is_module_owner(&self) -> bool {
         is_module_owner(self.kind, &self.name, self.entry_point_kind)
+    }
+
+    /// nw-113: the name to show a user: [`module_owner_label`] for an owner,
+    /// the plain name for every other symbol.
+    pub fn display_name(&self) -> std::borrow::Cow<'_, str> {
+        if self.is_module_owner() {
+            std::borrow::Cow::Owned(module_owner_label(&self.file_path))
+        } else {
+            std::borrow::Cow::Borrowed(&self.name)
+        }
     }
 }
 
@@ -430,6 +514,90 @@ pub struct Contract {
 #[cfg(test)]
 mod tests {
     use super::{Repo, SymbolKind};
+
+    fn symbol_at(name: &str, file_path: &str) -> super::Symbol {
+        super::Symbol {
+            uid: format!("sym:{file_path}:{name}"),
+            name: name.into(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:r".into(),
+            file_path: file_path.into(),
+            start_line: 1,
+            end_line: 1,
+            signature: String::new(),
+            summary: None,
+            content_hash: String::new(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: super::Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    fn owner_at(file_path: &str) -> super::Symbol {
+        let mut owner = symbol_at(super::MODULE_OWNER_NAME, file_path);
+        owner.kind = SymbolKind::Module;
+        owner.is_entry_point = true;
+        owner.entry_point_kind = Some(super::EntryPointKind::ModuleInit);
+        owner
+    }
+
+    fn paths(symbols: &[super::Symbol]) -> Vec<&str> {
+        symbols.iter().map(|s| s.file_path.as_str()).collect()
+    }
+
+    /// nw-113: an owner is always shown as `<path>::<module>`.
+    #[test]
+    fn owner_display_name_carries_its_repo_relative_path() {
+        assert_eq!(
+            owner_at("src/controllers/index.js").display_name(),
+            "src/controllers/index.js::<module>"
+        );
+        assert_eq!(symbol_at("listen", "index.js").display_name(), "listen");
+        assert_eq!(
+            super::symbol_display_name(super::MODULE_OWNER_NAME, "wsgi.py"),
+            "wsgi.py::<module>"
+        );
+        assert_eq!(super::symbol_display_name("app", "wsgi.py"), "app");
+    }
+
+    /// nw-113: `file::name` narrows by exact path, then a unique path suffix,
+    /// then a suffix without the extension; a non-path qualifier keeps every
+    /// candidate.
+    #[test]
+    fn file_qualifier_narrows_by_path_suffix() {
+        use super::narrow_by_file_qualifier as narrow;
+        let owners = || {
+            vec![
+                owner_at("index.js"),
+                owner_at("src/controllers/index.js"),
+                owner_at("app/wsgi.py"),
+                owner_at("tests/conftest.py"),
+            ]
+        };
+        assert_eq!(paths(&narrow(owners(), "index.js")), ["index.js"]);
+        assert_eq!(
+            paths(&narrow(owners(), "controllers/index.js")),
+            ["src/controllers/index.js"]
+        );
+        assert_eq!(paths(&narrow(owners(), "wsgi.py")), ["app/wsgi.py"]);
+        assert_eq!(paths(&narrow(owners(), "wsgi")), ["app/wsgi.py"]);
+        assert_eq!(paths(&narrow(owners(), "./tests/conftest.py")), ["tests/conftest.py"]);
+        assert_eq!(paths(&narrow(owners(), "x.js")).len(), 4, "no boundary match");
+        assert_eq!(paths(&narrow(owners(), "Class")).len(), 4, "not a path");
+        let utils = vec![symbol_at("f", "a/util.py"), symbol_at("f", "b/util.py")];
+        assert_eq!(narrow(utils, "util.py").len(), 2, "an ambiguous suffix stays ambiguous");
+        assert_eq!(
+            super::split_file_qualifier("src/a.js::<module>"),
+            Some(("src/a.js", "<module>"))
+        );
+        assert_eq!(super::split_file_qualifier("<module>"), None);
+        assert_eq!(super::split_file_qualifier("::x"), None);
+    }
 
     /// nw-113: one predicate identifies the per-file `<module>` owner; a real
     /// symbol of the same kind or name is never mistaken for it.

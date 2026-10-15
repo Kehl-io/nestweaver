@@ -855,6 +855,28 @@ impl GraphStore {
         result.map(|row| row_to_symbol(&row)).collect()
     }
 
+    /// nw-113: name lookup that honours a `file::name` qualifier.
+    ///
+    /// A spec that is itself a stored name resolves as one. Otherwise
+    /// `file::name` looks `name` up and keeps the candidates whose file the
+    /// qualifier names, as an exact repo-relative path, a path suffix such as
+    /// `wsgi.py`, or a suffix without its extension such as `conftest`
+    /// ([`nestweaver_schema::narrow_by_file_qualifier`]). A qualifier that
+    /// names no candidate's file (`Class::method`) keeps every candidate, so
+    /// those forms resolve by their last segment as before.
+    pub fn lookup_symbols_by_spec(&self, spec: &str) -> Result<Vec<Symbol>, StoreError> {
+        let exact = self.lookup_symbols_by_name(spec)?;
+        match nestweaver_schema::split_file_qualifier(spec) {
+            Some((qualifier, name)) if exact.is_empty() => Ok(
+                nestweaver_schema::narrow_by_file_qualifier(
+                    self.lookup_symbols_by_name(name)?,
+                    qualifier,
+                ),
+            ),
+            _ => Ok(exact),
+        }
+    }
+
     /// `(uid, repo_uid, visibility)` of every symbol whose name is in
     /// `names`, keyed by name, from ONE scan of the Symbol table.
     ///

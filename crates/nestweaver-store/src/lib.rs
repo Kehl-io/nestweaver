@@ -472,6 +472,34 @@ mod tests {
         assert!(uids.contains(&"s2"));
     }
 
+    /// nw-113: `file::name` narrows a name lookup by repo-relative path or
+    /// path suffix; a non-path qualifier keeps resolving by name.
+    #[test]
+    fn lookup_by_spec_narrows_by_file_qualifier() {
+        let store = test_store();
+        for (uid, path) in [("s1", "app/wsgi.py"), ("s2", "tests/conftest.py")] {
+            store
+                .insert_symbol(&make_symbol(uid, "app", "repo-1", path))
+                .unwrap();
+        }
+        let uids = |spec: &str| -> Vec<String> {
+            let mut uids: Vec<_> = store
+                .lookup_symbols_by_spec(spec)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.uid)
+                .collect();
+            uids.sort();
+            uids
+        };
+        assert_eq!(uids("wsgi.py::app"), ["s1"]);
+        assert_eq!(uids("conftest::app"), ["s2"]);
+        assert_eq!(uids("app/wsgi.py::app"), ["s1"]);
+        assert_eq!(uids("app"), ["s1", "s2"]);
+        assert_eq!(uids("Flask::app"), ["s1", "s2"]);
+        assert!(uids("wsgi.py::missing").is_empty());
+    }
+
     #[test]
     fn lookup_missing_symbol_returns_not_found() {
         let store = test_store();

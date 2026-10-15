@@ -49,6 +49,34 @@ pub struct SymbolWindow {
 pub struct AmbiguousMatch {
     pub query: String,
     pub candidate_uids: Vec<String>,
+    /// nw-113: every candidate with its display name and file, in the same
+    /// order as `candidate_uids`, so a caller can pick one (or qualify the
+    /// name as `path::name`) without a second lookup. `serde(default)` keeps
+    /// an older daemon's response readable.
+    #[serde(default)]
+    pub candidates: Vec<AmbiguousCandidate>,
+}
+
+/// One candidate of an [`AmbiguousMatch`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AmbiguousCandidate {
+    pub uid: String,
+    pub name: String,
+    pub kind: String,
+    pub file_path: String,
+    pub start_line: u32,
+}
+
+impl From<&Symbol> for AmbiguousCandidate {
+    fn from(symbol: &Symbol) -> Self {
+        Self {
+            uid: symbol.uid.clone(),
+            name: symbol.display_name().into_owned(),
+            kind: symbol.kind.to_string(),
+            file_path: symbol.file_path.clone(),
+            start_line: symbol.start_line,
+        }
+    }
 }
 
 // `Deserialize` so the CLI can parse a daemon response back into the SAME type
@@ -367,20 +395,27 @@ fn verified_current_span(
     ))
 }
 
-/// Resolve a spec (`sym:` UID, bare name, or dotted/`::` FQN) to candidate symbols.
-fn resolve(store: &GraphStore, spec: &str) -> Vec<Symbol> {
+/// Resolve a spec (`sym:` UID, bare name, `file::name`, or dotted/`::` FQN)
+/// to candidate symbols.
+///
+/// nw-113: a `file::name` qualifier narrows the candidates to that file (an
+/// exact repo-relative path or a path suffix); a qualifier that names no
+/// candidate's file (`Class::method`) keeps resolving by the last segment.
+pub fn resolve_spec(store: &GraphStore, spec: &str) -> Vec<Symbol> {
     if spec.starts_with("sym:") {
         return store.lookup_symbol(spec).ok().into_iter().collect();
     }
-    // FQN forms: take the last path segment as the symbol name.
-    let name = spec
-        .rsplit("::")
-        .next()
-        .unwrap_or(spec)
-        .rsplit('.')
-        .next()
-        .unwrap_or(spec);
-    store.lookup_symbols_by_name(name).unwrap_or_default()
+    let (qualifier, rest) = match nestweaver_schema::split_file_qualifier(spec) {
+        Some((qualifier, rest)) => (Some(qualifier), rest),
+        None => (None, spec),
+    };
+    // Dotted FQN forms: take the last segment as the symbol name.
+    let name = rest.rsplit('.').next().unwrap_or(rest);
+    let candidates = store.lookup_symbols_by_name(name).unwrap_or_default();
+    match qualifier {
+        Some(qualifier) => nestweaver_schema::narrow_by_file_qualifier(candidates, qualifier),
+        None => candidates,
+    }
 }
 
 /// Estimate the token cost of a window (chars/4 + small metadata overhead).
@@ -419,13 +454,14 @@ pub fn read_symbols_budgeted(
     // 1. Resolve specs → primary symbols (preserving input order).
     let mut primary: Vec<Symbol> = Vec::new();
     for spec in specs {
-        let candidates = resolve(store, spec);
+        let candidates = resolve_spec(store, spec);
         match candidates.len() {
             0 => result.not_found.push(spec.clone()),
             1 => primary.push(candidates.into_iter().next().expect("len == 1")),
             _ => result.ambiguous.push(AmbiguousMatch {
                 query: spec.clone(),
                 candidate_uids: candidates.iter().map(|s| s.uid.clone()).collect(),
+                candidates: candidates.iter().map(AmbiguousCandidate::from).collect(),
             }),
         }
     }
@@ -541,8 +577,8 @@ pub fn read_symbols_budgeted(
         }
         used += cost;
         result.symbols.push(SymbolWindow {
+            name: sym.display_name().into_owned(),
             uid: sym.uid,
-            name: sym.name,
             kind: sym.kind.to_string(),
             path: sym.file_path,
             start_line,
@@ -633,7 +669,7 @@ pub fn read_symbols_from_repo_roots(
 }
 
 fn repo_uid_for_spec(store: &GraphStore, spec: &str) -> Option<String> {
-    resolve(store, spec)
+    resolve_spec(store, spec)
         .into_iter()
         .next()
         .map(|symbol| symbol.repo_uid)
@@ -894,6 +930,79 @@ mod tests {
         let res = read_symbols(store, &[name.to_string()], &reader, 0, None);
         assert_eq!(res.symbols.len(), 1, "{name} must resolve: {res:?}");
         res.symbols.into_iter().next().unwrap()
+    }
+
+    /// Write every `(rel, src)` under a fresh tempdir and index it.
+    fn fixture_files(files: &[(&str, &str)]) -> (tempfile::TempDir, GraphStore) {
+        let dir = tempfile::tempdir().unwrap();
+        for (rel, src) in files {
+            let path = dir.path().join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, src).unwrap();
+        }
+        let (_r, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/r", "sha").unwrap();
+        (dir, store)
+    }
+
+    /// nw-113: `path::<module>` reads that file's owner, `file::name` narrows
+    /// an ordinary name by file, and an ambiguous suffix is still reported,
+    /// now with every candidate's path.
+    #[test]
+    fn file_qualifier_narrows_owner_and_symbol_lookups() {
+        let (dir, store) = fixture_files(&[
+            ("index.js", "function app() { return 1; }
+app();
+"),
+            ("src/controllers/index.js", "function app() { return 2; }
+app();
+"),
+            ("src/wsgi.py", "def app():\n    return 3\n\napp()\n"),
+        ]);
+        let reader = FilesystemReader::new(dir.path());
+        let read = |spec: &str| read_symbols(&store, &[spec.to_string()], &reader, 0, None);
+
+        let res = read("wsgi.py::<module>");
+        assert_eq!(res.symbols.len(), 1, "{res:?}");
+        assert_eq!(res.symbols[0].path, "src/wsgi.py");
+        assert_eq!(res.symbols[0].name, "src/wsgi.py::<module>");
+
+        let res = read("src/controllers/index.js::<module>");
+        assert_eq!(res.symbols.len(), 1, "{res:?}");
+        assert_eq!(res.symbols[0].path, "src/controllers/index.js");
+
+        let res = read("index.js::<module>");
+        assert_eq!(res.symbols.len(), 1, "an exact path wins: {res:?}");
+        assert_eq!(res.symbols[0].path, "index.js");
+
+        let res = read("controllers/index.js::app");
+        assert_eq!(res.symbols.len(), 1, "{res:?}");
+        assert_eq!(res.symbols[0].path, "src/controllers/index.js");
+
+        let res = read("wsgi::app");
+        assert_eq!(res.symbols.len(), 1, "{res:?}");
+        assert_eq!(res.symbols[0].path, "src/wsgi.py");
+
+        let res = read("<module>");
+        assert!(res.symbols.is_empty(), "{res:?}");
+        let [ambiguous] = res.ambiguous.as_slice() else {
+            panic!("{res:?}")
+        };
+        let mut paths: Vec<&str> = ambiguous
+            .candidates
+            .iter()
+            .map(|c| c.file_path.as_str())
+            .collect();
+        paths.sort();
+        assert_eq!(paths, ["index.js", "src/controllers/index.js", "src/wsgi.py"]);
+        assert!(
+            ambiguous
+                .candidates
+                .iter()
+                .all(|c| c.name == format!("{}::<module>", c.file_path)),
+            "{ambiguous:?}"
+        );
+        assert_eq!(ambiguous.candidate_uids.len(), 3);
     }
 
     /// nw-113 review: the owner is never a neighbour window; reading the

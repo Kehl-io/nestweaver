@@ -248,7 +248,10 @@ pub fn lookup_symbol(
         }
     };
 
-    if name_or_uid.contains(':') {
+    // nw-113: a `file::name` spec contains ':' but is a qualified name.
+    let qualified = !name_or_uid.starts_with("sym:")
+        && nestweaver_schema::split_file_qualifier(name_or_uid).is_some();
+    if name_or_uid.contains(':') && !qualified {
         // UID path
         match store.lookup_symbol(name_or_uid) {
             Ok(sym) => {
@@ -264,7 +267,7 @@ pub fn lookup_symbol(
     } else {
         // Name path
         let matches: Vec<_> = store
-            .lookup_symbols_by_name(name_or_uid)
+            .lookup_symbols_by_spec(name_or_uid)
             .context("name lookup")?
             .into_iter()
             .filter(|s| in_instance(&s.repo_uid))
@@ -940,7 +943,7 @@ pub fn build_context_with_intent(
                 }
                 Err(e) => return Err(anyhow::anyhow!(e)),
             }
-        } else if is_file_path(input) {
+        } else if is_file_path(input) && nestweaver_schema::split_file_qualifier(input).is_none() {
             // Resolve all symbols in the file.
             let file_syms = store
                 .symbols_in_file(input)
@@ -955,8 +958,9 @@ pub fn build_context_with_intent(
         } else {
             // Exact name first. An ambiguous exact name is a lookup refusal
             // (exit 3), not a substring union that also seeds `ping2`.
+            // nw-113: `file::name` narrows the exact name to that file.
             let exact = store
-                .lookup_symbols_by_name(input)
+                .lookup_symbols_by_spec(input)
                 .map_err(|e| anyhow::anyhow!(e))?;
             match exact.len() {
                 0 => {
@@ -1059,7 +1063,7 @@ pub fn build_context_with_intent(
 
         let node = ContextNode {
             uid: sym.uid.clone(),
-            name: sym.name.clone(),
+            name: sym.display_name().into_owned(),
             kind: sym.kind.to_string(),
             file_path: sym.file_path.clone(),
             start_line: sym.start_line,

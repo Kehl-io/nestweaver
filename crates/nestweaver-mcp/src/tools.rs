@@ -113,7 +113,8 @@ fn candidates_json(candidates: &[nestweaver_schema::Symbol]) -> Value {
     ordered.sort_by(|a, b| {
         (&a.file_path, a.start_line, &a.uid).cmp(&(&b.file_path, b.start_line, &b.uid))
     });
-    json!(ordered.into_iter().take(50).map(|symbol| json!({"uid":symbol.uid,"name":symbol.name,"file_path":symbol.file_path,"start_line":symbol.start_line})).collect::<Vec<_>>())
+    // nw-113: an owner candidate is named `path::<module>`, never bare.
+    json!(ordered.into_iter().take(50).map(|symbol| json!({"uid":symbol.uid,"name":symbol.display_name(),"file_path":symbol.file_path,"start_line":symbol.start_line})).collect::<Vec<_>>())
 }
 
 fn name_lookup_ambiguous_payload(
@@ -199,7 +200,11 @@ fn resolve_symbol_strict(
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
     repo_filter: Option<&str>,
 ) -> Result<StrictNameResolve, anyhow::Error> {
-    if name_or_uid.contains(':') {
+    // nw-113: a `file::name` spec also contains ':' but is no UID; it falls
+    // through to the qualified name lookup below when no UID matches.
+    let qualified = !name_or_uid.starts_with("sym:")
+        && nestweaver_schema::split_file_qualifier(name_or_uid).is_some();
+    if name_or_uid.contains(':') && !qualified {
         match store.lookup_symbol(name_or_uid) {
             Ok(symbol) => {
                 if !repo_is_visible(&symbol.repo_uid, visible) {
@@ -221,8 +226,8 @@ fn resolve_symbol_strict(
         }
     } else {
         let mut matches = store
-            .lookup_symbols_by_name(name_or_uid)
-            .map_err(|e| anyhow!("lookup_symbols_by_name: {e}"))?;
+            .lookup_symbols_by_spec(name_or_uid)
+            .map_err(|e| anyhow!("lookup_symbols_by_spec: {e}"))?;
         matches.retain(|symbol| repo_is_visible(&symbol.repo_uid, visible));
         let matches = filter_name_matches_by_repo(store, matches, repo_filter, visible)?;
         Ok(classify_name_matches(matches))
@@ -5436,21 +5441,13 @@ fn read_symbols_from_repo_roots(
 }
 
 /// Resolve a symbol spec to its `repo_uid` by looking up the symbol in the store.
+///
+/// The same resolution `read_symbols` itself applies, so a `file::name`
+/// target (nw-113) groups under the repo of the file it names.
 fn resolve_repo_for_spec(store: &GraphStore, spec: &str) -> Option<String> {
-    if spec.starts_with("sym:") {
-        return store.lookup_symbol(spec).ok().map(|s| s.repo_uid);
-    }
-    let name = spec
-        .rsplit("::")
+    nestweaver_engine::read_symbols::resolve_spec(store, spec)
+        .into_iter()
         .next()
-        .unwrap_or(spec)
-        .rsplit('.')
-        .next()
-        .unwrap_or(spec);
-    store
-        .lookup_symbols_by_name(name)
-        .ok()
-        .and_then(|syms| syms.into_iter().next())
         .map(|s| s.repo_uid)
 }
 
@@ -12660,13 +12657,14 @@ fn tool_brain_impact(
         if concise {
             #[derive(serde::Serialize)]
             struct Row<'a> {
-                name: &'a str,
+                name: std::borrow::Cow<'a, str>,
                 depth: u32,
                 impact_score: f64,
             }
             bounded_metadata(
                 &Row {
-                    name: &n.name,
+                    // nw-113: an owner reads `path::<module>`, never bare.
+                    name: nestweaver_schema::symbol_display_name(&n.name, &n.file_path),
                     depth: n.depth,
                     impact_score: n.impact_score,
                 },
@@ -12676,7 +12674,7 @@ fn tool_brain_impact(
             #[derive(serde::Serialize)]
             struct Row<'a> {
                 uid: &'a str,
-                name: &'a str,
+                name: std::borrow::Cow<'a, str>,
                 file_path: &'a str,
                 start_line: u32,
                 edge_type: &'a str,
@@ -12687,7 +12685,7 @@ fn tool_brain_impact(
             bounded_metadata(
                 &Row {
                     uid: &n.uid,
-                    name: &n.name,
+                    name: nestweaver_schema::symbol_display_name(&n.name, &n.file_path),
                     file_path: &n.file_path,
                     start_line: n.start_line,
                     edge_type: &n.edge_type,
@@ -32782,6 +32780,85 @@ mod ambiguous_name_contract_tests {
                 _ => panic!("hidden exact name stole visible substring resolution"),
             }
         }
+    }
+
+    /// nw-113: `path::<module>` names one file's owner in `brain_impact` and
+    /// `flow_trace`; impact rows label owners `path::<module>`; an ambiguous
+    /// owner lookup lists every candidate with its file.
+    #[test]
+    fn module_owner_is_addressable_and_labelled_by_file() {
+        use nestweaver_engine::index_directory_in_memory;
+        let dir = tempfile::tempdir().unwrap();
+        for (rel, src) in [
+            ("index.js", "const { listen } = require('./src/server');\nlisten();\n"),
+            (
+                "src/controllers/index.js",
+                "const { listen } = require('../server');\nlisten();\n",
+            ),
+            ("src/server.js", "function listen() { return 1; }\nmodule.exports = { listen };\n"),
+        ] {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, src).unwrap();
+        }
+        let (_repo, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/r", "sha").unwrap();
+
+        let impact = tool_brain_impact(&store, json!({ "symbol": "listen" }), None, None).unwrap();
+        let mut names: Vec<&str> = impact["impact_nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n["name"].as_str())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["index.js::<module>", "src/controllers/index.js::<module>"],
+            "{impact}"
+        );
+
+        for spec in ["src/controllers/index.js::<module>", "controllers/index.js::<module>"] {
+            let flow = tool_flow_trace(&store, json!({ "symbol": spec }), None, None).unwrap();
+            assert_ne!(flow["status"], "ambiguous", "{spec}: {flow}");
+            assert!(flow.to_string().contains("listen"), "{spec}: {flow}");
+            let impact = tool_brain_impact(&store, json!({ "symbol": spec }), None, None).unwrap();
+            assert_eq!(impact["status"], "ok", "{spec}: {impact}");
+            let owner = store
+                .symbols_in_file("src/controllers/index.js")
+                .unwrap()
+                .into_iter()
+                .find(|s| s.is_module_owner())
+                .unwrap();
+            assert_eq!(impact["target"], owner.uid, "{spec}: {impact}");
+        }
+
+        let ambiguous =
+            tool_brain_impact(&store, json!({ "symbol": "<module>" }), None, None).unwrap();
+        assert_eq!(ambiguous["status"], "ambiguous", "{ambiguous}");
+        let mut candidates: Vec<(String, String)> = ambiguous["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["name"].as_str().unwrap().to_string(),
+                    c["file_path"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        candidates.sort();
+        assert_eq!(
+            candidates,
+            [
+                ("index.js::<module>".to_string(), "index.js".to_string()),
+                (
+                    "src/controllers/index.js::<module>".to_string(),
+                    "src/controllers/index.js".to_string()
+                ),
+            ],
+            "{ambiguous}"
+        );
     }
 
     #[test]
