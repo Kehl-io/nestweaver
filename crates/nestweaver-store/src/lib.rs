@@ -496,8 +496,52 @@ mod tests {
         assert_eq!(uids("conftest::app"), ["s2"]);
         assert_eq!(uids("app/wsgi.py::app"), ["s1"]);
         assert_eq!(uids("app"), ["s1", "s2"]);
-        assert_eq!(uids("Flask::app"), ["s1", "s2"]);
+        assert!(
+            uids("Flask::app").is_empty(),
+            "a qualifier naming no file and no container is not found"
+        );
+        assert!(uids("nope/missing.py::app").is_empty());
         assert!(uids("wsgi.py::missing").is_empty());
+    }
+
+    /// nw-113: a `Class::method` spec narrows by the `MEMBER_OF` container
+    /// name; a container that does not own the method is not found rather
+    /// than resolving to another class's method by its last segment.
+    #[test]
+    fn lookup_by_spec_narrows_by_container() {
+        let store = test_store();
+        for (uid, name) in [("foo", "Foo"), ("baz", "Baz")] {
+            let mut class = make_symbol(uid, name, "repo-1", "src/a.js");
+            class.kind = SymbolKind::Class;
+            store.insert_symbol(&class).unwrap();
+        }
+        for (uid, name, parent) in [("foo-bar", "bar", "foo"), ("baz-qux", "qux", "baz")] {
+            let mut method = make_symbol(uid, name, "repo-1", "src/a.js");
+            method.kind = SymbolKind::Method;
+            store.insert_symbol(&method).unwrap();
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: uid.to_string(),
+                    target_uid: parent.to_string(),
+                    edge_type: EdgeType::MemberOf,
+                    confidence: 1.0,
+                    link_type: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+        let uids = |spec: &str| -> Vec<String> {
+            store
+                .lookup_symbols_by_spec(spec)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.uid)
+                .collect()
+        };
+        assert_eq!(uids("Foo::bar"), ["foo-bar"]);
+        assert!(uids("Foo::qux").is_empty());
+        assert_eq!(uids("Baz::qux"), ["baz-qux"]);
+        assert_eq!(uids("a.js::qux"), ["baz-qux"]);
     }
 
     #[test]

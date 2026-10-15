@@ -200,8 +200,9 @@ fn resolve_symbol_strict(
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
     repo_filter: Option<&str>,
 ) -> Result<StrictNameResolve, anyhow::Error> {
-    // nw-113: a `file::name` spec also contains ':' but is no UID; it falls
-    // through to the qualified name lookup below when no UID matches.
+    // nw-113: a `file::name` or `Class::method` spec also contains ':' but is
+    // no UID, so it skips the UID lookup and goes straight to the qualified
+    // name lookup below.
     let qualified = !name_or_uid.starts_with("sym:")
         && nestweaver_schema::split_file_qualifier(name_or_uid).is_some();
     if name_or_uid.contains(':') && !qualified {

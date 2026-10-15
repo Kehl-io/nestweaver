@@ -117,24 +117,39 @@ fn file_qualifier_rank(qualifier: &str, file_path: &str) -> Option<u8> {
     suffix_of(stem).then_some(2)
 }
 
-/// nw-113: narrow name-lookup candidates by a `file::name` qualifier.
-///
-/// Keeps the candidates whose file best matches `qualifier` (see
-/// [`file_qualifier_rank`]). When no candidate's file matches, the qualifier
-/// is not a path (`Class::method`, a Rust module path), and every candidate
-/// is returned unchanged, so those forms keep resolving by their last
-/// segment as before.
-pub fn narrow_by_file_qualifier(candidates: Vec<Symbol>, qualifier: &str) -> Vec<Symbol> {
-    let best = candidates
+/// nw-113: keep the candidates whose file best matches a `file::name`
+/// qualifier (see [`file_qualifier_rank`]). Empty when no candidate's file
+/// matches, so a strict lookup can report not found instead of guessing.
+pub fn filter_by_file_qualifier(candidates: Vec<Symbol>, qualifier: &str) -> Vec<Symbol> {
+    let Some(best) = candidates
         .iter()
         .filter_map(|symbol| file_qualifier_rank(qualifier, &symbol.file_path))
-        .min();
-    match best {
-        Some(best) => candidates
-            .into_iter()
-            .filter(|symbol| file_qualifier_rank(qualifier, &symbol.file_path) == Some(best))
-            .collect(),
-        None => candidates,
+        .min()
+    else {
+        return Vec::new();
+    };
+    candidates
+        .into_iter()
+        .filter(|symbol| file_qualifier_rank(qualifier, &symbol.file_path) == Some(best))
+        .collect()
+}
+
+/// nw-113: narrow name-lookup candidates by a `file::name` qualifier, for the
+/// lenient `read_symbols` spec resolver.
+///
+/// Keeps the candidates whose file best matches `qualifier`
+/// ([`filter_by_file_qualifier`]). When no candidate's file matches, the
+/// qualifier is not a path (`Class::method`, a Rust module path), and every
+/// candidate is returned unchanged, so those forms keep resolving by their
+/// last segment as before.
+pub fn narrow_by_file_qualifier(candidates: Vec<Symbol>, qualifier: &str) -> Vec<Symbol> {
+    if candidates
+        .iter()
+        .any(|symbol| file_qualifier_rank(qualifier, &symbol.file_path).is_some())
+    {
+        filter_by_file_qualifier(candidates, qualifier)
+    } else {
+        candidates
     }
 }
 

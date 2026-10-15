@@ -855,26 +855,69 @@ impl GraphStore {
         result.map(|row| row_to_symbol(&row)).collect()
     }
 
-    /// nw-113: name lookup that honours a `file::name` qualifier.
+    /// nw-113: name lookup that honours a `file::name` or `Class::method`
+    /// qualifier.
     ///
     /// A spec that is itself a stored name resolves as one. Otherwise
     /// `file::name` looks `name` up and keeps the candidates whose file the
     /// qualifier names, as an exact repo-relative path, a path suffix such as
     /// `wsgi.py`, or a suffix without its extension such as `conftest`
-    /// ([`nestweaver_schema::narrow_by_file_qualifier`]). A qualifier that
-    /// names no candidate's file (`Class::method`) keeps every candidate, so
-    /// those forms resolve by their last segment as before.
+    /// ([`nestweaver_schema::filter_by_file_qualifier`]). A qualifier that
+    /// names no candidate's file is read as a container: the candidates whose
+    /// `MEMBER_OF` parent is named by it are kept, so `Class::method` works.
+    /// A qualifier that names neither is not found: a strict lookup never
+    /// falls back to the last segment, which answered `Foo::qux` with another
+    /// class's `qux`.
     pub fn lookup_symbols_by_spec(&self, spec: &str) -> Result<Vec<Symbol>, StoreError> {
         let exact = self.lookup_symbols_by_name(spec)?;
-        match nestweaver_schema::split_file_qualifier(spec) {
-            Some((qualifier, name)) if exact.is_empty() => {
-                Ok(nestweaver_schema::narrow_by_file_qualifier(
-                    self.lookup_symbols_by_name(name)?,
-                    qualifier,
-                ))
-            }
-            _ => Ok(exact),
+        let Some((qualifier, name)) =
+            nestweaver_schema::split_file_qualifier(spec).filter(|_| exact.is_empty())
+        else {
+            return Ok(exact);
+        };
+        let by_file = nestweaver_schema::filter_by_file_qualifier(
+            self.lookup_symbols_by_name(name)?,
+            qualifier,
+        );
+        if !by_file.is_empty() {
+            return Ok(by_file);
         }
+        self.lookup_members_by_container_name(qualifier, name)
+    }
+
+    /// Symbols named `name` whose `MEMBER_OF` parent is named `container`.
+    fn lookup_members_by_container_name(
+        &self,
+        container: &str,
+        name: &str,
+    ) -> Result<Vec<Symbol>, StoreError> {
+        let conn = self.conn()?;
+        let q = format!(
+            "MATCH (s:Symbol)-[:MEMBER_OF]->(p:Symbol) \
+             WHERE s.name = $name AND p.name = $container RETURN {}",
+            SYMBOL_COLUMNS
+        );
+        let mut stmt = conn
+            .prepare(&q)
+            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+        let result = conn
+            .execute(
+                &mut stmt,
+                vec![
+                    ("name", Value::String(name.to_string())),
+                    ("container", Value::String(container.to_string())),
+                ],
+            )
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        let mut seen = HashSet::new();
+        let mut members = Vec::new();
+        for row in result {
+            let symbol = row_to_symbol(&row)?;
+            if seen.insert(symbol.uid.clone()) {
+                members.push(symbol);
+            }
+        }
+        Ok(members)
     }
 
     /// `(uid, repo_uid, visibility)` of every symbol whose name is in
