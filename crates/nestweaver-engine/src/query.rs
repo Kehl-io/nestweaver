@@ -1535,6 +1535,7 @@ mod promote_tests {
 mod context_tests {
     use std::fs;
 
+    use super::HybridSearchConfig;
     use super::build_context;
     use crate::index::index_directory_in_memory;
 
@@ -1849,8 +1850,7 @@ mod context_tests {
         };
 
         let code =
-            super::build_context_with_intent(&store, &["hub".to_string()], None, Some(20))
-                .unwrap();
+            super::build_context_with_intent(&store, &["hub".to_string()], None, Some(20)).unwrap();
         let names: Vec<&str> = code.connected.iter().map(|n| n.name.as_str()).collect();
         assert_eq!(names.len(), 20, "{names:?}");
         assert!(real_callers(names.clone()) >= 17, "{names:?}");
@@ -1875,7 +1875,59 @@ mod context_tests {
 
         let brain = super::build_brain_context(&store, &["hub".to_string()]).unwrap();
         let titles: Vec<&str> = brain.connected.iter().map(|n| n.title.as_str()).collect();
-        assert!(real_callers(titles.clone()) >= 30, "{} {titles:?}", titles.len());
+        assert!(
+            real_callers(titles.clone()) >= 30,
+            "{} {titles:?}",
+            titles.len()
+        );
+    }
+
+    /// nw-113 final review Minor 1: a refill candidate that the semantic
+    /// leg already put in `connected` is not listed a second time.
+    #[test]
+    fn brain_context_refill_skips_nodes_another_leg_already_listed() {
+        struct FixedEmbed;
+        impl super::EmbedQueryFn for FixedEmbed {
+            fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![1.0, 0.0, 0.0, 0.0])
+            }
+        }
+        let (dir, src) = hub_of_owners_repo(400);
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        // `stepN` is past the unified scope's floor, so it is in the refill
+        // pool; an embedding equal to the query's makes the semantic leg
+        // list it too.
+        let step_n = store.lookup_symbols_by_name("stepN").unwrap().remove(0).uid;
+        assert!(store.add_embedding(&step_n, vec![1.0, 0.0, 0.0, 0.0]));
+        // Fused, not seeded: the semantic hit reaches `connected` as a
+        // non-seed through the fusion, which needs a BM25 index (empty here).
+        let tantivy =
+            nestweaver_store::TantivyIndex::open_or_create(&dir.path().join("t")).unwrap();
+        let config = HybridSearchConfig {
+            always_blend_semantic: false,
+            ..HybridSearchConfig::default()
+        };
+        let result = super::build_brain_context_hybrid(
+            &store,
+            &["fromTemplate".to_string()],
+            Some(&tantivy),
+            &config,
+            None,
+            Some(&FixedEmbed),
+        )
+        .unwrap();
+        let titles: Vec<&str> = result.connected.iter().map(|n| n.title.as_str()).collect();
+        assert!(result.semantic_applied, "{:?}", result.semantic_unavailable);
+        assert!(titles.contains(&"stepN"), "{titles:?}");
+        let mut seen = std::collections::HashSet::new();
+        for node in &result.connected {
+            assert!(
+                seen.insert(node.uid.as_str()),
+                "{} twice: {titles:?}",
+                node.title
+            );
+        }
     }
 
     /// `owner_heavy_repo` plus a class whose method name is shared with a
@@ -3503,6 +3555,9 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     // Demoted members are not dropped outright: one that scores like any
     // other non-seed stays a candidate and surfaces in `connected` in score
     // order; the rest never reach fusion or hydration (see below).
+    // nw-113 Minor 1: the members the cut drops never reach `connected`, and
+    // the refill below must not bring them back.
+    let mut container_dropped = std::collections::HashSet::new();
     if !container_expansions.is_empty() {
         let cut = cap_container_expansions(
             &container_expansions,
@@ -3515,6 +3570,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         direct_seed_uids.retain(|uid| !cut.demoted.contains(uid));
         // nw-609 review: bounded hydration -- see `cap_container_expansions`.
         ppr.retain(|(uid, _)| !cut.dropped.contains(uid));
+        container_dropped = cut.dropped;
     }
 
     // ── Hybrid retrieval: fuse PPR + BM25 + semantic ──────────────────────
@@ -3633,14 +3689,25 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             .iter()
             .filter(|node| nestweaver_schema::uid::is_module_owner_uid(&node.uid))
             .count();
+        // nw-113 Minor 1: the BM25 and semantic legs can list a node the
+        // walk scored under the floor; it is not listed twice.
+        let listed: std::collections::HashSet<&str> = seeds
+            .iter()
+            .chain(&connected)
+            .map(|node| node.uid.as_str())
+            .collect();
+        let pool: Vec<&(String, f64)> = refill_pool
+            .iter()
+            .filter(|(uid, _)| !listed.contains(uid.as_str()) && !container_dropped.contains(uid))
+            .collect();
         let (take, _) = refill_count(
             module_owners_omitted + deep_owners,
             connected.len(),
             None,
-            refill_pool.len(),
+            pool.len(),
         );
         let mut refill = Vec::with_capacity(take);
-        for (uid, score) in &refill_pool[..take] {
+        for (uid, score) in pool.into_iter().take(take) {
             if let Some(node) = render_brain_node(store, uid, *score)? {
                 refill.push(node);
             }
