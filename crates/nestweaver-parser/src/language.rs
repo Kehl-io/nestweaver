@@ -11,8 +11,8 @@ use std::path::Path;
 pub fn detect_language(path: &Path) -> Option<Language> {
     let ext = path.extension()?.to_str()?;
     match ext {
-        "js" | "jsx" => Some(Language::JavaScript),
-        "ts" | "tsx" => Some(Language::TypeScript),
+        "js" | "jsx" | "mjs" | "cjs" => Some(Language::JavaScript),
+        "ts" | "tsx" | "mts" | "cts" => Some(Language::TypeScript),
         "java" => Some(Language::Java),
         "go" => Some(Language::Go),
         "py" => Some(Language::Python),
@@ -82,6 +82,25 @@ mod tests {
             detect_language(Path::new("foo.tsx")),
             Some(Language::TypeScript)
         );
+    }
+
+    /// nw-113 item 16: Node's module-format extensions are JS and TS.
+    #[test]
+    fn detect_language_module_format_extensions() {
+        for ext in ["mjs", "cjs"] {
+            assert_eq!(
+                detect_language(Path::new(&format!("foo.{ext}"))),
+                Some(Language::JavaScript),
+                "{ext}"
+            );
+        }
+        for ext in ["mts", "cts"] {
+            assert_eq!(
+                detect_language(Path::new(&format!("foo.{ext}"))),
+                Some(Language::TypeScript),
+                "{ext}"
+            );
+        }
     }
 
     #[test]

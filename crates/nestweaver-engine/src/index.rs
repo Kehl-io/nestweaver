@@ -3655,7 +3655,7 @@ fn call_originates_from_builtin(path: &str, name: &str) -> bool {
             "vars",
             "zip",
         ],
-        "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" => &[
+        "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" => &[
             "Array",
             "BigInt",
             "Boolean",
@@ -11601,6 +11601,68 @@ function hello(name) { return "Hello " + name; }
         );
         assert_eq!(result.files_count, 1);
         assert!(result.skipped_files.is_empty());
+    }
+
+    /// nw-113 item 16: `.mjs`/`.cjs` (JavaScript) and `.mts`/`.cts`
+    /// (TypeScript) files are indexed, and their imports resolve: an explicit
+    /// `./lib.mjs`, a CommonJS `require('./lib.cjs')`, and an extensionless
+    /// `./util` that reaches `util.mts`.
+    #[test]
+    fn index_module_format_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        for (path, body) in [
+            ("lib.mjs", "export function esmLib() { return 1; }\n"),
+            (
+                "main.mjs",
+                "import { esmLib } from './lib.mjs';\nexport function esmMain() { return esmLib(); }\n",
+            ),
+            (
+                "lib.cjs",
+                "function cjsLib() { return 1; }\nmodule.exports = { cjsLib };\n",
+            ),
+            (
+                "main.cjs",
+                "const { cjsLib } = require('./lib.cjs');\nfunction cjsMain() { return cjsLib(); }\nmodule.exports = { cjsMain };\n",
+            ),
+            (
+                "util.mts",
+                "export function mtsUtil(x: number): number { return x; }\n",
+            ),
+            (
+                "main.cts",
+                "import { mtsUtil } from './util';\nexport function ctsMain(): number { return mtsUtil(1); }\n",
+            ),
+        ] {
+            fs::write(src.join(path), body).unwrap();
+        }
+        let (result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        assert_eq!(result.files_count, 6, "{:?}", result.skipped_files);
+        let uid_of = |file: &str, name: &str| {
+            store
+                .symbols_in_file(file)
+                .unwrap()
+                .into_iter()
+                .find(|symbol| symbol.name == name)
+                .unwrap_or_else(|| panic!("{file}: {name} is indexed"))
+                .uid
+        };
+        let edges = store.load_typed_edges().unwrap();
+        for (caller_file, caller, callee_file, callee) in [
+            ("main.mjs", "esmMain", "lib.mjs", "esmLib"),
+            ("main.cjs", "cjsMain", "lib.cjs", "cjsLib"),
+            ("main.cts", "ctsMain", "util.mts", "mtsUtil"),
+        ] {
+            let (from, to) = (uid_of(caller_file, caller), uid_of(callee_file, callee));
+            assert!(
+                edges
+                    .iter()
+                    .any(|(a, b, kind, _, _)| *a == from && *b == to && kind == "CALLS"),
+                "{caller} -> {callee}: {edges:#?}"
+            );
+        }
     }
 
     /// A plain local index persists the working-tree location as

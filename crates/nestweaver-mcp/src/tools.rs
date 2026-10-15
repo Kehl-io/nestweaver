@@ -19145,9 +19145,9 @@ fn vault_add_source_payload(
 #[cfg(feature = "daemon")]
 fn dir_is_markdown_dominant(dir: &std::path::Path) -> bool {
     const CODE_EXTS: &[&str] = &[
-        "rs", "js", "ts", "jsx", "tsx", "py", "go", "java", "c", "h", "cpp", "hpp", "cc", "cs",
-        "rb", "php", "swift", "kt", "scala", "lua", "sh", "sql", "hcl", "dart", "ex", "exs", "zig",
-        "m", "mm",
+        "rs", "js", "ts", "jsx", "tsx", "mjs", "cjs", "mts", "cts", "py", "go", "java", "c", "h",
+        "cpp", "hpp", "cc", "cs", "rb", "php", "swift", "kt", "scala", "lua", "sh", "sql", "hcl",
+        "dart", "ex", "exs", "zig", "m", "mm",
     ];
     let mut md = 0usize;
     let mut code = 0usize;

@@ -597,7 +597,8 @@ pub fn extract_package_name(specifier: &str) -> &str {
 /// Try to resolve a path against known files, attempting various extensions.
 ///
 /// This is similar to Node.js module resolution: tries exact, then with
-/// `.ts`, `.tsx`, `.js`, `.jsx` extensions, then as a directory index.
+/// `.ts`, `.tsx`, `.js`, `.jsx` extensions (then the module-format
+/// `.mts`, `.cts`, `.mjs`, `.cjs`), then as a directory index.
 pub fn try_resolve_with_extensions(path: &str, known_files: &HashSet<&str>) -> Option<String> {
     // nw-323 (defect A, belt and braces): `known_files` never carries a
     // leading `./`, so the lookup must not depend on every caller having
@@ -611,7 +612,7 @@ pub fn try_resolve_with_extensions(path: &str, known_files: &HashSet<&str>) -> O
     }
 
     // Try with extensions
-    for ext in &[".ts", ".tsx", ".js", ".jsx"] {
+    for ext in &[".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"] {
         let candidate = format!("{path}{ext}");
         if known_files.contains(&candidate.as_str()) {
             return Some(candidate);

@@ -10,7 +10,7 @@ use crate::workspace::{
 ///
 /// For relative imports (starting with `.` or `..`):
 ///   - Try exact path
-///   - Try with .js, .ts, .tsx, .jsx extensions
+///   - Try with .js, .ts, .tsx, .jsx extensions, then .mts, .cts, .mjs, .cjs
 ///   - Try as directory index: /index.js, /index.ts, /index.tsx, /index.jsx
 ///
 /// For non-relative imports (bare specifiers):
@@ -59,7 +59,7 @@ fn resolve_relative(
     }
 
     // Try with extensions
-    for ext in &[".js", ".ts", ".tsx", ".jsx"] {
+    for ext in &[".js", ".ts", ".tsx", ".jsx", ".mts", ".cts", ".mjs", ".cjs"] {
         let candidate = format!("{normalized}{ext}");
         if known_files.contains(&candidate.as_str()) {
             return Some(candidate);
@@ -415,6 +415,38 @@ mod tests {
             &empty_ctx(),
         );
         assert_eq!(result, Some("src/common/errors/index.ts".to_string()));
+    }
+
+    /// nw-113 item 16: an extensionless specifier reaches a `.mts`, `.cts`,
+    /// `.mjs` or `.cjs` module, after the classic extensions.
+    #[test]
+    fn extensionless_specifiers_reach_module_format_files() {
+        let known = set(&[
+            "src/a.mts",
+            "src/b.cts",
+            "src/c.mjs",
+            "src/d.cjs",
+            "src/e.ts",
+            "src/e.mts",
+        ]);
+        for (specifier, expected) in [
+            ("./a", "src/a.mts"),
+            ("./b", "src/b.cts"),
+            ("./c", "src/c.mjs"),
+            ("./d", "src/d.cjs"),
+            ("./c.mjs", "src/c.mjs"),
+            ("./e", "src/e.ts"),
+        ] {
+            assert_eq!(
+                resolve_import("src/main.ts", specifier, &known, &empty_ctx()),
+                Some(expected.to_string()),
+                "{specifier}"
+            );
+        }
+        assert_eq!(
+            crate::workspace::try_resolve_with_extensions("src/a", &known),
+            Some("src/a.mts".to_string())
+        );
     }
 
     #[test]

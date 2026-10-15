@@ -5951,6 +5951,39 @@ mod tests {
 
     /// TSX and TS files use different query sources; both should parse correctly
     /// even though they share the same `Language::TypeScript`.
+    /// nw-113 item 16: `.mts`/`.cts` parse with the TypeScript grammar (type
+    /// annotations, `import x = require()`), `.mjs`/`.cjs` with JavaScript.
+    #[test]
+    fn module_format_extensions_parse_with_their_grammar() {
+        let ts = "import lib = require('./lib');\n\
+                  export function typed(x: number): number { return lib.f(x); }\n";
+        for path in ["a.mts", "a.cts"] {
+            let parsed = parse_source(Path::new(path), ts).unwrap();
+            assert!(
+                parsed.symbols.iter().any(|s| s.name == "typed"),
+                "{path}: {:?}",
+                parsed.symbols
+            );
+            assert!(
+                parsed
+                    .references
+                    .iter()
+                    .any(|r| r.kind == ReferenceKind::Call && r.name == "f"),
+                "{path}: {:?}",
+                parsed.references
+            );
+        }
+        let js = "const { f } = require('./lib');\nexport function run() { return f(); }\n";
+        for path in ["a.mjs", "a.cjs"] {
+            let parsed = parse_source(Path::new(path), js).unwrap();
+            assert!(
+                parsed.symbols.iter().any(|s| s.name == "run"),
+                "{path}: {:?}",
+                parsed.symbols
+            );
+        }
+    }
+
     #[test]
     fn query_cache_tsx_vs_ts_both_succeed() {
         let ts_source = "function greet(): string { return 'hi'; }";
