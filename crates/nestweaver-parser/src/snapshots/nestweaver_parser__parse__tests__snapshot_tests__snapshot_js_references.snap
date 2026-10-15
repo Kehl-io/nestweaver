@@ -44,7 +44,7 @@ expression: "parsed_references(\"simple.js\", &source)"
     start: 0
     end: 438
     position: 36
-    initialized_at: 36
+    initialized_at: 0
     hoisted_var: false
   name: EventEmitter
   kind: ImportAlias
