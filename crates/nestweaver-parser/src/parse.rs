@@ -3321,6 +3321,19 @@ fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
                 hoisted_var,
             });
         }
+        // nw-113: an expression-body arrow (`() => f()`) has no block, but
+        // its body is still a function body that runs later. Scope what is
+        // written in it to the arrow, as a block body is scoped to its block,
+        // so a closure above a CommonJS `require` sees the binding.
+        if is_concise_arrow_body(parent, node) && !function_scoped {
+            return Some(LexicalScope {
+                start: parent.start_byte(),
+                end: parent.end_byte(),
+                position: node.start_byte(),
+                initialized_at,
+                hoisted_var,
+            });
+        }
         // nw-800: a `catch` parameter is scoped to its clause, and a `let` or
         // `const` declared in a loop header to that loop. A declaration in
         // the loop body or the catch body stops at its own block first.
@@ -3346,6 +3359,16 @@ fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
         current = parent.parent();
     }
     None
+}
+
+/// `node` is written in the expression body of the arrow `parent`.
+fn is_concise_arrow_body(parent: tree_sitter::Node<'_>, node: tree_sitter::Node<'_>) -> bool {
+    parent.kind() == "arrow_function"
+        && parent.child_by_field_name("body").is_some_and(|body| {
+            body.kind() != "statement_block"
+                && body.start_byte() <= node.start_byte()
+                && node.end_byte() <= body.end_byte()
+        })
 }
 
 /// `f => f()`: the bare `parameter` of an arrow is scoped to that arrow.

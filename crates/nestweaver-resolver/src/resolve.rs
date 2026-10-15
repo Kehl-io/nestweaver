@@ -10156,6 +10156,52 @@ export function readIt() { return value(); }
         }
     }
 
+    /// nw-113 final QA round 2 (item 14): an expression-body arrow written
+    /// above a CommonJS `require` runs later, like any function body, so its
+    /// call binds the required name. Top-level code above the `require`,
+    /// including a concise callback, still runs first and does not bind.
+    #[test]
+    fn a_concise_arrow_above_a_require_sees_the_binding() {
+        let lib = ("src/lib.js", "export function f() { return 1; }\n");
+        let b = (
+            "src/b.js",
+            "const fb = () => f();\n\
+             const fb2 = () =>\n\
+             \x20 f();\n\
+             [1].map(() => f());\n\
+             const { f } = require('./lib');\n\
+             module.exports = { fb, fb2 };\n",
+        );
+        let c = (
+            "src/c.js",
+            "function outer() {\n\
+             \x20 const fb6 = () => f();\n\
+             \x20 const { f } = require('./lib');\n\
+             \x20 return fb6;\n\
+             }\n\
+             module.exports = { outer };\n",
+        );
+        let (files, edges) = review_edges(&[lib, b, c], Language::JavaScript);
+        let f = vec![uid(&files, "src/lib.js", "f")];
+        for (path, caller) in [("src/b.js", "fb"), ("src/b.js", "fb2"), ("src/c.js", "fb6")] {
+            assert_eq!(
+                call_targets(&files, &edges, path, caller),
+                f,
+                "{path}: {caller}: {edges:#?}"
+            );
+        }
+        assert!(
+            !call_targets(
+                &files,
+                &edges,
+                "src/b.js",
+                nestweaver_schema::MODULE_OWNER_NAME
+            )
+            .contains(&f[0]),
+            "top-level code above the require runs first: {edges:#?}"
+        );
+    }
+
     /// nw-113 final review M2: a receiver call on a `catch` or `for … of`
     /// variable is unresolved, as one on a parameter is (nw-724), even when
     /// the variable shadows a namespace import whose module has the member.
