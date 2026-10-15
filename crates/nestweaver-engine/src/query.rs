@@ -937,13 +937,13 @@ pub(crate) fn rank_module_owners_last<T>(
 /// kept back to refill the list when capped owners soaked up the walk.
 pub(crate) const CONTEXT_PPR_FLOOR: f64 = 0.0;
 
+/// `(uid, score)` pairs, best first.
+type ScoredUids = Vec<(String, f64)>;
+
 /// nw-113: split a [`CONTEXT_PPR_FLOOR`] walk into the ranking every context
 /// builder used before (seeds, and nodes above `PPR_MIN_SCORE`) and the
 /// refill pool: the non-seed, non-owner nodes under that floor, best first.
-pub(crate) fn split_refill_pool(
-    walk: Vec<(String, f64)>,
-    seeds: &[String],
-) -> (Vec<(String, f64)>, Vec<(String, f64)>) {
+pub(crate) fn split_refill_pool(walk: ScoredUids, seeds: &[String]) -> (ScoredUids, ScoredUids) {
     let seeds: std::collections::HashSet<&str> = seeds.iter().map(String::as_str).collect();
     let (ranked, deep): (Vec<_>, Vec<_>) = walk.into_iter().partition(|(uid, score)| {
         seeds.contains(uid.as_str()) || *score > nestweaver_store::PPR_MIN_SCORE
