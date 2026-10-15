@@ -159,7 +159,8 @@ impl From<&Symbol> for SymbolCandidate {
         SymbolCandidate {
             uid: s.uid.clone(),
             canonical_id: s.canonical_id.clone(),
-            name: s.name.clone(),
+            // nw-113: an owner candidate reads `path::<module>`.
+            name: s.display_name().into_owned(),
             kind: s.kind.to_string(),
             file_path: s.file_path.clone(),
             start_line: s.start_line,
@@ -1404,6 +1405,31 @@ mod context_tests {
             !names.contains(&nestweaver_schema::MODULE_OWNER_NAME),
             "{names:?}"
         );
+    }
+
+    /// nw-113: `symbol` resolves `path::<module>` to that file's owner, and
+    /// an ambiguous `<module>` lists every candidate labelled by its path.
+    #[test]
+    fn symbol_lookup_resolves_and_labels_owners_by_file() {
+        let (_dir, src) = owner_heavy_repo();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        match super::lookup_symbol(&store, "s1.style.js::<module>", None).unwrap() {
+            super::LookupResult::Found(detail) => {
+                assert_eq!(detail.symbol.file_path, "styles/s1.style.js");
+                assert!(detail.symbol.is_module_owner());
+            }
+            _ => panic!("s1.style.js::<module> must resolve"),
+        }
+        match super::lookup_symbol(&store, "<module>", None).unwrap() {
+            super::LookupResult::Ambiguous(candidates) => {
+                assert_eq!(candidates.len(), 6);
+                for c in &candidates {
+                    assert_eq!(c.name, format!("{}::<module>", c.file_path));
+                }
+            }
+            _ => panic!("<module> is ambiguous"),
+        }
     }
 
     /// nw-113: `path::<module>` seeds context with that file's owner.

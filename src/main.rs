@@ -22509,9 +22509,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                         .map_err(|e| anyhow::anyhow!("deserialize: {e}"))?;
                                 let s = &d.symbol;
                                 if out.verbose {
-                                    println!("Symbol: {} [{}]", s.name, s.uid);
+                                    println!("Symbol: {} [{}]", s.display_name(), s.uid);
                                 } else {
-                                    println!("Symbol: {}", s.name);
+                                    println!("Symbol: {}", s.display_name());
                                 }
                                 println!("Kind: {}", s.kind);
                                 println!("File: {}:{}", s.file_path, s.start_line);
@@ -22524,12 +22524,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                         if out.verbose {
                                             println!(
                                                 "  {} ({}:{}) [{}]",
-                                                c.name, c.file_path, c.start_line, c.uid
+                                                c.display_name(),
+                                                c.file_path,
+                                                c.start_line,
+                                                c.uid
                                             );
                                         } else {
                                             println!(
                                                 "  {} ({}:{})",
-                                                c.name, c.file_path, c.start_line
+                                                c.display_name(),
+                                                c.file_path,
+                                                c.start_line
                                             );
                                         }
                                     }
@@ -22542,12 +22547,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                         if out.verbose {
                                             println!(
                                                 "  {} ({}:{}) [{}]",
-                                                c.name, c.file_path, c.start_line, c.uid
+                                                c.display_name(),
+                                                c.file_path,
+                                                c.start_line,
+                                                c.uid
                                             );
                                         } else {
                                             println!(
                                                 "  {} ({}:{})",
-                                                c.name, c.file_path, c.start_line
+                                                c.display_name(),
+                                                c.file_path,
+                                                c.start_line
                                             );
                                         }
                                     }
@@ -22606,9 +22616,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     } else {
                         let s = &detail.symbol;
                         if out.verbose {
-                            println!("Symbol: {} [{}]", s.name, s.uid);
+                            println!("Symbol: {} [{}]", s.display_name(), s.uid);
                         } else {
-                            println!("Symbol: {}", s.name);
+                            println!("Symbol: {}", s.display_name());
                         }
                         println!("Kind: {}", s.kind);
                         println!("File: {}:{}", s.file_path, s.start_line);
@@ -22622,10 +22632,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 if out.verbose {
                                     println!(
                                         "  {} ({}:{}) [{}]",
-                                        c.name, c.file_path, c.start_line, c.uid
+                                        c.display_name(),
+                                        c.file_path,
+                                        c.start_line,
+                                        c.uid
                                     );
                                 } else {
-                                    println!("  {} ({}:{})", c.name, c.file_path, c.start_line);
+                                    println!(
+                                        "  {} ({}:{})",
+                                        c.display_name(),
+                                        c.file_path,
+                                        c.start_line
+                                    );
                                 }
                             }
                         }
@@ -22638,10 +22656,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 if out.verbose {
                                     println!(
                                         "  {} ({}:{}) [{}]",
-                                        c.name, c.file_path, c.start_line, c.uid
+                                        c.display_name(),
+                                        c.file_path,
+                                        c.start_line,
+                                        c.uid
                                     );
                                 } else {
-                                    println!("  {} ({}:{})", c.name, c.file_path, c.start_line);
+                                    println!(
+                                        "  {} ({}:{})",
+                                        c.display_name(),
+                                        c.file_path,
+                                        c.start_line
+                                    );
                                 }
                             }
                         }
