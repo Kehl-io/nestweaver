@@ -42,13 +42,16 @@ pub const DID_YOU_MEAN_OVER_FETCH: usize = DID_YOU_MEAN_LIMIT * 4;
 /// then path/kind tie-breaks, then file path) comes from that search and is
 /// already deterministic.
 ///
-/// `query` MUST be a bare name, never a UID. Every caller already branches
+/// `query` is a bare name or a `path::name` spec, never a UID. A
+/// `path::name` miss (nw-113) is searched by its name half and each
+/// suggestion is returned as `path::name`, a spec that resolves to that
+/// symbol. Every caller already branches
 /// on `name_or_uid.contains(':')` to route UID input to an exact lookup
 /// (`resolve_uid`, `tool_brain_impact`'s UID branch); a UID substring-matched
 /// against symbol NAMES is never a useful suggestion, so callers should skip
 /// calling this entirely for UID input. (nw-481 counterweight: `impact
 /// <uid-with-colon>` carries no `did_you_mean` key.) This function ALSO
-/// checks `query.contains(':')` itself and returns an empty list — defense
+/// returns an empty list for any other `:` form itself — defense
 /// in depth, so a future caller that forgets that branch still fails safe
 /// instead of substring-searching symbol names for a UID and returning
 /// nonsense. A query that is empty, or whitespace-only after trimming, is
