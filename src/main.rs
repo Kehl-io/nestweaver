@@ -4249,8 +4249,26 @@ mod context_header_tests {
     #[test]
     fn connected_header_says_owners_are_listed_last() {
         assert_eq!(
-            super::connected_symbols_header(4, 0),
+            super::connected_symbols_header(4, 2, 0),
             "Connected (4 symbols, ranked by relevance; top-level `<module>` owners listed last):"
+        );
+    }
+
+    /// nw-113 final review Minor 3: with no owner listed or left out, both
+    /// headings are 12.0.4's, word for word.
+    #[test]
+    fn connected_headers_without_owners_keep_the_baseline_text() {
+        assert_eq!(
+            super::connected_symbols_header(4, 0, 0),
+            "Connected (4 symbols, ranked by relevance):"
+        );
+        assert_eq!(
+            super::cli::brain_render::brain_connected_header(5, 11, None, 0, 0),
+            "Connected (5 of 11, ranked by relevance):"
+        );
+        assert_eq!(
+            super::cli::brain_render::brain_connected_header(5, 11, Some((40, 100)), 0, 0),
+            "Connected (5 of 11, ~40/100 tokens, ranked by relevance):"
         );
     }
 
@@ -4261,17 +4279,22 @@ mod context_header_tests {
     fn connected_headers_count_omitted_owners_alike() {
         let clause = "top-level `<module>` owners listed last, 3 more not counted";
         assert_eq!(
-            super::connected_symbols_header(4, 3),
+            super::connected_symbols_header(4, 3, 3),
             format!("Connected (4 symbols, ranked by relevance; {clause}):")
         );
         assert_eq!(
-            super::cli::brain_render::brain_connected_header(11, 11, None, 3),
+            super::cli::brain_render::brain_connected_header(11, 11, None, 3, 3),
             format!("Connected (11 of 11, ranked by relevance; {clause}):")
         );
         assert_eq!(
-            super::cli::brain_render::brain_connected_header(5, 11, Some((40, 100)), 0),
+            super::cli::brain_render::brain_connected_header(5, 11, Some((40, 100)), 1, 0),
             "Connected (5 of 11, ~40/100 tokens, ranked by relevance; top-level `<module>` \
              owners listed last):"
+        );
+        assert_eq!(
+            super::connected_symbols_header(4, 0, 2),
+            "Connected (4 symbols, ranked by relevance; top-level `<module>` owners listed \
+             last, 2 more not counted):"
         );
     }
 }
@@ -27490,11 +27513,22 @@ fn resolve_uid_with_repo_filter(
 ///
 /// nw-113 final round: when the owner cap left owners out, the heading says
 /// how many, in the words `brain context`'s heading uses.
-fn connected_symbols_header(count: usize, owners_omitted: usize) -> String {
-    format!(
-        "Connected ({count} symbols, ranked by relevance; {}):",
-        cli::brain_render::owner_order_clause(owners_omitted)
-    )
+///
+/// nw-113 final review Minor 3: with no owner listed or left out, it is
+/// 12.0.4's heading.
+fn connected_symbols_header(count: usize, owners_listed: usize, owners_omitted: usize) -> String {
+    let owners = cli::brain_render::owner_order_clause(owners_listed, owners_omitted)
+        .map(|clause| format!("; {clause}"))
+        .unwrap_or_default();
+    format!("Connected ({count} symbols, ranked by relevance{owners}):")
+}
+
+/// How many of `nodes` are `<module>` owners, for [`connected_symbols_header`].
+fn owners_listed(nodes: &[nestweaver_engine::ContextNode]) -> usize {
+    nodes
+        .iter()
+        .filter(|node| nestweaver_schema::uid::is_module_owner_uid(&node.uid))
+        .count()
 }
 
 /// Print a human-readable representation of a `ContextResult`.
@@ -27527,7 +27561,11 @@ fn print_context_text(result: &ContextResult) {
         println!();
         println!(
             "{}",
-            connected_symbols_header(result.connected.len(), result.module_owners_omitted)
+            connected_symbols_header(
+                result.connected.len(),
+                owners_listed(&result.connected),
+                result.module_owners_omitted,
+            )
         );
         for node in &result.connected {
             println!(
@@ -27606,7 +27644,11 @@ fn print_feature_context_text(result: &FeatureContextResult) {
         println!();
         println!(
             "{}",
-            connected_symbols_header(result.connected.len(), result.module_owners_omitted)
+            connected_symbols_header(
+                result.connected.len(),
+                owners_listed(&result.connected),
+                result.module_owners_omitted,
+            )
         );
         for node in &result.connected {
             println!(

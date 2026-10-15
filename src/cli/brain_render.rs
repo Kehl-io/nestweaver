@@ -656,6 +656,12 @@ pub(crate) fn print_brain_context_text(
                 cut,
                 total,
                 token_budget.map(|budget| (used_tokens, budget)),
+                result
+                    .connected
+                    .iter()
+                    .take(cut)
+                    .filter(|n| nestweaver_schema::uid::is_module_owner_uid(&n.uid))
+                    .count(),
                 result.module_owners_omitted,
             )
         );
@@ -686,12 +692,16 @@ pub(crate) fn print_brain_context_text(
 
 /// nw-113: how a `Connected (...)` heading describes owners: listed last,
 /// and how many the cap left out of the count. Shared by code, feature and
-/// brain context so their headings say the same thing.
-pub(crate) fn owner_order_clause(owners_omitted: usize) -> String {
-    if owners_omitted == 0 {
-        "top-level `<module>` owners listed last".to_string()
-    } else {
-        format!("top-level `<module>` owners listed last, {owners_omitted} more not counted")
+/// brain context so their headings say the same thing. `None` when no owner
+/// is listed or left out: the heading is then 12.0.4's (final review
+/// Minor 3).
+pub(crate) fn owner_order_clause(owners_listed: usize, owners_omitted: usize) -> Option<String> {
+    match (owners_listed, owners_omitted) {
+        (0, 0) => None,
+        (_, 0) => Some("top-level `<module>` owners listed last".to_string()),
+        (_, omitted) => Some(format!(
+            "top-level `<module>` owners listed last, {omitted} more not counted"
+        )),
     }
 }
 
@@ -701,15 +711,16 @@ pub(crate) fn brain_connected_header(
     shown: usize,
     total: usize,
     tokens: Option<(usize, usize)>,
+    owners_listed: usize,
     owners_omitted: usize,
 ) -> String {
     let tokens = tokens
         .map(|(used, budget)| format!(", ~{used}/{budget} tokens"))
         .unwrap_or_default();
-    format!(
-        "Connected ({shown} of {total}{tokens}, ranked by relevance; {}):",
-        owner_order_clause(owners_omitted)
-    )
+    let owners = owner_order_clause(owners_listed, owners_omitted)
+        .map(|clause| format!("; {clause}"))
+        .unwrap_or_default();
+    format!("Connected ({shown} of {total}{tokens}, ranked by relevance{owners}):")
 }
 
 /// Render a daemon-routed `BrainSearchResponse` in the same shape as the
