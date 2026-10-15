@@ -312,7 +312,9 @@ use std::path::Path;
 /// 11 — nw-787: a nested JS/TS `function` declaration is scoped to the region
 ///     it is visible in instead of binding every same-named bare call in the
 ///     file. It is hoisted to the start of its enclosing function body; in
-///     strict code (a module, a class body or a `"use strict"` scope) a
+///     strict code (TypeScript, an ES module: `.mjs`/`.mts` or a file with
+///     `import`/`export`, a class body, or a `"use strict"` directive anywhere
+///     in the file's or an enclosing function's directive prologue) a
 ///     declaration inside a block is scoped to that block, the ES2015 block
 ///     rule. The parser records the region as a `HoistedDeclaration`
 ///     reference (parsed cache 7). nw-789: a bare JS/TS call (`f()`, no

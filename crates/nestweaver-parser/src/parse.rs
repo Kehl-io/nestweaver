@@ -177,9 +177,10 @@ pub enum ReferenceKind {
     /// nw-787: a JS/TS `function` declaration nested in a function body or a
     /// block. `scope` is the region it is visible in: the enclosing function
     /// body, or (strict code: TypeScript, an ES module, `"use strict"`) its
-    /// own block. It is hoisted, so `position` and `initialized_at` are the
-    /// region's start. A module-level declaration emits none: it is visible
-    /// file-wide. Kept apart from `LocalBinding` because it names the graph
+    /// own block. `position` is the declaration's own byte offset; it is
+    /// hoisted, so `initialized_at` is the region's start. A module-level
+    /// declaration emits none: it is visible file-wide, and so is a nested
+    /// one that shares its name and line (the same graph symbol). Kept apart from `LocalBinding` because it names the graph
     /// symbol itself and never shadows it. Not an edge.
     HoistedDeclaration,
     /// Exact public export. `name` is the public name (including `default`),
@@ -2203,7 +2204,17 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     if share_locals {
         references.extend(local_bindings.iter().cloned());
         if matches!(lang, Language::JavaScript | Language::TypeScript) {
-            collect_hoisted_declarations(tree.root_node(), source_bytes, &mut references, lang);
+            let module_extension = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| matches!(extension, "mjs" | "mts"));
+            collect_hoisted_declarations(
+                tree.root_node(),
+                source_bytes,
+                &mut references,
+                lang,
+                module_extension,
+            );
         }
     } else {
         collect_local_bindings(tree.root_node(), source_bytes, &mut references, lang);
@@ -3320,33 +3331,34 @@ fn emit_binding_names(
 /// nw-787: one `HoistedDeclaration` per JS/TS `function` declaration that is
 /// not at module level, scoped to where it is visible (see the variant).
 ///
-/// In sloppy code (a `.js` script with no `import`/`export` and no leading
-/// `"use strict"`) a block-level declaration is also visible in its enclosing
-/// function (ECMA-262 Annex B.3.3), so it is scoped to that function body, or
-/// emits nothing when that is the module. Class bodies are always strict.
+/// Code is strict in TypeScript, in an ES module (an `.mjs`/`.mts` file, or
+/// any file with `import`/`export`), under a `"use strict"` directive anywhere
+/// in the file's or an enclosing function's directive prologue, and in a class
+/// body. In sloppy code a block-level declaration is also visible in its
+/// enclosing function (ECMA-262 Annex B.3.3), so it is scoped to that function
+/// body, or emits nothing when that is the module.
+///
+/// The graph identifies a symbol by name and line, so a nested declaration
+/// that shares both with a module-level declaration (`function a(){ function
+/// f(){} } function f(){}` on one line) is the same graph node as that
+/// module-level `f`, which is visible file-wide: no region is emitted for it.
+/// `position` carries the declaration's own byte offset; `initialized_at` is
+/// the region's start, since a declaration is hoisted.
 fn collect_hoisted_declarations(
     root: tree_sitter::Node<'_>,
     source_bytes: &[u8],
     references: &mut Vec<RawReference>,
     lang: Language,
+    module_extension: bool,
 ) {
-    let strict_file = lang == Language::TypeScript || {
-        let mut cursor = root.walk();
-        let statements: Vec<_> = root.named_children(&mut cursor).collect();
-        statements
-            .iter()
-            .any(|child| matches!(child.kind(), "import_statement" | "export_statement"))
-            || statements
-                .iter()
-                .find(|child| child.kind() != "comment" && child.kind() != "hash_bang_line")
-                .and_then(|first| {
-                    first
-                        .named_child(0)
-                        .filter(|_| first.kind() == "expression_statement")
-                })
-                .and_then(|string| string.utf8_text(source_bytes).ok())
-                .is_some_and(|text| matches!(text, "\"use strict\"" | "'use strict'"))
-    };
+    let strict_file = lang == Language::TypeScript
+        || module_extension
+        || has_use_strict_directive(root, source_bytes)
+        || {
+            let mut cursor = root.walk();
+            root.named_children(&mut cursor)
+                .any(|child| matches!(child.kind(), "import_statement" | "export_statement"))
+        };
     let is_function_body = |node: tree_sitter::Node<'_>| {
         node.kind() == "class_static_block"
             || node.kind() == "statement_block"
@@ -3362,6 +3374,8 @@ fn collect_hoisted_declarations(
                     )
                 })
     };
+    let mut declarations = Vec::new();
+    let mut module_level = std::collections::HashSet::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         let mut cursor = node.walk();
@@ -3374,14 +3388,20 @@ fn collect_hoisted_declarations(
         ) {
             continue;
         }
-        let Some(name) = node
+        let Some((name_node, name)) = node
             .child_by_field_name("name")
             .and_then(|name| Some((name, name.utf8_text(source_bytes).ok()?)))
         else {
             continue;
         };
+        let line = name_node.start_position().row as u32 + 1;
         let ancestors = || std::iter::successors(node.parent(), |ancestor| ancestor.parent());
-        let strict = strict_file || ancestors().any(|ancestor| ancestor.kind() == "class_body");
+        let strict = strict_file
+            || ancestors().any(|ancestor| {
+                ancestor.kind() == "class_body"
+                    || is_function_body(ancestor)
+                        && has_use_strict_directive(ancestor, source_bytes)
+            });
         // The innermost function body, or in strict code the innermost block;
         // `None` at module level.
         let Some(region) = ancestors()
@@ -3391,23 +3411,52 @@ fn collect_hoisted_declarations(
                     || strict && matches!(ancestor.kind(), "statement_block" | "switch_body")
             })
         else {
+            module_level.insert((name, line));
             continue;
         };
+        declarations.push((name, line, node.start_byte(), region));
+    }
+    for (name, line, declared_at, region) in declarations {
+        if module_level.contains(&(name, line)) {
+            continue;
+        }
         references.push(RawReference {
             scope: Some(LexicalScope {
                 start: region.start_byte(),
                 end: region.end_byte(),
-                position: region.start_byte(),
+                position: declared_at,
                 initialized_at: region.start_byte(),
                 hoisted_var: false,
             }),
-            name: name.1.to_string(),
+            name: name.to_string(),
             kind: ReferenceKind::HoistedDeclaration,
-            start_line: name.0.start_position().row as u32 + 1,
+            start_line: line,
             context: String::new(),
             receiver: None,
         });
     }
+}
+
+/// Whether the directive prologue of `body` (a program or a function body:
+/// its leading string-literal expression statements) holds `"use strict"`.
+/// Every directive counts, so `"use client"; "use strict";` is strict.
+fn has_use_strict_directive(body: tree_sitter::Node<'_>, source_bytes: &[u8]) -> bool {
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .filter(|child| !matches!(child.kind(), "comment" | "hash_bang_line"))
+        .map_while(|statement| {
+            let string = statement
+                .named_child(0)
+                .filter(|_| statement.kind() == "expression_statement")
+                .filter(|string| string.kind() == "string")?;
+            // A directive is a whole statement: `"use strict" + x;` is not.
+            (statement.named_child_count() == 1).then_some(string)
+        })
+        .any(|string| {
+            string
+                .utf8_text(source_bytes)
+                .is_ok_and(|text| matches!(text, "\"use strict\"" | "'use strict'"))
+        })
 }
 
 fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
@@ -14628,8 +14677,14 @@ export function G(a) {\n\
                 .filter(|r| r.kind == ReferenceKind::HoistedDeclaration && r.name == name)
                 .filter_map(|r| r.scope)
                 .inspect(|scope| {
-                    assert_eq!(scope.position, scope.start, "{path}: {name} is hoisted");
-                    assert_eq!(scope.initialized_at, scope.start);
+                    assert!(
+                        scope.start < scope.position && scope.position < scope.end,
+                        "{path}: {name}'s declaration lies in its region"
+                    );
+                    assert_eq!(
+                        scope.initialized_at, scope.start,
+                        "{path}: {name} is hoisted"
+                    );
                 })
                 .map(|scope| (scope.start, scope.end))
                 .collect()
@@ -14670,5 +14725,85 @@ export function G(a) {\n\
             region(script, "s.js", "k"),
             vec![span(script, "{\n      function k", "\n    }")]
         );
+    }
+
+    fn hoisted_regions(path: &str, source: &str, name: &str) -> Vec<LexicalScope> {
+        parse_source(Path::new(path), source)
+            .unwrap()
+            .references
+            .into_iter()
+            .filter(|r| r.kind == ReferenceKind::HoistedDeclaration && r.name == name)
+            .filter_map(|r| r.scope)
+            .collect()
+    }
+
+    /// nw-787 (M1): the graph keys a symbol by name and line, so a nested
+    /// `f` sharing its line with a module-level `f` is that file-wide symbol
+    /// and must not narrow it to `a`'s body. Each region carries its own
+    /// declaration's byte offset.
+    #[test]
+    fn a_nested_declaration_sharing_a_line_with_a_module_level_one_emits_no_region() {
+        let source = "function a(){ function f(){} } function f(){}\nf();\n";
+        assert!(hoisted_regions("s.js", source, "f").is_empty());
+        let nested = "function a(){ function f(){} }\nfunction b(){\n  function f(){}\n}\n";
+        let mut offsets: Vec<usize> = hoisted_regions("s.js", nested, "f")
+            .iter()
+            .map(|scope| scope.position)
+            .collect();
+        offsets.sort();
+        let first = nested.find("function f").unwrap();
+        let second = nested.rfind("function f").unwrap();
+        assert_eq!(offsets, vec![first, second]);
+    }
+
+    /// nw-787 (M2): `.mjs`/`.mts` files are ES modules and strict; every
+    /// directive in the prologue counts; a function-level `"use strict"`
+    /// makes that function's body strict. Strict scopes a block declaration
+    /// to its block; sloppy code scopes it to the enclosing function body.
+    #[test]
+    fn strict_mode_covers_module_extensions_every_directive_and_function_prologues() {
+        let body = "function g() {\n  {\n    function f() {}\n  }\n}\n";
+        let block = |source: &str| {
+            let start = source.find("{\n    function f").unwrap();
+            (start, source[start..].find("\n  }").unwrap() + start + 4)
+        };
+        let region = |path: &str, source: &str| {
+            hoisted_regions(path, source, "f")
+                .iter()
+                .map(|scope| (scope.start, scope.end))
+                .collect::<Vec<_>>()
+        };
+        for (path, source) in [
+            ("m.mjs", body.to_string()),
+            ("m.mts", body.to_string()),
+            ("c.js", format!("\"use client\";\n'use strict';\n{body}")),
+            (
+                "fn.js",
+                "function g() {\n  \"use strict\";\n  {\n    function f() {}\n  }\n}\n".to_string(),
+            ),
+        ] {
+            assert_eq!(
+                region(path, &source),
+                vec![block(&source)],
+                "{path} is strict"
+            );
+        }
+        // Sloppy: a plain script, a directive after the prologue, and a
+        // `"use strict"` in a sibling function.
+        for (path, source) in [
+            ("s.js", body.to_string()),
+            ("late.js", format!("x();\n\"use strict\";\n{body}")),
+            (
+                "sib.js",
+                format!("function h() {{ \"use strict\"; }}\n{body}"),
+            ),
+        ] {
+            let g_body = source.find("{\n  {").unwrap();
+            assert_eq!(
+                region(path, &source),
+                vec![(g_body, source.len() - 1)],
+                "{path} is sloppy"
+            );
+        }
     }
 }
