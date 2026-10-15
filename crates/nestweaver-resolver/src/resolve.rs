@@ -975,23 +975,33 @@ fn resolve_single_reference(
                     && candidate_matches(reference, file_path, f, sym, language, graph)
             })
             // Records rejections as a side effect; `min_by_key` consumes the
-            // whole iterator, so every candidate is seen.
+            // whole iterator, so every candidate is seen. An unresolved import
+            // admits only a nested declaration. That test runs per candidate,
+            // before the innermost is chosen, so a rejected homonym (a sibling
+            // function's nested `f`) cannot hide an admissible one.
             .filter_map(|candidate| {
                 let width =
                     same_file_declaration_scope(scope_index, candidate.1, reference, language);
                 same_file_out_of_scope |= width.is_none();
-                width.map(|width| (width, candidate))
+                let width = width?;
+                unresolved_binding
+                    .is_none_or(|binding| {
+                        binding
+                            .scope
+                            .is_some_and(|scope| width < scope.end - scope.start)
+                            || nested_inside_binding(
+                                sorted_syms,
+                                candidate.1,
+                                reference,
+                                binding,
+                                language,
+                            )
+                    })
+                    .then_some((width, candidate))
             })
-            // Ties keep the first in source order: the base `.find` order.
-            .min_by_key(|(width, _)| *width)
-            .filter(|(width, (_, sym))| {
-                unresolved_binding.is_none_or(|binding| {
-                    binding
-                        .scope
-                        .is_some_and(|scope| *width < scope.end - scope.start)
-                        || nested_inside_binding(sorted_syms, sym, reference, binding, language)
-                })
-            })
+            // The innermost scope wins; a tie goes to the earliest declaration,
+            // so the choice never depends on `symbol_map` order.
+            .min_by_key(|(width, (_, sym))| (*width, sym.start_line))
             .map(|(_, candidate)| candidate)
     {
         let target_uid = symbol_uid(repo_uid, file_path, &sym.name, sym.start_line);
@@ -8880,7 +8890,7 @@ export function g() {
     /// expects only `unresolved:f`.
     #[test]
     fn a_nested_function_shadows_an_npm_import_only_from_its_innermost_function() {
-        let cases: [(&str, &str, &str, Option<u32>); 10] = [
+        let cases: [(&str, &str, &str, Option<u32>); 11] = [
             // S3: nested in g, called in g.
             (
                 "S3",
@@ -8945,6 +8955,13 @@ export function g() {
                 "class C {\n  m() {\n    function f() { return 1; }\n    return f();\n  }\n}\n",
                 "m",
                 Some(4),
+            ),
+            // I2: an earlier sibling's nested homonym must not hide g's own.
+            (
+                "sibling-homonym",
+                "function h() {\n  function f() { return 1; }\n  return 0;\n}\nfunction g() {\n  function f() { return 2; }\n  return f();\n}\n",
+                "g",
+                Some(7),
             ),
             // F4 (known residual, nw-787): a block-nested function declaration
             // binds after its block, which is sloppy-mode semantics.
