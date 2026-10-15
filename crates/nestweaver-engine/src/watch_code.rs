@@ -2527,12 +2527,40 @@ fn prepare_code_file(
         parsed.symbols.clone(),
         parsed.references.clone(),
     )];
-    let resolved_edges =
-        resolve_references_with_context(&file_data, lang, r_uid, &workspace_ctx, None, None);
-    let resolved_edges: Vec<_> = resolved_edges
+    // nw-113 P1: the file's type environment, built as the index builds it,
+    // so `this.m()` / `self.m()` resolve `type_aware` here too rather than
+    // falling back to `same_file`. Cross-file return-type seeding needs the
+    // whole repo's symbols and stays with the index.
+    let env = nestweaver_resolver::types::TypeEnvironment::build(
+        &source,
+        lang,
+        &parsed.symbols,
+        &parsed.type_bindings,
+    );
+    let type_envs: std::collections::HashMap<String, _> = (env.binding_count() > 0
+        || env.has_scoped_call_assignments())
+    .then(|| (rel_str.clone(), env))
+    .into_iter()
+    .collect();
+    let resolved_edges = resolve_references_with_context(
+        &file_data,
+        lang,
+        r_uid,
+        &workspace_ctx,
+        Some(&type_envs),
+        None,
+    );
+    let mut resolved_edges: Vec<_> = resolved_edges
         .into_iter()
         .filter(|e| !e.target_uid.starts_with("unresolved:"))
         .collect();
+    // MEMBER_OF is intra-file, so the file's own pass emits it, as the index
+    // does; the replacement's `DETACH DELETE` removed the old ones.
+    resolved_edges.extend(crate::index::file_member_of_edges(
+        r_uid,
+        &rel_str,
+        &parsed.symbols,
+    ));
 
     Ok(PreparedCodeFile {
         rel_path: rel_str,
@@ -3806,6 +3834,59 @@ mod tests {
             missing.is_empty() && extra.is_empty(),
             "{what}: watcher differs from fresh\nmissing/miscounted: {missing:#?}\nextra: {extra:#?}"
         );
+    }
+
+    /// Edges with their kind and evidence kinds, as a multiset, so a
+    /// `type_aware` edge downgraded to `same_file` is a difference too.
+    fn edge_evidence_multiset(
+        db: &GraphStore,
+    ) -> std::collections::BTreeMap<(String, String, String, String), usize> {
+        let mut out = std::collections::BTreeMap::new();
+        for (a, b, kind, _, evidence) in db.load_typed_edges().unwrap() {
+            *out.entry((a, b, kind, evidence)).or_insert(0) += 1;
+        }
+        out
+    }
+
+    /// nw-113 final watch parity P1: a watcher pass over a file with a class
+    /// keeps every MEMBER_OF edge and the `type_aware` `this.m()` /
+    /// `self.m()` calls, exactly as a fresh index has them (JS, TS, Python).
+    #[test]
+    fn watcher_keeps_member_of_and_type_aware_edges_of_an_edited_class() {
+        for (path, body) in [
+            (
+                "a.js",
+                "class A {\n  constructor() {\n    this.x = 1;\n  }\n  run() {\n    return this.go();\n  }\n  go() {\n    return 1;\n  }\n}\nexport default A;\n",
+            ),
+            (
+                "b.ts",
+                "export class B {\n  run() {\n    return this.go();\n  }\n  go() {\n    return 1;\n  }\n}\n",
+            ),
+            (
+                "c.py",
+                "class A:\n    def run(self):\n        return self.go()\n\n    def go(self):\n        return 1\n",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, r_uid, root, repo_url) = index_files(&dir, &[(path, body.to_string())]);
+            let before = edge_evidence_multiset(&store);
+            assert!(
+                before.keys().any(|(_, _, kind, _)| kind == "MEMBER_OF"),
+                "{path}: precondition: the index has MEMBER_OF: {before:#?}"
+            );
+            let file = root.join(path);
+            let comment = if path.ends_with(".py") { "# e" } else { "// e" };
+            std::fs::write(&file, format!("{comment}\n{body}")).unwrap();
+            let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+            process_fixture_batch(&watcher, &store, &r_uid, &root, &[file]);
+            let (_, fresh) =
+                crate::index::index_directory_in_memory(&root, "test", &repo_url, "fresh").unwrap();
+            let (live, fresh) = (
+                edge_evidence_multiset(&store),
+                edge_evidence_multiset(&fresh),
+            );
+            assert_eq!(live, fresh, "{path}: watcher differs from fresh");
+        }
     }
 
     /// The two barrel shapes: a local re-export and a `from` re-export.

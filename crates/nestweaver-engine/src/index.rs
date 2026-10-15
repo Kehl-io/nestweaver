@@ -3776,6 +3776,47 @@ fn containing_symbol_for_line(symbols: &[RawSymbol], line: u32) -> Option<&RawSy
         })
 }
 
+/// The MEMBER_OF edges of one file: from each symbol whose `parent_name`
+/// names a class, interface, enum or trait declared in the same file to that
+/// container. Shared by the index and the live watcher (nw-113 P1), so a
+/// watcher pass over a file with a class keeps its members.
+pub(crate) fn file_member_of_edges(
+    r_uid: &str,
+    rel_path: &str,
+    raw_symbols: &[RawSymbol],
+) -> Vec<nestweaver_schema::ResolvedEdge> {
+    use nestweaver_schema::SymbolKind;
+    let containers: HashMap<&str, String> = raw_symbols
+        .iter()
+        .filter(|symbol| {
+            matches!(
+                symbol.kind,
+                SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum | SymbolKind::Trait
+            )
+        })
+        .map(|symbol| {
+            (
+                symbol.name.as_str(),
+                symbol_uid(r_uid, rel_path, &symbol.name, symbol.start_line),
+            )
+        })
+        .collect();
+    raw_symbols
+        .iter()
+        .filter_map(|symbol| {
+            let parent_uid = containers.get(symbol.parent_name.as_deref()?)?;
+            Some(nestweaver_schema::ResolvedEdge {
+                source_uid: symbol_uid(r_uid, rel_path, &symbol.name, symbol.start_line),
+                target_uid: parent_uid.clone(),
+                edge_type: nestweaver_schema::EdgeType::MemberOf,
+                confidence: 1.0,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+        })
+        .collect()
+}
+
 struct IndexResolution {
     skip_resolution: bool,
     resolve_filter: Option<std::collections::HashSet<String>>,
@@ -3822,7 +3863,7 @@ impl IndexResolution {
 fn prepare_index_resolution(
     prep: PrepareIndexResolution<'_>,
 ) -> Result<IndexResolution, anyhow::Error> {
-    use nestweaver_schema::{EdgeType, ResolvedEdge};
+    use nestweaver_schema::ResolvedEdge;
     use rayon::prelude::*;
 
     let PrepareIndexResolution {
@@ -4018,56 +4059,21 @@ fn prepare_index_resolution(
         );
     }
 
-    let member_of_edges = {
-        let container_kinds = [
-            nestweaver_schema::SymbolKind::Class,
-            nestweaver_schema::SymbolKind::Interface,
-            nestweaver_schema::SymbolKind::Enum,
-            nestweaver_schema::SymbolKind::Trait,
-        ];
-
-        let mut container_map: HashMap<(String, String), String> = HashMap::new();
-        for (rel_path, raw_symbols, _, _) in parsed_files_for_resolver {
-            for raw_sym in raw_symbols {
-                if container_kinds.contains(&raw_sym.kind) {
-                    let uid = symbol_uid(r_uid, rel_path, &raw_sym.name, raw_sym.start_line);
-                    container_map.insert((rel_path.clone(), raw_sym.name.clone()), uid);
-                }
-            }
-        }
-
-        let mut member_of_edges: Vec<ResolvedEdge> = Vec::new();
-        // nw-726. MEMBER_OF is intra-file. An incremental resolution deletes
-        // resolved edges only for the affected files, then inserts every edge
-        // this pass built. Emitting MEMBER_OF for files outside that set
-        // inserts a second copy of edges the delete did not touch.
-        for (rel_path, raw_symbols, _, _) in parsed_files_for_resolver {
-            if resolve_filter
+    // nw-726. MEMBER_OF is intra-file. An incremental resolution deletes
+    // resolved edges only for the affected files, then inserts every edge
+    // this pass built. Emitting MEMBER_OF for files outside that set
+    // inserts a second copy of edges the delete did not touch.
+    let member_of_edges: Vec<ResolvedEdge> = parsed_files_for_resolver
+        .iter()
+        .filter(|(rel_path, _, _, _)| {
+            resolve_filter
                 .as_ref()
-                .is_some_and(|filter| !filter.contains(rel_path.as_str()))
-            {
-                continue;
-            }
-            for raw_sym in raw_symbols {
-                if let Some(parent_name) = &raw_sym.parent_name {
-                    let key = (rel_path.clone(), parent_name.clone());
-                    if let Some(parent_uid) = container_map.get(&key) {
-                        let child_uid =
-                            symbol_uid(r_uid, rel_path, &raw_sym.name, raw_sym.start_line);
-                        member_of_edges.push(ResolvedEdge {
-                            source_uid: child_uid,
-                            target_uid: parent_uid.clone(),
-                            edge_type: EdgeType::MemberOf,
-                            confidence: 1.0,
-                            link_type: None,
-                            evidence: Vec::new(),
-                        });
-                    }
-                }
-            }
-        }
-        member_of_edges
-    };
+                .is_none_or(|filter| filter.contains(rel_path.as_str()))
+        })
+        .flat_map(|(rel_path, raw_symbols, _, _)| {
+            file_member_of_edges(r_uid, rel_path, raw_symbols)
+        })
+        .collect();
 
     resolve_pb.finish_and_clear();
     let resolution = IndexResolution {
