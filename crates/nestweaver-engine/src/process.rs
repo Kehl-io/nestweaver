@@ -74,8 +74,16 @@ pub struct AffectedSymbol {
 pub struct AffectedProcess {
     pub name: String,
     pub uid: String,
+    /// Changed symbols among the process's members. nw-113: a `<module>`
+    /// owner is never a changed symbol, so a process affected only because
+    /// a member file's top-level code changed counts 0 here and says so in
+    /// [`Self::top_level_code_changed`].
     pub affected_symbol_count: u32,
     pub total_symbol_count: u32,
+    /// nw-113: a member's file changed its top-level code (the process's
+    /// own `<module>` entry, or an owner it reaches). Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub top_level_code_changed: bool,
 }
 
 /// Risk level derived from the number of affected processes.
@@ -681,13 +689,15 @@ fn detect_changes_impact_with_work_budget(
             // A process whose only changed member is an owner (its file's
             // top-level code changed) is affected, with no changed SYMBOL.
             let overlap = affected_uids.intersection(&members).count();
-            if overlap > 0 || !owner_seeds.is_disjoint(&members) {
+            let top_level_code_changed = !owner_seeds.is_disjoint(&members);
+            if overlap > 0 || top_level_code_changed {
                 let hash = crate::hash::blake3_hex(&format!("process:{}", ep.uid));
                 affected_processes.push(AffectedProcess {
                     name: derive_process_name(ep),
                     uid: format!("proc:{}", &hash[..16]),
                     affected_symbol_count: overlap as u32,
                     total_symbol_count: members.len() as u32,
+                    top_level_code_changed,
                 });
             }
         }
@@ -883,6 +893,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["index.js::<module>"],
             "a changed file's top-level code still affects its own process"
+        );
+        // nw-113 final round: owners are not changed symbols, so the count
+        // stays 0, and the process says why it is listed.
+        let process = &owner_only.affected_processes[0];
+        assert_eq!(process.affected_symbol_count, 0, "{process:?}");
+        assert!(process.top_level_code_changed, "{process:?}");
+        let symbol_change = impact
+            .affected_processes
+            .iter()
+            .find(|p| p.name == "src/controllers/index.js::<module>")
+            .unwrap();
+        assert!(
+            !symbol_change.top_level_code_changed,
+            "only server.js changed, which is a symbol change: {symbol_change:?}"
         );
 
         let traced: Vec<String> = trace_processes(&store, 10)

@@ -13539,7 +13539,7 @@ fn build_flow_tree(
 fn tool_schema_detect_changes() -> Value {
     json!({
         "name": "detect_changes",
-        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high, or unknown when a changed file maps to no indexed symbols — never read unknown as low)\n- `risk` and `gate_state` are the verdict `blast_radius` returns for the same files at its default depth (nw-544), so a gate built on either tool agrees; `affected_processes` is detail, not a risk input\n- Gate on `gate_state`, not `status` (nw-467): a run that merely stopped at its configured depth is `status: partial` but `gate_state: ok` — bounded, not broken, and the normal state at the default depth. `degraded-unknown` means stale/errored/refused/cancelled and requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts\n- `resolver_stale_repos`, when present, is repo UIDs with generation-mismatched edges that own or are linked to a changed file (a stale repo unrelated to the change is only named in a `resolver-generation-stale-unrelated` warning) — a different population from `stale_check`'s or `hub_nodes`'s own `stale_repos` (same key name, different tools, different meanings — nw-371)",
+        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high, or unknown when a changed file maps to no indexed symbols — never read unknown as low)\n- `risk` and `gate_state` are the verdict `blast_radius` returns for the same files at its default depth (nw-544), so a gate built on either tool agrees; `affected_processes` is detail, not a risk input\n- A process whose `affected_symbol_count` is 0 is listed because a member file's top-level code (its `path::<module>` owner, never a changed symbol) changed; it carries `top_level_code_changed: true`\n- Gate on `gate_state`, not `status` (nw-467): a run that merely stopped at its configured depth is `status: partial` but `gate_state: ok` — bounded, not broken, and the normal state at the default depth. `degraded-unknown` means stale/errored/refused/cancelled and requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts\n- `resolver_stale_repos`, when present, is repo UIDs with generation-mismatched edges that own or are linked to a changed file (a stale repo unrelated to the change is only named in a `resolver-generation-stale-unrelated` warning) — a different population from `stale_check`'s or `hub_nodes`'s own `stale_repos` (same key name, different tools, different meanings — nw-371)",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -13765,12 +13765,17 @@ fn tool_detect_changes_scoped(
         .iter()
         .take(limit)
         .map(|p| {
-            json!({
+            let mut process = json!({
                 "name": p.name,
                 "uid": p.uid,
                 "affected_symbol_count": p.affected_symbol_count,
                 "total_symbol_count": p.total_symbol_count,
-            })
+            });
+            // nw-113: why a process with 0 changed symbols is listed.
+            if p.top_level_code_changed {
+                process["top_level_code_changed"] = json!(true);
+            }
+            process
         })
         .collect();
 
