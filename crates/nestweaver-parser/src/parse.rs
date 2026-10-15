@@ -5261,6 +5261,33 @@ fn collect_js_import_bindings(
         let (specifier, bindings): (String, Vec<(tree_sitter::Node<'_>, String)>) = match statement
             .kind()
         {
+            // nw-801: TS `import x = require('pkg')` binds `x` to the whole
+            // module, exactly like `const x = require('pkg')`. The specifier
+            // sits on the clause, not the statement, so the import query
+            // never captures it either.
+            "import_statement" if import_require_clause(statement).is_some() => {
+                let Some(clause) = import_require_clause(statement) else {
+                    continue;
+                };
+                let mut cursor = clause.walk();
+                let local = clause
+                    .named_children(&mut cursor)
+                    .find(|node| node.kind() == "identifier");
+                let (Some(local), Some(spec)) = (local, clause.child_by_field_name("source"))
+                else {
+                    continue;
+                };
+                let specifier = strip_quotes(&text(spec));
+                references.push(RawReference {
+                    scope: None,
+                    name: specifier.clone(),
+                    kind: ReferenceKind::Import,
+                    start_line: statement.start_position().row as u32 + 1,
+                    context: text(statement),
+                    receiver: None,
+                });
+                (specifier, vec![(local, "*".into())])
+            }
             "import_statement" => {
                 let Some(spec) = statement.child_by_field_name("source") else {
                     continue;
@@ -5403,6 +5430,13 @@ fn collect_js_import_bindings(
             }
         }
     }
+}
+
+fn import_require_clause(statement: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    let mut cursor = statement.walk();
+    statement
+        .named_children(&mut cursor)
+        .find(|node| node.kind() == "import_require_clause")
 }
 
 /// Exact module-level object literals and constructor instances expose their own

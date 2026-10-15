@@ -931,6 +931,13 @@ fn resolve_single_reference(
                 })
                 && if binding.original_name == "*" {
                     reference.receiver.as_deref() == Some(binding.local_name.as_str())
+                        // nw-801: a CommonJS module bound whole (`import x =
+                        // require('…')`, `const x = require('…')`) can itself
+                        // be called. A bare `x()` names that import, never a
+                        // same-named declaration elsewhere in the file.
+                        || matches!(language, Language::JavaScript | Language::TypeScript)
+                            && reference.receiver.is_none()
+                            && binding.local_name == *name
                 } else {
                     (binding.local_name == *name && reference.receiver.is_none())
                         || reference.receiver.as_deref() == Some(binding.local_name.as_str())
@@ -1028,6 +1035,14 @@ fn resolve_single_reference(
                     .scope
                     .is_some_and(|scope| positions.contains(&scope.position))
             })
+        {
+            return Some(unresolved_edge(source_uid, name, edge_type));
+        }
+        // nw-801: calling a whole-module binding calls what the module
+        // exports as its value, which no export name identifies.
+        if binding.original_name == "*"
+            && reference.receiver.is_none()
+            && matches!(language, Language::JavaScript | Language::TypeScript)
         {
             return Some(unresolved_edge(source_uid, name, edge_type));
         }
@@ -9927,6 +9942,31 @@ export function readIt() { return value(); }
                 );
             }
         }
+    }
+
+    /// nw-801: TS `import x = require('…')` binds `x` exactly like
+    /// `import * as x from '…'`. A package import leaves `x()` external
+    /// instead of falling through to a nested same-named declaration, and a
+    /// relative import resolves `x.member()` into that module.
+    #[test]
+    fn ts_import_equals_require_binds_like_an_import() {
+        let lib = ("src/lib.ts", "export function helper() { return 1; }\n");
+        let a = (
+            "src/a.ts",
+            "import debug = require('debug');\n\
+             import lib = require('./lib');\n\
+             export function run() { function debug(m: string) { return m; } return debug('in'); }\n\
+             export function use() { return debug('out') + lib.helper(); }\n",
+        );
+        let (files, edges) = review_edges(&[lib, a], Language::TypeScript);
+        assert_eq!(
+            call_targets(&files, &edges, "src/a.ts", "use"),
+            vec![
+                uid(&files, "src/lib.ts", "helper"),
+                "unresolved:debug".to_string()
+            ],
+            "{edges:#?}"
+        );
     }
 
     /// nw-113 B1: a `.js` arrow with a bare parameter is a function: it owns
