@@ -41,7 +41,7 @@ class IsolatedDaemon:
             self.env[name] = str(path)
         self.env["NESTWEAVER_SOCK_FALLBACK_DIR"] = str(self.root / "sock")
         self.env["NESTWEAVER_DIAGNOSTIC_WIDTH"] = "1000"
-        self.env["NESTWEAVER_INDEX_CPU_PERCENT"] = "50"
+        self.env["NESTWEAVER_INDEX_CPU_PERCENT"] = "40"
         # Git must not inherit repository/index/config routing from hooks or
         # shell wrappers. Its system/global configuration is disabled too.
         self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_SYSTEM=os.devnull,
