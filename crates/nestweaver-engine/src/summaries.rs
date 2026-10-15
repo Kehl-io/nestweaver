@@ -325,10 +325,12 @@ pub fn generate_symbol_summaries_bounded(
         } else {
             std::borrow::Cow::Borrowed(sym.signature.as_str())
         };
+        // nw-113: at most three owner callers, then a count, so a helper
+        // called at load time from many files keeps a one-line summary.
         let content = format!(
             "{kind} {sig} | callers: [{callers}] | callees: [{callees}] | file: {file}:{line}",
             kind = sym.kind,
-            callers = caller_names.join(", "),
+            callers = nestweaver_schema::cap_module_owner_labels(caller_names).join(", "),
             callees = callee_names.join(", "),
             file = sym.file_path,
             line = sym.start_line,
@@ -929,6 +931,55 @@ mod tests {
                 .starts_with("Module src/ownerless.ts::<module> | callers: []"),
             "{}",
             owner.content
+        );
+    }
+
+    /// nw-113 final round: a symbol called at load time from many files
+    /// lists at most three owner callers, then counts the rest, so one
+    /// summary line stays small; real callers are all listed.
+    #[test]
+    fn symbol_summary_caps_owner_callers() {
+        use crate::index::index_directory_in_memory;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("theme.ts"),
+            "export function fromTemplate() { return 8; }\n\
+             export function realCaller() { return fromTemplate(); }\n",
+        )
+        .unwrap();
+        for i in 0..7 {
+            std::fs::write(
+                src.join(format!("s{i}.style.ts")),
+                "import { fromTemplate } from './theme';\nfromTemplate();\n",
+            )
+            .unwrap();
+        }
+        let (_r, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/r", "sha").unwrap();
+        let summaries = generate_symbol_summaries_bounded(&store, Some("fromTemplate"), 100)
+            .unwrap()
+            .summaries;
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.target_name == "fromTemplate")
+            .expect("fromTemplate summary");
+        assert_eq!(
+            summary.content.matches("::<module>").count(),
+            3,
+            "{}",
+            summary.content
+        );
+        assert!(
+            summary.content.contains("realCaller"),
+            "{}",
+            summary.content
+        );
+        assert!(
+            summary.content.contains("+4 more files' top-level code"),
+            "{}",
+            summary.content
         );
     }
 

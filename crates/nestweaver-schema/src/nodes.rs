@@ -89,6 +89,44 @@ pub fn symbol_display_name<'a>(name: &'a str, file_path: &str) -> std::borrow::C
 /// the federation merge apply one cap.
 pub const MODULE_OWNER_CONTEXT_CAP: usize = 3;
 
+/// nw-113: whether a display label names a `<module>` owner (see
+/// [`module_owner_label`]). `<module>` is not an identifier in any indexed
+/// language, so the label alone identifies an owner.
+pub fn is_module_owner_label(label: &str) -> bool {
+    label == MODULE_OWNER_NAME || label.ends_with(&format!("::{MODULE_OWNER_NAME}"))
+}
+
+/// nw-113: the one phrase for owners a capped list leaves out.
+pub fn omitted_module_owners_phrase(omitted: usize) -> String {
+    format!("+{omitted} more files' top-level code")
+}
+
+/// nw-113: a caller list with every real caller and at most
+/// [`MODULE_OWNER_CONTEXT_CAP`] owner labels, in their order, followed by
+/// [`omitted_module_owners_phrase`] when owners were left out. Keeps a
+/// helper called at load time from many files to a short list.
+pub fn cap_module_owner_labels(labels: &[String]) -> Vec<String> {
+    let (owners, mut capped): (Vec<&String>, Vec<String>) = (
+        labels.iter().filter(|l| is_module_owner_label(l)).collect(),
+        labels
+            .iter()
+            .filter(|l| !is_module_owner_label(l))
+            .cloned()
+            .collect(),
+    );
+    capped.extend(
+        owners
+            .iter()
+            .take(MODULE_OWNER_CONTEXT_CAP)
+            .map(|l| (*l).clone()),
+    );
+    let omitted = owners.len().saturating_sub(MODULE_OWNER_CONTEXT_CAP);
+    if omitted > 0 {
+        capped.push(omitted_module_owners_phrase(omitted));
+    }
+    capped
+}
+
 /// nw-113: split a `file::name` lookup spec into its file qualifier and
 /// name. `None` when the spec has no `::` or either half is empty.
 pub fn split_file_qualifier(spec: &str) -> Option<(&str, &str)> {
