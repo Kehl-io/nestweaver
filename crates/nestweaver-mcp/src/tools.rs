@@ -5492,7 +5492,7 @@ fn tool_schema_read_symbols() -> Value {
                 },
                 "token_budget": {
                     "type": "integer",
-                    "description": "Approximate requested token cap for combined source. Native CLI retains the first symbol in full and drops later symbols after this budget. Omission removes that token cap; 0 requests only the first symbol. MCP independently applies its 20KB logical / 40KB escaped wire bound, which may truncate even the first symbol; inspect output_budget and retry narrowly."
+                    "description": "Approximate requested token cap for combined source. Native CLI cuts a first symbol larger than this budget to fit (`body_truncated: true`, with a closing marker line) and drops later symbols after this budget. Omission removes that token cap; 0 requests only the first symbol, in full. MCP independently applies its 20KB logical / 40KB escaped wire bound, which may truncate even the first symbol; inspect output_budget and retry narrowly."
                 },
                 "root": {
                     "type": "string",

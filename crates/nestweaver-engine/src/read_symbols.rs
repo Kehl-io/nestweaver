@@ -42,6 +42,11 @@ pub struct SymbolWindow {
     /// only the end changed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relocated_from_line: Option<u32>,
+    /// nw-804: the body alone was larger than `token_budget`, so only its
+    /// first lines are returned, followed by a marker line naming what was
+    /// cut. `start_line`/`end_line` still give the whole symbol's span.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub body_truncated: bool,
 }
 
 /// A spec that matched more than one symbol.
@@ -94,7 +99,9 @@ pub struct ReadSymbolsResult {
     /// UIDs dropped because the token budget was exhausted.
     pub dropped: Vec<String>,
     pub truncated: bool,
-    /// Set when the FIRST symbol alone exceeded `token_budget`.
+    /// Set when the FIRST symbol alone exceeded `token_budget` even after it
+    /// was cut to fit (nw-804: only a budget smaller than the truncation
+    /// marker, or a budget of 0, which returns the first symbol whole).
     ///
     /// One symbol is always returned, because an empty answer to "read this
     /// symbol" is useless. That guarantee is deliberate — but it was kept
@@ -423,6 +430,50 @@ fn window_cost(body: &str) -> usize {
     body.len() / 4 + 16
 }
 
+/// nw-804: the leading whole lines of `body` that fit `budget` (by
+/// [`window_cost`]) together with a closing marker line naming the cut. A
+/// first line too long to fit (minified code) is cut at a char boundary. The
+/// marker is always kept, so a budget smaller than the marker alone still
+/// overruns and is reported as such by the caller.
+fn truncate_to_budget(body: &str, budget: usize) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let total = lines.len();
+    let allowance = budget.saturating_sub(window_cost("")) * 4;
+    let marker = |kept: usize| {
+        format!(
+            "{ELISION} truncated: {} of {total} lines omitted to fit the {budget}-token \
+             budget; raise --token-budget for the whole body",
+            total - kept
+        )
+    };
+    let mut kept = String::new();
+    let mut kept_lines = 0;
+    for line in &lines {
+        let next = kept.len() + line.len() + 1;
+        if next + marker(kept_lines + 1).len() > allowance {
+            break;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+        kept_lines += 1;
+    }
+    if kept_lines == 0
+        && let Some(first) = lines.first()
+    {
+        let room = allowance.saturating_sub(marker(0).len() + 1);
+        let mut end = room.min(first.len());
+        while !first.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end > 0 {
+            kept.push_str(&first[..end]);
+            kept.push('\n');
+        }
+    }
+    kept.push_str(&marker(kept_lines));
+    kept
+}
+
 pub fn read_symbols(
     store: &GraphStore,
     specs: &[String],
@@ -546,8 +597,8 @@ pub fn read_symbols_budgeted(
             }
         });
         let body_available = body_opt.is_some();
-        let body = body_opt.unwrap_or_default();
-        let cost = window_cost(&body);
+        let mut body = body_opt.unwrap_or_default();
+        let mut cost = window_cost(&body);
         let may_exempt = exempt_first_symbol && result.symbols.is_empty();
         if let Some(budget) = token_budget
             && !may_exempt
@@ -558,22 +609,39 @@ pub fn read_symbols_budgeted(
             continue;
         }
         // The first symbol of a fresh call is exempt from the budget so the
-        // caller never gets an empty answer — but say so rather than reporting
-        // a clean result that silently blew the budget.
+        // caller never gets an empty answer. nw-804: it is cut to fit rather
+        // than returned whole, and the cut is marked in the body and flagged.
+        // A budget of 0 keeps its documented meaning, "only the first symbol",
+        // and returns it whole.
+        let mut body_truncated = false;
         if let Some(budget) = token_budget
             && may_exempt
             && cost > budget
         {
+            if budget > 0 {
+                body = truncate_to_budget(&body, budget);
+                cost = window_cost(&body);
+                body_truncated = true;
+            }
             result.truncated = true;
-            result.budget_exceeded_by_first_symbol = Some(BudgetOverrun {
-                requested_tokens: budget,
-                returned_tokens: cost,
-                note: format!(
-                    "the first symbol alone costs ~{cost} tokens, over the requested \
-                     budget of {budget}; it is returned whole because an empty result \
-                     answers nothing, so this response EXCEEDS the budget"
-                ),
-            });
+            // Only a budget too small for even the cut window still overruns;
+            // that is said, never silent (nw-111).
+            if cost > budget {
+                result.budget_exceeded_by_first_symbol = Some(BudgetOverrun {
+                    requested_tokens: budget,
+                    returned_tokens: cost,
+                    note: format!(
+                        "the first symbol{} still costs ~{cost} tokens, over the requested \
+                         budget of {budget}; it is returned because an empty result answers \
+                         nothing, so this response EXCEEDS the budget",
+                        if body_truncated {
+                            ", cut to its truncation marker,"
+                        } else {
+                            ""
+                        }
+                    ),
+                });
+            }
         }
         used += cost;
         result.symbols.push(SymbolWindow {
@@ -588,6 +656,7 @@ pub fn read_symbols_budgeted(
             is_neighbor,
             stale_span,
             relocated_from_line,
+            body_truncated,
         });
     }
 
@@ -1052,6 +1121,56 @@ app();
         assert_eq!(w.relocated_from_line, None, "{w:?}");
         assert_eq!((w.start_line, w.end_line), (1, 5), "{w:?}");
         assert!(!w.stale_span && w.body_available, "{w:?}");
+    }
+
+    /// nw-804: one symbol larger than `token_budget` is truncated to fit,
+    /// with a marker line in the body and `body_truncated` in the JSON, for
+    /// an ordinary function and a `<module>` owner alike. Its first lines are
+    /// kept, and a budget the cut fits within is not reported as overrun.
+    #[test]
+    fn a_symbol_larger_than_the_budget_is_truncated_with_a_marker() {
+        let body: String = (0..400)
+            .map(|i| format!("  total += step({i});\n"))
+            .collect();
+        let calls: String = (0..400).map(|i| format!("step({i});\n")).collect();
+        let (dir, store) = fixture_file(
+            "src/big.js",
+            &format!(
+                "function step(n) {{ return n; }}\nfunction big(total) {{\n{body}  return total;\n}}\n{calls}"
+            ),
+        );
+        let owner = store
+            .symbols_in_file("src/big.js")
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.is_module_owner())
+            .expect("fixture mints an owner");
+        let reader = FilesystemReader::new(dir.path());
+        for (spec, first_line) in [
+            ("big", "function big(total) {"),
+            (owner.uid.as_str(), "step(0);"),
+        ] {
+            let res = read_symbols(&store, &[spec.to_string()], &reader, 0, Some(200));
+            assert_eq!(res.symbols.len(), 1, "{spec}: {res:?}");
+            let w = &res.symbols[0];
+            assert!(w.body_truncated, "{spec}: {w:?}");
+            assert!(res.truncated, "{spec}");
+            assert!(w.body.starts_with(first_line), "{spec}: {}", w.body);
+            let marker = w.body.lines().last().unwrap();
+            assert!(
+                marker.starts_with(ELISION) && marker.contains("truncated"),
+                "{spec}: {marker}"
+            );
+            assert!(window_cost(&w.body) <= 200, "{spec}: {}", w.body.len());
+            assert!(
+                res.budget_exceeded_by_first_symbol.is_none(),
+                "{spec}: the truncated window fits the budget"
+            );
+            let json = serde_json::to_value(&res).unwrap();
+            assert_eq!(json["symbols"][0]["body_truncated"], true, "{json}");
+        }
+        let res = read_symbols(&store, &["big".to_string()], &reader, 0, None);
+        assert!(!res.symbols[0].body_truncated, "no budget, no cut");
     }
 
     /// nw-113: reading `<module>` returns the file's top-level code: the lines

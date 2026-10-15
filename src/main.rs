@@ -35124,6 +35124,7 @@ credential_method = "gh"
             is_neighbor: false,
             stale_span: false,
             relocated_from_line: None,
+            body_truncated: false,
         };
         let out = read_symbols_window_text(&w);
         assert!(
@@ -35152,6 +35153,7 @@ credential_method = "gh"
             is_neighbor: false,
             stale_span: true,
             relocated_from_line: None,
+            body_truncated: false,
         };
         let out = read_symbols_window_text(&w);
         assert!(out.contains("source changed since indexing"), "{out:?}");
@@ -35177,6 +35179,7 @@ credential_method = "gh"
             is_neighbor: false,
             stale_span: false,
             relocated_from_line: Some(10),
+            body_truncated: false,
         };
         let out = read_symbols_window_text(&w);
         assert!(out.contains("moved from line 10 since indexing"), "{out:?}");
@@ -35200,6 +35203,7 @@ credential_method = "gh"
             is_neighbor: false,
             stale_span: false,
             relocated_from_line: None,
+            body_truncated: false,
         };
         let text = read_symbols_window_text(&w);
         let body: Vec<&str> = text.lines().skip(1).collect();
@@ -35230,6 +35234,7 @@ credential_method = "gh"
             is_neighbor: false,
             stale_span: false,
             relocated_from_line: None,
+            body_truncated: false,
         };
         let res = nestweaver_engine::read_symbols::ReadSymbolsResult {
             symbols: vec![unreadable("greet")],
