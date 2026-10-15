@@ -243,7 +243,10 @@ impl ParsedFile {
     /// incremental index, `parse_batch`), so the routes cannot disagree about
     /// what "unparsable" means.
     pub fn unparsable_skip(&self, display_path: impl Into<String>) -> Option<SkippedFile> {
-        (self.has_syntax_errors && self.symbols.is_empty()).then(|| {
+        // nw-113: the `<module>` owner is never an extractable symbol; it
+        // must not hide a parse error that left no real symbol behind.
+        let no_real_symbols = self.symbols.iter().all(RawSymbol::is_module_owner);
+        (self.has_syntax_errors && no_real_symbols).then(|| {
             SkippedFile::new(
                 display_path,
                 SkipReasonCode::ParseError,
@@ -2229,8 +2232,14 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     }
 
     // nw-113: top-level code has an owner, and the owner is the module
-    // (CodeQL: JS `TopLevel`, Python `Module`).
-    if let Some(owner) = module_owner_symbol(source, &symbols, &top_level_call_lines) {
+    // (CodeQL: JS `TopLevel`, Python `Module`). A tree with errors and no real
+    // symbol gets none: its "top-level" lines are error-recovered spans (a
+    // component body the parser could not see), and the file must stay
+    // disclosed as a parse error (edge-diff B3).
+    let error_without_symbols = tree.root_node().has_error() && symbols.is_empty();
+    if !error_without_symbols
+        && let Some(owner) = module_owner_symbol(source, &symbols, &top_level_call_lines)
+    {
         symbols.insert(0, owner);
     }
 
@@ -13900,5 +13909,87 @@ mod generator_and_bare_arrow_tests {
                 parsed.symbols
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod parse_error_owner_tests {
+    use super::*;
+
+    /// edge-diff B3 repro (freeplay-app GymCard.js): a self-closing JSX tag
+    /// split across lines leaves a tree with errors and no real symbols.
+    const BROKEN: &str = "import { style } from './lib';\n\
+export function G(a) {\n\
+  return (\n\
+    <T>\n\
+      {a && (\n\
+        <V s={style(a)}/\n\
+        >\n\
+      )}\n\
+    </T>\n\
+  );\n\
+}\n";
+
+    /// nw-113 B3: no owner from error-recovered spans, and the file is still
+    /// disclosed as a parse error instead of silently indexed.
+    #[test]
+    fn a_broken_file_with_no_real_symbols_gets_no_owner_and_stays_skipped() {
+        let parsed = parse_source(Path::new("G.js"), BROKEN).unwrap();
+        assert!(parsed.has_syntax_errors, "fixture must have syntax errors");
+        assert!(
+            !parsed.symbols.iter().any(|s| s.is_module_owner()),
+            "{:?}",
+            parsed.symbols
+        );
+        assert!(
+            parsed.unparsable_skip("G.js").is_some(),
+            "{:?}",
+            parsed.symbols
+        );
+    }
+
+    /// The owner never counts as an extractable symbol for the skip decision.
+    #[test]
+    fn an_owner_alone_does_not_make_a_broken_file_parsable() {
+        let parsed = ParsedFile {
+            path: "G.js".to_string(),
+            symbols: vec![RawSymbol {
+                name: MODULE_OWNER_NAME.to_string(),
+                kind: SymbolKind::Module,
+                start_line: 1,
+                end_line: 3,
+                signature: String::new(),
+                content_hash: String::new(),
+                is_entry_point: true,
+                entry_point_kind: Some(EntryPointKind::ModuleInit),
+                visibility: Visibility::Private,
+                type_info: None,
+                parent_name: None,
+                scope_chain: None,
+            }],
+            references: Vec::new(),
+            type_bindings: Vec::new(),
+            has_syntax_errors: true,
+        };
+        assert!(parsed.unparsable_skip("G.js").is_some());
+    }
+
+    /// Counterweight: a file with errors but real symbols keeps its owner.
+    #[test]
+    fn a_broken_file_with_real_symbols_keeps_its_owner() {
+        let source = "export function a() { return 1; }\nboot();\nconst = ;\n";
+        let parsed = parse_source(Path::new("b.js"), source).unwrap();
+        assert!(parsed.has_syntax_errors, "fixture must have syntax errors");
+        assert!(
+            parsed.symbols.iter().any(|s| s.name == "a"),
+            "{:?}",
+            parsed.symbols
+        );
+        assert!(
+            parsed.symbols.iter().any(|s| s.is_module_owner()),
+            "{:?}",
+            parsed.symbols
+        );
+        assert!(parsed.unparsable_skip("b.js").is_none());
     }
 }
