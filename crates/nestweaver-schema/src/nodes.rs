@@ -84,6 +84,11 @@ pub fn symbol_display_name<'a>(name: &'a str, file_path: &str) -> std::borrow::C
     }
 }
 
+/// nw-113: how many connected `<module>` owners a context answer lists; the
+/// rest are counted in `module_owners_omitted`. In schema so the engine and
+/// the federation merge apply one cap.
+pub const MODULE_OWNER_CONTEXT_CAP: usize = 3;
+
 /// nw-113: split a `file::name` lookup spec into its file qualifier and
 /// name. `None` when the spec has no `::` or either half is empty.
 pub fn split_file_qualifier(spec: &str) -> Option<(&str, &str)> {

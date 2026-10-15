@@ -687,14 +687,19 @@ pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
                     "eq"
                 });
         }
-        // nw-113: connected `<module>` owners each tier counted rather than
-        // listed. The tiers can share repos, so a sum could double-count; the
-        // larger of the two is an honest lower bound.
+        // nw-113: each tier listed up to the owner cap, so the merge can hold
+        // twice that. Re-apply it: owners rank after every real node and only
+        // `MODULE_OWNER_CONTEXT_CAP` stay. The omitted count is the owners
+        // this cut dropped plus what the tiers counted; the tiers can share
+        // repos, so their counts are combined by the larger, not the sum.
+        let dropped_owners = result["connected"]
+            .as_array_mut()
+            .map_or(0, recap_module_owners);
         let local_owners = local.get("module_owners_omitted").and_then(Value::as_u64);
         let server_owners = server.get("module_owners_omitted").and_then(Value::as_u64);
-        if local_owners.is_some() || server_owners.is_some() {
-            result["module_owners_omitted"] =
-                Value::from(local_owners.unwrap_or(0).max(server_owners.unwrap_or(0)));
+        if local_owners.is_some() || server_owners.is_some() || dropped_owners > 0 {
+            let tiers = local_owners.unwrap_or(0).max(server_owners.unwrap_or(0));
+            result["module_owners_omitted"] = Value::from(tiers + dropped_owners as u64);
         }
         let local_cut = local.get("seeds_truncated").and_then(Value::as_bool);
         let server_cut = server.get("seeds_truncated").and_then(Value::as_bool);
@@ -817,7 +822,11 @@ pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
                     })
                     .unwrap_or(0)
             };
-            let total = tier_total(local).saturating_add(tier_total(server));
+            // nw-113: owners the merge's owner cap dropped are counted in
+            // `module_owners_omitted`, never in `total`, as on a single tier.
+            let total = tier_total(local)
+                .saturating_add(tier_total(server))
+                .saturating_sub(dropped_owners as u64);
             let connected_len = result["connected"].as_array().map_or(0, Vec::len) as u64;
             result["total"] = Value::from(total.max(connected_len));
             if total > connected_len {
@@ -903,6 +912,26 @@ pub fn inject_or_wrap_provenance(result: &mut Value, sources: &[&str], stale_rep
         sources,
         stale_repos,
     );
+}
+
+/// nw-113: move `<module>` owners (recognised by UID) after every other
+/// node of a merged `connected` array, keep
+/// [`nestweaver_schema::MODULE_OWNER_CONTEXT_CAP`] of them, and return how
+/// many were dropped.
+fn recap_module_owners(connected: &mut Vec<Value>) -> usize {
+    let is_owner = |node: &Value| {
+        node.get("uid")
+            .and_then(Value::as_str)
+            .is_some_and(nestweaver_schema::uid::is_module_owner_uid)
+    };
+    let (real, owners): (Vec<Value>, Vec<Value>) = std::mem::take(connected)
+        .into_iter()
+        .partition(|node| !is_owner(node));
+    let cap = nestweaver_schema::MODULE_OWNER_CONTEXT_CAP;
+    let dropped = owners.len().saturating_sub(cap);
+    *connected = real;
+    connected.extend(owners.into_iter().take(cap));
+    dropped
 }
 
 // ---------------------------------------------------------------------------
@@ -1068,6 +1097,52 @@ mod tests {
             serde_json::json!({ "seeds": [], "connected": [], "module_owners_omitted": 9 });
         let merged = merge_structured_results(&local, &server);
         assert_eq!(merged["module_owners_omitted"], 9, "{merged}");
+    }
+
+    /// nw-113: the merge re-applies the owner cap. Owners rank after every
+    /// real node, at most three survive, and `module_owners_omitted` counts
+    /// the ones the cap dropped plus the larger tier's own count.
+    #[test]
+    fn merged_context_recaps_module_owners() {
+        let owner = |path: &str| {
+            serde_json::json!({
+                "uid": nestweaver_schema::symbol_uid("repo:r", path, nestweaver_schema::MODULE_OWNER_NAME, 1),
+                "name": format!("{path}::<module>"),
+                "relevance": 0.9,
+            })
+        };
+        let real = serde_json::json!({ "uid": "sym:real", "name": "real", "relevance": 0.1 });
+        let local = serde_json::json!({
+            "seeds": [],
+            "connected": [owner("a.js"), owner("b.js"), owner("c.js"), real],
+            "total": 4,
+            "module_owners_omitted": 1,
+        });
+        let server = serde_json::json!({
+            "seeds": [],
+            "connected": [owner("d.js"), owner("e.js"), owner("f.js")],
+            "total": 3,
+            "module_owners_omitted": 2,
+        });
+        let merged = merge_structured_results(&local, &server);
+        let names: Vec<&str> = merged["connected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n["name"].as_str())
+            .collect();
+        assert_eq!(names.len(), 4, "{names:?}");
+        assert_eq!(names[0], "real", "owners rank last: {names:?}");
+        assert!(
+            names[1..].iter().all(|n| n.ends_with("::<module>")),
+            "{names:?}"
+        );
+        assert_eq!(merged["module_owners_omitted"], 3 + 2, "{merged}");
+        assert_eq!(
+            merged["total"], 4,
+            "dropped owners leave the total: {merged}"
+        );
+        assert_ne!(merged["truncated"], true, "{merged}");
     }
 
     /// `rrf_merge` DEDUPLICATES, so summing the tiers overcounts by exactly the

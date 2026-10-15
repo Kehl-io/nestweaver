@@ -835,7 +835,7 @@ pub struct ContextResult {
 /// nw-113: how many connected `<module>` owners `context` lists. Owners are
 /// real callers, but a helper called at load time from many files would
 /// otherwise fill the list with near-identical owner rows.
-pub const CONTEXT_MODULE_OWNER_CAP: usize = 3;
+pub const CONTEXT_MODULE_OWNER_CAP: usize = nestweaver_schema::MODULE_OWNER_CONTEXT_CAP;
 
 /// nw-113: move `<module>` owners after every other node and keep at most
 /// [`CONTEXT_MODULE_OWNER_CAP`] of them, preserving rank order within each
