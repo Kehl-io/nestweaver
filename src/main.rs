@@ -4205,8 +4205,29 @@ mod context_header_tests {
     #[test]
     fn connected_header_says_owners_are_listed_last() {
         assert_eq!(
-            super::connected_symbols_header(4),
+            super::connected_symbols_header(4, 0),
             "Connected (4 symbols, ranked by relevance; top-level `<module>` owners listed last):"
+        );
+    }
+
+    /// nw-113 final round: code and brain context headers both say how many
+    /// owners the cap left out of the count, so `11 of 11` is never printed
+    /// beside `+3 more files' top-level code` without a word.
+    #[test]
+    fn connected_headers_count_omitted_owners_alike() {
+        let clause = "top-level `<module>` owners listed last, 3 more not counted";
+        assert_eq!(
+            super::connected_symbols_header(4, 3),
+            format!("Connected (4 symbols, ranked by relevance; {clause}):")
+        );
+        assert_eq!(
+            super::cli::brain_render::brain_connected_header(11, 11, None, 3),
+            format!("Connected (11 of 11, ranked by relevance; {clause}):")
+        );
+        assert_eq!(
+            super::cli::brain_render::brain_connected_header(5, 11, Some((40, 100)), 0),
+            "Connected (5 of 11, ~40/100 tokens, ranked by relevance; top-level `<module>` \
+             owners listed last):"
         );
     }
 }
@@ -27421,9 +27442,13 @@ fn resolve_uid_with_repo_filter(
 
 /// The `Connected (...)` heading of code and feature context. nw-113: owners
 /// rank after every real symbol, not by relevance, and the heading says so.
-fn connected_symbols_header(count: usize) -> String {
+///
+/// nw-113 final round: when the owner cap left owners out, the heading says
+/// how many, in the words `brain context`'s heading uses.
+fn connected_symbols_header(count: usize, owners_omitted: usize) -> String {
     format!(
-        "Connected ({count} symbols, ranked by relevance; top-level `<module>` owners listed last):"
+        "Connected ({count} symbols, ranked by relevance; {}):",
+        cli::brain_render::owner_order_clause(owners_omitted)
     )
 }
 
@@ -27455,7 +27480,10 @@ fn print_context_text(result: &ContextResult) {
 
     if !result.connected.is_empty() {
         println!();
-        println!("{}", connected_symbols_header(result.connected.len()));
+        println!(
+            "{}",
+            connected_symbols_header(result.connected.len(), result.module_owners_omitted)
+        );
         for node in &result.connected {
             println!(
                 "  {}  {}  {}:{}  {:.4}",
@@ -27531,7 +27559,10 @@ fn print_feature_context_text(result: &FeatureContextResult) {
 
     if !result.connected.is_empty() {
         println!();
-        println!("{}", connected_symbols_header(result.connected.len()));
+        println!(
+            "{}",
+            connected_symbols_header(result.connected.len(), result.module_owners_omitted)
+        );
         for node in &result.connected {
             println!(
                 "  {}  {}  {}:{}  {:.4}",

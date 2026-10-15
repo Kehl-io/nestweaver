@@ -650,13 +650,15 @@ pub(crate) fn print_brain_context_text(
             // the right one. Unchanged from before nw-316.
             .map(|n| render_cost_tokens(n, false))
             .sum();
-        match token_budget {
-            Some(budget) => println!(
-                "Connected ({} of {}, ~{}/{} tokens, ranked by relevance):",
-                cut, total, used_tokens, budget
-            ),
-            None => println!("Connected ({} of {}, ranked by relevance):", cut, total),
-        }
+        println!(
+            "{}",
+            brain_connected_header(
+                cut,
+                total,
+                token_budget.map(|budget| (used_tokens, budget)),
+                result.module_owners_omitted,
+            )
+        );
         for n in result.connected.iter().take(cut) {
             if n.location.is_empty() {
                 println!("  {:.4}  {}  [{}]", n.relevance, n.title, n.kind);
@@ -680,6 +682,34 @@ pub(crate) fn print_brain_context_text(
             result.module_owners_omitted
         );
     }
+}
+
+/// nw-113: how a `Connected (...)` heading describes owners: listed last,
+/// and how many the cap left out of the count. Shared by code, feature and
+/// brain context so their headings say the same thing.
+pub(crate) fn owner_order_clause(owners_omitted: usize) -> String {
+    if owners_omitted == 0 {
+        "top-level `<module>` owners listed last".to_string()
+    } else {
+        format!("top-level `<module>` owners listed last, {owners_omitted} more not counted")
+    }
+}
+
+/// `brain context`'s `Connected (N of M, ...)` heading. `tokens` is
+/// `(used, budget)` under `--token-budget`.
+pub(crate) fn brain_connected_header(
+    shown: usize,
+    total: usize,
+    tokens: Option<(usize, usize)>,
+    owners_omitted: usize,
+) -> String {
+    let tokens = tokens
+        .map(|(used, budget)| format!(", ~{used}/{budget} tokens"))
+        .unwrap_or_default();
+    format!(
+        "Connected ({shown} of {total}{tokens}, ranked by relevance; {}):",
+        owner_order_clause(owners_omitted)
+    )
 }
 
 /// Render a daemon-routed `BrainSearchResponse` in the same shape as the
