@@ -4431,10 +4431,10 @@ where
     // Immutable borrow of the parsed cache for the parallel phase.
     let pc_ref: Option<&crate::parsed_cache::ParsedCache> = parsed_cache.as_deref();
 
-    // Rolling-window CPU budget for the CPU-bound phases below (parse +
-    // type-env build) — keeps an indexing daemon under runningboardd's CPU
-    // limit. Both phases run before the write gate is taken (nw-812). The
-    // budget is process-wide: the kill limit counts the whole daemon.
+    // Opt-in rolling-window CPU budget for the CPU-bound phases below (parse
+    // + type-env build); inert unless NESTWEAVER_INDEX_CPU_PERCENT enables it
+    // (nw-814). Both phases run before the write gate is taken (nw-812). The
+    // budget is process-wide, shared by every index in the daemon.
     let cpu_throttle = crate::cpu_throttle::CpuThrottle::global();
 
     let parse_one = |(path, lang): &(PathBuf, Language)| -> ParseOutcome {
