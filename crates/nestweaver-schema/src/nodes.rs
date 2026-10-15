@@ -96,12 +96,108 @@ pub fn split_file_qualifier(spec: &str) -> Option<(&str, &str)> {
         .filter(|(qualifier, name)| !qualifier.is_empty() && !name.is_empty())
 }
 
+/// nw-113: a qualified lookup spec, `[file::][Container::…]name`.
+///
+/// The segments before the name are qualifiers. They are read two ways and
+/// a candidate matches if either holds:
+/// - **container chain:** every qualifier names the candidate's `MEMBER_OF`
+///   chain, innermost last (`Outer::Inner::m`, `Svc::run`);
+/// - **file, then container chain:** the first qualifier names the
+///   candidate's file ([`file_qualifier_rank`]) and the rest name its
+///   container chain (`b.ts::Svc::run`, `wsgi.py::app`).
+///
+/// Neither reading wins over the other: `Svc::run` keeps a method of class
+/// `Svc` in `b.ts` as well as the `run` in `a/Svc.ts` whose file stem is
+/// `Svc`, so the lookup is ambiguous rather than silently picking one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualifiedSpec<'a> {
+    /// The segments before the name, outermost first.
+    pub qualifiers: Vec<&'a str>,
+    /// The last segment: the symbol name looked up.
+    pub name: &'a str,
+}
+
+impl<'a> QualifiedSpec<'a> {
+    /// Parse `spec`. `None` for an unqualified spec (no `::`) or one with an
+    /// empty segment (`::x`, `a::::b`).
+    pub fn parse(spec: &'a str) -> Option<Self> {
+        let mut segments: Vec<&str> = spec.split("::").collect();
+        if segments.len() < 2 || segments.iter().any(|segment| segment.is_empty()) {
+            return None;
+        }
+        let name = segments.pop()?;
+        Some(Self {
+            qualifiers: segments,
+            name,
+        })
+    }
+
+    /// How many `MEMBER_OF` levels a match can need: one per qualifier.
+    pub fn max_container_depth(&self) -> usize {
+        self.qualifiers.len()
+    }
+
+    /// Keep the `candidates` (symbols named [`Self::name`]) this spec names.
+    ///
+    /// `chain_of(uid)` returns a candidate's container names, innermost
+    /// first (`["Inner", "Outer"]` for `Outer::Inner::m`); at least
+    /// [`Self::max_container_depth`] levels are needed for an exact answer.
+    /// Container matches are kept whatever their file. Among file matches
+    /// only the best file rank is kept: an exact path beats a path suffix,
+    /// which beats a suffix without the extension. Empty when nothing
+    /// matches, so a strict lookup can report not found instead of guessing.
+    pub fn select<'c>(
+        &self,
+        candidates: Vec<Symbol>,
+        chain_of: impl Fn(&str) -> &'c [String],
+    ) -> Vec<Symbol> {
+        let chain_matches = |qualifiers: &[&str], chain: &[String]| {
+            qualifiers.len() <= chain.len()
+                && qualifiers
+                    .iter()
+                    .rev()
+                    .zip(chain)
+                    .all(|(qualifier, container)| *qualifier == container)
+        };
+        let ranked: Vec<(Symbol, bool, Option<u8>)> = candidates
+            .into_iter()
+            .map(|symbol| {
+                let chain = chain_of(&symbol.uid);
+                let by_container = chain_matches(&self.qualifiers, chain);
+                let by_file = file_qualifier_rank(self.qualifiers[0], &symbol.file_path)
+                    .filter(|_| chain_matches(&self.qualifiers[1..], chain));
+                (symbol, by_container, by_file)
+            })
+            .collect();
+        let best_file = ranked.iter().filter_map(|(_, _, rank)| *rank).min();
+        ranked
+            .into_iter()
+            .filter(|(_, by_container, by_file)| {
+                *by_container || (by_file.is_some() && *by_file == best_file)
+            })
+            .map(|(symbol, _, _)| symbol)
+            .collect()
+    }
+}
+
 /// How closely a `file::name` qualifier names a symbol's file: an exact
 /// repo-relative path beats a path suffix, which beats a suffix without the
-/// extension (`conftest` for `tests/conftest.py`). Suffixes only match on a
-/// `/` boundary, so `x.js` never matches `index.js`.
+/// extension (`conftest` for `tests/conftest.py`, the file-stem match).
+/// Suffixes only match on a `/` boundary, so `x.js` never matches
+/// `index.js`. A leading `./` or `/` is ignored and `\` reads as `/`, so a
+/// Windows-style or root-anchored path names the same file.
 fn file_qualifier_rank(qualifier: &str, file_path: &str) -> Option<u8> {
-    let qualifier = qualifier.strip_prefix("./").unwrap_or(qualifier);
+    let normalised = qualifier.replace('\\', "/");
+    let mut qualifier = normalised.as_str();
+    while let Some(rest) = qualifier
+        .strip_prefix("./")
+        .or_else(|| qualifier.strip_prefix('/'))
+    {
+        qualifier = rest;
+    }
+    if qualifier.is_empty() {
+        return None;
+    }
     let suffix_of = |path: &str| {
         path == qualifier
             || path
@@ -120,42 +216,6 @@ fn file_qualifier_rank(qualifier: &str, file_path: &str) -> Option<u8> {
         _ => return None,
     };
     suffix_of(stem).then_some(2)
-}
-
-/// nw-113: keep the candidates whose file best matches a `file::name`
-/// qualifier (see [`file_qualifier_rank`]). Empty when no candidate's file
-/// matches, so a strict lookup can report not found instead of guessing.
-pub fn filter_by_file_qualifier(candidates: Vec<Symbol>, qualifier: &str) -> Vec<Symbol> {
-    let Some(best) = candidates
-        .iter()
-        .filter_map(|symbol| file_qualifier_rank(qualifier, &symbol.file_path))
-        .min()
-    else {
-        return Vec::new();
-    };
-    candidates
-        .into_iter()
-        .filter(|symbol| file_qualifier_rank(qualifier, &symbol.file_path) == Some(best))
-        .collect()
-}
-
-/// nw-113: narrow name-lookup candidates by a `file::name` qualifier, for the
-/// lenient `read_symbols` spec resolver.
-///
-/// Keeps the candidates whose file best matches `qualifier`
-/// ([`filter_by_file_qualifier`]). When no candidate's file matches, the
-/// qualifier is not a path (`Class::method`, a Rust module path), and every
-/// candidate is returned unchanged, so those forms keep resolving by their
-/// last segment as before.
-pub fn narrow_by_file_qualifier(candidates: Vec<Symbol>, qualifier: &str) -> Vec<Symbol> {
-    if candidates
-        .iter()
-        .any(|symbol| file_qualifier_rank(qualifier, &symbol.file_path).is_some())
-    {
-        filter_by_file_qualifier(candidates, qualifier)
-    } else {
-        candidates
-    }
 }
 
 impl SymbolKind {
@@ -586,11 +646,14 @@ mod tests {
     }
 
     /// nw-113: `file::name` narrows by exact path, then a unique path suffix,
-    /// then a suffix without the extension; a non-path qualifier keeps every
-    /// candidate.
+    /// then a suffix without the extension; a qualifier that names no file
+    /// and no container matches nothing.
     #[test]
     fn file_qualifier_narrows_by_path_suffix() {
-        use super::narrow_by_file_qualifier as narrow;
+        let narrow = |candidates: Vec<super::Symbol>, spec: &str| {
+            let spec = super::QualifiedSpec::parse(spec).expect("qualified");
+            spec.select(candidates, |_| &[])
+        };
         let owners = || {
             vec![
                 owner_at("index.js"),
@@ -599,26 +662,36 @@ mod tests {
                 owner_at("tests/conftest.py"),
             ]
         };
-        assert_eq!(paths(&narrow(owners(), "index.js")), ["index.js"]);
+        let owner = |path: &str| format!("{path}::<module>");
+        assert_eq!(paths(&narrow(owners(), &owner("index.js"))), ["index.js"]);
         assert_eq!(
-            paths(&narrow(owners(), "controllers/index.js")),
+            paths(&narrow(owners(), &owner("controllers/index.js"))),
             ["src/controllers/index.js"]
         );
-        assert_eq!(paths(&narrow(owners(), "wsgi.py")), ["app/wsgi.py"]);
-        assert_eq!(paths(&narrow(owners(), "wsgi")), ["app/wsgi.py"]);
+        assert_eq!(paths(&narrow(owners(), &owner("wsgi.py"))), ["app/wsgi.py"]);
+        assert_eq!(paths(&narrow(owners(), &owner("wsgi"))), ["app/wsgi.py"]);
         assert_eq!(
-            paths(&narrow(owners(), "./tests/conftest.py")),
+            paths(&narrow(owners(), &owner("./tests/conftest.py"))),
             ["tests/conftest.py"]
         );
         assert_eq!(
-            paths(&narrow(owners(), "x.js")).len(),
-            4,
+            paths(&narrow(owners(), &owner("/tests/conftest.py"))),
+            ["tests/conftest.py"],
+            "a leading slash is ignored"
+        );
+        assert_eq!(
+            paths(&narrow(owners(), &owner("src\\controllers\\index.js"))),
+            ["src/controllers/index.js"],
+            "a backslash reads as a slash"
+        );
+        assert!(
+            narrow(owners(), &owner("x.js")).is_empty(),
             "no boundary match"
         );
-        assert_eq!(paths(&narrow(owners(), "Class")).len(), 4, "not a path");
+        assert!(narrow(owners(), &owner("Class")).is_empty(), "not a path");
         let utils = vec![symbol_at("f", "a/util.py"), symbol_at("f", "b/util.py")];
         assert_eq!(
-            narrow(utils, "util.py").len(),
+            narrow(utils, "util.py::f").len(),
             2,
             "an ambiguous suffix stays ambiguous"
         );
@@ -628,6 +701,15 @@ mod tests {
         );
         assert_eq!(super::split_file_qualifier("<module>"), None);
         assert_eq!(super::split_file_qualifier("::x"), None);
+        assert_eq!(super::QualifiedSpec::parse("<module>"), None);
+        assert_eq!(super::QualifiedSpec::parse("a::::b"), None);
+        assert_eq!(
+            super::QualifiedSpec::parse("b.ts::Svc::run"),
+            Some(super::QualifiedSpec {
+                qualifiers: vec!["b.ts", "Svc"],
+                name: "run"
+            })
+        );
     }
 
     /// nw-113: one predicate identifies the per-file `<module>` owner; a real

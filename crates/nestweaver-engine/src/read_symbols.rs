@@ -402,27 +402,36 @@ fn verified_current_span(
     ))
 }
 
-/// Resolve a spec (`sym:` UID, bare name, `file::name`, or dotted/`::` FQN)
-/// to candidate symbols.
+/// Resolve a spec (`sym:` UID, bare name, `file::name`,
+/// `file::Class::method`, `Class::method`, or a dotted FQN) to candidate
+/// symbols.
 ///
-/// nw-113: a `file::name` qualifier narrows the candidates to that file (an
-/// exact repo-relative path or a path suffix); a qualifier that names no
-/// candidate's file (`Class::method`) keeps resolving by the last segment.
+/// nw-113: a qualified spec resolves through the strict
+/// [`GraphStore::lookup_symbols_by_spec`] first, so a file and container
+/// narrow together. When the qualifiers name nothing, the lookup falls back
+/// to the last segment, so a module path such as `net::inner::send` keeps
+/// resolving by name.
 pub fn resolve_spec(store: &GraphStore, spec: &str) -> Vec<Symbol> {
     if spec.starts_with("sym:") {
         return store.lookup_symbol(spec).ok().into_iter().collect();
     }
-    let (qualifier, rest) = match nestweaver_schema::split_file_qualifier(spec) {
-        Some((qualifier, rest)) => (Some(qualifier), rest),
-        None => (None, spec),
-    };
-    // Dotted FQN forms: take the last segment as the symbol name.
-    let name = rest.rsplit('.').next().unwrap_or(rest);
-    let candidates = store.lookup_symbols_by_name(name).unwrap_or_default();
-    match qualifier {
-        Some(qualifier) => nestweaver_schema::narrow_by_file_qualifier(candidates, qualifier),
-        None => candidates,
+    if let Some(qualified) = nestweaver_schema::QualifiedSpec::parse(spec) {
+        let strict = store.lookup_symbols_by_spec(spec).unwrap_or_default();
+        if !strict.is_empty() {
+            return strict;
+        }
+        return store
+            .lookup_symbols_by_name(last_dotted_segment(qualified.name))
+            .unwrap_or_default();
     }
+    store
+        .lookup_symbols_by_name(last_dotted_segment(spec))
+        .unwrap_or_default()
+}
+
+/// Dotted FQN forms (`pkg.mod.func`): the last segment is the symbol name.
+fn last_dotted_segment(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
 }
 
 /// Estimate the token cost of a window (chars/4 + small metadata overhead).

@@ -542,9 +542,8 @@ mod tests {
         assert!(uids("Foo::qux").is_empty());
         assert_eq!(uids("Baz::qux"), ["baz-qux"]);
         assert_eq!(uids("a.js::qux"), ["baz-qux"]);
-        // Pinned: the container match is exact, so a module-qualified
-        // `mod::Foo::bar` is not found. 12.0.4 also answered a qualified miss
-        // with not found, so this is no regression.
+        // Pinned: `mod` is neither `bar`'s file nor the container above
+        // `Foo`, so the module-qualified `mod::Foo::bar` is not found.
         assert!(uids("mod::Foo::bar").is_empty());
     }
 
@@ -553,6 +552,80 @@ mod tests {
         let store = test_store();
         let err = store.lookup_symbol("nonexistent").unwrap_err();
         assert!(matches!(err, crate::StoreError::NotFound));
+    }
+
+    /// nw-113 final round: file and container narrow together. `Svc::run`
+    /// where `Svc` is both a file stem (`a/Svc.ts`) and a class in another
+    /// file (`b.ts`) considers every container match instead of letting the
+    /// stem win; `path::Class::method` narrows by both; a container chain
+    /// matches nested classes; a leading `/` or a `\` separator is normalised.
+    #[test]
+    fn lookup_by_spec_combines_file_and_container() {
+        let store = test_store();
+        let add = |uid: &str, name: &str, path: &str, kind: SymbolKind, parent: Option<&str>| {
+            let mut symbol = make_symbol(uid, name, "repo-1", path);
+            symbol.kind = kind;
+            store.insert_symbol(&symbol).unwrap();
+            if let Some(parent) = parent {
+                store
+                    .insert_edge(&ResolvedEdge {
+                        source_uid: uid.to_string(),
+                        target_uid: parent.to_string(),
+                        edge_type: EdgeType::MemberOf,
+                        confidence: 1.0,
+                        link_type: None,
+                        evidence: Vec::new(),
+                    })
+                    .unwrap();
+            }
+        };
+        add("a-svc", "Svc", "a/Svc.ts", SymbolKind::Class, None);
+        add(
+            "a-run",
+            "run",
+            "a/Svc.ts",
+            SymbolKind::Method,
+            Some("a-svc"),
+        );
+        add("b-svc", "Svc", "b.ts", SymbolKind::Class, None);
+        add("b-run", "run", "b.ts", SymbolKind::Method, Some("b-svc"));
+        add("b-other", "Other", "b.ts", SymbolKind::Class, None);
+        add(
+            "b-other-run",
+            "run",
+            "b.ts",
+            SymbolKind::Method,
+            Some("b-other"),
+        );
+        add("outer", "Outer", "n.ts", SymbolKind::Class, None);
+        add("inner", "Inner", "n.ts", SymbolKind::Class, Some("outer"));
+        add("m", "m", "n.ts", SymbolKind::Method, Some("inner"));
+        let uids = |spec: &str| -> Vec<String> {
+            let mut uids: Vec<_> = store
+                .lookup_symbols_by_spec(spec)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.uid)
+                .collect();
+            uids.sort();
+            uids
+        };
+        assert_eq!(uids("Svc::run"), ["a-run", "b-run"], "stem must not win");
+        assert_eq!(uids("b.ts::Svc::run"), ["b-run"]);
+        assert_eq!(uids("b.ts::Other::run"), ["b-other-run"]);
+        assert_eq!(uids("b.ts::run"), ["b-other-run", "b-run"], "ambiguous");
+        assert_eq!(uids("a/Svc.ts::Svc::run"), ["a-run"]);
+        assert!(uids("a/Svc.ts::Other::run").is_empty());
+        assert_eq!(uids("/b.ts::Svc::run"), ["b-run"]);
+        assert_eq!(uids("a\\Svc.ts::run"), ["a-run"]);
+        assert_eq!(uids("Outer::Inner::m"), ["m"]);
+        assert_eq!(uids("Inner::m"), ["m"]);
+        assert_eq!(uids("n.ts::Outer::Inner::m"), ["m"]);
+        assert!(
+            uids("Outer::m").is_empty(),
+            "the direct container must match"
+        );
+        assert!(uids("Other::Inner::m").is_empty());
     }
 
     #[test]

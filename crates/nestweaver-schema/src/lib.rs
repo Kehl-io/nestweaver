@@ -22,9 +22,9 @@ pub use embedding::{
 pub use limits::{DEFAULT_DRAIN_CEILING_SECS, drain_ceiling_from_env, parse_drain_ceiling};
 pub use nodes::{
     Contract, EntryPointKind, File, FrameworkHint, Heading, MODULE_OWNER_CONTEXT_CAP,
-    MODULE_OWNER_NAME, Note, NoteKind, Project, Repo, ResolvedType, Section, Service, Symbol,
-    SymbolKind, Tag, TypeInfo, Vault, Visibility, filter_by_file_qualifier, is_module_owner,
-    module_owner_label, narrow_by_file_qualifier, split_file_qualifier, symbol_display_name,
+    MODULE_OWNER_NAME, Note, NoteKind, Project, QualifiedSpec, Repo, ResolvedType, Section,
+    Service, Symbol, SymbolKind, Tag, TypeInfo, Vault, Visibility, is_module_owner,
+    module_owner_label, split_file_qualifier, symbol_display_name,
 };
 pub use repo_url::{normalized_repo_key, repo_name};
 pub use uid::{

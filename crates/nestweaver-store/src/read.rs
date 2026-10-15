@@ -855,69 +855,115 @@ impl GraphStore {
         result.map(|row| row_to_symbol(&row)).collect()
     }
 
-    /// nw-113: name lookup that honours a `file::name` or `Class::method`
-    /// qualifier.
+    /// nw-113: name lookup that honours a `file::name`, `Class::method` or
+    /// `file::Class::method` qualifier.
     ///
-    /// A spec that is itself a stored name resolves as one. Otherwise
-    /// `file::name` looks `name` up and keeps the candidates whose file the
-    /// qualifier names, as an exact repo-relative path, a path suffix such as
-    /// `wsgi.py`, or a suffix without its extension such as `conftest`
-    /// ([`nestweaver_schema::filter_by_file_qualifier`]). A qualifier that
-    /// names no candidate's file is read as a container: the candidates whose
-    /// `MEMBER_OF` parent is named by it are kept, so `Class::method` works.
-    /// A qualifier that names neither is not found: a strict lookup never
-    /// falls back to the last segment, which answered `Foo::qux` with another
-    /// class's `qux`.
+    /// A spec that is itself a stored name resolves as one. Otherwise the
+    /// last segment is looked up and the qualifiers narrow it, read as a
+    /// file (an exact repo-relative path, a path suffix such as `wsgi.py`,
+    /// or a suffix without its extension such as `conftest`) followed by a
+    /// `MEMBER_OF` container chain, or as a container chain alone
+    /// ([`nestweaver_schema::QualifiedSpec::select`]). Both readings are
+    /// kept, so a class name that is also a file stem is ambiguous rather
+    /// than silently answered by the file. A qualifier that names neither
+    /// is not found: a strict lookup never falls back to the last segment,
+    /// which answered `Foo::qux` with another class's `qux`.
     pub fn lookup_symbols_by_spec(&self, spec: &str) -> Result<Vec<Symbol>, StoreError> {
         let exact = self.lookup_symbols_by_name(spec)?;
-        let Some((qualifier, name)) =
-            nestweaver_schema::split_file_qualifier(spec).filter(|_| exact.is_empty())
+        let Some(qualified) =
+            nestweaver_schema::QualifiedSpec::parse(spec).filter(|_| exact.is_empty())
         else {
             return Ok(exact);
         };
-        let by_file = nestweaver_schema::filter_by_file_qualifier(
-            self.lookup_symbols_by_name(name)?,
-            qualifier,
-        );
-        if !by_file.is_empty() {
-            return Ok(by_file);
+        let candidates = self.lookup_symbols_by_name(qualified.name)?;
+        if candidates.is_empty() {
+            return Ok(candidates);
         }
-        self.lookup_members_by_container_name(qualifier, name)
+        let uids: Vec<&str> = candidates.iter().map(|s| s.uid.as_str()).collect();
+        let chains = self.container_chains(&uids, qualified.max_container_depth())?;
+        Ok(qualified.select(candidates, |uid| {
+            chains.get(uid).map_or(&[][..], Vec::as_slice)
+        }))
     }
 
-    /// Symbols named `name` whose `MEMBER_OF` parent is named `container`.
-    fn lookup_members_by_container_name(
+    /// Each symbol's `MEMBER_OF` container names, innermost first, up to
+    /// `depth` levels. A symbol with no container maps to an empty chain (or
+    /// is absent). When a symbol has several containers the one with the
+    /// smallest UID is followed, so the answer is deterministic.
+    pub fn container_chains(
         &self,
-        container: &str,
-        name: &str,
-    ) -> Result<Vec<Symbol>, StoreError> {
+        uids: &[&str],
+        depth: usize,
+    ) -> Result<HashMap<String, Vec<String>>, StoreError> {
+        let mut chains: HashMap<String, Vec<String>> = HashMap::new();
+        // (origin uid, uid whose parent is fetched next)
+        let mut frontier: Vec<(String, String)> = uids
+            .iter()
+            .map(|uid| (uid.to_string(), uid.to_string()))
+            .collect();
+        for _ in 0..depth {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut wanted: Vec<&str> = frontier.iter().map(|(_, at)| at.as_str()).collect();
+            wanted.sort_unstable();
+            wanted.dedup();
+            let parents = self.member_of_parents(&wanted)?;
+            frontier = frontier
+                .into_iter()
+                .filter_map(|(origin, at)| {
+                    let (parent_uid, parent_name) = parents.get(&at)?;
+                    chains
+                        .entry(origin.clone())
+                        .or_default()
+                        .push(parent_name.clone());
+                    Some((origin, parent_uid.clone()))
+                })
+                .collect();
+        }
+        Ok(chains)
+    }
+
+    /// `uid -> (parent uid, parent name)` over `MEMBER_OF`, for `uids`.
+    fn member_of_parents(
+        &self,
+        uids: &[&str],
+    ) -> Result<HashMap<String, (String, String)>, StoreError> {
+        let mut parents: HashMap<String, (String, String)> = HashMap::new();
+        if uids.is_empty() {
+            return Ok(parents);
+        }
         let conn = self.conn()?;
-        let q = format!(
-            "MATCH (s:Symbol)-[:MEMBER_OF]->(p:Symbol) \
-             WHERE s.name = $name AND p.name = $container RETURN {}",
-            SYMBOL_COLUMNS
-        );
-        let mut stmt = conn
-            .prepare(&q)
-            .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-        let result = conn
-            .execute(
-                &mut stmt,
-                vec![
-                    ("name", Value::String(name.to_string())),
-                    ("container", Value::String(container.to_string())),
-                ],
-            )
-            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
-        let mut seen = HashSet::new();
-        let mut members = Vec::new();
-        for row in result {
-            let symbol = row_to_symbol(&row)?;
-            if seen.insert(symbol.uid.clone()) {
-                members.push(symbol);
+        let q = "UNWIND $uids AS want_uid \
+                 MATCH (s:Symbol {uid: want_uid})-[:MEMBER_OF]->(p:Symbol) \
+                 RETURN s.uid, p.uid, p.name";
+        for chunk in uids.chunks(512) {
+            let mut stmt = conn
+                .prepare(q)
+                .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+            let list = Value::List(
+                lbug::LogicalType::String,
+                chunk
+                    .iter()
+                    .map(|uid| Value::String(uid.to_string()))
+                    .collect(),
+            );
+            let result = conn
+                .execute(&mut stmt, vec![("uids", list)])
+                .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+            for row in result {
+                let child = extract_string(&row, 0)?;
+                let parent_uid = extract_string(&row, 1)?;
+                let parent_name = extract_string(&row, 2)?;
+                match parents.get(&child) {
+                    Some((kept, _)) if *kept <= parent_uid => {}
+                    _ => {
+                        parents.insert(child, (parent_uid, parent_name));
+                    }
+                }
             }
         }
-        Ok(members)
+        Ok(parents)
     }
 
     /// `(uid, repo_uid, visibility)` of every symbol whose name is in
