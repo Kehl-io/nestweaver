@@ -10163,7 +10163,8 @@ export function readIt() { return value(); }
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(3000);
-        let shapes: [(&str, &str, Language, fn(usize) -> String); 3] = [
+        type Shape = (&'static str, &'static str, Language, fn(usize) -> String);
+        let shapes: [Shape; 3] = [
             ("import =", "src/a.ts", Language::TypeScript, |i| {
                 format!("import m{i} = require('./lib');\nexport function q{i}() {{ m{i}(); }}\n")
             }),
