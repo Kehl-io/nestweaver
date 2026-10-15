@@ -11449,6 +11449,16 @@ fn print_pr_impact_hook(result: &BlastRadiusResult, breaking: &[BreakingChange])
         }
     }
 
+    // nw-113: a changed file that is only top-level code says so; its
+    // affected symbols below are what that code calls.
+    for note in result
+        .notifications
+        .iter()
+        .filter(|n| n.descriptor == "changed-file-top-level-only")
+    {
+        println!("  {}", note.message);
+    }
+
     // Top ~5 affected symbols (already sorted by impact_score, descending).
     for s in result.affected_symbols.iter().take(5) {
         println!("  {} ({}:{})", s.name, s.file_path, s.start_line);

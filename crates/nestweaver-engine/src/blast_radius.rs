@@ -57,6 +57,11 @@ pub struct AffectedSymbol {
     pub ownership_resolved: bool,
 }
 
+/// nw-113: the `edge_type` of an affected symbol reached because a changed
+/// file that is only top-level code calls it. Nothing calls a file's
+/// top-level code, so what it calls is the reach of the change.
+pub const TOP_LEVEL_CALL_EDGE: &str = "TOP_LEVEL_CALL";
+
 /// A cluster (community) that contains affected symbols.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AffectedCluster {
@@ -500,6 +505,8 @@ pub fn analyze_blast_radius(
     // Step 1: Map changed files to symbols.
     let mut changed_symbols: Vec<ChangedSymbol> = Vec::new();
     let mut changed_uids: HashSet<String> = HashSet::new();
+    // nw-113: owners of changed files that hold only top-level code.
+    let mut top_level_only: Vec<nestweaver_schema::Symbol> = Vec::new();
     // Repos that own the changed symbols — used to separate same-repo ("local")
     // impact from cross-repo ("org-wide") impact below.
     let mut changed_repos: HashSet<String> = HashSet::new();
@@ -620,6 +627,15 @@ pub fn analyze_blast_radius(
                 status = status.max(AnalysisStatus::Partial);
             }
             continue;
+        }
+
+        // nw-113: a source file that is only top-level code has just its
+        // owner, which is no changed symbol. Its change is reported through
+        // what its top-level code calls (below), never as a silent Low.
+        if class == crate::changed_files::ChangedFileClass::Source
+            && syms.iter().all(|sym| sym.is_module_owner())
+        {
+            top_level_only.extend(syms.iter().cloned());
         }
 
         for sym in syms {
@@ -792,6 +808,66 @@ pub fn analyze_blast_radius(
             if affected_uids.insert(node.uid.clone()) {
                 buffered.push((node, cs.name.clone(), cs.kind.clone(), cs.repo_uid.clone()));
             }
+        }
+    }
+
+    // nw-113: nothing calls a file's top-level code, so a changed file that
+    // is only top-level code reaches exactly what that code calls. List those
+    // callees as its blast radius and say so, instead of reporting nothing.
+    for owner in &top_level_only {
+        let callees = match store.callees_of(&owner.uid) {
+            Ok(callees) => callees,
+            Err(e) => {
+                notifications.push(Notification {
+                    level: NotificationLevel::Error,
+                    message: format!(
+                        "listing the calls of {}'s top-level code failed: {e}",
+                        owner.file_path
+                    ),
+                    descriptor: "store.impact-failed".to_string(),
+                });
+                status = status.max(AnalysisStatus::Degraded);
+                continue;
+            }
+        };
+        let names: Vec<String> = callees
+            .iter()
+            .map(|callee| callee.display_name().into_owned())
+            .collect();
+        notifications.push(Notification {
+            level: NotificationLevel::Warning,
+            message: format!(
+                "changed file {file} is only top-level code ({owner}); nothing calls it, so its \
+                 blast radius is what it calls: {calls}",
+                file = owner.file_path,
+                owner = owner.display_name(),
+                calls = if names.is_empty() {
+                    "nothing indexed".to_string()
+                } else {
+                    names.join(", ")
+                },
+            ),
+            descriptor: "changed-file-top-level-only".to_string(),
+        });
+        for callee in callees {
+            if changed_uids.contains(&callee.uid) || !affected_uids.insert(callee.uid.clone()) {
+                continue;
+            }
+            buffered.push((
+                ImpactNode {
+                    uid: callee.uid,
+                    name: callee.name,
+                    file_path: callee.file_path,
+                    start_line: callee.start_line,
+                    edge_type: TOP_LEVEL_CALL_EDGE.to_string(),
+                    confidence: 1.0,
+                    depth: 1,
+                    impact_score: 1.0,
+                },
+                owner.display_name().into_owned(),
+                owner.kind.to_string(),
+                owner.repo_uid.clone(),
+            ));
         }
     }
 
@@ -1394,6 +1470,55 @@ mod tests {
 
     /// Build options preserving a test's prior target_repo/max_depth/data-edge
     /// intent, with no result cap.
+    /// nw-113 final round: a changed file that is only top-level code is
+    /// reported, not silently Low: a `changed-file-top-level-only` note names
+    /// its owner, and the symbols its top-level code calls are its blast
+    /// radius (`edge_type: TOP_LEVEL_CALL`). The owner stays out of the
+    /// changed symbols.
+    #[test]
+    fn an_owner_only_changed_file_reports_its_top_level_calls() {
+        use crate::index::index_directory_in_memory;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("npmonly.ts"),
+            "export function core() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("caller.ts"),
+            "import { core } from './npmonly';\ncore();\n",
+        )
+        .unwrap();
+        let (_r, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/r", "sha").unwrap();
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("caller.ts")],
+            &opts(None, 3, false),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(result.changed_symbols.is_empty(), "{result:#?}");
+        let note = result
+            .notifications
+            .iter()
+            .find(|n| n.descriptor == "changed-file-top-level-only")
+            .unwrap_or_else(|| panic!("{:#?}", result.notifications));
+        assert!(
+            note.message.contains("caller.ts::<module>"),
+            "{}",
+            note.message
+        );
+        let affected: Vec<(&str, &str)> = result
+            .affected_symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.edge_type.as_str()))
+            .collect();
+        assert_eq!(affected, [("core", TOP_LEVEL_CALL_EDGE)], "{result:#?}");
+        assert_eq!(result.status, AnalysisStatus::Complete, "{result:#?}");
+    }
+
     fn opts(
         target_repo: Option<&str>,
         max_depth: u32,
