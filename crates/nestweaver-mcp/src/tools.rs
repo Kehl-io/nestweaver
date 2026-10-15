@@ -7219,6 +7219,9 @@ fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         "connected_count": returned,
         "returned": returned,
         "total": total,
+        // nw-113: connected `<module>` owners beyond the engine's cap of
+        // three, counted rather than listed (and not part of `total`).
+        "module_owners_omitted": result.module_owners_omitted,
         "limit": limit,
         "truncated": truncated_flag,
         // Emitted even when null, unlike the CLI's `skip_serializing_if`,

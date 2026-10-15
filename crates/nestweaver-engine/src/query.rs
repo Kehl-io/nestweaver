@@ -739,6 +739,12 @@ pub struct ContextResult {
     /// were standardised on, so the CLI parses the daemon's reply into it.
     #[serde(default, rename = "total", skip_serializing_if = "Option::is_none")]
     pub connected_total: Option<usize>,
+    /// nw-113: connected `<module>` owners left out by
+    /// [`CONTEXT_MODULE_OWNER_CAP`]. Owners rank after every real symbol and
+    /// at most that many are listed; the rest are counted here (the CLI says
+    /// "+N more files' top-level code") and not in `connected_total`.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub module_owners_omitted: usize,
     /// WHICH cap cut, when one did.
     ///
     /// `truncated` says the caller is not holding everything; this says what
@@ -824,6 +830,11 @@ pub struct ContextResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_resolution_limit: Option<usize>,
 }
+
+/// nw-113: how many connected `<module>` owners `context` lists. Owners are
+/// real callers, but a helper called at load time from many files would
+/// otherwise fill the list with near-identical owner rows.
+pub const CONTEXT_MODULE_OWNER_CAP: usize = 3;
 
 /// Detect whether an input string looks like a file path.
 fn is_file_path(input: &str) -> bool {
@@ -1044,6 +1055,9 @@ pub fn build_context_with_intent(
 
     let mut seeds: Vec<ContextNode> = Vec::new();
     let mut connected: Vec<ContextNode> = Vec::new();
+    // nw-113: connected `<module>` owners, kept aside so they rank after
+    // every real symbol and only `CONTEXT_MODULE_OWNER_CAP` are listed.
+    let mut owners: Vec<ContextNode> = Vec::new();
     // Counted for EVERY resolved non-seed node, whether or not the cap let it
     // through. This is the whole of nw-320.
     let mut connected_total: usize = 0;
@@ -1073,11 +1087,21 @@ pub fn build_context_with_intent(
 
         if seed_set.contains(uid.as_str()) {
             seeds.push(node);
+        } else if sym.is_module_owner() {
+            owners.push(node);
         } else {
             connected_total += 1;
             if connected.len() < effective_limit {
                 connected.push(node);
             }
+        }
+    }
+    let listed_owners = owners.len().min(CONTEXT_MODULE_OWNER_CAP);
+    let module_owners_omitted = owners.len() - listed_owners;
+    connected_total += listed_owners;
+    for owner in owners.into_iter().take(listed_owners) {
+        if connected.len() < effective_limit {
+            connected.push(owner);
         }
     }
 
@@ -1112,6 +1136,7 @@ pub fn build_context_with_intent(
         // policy the caller chose, it is a fact only this traversal can
         // observe, so the engine is the only layer that CAN report it.
         connected_total: Some(connected_total),
+        module_owners_omitted,
         // nw-393. Same argument as `connected_total`, one layer earlier: the
         // seed cap is the engine's own, no caller states it and no caller can
         // raise it, so the engine is the only layer that can report it — and
@@ -1318,6 +1343,75 @@ mod context_tests {
         )
         .unwrap();
         (dir, src)
+    }
+
+    /// `theme.js` exports `fromTemplate`; six style files call it at top
+    /// level, and `theme.js` also has two same-file collaborators.
+    fn owner_heavy_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(src.join("styles")).unwrap();
+        fs::write(
+            src.join("theme.js"),
+            "function getThemeValue(k) { return k; }\n\
+             function getThemeColor(k) { return getThemeValue(k); }\n\
+             function fromTemplate(t) { return getThemeColor(t); }\n\
+             module.exports = { fromTemplate };\n",
+        )
+        .unwrap();
+        for i in 0..6 {
+            fs::write(
+                src.join(format!("styles/s{i}.style.js")),
+                "const { fromTemplate } = require('../theme');\nexport const dark = fromTemplate({});\n",
+            )
+            .unwrap();
+        }
+        (dir, src)
+    }
+
+    /// nw-113: owners rank after every real symbol, at most three are listed,
+    /// the rest are counted, and each is labelled `path::<module>`.
+    #[test]
+    fn context_ranks_owners_last_and_caps_them() {
+        let (_dir, src) = owner_heavy_repo();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let result = build_context(&store, &["fromTemplate".to_string()]).unwrap();
+        let names: Vec<&str> = result.connected.iter().map(|n| n.name.as_str()).collect();
+        let owners: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| n.ends_with("::<module>"))
+            .collect();
+        assert_eq!(owners.len(), 3, "{names:?}");
+        assert!(
+            owners.iter().all(|n| n.starts_with("styles/s")),
+            "owners are labelled by path: {names:?}"
+        );
+        let first_owner = names.iter().position(|n| n.ends_with("::<module>")).unwrap();
+        assert!(
+            names[first_owner..].iter().all(|n| n.ends_with("::<module>")),
+            "owners rank after every real symbol: {names:?}"
+        );
+        assert!(names.contains(&"getThemeColor"), "{names:?}");
+        assert_eq!(result.module_owners_omitted, 3, "{result:?}");
+        assert!(
+            !names.contains(&nestweaver_schema::MODULE_OWNER_NAME),
+            "{names:?}"
+        );
+    }
+
+    /// nw-113: `path::<module>` seeds context with that file's owner.
+    #[test]
+    fn context_seeds_a_file_qualified_owner() {
+        let (_dir, src) = owner_heavy_repo();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        for spec in ["styles/s2.style.js::<module>", "s2.style.js::<module>"] {
+            let result = build_context(&store, &[spec.to_string()]).unwrap();
+            let seeds: Vec<&str> = result.seeds.iter().map(|n| n.name.as_str()).collect();
+            assert_eq!(seeds, ["styles/s2.style.js::<module>"], "{spec}");
+        }
     }
 
     #[test]

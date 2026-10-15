@@ -27283,6 +27283,14 @@ fn print_context_text(result: &ContextResult) {
     // notice belongs to the RESULT, not to the timing line that happened to
     // carry it. Printed after the rows, where a reader who scrolled to the end
     // of a short list is looking.
+    // nw-113: owners beyond the engine's cap are counted, not listed.
+    if result.module_owners_omitted > 0 {
+        println!(
+            "  +{} more files' top-level code",
+            result.module_owners_omitted
+        );
+    }
+
     if let Some(notice) =
         context_truncation_notice(result.truncated_by, result.limit, result.token_budget)
     {
