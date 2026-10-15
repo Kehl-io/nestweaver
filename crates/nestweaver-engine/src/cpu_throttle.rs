@@ -39,6 +39,7 @@ use std::time::Duration;
 /// same unit macOS reports for its own limit: 90 s / 180 s is 50%). `0` or
 /// `>= 100` disables the throttle; values above [`MAX_PERCENT`] fall back to
 /// the default.
+#[cfg_attr(test, allow(dead_code))] // unit tests use an inert global
 const ENV_VAR: &str = "NESTWEAVER_INDEX_CPU_PERCENT";
 
 /// Default budget: 40% of one core over 180 s = 72 s of CPU per window,
@@ -201,12 +202,19 @@ impl CpuThrottle {
         if let Some(installed) = test_seam::installed() {
             return installed;
         }
+        // Unit tests: the whole test binary is one process running thousands
+        // of indexes in parallel, so a real process-wide budget would make
+        // them wait on each other. Throttle behaviour is tested on rigs.
+        #[cfg(test)]
+        return THROTTLE.get_or_init(|| Self::new(None));
+        #[cfg(not(test))]
         THROTTLE.get_or_init(Self::from_env)
     }
 
     /// Build from `NESTWEAVER_INDEX_CPU_PERCENT` (default 40; `0` or
     /// `>= 100` produces an inert throttle whose [`check`](Self::check)
     /// never sleeps).
+    #[cfg_attr(test, allow(dead_code))] // unit tests use an inert global
     fn from_env() -> Self {
         Self::from_env_value(std::env::var(ENV_VAR).ok().as_deref())
     }
