@@ -687,6 +687,15 @@ pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
                     "eq"
                 });
         }
+        // nw-113: connected `<module>` owners each tier counted rather than
+        // listed. The tiers can share repos, so a sum could double-count; the
+        // larger of the two is an honest lower bound.
+        let local_owners = local.get("module_owners_omitted").and_then(Value::as_u64);
+        let server_owners = server.get("module_owners_omitted").and_then(Value::as_u64);
+        if local_owners.is_some() || server_owners.is_some() {
+            result["module_owners_omitted"] =
+                Value::from(local_owners.unwrap_or(0).max(server_owners.unwrap_or(0)));
+        }
         let local_cut = local.get("seeds_truncated").and_then(Value::as_bool);
         let server_cut = server.get("seeds_truncated").and_then(Value::as_bool);
         if local_cut.is_some() || server_cut.is_some() {
@@ -1049,6 +1058,16 @@ mod tests {
         let merged = merge_structured_results(&local, &server);
 
         assert_eq!(merged["cross_repo_links"], serde_json::json!([]));
+    }
+
+    /// nw-113: the merged `module_owners_omitted` is the larger tier's count.
+    #[test]
+    fn module_owners_omitted_survives_the_merge_as_the_larger_count() {
+        let local = serde_json::json!({ "seeds": [], "connected": [], "module_owners_omitted": 4 });
+        let server =
+            serde_json::json!({ "seeds": [], "connected": [], "module_owners_omitted": 9 });
+        let merged = merge_structured_results(&local, &server);
+        assert_eq!(merged["module_owners_omitted"], 9, "{merged}");
     }
 
     /// `rrf_merge` DEDUPLICATES, so summing the tiers overcounts by exactly the
