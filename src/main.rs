@@ -1644,6 +1644,10 @@ const ENV_REGISTRY: &[EnvVar] = &[
         role: EnvRole::Grants,
     },
     EnvVar {
+        name: "NESTWEAVER_AUTHORITY_DIR",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
         name: "NESTWEAVER_AUTH_TOKEN",
         role: EnvRole::Configures,
     },
