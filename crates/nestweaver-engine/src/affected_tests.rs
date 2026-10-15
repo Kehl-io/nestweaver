@@ -659,6 +659,12 @@ fn consider(best: &mut HashMap<String, AffectedTestSymbol>, candidate: AffectedT
 
 /// Group selected test symbols by their test file, ordering files (and the
 /// representative confidence) by descending edge confidence.
+/// nw-113: the test name listed for a test file selected only through its
+/// own top-level code (its `<module>` owner). The file runs whole, so its
+/// top-level code is counted as its one affected test: a script gating on
+/// the count must not read a selected file as nothing to run.
+pub const TOP_LEVEL_CODE_TEST: &str = "(top-level code)";
+
 fn group_by_file(mut syms: Vec<AffectedTestSymbol>) -> Vec<AffectedTestFile> {
     // Sort symbols by confidence desc so the first per file is the strongest.
     syms.sort_by(|a, b| {
@@ -684,7 +690,8 @@ fn group_by_file(mut syms: Vec<AffectedTestSymbol>) -> Vec<AffectedTestFile> {
             }
         });
         // nw-113: an owner selects its test file (its top-level code calls
-        // the change) but is not a test, so it is neither listed nor counted.
+        // the change) but is not a test, so it is not listed by name; a file
+        // only it selected gets `TOP_LEVEL_CODE_TEST` below.
         if !nestweaver_schema::uid::is_module_owner_uid(&sym.symbol_uid)
             && seen_tests.insert((sym.test_file.clone(), sym.name.clone()))
         {
@@ -693,6 +700,15 @@ fn group_by_file(mut syms: Vec<AffectedTestSymbol>) -> Vec<AffectedTestFile> {
         if sym.confidence > entry.confidence {
             entry.confidence = sym.confidence;
             entry.symbol_uid = sym.symbol_uid.clone();
+        }
+    }
+
+    // nw-113: a file its owner selected with no test of its own reached
+    // still runs: its top-level code is listed and counted as its one test.
+    for entry in by_file.values_mut() {
+        if entry.tests.is_empty() && nestweaver_schema::uid::is_module_owner_uid(&entry.symbol_uid)
+        {
+            entry.tests.push(TOP_LEVEL_CODE_TEST.to_string());
         }
     }
 
@@ -1127,13 +1143,16 @@ mod tests {
         let result = affected_tests(&store, &["src/lib.ts".to_string()]).expect("affected");
         let t1_files: Vec<&str> = result.tier_1.iter().map(|f| f.test_file.as_str()).collect();
         assert_eq!(t1_files, vec!["src/lib.test.ts"], "{result:#?}");
-        // nw-113: the owner selects its file but is not itself a test.
-        assert!(result.tier_1[0].tests.is_empty(), "{result:#?}");
-        assert!(result.summary.starts_with("0 tier-1"), "{}", result.summary);
+        // nw-113: the owner selects its file and, with no test of its own
+        // reached, the file's top-level code counts as its one test, so a
+        // script gating on the count does not skip a selected file.
+        assert_eq!(result.tier_1[0].tests, [TOP_LEVEL_CODE_TEST], "{result:#?}");
+        assert!(result.summary.starts_with("1 tier-1"), "{}", result.summary);
     }
 
     /// nw-113: a changed test file whose only symbol is its owner (a script
-    /// of top-level calls) is still selected, with no test counted.
+    /// of top-level calls) is still selected, its top-level code counted as
+    /// its one test.
     #[test]
     fn a_changed_owner_only_test_file_is_still_selected() {
         use crate::index::index_directory_in_memory;
@@ -1156,7 +1175,8 @@ mod tests {
         assert!(result.changed_symbols.is_empty(), "{result:#?}");
         let t1: Vec<&str> = result.tier_1.iter().map(|f| f.test_file.as_str()).collect();
         assert_eq!(t1, ["tests/test_smoke.py"], "{result:#?}");
-        assert!(result.tier_1[0].tests.is_empty(), "{result:#?}");
+        assert_eq!(result.tier_1[0].tests, [TOP_LEVEL_CODE_TEST], "{result:#?}");
+        assert!(result.summary.starts_with("1 tier-1"), "{}", result.summary);
     }
 
     /// nw-113: a changed file's owner is not a changed symbol and is not
