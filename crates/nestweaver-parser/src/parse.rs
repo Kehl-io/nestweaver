@@ -5949,8 +5949,6 @@ mod tests {
         );
     }
 
-    /// TSX and TS files use different query sources; both should parse correctly
-    /// even though they share the same `Language::TypeScript`.
     /// nw-113 item 16: `.mts`/`.cts` parse with the TypeScript grammar (type
     /// annotations, `import x = require()`), `.mjs`/`.cjs` with JavaScript.
     #[test]
@@ -5984,6 +5982,8 @@ mod tests {
         }
     }
 
+    /// TSX and TS files use different query sources; both should parse correctly
+    /// even though they share the same `Language::TypeScript`.
     #[test]
     fn query_cache_tsx_vs_ts_both_succeed() {
         let ts_source = "function greet(): string { return 'hi'; }";
