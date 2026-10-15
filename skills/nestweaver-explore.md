@@ -19,6 +19,8 @@ When the user asks to explore, understand, or navigate unfamiliar code:
 10. If vault notes appear in results, call `note_get` to read relevant notes. In a subagent or for scripted/batch lookups, prefer the CLI twin `nestweaver note get <title|uid> --json` — the CLI path is 40-60% cheaper in tokens than the MCP tool for that kind of work
 11. Summarize: what this code does, what calls it, what it depends on, and any design notes from the vault
 
+**Qualify an ambiguous name as `path::name`** (`src/app.js::init`, or a unique suffix such as `app.js::init`), or as `Class::method`. `path::<module>` names a file's top-level code.
+
 **DO NOT** grep/rg/find across the repo to locate symbols — `brain_search` finds both code symbols and vault notes in one call.
 **DO NOT** read entire files to understand a function — `read_symbols` returns just the symbol body.
 **DO NOT** explore directory trees to understand architecture — `hub_nodes` and `clusters` give the structural picture.

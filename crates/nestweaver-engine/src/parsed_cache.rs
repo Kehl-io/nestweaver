@@ -43,7 +43,12 @@ use serde::{Deserialize, Serialize};
 /// 5 — Rust inline-module functions and exact unit/member-return evidence;
 ///     CommonJS literal methods and implicit constructor fields.
 /// 6 — nw-113: a JS/TS/Python/PHP file with a call outside every
-///     code-bearing span gains a `<module>` owner symbol (`module_init`).
+///     code-bearing span gains a `<module>` owner symbol (`module_init`),
+///     except a broken file with no real symbols or a lowercase JSX tag.
+///     Also: JS/TS generators are functions that scope their parameters,
+///     `.js` bare-parameter arrows are functions, `catch`/`for` bindings are
+///     clause-scoped, ESM imports are hoisted, TS `import x = require` binds,
+///     and `.ts`/`.tsx` keep their own type bindings.
 const CACHE_VERSION: u32 = 6;
 
 /// A log larger than this (and than the base) is folded into the base.

@@ -17,6 +17,8 @@ Before modifying a function, class, or module:
 8. Call `backlinks` if the symbol is referenced in vault notes
 9. Report: what will break (sorted by impact_score), what tests to run, what notes document this decision
 
+A caller labelled `path::<module>` is that file's top-level code (a call at load time, a decorator, a route registration). Pass `path::<module>` to `brain_impact`, `flow_trace` or `read_symbols` to inspect it.
+
 ## Limitations
 
 Impact results are a **lower bound** — they over-approximate the *candidate set* over the indexed graph, not a proven set of affected code. Treat them as "at least this, possibly more":

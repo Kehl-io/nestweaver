@@ -974,7 +974,11 @@ immediately in normal operation.
 > a test title no longer shadows a real definition. Generation 9 corrects
 > binding-user imports, receiver/export resolution and exported executable
 > roots. Generation 10 (nw-113) restricts a block-scoped JS/TS callable to
-> its block. A generation-8 or generation-9 graph must also be rebuilt:
+> its block, gives the calls a JS/TS/Python/PHP file makes at its top level a
+> per-file `<module>` owner (parsed cache 6), and folds in JS/TS parser fixes:
+> generators, `.js` bare-parameter arrows, `catch`/`for` scoping, import
+> hoisting, TS `import x = require`, and per-grammar `.ts`/`.tsx` type
+> bindings. A generation-8 or generation-9 graph must also be rebuilt:
 > `stale-check` exits 2 and `dead-code` refuses until it matches. Re-index
 > every repo — `nestweaver index --repo <path> --force` — before trusting any
 > ranking on this server.

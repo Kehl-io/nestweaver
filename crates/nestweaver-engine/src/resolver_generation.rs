@@ -294,8 +294,21 @@ use std::path::Path;
 ///     function invoked at module load has a caller and is no longer
 ///     reported dead, and a one-line function above such a call no longer
 ///     owns it. The owner is never an enclosing container and is the source
-///     of CALLS (and their IMPORTS by-product) only. Each owner is also a
-///     `<file>::<module>` process. Parsed cache 6 reparses older records.
+///     of CALLS (and their IMPORTS by-product) only. An owner with an
+///     outgoing CALLS edge is also a `<repo-relative path>::<module>`
+///     process; one without is not. Parsed cache 6 reparses older records.
+///     Also folded in: JS/TS generators are `Function` symbols that scope
+///     their parameters and vars, CommonJS `function*` exports included
+///     (nw-791); a `.js` bare-parameter arrow is a function; `catch`
+///     parameters and `for` loop variables are scoped to their clause
+///     (nw-800); ESM import bindings are hoisted to their scope's start, and a
+///     function above a CommonJS `require` sees its binding (nw-803); TS
+///     `import x = require` and `export import x = require` bind like an
+///     import, and a bare call on a whole-module binding stays unresolved
+///     (nw-801); `.ts` and `.tsx` keep their own type bindings (nw-805); a
+///     broken file with no real symbols, or a lowercase JSX tag, mints no
+///     owner; an import below a one-line function is module scope; and a
+///     sibling's nested homonym no longer hides the caller's own.
 pub const RESOLVER_GENERATION: u32 = 10;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
