@@ -6,7 +6,7 @@
 //! (`neighbors`) and is token-budget aware. Comment stripping is a planned
 //! follow-up (default-off; deferred to avoid false-elision risk).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use nestweaver_schema::Symbol;
@@ -60,6 +60,21 @@ pub struct AmbiguousMatch {
     /// an older daemon's response readable.
     #[serde(default)]
     pub candidates: Vec<AmbiguousCandidate>,
+    /// nw-113: how to pick one candidate, fitted to the query: a UID always
+    /// works; `path::name` is offered only when the caller did not already
+    /// qualify the name and the candidates are in different files, and
+    /// `path::Class::name` when each candidate has its own class. Empty from
+    /// an older daemon.
+    #[serde(default)]
+    pub hint: String,
+}
+
+/// nw-113: a `read-symbols` target whose qualifier named no file and no
+/// container, so it was resolved by its last segment alone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualifierIgnored {
+    pub query: String,
+    pub note: String,
 }
 
 /// One candidate of an [`AmbiguousMatch`].
@@ -110,6 +125,10 @@ pub struct ReadSymbolsResult {
     /// (nw-111). The guarantee stays; the silence does not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_exceeded_by_first_symbol: Option<BudgetOverrun>,
+    /// nw-113: targets whose `path::` or `Class::` qualifier named nothing
+    /// and were resolved by their last segment instead. Absent when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub qualifier_ignored: Vec<QualifierIgnored>,
 }
 
 /// How far the mandatory first symbol overran the requested budget.
@@ -410,23 +429,72 @@ fn verified_current_span(
 /// [`GraphStore::lookup_symbols_by_spec`] first, so a file and container
 /// narrow together. When the qualifiers name nothing, the lookup falls back
 /// to the last segment, so a module path such as `net::inner::send` keeps
-/// resolving by name.
+/// resolving by name; [`resolve_spec_detailed`] reports that fallback.
 pub fn resolve_spec(store: &GraphStore, spec: &str) -> Vec<Symbol> {
+    resolve_spec_detailed(store, spec).symbols
+}
+
+/// What [`resolve_spec_detailed`] found for one spec.
+#[derive(Debug, Default)]
+pub struct SpecResolution {
+    pub symbols: Vec<Symbol>,
+    /// The qualifiers named nothing and the last segment answered instead.
+    pub qualifier_ignored: bool,
+}
+
+/// [`resolve_spec`], also saying whether a qualifier was dropped.
+pub fn resolve_spec_detailed(store: &GraphStore, spec: &str) -> SpecResolution {
     if spec.starts_with("sym:") {
-        return store.lookup_symbol(spec).ok().into_iter().collect();
+        return SpecResolution {
+            symbols: store.lookup_symbol(spec).ok().into_iter().collect(),
+            qualifier_ignored: false,
+        };
     }
     if let Some(qualified) = nestweaver_schema::QualifiedSpec::parse(spec) {
         let strict = store.lookup_symbols_by_spec(spec).unwrap_or_default();
         if !strict.is_empty() {
-            return strict;
+            return SpecResolution {
+                symbols: strict,
+                qualifier_ignored: false,
+            };
         }
-        return store
+        let symbols = store
             .lookup_symbols_by_name(last_dotted_segment(qualified.name))
             .unwrap_or_default();
+        return SpecResolution {
+            qualifier_ignored: !symbols.is_empty(),
+            symbols,
+        };
     }
-    store
-        .lookup_symbols_by_name(last_dotted_segment(spec))
-        .unwrap_or_default()
+    SpecResolution {
+        symbols: store
+            .lookup_symbols_by_name(last_dotted_segment(spec))
+            .unwrap_or_default(),
+        qualifier_ignored: false,
+    }
+}
+
+/// nw-113: the [`AmbiguousMatch::hint`] for `candidates` of `spec`.
+fn ambiguity_hint(store: &GraphStore, spec: &str, candidates: &[Symbol]) -> String {
+    let uids: Vec<&str> = candidates.iter().map(|s| s.uid.as_str()).collect();
+    let containers = store.container_chains(&uids, 1).unwrap_or_default();
+    let mut seen = HashSet::new();
+    let distinct_classes = candidates.iter().all(|s| {
+        containers
+            .get(&s.uid)
+            .and_then(|chain| chain.first())
+            .is_some_and(|class| seen.insert((s.file_path.as_str(), class.as_str())))
+    });
+    if distinct_classes {
+        return "pass a UID or path::Class::name".to_string();
+    }
+    let one_file = candidates
+        .windows(2)
+        .all(|pair| pair[0].file_path == pair[1].file_path);
+    if nestweaver_schema::QualifiedSpec::parse(spec).is_some() || one_file {
+        return "pass a UID".to_string();
+    }
+    "pass a UID or path::name".to_string()
 }
 
 /// Dotted FQN forms (`pkg.mod.func`): the last segment is the symbol name.
@@ -514,7 +582,19 @@ pub fn read_symbols_budgeted(
     // 1. Resolve specs → primary symbols (preserving input order).
     let mut primary: Vec<Symbol> = Vec::new();
     for spec in specs {
-        let candidates = resolve_spec(store, spec);
+        let SpecResolution {
+            symbols: candidates,
+            qualifier_ignored,
+        } = resolve_spec_detailed(store, spec);
+        if qualifier_ignored && let Some((qualifier, name)) = spec.rsplit_once("::") {
+            result.qualifier_ignored.push(QualifierIgnored {
+                query: spec.clone(),
+                note: format!(
+                    "qualifier '{qualifier}' names no file or container of '{name}'; \
+                     matched by '{name}' alone"
+                ),
+            });
+        }
         match candidates.len() {
             0 => result.not_found.push(spec.clone()),
             1 => primary.push(candidates.into_iter().next().expect("len == 1")),
@@ -522,6 +602,7 @@ pub fn read_symbols_budgeted(
                 query: spec.clone(),
                 candidate_uids: candidates.iter().map(|s| s.uid.clone()).collect(),
                 candidates: candidates.iter().map(AmbiguousCandidate::from).collect(),
+                hint: ambiguity_hint(store, spec, &candidates),
             }),
         }
     }
@@ -737,6 +818,7 @@ pub fn read_symbols_from_repo_roots(
         merged.symbols.extend(partial.symbols);
         merged.not_found.extend(partial.not_found);
         merged.ambiguous.extend(partial.ambiguous);
+        merged.qualifier_ignored.extend(partial.qualifier_ignored);
         merged.dropped.extend(partial.dropped);
         merged.truncated = merged.truncated || partial.truncated;
         if merged.budget_exceeded_by_first_symbol.is_none() {
@@ -1090,6 +1172,75 @@ app();
             "{ambiguous:?}"
         );
         assert_eq!(ambiguous.candidate_uids.len(), 3);
+    }
+
+    /// nw-113 final round: `path::Class::method` narrows by file and class;
+    /// a qualifier that names nothing falls back to the last segment and says
+    /// so in `qualifier_ignored`; the ambiguity hint never asks for the
+    /// `path::name` the caller already passed, nor for one that cannot help.
+    #[test]
+    fn qualifier_fallback_is_disclosed_and_hints_fit_the_query() {
+        let (dir, store) = fixture_files(&[
+            (
+                "a/svc.ts",
+                "export class Svc { run() { return 1; } }\n\
+                 export function strip(a: string) { return a; }\n",
+            ),
+            (
+                "b/svc.ts",
+                "export class Svc { run() { return 2; } }\n\
+                 export class Other { run() { return 3; } }\n\
+                 export function strip(b: string) { return b; }\n",
+            ),
+        ]);
+        let reader = FilesystemReader::new(dir.path());
+        let read = |spec: &str| read_symbols(&store, &[spec.to_string()], &reader, 0, None);
+
+        let res = read("a/svc.ts::Svc::run");
+        assert_eq!(res.symbols.len(), 1, "{res:?}");
+        assert_eq!(res.symbols[0].path, "a/svc.ts");
+        assert!(res.qualifier_ignored.is_empty(), "{res:?}");
+
+        let res = read("nothere.ts::missing");
+        assert!(res.qualifier_ignored.is_empty(), "a miss is not a fallback");
+        assert_eq!(res.not_found, ["nothere.ts::missing"]);
+        let res = read("nothere.ts::Other");
+        assert_eq!(res.symbols.len(), 1, "fallback still reads: {res:?}");
+        let [ignored] = res.qualifier_ignored.as_slice() else {
+            panic!("{res:?}")
+        };
+        assert_eq!(ignored.query, "nothere.ts::Other");
+        assert!(ignored.note.contains("nothere.ts"), "{ignored:?}");
+
+        let res = read("nothere.ts::run");
+        let [ambiguous] = res.ambiguous.as_slice() else {
+            panic!("{res:?}")
+        };
+        assert!(!ambiguous.hint.contains("path::name"), "{ambiguous:?}");
+        assert!(ambiguous.hint.contains("UID"), "{ambiguous:?}");
+        assert_eq!(res.qualifier_ignored.len(), 1, "{res:?}");
+
+        let res = read("b/svc.ts::run");
+        let [ambiguous] = res.ambiguous.as_slice() else {
+            panic!("{res:?}")
+        };
+        assert!(!ambiguous.hint.contains("--repo"), "{ambiguous:?}");
+        assert!(
+            !ambiguous.hint.contains("pass a UID or path::name"),
+            "{ambiguous:?}"
+        );
+
+        let res = read("run");
+        let [ambiguous] = res.ambiguous.as_slice() else {
+            panic!("{res:?}")
+        };
+        assert_eq!(ambiguous.hint, "pass a UID or path::Class::name");
+
+        let res = read("strip");
+        let [ambiguous] = res.ambiguous.as_slice() else {
+            panic!("{res:?}")
+        };
+        assert_eq!(ambiguous.hint, "pass a UID or path::name");
     }
 
     /// nw-113 review: the owner is never a neighbour window; reading the

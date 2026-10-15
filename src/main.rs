@@ -27742,9 +27742,20 @@ fn render_read_symbols(
         for nf in &res.not_found {
             eprintln!("not found: {nf}");
         }
+        // nw-113: a dropped qualifier is said out loud, not silently
+        // answered with whatever shares the last segment.
+        for ignored in &res.qualifier_ignored {
+            eprintln!("warning: {}: {}", ignored.query, ignored.note);
+        }
         for a in &res.ambiguous {
+            // An older daemon sends no hint; its answer was this one.
+            let hint = if a.hint.is_empty() {
+                "pass a UID or path::name"
+            } else {
+                a.hint.as_str()
+            };
             eprintln!(
-                "ambiguous: {} \u{2192} {} candidates (pass a UID or path::name)",
+                "ambiguous: {} \u{2192} {} candidates ({hint})",
                 a.query,
                 a.candidate_uids.len()
             );
