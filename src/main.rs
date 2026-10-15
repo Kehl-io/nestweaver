@@ -4202,6 +4202,50 @@ fn render_flow_trace_text_to(out: &mut impl std::io::Write, payload: &serde_json
 mod context_header_tests {
     /// nw-113: the header says owners are listed last, since they rank after
     /// every real symbol rather than by relevance.
+    /// nw-113 final round: a body cut to fit the budget is reported as such,
+    /// never as "0 symbol(s) dropped"; a dropped symbol keeps its own line.
+    #[test]
+    fn read_symbols_truncation_lines_name_what_was_cut() {
+        let window = |truncated: bool| nestweaver_engine::read_symbols::SymbolWindow {
+            uid: "sym:x".into(),
+            name: "big".into(),
+            kind: "Function".into(),
+            path: "src/big.rs".into(),
+            start_line: 1,
+            end_line: 900,
+            body: "fn big() {".into(),
+            body_available: true,
+            is_neighbor: false,
+            stale_span: false,
+            relocated_from_line: None,
+            body_truncated: truncated,
+        };
+        let cut = nestweaver_engine::read_symbols::ReadSymbolsResult {
+            symbols: vec![window(true)],
+            truncated: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::read_symbols_truncation_lines(&cut),
+            ["body truncated to fit the token budget"]
+        );
+        let dropped = nestweaver_engine::read_symbols::ReadSymbolsResult {
+            symbols: vec![window(false)],
+            dropped: vec!["sym:y".into()],
+            truncated: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::read_symbols_truncation_lines(&dropped),
+            ["truncated: 1 symbol(s) dropped for token budget"]
+        );
+        let whole = nestweaver_engine::read_symbols::ReadSymbolsResult {
+            symbols: vec![window(false)],
+            ..Default::default()
+        };
+        assert!(super::read_symbols_truncation_lines(&whole).is_empty());
+    }
+
     #[test]
     fn connected_header_says_owners_are_listed_last() {
         assert_eq!(
@@ -27765,6 +27809,32 @@ fn render_read_symbols_unreadable_root(
     Ok((EXIT_ERROR, None))
 }
 
+/// nw-113: what a `read-symbols` budget cut says: a dropped symbol is
+/// counted, and a first symbol cut to fit is reported as a body truncation
+/// rather than as "0 symbol(s) dropped".
+fn read_symbols_truncation_lines(
+    res: &nestweaver_engine::read_symbols::ReadSymbolsResult,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if res.symbols.iter().any(|w| w.body_truncated) {
+        lines.push("body truncated to fit the token budget".to_string());
+    }
+    if res.truncated && !res.dropped.is_empty() {
+        lines.push(format!(
+            "truncated: {} symbol(s) dropped for token budget",
+            res.dropped.len()
+        ));
+    }
+    // A first symbol returned whole over the budget (a budget of 0, or one
+    // smaller than the cut marker) says so in its own words.
+    if lines.is_empty()
+        && let Some(overrun) = &res.budget_exceeded_by_first_symbol
+    {
+        lines.push(overrun.note.clone());
+    }
+    lines
+}
+
 /// Render a `read_symbols` result and compute its exit code.
 ///
 /// Shared by the daemon and direct paths so `--json` and the exit-code
@@ -27808,11 +27878,8 @@ fn render_read_symbols(
                 );
             }
         }
-        if res.truncated {
-            eprintln!(
-                "truncated: {} symbol(s) dropped for token budget",
-                res.dropped.len()
-            );
+        for line in read_symbols_truncation_lines(res) {
+            eprintln!("{line}");
         }
     }
     // Exit 2 when targets were requested but none resolved to a symbol
