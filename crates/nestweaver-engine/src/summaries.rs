@@ -319,10 +319,15 @@ pub fn generate_symbol_summaries_bounded(
             .map(|(callers, callees)| (callers.as_slice(), callees.as_slice()))
             .unwrap_or_default();
 
+        // nw-113: an owner has no signature; it is named `path::<module>`.
+        let sig = if sym.is_module_owner() {
+            sym.display_name()
+        } else {
+            std::borrow::Cow::Borrowed(sym.signature.as_str())
+        };
         let content = format!(
             "{kind} {sig} | callers: [{callers}] | callees: [{callees}] | file: {file}:{line}",
             kind = sym.kind,
-            sig = sym.signature,
             callers = caller_names.join(", "),
             callees = callee_names.join(", "),
             file = sym.file_path,
@@ -334,7 +339,7 @@ pub fn generate_symbol_summaries_bounded(
         summaries.push(Summary {
             level: SummaryLevel::Symbol,
             target_uid: sym.uid.clone(),
-            target_name: sym.name.clone(),
+            target_name: sym.display_name().into_owned(),
             content,
             token_estimate,
             file_path: None,
@@ -892,9 +897,38 @@ mod tests {
             targeted
                 .summaries
                 .iter()
-                .all(|summary| summary.target_name != "<module>"),
+                .all(|summary| !summary.target_name.ends_with("<module>")),
             "{:?}",
             targeted.summaries
+        );
+
+        // nw-113: the owner is named `path::<module>` in its own summary and
+        // in its callees' caller lists, never blank or bare.
+        let callee = generate_symbol_summaries_bounded(&store, Some("flushBuffer"), 100).unwrap();
+        let callee = callee
+            .summaries
+            .iter()
+            .find(|summary| summary.target_name == "flushBuffer")
+            .expect("flushBuffer summary");
+        assert!(
+            callee
+                .content
+                .contains("callers: [src/ownerless.ts::<module>]"),
+            "{}",
+            callee.content
+        );
+        let owner = generate_symbol_summaries_bounded(&store, Some("ownerless"), 100).unwrap();
+        let owner = owner
+            .summaries
+            .iter()
+            .find(|summary| summary.target_name == "src/ownerless.ts::<module>")
+            .expect("owner summary");
+        assert!(
+            owner
+                .content
+                .starts_with("Module src/ownerless.ts::<module> | callers: []"),
+            "{}",
+            owner.content
         );
     }
 

@@ -1053,7 +1053,7 @@ impl GraphStore {
         let callers_query = format!(
             "UNWIND [{in_list}] AS want_uid \
              MATCH (caller:Symbol)-[:CALLS]->(target:Symbol {{uid: want_uid}}) \
-             RETURN target.uid, caller.name"
+             RETURN target.uid, caller.name, caller.file_path"
         );
         let callers = conn
             .query(&callers_query)
@@ -1061,6 +1061,10 @@ impl GraphStore {
         for row in callers {
             let uid = extract_string(&row, 0)?;
             let name = extract_string(&row, 1)?;
+            // nw-113: an owner caller reads `path::<module>`, never bare.
+            let name =
+                nestweaver_schema::symbol_display_name(&name, &extract_string(&row, 2)?)
+                    .into_owned();
             if let Some((names, _)) = adjacency.get_mut(&uid) {
                 names.push(name);
             }
