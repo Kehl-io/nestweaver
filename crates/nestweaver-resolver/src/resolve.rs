@@ -2092,10 +2092,11 @@ fn active_lexical_binding<'a>(
 /// symbols, which is O(calls x candidates x (bindings + symbols)) and
 /// measured cubic on a file of many same-named locals (bug-hunt #1).
 pub(crate) struct FileScopeIndex<'a> {
-    /// Scoped bindings (`LocalBinding`s with a byte scope: declarators and
-    /// parameters), by name, sorted by line. A candidate's own declarators are
-    /// a binary search over its span; `active_lexical_binding` reads one
-    /// name's list instead of every binding in the file.
+    /// Scoped bindings (`LocalBinding`s with a byte scope: declarators,
+    /// parameters, and `catch` and `for … of/in` bindings), by name, sorted by
+    /// line. A candidate's own declarators are a binary search over its span;
+    /// `active_lexical_binding` reads one name's list instead of every binding
+    /// in the file.
     declarators: std::collections::HashMap<&'a str, Vec<&'a RawReference>>,
     /// `covering[l - 1]`: how many code-bearing symbols (never the `<module>`
     /// owner) contain line `l`.
@@ -2148,7 +2149,9 @@ impl<'a> FileScopeIndex<'a> {
         self.declarators.get(name).map_or(&[], Vec::as_slice)
     }
 
-    /// Declarator bindings named `name` whose line lies in `start..=end`.
+    /// Every scoped binding named `name` (not only declarators: parameters,
+    /// `catch` and loop bindings too) whose line lies in `start..=end`. The
+    /// caller picks the declaration among them by width.
     fn declarators_in(&self, name: &str, start: u32, end: u32) -> &[&'a RawReference] {
         let Some(bindings) = self.declarators.get(name) else {
             return &[];
@@ -2207,9 +2210,10 @@ impl<'a> FileScopeIndex<'a> {
 /// A declarator's own block encloses any same-named local declared inside
 /// an initializer in its span (`let a = { g() { let f = 1; return f; } },
 /// f = () => 2;` puts the inner `f` ahead of `f`'s own declarator), so among
-/// the in-span same-named declarator bindings the one with the WIDEST scope
-/// is the symbol's declaration. A same-named parameter in that span is
-/// always narrower than the declarator's own binding, so it is never chosen.
+/// the in-span same-named scoped bindings the one with the WIDEST scope is
+/// the symbol's declaration. A same-named parameter, `catch` or loop binding
+/// in that span is always narrower than the declarator's own binding, so it
+/// is never chosen.
 ///
 /// Gated to bare JS/TS calls (plan validation): Rust has its own exact gate,
 /// and receiver calls (`Api.get()`, `this.x()`) are matched by
