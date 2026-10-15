@@ -4148,6 +4148,19 @@ fn render_flow_trace_text_to(out: &mut impl std::io::Write, payload: &serde_json
 }
 
 #[cfg(test)]
+mod context_header_tests {
+    /// nw-113: the header says owners are listed last, since they rank after
+    /// every real symbol rather than by relevance.
+    #[test]
+    fn connected_header_says_owners_are_listed_last() {
+        assert_eq!(
+            super::connected_symbols_header(4),
+            "Connected (4 symbols, ranked by relevance; top-level `<module>` owners listed last):"
+        );
+    }
+}
+
+#[cfg(test)]
 mod flow_trace_text_tests {
     /// nw-113: an owner root is labelled `path::<module>` in the heading and
     /// the root row, even when the payload names it bare.
@@ -27319,6 +27332,14 @@ fn resolve_uid_with_repo_filter(
     }
 }
 
+/// The `Connected (...)` heading of code and feature context. nw-113: owners
+/// rank after every real symbol, not by relevance, and the heading says so.
+fn connected_symbols_header(count: usize) -> String {
+    format!(
+        "Connected ({count} symbols, ranked by relevance; top-level `<module>` owners listed last):"
+    )
+}
+
 /// Print a human-readable representation of a `ContextResult`.
 fn print_context_text(result: &ContextResult) {
     // nw-393: `Seeds (5 resolved):` was printed for a bare-name input that
@@ -27347,10 +27368,7 @@ fn print_context_text(result: &ContextResult) {
 
     if !result.connected.is_empty() {
         println!();
-        println!(
-            "Connected ({} symbols, ranked by relevance):",
-            result.connected.len()
-        );
+        println!("{}", connected_symbols_header(result.connected.len()));
         for node in &result.connected {
             println!(
                 "  {}  {}  {}:{}  {:.4}",
@@ -27426,10 +27444,7 @@ fn print_feature_context_text(result: &FeatureContextResult) {
 
     if !result.connected.is_empty() {
         println!();
-        println!(
-            "Connected ({} symbols, ranked by relevance):",
-            result.connected.len()
-        );
+        println!("{}", connected_symbols_header(result.connected.len()));
         for node in &result.connected {
             println!(
                 "  {}  {}  {}:{}  {:.4}",
