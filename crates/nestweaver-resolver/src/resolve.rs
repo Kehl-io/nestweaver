@@ -10110,6 +10110,129 @@ export function readIt() { return value(); }
         }
     }
 
+    /// nw-113 final review M2: a receiver call on a `catch` or `for … of`
+    /// variable is unresolved, as one on a parameter is (nw-724), even when
+    /// the variable shadows a namespace import whose module has the member.
+    #[test]
+    fn receiver_calls_on_catch_and_loop_variables_are_unresolved() {
+        for (ext, language) in [("js", Language::JavaScript), ("ts", Language::TypeScript)] {
+            let svc = format!("src/svc.{ext}");
+            let e = format!("src/e.{ext}");
+            let run = format!("src/run.{ext}");
+            let run_source = "import * as svc from './svc';\n\
+                 import * as e from './e';\n\
+                 export function loop(list) { for (const svc of list) svc.start(); }\n\
+                 export function caught() { try { work(); } catch (e) { e.report(); } }\n\
+                 export function control() { svc.start(); e.report(); }\n";
+            let (files, edges) = review_edges(
+                &[
+                    (&svc, "export function start() {}\n"),
+                    (&e, "export function report() {}\n"),
+                    (&run, run_source),
+                ],
+                language,
+            );
+            let start = uid(&files, &svc, "start");
+            let report = uid(&files, &e, "report");
+            let mut control = vec![start.clone(), report.clone()];
+            control.sort();
+            assert_eq!(
+                call_targets(&files, &edges, &run, "control"),
+                control,
+                "{run}: {edges:#?}"
+            );
+            assert_eq!(
+                call_targets(&files, &edges, &run, "loop"),
+                vec!["unresolved:start".to_string()],
+                "{run}: {edges:#?}"
+            );
+            assert!(
+                !call_targets(&files, &edges, &run, "caught").contains(&report),
+                "{run}: {edges:#?}"
+            );
+        }
+    }
+
+    /// nw-113 final review M3: `export import x = require('…')` binds `x`
+    /// like `import x = require('…')`.
+    #[test]
+    fn ts_export_import_equals_require_binds_like_an_import() {
+        let lib = ("src/lib.ts", "export function helper() { return 1; }\n");
+        let a = (
+            "src/a.ts",
+            "export import util = require('./lib');\n\
+             export function use() { return util.helper(); }\n",
+        );
+        let (files, edges) = review_edges(&[lib, a], Language::TypeScript);
+        assert_eq!(
+            call_targets(&files, &edges, "src/a.ts", "use"),
+            vec![uid(&files, "src/lib.ts", "helper")],
+            "{edges:#?}"
+        );
+    }
+
+    /// nw-113 final review M3: calling a whole-module binding bare (`ns()`,
+    /// `x()`) calls the module's value, which no export name identifies, so
+    /// the call is unresolved and never binds a same-named export.
+    #[test]
+    fn bare_calls_on_whole_module_bindings_are_unresolved() {
+        for (ext, language) in [("js", Language::JavaScript), ("ts", Language::TypeScript)] {
+            let ns = format!("src/ns.{ext}");
+            let rel = format!("src/rel.{ext}");
+            let a = format!("src/a.{ext}");
+            let a_source = "import * as ns from './ns';\n\
+                 const rel = require('./rel');\n\
+                 export function use() { return [ns(), rel()]; }\n";
+            let (files, edges) = review_edges(
+                &[
+                    (&ns, "export function ns() { return 1; }\n"),
+                    (&rel, "export function rel() { return 2; }\n"),
+                    (&a, a_source),
+                ],
+                language,
+            );
+            assert_eq!(
+                call_targets(&files, &edges, &a, "use"),
+                vec!["unresolved:ns".to_string(), "unresolved:rel".to_string()],
+                "{a}: {edges:#?}"
+            );
+        }
+    }
+
+    /// nw-113 final review M3: a hoisted import is visible above its line, and
+    /// a block-local or function-local declarator there still shadows it.
+    #[test]
+    fn a_local_declarator_shadows_a_hoisted_import_above_the_import_line() {
+        for (lib, a, language) in [
+            ("src/lib.ts", "src/a.ts", Language::TypeScript),
+            ("src/lib.js", "src/a.js", Language::JavaScript),
+        ] {
+            let a_source = "export function local() {\n  const helper = () => 2;\n  return helper();\n}\n\
+                 export function block() {\n  {\n    const helper = () => 3;\n    helper();\n  }\n  return helper();\n}\n\
+                 import { helper } from './lib';\n";
+            let (files, edges) = review_edges(
+                &[
+                    (lib, "export function helper() { return 1; }\n"),
+                    (a, a_source),
+                ],
+                language,
+            );
+            let imported = uid(&files, lib, "helper");
+            assert_eq!(
+                call_targets(&files, &edges, a, "local"),
+                vec![uid_at(&files, a, "helper", 2)],
+                "{a}: {edges:#?}"
+            );
+            let mut block = vec![uid_at(&files, a, "helper", 7), imported];
+            block.sort();
+            assert_eq!(
+                call_targets(&files, &edges, a, "block"),
+                block,
+                "{a}: {edges:#?}"
+            );
+        }
+    }
+
     /// nw-801: TS `import x = require('…')` binds `x` exactly like
     /// `import * as x from '…'`. A package import leaves `x()` external
     /// instead of falling through to a nested same-named declaration, and a

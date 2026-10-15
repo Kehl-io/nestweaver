@@ -5293,6 +5293,24 @@ fn collect_js_import_bindings(
                 });
                 (specifier, vec![(local, "*".into())])
             }
+            // `export import x = require('pkg')`: the TS grammar recovers it
+            // as `export import x = require` (an `import_alias`) followed by
+            // a `('pkg')` expression statement. Read it as the clause above.
+            "import_alias" => {
+                let Some((local, spec)) = exported_import_require(statement, source) else {
+                    continue;
+                };
+                let specifier = strip_quotes(&text(spec));
+                references.push(RawReference {
+                    scope: None,
+                    name: specifier.clone(),
+                    kind: ReferenceKind::Import,
+                    start_line: statement.start_position().row as u32 + 1,
+                    context: text(statement),
+                    receiver: None,
+                });
+                (specifier, vec![(local, "*".into())])
+            }
             "import_statement" => {
                 let Some(spec) = statement.child_by_field_name("source") else {
                     continue;
@@ -5450,6 +5468,35 @@ fn collect_js_import_bindings(
             }
         }
     }
+}
+
+/// The local name and specifier of `export import x = require('pkg')`, which
+/// the TS grammar error-recovers as `(export_statement (import_alias x
+/// require))` followed by `(expression_statement (parenthesized_expression
+/// (string)))`.
+fn exported_import_require<'a>(
+    alias: tree_sitter::Node<'a>,
+    source: &[u8],
+) -> Option<(tree_sitter::Node<'a>, tree_sitter::Node<'a>)> {
+    let export = alias
+        .parent()
+        .filter(|node| node.kind() == "export_statement")?;
+    let mut cursor = alias.walk();
+    let mut names = alias
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "identifier");
+    let local = names.next()?;
+    names
+        .next()
+        .filter(|node| node.utf8_text(source) == Ok("require"))?;
+    let spec = export
+        .next_named_sibling()
+        .filter(|node| node.kind() == "expression_statement")?
+        .named_child(0)
+        .filter(|node| node.kind() == "parenthesized_expression")?
+        .named_child(0)
+        .filter(|node| node.kind() == "string")?;
+    Some((local, spec))
 }
 
 fn import_require_clause(statement: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
@@ -14012,6 +14059,112 @@ mod generator_and_bare_arrow_tests {
                 !parsed.symbols.iter().any(|s| s.is_module_owner()),
                 "{path}: generator bodies are not top-level code: {:?}",
                 parsed.symbols
+            );
+        }
+    }
+
+    /// The scoped `LocalBinding`s named `name`.
+    fn local_scopes(parsed: &ParsedFile, name: &str) -> Vec<LexicalScope> {
+        parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::LocalBinding && r.name == name)
+            .filter_map(|r| r.scope)
+            .collect()
+    }
+
+    /// nw-113 final review M1: a generator's parameter and `var` are scoped to
+    /// the generator, not the program.
+    #[test]
+    fn generator_parameters_and_vars_are_scoped_to_the_generator() {
+        let source = "function* saga(action) { var step = 1; yield action; }\n\
+                      const expr = function* (other) { yield other; };\n";
+        for path in ["g.js", "g.ts"] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            let saga_end = source.find('\n').unwrap();
+            for name in ["action", "step"] {
+                let scopes = local_scopes(&parsed, name);
+                assert!(
+                    !scopes.is_empty() && scopes.iter().all(|s| s.start == 0 && s.end == saga_end),
+                    "{path}: {name}: {scopes:?}"
+                );
+            }
+            let other = local_scopes(&parsed, "other");
+            assert!(
+                !other.is_empty() && other.iter().all(|s| s.start > saga_end),
+                "{path}: {other:?}"
+            );
+        }
+    }
+
+    /// nw-113 final review M3 (nw-800): a `for (var f of …)` binding hoists to
+    /// the enclosing function; destructured loop and `catch` bindings are
+    /// scoped to their loop or clause; `for (f of xs)` with no keyword
+    /// assigns an existing name and binds nothing.
+    #[test]
+    fn loop_and_catch_bindings_have_their_js_scopes() {
+        let source = "function run(xs) {\n\
+                      \x20 for (var f of xs) { f(); }\n\
+                      \x20 for (const { a, b: [c] } of xs) { a(); c(); }\n\
+                      \x20 try { work(); } catch ({ message, code: [d] }) { d(); }\n\
+                      \x20 for (g of xs) { g(); }\n\
+                      }\n";
+        for path in ["l.js", "l.ts"] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            let run = (0, source.len() - 1);
+            let f = local_scopes(&parsed, "f");
+            assert!(
+                f.len() == 1 && (f[0].start, f[0].end) == run && f[0].hoisted_var,
+                "{path}: var f hoists to run: {f:?}"
+            );
+            let loop_start = source.find("for (const").unwrap();
+            for name in ["a", "c"] {
+                let scopes = local_scopes(&parsed, name);
+                assert!(
+                    scopes.len() == 1 && scopes[0].start == loop_start,
+                    "{path}: {name} is the loop's: {scopes:?}"
+                );
+            }
+            let catch_start = source.find("catch").unwrap();
+            for name in ["message", "d"] {
+                let scopes = local_scopes(&parsed, name);
+                assert!(
+                    scopes.len() == 1 && scopes[0].start == catch_start,
+                    "{path}: {name} is the clause's: {scopes:?}"
+                );
+            }
+            assert!(
+                local_scopes(&parsed, "g").is_empty(),
+                "{path}: for (g of xs) binds nothing: {:?}",
+                parsed.references
+            );
+        }
+    }
+
+    /// nw-113 final review M3 (nw-803): an ESM import binding initializes at
+    /// its scope's start (hoisted); `import x = require` and
+    /// `export import x = require` initialize where written.
+    #[test]
+    fn import_equals_require_is_not_hoisted() {
+        let source = "function early() { return lib.helper(); }\n\
+                      import { helper } from './lib';\n\
+                      import lib = require('./lib');\n\
+                      export import other = require('./other');\n";
+        let parsed = parse_source(Path::new("a.ts"), source).unwrap();
+        let alias = |name: &str| {
+            parsed
+                .references
+                .iter()
+                .find(|r| r.kind == ReferenceKind::ImportAlias && r.name == name)
+                .and_then(|r| r.scope)
+                .unwrap_or_else(|| panic!("{name}: {:?}", parsed.references))
+        };
+        assert_eq!(alias("helper").initialized_at, 0, "ESM import is hoisted");
+        for (name, line) in [("lib", "import lib"), ("other", "export import other")] {
+            let scope = alias(name);
+            assert!(
+                scope.initialized_at >= source.find(line).unwrap(),
+                "{name} initializes where written: {scope:?}"
             );
         }
     }
