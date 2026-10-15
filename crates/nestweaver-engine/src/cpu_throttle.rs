@@ -37,7 +37,8 @@ use std::time::Duration;
 /// Environment variable selecting the budget, as the average percentage of
 /// ONE core the daemon process may use over the rolling 180 s window (the
 /// same unit macOS reports for its own limit: 90 s / 180 s is 50%). `0` or
-/// `>= 100` disables the throttle; values above [`MAX_PERCENT`] are clamped.
+/// `>= 100` disables the throttle; values above [`MAX_PERCENT`] fall back to
+/// the default.
 const ENV_VAR: &str = "NESTWEAVER_INDEX_CPU_PERCENT";
 
 /// Default budget: 40% of one core over 180 s = 72 s of CPU per window,
@@ -45,10 +46,19 @@ const ENV_VAR: &str = "NESTWEAVER_INDEX_CPU_PERCENT";
 /// repo (an 11-core burst of a few seconds) runs unthrottled.
 const DEFAULT_PERCENT: u32 = 40;
 
-/// Ceiling for configured values: 45% = 81 s per window. Anything higher
-/// (including the old default of 50) would sit at or over the kill line, so
-/// it is clamped here rather than honoured.
-const MAX_PERCENT: u32 = 45;
+/// Ceiling for configured values: 40% = 72 s per window, the same as the
+/// default. The write phase after the gate is not throttled and adds up to
+/// [`WRITE_RESERVE`] on top of the budget, so anything higher could carry the
+/// window past the 90 s kill line. Values above it — notably the old default
+/// `50` that existing launchd plists bake — are treated as unset (the
+/// default), not as "as much as allowed".
+const MAX_PERCENT: u32 = 40;
+
+/// CPU kept free for the write/epilogue phase, which runs under the write
+/// gate and therefore is never throttled (~10–15 s for a large repo). Before
+/// taking the gate an index waits until the window is at most
+/// `budget - WRITE_RESERVE`; see [`CpuThrottle::reserve_write_headroom`].
+const WRITE_RESERVE: Duration = Duration::from_secs(20);
 
 /// The rolling window runningboardd measures CPU over.
 const WINDOW: Duration = Duration::from_secs(180);
@@ -200,8 +210,13 @@ impl CpuThrottle {
         let percent = value
             .and_then(|s| s.trim().parse::<u32>().ok())
             .unwrap_or(DEFAULT_PERCENT);
-        let target = (percent > 0 && percent < 100)
-            .then(|| WINDOW.mul_f64(f64::from(percent.min(MAX_PERCENT)) / 100.0));
+        let percent = if percent > MAX_PERCENT && percent < 100 {
+            DEFAULT_PERCENT
+        } else {
+            percent
+        };
+        let target =
+            (percent > 0 && percent < 100).then(|| WINDOW.mul_f64(f64::from(percent) / 100.0));
         Self::new(target)
     }
 
@@ -248,6 +263,23 @@ impl CpuThrottle {
         #[cfg(test)]
         self.checks.fetch_add(1, Ordering::Relaxed);
         let Some(budget) = self.target else { return };
+        self.wait_within(budget, cancel);
+    }
+
+    /// Called once before an index takes its write gate (never under it):
+    /// waits until the window is at most `budget - WRITE_RESERVE`, so the
+    /// unthrottled write phase cannot carry the window past the budget by
+    /// more than the reserve. Stops waiting as soon as `cancel` is set.
+    pub fn reserve_write_headroom(&self, cancel: Option<&AtomicBool>) {
+        #[cfg(test)]
+        self.checks.fetch_add(1, Ordering::Relaxed);
+        let Some(budget) = self.target else { return };
+        self.wait_within(budget.saturating_sub(WRITE_RESERVE), cancel);
+    }
+
+    /// Wait (in [`MAX_SLEEP`] slices, at most [`MAX_WAIT_PER_CHECK`]) until
+    /// the window's total is at most `limit`.
+    fn wait_within(&self, limit: Duration, cancel: Option<&AtomicBool>) {
         let mut slept = Duration::ZERO;
         while slept < MAX_WAIT_PER_CHECK {
             if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -260,10 +292,10 @@ impl CpuThrottle {
                 // mid-check; the window is still usable, so recover.
                 let mut window = self.window.lock().unwrap_or_else(|p| p.into_inner());
                 window.update(now_wall, now_cpu);
-                if window.total() <= budget {
+                if window.total() <= limit {
                     return;
                 }
-                window.wait_until_within(budget, now_wall)
+                window.wait_until_within(limit, now_wall)
             };
             let nap = wait.min(MAX_SLEEP).min(MAX_WAIT_PER_CHECK - slept);
             if nap.is_zero() {
@@ -271,7 +303,7 @@ impl CpuThrottle {
             }
             if slept.is_zero() {
                 tracing::debug!(
-                    budget_secs = budget.as_secs_f64(),
+                    limit_secs = limit.as_secs_f64(),
                     wait_secs = wait.as_secs_f64(),
                     "index CPU budget for the rolling window spent; waiting"
                 );
@@ -279,6 +311,14 @@ impl CpuThrottle {
             (self.sleep)(nap);
             slept += nap;
         }
+    }
+
+    /// The window's current total (tests).
+    #[cfg(test)]
+    fn window_total(&self) -> Duration {
+        let mut window = self.window.lock().unwrap_or_else(|p| p.into_inner());
+        window.update((self.wall_clock)(), (self.cpu_clock)());
+        window.total()
     }
 }
 
@@ -443,16 +483,25 @@ mod tests {
     }
 
     #[test]
-    fn env_values_at_or_over_the_kill_line_are_clamped() {
-        // 50% would be exactly runningboardd's 90 s / 180 s limit.
-        assert_eq!(CpuThrottle::from_env_value(Some("50")).target, secs(81));
-        assert_eq!(CpuThrottle::from_env_value(Some("99")).target, secs(81));
+    fn legacy_values_over_the_max_map_to_the_default() {
+        // Existing plists bake the old default `50`, which is exactly
+        // runningboardd's 90 s / 180 s kill line. Anything over the max is
+        // treated as unset, not as "as much as allowed".
+        let default = CpuThrottle::from_env_value(None).target;
+        for legacy in ["50", "41", "45", "99"] {
+            assert_eq!(
+                CpuThrottle::from_env_value(Some(legacy)).target,
+                default,
+                "{legacy} must map to the default"
+            );
+        }
+        assert_eq!(CpuThrottle::from_env_value(Some("40")).target, secs(72));
     }
 
     #[test]
     fn env_value_is_trimmed() {
-        let t = CpuThrottle::from_env_value(Some(" 45 "));
-        assert_eq!(t.target, secs(81));
+        let t = CpuThrottle::from_env_value(Some(" 30 "));
+        assert_eq!(t.target, secs(54));
     }
 
     #[test]
@@ -690,5 +739,35 @@ mod tests {
     #[test]
     fn global_throttle_is_one_process_wide_instance() {
         assert!(std::ptr::eq(CpuThrottle::global(), CpuThrottle::global()));
+    }
+
+    // ── nw-812 review C2: headroom for the unthrottled write phase ───────
+
+    #[test]
+    fn write_phase_starts_with_headroom() {
+        // Parse + type-env used 60 s: under the 72 s budget, so no worker
+        // waited. The write/epilogue phase is not throttled and adds ~10–15 s,
+        // so before the gate the window must come back to budget − reserve.
+        let rig = sim_rig();
+        for _ in 0..600 {
+            rig.throttle.check();
+            rig.advance(Duration::from_millis(10), Duration::from_millis(100));
+        }
+        assert!(rig.sleeps().is_empty(), "60 s is under budget");
+        rig.throttle.reserve_write_headroom(None);
+        assert!(!rig.sleeps().is_empty(), "60 s leaves no write reserve");
+        assert!(
+            rig.throttle.window_total() <= Duration::from_secs(72) - WRITE_RESERVE,
+            "the write phase must start with {WRITE_RESERVE:?} of headroom, window holds {:?}",
+            rig.throttle.window_total()
+        );
+    }
+
+    #[test]
+    fn write_headroom_needs_no_wait_when_already_available() {
+        let rig = sim_rig();
+        rig.advance(Duration::from_secs(5), Duration::from_secs(40));
+        rig.throttle.reserve_write_headroom(None);
+        assert!(rig.sleeps().is_empty());
     }
 }

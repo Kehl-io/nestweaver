@@ -4900,6 +4900,9 @@ where
         cpu_throttle,
         cancel.map(|c| c.as_ref()),
     )?;
+    // The write/epilogue phase below runs under the gate and is never
+    // throttled; leave it headroom in the window first (still outside it).
+    cpu_throttle.reserve_write_headroom(cancel.map(|c| c.as_ref()));
 
     let mut write_guard = Some(acquire_write_guard()?);
 
@@ -18627,9 +18630,10 @@ module.exports = { check, plain };\n";
             .find(|(e, _)| *e == "release")
             .unwrap()
             .1;
-        // Parse (4 files) and type-env build (4 files) both check per file.
+        // Parse (4 files) and type-env build (4 files) both check per file,
+        // plus the write-headroom reserve: all before the gate.
         assert!(
-            acquired >= 8,
+            acquired >= 9,
             "parse and type-env checks must all happen before the gate: {events:?}"
         );
         assert_eq!(
