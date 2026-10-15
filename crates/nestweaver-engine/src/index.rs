@@ -3876,6 +3876,11 @@ fn build_type_environments(
 
     let build_env = |(file_path, symbols, _references, source_opt): &ParsedFileEntry| {
         cpu_throttle.check_with_cancel(cancel);
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            // The index is abandoned at the pre-write cancellation check;
+            // skip the remaining type-env work.
+            return None;
+        }
         let source_owned;
         let source: &str = if let Some(s) = source_opt.as_deref() {
             s
@@ -18639,6 +18644,54 @@ module.exports = { check, plain };\n";
         assert_eq!(
             acquired, released,
             "the throttle was consulted while the write gate was held: {events:?}"
+        );
+    }
+
+    /// nw-812 review M2: once the index is cancelled, the type-env build
+    /// stops doing work for the remaining files.
+    #[test]
+    fn type_env_build_stops_early_on_cancel() {
+        let throttle = crate::cpu_throttle::test_seam::install_counting_throttle();
+        let tmp = tempfile::tempdir().unwrap();
+        let reader = ThrottleProbeReader {
+            root: tmp.path().to_path_buf(),
+        };
+        let source =
+            "class Foo { bar() {} }\nfunction f() { const foo: Foo = new Foo(); foo.bar(); }\n";
+        let parsed = nestweaver_parser::parse_source(Path::new("src/a.ts"), source).unwrap();
+        let entries: Vec<ParsedFileEntry> = vec![(
+            "src/a.ts".to_string(),
+            parsed.symbols.clone(),
+            parsed.references.clone(),
+            Some(source.to_string()),
+        )];
+        let languages = HashMap::from([("src/a.ts".to_string(), Language::TypeScript)]);
+        let bindings = HashMap::new();
+        let live = std::sync::atomic::AtomicBool::new(false);
+        let built = build_type_environments(
+            &reader,
+            &entries,
+            &languages,
+            &bindings,
+            throttle,
+            Some(&live),
+        )
+        .unwrap();
+        assert_eq!(built.len(), 1, "control: the file has type bindings");
+
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let built = build_type_environments(
+            &reader,
+            &entries,
+            &languages,
+            &bindings,
+            throttle,
+            Some(&cancelled),
+        )
+        .unwrap();
+        assert!(
+            built.is_empty(),
+            "a cancelled index must not build type envs"
         );
     }
 

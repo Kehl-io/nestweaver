@@ -106,6 +106,8 @@ struct Window {
     /// `(bucket index, CPU billed to it)`, oldest first. Bucket `i` covers
     /// wall time `[i * SUB_WINDOW, (i + 1) * SUB_WINDOW)`.
     buckets: VecDeque<(u64, Duration)>,
+    /// Wall time of the last "budget spent" debug line (rate limit).
+    last_log: Option<Duration>,
 }
 
 impl Window {
@@ -243,6 +245,7 @@ impl CpuThrottle {
             last_wall: wall_clock(),
             last_cpu: Duration::ZERO,
             buckets: VecDeque::new(),
+            last_log: None,
         };
         Self {
             target,
@@ -300,28 +303,38 @@ impl CpuThrottle {
             {
                 return;
             }
-            let now_wall = (self.wall_clock)();
-            let now_cpu = (self.cpu_clock)();
             let wait = {
                 // A poisoned lock only means another worker panicked
                 // mid-check; the window is still usable, so recover.
                 let mut window = self.window.lock().unwrap_or_else(|p| p.into_inner());
+                // Read both clocks under the lock, so measurements reach
+                // `update` in order and no worker bills a stale sample.
+                let now_wall = (self.wall_clock)();
+                let now_cpu = (self.cpu_clock)();
                 window.update(now_wall, now_cpu);
-                if window.total() <= limit {
+                let total = window.total();
+                if total <= limit {
                     return;
+                }
+                // Rate-limited: one line per sub-window, however many
+                // workers are waiting.
+                if window
+                    .last_log
+                    .is_none_or(|at| now_wall.saturating_sub(at) >= SUB_WINDOW)
+                {
+                    window.last_log = Some(now_wall);
+                    tracing::debug!(
+                        window_total_secs = total.as_secs_f64(),
+                        limit_secs = limit.as_secs_f64(),
+                        budget_secs = self.target.unwrap_or_default().as_secs_f64(),
+                        "index CPU budget for the rolling 180 s window spent; waiting"
+                    );
                 }
                 window.wait_until_within(limit, now_wall)
             };
             let nap = wait.min(MAX_SLEEP).min(MAX_WAIT_PER_CHECK - slept);
             if nap.is_zero() {
                 return;
-            }
-            if slept.is_zero() {
-                tracing::debug!(
-                    limit_secs = limit.as_secs_f64(),
-                    wait_secs = wait.as_secs_f64(),
-                    "index CPU budget for the rolling window spent; waiting"
-                );
             }
             (self.sleep)(nap);
             slept += nap;
