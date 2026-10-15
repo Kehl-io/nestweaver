@@ -8641,7 +8641,21 @@ enum DaemonAction {
     ///
     /// Pass `--db PATH` to limit the sweep to that database's instance.
     /// Omitting `--db` remains a global sweep.
-    Gc,
+    ///
+    /// Also prunes the authority registry (`~/.local/state/nestweaver/authority`):
+    /// lock records whose database, publication root or operation journal no
+    /// longer exists, plus old unheld records from earlier releases that match
+    /// no live database. A record some process holds is never removed.
+    Gc {
+        /// Report what the authority-registry sweep would remove, and change
+        /// nothing. Skips the launch-agent and directory sweeps.
+        #[arg(long)]
+        dry_run: bool,
+        /// Sweep this registry directory instead of the account's (scratch
+        /// copies, tests). Implies an authority-registry-only sweep.
+        #[arg(long, hide = true)]
+        authority_registry: Option<PathBuf>,
+    },
     /// Run daemon in foreground (used by launchd)
     Run {
         /// Internal single-use owned-daemon fixture activation.
@@ -16464,7 +16478,18 @@ fn no_daemon_allowed() -> bool {
 /// With `--db PATH`, only that database's instance is considered. Omitting
 /// `--db` remains a global sweep of every instance under the three roots.
 /// Live daemons are still spared by ownership proof (write lock, pidfile lock).
-fn run_daemon_gc(db: Option<PathBuf>) -> Result<(i32, Option<String>), anyhow::Error> {
+fn run_daemon_gc(
+    db: Option<PathBuf>,
+    dry_run: bool,
+    authority_registry: Option<&Path>,
+) -> Result<(i32, Option<String>), anyhow::Error> {
+    if dry_run || authority_registry.is_some() {
+        if dry_run {
+            println!("Dry run: launch-agent and daemon-directory sweeps skipped.");
+        }
+        print_authority_gc(db.as_deref(), dry_run, authority_registry)?;
+        return Ok((EXIT_SUCCESS, None));
+    }
     #[cfg(target_os = "macos")]
     {
         let report = nestweaver_daemon::launchd::gc_orphaned_agents_for(db.as_deref())?;
@@ -16608,7 +16633,40 @@ fn run_daemon_gc(db: Option<PathBuf>) -> Result<(i32, Option<String>), anyhow::E
             report.unidentified.len()
         );
     }
+    print_authority_gc(db.as_deref(), false, None)?;
     Ok((EXIT_SUCCESS, None))
+}
+
+fn print_authority_gc(
+    db: Option<&Path>,
+    dry_run: bool,
+    registry: Option<&Path>,
+) -> Result<(), anyhow::Error> {
+    let report = nestweaver_daemon::lifecycle::gc_authority_registry(registry, db, dry_run)
+        .context("sweep authority registry")?;
+    let prune = &report.prune;
+    println!(
+        "Authority registry {}: {} {} record(s) ({} whose scope is gone, {} legacy unheld \
+         and older than {}h matching no live database).",
+        report.registry.display(),
+        if dry_run { "would remove" } else { "removed" },
+        prune.removed_orphaned + prune.removed_legacy,
+        prune.removed_orphaned,
+        prune.removed_legacy,
+        nestweaver_daemon::lifecycle::AUTHORITY_LEGACY_MIN_AGE.as_secs() / 3600,
+    );
+    println!(
+        "  kept: {} live scope, {} held by a process, {} legacy of {} live database(s), \
+         {} legacy too recent; {} foreign entr(ies) skipped, {} error(s).",
+        prune.kept_live,
+        prune.kept_held,
+        prune.kept_protected,
+        report.live_databases,
+        prune.kept_recent_legacy,
+        prune.skipped_foreign,
+        prune.errors,
+    );
+    Ok(())
 }
 
 fn resolve_track_interactions(force_on: bool, force_off: bool, config_enabled: bool) -> bool {
@@ -25229,8 +25287,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // `gc` must resolve BEFORE the shared db_path requirement below:
             // omitting `--db` is a global sweep. When `--db` is set, the sweep
             // is scoped to that instance; the path need not exist on disk.
-            if matches!(action, DaemonAction::Gc) {
-                return run_daemon_gc(db);
+            if let DaemonAction::Gc {
+                dry_run,
+                authority_registry,
+            } = &action
+            {
+                return run_daemon_gc(db, *dry_run, authority_registry.as_deref());
             }
             let lifecycle_config = match &action {
                 DaemonAction::Start { config, .. }
@@ -27097,7 +27159,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     );
                     Ok((EXIT_SUCCESS, None))
                 }
-                DaemonAction::Gc => run_daemon_gc(None),
+                DaemonAction::Gc { .. } => unreachable!("daemon gc returns before db resolution"),
                 DaemonAction::Restart {
                     idle_timeout,
                     config,

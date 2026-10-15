@@ -2835,6 +2835,113 @@ fn retire_gc_runtime(runtime: &Path) -> std::io::Result<()> {
     })
 }
 
+/// Registry entry names that may guard `db_path`: every anchor domain keyed
+/// by the database's data directory, its publication root, or any slot or
+/// operation journal below that root (`<root>/{slots,operations}/<uuid>/…`).
+///
+/// Pre-v1 registry entries are empty, so this is the only way gc can tell
+/// that an old entry still belongs to a live database.
+pub fn authority_keys_for_database(db_path: &Path) -> std::collections::HashSet<String> {
+    use nestweaver_store::stable_anchor::{ANCHOR_DOMAINS, anchor_key};
+    let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
+    let base = nestweaver_engine::publication::instance_anchor_database(&canonical(db_path));
+    let mut scopes = vec![canonical(db_path), base.clone()];
+    scopes.extend(base.parent().map(canonical));
+    let root = canonical(&nestweaver_engine::publication::default_publication_root(
+        &base,
+    ));
+    let mut frontier = vec![root];
+    for _depth in 0..=3 {
+        let mut next = Vec::new();
+        for dir in frontier {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        next.push(entry.path());
+                    } else {
+                        scopes.push(entry.path());
+                    }
+                }
+            }
+            scopes.push(dir);
+        }
+        frontier = next;
+    }
+    scopes
+        .iter()
+        .flat_map(|scope| {
+            ANCHOR_DOMAINS
+                .iter()
+                .map(move |domain| anchor_key(domain, scope))
+        })
+        .collect()
+}
+
+/// Outcome of an authority-registry sweep.
+#[derive(Debug)]
+pub struct AuthorityGcReport {
+    pub registry: PathBuf,
+    /// Databases named by daemon boot logs (or `--db`) that still exist.
+    pub live_databases: usize,
+    pub prune: nestweaver_store::stable_anchor::AuthorityPruneReport,
+}
+
+/// Unidentifiable (pre-v1) registry entries younger than this are kept.
+pub const AUTHORITY_LEGACY_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(86_400);
+
+/// Prune the account's authority registry (`~/.local/state/nestweaver/authority`)
+/// — or `registry` when given. See
+/// [`nestweaver_store::stable_anchor::prune_authority_registry_in`] for the
+/// per-entry rules; this adds the live-database protection for old entries
+/// that cannot name their own scope.
+pub fn gc_authority_registry(
+    registry: Option<&Path>,
+    extra_db: Option<&Path>,
+    dry_run: bool,
+) -> std::io::Result<AuthorityGcReport> {
+    let registry = match registry {
+        Some(registry) => registry.to_path_buf(),
+        None => nestweaver_store::stable_anchor::authority_registry_root()?,
+    };
+    gc_authority_registry_in(&registry, &persistent_state_root(), extra_db, dry_run)
+}
+
+fn gc_authority_registry_in(
+    registry: &Path,
+    state_root: &Path,
+    extra_db: Option<&Path>,
+    dry_run: bool,
+) -> std::io::Result<AuthorityGcReport> {
+    let mut databases: std::collections::BTreeSet<PathBuf> = Default::default();
+    if let Ok(entries) = std::fs::read_dir(state_root) {
+        for entry in entries.flatten() {
+            let is_instance = entry.file_name().to_str().is_some_and(is_instance_dir_name);
+            if is_instance && let Some(db) = db_path_from_log_dir(&entry.path()) {
+                databases.insert(db);
+            }
+        }
+    }
+    databases.extend(extra_db.map(Path::to_path_buf));
+    databases.retain(|db| database_present(db));
+    let protected = databases
+        .iter()
+        .flat_map(|db| authority_keys_for_database(db))
+        .collect();
+    let prune = nestweaver_store::stable_anchor::prune_authority_registry_in(
+        registry,
+        &nestweaver_store::stable_anchor::AuthorityPruneOptions {
+            protected: &protected,
+            legacy_min_age: AUTHORITY_LEGACY_MIN_AGE,
+            dry_run,
+        },
+    )?;
+    Ok(AuthorityGcReport {
+        registry: registry.to_path_buf(),
+        live_databases: databases.len(),
+        prune,
+    })
+}
+
 /// [`gc_orphaned_daemon_dirs`] against explicit roots — the seam that keeps
 /// every test on scratch directories and off the operator's real roots.
 #[cfg(test)]
@@ -4610,6 +4717,118 @@ mod tests {
     /// for a reason that had nothing to do with the behaviour under test
     /// (nw-194). The sweep only calls `.exists()`, so any stable system file
     /// serves.
+    fn private_authority_registry() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let registry = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(registry.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        registry
+    }
+
+    /// An empty record as every pre-v1 binary wrote it, backdated a month.
+    fn seed_legacy_authority_record(registry: &Path, key: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = registry.join(key);
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let month_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(month_ago)
+            .unwrap();
+    }
+
+    /// A publication database: the base path plus slots and journals below
+    /// `<db>.publications`, the shape kory-brain uses.
+    fn seed_publication_database(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let base = dir.join("brain.lbug");
+        let root = dir.join("brain.lbug.publications");
+        let slot = root
+            .join("slots")
+            .join("8b0c3f7e-2c1a-4f39-9a51-6b8d1c2e3f40");
+        let journal = root
+            .join("operations")
+            .join("1f2e3d4c-5b6a-4978-8a9b-0c1d2e3f4a5b")
+            .join("state.json");
+        std::fs::create_dir_all(&slot).unwrap();
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        std::fs::write(slot.join("graph.lbug"), b"graph").unwrap();
+        std::fs::write(&journal, b"{}").unwrap();
+        std::fs::write(root.join("CURRENT"), b"slot").unwrap();
+        let canonical = |path: &Path| std::fs::canonicalize(path).unwrap();
+        (
+            base,
+            canonical(&root),
+            canonical(&slot),
+            canonical(&journal),
+        )
+    }
+
+    #[test]
+    fn authority_keys_cover_every_anchor_a_publication_database_takes() {
+        use nestweaver_store::stable_anchor::anchor_key;
+        let dir = tempfile::tempdir().unwrap();
+        let (base, root, slot, journal) = seed_publication_database(dir.path());
+        let data_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let keys = authority_keys_for_database(&base);
+        for (domain, scope) in [
+            ("database-namespace", &data_dir),
+            ("publication-root", &root),
+            ("database-namespace", &slot),
+            ("publication-operation-journal", &journal),
+        ] {
+            assert!(
+                keys.contains(&anchor_key(domain, scope)),
+                "{domain} anchor for {} must be protected",
+                scope.display()
+            );
+        }
+    }
+
+    #[test]
+    fn authority_gc_keeps_legacy_records_of_live_databases_and_prunes_the_rest() {
+        use nestweaver_store::stable_anchor::anchor_key;
+        let state = tempfile::tempdir().unwrap();
+        let registry = private_authority_registry();
+        let live = tempfile::tempdir().unwrap();
+        let (base, root, _, _) = seed_publication_database(live.path());
+        let instance = state.path().join("c37ccf01");
+        std::fs::create_dir_all(&instance).unwrap();
+        std::fs::write(
+            instance.join("daemon.log.2026-10-15"),
+            format!(
+                "2026-10-15T00:00:00Z  INFO nestweaver_daemon::server: daemon process starting db={} instance=brain-c37ccf01\n",
+                base.display()
+            ),
+        )
+        .unwrap();
+        let live_namespace = anchor_key(
+            "database-namespace",
+            &std::fs::canonicalize(live.path()).unwrap(),
+        );
+        let live_root = anchor_key("publication-root", &root);
+        let scratch = anchor_key("database-namespace", Path::new("/gone/scratch-1234"));
+        for key in [&live_namespace, &live_root, &scratch] {
+            seed_legacy_authority_record(registry.path(), key);
+        }
+
+        let dry = gc_authority_registry_in(registry.path(), state.path(), None, true).unwrap();
+        assert_eq!(dry.live_databases, 1);
+        assert_eq!(dry.prune.removed_legacy, 1);
+        assert_eq!(dry.prune.kept_protected, 2);
+        assert!(
+            registry.path().join(&scratch).exists(),
+            "dry run removes nothing"
+        );
+
+        let report = gc_authority_registry_in(registry.path(), state.path(), None, false).unwrap();
+        assert_eq!(report.prune.removed_legacy, 1);
+        assert!(!registry.path().join(&scratch).exists());
+        assert!(registry.path().join(&live_namespace).exists());
+        assert!(registry.path().join(&live_root).exists());
+    }
+
     fn stable_non_temp_path() -> PathBuf {
         ["/bin/sh", "/usr/bin/env", "/etc/hosts"]
             .into_iter()

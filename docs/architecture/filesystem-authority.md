@@ -5,9 +5,23 @@ compatibility and additionally hold an independent registry anchor keyed by the
 canonical data directory or publication root. The registry lives under the effective UID's account-database home at
 `.local/state/nestweaver/authority`, with a private 0700 directory
 and 0600 files. It is deliberately independent of `HOME`, `XDG_STATE_HOME`, `TMPDIR`, replaceable data
-roots, and publication `LOCK` files. Entries must not be pruned while any
-NestWeaver processes may be running. An empty entry costs one inode; entries
-contain no paths, credentials, PID authority, or graph data.
+roots, and publication `LOCK` files. Each entry costs one inode. Since nw-811
+an entry records the domain and canonical path it guards
+(`nestweaver-authority v1\n<domain>\0<path>`); it never holds credentials,
+PID authority, or graph data. Entries written by earlier releases are empty.
+
+Every scratch, test, CI and QA database mints entries, so `nestweaver daemon gc`
+prunes the registry (`--dry-run` reports without changing anything). An entry
+is unlinked only while gc holds its exclusive lock and the pathname still
+names the locked inode, so an entry held by any process, shared or exclusive,
+is never displaced. An acquirer that opened an entry just before gc unlinked
+it sees the replacement and retries onto a fresh entry. A self-describing
+entry is removed when its path no longer exists. An empty legacy entry cannot
+name its database, so it is removed only when it is older than 24 hours,
+unheld, and matches no anchor of a live database named by a daemon boot log
+or `--db` (data directory, publication root, slots and operation journals).
+Older binaries without the retry fail closed ("registry entry was replaced")
+if they lose that microsecond race; they never gain a second owner.
 
 This is a cooperating-process protocol. It assumes the private registry and its ancestors remain
 intact. Account-home resolution uses `getpwuid_r`, avoiding temporary-directory

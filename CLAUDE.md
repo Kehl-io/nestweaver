@@ -147,6 +147,15 @@ shell env for directly-spawned daemons, or baked into the launchd plist's
 `EnvironmentVariables` at `daemon start` time (launchd jobs don't inherit the
 shell env — re-run `daemon start` after changing it).
 
+**`daemon gc` also prunes the authority registry** (`~/.local/state/nestweaver/authority`,
+nw-811). Every database scope ever locked leaves one lock record there, so test
+and scratch databases grew it past 120k entries. gc removes records whose
+database, publication root or operation journal is gone, and empty pre-nw-811
+records that are older than 24h, unheld, and match no live database named by a
+daemon boot log or `--db`. It never removes a record some process holds.
+`daemon gc --dry-run` reports what would go and skips the launch-agent and
+directory sweeps. See `docs/architecture/filesystem-authority.md`.
+
 **The daemon is the sole writer to the DB file.** Never run `sqlite3` or other
 tools against the DB while the daemon is running. Bypassing the daemon risks
 WAL corruption from concurrent access. If you see "database locked" errors,
