@@ -952,15 +952,21 @@ pub(crate) struct SplitWalk {
     /// they push every node, themselves included, under the floor, and the
     /// owner cap then has nothing to hide (final review I1).
     pub(crate) deep_owners: usize,
+    /// Real rows under the floor that the store's
+    /// `PPR_BELOW_FLOOR_KEEP` cut left out of `pool` (nw-113 R1). A refill
+    /// that would have reached them is incomplete and must say so.
+    pub(crate) pool_cut: usize,
 }
 
 /// nw-113: split a [`CONTEXT_PPR_FLOOR`] walk into the ranking every context
 /// builder used before and the refill pool, counting the owners under the
-/// floor. The store keeps only the best `PPR_BELOW_FLOOR_KEEP` rows under the
-/// floor, so `deep_owners` counts the owners among those.
-pub(crate) fn split_refill_pool(walk: ScoredUids, seeds: &[String]) -> SplitWalk {
+/// floor. The store keeps only the best `PPR_BELOW_FLOOR_KEEP` real rows under
+/// the floor and only counts the owners there, so `deep_owners` is that count
+/// (plus any owner a standard-floor walk returned) and `pool_cut` is how many
+/// real rows the cut left out.
+pub(crate) fn split_refill_pool(walk: nestweaver_store::FloorWalk, seeds: &[String]) -> SplitWalk {
     let seeds: std::collections::HashSet<&str> = seeds.iter().map(String::as_str).collect();
-    let (ranked, deep): (Vec<_>, Vec<_>) = walk.into_iter().partition(|(uid, score)| {
+    let (ranked, deep): (Vec<_>, Vec<_>) = walk.rows.into_iter().partition(|(uid, score)| {
         seeds.contains(uid.as_str()) || *score > nestweaver_store::PPR_MIN_SCORE
     });
     let (owners, pool): (Vec<_>, Vec<_>) = deep
@@ -969,7 +975,8 @@ pub(crate) fn split_refill_pool(walk: ScoredUids, seeds: &[String]) -> SplitWalk
     SplitWalk {
         ranked,
         pool,
-        deep_owners: owners.len(),
+        deep_owners: owners.len() + walk.owners_below_floor,
+        pool_cut: walk.rows_cut,
     }
 }
 
@@ -978,17 +985,23 @@ pub(crate) fn split_refill_pool(walk: ScoredUids, seeds: &[String]) -> SplitWalk
 /// those under the floor. The list takes at most that many real symbols from
 /// the pool, so it grows back to the length it would have had if the owners'
 /// mass had gone to real symbols, never past `limit`. `listed` is the list's
-/// length so far, owners included. Returns `(take, available)`: how many to
-/// insert now, and how many the pool could supply (for `connected_total`).
+/// length so far, owners included. `pool_cut` is how many real rows the
+/// store's below-floor cut left out of the pool (see [`SplitWalk::pool_cut`]).
+/// Returns `(take, available, cut)`: how many to insert now, how many the
+/// walk could have supplied had nothing been cut (for `connected_total`), and
+/// how many of those the cut withheld, which the caller must disclose as a
+/// truncation (nw-113 R1).
 pub(crate) fn refill_count(
     owners_hidden: usize,
     listed: usize,
     limit: Option<usize>,
     pool: usize,
-) -> (usize, usize) {
-    let available = owners_hidden.min(pool);
+    pool_cut: usize,
+) -> (usize, usize, usize) {
+    let supplied = owners_hidden.min(pool);
+    let available = owners_hidden.min(pool.saturating_add(pool_cut));
     let room = limit.map_or(usize::MAX, |limit| limit.saturating_sub(listed));
-    (available.min(room), available)
+    (supplied.min(room), available, available - supplied)
 }
 
 /// nw-113 final review Minor 2: cut `ranked` (owners last) to `limit`.
@@ -1269,6 +1282,7 @@ pub fn build_context_with_intent(
         ranked: ppr_results,
         pool: refill_pool,
         deep_owners,
+        pool_cut,
     } = split_refill_pool(walk, &seed_uids);
 
     let seed_set: std::collections::HashSet<&str> = seed_uids.iter().map(|s| s.as_str()).collect();
@@ -1322,11 +1336,12 @@ pub fn build_context_with_intent(
         .iter()
         .filter(|node| owner_uids.contains(&node.uid))
         .count();
-    let (take, refill_available) = refill_count(
+    let (take, refill_available, refill_cut) = refill_count(
         module_owners_omitted + deep_owners,
         ranked.len(),
         limit,
         refill_pool.len(),
+        pool_cut,
     );
     let refill = context_nodes(store, &refill_pool[..take])?;
     let mut connected_total = ranked.len() + refill_available;
@@ -1360,9 +1375,14 @@ pub fn build_context_with_intent(
         // the CALLER meant by it, so it reports nothing here. Callers that
         // impose a cap (the `code_context` tool, the CLI's direct path) set
         // these after deciding whether the extra row they asked for arrived.
+        //
+        // nw-113 R1: the one cap the engine CAN answer for is the store's
+        // below-floor keep. When it withheld real rows this list would have
+        // listed, the list is incomplete whatever the caller asked for, so it
+        // says so here; `connected_total` already counts those rows.
         limit: None,
-        truncated: None,
-        truncated_by: None,
+        truncated: (refill_cut > 0).then_some(true),
+        truncated_by: TruncationCause::resolve(false, refill_cut > 0),
         token_budget: None,
         // `connected_total` is different from the two above: it is not a
         // policy the caller chose, it is a fact only this traversal can
@@ -1816,6 +1836,88 @@ mod context_tests {
             total + 3,
             "trimmed owners leave the total: {unlimited:?}"
         );
+    }
+
+    /// nw-113 R1: a star where the hub reaches thousands of `<module>`
+    /// owners and thousands of real symbols, all under the score floor. The
+    /// walk keeps at most `PPR_BELOW_FLOOR_KEEP` real rows; when it had to
+    /// cut real rows the refill wanted, the result says so rather than
+    /// claiming a complete list.
+    #[test]
+    fn context_discloses_real_rows_the_below_floor_keep_cut() {
+        use nestweaver_schema::uid::symbol_uid;
+        let per_kind = 2_500;
+        let repo = "repo:t:1";
+        let sym = |uid: String, name: &str, path: String, owner: bool| nestweaver_schema::Symbol {
+            uid,
+            name: name.to_string(),
+            kind: if owner {
+                nestweaver_schema::SymbolKind::Module
+            } else {
+                nestweaver_schema::SymbolKind::Function
+            },
+            repo_uid: repo.to_string(),
+            file_path: path,
+            start_line: 1,
+            end_line: 1,
+            signature: String::new(),
+            summary: None,
+            content_hash: "hash".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: owner,
+            entry_point_kind: owner.then_some(nestweaver_schema::EntryPointKind::ModuleInit),
+            visibility: nestweaver_schema::Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        let edge = |source: &str, target: &str, confidence: f32| nestweaver_schema::ResolvedEdge {
+            source_uid: source.to_string(),
+            target_uid: target.to_string(),
+            edge_type: nestweaver_schema::EdgeType::Calls,
+            confidence,
+            link_type: None,
+            evidence: Vec::new(),
+        };
+        let hub = symbol_uid(repo, "src/hub.js", "hub", 1);
+        let mut symbols = vec![sym(hub.clone(), "hub", "src/hub.js".into(), false)];
+        let mut edges = Vec::new();
+        for i in 0..per_kind {
+            let path = format!("src/f{i}.js");
+            let owner = symbol_uid(repo, &path, nestweaver_schema::MODULE_OWNER_NAME, 1);
+            let real = symbol_uid(repo, &path, &format!("real_{i}"), 2);
+            symbols.push(sym(
+                owner.clone(),
+                nestweaver_schema::MODULE_OWNER_NAME,
+                path.clone(),
+                true,
+            ));
+            symbols.push(sym(real.clone(), &format!("real_{i}"), path, false));
+            edges.push(edge(&hub, &owner, 1.0));
+            edges.push(edge(&hub, &real, 0.9));
+        }
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        store.batch_insert_symbols(&symbols).unwrap();
+        store.batch_insert_edges(&edges).unwrap();
+
+        let result =
+            super::build_context_with_intent(&store, std::slice::from_ref(&hub), None, Some(3_000))
+                .unwrap();
+        let real_listed = result
+            .connected
+            .iter()
+            .filter(|node| node.name.starts_with("real_"))
+            .count();
+        assert_eq!(
+            real_listed,
+            nestweaver_store::PPR_BELOW_FLOOR_KEEP,
+            "{} listed",
+            result.connected.len()
+        );
+        assert_eq!(result.truncated, Some(true), "{:?}", result.connected_total);
+        assert_eq!(result.truncated_by, Some(super::TruncationCause::Limit));
+        assert_eq!(result.connected_total, Some(per_kind));
     }
 
     /// The same refill on feature context.
@@ -2522,6 +2624,7 @@ pub fn build_feature_context(
         ranked: ppr_scores,
         pool: refill_pool,
         deep_owners,
+        pool_cut,
     } = split_refill_pool(walk, &seed_uids);
 
     let seed_set: std::collections::HashSet<&str> = seed_uids.iter().map(|s| s.as_str()).collect();
@@ -2565,11 +2668,12 @@ pub fn build_feature_context(
         .iter()
         .filter(|node| owner_uids.contains(&node.uid))
         .count();
-    let (take, refill_available) = refill_count(
+    let (take, refill_available, _) = refill_count(
         module_owners_omitted + deep_owners,
         ranked.len(),
         limit,
         refill_pool.len(),
+        pool_cut,
     );
     let refill = context_nodes(store, &refill_pool[..take])?;
     // Apply limit to PPR results (seeds are always included).
@@ -2792,6 +2896,12 @@ pub struct BrainContextResult {
     /// [`CONTEXT_MODULE_OWNER_CAP`], as on [`ContextResult`].
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub module_owners_omitted: usize,
+    /// nw-113 R1: real symbols the refill would have added to `connected`
+    /// but the store's below-floor keep (`PPR_BELOW_FLOOR_KEEP`) withheld.
+    /// `connected` is then incomplete: a renderer adds this to its `total`
+    /// and reports the list truncated.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub below_floor_rows_cut: usize,
 }
 
 /// Surface a project's curated member notes into the rendered `connected`
@@ -3596,6 +3706,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         ranked: mut ppr,
         pool: refill_pool,
         deep_owners,
+        pool_cut,
     } = split_refill_pool(walk, &seed_uids);
 
     // nw-609: bound each container expansion to its most central members.
@@ -3737,6 +3848,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     // many real symbols as owners were hidden and the caller's limit cuts.
     // Not for a capped hydration (`investigate`), whose entries never list
     // owners and whose cap is its own.
+    let mut below_floor_rows_cut = 0;
     if render_cap.is_none() {
         let owners_listed = connected
             .iter()
@@ -3753,12 +3865,14 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             .iter()
             .filter(|(uid, _)| !listed.contains(uid.as_str()) && !container_dropped.contains(uid))
             .collect();
-        let (take, _) = refill_count(
+        let (take, _, cut) = refill_count(
             module_owners_omitted + deep_owners,
             connected.len(),
             None,
             pool.len(),
+            pool_cut,
         );
+        below_floor_rows_cut = cut;
         let mut refill = Vec::with_capacity(take);
         for (uid, score) in pool.into_iter().take(take) {
             if let Some(node) = render_brain_node(store, uid, *score)? {
@@ -3826,6 +3940,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         seed_resolution_limit: seed_name_tally.resolved().map(|_| SEED_NAME_MATCH_LIMIT),
         admitted_before_cap: render_cap.map(|_| admitted_before_cap),
         module_owners_omitted,
+        below_floor_rows_cut,
     })
 }
 

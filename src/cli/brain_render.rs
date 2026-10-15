@@ -641,7 +641,7 @@ pub(crate) fn print_brain_context_text(
         // Same correction as the JSON twin: on the daemon route
         // `result.connected` is post-cut, so `Connected (N of M)` printed
         // `N of N` and the HUMAN route lost the disclosure it has had all along.
-        let total = upstream.total(result.connected.len(), cut);
+        let total = upstream.total(result.connected.len() + result.below_floor_rows_cut, cut);
         let used_tokens: usize = result
             .connected
             .iter()
@@ -1294,7 +1294,12 @@ pub(crate) fn brain_context_json_value(
     // On the direct route `result.connected` IS the pre-cut list, so its length
     // is the total. On the daemon route it is what survived the daemon's cut,
     // and the honest total came over the wire.
-    let total = upstream.total(result.connected.len(), returned);
+    // nw-113 R1: rows the store's below-floor keep withheld from the engine's
+    // refill matched as well, so they count in the local total.
+    let total = upstream.total(
+        result.connected.len() + result.below_floor_rows_cut,
+        returned,
+    );
     let truncated = returned < total;
     let budget_cut =
         token_budget.map(|budget| token_budgeted_truncate(&result.connected, budget, false));
@@ -1308,7 +1313,11 @@ pub(crate) fn brain_context_json_value(
         "truncated": truncated,
         // Emitted even when null, matching the MCP twin: one shape parses
         // both routes.
-        "truncated_by": truncated_by.map(nestweaver_engine::TruncationCause::as_str).or(upstream.truncated_by.as_deref()),
+        "truncated_by": truncated_by
+            .map(nestweaver_engine::TruncationCause::as_str)
+            .or(upstream.truncated_by.as_deref())
+            .or_else(|| (result.below_floor_rows_cut > 0 && truncated)
+                .then_some(nestweaver_engine::TruncationCause::Limit.as_str())),
         "semantic_applied": result.semantic_applied,
         "semantic_unavailable": result.semantic_unavailable,
         "degraded_components": result.degraded_components,

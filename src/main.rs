@@ -31407,6 +31407,7 @@ mod context_json_renderer_tests {
             seed_resolution_limit: None,
             admitted_before_cap: None,
             module_owners_omitted: 0,
+            below_floor_rows_cut: 0,
         }
     }
 

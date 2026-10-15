@@ -7692,9 +7692,17 @@ fn tool_brain_context(
     // along (`print_brain_context_text`), which makes this nw-259(a)'s shape
     // exactly: the human is told and the agent is not. The spellings are
     // `Bounded::merge_into`'s and `code_context`'s; no sixth one is invented.
-    let total = result.connected.len();
+    //
+    // nw-113 R1: the engine's refill can be cut short by the store's
+    // below-floor keep; those rows matched too, so they count in `total` and
+    // the list reports itself truncated by the row cap even when the caller's
+    // own caps did not bite.
+    let total = result.connected.len() + result.below_floor_rows_cut;
     let returned = connected_json.len();
     let truncated = returned < total;
+    let truncated_by = truncated_by.or(nestweaver_engine::TruncationCause::resolve(
+        false, truncated,
+    ));
     let mut resp = json!({
         "seeds_expanded": result.seeds.len(),
         // nw-393. The SEED cap, one layer upstream of the connected-list
