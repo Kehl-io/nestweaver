@@ -586,11 +586,22 @@ mod tests {
         );
         assert_eq!(paths(&narrow(owners(), "wsgi.py")), ["app/wsgi.py"]);
         assert_eq!(paths(&narrow(owners(), "wsgi")), ["app/wsgi.py"]);
-        assert_eq!(paths(&narrow(owners(), "./tests/conftest.py")), ["tests/conftest.py"]);
-        assert_eq!(paths(&narrow(owners(), "x.js")).len(), 4, "no boundary match");
+        assert_eq!(
+            paths(&narrow(owners(), "./tests/conftest.py")),
+            ["tests/conftest.py"]
+        );
+        assert_eq!(
+            paths(&narrow(owners(), "x.js")).len(),
+            4,
+            "no boundary match"
+        );
         assert_eq!(paths(&narrow(owners(), "Class")).len(), 4, "not a path");
         let utils = vec![symbol_at("f", "a/util.py"), symbol_at("f", "b/util.py")];
-        assert_eq!(narrow(utils, "util.py").len(), 2, "an ambiguous suffix stays ambiguous");
+        assert_eq!(
+            narrow(utils, "util.py").len(),
+            2,
+            "an ambiguous suffix stays ambiguous"
+        );
         assert_eq!(
             super::split_file_qualifier("src/a.js::<module>"),
             Some(("src/a.js", "<module>"))

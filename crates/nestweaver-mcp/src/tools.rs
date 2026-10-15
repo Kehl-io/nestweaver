@@ -32793,12 +32793,18 @@ mod ambiguous_name_contract_tests {
         use nestweaver_engine::index_directory_in_memory;
         let dir = tempfile::tempdir().unwrap();
         for (rel, src) in [
-            ("index.js", "const { listen } = require('./src/server');\nlisten();\n"),
+            (
+                "index.js",
+                "const { listen } = require('./src/server');\nlisten();\n",
+            ),
             (
                 "src/controllers/index.js",
                 "const { listen } = require('../server');\nlisten();\n",
             ),
-            ("src/server.js", "function listen() { return 1; }\nmodule.exports = { listen };\n"),
+            (
+                "src/server.js",
+                "function listen() { return 1; }\nmodule.exports = { listen };\n",
+            ),
         ] {
             let path = dir.path().join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -32821,7 +32827,10 @@ mod ambiguous_name_contract_tests {
             "{impact}"
         );
 
-        for spec in ["src/controllers/index.js::<module>", "controllers/index.js::<module>"] {
+        for spec in [
+            "src/controllers/index.js::<module>",
+            "controllers/index.js::<module>",
+        ] {
             let flow = tool_flow_trace(&store, json!({ "symbol": spec }), None, None).unwrap();
             assert_ne!(flow["status"], "ambiguous", "{spec}: {flow}");
             assert!(flow.to_string().contains("listen"), "{spec}: {flow}");

@@ -1388,9 +1388,14 @@ mod context_tests {
             owners.iter().all(|n| n.starts_with("styles/s")),
             "owners are labelled by path: {names:?}"
         );
-        let first_owner = names.iter().position(|n| n.ends_with("::<module>")).unwrap();
+        let first_owner = names
+            .iter()
+            .position(|n| n.ends_with("::<module>"))
+            .unwrap();
         assert!(
-            names[first_owner..].iter().all(|n| n.ends_with("::<module>")),
+            names[first_owner..]
+                .iter()
+                .all(|n| n.ends_with("::<module>")),
             "owners rank after every real symbol: {names:?}"
         );
         assert!(names.contains(&"getThemeColor"), "{names:?}");

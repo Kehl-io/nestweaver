@@ -951,12 +951,18 @@ mod tests {
     #[test]
     fn file_qualifier_narrows_owner_and_symbol_lookups() {
         let (dir, store) = fixture_files(&[
-            ("index.js", "function app() { return 1; }
+            (
+                "index.js",
+                "function app() { return 1; }
 app();
-"),
-            ("src/controllers/index.js", "function app() { return 2; }
+",
+            ),
+            (
+                "src/controllers/index.js",
+                "function app() { return 2; }
 app();
-"),
+",
+            ),
             ("src/wsgi.py", "def app():\n    return 3\n\napp()\n"),
         ]);
         let reader = FilesystemReader::new(dir.path());
@@ -994,7 +1000,10 @@ app();
             .map(|c| c.file_path.as_str())
             .collect();
         paths.sort();
-        assert_eq!(paths, ["index.js", "src/controllers/index.js", "src/wsgi.py"]);
+        assert_eq!(
+            paths,
+            ["index.js", "src/controllers/index.js", "src/wsgi.py"]
+        );
         assert!(
             ambiguous
                 .candidates

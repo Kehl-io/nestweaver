@@ -23393,10 +23393,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             .iter()
                             .map(|&n| ImpactNodeJson {
                                 uid: &n.uid,
-                                name: nestweaver_schema::symbol_display_name(
-                                    &n.name,
-                                    &n.file_path,
-                                ),
+                                name: nestweaver_schema::symbol_display_name(&n.name, &n.file_path),
                                 file_path: &n.file_path,
                                 start_line: n.start_line,
                                 edge_type: &n.edge_type,
