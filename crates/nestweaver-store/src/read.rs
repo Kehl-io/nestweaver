@@ -3257,6 +3257,15 @@ impl GraphStore {
     /// Each row is `(file_uid, file_path)`.
     pub fn list_files_by_repo(&self, repo_uid: &str) -> Result<Vec<(String, String)>, StoreError> {
         let conn = self.conn()?;
+        Self::list_files_by_repo_on(&conn, repo_uid)
+    }
+
+    /// [`Self::list_files_by_repo`] on a caller-held connection, so a write
+    /// transaction sees its own uncommitted File rows.
+    pub fn list_files_by_repo_on(
+        conn: &crate::db::StoreConnection<'_>,
+        repo_uid: &str,
+    ) -> Result<Vec<(String, String)>, StoreError> {
         let q = "MATCH (f:File) WHERE f.repo_uid = $repo RETURN f.uid, f.path";
         let mut stmt = conn
             .prepare(q)

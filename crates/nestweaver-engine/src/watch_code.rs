@@ -3766,6 +3766,122 @@ mod tests {
     /// CALLS/IMPORTS edge incident to the re-indexed file was destroyed by
     /// the per-file `DETACH DELETE` and never rebuilt (symbols present,
     /// all edges gone; only `--force` repaired).
+    /// Write `files` under a fresh repo dir, index it in memory, and return
+    /// the store, repo uid, canonical root and `file://` url.
+    fn index_files(
+        dir: &tempfile::TempDir,
+        files: &[(&str, String)],
+    ) -> (GraphStore, String, PathBuf, String) {
+        let repo_root = dir.path().join("repo");
+        for (rel, body) in files {
+            let path = repo_root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let root = std::fs::canonicalize(&repo_root).unwrap();
+        let repo_url = format!("file://{}", root.display());
+        let r_uid = nestweaver_schema::repo_uid("test", &repo_url);
+        let (_, store) =
+            crate::index::index_directory_in_memory(&root, "test", &repo_url, "sha1").unwrap();
+        (store, r_uid, root, repo_url)
+    }
+
+    /// Edge topology keyed by endpoints and kind, as a multiset so a
+    /// duplicated re-insert is caught too.
+    fn edge_multiset(
+        db: &GraphStore,
+    ) -> std::collections::BTreeMap<(String, String, String), usize> {
+        let mut out = std::collections::BTreeMap::new();
+        for (a, b, kind, _, _) in db.load_typed_edges().unwrap() {
+            *out.entry((a, b, kind)).or_insert(0) += 1;
+        }
+        out
+    }
+
+    fn assert_matches_fresh(store: &GraphStore, root: &Path, repo_url: &str, what: &str) {
+        let (_, fresh) =
+            crate::index::index_directory_in_memory(root, "test", repo_url, "fresh").unwrap();
+        let (live, fresh) = (edge_multiset(store), edge_multiset(&fresh));
+        let missing: Vec<_> = fresh
+            .iter()
+            .filter(|(k, n)| live.get(*k) != Some(n))
+            .collect();
+        let extra: Vec<_> = live
+            .iter()
+            .filter(|(k, n)| fresh.get(*k) != Some(n))
+            .collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "{what}: watcher differs from fresh\nmissing/miscounted: {missing:#?}\nextra: {extra:#?}"
+        );
+    }
+
+    /// The two barrel shapes: a local re-export and a `from` re-export.
+    const BARRELS: [&str; 2] = [
+        "import { WithTheme } from './WithTheme';\nexport default WithTheme;\n",
+        "export { default } from './WithTheme';\n",
+    ];
+
+    fn barrel_fixture(barrel: &str) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "lib/withTheme/WithTheme.js",
+                "export function WithTheme(C) { return C; }\nexport default WithTheme;\n".into(),
+            ),
+            ("lib/withTheme/index.js", barrel.into()),
+            (
+                "app/Title.js",
+                "import withTheme from '../lib/withTheme';\nexport function Title() { return withTheme(1); }\nexport default withTheme(Title);\n".into(),
+            ),
+        ]
+    }
+
+    /// nw-113 batch C (O1a). An edited file's outgoing edges through an
+    /// unchanged default-re-exporting barrel survive its watcher batch.
+    #[test]
+    fn watcher_keeps_edited_files_edges_through_a_default_barrel() {
+        for barrel in BARRELS {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, r_uid, root, repo_url) = index_files(&dir, &barrel_fixture(barrel));
+            let title = uid_of(&store, &r_uid, "Title");
+            assert!(
+                store
+                    .callees_of(&title)
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.name == "WithTheme"),
+                "precondition: the index binds Title -> WithTheme through the barrel"
+            );
+            let body = std::fs::read_to_string(root.join("app/Title.js")).unwrap();
+            std::fs::write(root.join("app/Title.js"), format!("{body}// edit\n")).unwrap();
+            let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+            process_fixture_batch(
+                &watcher,
+                &store,
+                &r_uid,
+                &root,
+                &[root.join("app/Title.js")],
+            );
+            assert_matches_fresh(&store, &root, &repo_url, "edited importer of a barrel");
+        }
+    }
+
+    /// nw-113 batch C (O1b). Inbound edges that reach a line-shifted file
+    /// through an unchanged barrel are restored by the watcher batch.
+    #[test]
+    fn watcher_restores_inbound_barrel_edges_to_a_line_shifted_file() {
+        for barrel in BARRELS {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, r_uid, root, repo_url) = index_files(&dir, &barrel_fixture(barrel));
+            let hub = root.join("lib/withTheme/WithTheme.js");
+            let body = std::fs::read_to_string(&hub).unwrap();
+            std::fs::write(&hub, format!("// top\n{body}")).unwrap();
+            let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+            process_fixture_batch(&watcher, &store, &r_uid, &root, &[hub]);
+            assert_matches_fresh(&store, &root, &repo_url, "line-shifted barrel target");
+        }
+    }
+
     #[test]
     fn watch_reindex_preserves_cross_file_edges() {
         let dir = tempfile::tempdir().unwrap();

@@ -8132,7 +8132,20 @@ fn reresolve_affected_dependents(
 
     let db_symbols = nestweaver_store::GraphStore::lookup_symbols_by_repo_on(conn, r_uid)
         .with_context(|| "lookup_symbols_by_repo_on for forward edge resolution")?;
-    let insertable = build_reresolve_edges(reader, r_uid, changed, rdeps, &db_symbols, None)?;
+    let known_files = nestweaver_store::GraphStore::list_files_by_repo_on(conn, r_uid)
+        .with_context(|| "list_files_by_repo_on for forward edge resolution")?
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect();
+    let insertable = build_reresolve_edges(
+        reader,
+        r_uid,
+        changed,
+        rdeps,
+        &db_symbols,
+        &known_files,
+        None,
+    )?;
 
     // Runs inside the same transaction as the mutation loop.
     let count = insertable.len();
@@ -8173,12 +8186,23 @@ pub(crate) fn prepare_watcher_reresolve_edges(
         !inputs.changed.contains(&symbol.file_path) && !inputs.removed.contains(&symbol.file_path)
     });
     symbols.extend_from_slice(inputs.replacement_symbols);
+    // Symbol-less files (a barrel `index.js` that only re-exports) have no
+    // Symbol row, so they are known only by their File node.
+    let mut known_files: std::collections::HashSet<String> = store
+        .list_files_by_repo(r_uid)
+        .with_context(|| "list_files_by_repo for watcher edge preparation")?
+        .into_iter()
+        .map(|(_, path)| path)
+        .filter(|path| !inputs.removed.contains(path))
+        .collect();
+    known_files.extend(inputs.changed.iter().cloned());
     build_reresolve_edges(
         reader,
         r_uid,
         inputs.changed,
         inputs.rdeps,
         &symbols,
+        &known_files,
         Some(inputs.prepared_file_data),
     )
 }
@@ -8196,12 +8220,17 @@ pub(crate) fn prepare_watcher_reresolve_edges(
 ///
 /// `db_symbols` must be the repo's live symbol set (post-mutation), used to
 /// give the resolver visibility into unchanged files' symbols as targets.
+/// `known_files` is the repo's live file set. It adds the JS/TS files that
+/// have no symbols at all, such as a barrel `index.js` that only re-exports:
+/// without them an import through the barrel cannot resolve, and the
+/// hydration below can never reach the barrel's forwarding references.
 fn build_reresolve_edges(
     reader: &dyn crate::content_reader::ContentReader,
     r_uid: &str,
     changed: &std::collections::HashSet<String>,
     rdeps: &std::collections::HashSet<String>,
     db_symbols: &[nestweaver_schema::Symbol],
+    known_files: &std::collections::HashSet<String>,
     prepared_file_data: Option<&PreparedFileData>,
 ) -> Result<Vec<nestweaver_schema::ResolvedEdge>, anyhow::Error> {
     // S = changed ∪ rdeps — files whose references need re-resolution.
@@ -8301,6 +8330,22 @@ fn build_reresolve_edges(
         // Empty references: we only need these files as resolution
         // targets, not as resolution sources.
         file_data.push((file_path, symbols, Vec::new()));
+    }
+    // Symbol-less JS/TS files. Only JS/TS: the hydration below is what gives
+    // such a file its forwarding references, and it is JS/TS only.
+    let mut symbol_less: Vec<&String> = known_files
+        .iter()
+        .filter(|path| !file_languages.contains_key(*path) && !scope.contains(*path))
+        .filter(|path| reader.accepts_path(Path::new(path.as_str())))
+        .collect();
+    symbol_less.sort();
+    for file_path in symbol_less {
+        if let Some(language @ (Language::JavaScript | Language::TypeScript)) =
+            detect_language(&reader.root().join(file_path))
+        {
+            file_languages.insert(file_path.clone(), language);
+            file_data.push((file_path.clone(), Vec::new(), Vec::new()));
+        }
     }
 
     let workspace_ctx = if file_languages.values().any(|language| {
@@ -14152,6 +14197,7 @@ module.exports = { check, plain };\n";
             &changed,
             &std::collections::HashSet::new(),
             &symbols,
+            &Default::default(),
             None,
         )
         .unwrap();
@@ -14243,6 +14289,7 @@ module.exports = { check, plain };\n";
             &changed,
             &Default::default(),
             &symbols,
+            &Default::default(),
             None,
         )
         .unwrap();
@@ -14277,6 +14324,7 @@ module.exports = { check, plain };\n";
             &changed,
             &Default::default(),
             &symbols,
+            &Default::default(),
             Some(&prepared),
         )
         .unwrap();
@@ -14299,6 +14347,7 @@ module.exports = { check, plain };\n";
             &changed,
             &Default::default(),
             &symbols,
+            &Default::default(),
             None,
         )
         .unwrap();
