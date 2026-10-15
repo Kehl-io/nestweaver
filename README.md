@@ -223,7 +223,8 @@ carries these JS/TS parser and resolver fixes:
 | Generators scope their parameters and `var`s | A generator's parameter no longer shadows a same-named module function |
 | A `.js` bare-parameter arrow (`const f = x => …`) is a function | It was a `Constant`, so its callers had no edge |
 | A `catch (f)` parameter and a `for` loop variable are scoped to their clause (nw-800) | `f()` inside them no longer binds a same-file `f` |
-| ESM import bindings are hoisted to the top of their scope (nw-803) | A function written above an `import` sees the binding. A function above a CommonJS `require` sees it too; top-level code above the `require` does not |
+| An unparenthesised arrow parameter (`f => f()`) is scoped to its arrow, like `(f) => f()` | `[1].map(g => g())` no longer gives a false edge to an imported `g` |
+| ESM import bindings are hoisted to the top of their scope (nw-803) | A function written above an `import` sees the binding. A function above a CommonJS `require` sees it too, including an expression-body arrow (`const fb = () => f()`); top-level code above the `require` does not |
 | TS `import x = require('m')` and `export import x = require('m')` bind like an import (nw-801) | Calls through `x` resolve. A bare call on a whole-module binding (`x()`) is unresolved |
 | `.ts` and `.tsx` keep their own type bindings (nw-805) | `type_aware` edges are deterministic; on mixed `.ts`/`.tsx` repos they may differ from 12.0.x |
 | A broken file with no real symbols gets no owner; a lowercase JSX tag (`<div/>`) never mints one | Such files stay disclosed as parse errors and add no empty owners |
