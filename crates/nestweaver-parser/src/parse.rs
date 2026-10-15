@@ -5414,7 +5414,10 @@ fn collect_js_import_bindings(
         };
         // nw-803: an ESM `import … from` is hoisted: its binding is live from
         // the top of its scope, so code written above the import line sees
-        // it. `require()` and TS `import x = require()` run where written.
+        // it. `require()` and TS `import x = require()` run where written, so
+        // their binding initializes at the declaration: code above it in the
+        // same scope does not see it. A function body written above it still
+        // does, since it runs later; the resolver exempts nested bodies.
         let hoisted =
             statement.kind() == "import_statement" && import_require_clause(statement).is_none();
         for (local, original) in bindings {

@@ -909,7 +909,16 @@ fn resolve_single_reference(
                 if let (Some(binding_scope), Some(call_scope)) = (binding.scope, reference.scope) {
                     binding_scope.start <= call_scope.position
                         && call_scope.position < binding_scope.end
-                        && binding_scope.initialized_at <= call_scope.position
+                        && (binding_scope.initialized_at <= call_scope.position
+                            // nw-113: a function body written above a
+                            // `require` runs later, once the binding is
+                            // initialized (the exemption `name_is_locally_bound`
+                            // gives a nested body). Top-level code, even in a
+                            // block or an IIFE, runs first: it has no source
+                            // but the module owner.
+                            || !source_sym.is_module_owner()
+                                && call_scope.start > binding_scope.start
+                                && call_scope.end <= binding_scope.end)
                 } else {
                     owner.is_none_or(|owner| {
                         owner.start_line == source_sym.start_line && owner.name == source_sym.name
@@ -10047,6 +10056,51 @@ export function readIt() { return value(); }
             assert!(
                 !call_targets(&files, &edges, a, "shadowed").contains(&helper[0]),
                 "{a}: a parameter shadows the import: {edges:#?}"
+            );
+        }
+    }
+
+    /// nw-113 final review M5: a CommonJS `require` runs where written, but a
+    /// function body above it runs later, after the binding is initialized,
+    /// so its calls through the binding resolve. Top-level code above the
+    /// `require` (including a top-level block) runs first and does not bind.
+    #[test]
+    fn a_function_above_a_require_sees_the_binding_but_top_level_code_does_not() {
+        for (lib, a, language, import) in [
+            (
+                "src/lib.js",
+                "src/a.js",
+                Language::JavaScript,
+                "const lib = require('./lib');",
+            ),
+            (
+                "src/lib.ts",
+                "src/a.ts",
+                Language::TypeScript,
+                "import lib = require('./lib');",
+            ),
+        ] {
+            let lib_source = "export function helper() { return 1; }\n";
+            let a_source = format!(
+                "function early() {{ return lib.helper(); }}\n\
+                 lib.helper();\n\
+                 {{ lib.helper(); }}\n\
+                 {import}\n\
+                 function late() {{ return lib.helper(); }}\n"
+            );
+            let (files, edges) = review_edges(&[(lib, lib_source), (a, &a_source)], language);
+            let helper = uid(&files, lib, "helper");
+            for caller in ["early", "late"] {
+                assert_eq!(
+                    call_targets(&files, &edges, a, caller),
+                    vec![helper.clone()],
+                    "{a}: {caller}: {edges:#?}"
+                );
+            }
+            assert!(
+                !call_targets(&files, &edges, a, nestweaver_schema::MODULE_OWNER_NAME)
+                    .contains(&helper),
+                "{a}: top-level code above the require runs first: {edges:#?}"
             );
         }
     }
