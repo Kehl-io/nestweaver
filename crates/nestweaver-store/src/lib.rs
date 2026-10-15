@@ -542,6 +542,10 @@ mod tests {
         assert!(uids("Foo::qux").is_empty());
         assert_eq!(uids("Baz::qux"), ["baz-qux"]);
         assert_eq!(uids("a.js::qux"), ["baz-qux"]);
+        // Pinned: the container match is exact, so a module-qualified
+        // `mod::Foo::bar` is not found. 12.0.4 also answered a qualified miss
+        // with not found, so this is no regression.
+        assert!(uids("mod::Foo::bar").is_empty());
     }
 
     #[test]

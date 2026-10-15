@@ -83,13 +83,21 @@ pub fn did_you_mean_candidates(
     query: &str,
     keep: impl Fn(&Symbol) -> bool,
 ) -> Result<Vec<String>, anyhow::Error> {
-    if query.contains(':') || query.trim().is_empty() {
+    // nw-113: a `path::name` miss is searched by its name half and answered
+    // with `path::name` specs; any other `:` form (a UID) gets nothing.
+    let qualified =
+        !query.starts_with("sym:") && nestweaver_schema::split_file_qualifier(query).is_some();
+    let search = match nestweaver_schema::split_file_qualifier(query) {
+        Some((_, name)) if qualified => name,
+        _ => query,
+    };
+    if search.contains(':') || search.trim().is_empty() {
         return Ok(Vec::new());
     }
 
     let page = store
         .search_symbols_by_name_page(
-            query,
+            search,
             DID_YOU_MEAN_OVER_FETCH,
             &SeedResolutionConfig::default(),
         )
@@ -101,8 +109,13 @@ pub fn did_you_mean_candidates(
         if names.len() == DID_YOU_MEAN_LIMIT {
             break;
         }
-        if seen_names.insert(candidate.name.clone()) {
-            names.push(candidate.name.clone());
+        let suggestion = if qualified {
+            format!("{}::{}", candidate.file_path, candidate.name)
+        } else {
+            candidate.display_name().into_owned()
+        };
+        if seen_names.insert(suggestion.clone()) {
+            names.push(suggestion);
         }
     }
     Ok(names)
@@ -153,6 +166,25 @@ mod tests {
         let names = did_you_mean_candidates(&store, "project_context", always_keep).unwrap();
 
         assert_eq!(names, vec!["tool_project_context".to_string()]);
+    }
+
+    /// nw-113: a qualified miss is searched by its name half, and each
+    /// suggestion is a `path::name` spec that resolves to that symbol.
+    #[test]
+    fn qualified_miss_suggests_path_qualified_names() {
+        let store = GraphStore::in_memory().unwrap();
+        let mut listen = symbol("s1", "listen", "repo:a");
+        listen.file_path = "src/server.js".to_string();
+        store.insert_symbol(&listen).unwrap();
+
+        let names = did_you_mean_candidates(&store, "nope/missing.js::liste", always_keep).unwrap();
+        assert_eq!(names, vec!["src/server.js::listen".to_string()]);
+        assert!(
+            did_you_mean_candidates(&store, "sym:repo:a:x", always_keep)
+                .unwrap()
+                .is_empty(),
+            "a UID gets no suggestion"
+        );
     }
 
     /// Counterweight: a genuine miss (no substring hits at all) returns an
