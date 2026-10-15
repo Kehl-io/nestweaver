@@ -1501,6 +1501,89 @@ mod context_tests {
         }
     }
 
+    /// `owner_heavy_repo` plus a class whose method name is shared with a
+    /// free function, so `Class::method` has something to narrow.
+    fn qualified_seed_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, src) = owner_heavy_repo();
+        fs::write(
+            src.join("hub.js"),
+            "class Hub { makeListener() { return 1; } }\n\
+             function makeListener() { return 2; }\n\
+             module.exports = { Hub, makeListener };\n",
+        )
+        .unwrap();
+        (dir, src)
+    }
+
+    /// nw-113 final round: brain context accepts `path::name`,
+    /// `path::<module>` and `Class::method` seeds through the strict
+    /// resolver, including the owner labels it prints itself.
+    #[test]
+    fn brain_context_resolves_qualified_seeds() {
+        let (_dir, src) = qualified_seed_repo();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        for (spec, want) in [
+            (
+                "styles/s2.style.js::<module>",
+                "styles/s2.style.js::<module>",
+            ),
+            ("theme.js::fromTemplate", "fromTemplate"),
+            ("Hub::makeListener", "makeListener"),
+        ] {
+            let result = super::build_brain_context(&store, &[spec.to_string()])
+                .unwrap_or_else(|e| panic!("{spec}: {e:#}"));
+            let seeds: Vec<(&str, &str)> = result
+                .seeds
+                .iter()
+                .map(|n| (n.title.as_str(), n.kind.as_str()))
+                .collect();
+            assert_eq!(seeds.len(), 1, "{spec}: {seeds:?}");
+            assert_eq!(seeds[0].0, want, "{spec}: {seeds:?}");
+        }
+        let hub = super::build_brain_context(&store, &["Hub::makeListener".to_string()]).unwrap();
+        assert_eq!(hub.seeds[0].kind, "Symbol/Method", "{:?}", hub.seeds);
+        let miss = super::build_brain_context(&store, &["Nope::makeListener".to_string()])
+            .expect_err("a qualifier naming nothing is not found");
+        assert!(
+            format!("{miss:#}").starts_with("No seeds resolved."),
+            "{miss:#}"
+        );
+    }
+
+    /// nw-113 final round: feature entry points accept qualified names.
+    #[test]
+    fn feature_context_resolves_qualified_entry_points() {
+        let (_dir, src) = qualified_seed_repo();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let repo = store.list_repos(None).unwrap().remove(0);
+        let feature = crate::config::FeatureConfig {
+            name: "theme".to_string(),
+            description: None,
+            repos: vec![repo.name.clone().unwrap_or(repo.url.clone())],
+            entry_points: vec![
+                "styles/s2.style.js::<module>".to_string(),
+                "Hub::makeListener".to_string(),
+            ],
+        };
+        let result = super::build_feature_context(&store, &feature, &[], &[], None, None).unwrap();
+        assert!(result.unmatched_entry_points.is_empty(), "{result:?}");
+        let mut seeds: Vec<(&str, &str)> = result
+            .seeds
+            .iter()
+            .map(|n| (n.name.as_str(), n.kind.as_str()))
+            .collect();
+        seeds.sort();
+        assert_eq!(
+            seeds,
+            [
+                ("makeListener", "Method"),
+                ("styles/s2.style.js::<module>", "Module")
+            ]
+        );
+    }
+
     /// nw-113: `path::<module>` seeds context with that file's owner.
     #[test]
     fn context_seeds_a_file_qualified_owner() {
@@ -1838,8 +1921,10 @@ pub fn build_feature_context(
 
     for entry_point in &feature.entry_points {
         // Use exact name match, then filter to feature repos only.
+        // nw-113: `path::name` and `Class::method` narrow through the same
+        // strict resolver as `context` and `impact`.
         let matches = store
-            .lookup_symbols_by_name(entry_point)
+            .lookup_symbols_by_spec(entry_point)
             .map_err(|e| anyhow::anyhow!(e))?;
         // nw-674: unscoped ONLY when nothing is indexed at all. Keying this on
         // an empty RESOLVED set meant a feature whose every declared repo
@@ -2619,6 +2704,24 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         if let Some(note_uids) = resolve_brain_note_seeds(store, trimmed)? {
             seed_uids.extend(note_uids);
             resolved_inputs.push(trimmed.to_string());
+            continue;
+        }
+
+        // nw-113: a qualified name (`path::name`, `path::<module>`,
+        // `Class::method`) resolves through the same strict resolver as
+        // `context` and `impact`. A qualifier that names nothing is a miss:
+        // a substring search would ignore it and seed the wrong symbols.
+        if nestweaver_schema::QualifiedSpec::parse(trimmed).is_some() {
+            let qualified = store
+                .lookup_symbols_by_spec(trimmed)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            if !qualified.is_empty() {
+                seed_name_tally.record_exact(qualified.len());
+                seed_uids.extend(qualified.into_iter().map(|s| s.uid));
+                resolved_inputs.push(trimmed.to_string());
+            } else {
+                unresolved.push(raw.clone());
+            }
             continue;
         }
 
