@@ -3758,14 +3758,6 @@ mod tests {
         );
     }
 
-    /// Regression (CRITICAL — edge loss across watch reindex): a watcher
-    /// reindex of a modified file must restore the SAME cross-file edges a
-    /// manual incremental index produces — both the file's outgoing edges
-    /// and the incoming edges from its dependents. Before this fix the
-    /// watcher ran single-file resolution only, so every cross-file
-    /// CALLS/IMPORTS edge incident to the re-indexed file was destroyed by
-    /// the per-file `DETACH DELETE` and never rebuilt (symbols present,
-    /// all edges gone; only `--force` repaired).
     /// Write `files` under a fresh repo dir, index it in memory, and return
     /// the store, repo uid, canonical root and `file://` url.
     fn index_files(
@@ -3926,6 +3918,14 @@ mod tests {
         assert_matches_fresh(&store, &root, &repo_url, "hub past the transitive cap");
     }
 
+    /// Regression (CRITICAL — edge loss across watch reindex): a watcher
+    /// reindex of a modified file must restore the SAME cross-file edges a
+    /// manual incremental index produces — both the file's outgoing edges
+    /// and the incoming edges from its dependents. Before this fix the
+    /// watcher ran single-file resolution only, so every cross-file
+    /// CALLS/IMPORTS edge incident to the re-indexed file was destroyed by
+    /// the per-file `DETACH DELETE` and never rebuilt (symbols present,
+    /// all edges gone; only `--force` repaired).
     #[test]
     fn watch_reindex_preserves_cross_file_edges() {
         let dir = tempfile::tempdir().unwrap();
