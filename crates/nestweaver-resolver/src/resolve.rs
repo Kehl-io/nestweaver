@@ -977,6 +977,7 @@ fn resolve_single_reference(
     // that import's member, never a same-file symbol of the bare member name,
     // even when the file stem matches the receiver (`Modal.test.js`).
     let mut same_file_out_of_scope = false;
+    let mut rejected_member = false;
     if let Some(syms) = symbol_map.get(name.as_str())
         && let Some((_, sym)) = syms
             .iter()
@@ -989,7 +990,15 @@ fn resolve_single_reference(
                             .is_some_and(|line| sym.start_line == line)
                     })
                     && candidate_matches(reference, file_path, f, sym, language, graph)
-                    && !bare_call_names_member(reference, sym, language)
+                    && {
+                        // nw-789: a bare call never names a same-file method,
+                        // but the method's presence is still this file's
+                        // declaration of the name: Priority 4 must not bind a
+                        // sibling file's homonym in its place.
+                        let member = bare_call_names_member(reference, sym, language);
+                        rejected_member |= member;
+                        !member
+                    }
             })
             // Records rejections as a side effect; `min_by_key` consumes the
             // whole iterator, so every candidate is seen. An unresolved import
@@ -1008,10 +1017,15 @@ fn resolve_single_reference(
                 let width = width?;
                 unresolved_binding
                     .is_none_or(|binding| {
-                        binding
-                            .scope
-                            .is_some_and(|scope| width < scope.end - scope.start)
+                        // A Python width is a line span, not comparable with
+                        // a byte scope: a Python candidate is admitted by
+                        // explicit containment alone.
+                        language != Language::Python
+                            && binding
+                                .scope
+                                .is_some_and(|scope| width < scope.end - scope.start)
                             || nested_inside_binding(
+                                scope_index,
                                 sorted_syms,
                                 candidate.1,
                                 reference,
@@ -1041,6 +1055,8 @@ fn resolve_single_reference(
             }],
         });
     }
+
+    same_file_out_of_scope |= rejected_member;
 
     // Otherwise an import whose source is not in this resolution set binds
     // nothing: no sibling homonym or later tier may stand in for it.
@@ -1506,14 +1522,15 @@ fn resolve_single_reference(
         return Some(unresolved_edge(source_uid, name, edge_type));
     }
 
-    // nw-113: the name is declared in this file, but only inside blocks that
-    // do not contain this call (Priority 1 rejected every such candidate for
-    // scope). An ES module cannot see a sibling file's function without
-    // importing it, so the same-directory fallback below would fabricate the
-    // edge. Only reachable when the JS/TS file has no imports at all: a file
-    // with imports already returned unresolved above for an unbound name, so
-    // this does not protect import resolution. A name not declared in this
-    // file at all still takes the same-directory fallback.
+    // nw-113: the name is declared in this file, but Priority 1 rejected
+    // every such candidate: out of scope at this call (a block-scoped JS/TS
+    // declaration, a Python `def` nested in another function), or (nw-789) a
+    // method a bare JS/TS call cannot name. The file's own declaration is the
+    // one the name denotes, so the same-directory fallback below would
+    // fabricate the edge. A JS/TS file reaches here only when it has no
+    // imports (one with imports returned unresolved above for an unbound
+    // name); a Python file reaches here with or without imports. A name not
+    // declared in this file at all still takes the same-directory fallback.
     if same_file_out_of_scope {
         return Some(unresolved_edge(source_uid, name, edge_type));
     }
@@ -2123,6 +2140,10 @@ pub(crate) struct FileScopeIndex<'a> {
     /// nw-787: each nested JS/TS `function` declaration's visible region, by
     /// name, keyed by the line of its name.
     hoisted: std::collections::HashMap<&'a str, Vec<&'a RawReference>>,
+    /// Memo of [`innermost_container`] by the symbol's index in the file's
+    /// `sorted_syms` (nw-787 perf): computed once per symbol per file rather
+    /// than once per (reference, candidate) pair.
+    containers: std::cell::RefCell<std::collections::HashMap<usize, Option<usize>>>,
 }
 
 impl<'a> FileScopeIndex<'a> {
@@ -2164,6 +2185,7 @@ impl<'a> FileScopeIndex<'a> {
             declarators,
             covering,
             hoisted: std::collections::HashMap::new(),
+            containers: Default::default(),
         }
     }
 
@@ -2182,8 +2204,11 @@ impl<'a> FileScopeIndex<'a> {
     }
 
     /// The visible region of the nested `function name` declared on `line`.
-    /// A one-line nest of same-named declarations takes the outermost (the
-    /// first name on the line).
+    /// A graph symbol is keyed by name and line, so declarations that share
+    /// both are one symbol: the parser emits no region when one of them is
+    /// module-level (the symbol is file-wide), and among nested ones, each
+    /// carrying its own declaration offset in `position`, the widest region
+    /// wins.
     fn hoisted_region(&self, name: &str, line: u32) -> Option<nestweaver_parser::LexicalScope> {
         self.hoisted
             .get(name)?
@@ -2191,6 +2216,37 @@ impl<'a> FileScopeIndex<'a> {
             .filter(|reference| reference.start_line == line)
             .filter_map(|reference| reference.scope)
             .max_by_key(|scope| scope.end - scope.start)
+    }
+
+    /// [`innermost_container`] of `sym`, memoised. `sorted_syms` must be the
+    /// list this index was built from; a symbol not found in it is computed
+    /// directly.
+    fn innermost_container<'s>(
+        &self,
+        sorted_syms: &[&'s RawSymbol],
+        sym: &RawSymbol,
+    ) -> Option<&'s RawSymbol> {
+        let lo = sorted_syms.partition_point(|other| other.start_line < sym.start_line);
+        let Some(index) = sorted_syms[lo..]
+            .iter()
+            .take_while(|other| other.start_line == sym.start_line)
+            .position(|other| std::ptr::eq(*other, sym))
+            .map(|offset| lo + offset)
+        else {
+            return innermost_container(sorted_syms, sym);
+        };
+        let container = *self
+            .containers
+            .borrow_mut()
+            .entry(index)
+            .or_insert_with(|| {
+                innermost_container(sorted_syms, sym).and_then(|container| {
+                    sorted_syms
+                        .iter()
+                        .position(|other| std::ptr::eq(*other, container))
+                })
+            });
+        container.map(|index| sorted_syms[index])
     }
 
     /// Every scoped binding named `name`, in line order.
@@ -2289,7 +2345,7 @@ fn same_file_declaration_scope(
         if scope_index.covering(sym.start_line) <= 1 {
             return Some(usize::MAX);
         }
-        return match innermost_container(sorted_syms, sym) {
+        return match scope_index.innermost_container(sorted_syms, sym) {
             Some(container)
                 if matches!(container.kind, SymbolKind::Function | SymbolKind::Method) =>
             {
@@ -2357,6 +2413,7 @@ fn same_file_declaration_scope(
 /// region. Residual: when `function f() {} } function h() {` sits on one
 /// line, the tie-break credits `f` to `h`.
 fn nested_inside_binding(
+    scope_index: &FileScopeIndex<'_>,
     sorted_syms: &[&RawSymbol],
     sym: &RawSymbol,
     reference: &RawReference,
@@ -2370,7 +2427,7 @@ fn nested_inside_binding(
         outer.start_line <= line && line <= outer.end_line.max(outer.start_line)
     };
     let same = |a: &RawSymbol, b: &RawSymbol| a.name == b.name && a.start_line == b.start_line;
-    let Some(container) = innermost_container(sorted_syms, sym) else {
+    let Some(container) = scope_index.innermost_container(sorted_syms, sym) else {
         return false;
     };
     let binding_owner = scoping_owner(sorted_syms, binding.start_line, language);
@@ -10912,16 +10969,27 @@ export function readIt() { return value(); }
     }
 
     /// nw-787: a block-level `function` is block-scoped in strict code (TS,
-    /// an ES module, a `"use strict"` script) and, per ECMA-262 Annex B.3.3,
-    /// function-scoped in a sloppy script.
+    /// an ES module including any `.mjs`/`.mts` file, a `"use strict"`
+    /// directive anywhere in the file's or the enclosing function's prologue)
+    /// and, per ECMA-262 Annex B.3.3, function-scoped in a sloppy script.
     #[test]
     fn a_block_function_is_block_scoped_only_in_strict_code() {
         let body = "function g() {\n  {\n    function f() { return 1; }\n  }\n  return f();\n}\n";
-        for (path, prefix, block_scoped) in [
-            ("src/module.js", "export const x = 1;\n", true),
-            ("src/strict.js", "'use strict';\n", true),
-            ("src/script.js", "", false),
-            ("src/typed.ts", "", true),
+        let strict_g = "function g() {\n  'use strict';\n  {\n    function f() { return 1; }\n  }\n  return f();\n}\n";
+        for (path, prefix, body, line, block_scoped) in [
+            ("src/module.js", "export const x = 1;\n", body, 4, true),
+            ("src/strict.js", "'use strict';\n", body, 4, true),
+            (
+                "src/client.js",
+                "\"use client\";\n'use strict';\n",
+                body,
+                5,
+                true,
+            ),
+            ("src/esm.mjs", "", body, 3, true),
+            ("src/fn.js", "", strict_g, 4, true),
+            ("src/script.js", "", body, 3, false),
+            ("src/typed.ts", "", body, 3, true),
         ] {
             let source = format!("{prefix}{body}");
             let language = if path.ends_with(".ts") {
@@ -10930,7 +10998,6 @@ export function readIt() { return value(); }
                 Language::JavaScript
             };
             let (files, edges) = review_edges(&[(path, &source)], language);
-            let line = 3 + u32::from(!prefix.is_empty());
             let want = if block_scoped {
                 "unresolved:f".to_string()
             } else {
@@ -10940,6 +11007,52 @@ export function readIt() { return value(); }
                 call_targets(&files, &edges, path, "g"),
                 vec![want],
                 "{path}"
+            );
+        }
+    }
+
+    /// nw-787 (M1): the graph keys a symbol by name and line, so a nested
+    /// `f` on the same line as a module-level `f` is that file-wide symbol: a
+    /// call outside `a` still binds it.
+    #[test]
+    fn a_one_line_nested_homonym_keeps_the_module_level_function_file_wide() {
+        let source =
+            "function a(){ function f(){} } function f(){}\nfunction g() { return f(); }\n";
+        let (files, edges) = review_edges(&[("src/app.js", source)], Language::JavaScript);
+        assert_eq!(
+            call_targets(&files, &edges, "src/app.js", "g"),
+            vec![uid_at(&files, "src/app.js", "f", 1)]
+        );
+    }
+
+    /// nw-789 (M7): in an import-less file a bare `run()` that rejects the
+    /// same-file method `run` must not fall through to a sibling file's
+    /// `function run`.
+    #[test]
+    fn a_bare_call_rejecting_a_same_file_method_invents_no_sibling_edge() {
+        for language in [Language::JavaScript, Language::TypeScript] {
+            let ext = if language == Language::TypeScript {
+                "ts"
+            } else {
+                "js"
+            };
+            let (app, lib) = (format!("src/app.{ext}"), format!("src/lib.{ext}"));
+            let (files, edges) = review_edges(
+                &[
+                    (&app, "class C {\n  run() {}\n  m() { run(); }\n}\n"),
+                    (&lib, "export function run() {}\n"),
+                ],
+                language,
+            );
+            let sibling = uid(&files, &lib, "run");
+            assert_eq!(
+                call_targets(&files, &edges, &app, "m"),
+                vec!["unresolved:run".to_string()],
+                "{app}"
+            );
+            assert!(
+                !edges.iter().any(|edge| edge.target_uid == sibling),
+                "{edges:#?}"
             );
         }
     }
