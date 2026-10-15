@@ -4606,7 +4606,13 @@ fn render_affected_tests_result(
                 "  {} (conf {:.2}) — {}",
                 file.test_file,
                 file.confidence,
-                file.tests.join(", ")
+                // nw-113: a file its own top-level code selected names no
+                // test; the text says why it runs.
+                if file.tests.is_empty() && file.selected_by.is_some() {
+                    "(top-level code)".to_string()
+                } else {
+                    file.tests.join(", ")
+                }
             );
         }
         println!();

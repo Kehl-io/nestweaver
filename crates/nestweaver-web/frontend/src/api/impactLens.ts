@@ -35,6 +35,8 @@ export interface AffectedTestFile {
   tests: string[];
   symbol_uid: string;
   confidence: number;
+  /** nw-113: "top_level_code" when the file's own top-level code selected it. */
+  selected_by?: string;
 }
 
 export interface AffectedTestsResult {

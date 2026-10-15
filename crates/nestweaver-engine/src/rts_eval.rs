@@ -725,6 +725,7 @@ fn attach_recording(
                     tests: Vec::new(),
                     symbol_uid: String::new(),
                     confidence: 1.0,
+                    selected_by: None,
                 });
             }
             result
@@ -825,6 +826,7 @@ mod tests {
                     tests: vec!["t".to_string()],
                     symbol_uid: "sym:t".to_string(),
                     confidence: 0.9,
+                    selected_by: None,
                 })
                 .collect(),
             tier_2: Vec::new(),

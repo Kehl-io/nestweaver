@@ -342,17 +342,17 @@ fn scoped_affected_tests(
         result
             .tier_1
             .iter()
-            .map(|file| file.tests.len())
+            .map(|file| file.test_count())
             .sum::<usize>(),
         result
             .tier_2
             .iter()
-            .map(|file| file.tests.len())
+            .map(|file| file.test_count())
             .sum::<usize>(),
         result
             .tier_3
             .iter()
-            .map(|file| file.tests.len())
+            .map(|file| file.test_count())
             .sum::<usize>(),
     );
     Ok(result)

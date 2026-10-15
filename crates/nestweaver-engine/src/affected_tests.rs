@@ -68,6 +68,24 @@ pub struct AffectedTestFile {
     pub symbol_uid: String,
     /// Highest edge confidence among this file's tests in this tier.
     pub confidence: f32,
+    /// nw-113: why a file with no test of its own reached was selected.
+    /// [`SELECTED_BY_TOP_LEVEL_CODE`] when its own top-level code (its
+    /// `<module>` owner) calls the change: the file runs whole, so it counts
+    /// as one affected test (see [`Self::test_count`]) with `tests` empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_by: Option<String>,
+}
+
+impl AffectedTestFile {
+    /// How many affected tests this file counts for in the summary: its
+    /// named tests, or one for a file selected by its top-level code.
+    pub fn test_count(&self) -> usize {
+        if self.tests.is_empty() && self.selected_by.is_some() {
+            1
+        } else {
+            self.tests.len()
+        }
+    }
 }
 
 /// The full affected-tests result, bucketed by priority tier.
@@ -490,6 +508,7 @@ fn affected_tests_within(
             tests: Vec::new(),
             symbol_uid: String::new(),
             confidence: 1.0,
+            selected_by: None,
         });
     }
     if !always_included.is_empty() {
@@ -659,11 +678,12 @@ fn consider(best: &mut HashMap<String, AffectedTestSymbol>, candidate: AffectedT
 
 /// Group selected test symbols by their test file, ordering files (and the
 /// representative confidence) by descending edge confidence.
-/// nw-113: the test name listed for a test file selected only through its
-/// own top-level code (its `<module>` owner). The file runs whole, so its
+/// nw-113: the `selected_by` of a test file selected only through its own
+/// top-level code (its `<module>` owner). The file runs whole, so its
 /// top-level code is counted as its one affected test: a script gating on
-/// the count must not read a selected file as nothing to run.
-pub const TOP_LEVEL_CODE_TEST: &str = "(top-level code)";
+/// the count must not read a selected file as nothing to run. Final review
+/// Minor 8: it used to be listed as a pseudo test named `(top-level code)`.
+pub const SELECTED_BY_TOP_LEVEL_CODE: &str = "top_level_code";
 
 fn group_by_file(mut syms: Vec<AffectedTestSymbol>) -> Vec<AffectedTestFile> {
     // Sort symbols by confidence desc so the first per file is the strongest.
@@ -687,11 +707,12 @@ fn group_by_file(mut syms: Vec<AffectedTestSymbol>) -> Vec<AffectedTestFile> {
                 tests: Vec::new(),
                 symbol_uid: sym.symbol_uid.clone(),
                 confidence: sym.confidence,
+                selected_by: None,
             }
         });
         // nw-113: an owner selects its test file (its top-level code calls
         // the change) but is not a test, so it is not listed by name; a file
-        // only it selected gets `TOP_LEVEL_CODE_TEST` below.
+        // only it selected gets `selected_by` below.
         if !nestweaver_schema::uid::is_module_owner_uid(&sym.symbol_uid)
             && seen_tests.insert((sym.test_file.clone(), sym.name.clone()))
         {
@@ -704,11 +725,11 @@ fn group_by_file(mut syms: Vec<AffectedTestSymbol>) -> Vec<AffectedTestFile> {
     }
 
     // nw-113: a file its owner selected with no test of its own reached
-    // still runs: its top-level code is listed and counted as its one test.
+    // still runs: it says why it was selected and counts as one test.
     for entry in by_file.values_mut() {
         if entry.tests.is_empty() && nestweaver_schema::uid::is_module_owner_uid(&entry.symbol_uid)
         {
-            entry.tests.push(TOP_LEVEL_CODE_TEST.to_string());
+            entry.selected_by = Some(SELECTED_BY_TOP_LEVEL_CODE.to_string());
         }
     }
 
@@ -720,7 +741,7 @@ fn group_by_file(mut syms: Vec<AffectedTestSymbol>) -> Vec<AffectedTestFile> {
 }
 
 fn count_tests(files: &[AffectedTestFile]) -> usize {
-    files.iter().map(|f| f.tests.len()).sum()
+    files.iter().map(AffectedTestFile::test_count).sum()
 }
 
 #[cfg(test)]
@@ -787,6 +808,7 @@ mod tests {
             tests: Vec::new(),
             symbol_uid: String::new(),
             confidence: 1.0,
+            selected_by: None,
         };
         assert!(selected_test.tests.is_empty());
         assert_eq!(
@@ -1145,8 +1167,15 @@ mod tests {
         assert_eq!(t1_files, vec!["src/lib.test.ts"], "{result:#?}");
         // nw-113: the owner selects its file and, with no test of its own
         // reached, the file's top-level code counts as its one test, so a
-        // script gating on the count does not skip a selected file.
-        assert_eq!(result.tier_1[0].tests, [TOP_LEVEL_CODE_TEST], "{result:#?}");
+        // script gating on the count does not skip a selected file. Final
+        // review Minor 8: no pseudo test name; `selected_by` says why.
+        assert!(result.tier_1[0].tests.is_empty(), "{result:#?}");
+        assert_eq!(
+            result.tier_1[0].selected_by.as_deref(),
+            Some(SELECTED_BY_TOP_LEVEL_CODE),
+            "{result:#?}"
+        );
+        assert_eq!(result.tier_1[0].test_count(), 1);
         assert!(result.summary.starts_with("1 tier-1"), "{}", result.summary);
     }
 
@@ -1175,7 +1204,12 @@ mod tests {
         assert!(result.changed_symbols.is_empty(), "{result:#?}");
         let t1: Vec<&str> = result.tier_1.iter().map(|f| f.test_file.as_str()).collect();
         assert_eq!(t1, ["tests/test_smoke.py"], "{result:#?}");
-        assert_eq!(result.tier_1[0].tests, [TOP_LEVEL_CODE_TEST], "{result:#?}");
+        assert!(result.tier_1[0].tests.is_empty(), "{result:#?}");
+        assert_eq!(
+            result.tier_1[0].selected_by.as_deref(),
+            Some(SELECTED_BY_TOP_LEVEL_CODE),
+            "{result:#?}"
+        );
         assert!(result.summary.starts_with("1 tier-1"), "{}", result.summary);
     }
 
