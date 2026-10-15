@@ -79,6 +79,10 @@ const MAX_WAIT_PER_CHECK: Duration = Duration::from_secs(190);
 /// sub-window, so a gap between measurements never spans more than one.
 pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
+/// A wait expected to take longer than this is announced at `info`, so it
+/// is not mistaken for a hang (the nw-812 stall looked exactly like one).
+const ANNOUNCE_WAIT_OVER: Duration = Duration::from_secs(3);
+
 /// Upper bound on a single sleep slice, so a waiting worker re-measures and
 /// notices cancellation promptly.
 const MAX_SLEEP: Duration = Duration::from_millis(250);
@@ -98,6 +102,9 @@ pub struct CpuThrottle {
     /// Set by [`interrupt_waits`](Self::interrupt_waits): every current and
     /// future wait returns at once.
     interrupted: AtomicBool,
+    /// Long-wait announcements, recorded for tests.
+    #[cfg(test)]
+    notices: Mutex<Vec<String>>,
     /// nw-812 test seam: how many times [`check`](Self::check) ran.
     #[cfg(test)]
     checks: std::sync::atomic::AtomicUsize,
@@ -117,6 +124,8 @@ struct Window {
     last_log: Option<Duration>,
     /// Write reserves currently claimed by indexes in their write phase.
     claimed: Duration,
+    /// End of the last announced wait (one announcement per episode).
+    notice_until: Option<Duration>,
     /// A wait timed out with the window still over budget (outside CPU);
     /// waits are skipped until the total falls back under the budget.
     saturated: bool,
@@ -267,6 +276,7 @@ impl CpuThrottle {
             last_log: None,
             claimed: Duration::ZERO,
             saturated: false,
+            notice_until: None,
         };
         Self {
             target,
@@ -275,6 +285,8 @@ impl CpuThrottle {
             sleep,
             window: Mutex::new(window),
             interrupted: AtomicBool::new(false),
+            #[cfg(test)]
+            notices: Mutex::new(Vec::new()),
             #[cfg(test)]
             checks: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -392,12 +404,14 @@ impl CpuThrottle {
                         "index CPU budget for the rolling 180 s window spent; waiting"
                     );
                 }
-                match window.wait_until_within(limit, now_wall) {
+                let wait = match window.wait_until_within(limit, now_wall) {
                     // Only another index's claimed reserve is in the way:
                     // poll until it is released.
                     wait if wait.is_zero() && claim => MAX_SLEEP,
                     wait => wait,
-                }
+                };
+                self.announce_long_wait(&mut window, now_wall, wait);
+                wait
             };
             let nap = wait.min(MAX_SLEEP).min(MAX_WAIT_PER_CHECK - slept);
             if nap.is_zero() {
@@ -438,6 +452,38 @@ impl CpuThrottle {
         let now_wall = (self.wall_clock)();
         let now_cpu = (self.cpu_clock)();
         window.update(now_wall, now_cpu);
+    }
+
+    /// Announcements made so far (tests).
+    #[cfg(test)]
+    fn notices(&self) -> Vec<String> {
+        self.notices
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Announce a wait long enough to be mistaken for a stall: an `info`
+    /// line naming the knob, once per wait episode across all workers (not
+    /// again until the announced wait has elapsed).
+    fn announce_long_wait(&self, window: &mut Window, now_wall: Duration, wait: Duration) {
+        if wait <= ANNOUNCE_WAIT_OVER || window.notice_until.is_some_and(|until| now_wall < until) {
+            return;
+        }
+        window.notice_until = Some(now_wall + wait);
+        let notice = format!(
+            "waiting ~{}s for the index CPU budget (NESTWEAVER_INDEX_CPU_PERCENT; \
+             {:.0}s of daemon CPU in the last 180s, budget {:.0}s)",
+            wait.as_secs().max(1),
+            window.total().as_secs_f64(),
+            self.target.unwrap_or_default().as_secs_f64(),
+        );
+        tracing::info!("{notice}");
+        #[cfg(test)]
+        self.notices
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(notice);
     }
 
     /// The window's current total (tests).
@@ -1084,5 +1130,36 @@ mod tests {
         rig.advance(Duration::from_secs(5), Duration::from_secs(80));
         rig.throttle.check();
         assert!(rig.total_sleep() > first, "waiting resumes after recovery");
+    }
+
+    // ── nw-812 re-review N5: a long wait is announced ────────────────────
+
+    #[test]
+    fn a_long_wait_is_announced_once() {
+        let rig = sim_rig();
+        rig.advance(Duration::from_secs(5), Duration::from_secs(80));
+        for _ in 0..5 {
+            rig.throttle.check();
+        }
+        let notices = rig.throttle.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].contains("NESTWEAVER_INDEX_CPU_PERCENT") && notices[0].contains("waiting"),
+            "{notices:?}"
+        );
+    }
+
+    #[test]
+    fn a_short_wait_is_not_announced() {
+        let rig = sim_rig();
+        rig.advance(Duration::ZERO, Duration::from_secs(10));
+        rig.throttle.check();
+        rig.advance(Duration::from_millis(188_500), Duration::ZERO);
+        rig.throttle.sample();
+        rig.advance(Duration::ZERO, Duration::from_secs(70));
+        rig.throttle.check();
+        assert!(!rig.sleeps().is_empty(), "control: it did wait");
+        assert!(rig.total_sleep() <= Duration::from_secs(2));
+        assert!(rig.throttle.notices().is_empty());
     }
 }
