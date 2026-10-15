@@ -3570,6 +3570,105 @@ mod tests {
         assert_eq!(topology(&store), topology(&fresh));
     }
 
+    /// nw-787 / nw-789 (watcher parity). Each shape imports `f` from a
+    /// sibling file, which a watcher pass resolves alone (the import is
+    /// unresolved there) while a fresh index resolves it. Both must agree:
+    /// an invisible nested `f` (F1, F2, F4, S4) or a method `f` (F3) yields
+    /// to the import, and a visible one (S3, F6, F7, the caller's own beside
+    /// a sibling's homonym, a hoisted call) shadows it.
+    #[test]
+    fn watcher_scopes_nested_functions_like_a_fresh_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        std::fs::write(
+            repo_root.join("lib.ts"),
+            "export function f(): number { return 7; }\n",
+        )
+        .unwrap();
+        // (file, body, caller, the line of the expected same-file `f` in the
+        // body, or `None` for lib's `f`). The import adds one line.
+        let shapes: [(&str, &str, &str, Option<u32>); 10] = [
+            ("f1.ts", "function outer() {\n  function h() {\n    function f() { return 1; }\n  }\n  function g() {\n    return f();\n  }\n}\n", "g", None),
+            ("f2.ts", "function g() {\n  const cb = () => {\n    function f() { return 1; }\n  };\n  return f();\n}\n", "g", None),
+            ("f3.ts", "class C {\n  f() { return 1; }\n  m() {\n    return f();\n  }\n}\n", "m", None),
+            ("f4.ts", "function g() {\n  {\n    function f() { return 1; }\n  }\n  return f();\n}\n", "g", None),
+            ("s3.ts", "function g() {\n  function f() { return 1; }\n  return f();\n}\n", "g", Some(2)),
+            ("s4.ts", "function h() {\n  function f() {}\n}\nfunction g() {\n  return f();\n}\n", "g", None),
+            ("f6.ts", "function outer() {\n  function f() { return 1; }\n  function g() {\n    return f();\n  }\n}\n", "g", Some(2)),
+            ("f7.ts", "class C {\n  m() {\n    function f() { return 1; }\n    return f();\n  }\n}\n", "m", Some(3)),
+            ("sib.ts", "function h() {\n  function f() { return 1; }\n  return 0;\n}\nfunction g() {\n  function f() { return 2; }\n  return f();\n}\n", "g", Some(6)),
+            ("hoist.ts", "function g() {\n  const x = f();\n  function f() { return 1; }\n  return x;\n}\n", "g", Some(3)),
+        ];
+        let write_all = |edit: u32| {
+            for (file, body, _, _) in &shapes {
+                std::fs::write(
+                    repo_root.join(file),
+                    format!("import {{ f }} from \"./lib\";\n{body}// edit {edit}\n"),
+                )
+                .unwrap();
+            }
+        };
+        write_all(0);
+        let root = std::fs::canonicalize(&repo_root).unwrap();
+        let repo_url = format!("file://{}", root.display());
+        let r_uid = nestweaver_schema::repo_uid("test", &repo_url);
+        let (_, store) =
+            crate::index::index_directory_in_memory(&root, "test", &repo_url, "sha1").unwrap();
+        // (file, caller) -> the (file, line) of each `f` it calls.
+        let f_calls = |db: &GraphStore, file: &str, caller: &str| {
+            let caller = db
+                .symbols_in_file(file)
+                .unwrap()
+                .into_iter()
+                .find(|s| s.name == caller)
+                .unwrap_or_else(|| panic!("{file}: {caller} should be indexed"))
+                .uid;
+            let mut found: Vec<(String, u32)> = db
+                .callees_with_edge_types_of(&caller)
+                .unwrap()
+                .into_iter()
+                .filter(|(s, kind)| s.name == "f" && kind == "CALLS")
+                .map(|(s, _)| (s.file_path, s.start_line))
+                .collect();
+            found.sort();
+            found
+        };
+        let check = |db: &GraphStore, pass: &str| {
+            let mut failures = Vec::new();
+            for (file, _, caller, expected) in &shapes {
+                let want = match expected {
+                    Some(line) => vec![(file.to_string(), line + 1)],
+                    None => vec![("lib.ts".to_string(), 1)],
+                };
+                let got = f_calls(db, file, caller);
+                if got != want {
+                    failures.push(format!("{pass} {file}: want {want:?}, got {got:?}"));
+                }
+            }
+            failures
+        };
+        let mut failures = check(&store, "index");
+
+        write_all(1);
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        let paths: Vec<PathBuf> = shapes.iter().map(|(file, ..)| root.join(file)).collect();
+        process_fixture_batch(&watcher, &store, &r_uid, &root, &paths);
+        failures.extend(check(&store, "watcher"));
+        assert!(failures.is_empty(), "{failures:#?}");
+
+        let (_, fresh) =
+            crate::index::index_directory_in_memory(&root, "test", &repo_url, "fresh").unwrap();
+        let topology = |db: &GraphStore| {
+            db.load_typed_edges()
+                .unwrap()
+                .into_iter()
+                .map(|(a, b, kind, _, _)| (a, b, kind))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(topology(&store), topology(&fresh));
+    }
+
     #[test]
     fn directory_move_rebuilds_mixed_controller_and_spec_contracts() {
         let dir = tempfile::tempdir().unwrap();

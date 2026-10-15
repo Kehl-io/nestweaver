@@ -961,7 +961,7 @@ immediately in normal operation.
 
 > **This section is about *latency*, not *correctness*.** Everything below
 > describes how fast ranks are served, and assumes the underlying edges are the
-> ones the current resolver would write. **`RESOLVER_GENERATION` is 10**
+> ones the current resolver would write. **`RESOLVER_GENERATION` is 11**
 > (`crates/nestweaver-engine/src/resolver_generation.rs`), and compatibility is
 > an exact match rather than a floor, so a graph indexed by any other release
 > serves ranks *quickly* and *wrongly*. Through generation 4 that meant edges
@@ -978,7 +978,11 @@ immediately in normal operation.
 > per-file `<module>` owner (parsed cache 6), and folds in JS/TS parser fixes:
 > generators, `.js` bare-parameter arrows, `catch`/`for` scoping, import
 > hoisting, TS `import x = require`, and per-grammar `.ts`/`.tsx` type
-> bindings. A generation-8 or generation-9 graph must also be rebuilt:
+> bindings. Generation 11 (nw-787, nw-789) scopes nested JS/TS `function`
+> declarations and nested Python `def`s to where they are visible, stops a
+> bare JS/TS call binding a method or accessor, and gives a nested class's
+> members their own class (parsed cache 7). A generation-8, -9 or -10 graph
+> must also be rebuilt:
 > `stale-check` exits 2 and `dead-code` refuses until it matches. Re-index
 > every repo — `nestweaver index --repo <path> --force` — before trusting any
 > ranking on this server.

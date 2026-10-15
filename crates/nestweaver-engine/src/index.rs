@@ -3780,34 +3780,45 @@ fn containing_symbol_for_line(symbols: &[RawSymbol], line: u32) -> Option<&RawSy
 /// names a class, interface, enum or trait declared in the same file to that
 /// container. Shared by the index and the live watcher (nw-113 P1), so a
 /// watcher pass over a file with a class keeps its members.
+///
+/// nw-787: when several containers share the name (a nested `class Inner`
+/// and a top-level `class Inner`), the member belongs to the innermost one
+/// whose span encloses it. A member outside every same-named span (a Rust
+/// `impl` block, or a degenerate span) keeps the last-declared one, as before.
 pub(crate) fn file_member_of_edges(
     r_uid: &str,
     rel_path: &str,
     raw_symbols: &[RawSymbol],
 ) -> Vec<nestweaver_schema::ResolvedEdge> {
     use nestweaver_schema::SymbolKind;
-    let containers: HashMap<&str, String> = raw_symbols
-        .iter()
-        .filter(|symbol| {
-            matches!(
-                symbol.kind,
-                SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum | SymbolKind::Trait
-            )
-        })
-        .map(|symbol| {
-            (
-                symbol.name.as_str(),
-                symbol_uid(r_uid, rel_path, &symbol.name, symbol.start_line),
-            )
-        })
-        .collect();
+    let mut containers: HashMap<&str, Vec<&RawSymbol>> = HashMap::new();
+    for symbol in raw_symbols.iter().filter(|symbol| {
+        matches!(
+            symbol.kind,
+            SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum | SymbolKind::Trait
+        )
+    }) {
+        containers
+            .entry(symbol.name.as_str())
+            .or_default()
+            .push(symbol);
+    }
     raw_symbols
         .iter()
         .filter_map(|symbol| {
-            let parent_uid = containers.get(symbol.parent_name.as_deref()?)?;
+            let named = containers.get(symbol.parent_name.as_deref()?)?;
+            let parent = named
+                .iter()
+                .filter(|container| {
+                    container.start_line <= symbol.start_line
+                        && symbol.start_line <= container.end_line
+                        && !std::ptr::eq(**container, symbol)
+                })
+                .min_by_key(|container| container.end_line - container.start_line)
+                .or_else(|| named.last())?;
             Some(nestweaver_schema::ResolvedEdge {
                 source_uid: symbol_uid(r_uid, rel_path, &symbol.name, symbol.start_line),
-                target_uid: parent_uid.clone(),
+                target_uid: symbol_uid(r_uid, rel_path, &parent.name, parent.start_line),
                 edge_type: nestweaver_schema::EdgeType::MemberOf,
                 confidence: 1.0,
                 link_type: None,
@@ -8868,6 +8879,32 @@ fn content_hash_hex(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nw-787 (also nw-113 last-round QA): a Python nested class's method is a
+    /// member of the nested class, not of a same-named top-level class, and
+    /// each top-level member keeps its own class.
+    #[test]
+    fn member_of_picks_the_enclosing_same_named_class() {
+        let source = "class Outer:\n    class Inner:\n        def m(self):\n            return 1\n\n\nclass Inner:\n    def m(self):\n        return 2\n";
+        let parsed = nestweaver_parser::parse_source(Path::new("n.py"), source).unwrap();
+        let edges = file_member_of_edges("repo:test:abc", "n.py", &parsed.symbols);
+        let at = |name: &str, line: u32| symbol_uid("repo:test:abc", "n.py", name, line);
+        for (member, class) in [(at("m", 3), at("Inner", 2)), (at("m", 8), at("Inner", 7))] {
+            assert!(
+                edges
+                    .iter()
+                    .any(|edge| edge.source_uid == member && edge.target_uid == class),
+                "{member} -> {class}: {edges:#?} {:#?}",
+                parsed.symbols
+            );
+        }
+        assert!(
+            !edges
+                .iter()
+                .any(|edge| edge.source_uid == at("m", 3) && edge.target_uid == at("Inner", 7)),
+            "{edges:#?}"
+        );
+    }
 
     /// nw-113: cross-repo inference attributes a line to a real symbol, never
     /// to the whole-file module owner.
