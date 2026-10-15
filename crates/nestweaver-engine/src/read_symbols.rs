@@ -438,16 +438,22 @@ pub fn resolve_spec(store: &GraphStore, spec: &str) -> Vec<Symbol> {
 #[derive(Debug, Default)]
 pub struct SpecResolution {
     pub symbols: Vec<Symbol>,
-    /// The qualifiers named nothing and the last segment answered instead.
-    pub qualifier_ignored: bool,
+    /// The leading qualifiers named nothing and a shorter reading answered
+    /// instead: `(dropped qualifiers, reading that answered)`, e.g.
+    /// `("zzz", "Svc::run")` or `("nothere.ts", "run")`.
+    pub qualifier_ignored: Option<(String, String)>,
 }
 
 /// [`resolve_spec`], also saying whether a qualifier was dropped.
+///
+/// nw-113 final review Minor 4: when the full spec names nothing, the
+/// shorter qualified readings are tried outermost qualifier first
+/// (`zzz::Svc::run`, then `Svc::run`) before the last segment alone.
 pub fn resolve_spec_detailed(store: &GraphStore, spec: &str) -> SpecResolution {
     if spec.starts_with("sym:") {
         return SpecResolution {
             symbols: store.lookup_symbol(spec).ok().into_iter().collect(),
-            qualifier_ignored: false,
+            qualifier_ignored: None,
         };
     }
     if let Some(qualified) = nestweaver_schema::QualifiedSpec::parse(spec) {
@@ -455,14 +461,25 @@ pub fn resolve_spec_detailed(store: &GraphStore, spec: &str) -> SpecResolution {
         if !strict.is_empty() {
             return SpecResolution {
                 symbols: strict,
-                qualifier_ignored: false,
+                qualifier_ignored: None,
             };
         }
-        let symbols = store
-            .lookup_symbols_by_name(last_dotted_segment(qualified.name))
-            .unwrap_or_default();
+        let segments: Vec<&str> = spec.split("::").collect();
+        for drop in 1..segments.len() - 1 {
+            let reading = segments[drop..].join("::");
+            let symbols = store.lookup_symbols_by_spec(&reading).unwrap_or_default();
+            if !symbols.is_empty() {
+                return SpecResolution {
+                    symbols,
+                    qualifier_ignored: Some((segments[..drop].join("::"), reading)),
+                };
+            }
+        }
+        let name = last_dotted_segment(qualified.name);
+        let symbols = store.lookup_symbols_by_name(name).unwrap_or_default();
         return SpecResolution {
-            qualifier_ignored: !symbols.is_empty(),
+            qualifier_ignored: (!symbols.is_empty())
+                .then(|| (qualified.qualifiers.join("::"), qualified.name.to_string())),
             symbols,
         };
     }
@@ -470,7 +487,7 @@ pub fn resolve_spec_detailed(store: &GraphStore, spec: &str) -> SpecResolution {
         symbols: store
             .lookup_symbols_by_name(last_dotted_segment(spec))
             .unwrap_or_default(),
-        qualifier_ignored: false,
+        qualifier_ignored: None,
     }
 }
 
@@ -478,23 +495,33 @@ pub fn resolve_spec_detailed(store: &GraphStore, spec: &str) -> SpecResolution {
 fn ambiguity_hint(store: &GraphStore, spec: &str, candidates: &[Symbol]) -> String {
     let uids: Vec<&str> = candidates.iter().map(|s| s.uid.as_str()).collect();
     let containers = store.container_chains(&uids, 1).unwrap_or_default();
+    let class_of = |s: &Symbol| containers.get(&s.uid).and_then(|chain| chain.first());
+    // Candidates in a class are told apart by `path::Class::name`.
     let mut seen = HashSet::new();
-    let distinct_classes = candidates.iter().all(|s| {
-        containers
-            .get(&s.uid)
-            .and_then(|chain| chain.first())
-            .is_some_and(|class| seen.insert((s.file_path.as_str(), class.as_str())))
-    });
-    if distinct_classes {
+    let classes_distinct = candidates
+        .iter()
+        .filter_map(|s| class_of(s).map(|class| (s.file_path.as_str(), class.as_str())))
+        .all(|pair| seen.insert(pair));
+    let classed = candidates.iter().filter(|s| class_of(s).is_some()).count();
+    if classes_distinct && classed == candidates.len() {
         return "pass a UID or path::Class::name".to_string();
     }
-    let one_file = candidates
-        .windows(2)
-        .all(|pair| pair[0].file_path == pair[1].file_path);
-    if nestweaver_schema::QualifiedSpec::parse(spec).is_some() || one_file {
-        return "pass a UID".to_string();
+    // `path::name` only helps when it names one candidate each: every
+    // candidate in its own file, and not already the file the caller named.
+    let mut files = HashSet::new();
+    let files_distinct = candidates
+        .iter()
+        .all(|s| files.insert(s.file_path.as_str()));
+    if files_distinct && nestweaver_schema::QualifiedSpec::parse(spec).is_none() {
+        return "pass a UID or path::name".to_string();
     }
-    "pass a UID or path::name".to_string()
+    // nw-113 final review Minor 4: same-file candidates, or a `path::name`
+    // that would still match two, are told apart by their class where they
+    // have one, and otherwise only by UID.
+    if classed > 0 && classes_distinct {
+        return "pass a UID or path::Class::name".to_string();
+    }
+    "pass a UID".to_string()
 }
 
 /// Dotted FQN forms (`pkg.mod.func`): the last segment is the symbol name.
@@ -586,7 +613,7 @@ pub fn read_symbols_budgeted(
             symbols: candidates,
             qualifier_ignored,
         } = resolve_spec_detailed(store, spec);
-        if qualifier_ignored && let Some((qualifier, name)) = spec.rsplit_once("::") {
+        if let Some((qualifier, name)) = qualifier_ignored {
             result.qualifier_ignored.push(QualifierIgnored {
                 query: spec.clone(),
                 note: format!(
@@ -1241,6 +1268,70 @@ app();
             panic!("{res:?}")
         };
         assert_eq!(ambiguous.hint, "pass a UID or path::name");
+    }
+
+    /// nw-113 final review Minor 4: the hint never offers a `path::name`
+    /// that would still be ambiguous, offers `path::Class::name` when a class
+    /// tells same-file candidates apart, and `zzz::Svc::run` reads as
+    /// `Svc::run` before it falls back to `run`.
+    #[test]
+    fn ambiguity_hints_offer_only_what_disambiguates() {
+        let (dir, store) = fixture_files(&[
+            (
+                "a/svc.ts",
+                "export class Svc { run() { return 1; } }\n\
+                 export class Other { run() { return 3; } }\n",
+            ),
+            ("b/svc.ts", "export class Svc { run() { return 2; } }\n"),
+            (
+                "c.ts",
+                "export class Job { go() { return 1; } }\nexport function go() { return 2; }\n",
+            ),
+            (
+                "d.py",
+                "def helper():\n    return 1\n\n\ndef helper():\n    return 2\n",
+            ),
+            ("e.py", "def helper():\n    return 3\n"),
+        ]);
+        let reader = FilesystemReader::new(dir.path());
+        let read = |spec: &str| read_symbols(&store, &[spec.to_string()], &reader, 0, None);
+
+        let res = read("c.ts::go");
+        let [ambiguous] = res.ambiguous.as_slice() else {
+            panic!("{res:?}")
+        };
+        assert_eq!(ambiguous.hint, "pass a UID or path::Class::name", "{res:?}");
+
+        let res = read("helper");
+        let [ambiguous] = res.ambiguous.as_slice() else {
+            panic!("{res:?}")
+        };
+        assert_eq!(ambiguous.candidates.len(), 3, "{res:?}");
+        assert_eq!(
+            ambiguous.hint, "pass a UID",
+            "d.py::helper is still two: {res:?}"
+        );
+
+        let res = read("zzz::Svc::run");
+        let [ambiguous] = res.ambiguous.as_slice() else {
+            panic!("{res:?}")
+        };
+        let mut paths: Vec<&str> = ambiguous
+            .candidates
+            .iter()
+            .map(|c| c.file_path.as_str())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            ["a/svc.ts", "b/svc.ts"],
+            "Other::run is not Svc::run"
+        );
+        let [ignored] = res.qualifier_ignored.as_slice() else {
+            panic!("{res:?}")
+        };
+        assert!(ignored.note.contains("'zzz'"), "{ignored:?}");
+        assert!(ignored.note.contains("'Svc::run'"), "{ignored:?}");
     }
 
     /// nw-113 review: the owner is never a neighbour window; reading the
