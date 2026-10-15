@@ -30,6 +30,12 @@ NESTWEAVER_LBUG_MAX_DB_SIZE = { value = "17179869184" }
 # throttle can set its own value; released binaries never see this.
 NESTWEAVER_INDEX_CPU_PERCENT = { value = "0" }
 
+# nw-811: keep test, scratch and `cargo run` authority records out of the
+# account registry (~/.local/state/nestweaver/authority), which every tempdir
+# database otherwise grew by one or more permanent entries. Honoured by debug
+# builds only; release binaries always use the account registry.
+NESTWEAVER_AUTHORITY_DIR = { value = "target/test-authority", relative = true }
+
 # No linker workaround is needed here, and none should be added. liblbug.a
 # vendors zstd, exports its ZSTD_* symbols, and is linked +whole-archive, so
 # every binary already carries a complete libzstd; Rust code reaches that one

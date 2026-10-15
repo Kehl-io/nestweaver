@@ -23,6 +23,11 @@ or `--db` (data directory, publication root, slots and operation journals).
 Older binaries without the retry fail closed ("registry entry was replaced")
 if they lose that microsecond race; they never gain a second owner.
 
+Debug builds alone honour an absolute `NESTWEAVER_AUTHORITY_DIR` registry
+override. `.cargo/config.toml` sets it to `target/test-authority` for every
+process cargo runs, so test suites and `cargo run` scratch databases no longer
+write to the account registry. Release builds ignore the variable.
+
 This is a cooperating-process protocol. It assumes the private registry and its ancestors remain
 intact. Account-home resolution uses `getpwuid_r`, avoiding temporary-directory
 cleaners and inconsistent launch environments. An absent account home fails

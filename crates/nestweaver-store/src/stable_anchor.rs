@@ -73,7 +73,25 @@ fn registry_root(uid: libc::uid_t) -> std::io::Result<PathBuf> {
 }
 
 /// The registry this process's anchors live in.
+///
+/// Debug builds honour an absolute `NESTWEAVER_AUTHORITY_DIR`, which
+/// `.cargo/config.toml` sets for everything cargo runs so test and scratch
+/// databases stay out of the account registry. Release builds never read it:
+/// an ambient variable must not be able to split a released binary's
+/// authority from another process's.
 pub fn authority_registry_root() -> std::io::Result<PathBuf> {
+    #[cfg(debug_assertions)]
+    if let Some(dir) = std::env::var_os("NESTWEAVER_AUTHORITY_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+    {
+        return Ok(dir);
+    }
+    default_authority_registry_root()
+}
+
+/// The account registry, ignoring any test override.
+pub fn default_authority_registry_root() -> std::io::Result<PathBuf> {
     registry_root(unsafe { libc::geteuid() })
 }
 
@@ -279,8 +297,9 @@ pub fn prune_authority_registry_in(
 
 impl StableAnchor {
     pub fn acquire(domain: &str, canonical_path: &Path, exclusive: bool) -> std::io::Result<Self> {
-        // A persistent account-bound path, never /tmp or environment overrides:
-        // clients and ordinary temporary-file cleaners cannot split authorities.
+        // A persistent account-bound path, never /tmp or (in release builds)
+        // environment overrides: clients and ordinary temporary-file cleaners
+        // cannot split authorities.
         let root = authority_registry_root()?;
         Self::acquire_in(&root, domain, canonical_path, exclusive)
     }

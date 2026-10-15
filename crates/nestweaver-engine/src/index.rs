@@ -8871,6 +8871,45 @@ mod tests {
 
     /// nw-113: cross-repo inference attributes a line to a real symbol, never
     /// to the whole-file module owner.
+    /// nw-811: cargo-run tests must not grow the account authority registry.
+    #[test]
+    fn an_index_under_the_authority_override_writes_nothing_to_the_default_registry() {
+        use nestweaver_store::stable_anchor::{
+            anchor_key, authority_registry_root, default_authority_registry_root,
+        };
+        let override_dir = PathBuf::from(
+            std::env::var_os("NESTWEAVER_AUTHORITY_DIR")
+                .expect("cargo [env] sets NESTWEAVER_AUTHORITY_DIR for tests"),
+        );
+        // Checked before indexing so a missing override cannot write a record
+        // into the real registry.
+        assert_eq!(authority_registry_root().unwrap(), override_dir);
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("app.py"), "def app_main():\n    return 1\n").unwrap();
+        let db = dir.path().join("graph.lbug");
+        index_directory_with_opts(
+            &repo,
+            &db,
+            &IndexOptions::new("test", "https://example.test/nw-811", "sha").force(true),
+        )
+        .unwrap();
+
+        let key = anchor_key(
+            "database-namespace",
+            &std::fs::canonicalize(dir.path()).unwrap(),
+        );
+        assert!(override_dir.join(&key).exists());
+        assert!(
+            !default_authority_registry_root()
+                .unwrap()
+                .join(&key)
+                .exists()
+        );
+    }
+
     #[test]
     fn containing_symbol_for_line_skips_the_module_owner() {
         use nestweaver_schema::{EntryPointKind, SymbolKind};
