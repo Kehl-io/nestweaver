@@ -4740,7 +4740,9 @@ fn render_dead_code_text(payload: &serde_json::Value) {
         // symbol falls out unreachable. That is the absence of a finding, not
         // a finding, and it has to be said before the numbers rather than
         // after them.
-        if entry_points == 0 && total > 0 {
+        // nw-113: `<module>` owners seed the walk too; they are counted in
+        // `module_owner_roots`, not `entry_points`.
+        if entry_points == 0 && num("module_owner_roots") == 0 && total > 0 {
             println!(
                 "Coverage DEGRADED: no entry point was found, so the reachability walk had \
                  no seed and every symbol below is unreachable BY CONSTRUCTION. This is not \
