@@ -9893,6 +9893,43 @@ export function readIt() { return value(); }
         );
     }
 
+    /// nw-113 B1: a `.js` arrow with a bare parameter is a function: it owns
+    /// its body's calls and its callers get an edge.
+    #[test]
+    fn bare_parameter_arrows_own_their_calls() {
+        let lib = (
+            "src/lib.js",
+            "export function helper(x) { return x + 1; }\n",
+        );
+        let a = (
+            "src/a.js",
+            "import { helper } from './lib';\nconst clamp = (value, min, max) => Math.min(Math.max(value, min), max);\nconst normalizeDirection = value => helper(clamp(Number(value) || 0, 0, 360));\nconst parseDistance = value => { const parsed = helper(value); return parsed; };\nexport function use(v) { return normalizeDirection(v) + parseDistance(v); }\n",
+        );
+        let (files, edges) = review_edges(&[lib, a], Language::JavaScript);
+        let normalize = call_targets(&files, &edges, "src/a.js", "normalizeDirection");
+        for target in [
+            uid(&files, "src/lib.js", "helper"),
+            uid(&files, "src/a.js", "clamp"),
+        ] {
+            assert!(normalize.contains(&target), "{target} in {normalize:?}");
+        }
+        let mut uses = vec![
+            uid(&files, "src/a.js", "normalizeDirection"),
+            uid(&files, "src/a.js", "parseDistance"),
+        ];
+        uses.sort();
+        assert_eq!(
+            call_targets(&files, &edges, "src/a.js", "use"),
+            uses,
+            "{edges:#?}"
+        );
+        assert!(
+            !files[1].1.iter().any(|s| s.is_module_owner()),
+            "{:?}",
+            files[1].1
+        );
+    }
+
     /// nw-113 perf (bug-hunt #1): the per-candidate work is bounded. In a file
     /// with N same-named declarators, one candidate's lookup returns exactly
     /// its own declarator (not all N), and the module-level test is one array

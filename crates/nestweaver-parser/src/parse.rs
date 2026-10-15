@@ -13870,4 +13870,35 @@ mod generator_and_bare_arrow_tests {
             );
         }
     }
+
+    /// nw-113 regression B1: an arrow with a bare (unparenthesised) parameter
+    /// is a function, in `.js` as in `.ts`, not a module `Constant`.
+    #[test]
+    fn bare_parameter_arrows_are_function_symbols() {
+        let source = "const normalize = value => helper(value);\n\
+                      export const parse = value => { const p = helper(value); return p; };\n\
+                      const later = async value => helper(value);\n\
+                      const limit = 10;\n";
+        for path in ["a.js", "a.ts", "a.jsx"] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            for name in ["normalize", "parse", "later"] {
+                assert_eq!(
+                    kind_of(&parsed, name),
+                    Some(SymbolKind::Function),
+                    "{path}: {name}: {:?}",
+                    parsed.symbols
+                );
+            }
+            assert_eq!(
+                kind_of(&parsed, "limit"),
+                Some(SymbolKind::Constant),
+                "{path}"
+            );
+            assert!(
+                !parsed.symbols.iter().any(|s| s.is_module_owner()),
+                "{path}: arrow bodies are not top-level code: {:?}",
+                parsed.symbols
+            );
+        }
+    }
 }
