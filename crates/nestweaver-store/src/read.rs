@@ -867,12 +867,12 @@ impl GraphStore {
     pub fn lookup_symbols_by_spec(&self, spec: &str) -> Result<Vec<Symbol>, StoreError> {
         let exact = self.lookup_symbols_by_name(spec)?;
         match nestweaver_schema::split_file_qualifier(spec) {
-            Some((qualifier, name)) if exact.is_empty() => Ok(
-                nestweaver_schema::narrow_by_file_qualifier(
+            Some((qualifier, name)) if exact.is_empty() => {
+                Ok(nestweaver_schema::narrow_by_file_qualifier(
                     self.lookup_symbols_by_name(name)?,
                     qualifier,
-                ),
-            ),
+                ))
+            }
             _ => Ok(exact),
         }
     }
@@ -1062,9 +1062,8 @@ impl GraphStore {
             let uid = extract_string(&row, 0)?;
             let name = extract_string(&row, 1)?;
             // nw-113: an owner caller reads `path::<module>`, never bare.
-            let name =
-                nestweaver_schema::symbol_display_name(&name, &extract_string(&row, 2)?)
-                    .into_owned();
+            let name = nestweaver_schema::symbol_display_name(&name, &extract_string(&row, 2)?)
+                .into_owned();
             if let Some((names, _)) = adjacency.get_mut(&uid) {
                 names.push(name);
             }
@@ -4001,6 +4000,21 @@ impl GraphStore {
             if let Ok(uid) = extract_string(&row, 0) {
                 uids.insert(uid);
             }
+        }
+        Ok(uids)
+    }
+
+    /// nw-113: the set of all symbol UIDs that are the SOURCE of at least one
+    /// CALLS edge. Single bulk query, the mirror of [`Self::all_callee_uids`].
+    pub fn all_caller_uids(&self) -> Result<std::collections::HashSet<String>, StoreError> {
+        let conn = self.conn()?;
+        let q = "MATCH (s:Symbol)-[:CALLS]->(:Symbol) RETURN DISTINCT s.uid";
+        let result = conn
+            .query(q)
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        let mut uids = std::collections::HashSet::new();
+        for row in result {
+            uids.insert(extract_string(&row, 0)?);
         }
         Ok(uids)
     }

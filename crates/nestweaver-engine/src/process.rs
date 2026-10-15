@@ -121,10 +121,13 @@ pub fn trace_processes(store: &GraphStore, max_depth: u32) -> Result<Vec<Process
     let has_caller = store
         .all_callee_uids()
         .context("all_callee_uids for process tracing")?;
+    let has_callee = store
+        .all_caller_uids()
+        .context("all_caller_uids for process tracing")?;
 
     let entry_points: Vec<&nestweaver_schema::Symbol> = symbols
         .iter()
-        .filter(|sym| symbol_is_entry_point(sym, &has_caller))
+        .filter(|sym| symbol_is_entry_point(sym, &has_caller, &has_callee))
         .collect();
 
     let mut processes = Vec::new();
@@ -139,7 +142,18 @@ pub fn trace_processes(store: &GraphStore, max_depth: u32) -> Result<Vec<Process
 /// Whether a symbol is treated as a process entry point: explicitly flagged, a
 /// heuristic entry name/suffix, or a root (no callers). `has_caller` is the set
 /// of uids that appear as a callee somewhere (i.e. have at least one caller).
-fn symbol_is_entry_point(sym: &nestweaver_schema::Symbol, has_caller: &HashSet<String>) -> bool {
+///
+/// nw-113: a `<module>` owner is a process only when it calls something
+/// (`has_callee`, the set of CALLS sources). An owner whose top-level calls
+/// all go to packages would otherwise be a one-member process.
+fn symbol_is_entry_point(
+    sym: &nestweaver_schema::Symbol,
+    has_caller: &HashSet<String>,
+    has_callee: &HashSet<String>,
+) -> bool {
+    if sym.is_module_owner() {
+        return has_callee.contains(&sym.uid);
+    }
     if sym.is_entry_point {
         return true;
     }
@@ -288,6 +302,11 @@ fn derive_process_name(entry_point: &nestweaver_schema::Symbol) -> String {
         Some(EntryPointKind::EventListener) => format!("event::{}", entry_point.name),
         Some(EntryPointKind::CronJob) => format!("cron::{}", entry_point.name),
         Some(EntryPointKind::CliCommand) => format!("cli::{}", entry_point.name),
+        // nw-113: the repo-relative path, so `index.js` and
+        // `src/controllers/index.js` owners are two distinct names.
+        Some(EntryPointKind::ModuleInit) if entry_point.is_module_owner() => {
+            nestweaver_schema::module_owner_label(&entry_point.file_path)
+        }
         Some(EntryPointKind::ModuleInit) => {
             let file = entry_point
                 .file_path
@@ -591,11 +610,14 @@ fn detect_changes_impact_with_work_budget(
     // `has_caller` mirrors `all_callee_uids`: targets of CALLS edges. Used by the
     // entry-point predicate's root test.
     let mut has_caller: HashSet<String> = HashSet::new();
+    // nw-113: CALLS sources, so only an owner that calls something is a process.
+    let mut has_callee: HashSet<String> = HashSet::new();
     for edge in &typed_edges {
         GraphStore::check_read_deadline()?;
         let (src, dst, etype) = (&edge.0, &edge.1, edge.2.as_str());
         if etype == "CALLS" {
             has_caller.insert(dst.clone());
+            has_callee.insert(src.clone());
         }
         if PROCESS_EDGE_TYPES.contains(&etype) {
             fwd_adj.entry(src.clone()).or_default().push(dst.clone());
@@ -625,7 +647,8 @@ fn detect_changes_impact_with_work_budget(
         let mut entries = Vec::new();
         for sym in &symbols {
             GraphStore::check_read_deadline()?;
-            if ancestors.contains(&sym.uid) && symbol_is_entry_point(sym, &has_caller) {
+            if ancestors.contains(&sym.uid) && symbol_is_entry_point(sym, &has_caller, &has_callee)
+            {
                 entries.push(sym);
             }
         }
@@ -727,7 +750,90 @@ mod tests {
             framework_hint: None,
             canonical_id: None,
         };
-        assert_eq!(derive_process_name(&symbol), "ownerless.ts::<module>");
+        assert_eq!(
+            derive_process_name(&symbol),
+            "src/app/ownerless.ts::<module>"
+        );
+    }
+
+    /// Index `files` under a fresh tempdir.
+    fn indexed(files: &[(&str, &str)]) -> (tempfile::TempDir, GraphStore) {
+        let dir = tempfile::tempdir().unwrap();
+        for (rel, src) in files {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, src).unwrap();
+        }
+        let (_r, store) = crate::index::index_directory_in_memory(
+            dir.path(),
+            "test",
+            "https://example.com/r",
+            "sha",
+        )
+        .unwrap();
+        (dir, store)
+    }
+
+    /// nw-113: two `index.js` owners are two distinctly named processes, and
+    /// an owner with no outgoing CALLS edge (its top-level calls all go to
+    /// packages) is no process at all.
+    #[test]
+    fn owner_processes_carry_the_path_and_need_an_outgoing_call() {
+        let (_dir, store) = indexed(&[
+            (
+                "index.js",
+                "const { listen } = require('./src/server');\nlisten();\n",
+            ),
+            (
+                "src/controllers/index.js",
+                "const { listen } = require('../server');\nlisten();\n",
+            ),
+            (
+                "src/server.js",
+                "function listen() { return 1; }\nmodule.exports = { listen };\n",
+            ),
+            ("src/edgeless.js", "jest.mock('firebase-admin');\n"),
+        ]);
+        assert!(
+            store
+                .symbols_in_file("src/edgeless.js")
+                .unwrap()
+                .iter()
+                .any(|s| s.is_module_owner()),
+            "fixture mints an edgeless owner"
+        );
+        let impact = detect_changes_impact(
+            &store,
+            &["src/server.js".to_string(), "src/edgeless.js".to_string()],
+            10,
+            None,
+        )
+        .unwrap();
+        let names: Vec<&str> = impact
+            .affected_processes
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert!(names.contains(&"index.js::<module>"), "{names:?}");
+        assert!(
+            names.contains(&"src/controllers/index.js::<module>"),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("edgeless")),
+            "an owner with no outgoing call is no process: {names:?}"
+        );
+
+        let traced: Vec<String> = trace_processes(&store, 10)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert!(
+            traced.contains(&"index.js::<module>".to_string()),
+            "{traced:?}"
+        );
+        assert!(!traced.iter().any(|n| n.contains("edgeless")), "{traced:?}");
     }
 
     #[test]
