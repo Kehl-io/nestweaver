@@ -189,7 +189,8 @@ notes below before using an older database with a new binary.
   `nestweaver index --repo <path> --db <db> --force` for each repository.
   A plain incremental index does not repair generation-stale graphs.
 - **This release needs a forced re-index of every repository.** It moves the
-  resolver generation to 10 and the parsed cache to 6: run
+  resolver generation to 11 and the parsed cache to 7 (generation 10 never
+  shipped, so one forced re-index covers both): run
   `nestweaver index --repo <path> --force` for each repo. `stale-check` exits 2
   until you do.
 - New databases do not need migration. Vaults do not carry a code resolver

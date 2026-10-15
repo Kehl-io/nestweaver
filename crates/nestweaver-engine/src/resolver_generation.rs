@@ -309,7 +309,23 @@ use std::path::Path;
 ///     broken file with no real symbols, or a lowercase JSX tag, mints no
 ///     owner; an import below a one-line function is module scope; and a
 ///     sibling's nested homonym no longer hides the caller's own.
-pub const RESOLVER_GENERATION: u32 = 10;
+/// 11 — nw-787: a nested JS/TS `function` declaration is scoped to the region
+///     it is visible in instead of binding every same-named bare call in the
+///     file. It is hoisted to the start of its enclosing function body; in
+///     strict code (a module, a class body or a `"use strict"` scope) a
+///     declaration inside a block is scoped to that block, the ES2015 block
+///     rule. The parser records the region as a `HoistedDeclaration`
+///     reference (parsed cache 7). nw-789: a bare JS/TS call (`f()`, no
+///     receiver) never binds a method, getter or setter, same-file or
+///     sibling-file; only a receiver call can reach one. A Python `def`
+///     nested in a function is scoped to that function, so a module-level
+///     call no longer binds the inner helper. A nested class's members are
+///     MEMBER_OF the enclosing same-named class chosen by span, not the
+///     first class of that name in the file. All four change persisted edge
+///     targets. Generation 10 never shipped (the last release, 12.0.4, is
+///     generation 9), so this bump and generation 10 share one forced
+///     re-index: `nestweaver index --repo <path> --force`.
+pub const RESOLVER_GENERATION: u32 = 11;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would
