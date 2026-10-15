@@ -1950,13 +1950,6 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     top_level_called.insert(name.clone());
                 }
 
-                if kind == ReferenceKind::Call
-                    && matches!(lang_str, "javascript" | "typescript" | "python" | "php")
-                    && name != "require"
-                {
-                    top_level_call_lines.push(node.start_position().row as u32 + 1);
-                }
-
                 // Filter out HTML elements from JSX patterns: lowercase
                 // identifiers in jsx_opening_element / jsx_self_closing_element
                 // are native HTML tags (div, span, etc.), not component references.
@@ -1965,6 +1958,16 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     && name.starts_with(|c: char| c.is_ascii_lowercase())
                 {
                     continue;
+                }
+
+                // nw-113: recorded after the intrinsic-element filter above, so
+                // a lowercase JSX tag (an HTML element, not a call) never mints
+                // an owner.
+                if kind == ReferenceKind::Call
+                    && matches!(lang_str, "javascript" | "typescript" | "python" | "php")
+                    && name != "require"
+                {
+                    top_level_call_lines.push(node.start_position().row as u32 + 1);
                 }
 
                 // Extract receiver for method calls: in `obj.method()`,
@@ -13972,6 +13975,33 @@ export function G(a) {\n\
             has_syntax_errors: true,
         };
         assert!(parsed.unparsable_skip("G.js").is_some());
+    }
+
+    /// bug-hunt #3: lowercase JSX tags are HTML elements the parser drops,
+    /// not calls, so a file whose only top-level "calls" are such tags mints
+    /// no (edge-less) owner. A component tag at top level still does.
+    #[test]
+    fn lowercase_jsx_tags_alone_mint_no_owner() {
+        let html_only = parse_source(
+            Path::new("a.jsx"),
+            "export const el = (<div><span/></div>);\n",
+        )
+        .unwrap();
+        assert!(
+            !html_only.symbols.iter().any(|s| s.is_module_owner()),
+            "{:?}",
+            html_only.symbols
+        );
+        let component = parse_source(
+            Path::new("b.jsx"),
+            "import { App } from './App';\nexport const el = (<div><App/></div>);\n",
+        )
+        .unwrap();
+        assert!(
+            component.symbols.iter().any(|s| s.is_module_owner()),
+            "{:?}",
+            component.symbols
+        );
     }
 
     /// Counterweight: a file with errors but real symbols keeps its owner.
