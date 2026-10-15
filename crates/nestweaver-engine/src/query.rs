@@ -891,6 +891,82 @@ pub(crate) fn rank_module_owners_last<T>(
     omitted
 }
 
+/// nw-113: the PPR score floor the context builders ask the store for. They
+/// split the answer themselves with [`split_refill_pool`]: what clears
+/// [`nestweaver_store::PPR_MIN_SCORE`] is ranked as before, and the rest is
+/// kept back to refill the list when capped owners soaked up the walk.
+pub(crate) const CONTEXT_PPR_FLOOR: f64 = 0.0;
+
+/// nw-113: split a [`CONTEXT_PPR_FLOOR`] walk into the ranking every context
+/// builder used before (seeds, and nodes above `PPR_MIN_SCORE`) and the
+/// refill pool: the non-seed, non-owner nodes under that floor, best first.
+pub(crate) fn split_refill_pool(
+    walk: Vec<(String, f64)>,
+    seeds: &[String],
+) -> (Vec<(String, f64)>, Vec<(String, f64)>) {
+    let seeds: std::collections::HashSet<&str> = seeds.iter().map(String::as_str).collect();
+    let (ranked, deep): (Vec<_>, Vec<_>) = walk.into_iter().partition(|(uid, score)| {
+        seeds.contains(uid.as_str()) || *score > nestweaver_store::PPR_MIN_SCORE
+    });
+    let pool = deep
+        .into_iter()
+        .filter(|(uid, _)| !nestweaver_schema::uid::is_module_owner_uid(uid))
+        .collect();
+    (ranked, pool)
+}
+
+/// nw-113: how many refill candidates a context list takes. Only a list
+/// whose owner cap hid owners is refilled, and with at most as many real
+/// symbols as owners were hidden: the list grows back to the length it
+/// would have had with every owner listed, never past `limit`.
+/// `listed` is the list's length so far, owners included.
+pub(crate) fn refill_count(
+    owners_omitted: usize,
+    listed: usize,
+    limit: Option<usize>,
+    pool: usize,
+) -> usize {
+    let room = limit.map_or(usize::MAX, |limit| limit.saturating_sub(listed));
+    owners_omitted.min(pool).min(room)
+}
+
+/// nw-113: put `refill` after the real nodes of `ranked` and before its
+/// listed owners (always its tail, see [`rank_module_owners_last`]).
+pub(crate) fn insert_refill<T>(ranked: &mut Vec<T>, owners_listed: usize, refill: Vec<T>) {
+    let at = ranked.len() - owners_listed;
+    ranked.splice(at..at, refill);
+}
+
+/// The [`ContextNode`]s of `scored` symbols, in order; a UID that is not a
+/// symbol (a note, a file in the unified scope) is skipped.
+fn context_nodes(
+    store: &GraphStore,
+    scored: &[(String, f64)],
+) -> Result<Vec<ContextNode>, anyhow::Error> {
+    if scored.is_empty() {
+        return Ok(Vec::new());
+    }
+    let uids: Vec<&str> = scored.iter().map(|(uid, _)| uid.as_str()).collect();
+    let symbols = store
+        .batch_lookup_symbols(&uids)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok(scored
+        .iter()
+        .filter_map(|(uid, score)| {
+            let sym = symbols.get(uid.as_str())?;
+            Some(ContextNode {
+                uid: sym.uid.clone(),
+                name: sym.display_name().into_owned(),
+                kind: sym.kind.to_string(),
+                file_path: sym.file_path.clone(),
+                start_line: sym.start_line,
+                signature: sym.signature.clone(),
+                relevance: *score,
+            })
+        })
+        .collect())
+}
+
 /// Detect whether an input string looks like a file path.
 fn is_file_path(input: &str) -> bool {
     input.contains('/')
@@ -1096,15 +1172,18 @@ pub fn build_context_with_intent(
     // Run Personalized PageRank over the code-only scope (preserves the
     // pre-brain behaviour of `nestweaver context`). The unified scope that
     // mixes code + notes is exposed via `nestweaver brain context`.
-    let ppr_results = store
-        .personalized_pagerank_with_intent(
+    let walk = store
+        .personalized_pagerank_with_floor(
             &seed_uids,
             0.85,
             20,
             &GraphScope::code_only(),
             effective_intent,
+            None,
+            CONTEXT_PPR_FLOOR,
         )
         .map_err(|e| anyhow::anyhow!(e))?;
+    let (ppr_results, refill_pool) = split_refill_pool(walk, &seed_uids);
 
     let seed_set: std::collections::HashSet<&str> = seed_uids.iter().map(|s| s.as_str()).collect();
 
@@ -1150,7 +1229,23 @@ pub fn build_context_with_intent(
     // `CONTEXT_MODULE_OWNER_CAP` are listed; the rest are counted.
     let module_owners_omitted =
         rank_module_owners_last(&mut ranked, |node| owner_uids.contains(&node.uid));
-    let connected_total = ranked.len();
+    // nw-113: refill the places the hidden owners would have taken with
+    // real symbols that scored under the floor, so a helper called at load
+    // time from many files keeps its real neighbours.
+    let owners_listed = ranked
+        .iter()
+        .filter(|node| owner_uids.contains(&node.uid))
+        .count();
+    let refill_available = module_owners_omitted.min(refill_pool.len());
+    let take = refill_count(
+        module_owners_omitted,
+        ranked.len(),
+        limit,
+        refill_pool.len(),
+    );
+    let refill = context_nodes(store, &refill_pool[..take])?;
+    let connected_total = ranked.len() + refill_available;
+    insert_refill(&mut ranked, owners_listed, refill);
     let connected: Vec<ContextNode> = ranked
         .into_iter()
         .take(limit.unwrap_or(usize::MAX))
@@ -1535,6 +1630,117 @@ mod context_tests {
             }
             _ => panic!("<module> is ambiguous"),
         }
+    }
+
+    /// The hub-of-owners shape: `fromTemplate` is called at load time by
+    /// `owners` style files and starts a chain of real collaborators, so
+    /// the owners soak up the walk's mass and the deep end of the chain
+    /// falls under the PPR score floor.
+    fn hub_of_owners_repo(owners: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(src.join("styles")).unwrap();
+        fs::write(
+            src.join("theme.js"),
+            format!(
+                "{}function fromTemplate(t) {{ return {}(t); }}\nmodule.exports = {{ fromTemplate }};\n",
+                CHAIN
+                    .windows(2)
+                    .map(|pair| format!("function {}(k) {{ return {}(k); }}\n", pair[0], pair[1]))
+                    .chain(std::iter::once(format!(
+                        "function {}(k) {{ return k; }}\n",
+                        CHAIN[CHAIN.len() - 1]
+                    )))
+                    .collect::<String>(),
+                CHAIN[0]
+            ),
+        )
+        .unwrap();
+        for i in 0..owners {
+            fs::write(
+                src.join(format!("styles/s{i}.style.js")),
+                "const { fromTemplate } = require('../theme');\nexport const dark = fromTemplate({});\n",
+            )
+            .unwrap();
+        }
+        (dir, src)
+    }
+
+    /// A chain long enough that its far end falls under the PPR score floor
+    /// once the owners dilute the walk, and stays above it without them.
+    const CHAIN: [&str; 20] = [
+        "stepA", "stepB", "stepC", "stepD", "stepE", "stepF", "stepG", "stepH", "stepI", "stepJ",
+        "stepK", "stepL", "stepM", "stepN", "stepO", "stepP", "stepQ", "stepR", "stepS", "stepT",
+    ];
+
+    /// How far down the chain the walk itself reaches with 400 owners. Past
+    /// the floor the walk still scores these; further down the push stops.
+    /// Without the refill, code context lists only through `stepG` and the
+    /// unified scope only through `stepM`.
+    const REACHED: usize = 15;
+
+    /// nw-113 final round: when the owner cap hides owners, the connected
+    /// list is refilled with real symbols from below the score floor, up to
+    /// the limit; owners keep at most three slots, listed last.
+    #[test]
+    fn context_refills_real_symbols_behind_capped_owners() {
+        let (_dir, src) = hub_of_owners_repo(400);
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let result =
+            super::build_context_with_intent(&store, &["fromTemplate".to_string()], None, Some(30))
+                .unwrap();
+        let names: Vec<&str> = result.connected.iter().map(|n| n.name.as_str()).collect();
+        for step in &CHAIN[..REACHED] {
+            assert!(names.contains(step), "{step} missing: {names:?}");
+        }
+        let (owners, last) = owners_listed_last(&names);
+        assert_eq!(owners, 3, "{names:?}");
+        assert!(last, "{names:?}");
+        assert_eq!(result.module_owners_omitted, 397, "{result:?}");
+        assert!(names.len() <= 30, "{names:?}");
+    }
+
+    /// The same refill on feature context.
+    #[test]
+    fn feature_context_refills_real_symbols_behind_capped_owners() {
+        let (_dir, src) = hub_of_owners_repo(400);
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let repo = store.list_repos(None).unwrap().remove(0);
+        let feature = crate::config::FeatureConfig {
+            name: "theme".to_string(),
+            description: None,
+            repos: vec![repo.name.clone().unwrap_or(repo.url.clone())],
+            entry_points: vec!["fromTemplate".to_string()],
+        };
+        let result =
+            super::build_feature_context(&store, &feature, &[], &[], None, Some(30)).unwrap();
+        let names: Vec<&str> = result.connected.iter().map(|n| n.name.as_str()).collect();
+        for step in &CHAIN[..REACHED] {
+            assert!(names.contains(step), "{step} missing: {names:?}");
+        }
+        let (owners, last) = owners_listed_last(&names);
+        assert_eq!(owners, 3, "{names:?}");
+        assert!(last, "{names:?}");
+    }
+
+    /// The same refill on brain context, which has no engine-side limit: it
+    /// returns enough real candidates for any caller limit the owners would
+    /// have filled.
+    #[test]
+    fn brain_context_refills_real_symbols_behind_capped_owners() {
+        let (_dir, src) = hub_of_owners_repo(400);
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let result = super::build_brain_context(&store, &["fromTemplate".to_string()]).unwrap();
+        let titles: Vec<&str> = result.connected.iter().map(|n| n.title.as_str()).collect();
+        for step in &CHAIN[..REACHED] {
+            assert!(titles.contains(step), "{step} missing: {titles:?}");
+        }
+        let (owners, last) = owners_listed_last(&titles);
+        assert_eq!(owners, 3, "{titles:?}");
+        assert!(last, "{titles:?}");
     }
 
     /// `owner_heavy_repo` plus a class whose method name is shared with a
@@ -2032,9 +2238,18 @@ pub fn build_feature_context(
         );
     }
 
-    let ppr_scores = store
-        .personalized_pagerank_with_intent(&seed_uids, 0.85, 20, &GraphScope::unified(), intent)
+    let walk = store
+        .personalized_pagerank_with_floor(
+            &seed_uids,
+            0.85,
+            20,
+            &GraphScope::unified(),
+            intent,
+            None,
+            CONTEXT_PPR_FLOOR,
+        )
         .map_err(|e| anyhow::anyhow!(e))?;
+    let (ppr_scores, refill_pool) = split_refill_pool(walk, &seed_uids);
 
     let seed_set: std::collections::HashSet<&str> = seed_uids.iter().map(|s| s.as_str()).collect();
     let mut seeds: Vec<ContextNode> = Vec::new();
@@ -2069,11 +2284,25 @@ pub fn build_feature_context(
             ranked.push(node);
         }
     }
-    // nw-113: the same owner ordering and cap as `build_context_with_intent`.
+    // nw-113: the same owner ordering, cap and refill as
+    // `build_context_with_intent`.
     let module_owners_omitted =
         rank_module_owners_last(&mut ranked, |node| owner_uids.contains(&node.uid));
+    let owners_listed = ranked
+        .iter()
+        .filter(|node| owner_uids.contains(&node.uid))
+        .count();
+    let refill_available = module_owners_omitted.min(refill_pool.len());
+    let take = refill_count(
+        module_owners_omitted,
+        ranked.len(),
+        limit,
+        refill_pool.len(),
+    );
+    let refill = context_nodes(store, &refill_pool[..take])?;
     // Apply limit to PPR results (seeds are always included).
-    let connected_total = ranked.len();
+    let connected_total = ranked.len() + refill_available;
+    insert_refill(&mut ranked, owners_listed, refill);
     let connected: Vec<ContextNode> = ranked
         .into_iter()
         .take(limit.unwrap_or(usize::MAX))
@@ -3073,16 +3302,18 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     // nw-181: this path already carries the daemon's disconnect/timeout flag,
     // so hand it to PPR — the most expensive stage — instead of letting a
     // 193k-node push loop run for a client that is already gone.
-    let mut ppr = store
-        .personalized_pagerank_with_intent_cancellable(
+    let walk = store
+        .personalized_pagerank_with_floor(
             &seed_uids,
             damping,
             20,
             &GraphScope::unified(),
             intent,
             cancel.map(|flag| flag.as_ref()),
+            CONTEXT_PPR_FLOOR,
         )
         .map_err(|e| anyhow::anyhow!(e))?;
+    let (mut ppr, refill_pool) = split_refill_pool(walk, &seed_uids);
 
     // nw-609: bound each container expansion to its most central members.
     // Every member personalized the walk above, so the PPR score of a member
@@ -3214,6 +3445,30 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     let module_owners_omitted = rank_module_owners_last(&mut connected, |node| {
         nestweaver_schema::uid::is_module_owner_uid(&node.uid)
     });
+    // nw-113: refill the places the hidden owners would have taken, as in
+    // code context. Brain context has no engine-side limit, so it returns as
+    // many real symbols as owners were hidden and the caller's limit cuts.
+    // Not for a capped hydration (`investigate`), whose entries never list
+    // owners and whose cap is its own.
+    if render_cap.is_none() {
+        let owners_listed = connected
+            .iter()
+            .filter(|node| nestweaver_schema::uid::is_module_owner_uid(&node.uid))
+            .count();
+        let take = refill_count(
+            module_owners_omitted,
+            connected.len(),
+            None,
+            refill_pool.len(),
+        );
+        let mut refill = Vec::with_capacity(take);
+        for (uid, score) in &refill_pool[..take] {
+            if let Some(node) = render_brain_node(store, uid, *score)? {
+                refill.push(node);
+            }
+        }
+        insert_refill(&mut connected, owners_listed, refill);
+    }
     pin_direct_seeds_in_connected(&seeds, &mut connected, &direct_seed_uids);
     // nw-670 re-review N7: only notes/sections the caller NAMED pin their
     // code — not every member a `vlt:`/`repo:` container seed expanded to.

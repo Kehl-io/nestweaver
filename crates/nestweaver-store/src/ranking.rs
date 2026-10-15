@@ -1209,6 +1209,34 @@ impl GraphStore {
         intent: Option<QueryIntent>,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<Vec<(String, f64)>, StoreError> {
+        self.personalized_pagerank_with_floor(
+            seed_uids,
+            damping,
+            max_iterations,
+            scope,
+            intent,
+            cancel,
+            PPR_MIN_SCORE,
+        )
+    }
+
+    /// [`Self::personalized_pagerank_with_intent_cancellable`] with the
+    /// score floor as a parameter: non-seed nodes scoring at or below
+    /// `min_score` are left out. nw-113: the context builders ask for a floor
+    /// of `0.0` so that, when capped `<module>` owners soaked up the walk's
+    /// mass, they can refill their list with real symbols that scored under
+    /// [`PPR_MIN_SCORE`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn personalized_pagerank_with_floor(
+        &self,
+        seed_uids: &[String],
+        damping: f64,
+        max_iterations: u32,
+        scope: &GraphScope,
+        intent: Option<QueryIntent>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        min_score: f64,
+    ) -> Result<Vec<(String, f64)>, StoreError> {
         let ensure_active = || -> Result<(), StoreError> {
             Self::check_read_deadline()?;
             if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
@@ -1254,6 +1282,7 @@ impl GraphStore {
             sorted_seeds.sort();
             sorted_seeds.hash(&mut hasher);
             damping.to_bits().hash(&mut hasher);
+            min_score.to_bits().hash(&mut hasher);
             max_iterations.hash(&mut hasher);
             s_hash.hash(&mut hasher);
             intent.hash(&mut hasher);
@@ -1345,7 +1374,7 @@ impl GraphStore {
         let config = PprConfig {
             damping: effective_damping,
             max_iterations,
-            min_score: PPR_MIN_SCORE,
+            min_score,
             interaction_scores,
             interaction_bias_weight: 0.05,
         };
