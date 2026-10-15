@@ -13047,10 +13047,12 @@ fn tool_flow_trace(
     // can no longer decide which occurrence of a node is the canonical one,
     // because DFS order was exactly what made the answer non-monotone.
     let frontier = flow_frontier(store, &[root.uid.as_str()], &blocked, &opts)?;
+    // nw-113: an owner root reads `path::<module>`, never bare.
+    let root_name = root.display_name().into_owned();
     let tree = build_flow_tree(
         store,
         &root.uid,
-        &root.name,
+        &root_name,
         &root.file_path,
         0,
         &frontier,
@@ -13059,7 +13061,7 @@ fn tool_flow_trace(
 
     let mut payload = json!({
         "root_uid": root.uid,
-        "root_name": root.name,
+        "root_name": root_name,
         "max_depth": max_depth,
         "tree": tree,
     });
@@ -32855,6 +32857,14 @@ mod ambiguous_name_contract_tests {
             let flow = tool_flow_trace(&store, json!({ "symbol": spec }), None, None).unwrap();
             assert_ne!(flow["status"], "ambiguous", "{spec}: {flow}");
             assert!(flow.to_string().contains("listen"), "{spec}: {flow}");
+            assert_eq!(
+                flow["root_name"], "src/controllers/index.js::<module>",
+                "{spec}: {flow}"
+            );
+            assert_eq!(
+                flow["tree"]["name"], "src/controllers/index.js::<module>",
+                "{spec}: {flow}"
+            );
             let impact = tool_brain_impact(&store, json!({ "symbol": spec }), None, None).unwrap();
             assert_eq!(impact["status"], "ok", "{spec}: {impact}");
             let owner = store
@@ -32865,6 +32875,27 @@ mod ambiguous_name_contract_tests {
                 .unwrap();
             assert_eq!(impact["target"], owner.uid, "{spec}: {impact}");
         }
+
+        let ambiguous_flow =
+            tool_flow_trace(&store, json!({ "symbol": "<module>" }), None, None).unwrap();
+        assert_eq!(ambiguous_flow["status"], "ambiguous", "{ambiguous_flow}");
+        assert!(
+            ambiguous_flow["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("pass a UID or path::name"),
+            "{ambiguous_flow}"
+        );
+        assert!(
+            tool_flow_trace(
+                &store,
+                json!({ "symbol": "nope/missing.js::listen" }),
+                None,
+                None
+            )
+            .is_err(),
+            "a qualifier naming no file is not found"
+        );
 
         let ambiguous =
             tool_brain_impact(&store, json!({ "symbol": "<module>" }), None, None).unwrap();

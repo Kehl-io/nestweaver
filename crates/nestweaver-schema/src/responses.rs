@@ -24,11 +24,11 @@ pub fn name_lookup_ambiguity_remedy(repo_filter: Option<&str>) -> String {
         Some(repo) => format!(
             "the symbol name matched multiple symbols. \
              --repo {repo} is already set and every match is inside it, so it \
-             cannot separate them. Pass a full UID instead — each candidate \
-             below carries one."
+             cannot separate them. Instead, pass a UID or path::name — each \
+             candidate below carries its UID and file path."
         ),
         None => "the symbol name matched multiple symbols. \
-                 Disambiguate with --repo <name> or pass a full UID"
+                 Disambiguate with --repo <name>, or pass a UID or path::name"
             .to_string(),
     }
 }

@@ -4007,6 +4007,12 @@ mod blast_radius_exit_code_tests {
 /// cross-repo link rather than an observed call, and omitting the label is what
 /// let fabricated cross-language execution paths read as real ones (nw-111).
 fn render_flow_trace_text(payload: &serde_json::Value) {
+    render_flow_trace_text_to(&mut std::io::stdout().lock(), payload);
+}
+
+/// [`render_flow_trace_text`] into any writer, so the text is testable. A
+/// failed write (a closed pipe) is ignored.
+fn render_flow_trace_text_to(out: &mut impl std::io::Write, payload: &serde_json::Value) {
     // nw-390. The JSON payload marks every place the tree was CUT — a
     // depth-capped node, a node whose canonical expansion lives elsewhere, and
     // rows a visibility policy removed. The text renderer read NONE of them, so
@@ -4052,23 +4058,28 @@ fn render_flow_trace_text(payload: &serde_json::Value) {
         }
     }
 
-    fn walk(node: &serde_json::Value, depth: usize) {
-        let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+    fn walk(out: &mut impl std::io::Write, node: &serde_json::Value, depth: usize) {
         let edge = node.get("edge_type").and_then(|v| v.as_str());
         let path = node.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+        // nw-113: an owner reads `path::<module>` even from an older peer
+        // that sent it bare.
+        let name = nestweaver_schema::symbol_display_name(
+            node.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+            path,
+        );
         let indent = "  ".repeat(depth + 1);
         let cut = cut_marker(node);
-        match edge {
-            Some(e) => println!("{indent}{name}  [{e}]  {path}{cut}"),
-            None => println!("{indent}{name}  {path}{cut}"),
-        }
+        let _ = match edge {
+            Some(e) => writeln!(out, "{indent}{name}  [{e}]  {path}{cut}"),
+            None => writeln!(out, "{indent}{name}  {path}{cut}"),
+        };
         for child in node
             .get("children")
             .and_then(|v| v.as_array())
             .into_iter()
             .flatten()
         {
-            walk(child, depth + 1);
+            walk(out, child, depth + 1);
         }
     }
 
@@ -4077,7 +4088,15 @@ fn render_flow_trace_text(payload: &serde_json::Value) {
         .or_else(|| payload.get("name"))
         .and_then(|v| v.as_str())
         .unwrap_or("?");
-    println!("Flow trace from '{root_name}':");
+    // nw-113: the owner root is labelled by its file, as in the tree.
+    let root_path = payload
+        .get("tree")
+        .unwrap_or(payload)
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let root_name = nestweaver_schema::symbol_display_name(root_name, root_path);
+    let _ = writeln!(out, "Flow trace from '{root_name}':");
 
     // A class root expands to one tree per method.
     //
@@ -4108,19 +4127,57 @@ fn render_flow_trace_text(payload: &serde_json::Value) {
                 .get("methods_total")
                 .and_then(serde_json::Value::as_u64)
             {
-                Some(total) => println!("  (showing {shown} of {total} methods)"),
-                None => println!("  (method list truncated)"),
+                Some(total) => {
+                    let _ = writeln!(out, "  (showing {shown} of {total} methods)");
+                }
+                None => {
+                    let _ = writeln!(out, "  (method list truncated)");
+                }
             }
         }
         for tree in trees {
-            walk(tree, 0);
+            walk(out, tree, 0);
         }
         return;
     }
     if let Some(tree) = payload.get("tree") {
-        walk(tree, 0);
+        walk(out, tree, 0);
     } else {
-        walk(payload, 0);
+        walk(out, payload, 0);
+    }
+}
+
+#[cfg(test)]
+mod flow_trace_text_tests {
+    /// nw-113: an owner root is labelled `path::<module>` in the heading and
+    /// the root row, even when the payload names it bare.
+    #[test]
+    fn owner_root_is_labelled_by_its_file() {
+        let payload = serde_json::json!({
+            "root_name": "<module>",
+            "tree": {
+                "name": "<module>",
+                "file_path": "src/a.js",
+                "children": [
+                    { "name": "listen", "file_path": "src/server.js", "edge_type": "CALLS", "children": [] }
+                ],
+            },
+        });
+        let mut out = Vec::new();
+        super::render_flow_trace_text_to(&mut out, &payload);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with("Flow trace from 'src/a.js::<module>':\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n  src/a.js::<module>  src/a.js\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n    listen  [CALLS]  src/server.js\n"),
+            "{text}"
+        );
     }
 }
 
