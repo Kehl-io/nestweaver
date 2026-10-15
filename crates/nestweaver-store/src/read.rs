@@ -4056,21 +4056,6 @@ impl GraphStore {
         Ok(uids)
     }
 
-    /// nw-113: the set of all symbol UIDs that are the SOURCE of at least one
-    /// CALLS edge. Single bulk query, the mirror of [`Self::all_callee_uids`].
-    pub fn all_caller_uids(&self) -> Result<std::collections::HashSet<String>, StoreError> {
-        let conn = self.conn()?;
-        let q = "MATCH (s:Symbol)-[:CALLS]->(:Symbol) RETURN DISTINCT s.uid";
-        let result = conn
-            .query(q)
-            .map_err(|e| StoreError::Query(e.to_string()))?;
-        let mut uids = std::collections::HashSet::new();
-        for row in result {
-            uids.insert(extract_string(&row, 0)?);
-        }
-        Ok(uids)
-    }
-
     /// List all Project nodes.
     pub fn list_projects(&self) -> Result<Vec<Project>, StoreError> {
         let conn = self.conn()?;

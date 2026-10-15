@@ -118,12 +118,10 @@ pub fn trace_processes(store: &GraphStore, max_depth: u32) -> Result<Vec<Process
         return Ok(Vec::new());
     }
 
-    let has_caller = store
-        .all_callee_uids()
-        .context("all_callee_uids for process tracing")?;
-    let has_callee = store
-        .all_caller_uids()
-        .context("all_caller_uids for process tracing")?;
+    let typed_edges = store
+        .load_typed_edges()
+        .context("load_typed_edges for process tracing")?;
+    let (has_caller, has_callee) = call_endpoint_sets(&typed_edges);
 
     let entry_points: Vec<&nestweaver_schema::Symbol> = symbols
         .iter()
@@ -137,6 +135,23 @@ pub fn trace_processes(store: &GraphStore, max_depth: u32) -> Result<Vec<Process
     }
 
     Ok(processes)
+}
+
+/// The CALLS endpoint sets [`symbol_is_entry_point`] gates on, from the
+/// loaded edges: `(has_caller, has_callee)`, the CALLS targets and sources.
+/// Shared by [`trace_processes`] and change impact so both apply one gate.
+fn call_endpoint_sets(
+    typed_edges: &[nestweaver_store::read::TypedEdge],
+) -> (HashSet<String>, HashSet<String>) {
+    let mut has_caller = HashSet::new();
+    let mut has_callee = HashSet::new();
+    for (src, dst, etype, _, _) in typed_edges {
+        if etype == "CALLS" {
+            has_caller.insert(dst.clone());
+            has_callee.insert(src.clone());
+        }
+    }
+    (has_caller, has_callee)
 }
 
 /// Whether a symbol is treated as a process entry point: explicitly flagged, a
@@ -615,18 +630,12 @@ fn detect_changes_impact_with_work_budget(
         .context("load_typed_edges for change impact")?;
     let mut fwd_adj: Adjacency = std::collections::HashMap::new();
     let mut rev_adj: Adjacency = std::collections::HashMap::new();
-    // `has_caller` mirrors `all_callee_uids`: targets of CALLS edges. Used by the
-    // entry-point predicate's root test.
-    let mut has_caller: HashSet<String> = HashSet::new();
-    // nw-113: CALLS sources, so only an owner that calls something is a process.
-    let mut has_callee: HashSet<String> = HashSet::new();
+    // The same entry-point gate as `trace_processes` (nw-113: only an owner
+    // that calls something is a process).
+    let (has_caller, has_callee) = call_endpoint_sets(&typed_edges);
     for edge in &typed_edges {
         GraphStore::check_read_deadline()?;
         let (src, dst, etype) = (&edge.0, &edge.1, edge.2.as_str());
-        if etype == "CALLS" {
-            has_caller.insert(dst.clone());
-            has_callee.insert(src.clone());
-        }
         if PROCESS_EDGE_TYPES.contains(&etype) {
             fwd_adj.entry(src.clone()).or_default().push(dst.clone());
             rev_adj.entry(dst.clone()).or_default().push(src.clone());
@@ -778,6 +787,25 @@ mod tests {
         )
         .unwrap();
         (dir, store)
+    }
+
+    /// nw-113: one helper derives the entry-point gate's CALLS endpoint sets
+    /// from the loaded edges, for whole-graph tracing and change impact alike.
+    #[test]
+    fn call_endpoint_sets_read_only_calls_edges() {
+        let edge = |a: &str, b: &str, kind: &str| {
+            (
+                a.to_string(),
+                b.to_string(),
+                kind.to_string(),
+                1.0,
+                String::new(),
+            )
+        };
+        let edges = vec![edge("a", "b", "CALLS"), edge("c", "d", "IMPORTS")];
+        let (has_caller, has_callee) = call_endpoint_sets(&edges);
+        assert_eq!(has_caller, HashSet::from(["b".to_string()]));
+        assert_eq!(has_callee, HashSet::from(["a".to_string()]));
     }
 
     /// nw-113: two `index.js` owners are two distinctly named processes, and
