@@ -174,6 +174,14 @@ pub enum ReferenceKind {
     /// A use of this name inside the enclosing symbol names the binding, not
     /// an unrelated symbol of the same name.
     LocalBinding,
+    /// nw-787: a JS/TS `function` declaration nested in a function body or a
+    /// block. `scope` is the region it is visible in: the enclosing function
+    /// body, or (strict code: TypeScript, an ES module, `"use strict"`) its
+    /// own block. It is hoisted, so `position` and `initialized_at` are the
+    /// region's start. A module-level declaration emits none: it is visible
+    /// file-wide. Kept apart from `LocalBinding` because it names the graph
+    /// symbol itself and never shadows it. Not an edge.
+    HoistedDeclaration,
     /// Exact public export. `name` is the public name (including `default`),
     /// `context` is the local declaration or original forwarded name, and
     /// `receiver` is the source module for a named re-export. Not an edge.
@@ -2194,6 +2202,9 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     // nw-724: parameters and local declarations shadow same-named symbols.
     if share_locals {
         references.extend(local_bindings.iter().cloned());
+        if matches!(lang, Language::JavaScript | Language::TypeScript) {
+            collect_hoisted_declarations(tree.root_node(), source_bytes, &mut references, lang);
+        }
     } else {
         collect_local_bindings(tree.root_node(), source_bytes, &mut references, lang);
     }
@@ -3303,6 +3314,95 @@ fn emit_binding_names(
         for child in current.children(&mut cursor) {
             stack.push(child);
         }
+    }
+}
+
+/// nw-787: one `HoistedDeclaration` per JS/TS `function` declaration that is
+/// not at module level, scoped to where it is visible (see the variant).
+///
+/// In sloppy code (a `.js` script with no `import`/`export` and no leading
+/// `"use strict"`) a block-level declaration is also visible in its enclosing
+/// function (ECMA-262 Annex B.3.3), so it is scoped to that function body, or
+/// emits nothing when that is the module. Class bodies are always strict.
+fn collect_hoisted_declarations(
+    root: tree_sitter::Node<'_>,
+    source_bytes: &[u8],
+    references: &mut Vec<RawReference>,
+    lang: Language,
+) {
+    let strict_file = lang == Language::TypeScript || {
+        let mut cursor = root.walk();
+        let statements: Vec<_> = root.named_children(&mut cursor).collect();
+        statements
+            .iter()
+            .any(|child| matches!(child.kind(), "import_statement" | "export_statement"))
+            || statements
+                .iter()
+                .find(|child| child.kind() != "comment" && child.kind() != "hash_bang_line")
+                .and_then(|first| first.named_child(0).filter(|_| first.kind() == "expression_statement"))
+                .and_then(|string| string.utf8_text(source_bytes).ok())
+                .is_some_and(|text| matches!(text, "\"use strict\"" | "'use strict'"))
+    };
+    let is_function_body = |node: tree_sitter::Node<'_>| {
+        node.kind() == "class_static_block"
+            || node.kind() == "statement_block"
+                && node.parent().is_some_and(|parent| {
+                    matches!(
+                        parent.kind(),
+                        "function_declaration"
+                            | "function_expression"
+                            | "generator_function_declaration"
+                            | "generator_function"
+                            | "arrow_function"
+                            | "method_definition"
+                    )
+                })
+    };
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+        if !matches!(
+            node.kind(),
+            "function_declaration" | "generator_function_declaration"
+        ) {
+            continue;
+        }
+        let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|name| Some((name, name.utf8_text(source_bytes).ok()?)))
+        else {
+            continue;
+        };
+        let ancestors = || std::iter::successors(node.parent(), |ancestor| ancestor.parent());
+        let strict = strict_file || ancestors().any(|ancestor| ancestor.kind() == "class_body");
+        // The innermost function body, or in strict code the innermost block;
+        // `None` at module level.
+        let Some(region) = ancestors()
+            .take_while(|ancestor| ancestor.kind() != "program")
+            .find(|&ancestor| {
+                is_function_body(ancestor)
+                    || strict && matches!(ancestor.kind(), "statement_block" | "switch_body")
+            })
+        else {
+            continue;
+        };
+        references.push(RawReference {
+            scope: Some(LexicalScope {
+                start: region.start_byte(),
+                end: region.end_byte(),
+                position: region.start_byte(),
+                initialized_at: region.start_byte(),
+                hoisted_var: false,
+            }),
+            name: name.1.to_string(),
+            kind: ReferenceKind::HoistedDeclaration,
+            start_line: name.0.start_position().row as u32 + 1,
+            context: String::new(),
+            receiver: None,
+        });
     }
 }
 
@@ -14507,5 +14607,55 @@ export function G(a) {\n\
             parsed.symbols
         );
         assert!(parsed.unparsable_skip("b.js").is_none());
+    }
+
+    /// nw-787: a nested `function` declaration gets a `HoistedDeclaration`
+    /// scoped to where it is visible, hoisted to the region's start; a
+    /// module-level one gets none. A block declaration is block-scoped in
+    /// strict code and function-scoped (Annex B) in a sloppy script.
+    #[test]
+    fn nested_function_declarations_carry_their_visible_region() {
+        let body = "function g() {\n  {\n    function f() {}\n  }\n  function* h() {}\n}\nfunction top() {}\n";
+        let region = |source: &str, path: &str, name: &str| -> Vec<(usize, usize)> {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            parsed
+                .references
+                .iter()
+                .filter(|r| r.kind == ReferenceKind::HoistedDeclaration && r.name == name)
+                .filter_map(|r| r.scope)
+                .inspect(|scope| {
+                    assert_eq!(scope.position, scope.start, "{path}: {name} is hoisted");
+                    assert_eq!(scope.initialized_at, scope.start);
+                })
+                .map(|scope| (scope.start, scope.end))
+                .collect()
+        };
+        let span = |source: &str, open: &str, close: &str| {
+            let start = source.find(open).unwrap();
+            (start, source[start..].find(close).unwrap() + start + close.len())
+        };
+        for (path, prefix, strict) in [
+            ("a.ts", "", true),
+            ("m.js", "export const x = 1;\n", true),
+            ("u.js", "\"use strict\";\n", true),
+            ("s.js", "", false),
+        ] {
+            let source = format!("{prefix}{body}");
+            let g_body = span(&source, "{\n  {", "\n}");
+            let block = span(&source, "{\n    function f", "\n  }");
+            let f_region = if strict { block } else { g_body };
+            assert_eq!(region(&source, path, "f"), vec![f_region], "{path}");
+            assert_eq!(region(&source, path, "h"), vec![g_body], "{path}");
+            assert!(region(&source, path, "g").is_empty(), "{path}: module level");
+            assert!(region(&source, path, "top").is_empty(), "{path}: module level");
+        }
+        // A sloppy script's block declaration at module level stays file-wide;
+        // a class body is strict even in a script.
+        let script = "{\n  function f() {}\n}\nclass C {\n  m() {\n    {\n      function k() {}\n    }\n  }\n}\n";
+        assert!(region(script, "s.js", "f").is_empty());
+        assert_eq!(
+            region(script, "s.js", "k"),
+            vec![span(script, "{\n      function k", "\n    }")]
+        );
     }
 }
