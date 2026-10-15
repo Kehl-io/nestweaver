@@ -2290,7 +2290,9 @@ fn same_file_declaration_scope(
             return Some(usize::MAX);
         }
         return match innermost_container(sorted_syms, sym) {
-            Some(container) if matches!(container.kind, SymbolKind::Function | SymbolKind::Method) => {
+            Some(container)
+                if matches!(container.kind, SymbolKind::Function | SymbolKind::Method) =>
+            {
                 let end = container.end_line.max(container.start_line);
                 (container.start_line <= reference.start_line && reference.start_line <= end)
                     .then(|| (end - container.start_line) as usize)
@@ -2385,7 +2387,10 @@ fn nested_inside_binding(
 /// owner) whose line span contains `sym`'s first line: the narrowest span,
 /// the later start on a tie, which assumes `sym` follows a shared line's
 /// boundary.
-fn innermost_container<'a>(sorted_syms: &[&'a RawSymbol], sym: &RawSymbol) -> Option<&'a RawSymbol> {
+fn innermost_container<'a>(
+    sorted_syms: &[&'a RawSymbol],
+    sym: &RawSymbol,
+) -> Option<&'a RawSymbol> {
     sorted_syms
         .iter()
         .take_while(|other| other.start_line <= sym.start_line)
@@ -10931,7 +10936,11 @@ export function readIt() { return value(); }
             } else {
                 uid_at(&files, path, "f", line)
             };
-            assert_eq!(call_targets(&files, &edges, path, "g"), vec![want], "{path}");
+            assert_eq!(
+                call_targets(&files, &edges, path, "g"),
+                vec![want],
+                "{path}"
+            );
         }
     }
 
@@ -11025,7 +11034,10 @@ export function readIt(b: Box) { size(); run(); b.run(); return value(); }
                 targets.contains(&uid_at(&files, path, "value", 8)),
                 "{path}: the free function must win: {targets:?}"
             );
-            assert!(targets.contains(&"unresolved:run".to_string()), "{path}: {targets:?}");
+            assert!(
+                targets.contains(&"unresolved:run".to_string()),
+                "{path}: {targets:?}"
+            );
             assert_eq!(
                 call_targets(&files, &edges, path, "use"),
                 vec![uid_at(&files, path, "run", 4)],

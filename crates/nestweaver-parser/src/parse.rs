@@ -3339,7 +3339,11 @@ fn collect_hoisted_declarations(
             || statements
                 .iter()
                 .find(|child| child.kind() != "comment" && child.kind() != "hash_bang_line")
-                .and_then(|first| first.named_child(0).filter(|_| first.kind() == "expression_statement"))
+                .and_then(|first| {
+                    first
+                        .named_child(0)
+                        .filter(|_| first.kind() == "expression_statement")
+                })
                 .and_then(|string| string.utf8_text(source_bytes).ok())
                 .is_some_and(|text| matches!(text, "\"use strict\"" | "'use strict'"))
     };
@@ -14632,7 +14636,10 @@ export function G(a) {\n\
         };
         let span = |source: &str, open: &str, close: &str| {
             let start = source.find(open).unwrap();
-            (start, source[start..].find(close).unwrap() + start + close.len())
+            (
+                start,
+                source[start..].find(close).unwrap() + start + close.len(),
+            )
         };
         for (path, prefix, strict) in [
             ("a.ts", "", true),
@@ -14646,8 +14653,14 @@ export function G(a) {\n\
             let f_region = if strict { block } else { g_body };
             assert_eq!(region(&source, path, "f"), vec![f_region], "{path}");
             assert_eq!(region(&source, path, "h"), vec![g_body], "{path}");
-            assert!(region(&source, path, "g").is_empty(), "{path}: module level");
-            assert!(region(&source, path, "top").is_empty(), "{path}: module level");
+            assert!(
+                region(&source, path, "g").is_empty(),
+                "{path}: module level"
+            );
+            assert!(
+                region(&source, path, "top").is_empty(),
+                "{path}: module level"
+            );
         }
         // A sloppy script's block declaration at module level stays file-wide;
         // a class body is strict even in a script.

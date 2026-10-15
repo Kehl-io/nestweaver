@@ -3589,16 +3589,66 @@ mod tests {
         // (file, body, caller, the line of the expected same-file `f` in the
         // body, or `None` for lib's `f`). The import adds one line.
         let shapes: [(&str, &str, &str, Option<u32>); 10] = [
-            ("f1.ts", "function outer() {\n  function h() {\n    function f() { return 1; }\n  }\n  function g() {\n    return f();\n  }\n}\n", "g", None),
-            ("f2.ts", "function g() {\n  const cb = () => {\n    function f() { return 1; }\n  };\n  return f();\n}\n", "g", None),
-            ("f3.ts", "class C {\n  f() { return 1; }\n  m() {\n    return f();\n  }\n}\n", "m", None),
-            ("f4.ts", "function g() {\n  {\n    function f() { return 1; }\n  }\n  return f();\n}\n", "g", None),
-            ("s3.ts", "function g() {\n  function f() { return 1; }\n  return f();\n}\n", "g", Some(2)),
-            ("s4.ts", "function h() {\n  function f() {}\n}\nfunction g() {\n  return f();\n}\n", "g", None),
-            ("f6.ts", "function outer() {\n  function f() { return 1; }\n  function g() {\n    return f();\n  }\n}\n", "g", Some(2)),
-            ("f7.ts", "class C {\n  m() {\n    function f() { return 1; }\n    return f();\n  }\n}\n", "m", Some(3)),
-            ("sib.ts", "function h() {\n  function f() { return 1; }\n  return 0;\n}\nfunction g() {\n  function f() { return 2; }\n  return f();\n}\n", "g", Some(6)),
-            ("hoist.ts", "function g() {\n  const x = f();\n  function f() { return 1; }\n  return x;\n}\n", "g", Some(3)),
+            (
+                "f1.ts",
+                "function outer() {\n  function h() {\n    function f() { return 1; }\n  }\n  function g() {\n    return f();\n  }\n}\n",
+                "g",
+                None,
+            ),
+            (
+                "f2.ts",
+                "function g() {\n  const cb = () => {\n    function f() { return 1; }\n  };\n  return f();\n}\n",
+                "g",
+                None,
+            ),
+            (
+                "f3.ts",
+                "class C {\n  f() { return 1; }\n  m() {\n    return f();\n  }\n}\n",
+                "m",
+                None,
+            ),
+            (
+                "f4.ts",
+                "function g() {\n  {\n    function f() { return 1; }\n  }\n  return f();\n}\n",
+                "g",
+                None,
+            ),
+            (
+                "s3.ts",
+                "function g() {\n  function f() { return 1; }\n  return f();\n}\n",
+                "g",
+                Some(2),
+            ),
+            (
+                "s4.ts",
+                "function h() {\n  function f() {}\n}\nfunction g() {\n  return f();\n}\n",
+                "g",
+                None,
+            ),
+            (
+                "f6.ts",
+                "function outer() {\n  function f() { return 1; }\n  function g() {\n    return f();\n  }\n}\n",
+                "g",
+                Some(2),
+            ),
+            (
+                "f7.ts",
+                "class C {\n  m() {\n    function f() { return 1; }\n    return f();\n  }\n}\n",
+                "m",
+                Some(3),
+            ),
+            (
+                "sib.ts",
+                "function h() {\n  function f() { return 1; }\n  return 0;\n}\nfunction g() {\n  function f() { return 2; }\n  return f();\n}\n",
+                "g",
+                Some(6),
+            ),
+            (
+                "hoist.ts",
+                "function g() {\n  const x = f();\n  function f() { return 1; }\n  return x;\n}\n",
+                "g",
+                Some(3),
+            ),
         ];
         let write_all = |edit: u32| {
             for (file, body, _, _) in &shapes {
