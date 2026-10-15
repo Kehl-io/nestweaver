@@ -346,7 +346,9 @@ pub fn export_graphml_scoped(
       <data key="pagerank">{:.6}</data>
     </node>"#,
             xml_escape(&sym.uid),
-            xml_escape(&sym.name),
+            // nw-113: an owner is labelled `path::<module>`, like everywhere
+            // else; every other symbol's label is its name, as before.
+            xml_escape(&sym.display_name()),
             xml_escape(&sym.kind.to_string()),
             xml_escape(&sym.file_path),
             pr,
@@ -612,6 +614,16 @@ fn mermaid_label(s: &str) -> String {
     format!("\"{escaped}\"")
 }
 
+/// nw-113: a `<module>` owner's label, `<repo-relative path>::<module>`, the
+/// same name every other surface uses. The path goes through
+/// [`mermaid_label`]; the angle brackets use Mermaid's `#lt;`/`#gt;` entity
+/// codes, which render as `<`/`>` inside a quoted label, instead of being
+/// mangled to `_module_`.
+fn mermaid_owner_label(file_path: &str) -> String {
+    let quoted = mermaid_label(&format!("{file_path}::"));
+    format!("{}#lt;module#gt;\"", &quoted[..quoted.len() - 1])
+}
+
 /// Export the top-N symbols (by PageRank) as a Mermaid flowchart, grouped by file.
 ///
 /// Only symbols that appear in the top-N set and edges between them are included.
@@ -673,8 +685,12 @@ pub fn export_mermaid(
         )?;
         for sym in syms {
             let node_id = mermaid_id(&sym.uid);
-            let label = format!("{} ({})", sym.name, sym.kind);
-            writeln!(writer, "    {}[{}]", node_id, mermaid_label(&label))?;
+            let label = if sym.is_module_owner() {
+                mermaid_owner_label(&sym.file_path)
+            } else {
+                mermaid_label(&format!("{} ({})", sym.name, sym.kind))
+            };
+            writeln!(writer, "    {node_id}[{label}]")?;
         }
         writeln!(writer, "  end")?;
     }
@@ -1330,6 +1346,34 @@ mod tests {
         assert!(output.contains("</graphml>"));
     }
 
+    /// nw-113 final round: a `<module>` owner's GraphML label is its
+    /// `path::<module>` display name, so Gephi and yEd do not show thousands
+    /// of identical `<module>` labels.
+    #[test]
+    fn graphml_labels_owners_by_path() {
+        let store = populated_store();
+        let mut owner = make_symbol(
+            "sym-owner",
+            nestweaver_schema::MODULE_OWNER_NAME,
+            "src/a.js",
+        );
+        owner.kind = nestweaver_schema::SymbolKind::Module;
+        owner.is_entry_point = true;
+        owner.entry_point_kind = Some(nestweaver_schema::EntryPointKind::ModuleInit);
+        store.insert_symbol(&owner).unwrap();
+        let mut buf = Vec::new();
+        export_graphml(&store, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains(r#"<data key="label">src/a.js::&lt;module&gt;</data>"#),
+            "{output}"
+        );
+        assert!(
+            !output.contains(r#"<data key="label">&lt;module&gt;</data>"#),
+            "{output}"
+        );
+    }
+
     #[test]
     fn graphml_export_includes_edges() {
         let store = populated_store();
@@ -1362,6 +1406,30 @@ mod tests {
         assert!(output.contains("fn_beta"));
         // Edge from sym-a to sym-b should be present
         assert!(output.contains("-->"));
+    }
+
+    /// nw-113: a `<module>` owner reads `file::<module>` in a Mermaid label,
+    /// escaped with Mermaid entity codes, instead of the mangled `_module_`.
+    #[test]
+    fn mermaid_labels_the_module_owner_by_file() {
+        let store = test_store();
+        let mut owner = make_symbol(
+            "sym-m",
+            nestweaver_schema::MODULE_OWNER_NAME,
+            "src/app/ownerless.ts",
+        );
+        owner.kind = SymbolKind::Module;
+        owner.is_entry_point = true;
+        owner.entry_point_kind = Some(nestweaver_schema::EntryPointKind::ModuleInit);
+        store.insert_symbol(&owner).unwrap();
+        let mut buf = Vec::new();
+        export_mermaid(&store, 50, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("[\"src/app/ownerless.ts::#lt;module#gt;\"]"),
+            "{output}"
+        );
+        assert!(!output.contains("_module_"), "{output}");
     }
 
     #[test]

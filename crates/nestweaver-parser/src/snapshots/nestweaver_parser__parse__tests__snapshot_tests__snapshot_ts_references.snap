@@ -6,7 +6,7 @@ expression: "parsed_references(\"simple.ts\", &source)"
     start: 0
     end: 753
     position: 9
-    initialized_at: 9
+    initialized_at: 0
     hoisted_var: false
   name: EventEmitter
   kind: ImportAlias

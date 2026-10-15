@@ -525,6 +525,7 @@ fn parse_entry_point_kind(s: &str) -> Option<EntryPointKind> {
         "lambda_handler" => Some(EntryPointKind::LambdaHandler),
         "cron_job" => Some(EntryPointKind::CronJob),
         "cli_command" => Some(EntryPointKind::CliCommand),
+        "module_init" => Some(EntryPointKind::ModuleInit),
         _ => None,
     }
 }
@@ -854,6 +855,117 @@ impl GraphStore {
         result.map(|row| row_to_symbol(&row)).collect()
     }
 
+    /// nw-113: name lookup that honours a `file::name`, `Class::method` or
+    /// `file::Class::method` qualifier.
+    ///
+    /// A spec that is itself a stored name resolves as one. Otherwise the
+    /// last segment is looked up and the qualifiers narrow it, read as a
+    /// file (an exact repo-relative path, a path suffix such as `wsgi.py`,
+    /// or a suffix without its extension such as `conftest`) followed by a
+    /// `MEMBER_OF` container chain, or as a container chain alone
+    /// ([`nestweaver_schema::QualifiedSpec::select`]). Both readings are
+    /// kept, so a class name that is also a file stem is ambiguous rather
+    /// than silently answered by the file. A qualifier that names neither
+    /// is not found: a strict lookup never falls back to the last segment,
+    /// which answered `Foo::qux` with another class's `qux`.
+    pub fn lookup_symbols_by_spec(&self, spec: &str) -> Result<Vec<Symbol>, StoreError> {
+        let exact = self.lookup_symbols_by_name(spec)?;
+        let Some(qualified) =
+            nestweaver_schema::QualifiedSpec::parse(spec).filter(|_| exact.is_empty())
+        else {
+            return Ok(exact);
+        };
+        let candidates = self.lookup_symbols_by_name(qualified.name)?;
+        if candidates.is_empty() {
+            return Ok(candidates);
+        }
+        let uids: Vec<&str> = candidates.iter().map(|s| s.uid.as_str()).collect();
+        let chains = self.container_chains(&uids, qualified.max_container_depth())?;
+        Ok(qualified.select(candidates, |uid| {
+            chains.get(uid).map_or(&[][..], Vec::as_slice)
+        }))
+    }
+
+    /// Each symbol's `MEMBER_OF` container names, innermost first, up to
+    /// `depth` levels. A symbol with no container maps to an empty chain (or
+    /// is absent). When a symbol has several containers the one with the
+    /// smallest UID is followed, so the answer is deterministic.
+    pub fn container_chains(
+        &self,
+        uids: &[&str],
+        depth: usize,
+    ) -> Result<HashMap<String, Vec<String>>, StoreError> {
+        let mut chains: HashMap<String, Vec<String>> = HashMap::new();
+        // (origin uid, uid whose parent is fetched next)
+        let mut frontier: Vec<(String, String)> = uids
+            .iter()
+            .map(|uid| (uid.to_string(), uid.to_string()))
+            .collect();
+        for _ in 0..depth {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut wanted: Vec<&str> = frontier.iter().map(|(_, at)| at.as_str()).collect();
+            wanted.sort_unstable();
+            wanted.dedup();
+            let parents = self.member_of_parents(&wanted)?;
+            frontier = frontier
+                .into_iter()
+                .filter_map(|(origin, at)| {
+                    let (parent_uid, parent_name) = parents.get(&at)?;
+                    chains
+                        .entry(origin.clone())
+                        .or_default()
+                        .push(parent_name.clone());
+                    Some((origin, parent_uid.clone()))
+                })
+                .collect();
+        }
+        Ok(chains)
+    }
+
+    /// `uid -> (parent uid, parent name)` over `MEMBER_OF`, for `uids`.
+    fn member_of_parents(
+        &self,
+        uids: &[&str],
+    ) -> Result<HashMap<String, (String, String)>, StoreError> {
+        let mut parents: HashMap<String, (String, String)> = HashMap::new();
+        if uids.is_empty() {
+            return Ok(parents);
+        }
+        let conn = self.conn()?;
+        let q = "UNWIND $uids AS want_uid \
+                 MATCH (s:Symbol {uid: want_uid})-[:MEMBER_OF]->(p:Symbol) \
+                 RETURN s.uid, p.uid, p.name";
+        for chunk in uids.chunks(512) {
+            let mut stmt = conn
+                .prepare(q)
+                .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
+            let list = Value::List(
+                lbug::LogicalType::String,
+                chunk
+                    .iter()
+                    .map(|uid| Value::String(uid.to_string()))
+                    .collect(),
+            );
+            let result = conn
+                .execute(&mut stmt, vec![("uids", list)])
+                .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+            for row in result {
+                let child = extract_string(&row, 0)?;
+                let parent_uid = extract_string(&row, 1)?;
+                let parent_name = extract_string(&row, 2)?;
+                match parents.get(&child) {
+                    Some((kept, _)) if *kept <= parent_uid => {}
+                    _ => {
+                        parents.insert(child, (parent_uid, parent_name));
+                    }
+                }
+            }
+        }
+        Ok(parents)
+    }
+
     /// `(uid, repo_uid, visibility)` of every symbol whose name is in
     /// `names`, keyed by name, from ONE scan of the Symbol table.
     ///
@@ -1030,7 +1142,7 @@ impl GraphStore {
         let callers_query = format!(
             "UNWIND [{in_list}] AS want_uid \
              MATCH (caller:Symbol)-[:CALLS]->(target:Symbol {{uid: want_uid}}) \
-             RETURN target.uid, caller.name"
+             RETURN target.uid, caller.name, caller.file_path"
         );
         let callers = conn
             .query(&callers_query)
@@ -1038,6 +1150,9 @@ impl GraphStore {
         for row in callers {
             let uid = extract_string(&row, 0)?;
             let name = extract_string(&row, 1)?;
+            // nw-113: an owner caller reads `path::<module>`, never bare.
+            let name = nestweaver_schema::symbol_display_name(&name, &extract_string(&row, 2)?)
+                .into_owned();
             if let Some((names, _)) = adjacency.get_mut(&uid) {
                 names.push(name);
             }
@@ -2597,6 +2712,15 @@ impl GraphStore {
         Ok(self.list_all_symbols_with_integrity()?.0)
     }
 
+    /// Symbols an embedding pass should embed: every symbol except the
+    /// per-file `<module>` owners (nw-113), whose embed text would be only
+    /// `Module <module>` and carry no meaning.
+    pub fn list_embeddable_symbols(&self) -> Result<Vec<nestweaver_schema::Symbol>, StoreError> {
+        let mut symbols = self.list_all_symbols()?;
+        symbols.retain(|symbol| !symbol.is_module_owner());
+        Ok(symbols)
+    }
+
     /// [`Self::list_all_symbols`] plus what the scan actually covered.
     pub fn list_all_symbols_with_integrity(
         &self,
@@ -3222,6 +3346,15 @@ impl GraphStore {
     /// Each row is `(file_uid, file_path)`.
     pub fn list_files_by_repo(&self, repo_uid: &str) -> Result<Vec<(String, String)>, StoreError> {
         let conn = self.conn()?;
+        Self::list_files_by_repo_on(&conn, repo_uid)
+    }
+
+    /// [`Self::list_files_by_repo`] on a caller-held connection, so a write
+    /// transaction sees its own uncommitted File rows.
+    pub fn list_files_by_repo_on(
+        conn: &crate::db::StoreConnection<'_>,
+        repo_uid: &str,
+    ) -> Result<Vec<(String, String)>, StoreError> {
         let q = "MATCH (f:File) WHERE f.repo_uid = $repo RETURN f.uid, f.path";
         let mut stmt = conn
             .prepare(q)
@@ -5390,6 +5523,29 @@ impl GraphStore {
             }
         }
         Ok(out.into_iter().collect())
+    }
+}
+
+#[cfg(test)]
+mod entry_kind_tests {
+    use super::*;
+
+    /// nw-113: every entry kind survives the string round trip the store uses.
+    #[test]
+    fn every_entry_point_kind_round_trips_through_its_stored_string() {
+        use nestweaver_schema::EntryPointKind as K;
+        for kind in [
+            K::Main,
+            K::HttpHandler,
+            K::EventListener,
+            K::TestEntry,
+            K::LambdaHandler,
+            K::CronJob,
+            K::CliCommand,
+            K::ModuleInit,
+        ] {
+            assert_eq!(parse_entry_point_kind(&kind.to_string()), Some(kind));
+        }
     }
 }
 

@@ -43,7 +43,7 @@ was **0/15**, and it remains poor on C++.
 
 ## Before you trust a ranking
 
-`RESOLVER_GENERATION` is 9. A repo is stale when its recorded generation is not exactly 9.
+`RESOLVER_GENERATION` is 10. A repo is stale when its recorded generation is not exactly 10.
 Re-index with `nestweaver index --repo <path> --force` — plain `index` is incremental and
 does nothing on a repo already at HEAD.
 

@@ -57,6 +57,11 @@ pub struct AffectedSymbol {
     pub ownership_resolved: bool,
 }
 
+/// nw-113: the `edge_type` of an affected symbol reached because a changed
+/// file that is only top-level code calls it. Nothing calls a file's
+/// top-level code, so what it calls is the reach of the change.
+pub const TOP_LEVEL_CALL_EDGE: &str = "TOP_LEVEL_CALL";
+
 /// A cluster (community) that contains affected symbols.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AffectedCluster {
@@ -217,6 +222,13 @@ pub struct BlastRadiusResult {
     #[serde(default)]
     pub affected_symbol_count: usize,
     pub affected_clusters: Vec<AffectedCluster>,
+    /// nw-113: what a changed file that is only top-level code calls
+    /// (`edge_type: TOP_LEVEL_CALL`, depth 1). Nothing calls such a file, so
+    /// these are the reach of its change, not its dependents: they are kept
+    /// out of `affected_symbols`, `affected_symbol_count`, the clusters and
+    /// the risk level (final review I3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_level_callees: Vec<AffectedSymbol>,
     pub risk_level: RiskLevel,
     pub summary: String,
     /// Org-wide impacts from the upstream server (if available).
@@ -321,6 +333,35 @@ pub(crate) fn derive_gate_state(
         GateState::RiskFlagged
     } else {
         GateState::Ok
+    }
+}
+
+/// How many callees a `changed-file-top-level-only` notification names.
+const TOP_LEVEL_CALLS_NAMED: usize = 10;
+
+/// nw-113 final review I3: the callee list of a `changed-file-top-level-only`
+/// notification: the first [`TOP_LEVEL_CALLS_NAMED`] callees in `owner`'s own
+/// repo, then "+N more". A callee in another repo is only counted, so a
+/// message redaction never sees cannot name a symbol of a repo the caller may
+/// not be allowed to see; `top_level_callees` lists them all.
+fn top_level_call_list(
+    owner: &nestweaver_schema::Symbol,
+    callees: &[nestweaver_schema::Symbol],
+) -> String {
+    if callees.is_empty() {
+        return "nothing indexed".to_string();
+    }
+    let named: Vec<String> = callees
+        .iter()
+        .filter(|callee| callee.repo_uid == owner.repo_uid)
+        .take(TOP_LEVEL_CALLS_NAMED)
+        .map(|callee| callee.display_name().into_owned())
+        .collect();
+    let more = callees.len() - named.len();
+    match (named.is_empty(), more) {
+        (true, _) => format!("{more} symbol(s) in other repos"),
+        (false, 0) => named.join(", "),
+        (false, more) => format!("{} (+{more} more)", named.join(", ")),
     }
 }
 
@@ -500,6 +541,8 @@ pub fn analyze_blast_radius(
     // Step 1: Map changed files to symbols.
     let mut changed_symbols: Vec<ChangedSymbol> = Vec::new();
     let mut changed_uids: HashSet<String> = HashSet::new();
+    // nw-113: owners of changed files that hold only top-level code.
+    let mut top_level_only: Vec<nestweaver_schema::Symbol> = Vec::new();
     // Repos that own the changed symbols — used to separate same-repo ("local")
     // impact from cross-repo ("org-wide") impact below.
     let mut changed_repos: HashSet<String> = HashSet::new();
@@ -622,8 +665,22 @@ pub fn analyze_blast_radius(
             continue;
         }
 
+        // nw-113: a source file that is only top-level code has just its
+        // owner, which is no changed symbol. Its change is reported through
+        // what its top-level code calls (below), never as a silent Low.
+        if class == crate::changed_files::ChangedFileClass::Source
+            && syms.iter().all(|sym| sym.is_module_owner())
+        {
+            top_level_only.extend(syms.iter().cloned());
+        }
+
         for sym in syms {
             changed_repos.insert(sym.repo_uid.clone());
+            // nw-113: a file's `<module>` owner is no changed symbol. It has
+            // no callers, so it adds nothing to the walk, only to the counts.
+            if sym.is_module_owner() {
+                continue;
+            }
             if changed_uids.insert(sym.uid.clone()) {
                 changed_symbols.push(ChangedSymbol {
                     uid: sym.uid.clone(),
@@ -790,11 +847,70 @@ pub fn analyze_blast_radius(
         }
     }
 
+    // nw-113: nothing calls a file's top-level code, so a changed file that
+    // is only top-level code reaches exactly what that code calls. Those
+    // callees are listed apart, in `top_level_callees`: they are the reach of
+    // the change, not its dependents, so they stay out of the affected
+    // symbols, the clusters and the risk (final review I3).
+    //
+    // What does depend on such a file is whoever loads it for its side
+    // effects (`import './setup'`, a bare `require`), and the graph records
+    // no edge for that. So the run is partial, never a clean "complete, Low"
+    // that hides untracked importers (final review N1).
+    let mut top_level_buffered: Vec<ImpactNode> = Vec::new();
+    let mut top_level_seen: HashSet<String> = HashSet::new();
+    for owner in &top_level_only {
+        let callees = match store.callees_of(&owner.uid) {
+            Ok(callees) => callees,
+            Err(e) => {
+                notifications.push(Notification {
+                    level: NotificationLevel::Error,
+                    message: format!(
+                        "listing the calls of {}'s top-level code failed: {e}",
+                        owner.file_path
+                    ),
+                    descriptor: "store.impact-failed".to_string(),
+                });
+                status = status.max(AnalysisStatus::Degraded);
+                continue;
+            }
+        };
+        notifications.push(Notification {
+            level: NotificationLevel::Warning,
+            message: format!(
+                "changed file {file} is only top-level code ({owner}); it calls {calls}. Files \
+                 that load it only for its side effects (`import './x'`, a bare `require`) are \
+                 not tracked, so its importers were not assessed",
+                file = owner.file_path,
+                owner = owner.display_name(),
+                calls = top_level_call_list(owner, &callees),
+            ),
+            descriptor: "changed-file-top-level-only".to_string(),
+        });
+        status = status.max(AnalysisStatus::Partial);
+        for callee in callees {
+            if changed_uids.contains(&callee.uid) || !top_level_seen.insert(callee.uid.clone()) {
+                continue;
+            }
+            top_level_buffered.push(ImpactNode {
+                uid: callee.uid,
+                name: callee.name,
+                file_path: callee.file_path,
+                start_line: callee.start_line,
+                edge_type: TOP_LEVEL_CALL_EDGE.to_string(),
+                confidence: 1.0,
+                depth: 1,
+                impact_score: 1.0,
+            });
+        }
+    }
+
     // Batch the per-node kind/owning-repo enrichment into ONE store query,
     // replacing the former N per-affected-node `lookup_symbol` round-trips.
     let uid_refs: Vec<&str> = buffered
         .iter()
         .map(|(node, _, _, _)| node.uid.as_str())
+        .chain(top_level_buffered.iter().map(|node| node.uid.as_str()))
         .collect();
     let lookup_map = match store.batch_lookup_symbols(&uid_refs) {
         Ok(map) => map,
@@ -836,7 +952,8 @@ pub fn analyze_blast_radius(
                 change_name,
                 change_kind,
                 change_repo_uid,
-                affected_name: node.name.clone(),
+                affected_name: nestweaver_schema::symbol_display_name(&node.name, &node.file_path)
+                    .into_owned(),
                 affected_repo_uid: affected_repo.clone(),
                 affected_repo: repo_label,
                 affected_file: node.file_path.clone(),
@@ -856,8 +973,9 @@ pub fn analyze_blast_radius(
         }
 
         affected_symbols.push(AffectedSymbol {
+            // nw-113: an owner caller reads `path::<module>`.
+            name: nestweaver_schema::symbol_display_name(&node.name, &node.file_path).into_owned(),
             uid: node.uid,
-            name: node.name,
             file_path: node.file_path,
             kind,
             depth: node.depth,
@@ -882,6 +1000,27 @@ pub fn analyze_blast_radius(
         });
         status = status.max(AnalysisStatus::Partial);
     }
+
+    let top_level_callees: Vec<AffectedSymbol> = top_level_buffered
+        .into_iter()
+        .map(|node| {
+            let callee = lookup_map.get(&node.uid);
+            AffectedSymbol {
+                name: nestweaver_schema::symbol_display_name(&node.name, &node.file_path)
+                    .into_owned(),
+                uid: node.uid,
+                file_path: node.file_path,
+                kind: callee.map(|s| s.kind.to_string()).unwrap_or_default(),
+                depth: node.depth,
+                edge_type: node.edge_type,
+                confidence: node.confidence,
+                start_line: node.start_line,
+                impact_score: node.impact_score,
+                repo_uid: callee.map(|s| s.repo_uid.clone()).unwrap_or_default(),
+                ownership_resolved: callee.is_some(),
+            }
+        })
+        .collect();
 
     // Sort affected symbols by impact_score (highest first).
     affected_symbols.sort_by(|a, b| {
@@ -1245,6 +1384,7 @@ pub fn analyze_blast_radius(
         affected_symbols,
         affected_symbol_count: total_affected,
         affected_clusters,
+        top_level_callees,
         risk_level,
         summary,
         org_wide,
@@ -1387,6 +1527,184 @@ mod tests {
 
     /// Build options preserving a test's prior target_repo/max_depth/data-edge
     /// intent, with no result cap.
+    /// nw-113 final round: a changed file that is only top-level code is
+    /// reported, not silently Low: a `changed-file-top-level-only` note names
+    /// its owner, and the symbols its top-level code calls are its blast
+    /// radius (`edge_type: TOP_LEVEL_CALL`). The owner stays out of the
+    /// changed symbols.
+    #[test]
+    fn an_owner_only_changed_file_reports_its_top_level_calls() {
+        use crate::index::index_directory_in_memory;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("npmonly.ts"),
+            "export function core() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("caller.ts"),
+            "import { core } from './npmonly';\ncore();\n",
+        )
+        .unwrap();
+        let (_r, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/r", "sha").unwrap();
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("caller.ts")],
+            &opts(None, 3, false),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(result.changed_symbols.is_empty(), "{result:#?}");
+        let note = result
+            .notifications
+            .iter()
+            .find(|n| n.descriptor == "changed-file-top-level-only")
+            .unwrap_or_else(|| panic!("{:#?}", result.notifications));
+        assert!(
+            note.message.contains("caller.ts::<module>"),
+            "{}",
+            note.message
+        );
+        let callees: Vec<(&str, &str)> = result
+            .top_level_callees
+            .iter()
+            .map(|s| (s.name.as_str(), s.edge_type.as_str()))
+            .collect();
+        assert_eq!(callees, [("core", TOP_LEVEL_CALL_EDGE)], "{result:#?}");
+        // nw-113 final review I3: callees are not dependents.
+        assert!(result.affected_symbols.is_empty(), "{result:#?}");
+        assert_eq!(result.affected_symbol_count, 0, "{result:#?}");
+        assert_eq!(result.risk_level, RiskLevel::Low, "{result:#?}");
+        // N1: files that import it for its side effects are not tracked, so
+        // the run is not complete.
+        assert_eq!(result.status, AnalysisStatus::Partial, "{result:#?}");
+        assert!(note.message.contains("not assessed"), "{}", note.message);
+    }
+
+    /// nw-113 final review N1 (QA repro): `main.ts` loads `setup.ts` only for
+    /// its side effects, which the graph records no edge for. Changing
+    /// `setup.ts` must not read as a complete, safe run, here or in
+    /// `detect-changes`.
+    #[test]
+    fn a_side_effect_file_is_not_reported_complete() {
+        use crate::index::index_directory_in_memory;
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("npmonly.ts", "export function core() { return 1; }\n"),
+            ("setup.ts", "import { core } from './npmonly';\ncore();\n"),
+            (
+                "main.ts",
+                "import './setup';\nexport function main() { return 1; }\n",
+            ),
+            (
+                "main.test.ts",
+                "import { main } from './main';\ntest('m', () => { expect(main()).toBe(1); });\n",
+            ),
+        ] {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+        let (_r, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/r", "sha").unwrap();
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("setup.ts")],
+            &BlastRadiusOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_ne!(result.status, AnalysisStatus::Complete, "{result:#?}");
+        assert_eq!(result.gate_state, GateState::DegradedUnknown, "{result:#?}");
+        let impact =
+            crate::process::detect_changes_impact(&store, &["setup.ts".to_string()], 3, None)
+                .unwrap();
+        assert_ne!(impact.status, AnalysisStatus::Complete, "{impact:#?}");
+        assert_eq!(impact.gate_state, GateState::DegradedUnknown, "{impact:#?}");
+    }
+
+    /// nw-113 final review I3: a top-level script that calls many functions
+    /// is Low with no affected symbols, its callees are listed apart, and the
+    /// notification names the first ten.
+    #[test]
+    fn top_level_callees_stay_out_of_risk_and_counts() {
+        use crate::index::index_directory_in_memory;
+        let dir = tempfile::tempdir().unwrap();
+        let lib: String = (0..50)
+            .map(|i| format!("export function f{i:02}() {{ return {i}; }}\n"))
+            .collect();
+        std::fs::write(dir.path().join("lib.ts"), lib).unwrap();
+        let names: Vec<String> = (0..50).map(|i| format!("f{i:02}")).collect();
+        let script = format!(
+            "import {{ {} }} from './lib';\n{}",
+            names.join(", "),
+            names
+                .iter()
+                .map(|n| format!("{n}();\n"))
+                .collect::<String>()
+        );
+        std::fs::write(dir.path().join("seed.ts"), script).unwrap();
+        let (_r, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/r", "sha").unwrap();
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("seed.ts")],
+            &opts(None, 3, false),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.top_level_callees.len(), 50, "{result:#?}");
+        assert!(result.affected_symbols.is_empty(), "{result:#?}");
+        assert_eq!(result.affected_symbol_count, 0);
+        assert!(result.affected_clusters.is_empty());
+        assert_eq!(result.risk_level, RiskLevel::Low, "{result:#?}");
+        let note = result
+            .notifications
+            .iter()
+            .find(|n| n.descriptor == "changed-file-top-level-only")
+            .unwrap();
+        assert!(note.message.contains("+40 more"), "{}", note.message);
+        assert!(!note.message.contains("f49"), "{}", note.message);
+    }
+
+    /// nw-113 final review I3: a changed file with real dependents is still
+    /// rated by them, and its top-level callees add nothing.
+    #[test]
+    fn top_level_callees_do_not_add_to_real_dependents() {
+        use crate::index::index_directory_in_memory;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.ts"),
+            "export function core() { return 1; }\nexport function wrap() { return core(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("app.ts"),
+            "import { wrap } from './lib';\nwrap();\n",
+        )
+        .unwrap();
+        let (_r, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/r", "sha").unwrap();
+        let result = analyze_blast_radius(
+            &store,
+            &[PathBuf::from("lib.ts")],
+            &opts(None, 3, false),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(result.top_level_callees.is_empty(), "{result:#?}");
+        let names: Vec<&str> = result
+            .affected_symbols
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(names, ["app.ts::<module>"], "{result:#?}");
+        assert_eq!(result.status, AnalysisStatus::Complete, "{result:#?}");
+    }
+
     fn opts(
         target_repo: Option<&str>,
         max_depth: u32,
@@ -1524,6 +1842,69 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("at least one"), "{error}");
+    }
+
+    /// nw-113 (pr-impact): a changed file's owner is no changed symbol; an
+    /// owner that calls a changed symbol is still affected, labelled
+    /// `path::<module>`.
+    #[test]
+    fn blast_radius_lists_owners_only_as_labelled_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        for (rel, src) in [
+            (
+                "src/jobs/utils.js",
+                "function createNewQueue(n) { return n; }\nmodule.exports = { createNewQueue };\n",
+            ),
+            (
+                "src/jobs/queues.js",
+                "const { createNewQueue } = require('./utils');\nconst q = createNewQueue('g');\n",
+            ),
+        ] {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, src).unwrap();
+        }
+        let (_r, store) = crate::index::index_directory_in_memory(
+            dir.path(),
+            "test",
+            "https://example.com/r",
+            "sha",
+        )
+        .unwrap();
+        let result = analyze_blast_radius(
+            &store,
+            &[
+                PathBuf::from("src/jobs/utils.js"),
+                PathBuf::from("src/jobs/queues.js"),
+            ],
+            &BlastRadiusOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let changed: Vec<&str> = result
+            .changed_symbols
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !changed.contains(&nestweaver_schema::MODULE_OWNER_NAME),
+            "{changed:?}"
+        );
+        assert!(changed.contains(&"createNewQueue"), "{changed:?}");
+        let affected: Vec<&str> = result
+            .affected_symbols
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            affected.contains(&"src/jobs/queues.js::<module>"),
+            "{affected:?}"
+        );
+        assert!(
+            !affected.contains(&nestweaver_schema::MODULE_OWNER_NAME),
+            "{affected:?}"
+        );
     }
 
     #[test]

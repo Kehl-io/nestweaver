@@ -127,11 +127,51 @@ impl Default for HybridSearchConfig {
 }
 
 /// Full details for a single symbol, including its call graph neighbours.
+///
+/// nw-113: each symbol serializes with an added `display_name` (an owner's
+/// `path::<module>` label; otherwise its name) beside its raw `name`, which
+/// is kept for compatibility. `display_name` is ignored when read back.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SymbolDetail {
+    #[serde(serialize_with = "serialize_labelled")]
     pub symbol: Symbol,
+    #[serde(serialize_with = "serialize_labelled_list")]
     pub callers: Vec<Symbol>,
+    #[serde(serialize_with = "serialize_labelled_list")]
     pub callees: Vec<Symbol>,
+}
+
+/// A symbol's JSON object plus its `display_name`.
+fn labelled_symbol_value(symbol: &Symbol) -> Result<serde_json::Value, serde_json::Error> {
+    let mut value = serde_json::to_value(symbol)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "display_name".to_string(),
+            serde_json::Value::String(symbol.display_name().into_owned()),
+        );
+    }
+    Ok(value)
+}
+
+fn serialize_labelled<S: serde::Serializer>(
+    symbol: &Symbol,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    labelled_symbol_value(symbol)
+        .map_err(serde::ser::Error::custom)?
+        .serialize(serializer)
+}
+
+fn serialize_labelled_list<S: serde::Serializer>(
+    symbols: &[Symbol],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    symbols
+        .iter()
+        .map(labelled_symbol_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(serde::ser::Error::custom)?
+        .serialize(serializer)
 }
 
 /// A lightweight summary used for disambiguation and search results.
@@ -159,7 +199,8 @@ impl From<&Symbol> for SymbolCandidate {
         SymbolCandidate {
             uid: s.uid.clone(),
             canonical_id: s.canonical_id.clone(),
-            name: s.name.clone(),
+            // nw-113: an owner candidate reads `path::<module>`.
+            name: s.display_name().into_owned(),
             kind: s.kind.to_string(),
             file_path: s.file_path.clone(),
             start_line: s.start_line,
@@ -175,6 +216,42 @@ pub enum LookupResult {
     NotFound,
     /// Multiple symbols share the same name; the caller must disambiguate.
     Ambiguous(Vec<SymbolCandidate>),
+}
+
+/// nw-113: `did_you_mean` for a [`lookup_symbol`] miss: the shared nw-481
+/// builder `impact` uses, scoped to `instance`'s repos when one is given. A
+/// UID-shaped miss gets nothing. Best-effort: a lookup failure is logged and
+/// yields no suggestions.
+pub fn symbol_lookup_suggestions(
+    store: &GraphStore,
+    name_or_uid: &str,
+    instance: Option<&str>,
+) -> Vec<String> {
+    let qualified = !name_or_uid.starts_with("sym:")
+        && nestweaver_schema::QualifiedSpec::parse(name_or_uid).is_some();
+    if name_or_uid.contains(':') && !qualified {
+        return Vec::new();
+    }
+    let instance_repos: Option<std::collections::HashSet<String>> = instance.map(|inst| {
+        store
+            .list_repos(None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.instance_id == inst)
+            .map(|r| r.uid)
+            .collect()
+    });
+    crate::did_you_mean::did_you_mean_candidates(store, name_or_uid, |s| {
+        instance_repos
+            .as_ref()
+            .is_none_or(|repos| repos.contains(&s.repo_uid))
+    })
+    .unwrap_or_else(|error| {
+        tracing::warn!(
+            "symbol: did_you_mean_candidates lookup failed for '{name_or_uid}': {error:#}"
+        );
+        Vec::new()
+    })
 }
 
 /// Look up a symbol by name or UID.
@@ -248,7 +325,10 @@ pub fn lookup_symbol(
         }
     };
 
-    if name_or_uid.contains(':') {
+    // nw-113: a `file::name` spec contains ':' but is a qualified name.
+    let qualified = !name_or_uid.starts_with("sym:")
+        && nestweaver_schema::split_file_qualifier(name_or_uid).is_some();
+    if name_or_uid.contains(':') && !qualified {
         // UID path
         match store.lookup_symbol(name_or_uid) {
             Ok(sym) => {
@@ -264,7 +344,7 @@ pub fn lookup_symbol(
     } else {
         // Name path
         let matches: Vec<_> = store
-            .lookup_symbols_by_name(name_or_uid)
+            .lookup_symbols_by_spec(name_or_uid)
             .context("name lookup")?
             .into_iter()
             .filter(|s| in_instance(&s.repo_uid))
@@ -736,6 +816,12 @@ pub struct ContextResult {
     /// were standardised on, so the CLI parses the daemon's reply into it.
     #[serde(default, rename = "total", skip_serializing_if = "Option::is_none")]
     pub connected_total: Option<usize>,
+    /// nw-113: connected `<module>` owners left out by
+    /// [`CONTEXT_MODULE_OWNER_CAP`]. Owners rank after every real symbol and
+    /// at most that many are listed; the rest are counted here (the CLI says
+    /// "+N more files' top-level code") and not in `connected_total`.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub module_owners_omitted: usize,
     /// WHICH cap cut, when one did.
     ///
     /// `truncated` says the caller is not holding everything; this says what
@@ -820,6 +906,160 @@ pub struct ContextResult {
     /// caller needs to know, because it is why no retry can widen it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_resolution_limit: Option<usize>,
+}
+
+/// nw-113: how many connected `<module>` owners `context` lists. Owners are
+/// real callers, but a helper called at load time from many files would
+/// otherwise fill the list with near-identical owner rows.
+pub const CONTEXT_MODULE_OWNER_CAP: usize = nestweaver_schema::MODULE_OWNER_CONTEXT_CAP;
+
+/// nw-113: move `<module>` owners after every other node and keep at most
+/// [`CONTEXT_MODULE_OWNER_CAP`] of them, preserving rank order within each
+/// group. Returns how many owners the cap left out, for the result's
+/// `module_owners_omitted`. Shared by code, feature and brain context so the
+/// three answer an owner-heavy neighbourhood the same way.
+pub(crate) fn rank_module_owners_last<T>(
+    nodes: &mut Vec<T>,
+    is_owner: impl Fn(&T) -> bool,
+) -> usize {
+    let (real, owners): (Vec<T>, Vec<T>) = std::mem::take(nodes)
+        .into_iter()
+        .partition(|node| !is_owner(node));
+    let omitted = owners.len().saturating_sub(CONTEXT_MODULE_OWNER_CAP);
+    *nodes = real;
+    nodes.extend(owners.into_iter().take(CONTEXT_MODULE_OWNER_CAP));
+    omitted
+}
+
+/// nw-113: the PPR score floor the context builders ask the store for. They
+/// split the answer themselves with [`split_refill_pool`]: what clears
+/// [`nestweaver_store::PPR_MIN_SCORE`] is ranked as before, and the rest is
+/// kept back to refill the list when capped owners soaked up the walk.
+pub(crate) const CONTEXT_PPR_FLOOR: f64 = 0.0;
+
+/// `(uid, score)` pairs, best first.
+type ScoredUids = Vec<(String, f64)>;
+
+/// nw-113: a [`CONTEXT_PPR_FLOOR`] walk split by [`split_refill_pool`].
+pub(crate) struct SplitWalk {
+    /// The ranking every context builder used before: seeds, and nodes
+    /// above `PPR_MIN_SCORE`, best first.
+    pub(crate) ranked: ScoredUids,
+    /// The non-seed, non-owner nodes under that floor, best first.
+    pub(crate) pool: ScoredUids,
+    /// How many `<module>` owners scored under that floor. They are never
+    /// listed, but they took the walk's mass all the same: on a very hot hub
+    /// they push every node, themselves included, under the floor, and the
+    /// owner cap then has nothing to hide (final review I1).
+    pub(crate) deep_owners: usize,
+    /// Real rows under the floor that the store's
+    /// `PPR_BELOW_FLOOR_KEEP` cut left out of `pool` (nw-113 R1). A refill
+    /// that would have reached them is incomplete and must say so.
+    pub(crate) pool_cut: usize,
+}
+
+/// nw-113: split a [`CONTEXT_PPR_FLOOR`] walk into the ranking every context
+/// builder used before and the refill pool, counting the owners under the
+/// floor. The store keeps only the best `PPR_BELOW_FLOOR_KEEP` real rows under
+/// the floor and only counts the owners there, so `deep_owners` is that count
+/// (plus any owner a standard-floor walk returned) and `pool_cut` is how many
+/// real rows the cut left out.
+pub(crate) fn split_refill_pool(walk: nestweaver_store::FloorWalk, seeds: &[String]) -> SplitWalk {
+    let seeds: std::collections::HashSet<&str> = seeds.iter().map(String::as_str).collect();
+    let (ranked, deep): (Vec<_>, Vec<_>) = walk.rows.into_iter().partition(|(uid, score)| {
+        seeds.contains(uid.as_str()) || *score > nestweaver_store::PPR_MIN_SCORE
+    });
+    let (owners, pool): (Vec<_>, Vec<_>) = deep
+        .into_iter()
+        .partition(|(uid, _)| nestweaver_schema::uid::is_module_owner_uid(uid));
+    SplitWalk {
+        ranked,
+        pool,
+        deep_owners: owners.len() + walk.owners_below_floor,
+        pool_cut: walk.rows_cut,
+    }
+}
+
+/// nw-113: how a context list is refilled. `owners_hidden` is every owner
+/// the walk reached that the list does not show: those the cap left out and
+/// those under the floor. The list takes at most that many real symbols from
+/// the pool, so it grows back to the length it would have had if the owners'
+/// mass had gone to real symbols, never past `limit`. `listed` is the list's
+/// length so far, owners included. `pool_cut` is how many real rows the
+/// store's below-floor cut left out of the pool (see [`SplitWalk::pool_cut`]).
+/// Returns `(take, available, cut)`: how many to insert now, how many the
+/// walk could have supplied had nothing been cut (for `connected_total`), and
+/// how many of those the cut withheld, which the caller must disclose as a
+/// truncation (nw-113 R1).
+pub(crate) fn refill_count(
+    owners_hidden: usize,
+    listed: usize,
+    limit: Option<usize>,
+    pool: usize,
+    pool_cut: usize,
+) -> (usize, usize, usize) {
+    let supplied = owners_hidden.min(pool);
+    let available = owners_hidden.min(pool.saturating_add(pool_cut));
+    let room = limit.map_or(usize::MAX, |limit| limit.saturating_sub(listed));
+    (supplied.min(room), available, available - supplied)
+}
+
+/// nw-113 final review Minor 2: cut `ranked` (owners last) to `limit`.
+/// Owners the cut drops are counted like the ones the owner cap left out:
+/// the return value goes to `module_owners_omitted` and out of
+/// `connected_total`, so every route reports the same owners.
+pub(crate) fn truncate_counting_owners<T>(
+    ranked: &mut Vec<T>,
+    limit: Option<usize>,
+    is_owner: impl Fn(&T) -> bool,
+) -> usize {
+    let Some(limit) = limit else {
+        return 0;
+    };
+    let trimmed = ranked
+        .iter()
+        .skip(limit)
+        .filter(|node| is_owner(node))
+        .count();
+    ranked.truncate(limit);
+    trimmed
+}
+
+/// nw-113: put `refill` after the real nodes of `ranked` and before its
+/// listed owners (always its tail, see [`rank_module_owners_last`]).
+pub(crate) fn insert_refill<T>(ranked: &mut Vec<T>, owners_listed: usize, refill: Vec<T>) {
+    let at = ranked.len() - owners_listed;
+    ranked.splice(at..at, refill);
+}
+
+/// The [`ContextNode`]s of `scored` symbols, in order; a UID that is not a
+/// symbol (a note, a file in the unified scope) is skipped.
+fn context_nodes(
+    store: &GraphStore,
+    scored: &[(String, f64)],
+) -> Result<Vec<ContextNode>, anyhow::Error> {
+    if scored.is_empty() {
+        return Ok(Vec::new());
+    }
+    let uids: Vec<&str> = scored.iter().map(|(uid, _)| uid.as_str()).collect();
+    let symbols = store
+        .batch_lookup_symbols(&uids)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok(scored
+        .iter()
+        .filter_map(|(uid, score)| {
+            let sym = symbols.get(uid.as_str())?;
+            Some(ContextNode {
+                uid: sym.uid.clone(),
+                name: sym.display_name().into_owned(),
+                kind: sym.kind.to_string(),
+                file_path: sym.file_path.clone(),
+                start_line: sym.start_line,
+                signature: sym.signature.clone(),
+                relevance: *score,
+            })
+        })
+        .collect())
 }
 
 /// Detect whether an input string looks like a file path.
@@ -940,7 +1180,7 @@ pub fn build_context_with_intent(
                 }
                 Err(e) => return Err(anyhow::anyhow!(e)),
             }
-        } else if is_file_path(input) {
+        } else if is_file_path(input) && nestweaver_schema::split_file_qualifier(input).is_none() {
             // Resolve all symbols in the file.
             let file_syms = store
                 .symbols_in_file(input)
@@ -955,8 +1195,9 @@ pub fn build_context_with_intent(
         } else {
             // Exact name first. An ambiguous exact name is a lookup refusal
             // (exit 3), not a substring union that also seeds `ping2`.
+            // nw-113: `file::name` narrows the exact name to that file.
             let exact = store
-                .lookup_symbols_by_name(input)
+                .lookup_symbols_by_spec(input)
                 .map_err(|e| anyhow::anyhow!(e))?;
             match exact.len() {
                 0 => {
@@ -1026,24 +1267,35 @@ pub fn build_context_with_intent(
     // Run Personalized PageRank over the code-only scope (preserves the
     // pre-brain behaviour of `nestweaver context`). The unified scope that
     // mixes code + notes is exposed via `nestweaver brain context`.
-    let ppr_results = store
-        .personalized_pagerank_with_intent(
+    let walk = store
+        .personalized_pagerank_with_floor(
             &seed_uids,
             0.85,
             20,
             &GraphScope::code_only(),
             effective_intent,
+            None,
+            CONTEXT_PPR_FLOOR,
+            // nw-113 R1: keep enough below-floor rows to refill the whole
+            // list the caller asked for (bucketed and bounded by the store).
+            limit.unwrap_or(nestweaver_store::PPR_BELOW_FLOOR_KEEP),
         )
         .map_err(|e| anyhow::anyhow!(e))?;
+    let SplitWalk {
+        ranked: ppr_results,
+        pool: refill_pool,
+        deep_owners,
+        pool_cut,
+    } = split_refill_pool(walk, &seed_uids);
 
     let seed_set: std::collections::HashSet<&str> = seed_uids.iter().map(|s| s.as_str()).collect();
 
     let mut seeds: Vec<ContextNode> = Vec::new();
-    let mut connected: Vec<ContextNode> = Vec::new();
-    // Counted for EVERY resolved non-seed node, whether or not the cap let it
-    // through. This is the whole of nw-320.
-    let mut connected_total: usize = 0;
-    let effective_limit = limit.unwrap_or(usize::MAX);
+    // Every resolved non-seed node, in rank order, before any cap. Its length
+    // (once owners are capped) is `connected_total`, counted whether or not
+    // the row cap lets a node through. This is the whole of nw-320.
+    let mut ranked: Vec<ContextNode> = Vec::new();
+    let mut owner_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Batch-fetch all PPR-ranked symbols in a single query to avoid N+1 overhead.
     let ppr_uids: Vec<&str> = ppr_results.iter().map(|(u, _)| u.as_str()).collect();
@@ -1059,7 +1311,7 @@ pub fn build_context_with_intent(
 
         let node = ContextNode {
             uid: sym.uid.clone(),
-            name: sym.name.clone(),
+            name: sym.display_name().into_owned(),
             kind: sym.kind.to_string(),
             file_path: sym.file_path.clone(),
             start_line: sym.start_line,
@@ -1070,12 +1322,38 @@ pub fn build_context_with_intent(
         if seed_set.contains(uid.as_str()) {
             seeds.push(node);
         } else {
-            connected_total += 1;
-            if connected.len() < effective_limit {
-                connected.push(node);
+            if sym.is_module_owner() {
+                owner_uids.insert(sym.uid.clone());
             }
+            ranked.push(node);
         }
     }
+    // nw-113: owners rank after every real symbol and only
+    // `CONTEXT_MODULE_OWNER_CAP` are listed; the rest are counted.
+    let mut module_owners_omitted =
+        rank_module_owners_last(&mut ranked, |node| owner_uids.contains(&node.uid));
+    // nw-113: refill the places the hidden owners would have taken with
+    // real symbols that scored under the floor, so a helper called at load
+    // time from many files keeps its real neighbours.
+    let owners_listed = ranked
+        .iter()
+        .filter(|node| owner_uids.contains(&node.uid))
+        .count();
+    let (take, refill_available, refill_cut) = refill_count(
+        module_owners_omitted + deep_owners,
+        ranked.len(),
+        limit,
+        refill_pool.len(),
+        pool_cut,
+    );
+    let refill = context_nodes(store, &refill_pool[..take])?;
+    let mut connected_total = ranked.len() + refill_available;
+    insert_refill(&mut ranked, owners_listed, refill);
+    let owners_trimmed =
+        truncate_counting_owners(&mut ranked, limit, |node| owner_uids.contains(&node.uid));
+    module_owners_omitted += owners_trimmed;
+    connected_total -= owners_trimmed;
+    let connected = ranked;
 
     // Collect cross-repo links for seed symbols.
     let mut cross_repo_links: Vec<CrossRepoLink> = Vec::new();
@@ -1100,14 +1378,20 @@ pub fn build_context_with_intent(
         // the CALLER meant by it, so it reports nothing here. Callers that
         // impose a cap (the `code_context` tool, the CLI's direct path) set
         // these after deciding whether the extra row they asked for arrived.
+        //
+        // nw-113 R1: the one cap the engine CAN answer for is the store's
+        // below-floor keep. When it withheld real rows this list would have
+        // listed, the list is incomplete whatever the caller asked for, so it
+        // says so here; `connected_total` already counts those rows.
         limit: None,
-        truncated: None,
-        truncated_by: None,
+        truncated: (refill_cut > 0).then_some(true),
+        truncated_by: TruncationCause::resolve(false, refill_cut > 0),
         token_budget: None,
         // `connected_total` is different from the two above: it is not a
         // policy the caller chose, it is a fact only this traversal can
         // observe, so the engine is the only layer that CAN report it.
         connected_total: Some(connected_total),
+        module_owners_omitted,
         // nw-393. Same argument as `connected_total`, one layer earlier: the
         // seed cap is the engine's own, no caller states it and no caller can
         // raise it, so the engine is the only layer that can report it — and
@@ -1296,6 +1580,7 @@ mod promote_tests {
 mod context_tests {
     use std::fs;
 
+    use super::HybridSearchConfig;
     use super::build_context;
     use crate::index::index_directory_in_memory;
 
@@ -1314,6 +1599,666 @@ mod context_tests {
         )
         .unwrap();
         (dir, src)
+    }
+
+    /// `theme.js` exports `fromTemplate`; six style files call it at top
+    /// level, and `theme.js` also has two same-file collaborators.
+    fn owner_heavy_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(src.join("styles")).unwrap();
+        fs::write(
+            src.join("theme.js"),
+            "function getThemeValue(k) { return k; }\n\
+             function getThemeColor(k) { return getThemeValue(k); }\n\
+             function fromTemplate(t) { return getThemeColor(t); }\n\
+             module.exports = { fromTemplate };\n",
+        )
+        .unwrap();
+        for i in 0..6 {
+            fs::write(
+                src.join(format!("styles/s{i}.style.js")),
+                "const { fromTemplate } = require('../theme');\nexport const dark = fromTemplate({});\n",
+            )
+            .unwrap();
+        }
+        (dir, src)
+    }
+
+    /// nw-113: owners rank after every real symbol, at most three are listed,
+    /// the rest are counted, and each is labelled `path::<module>`.
+    #[test]
+    fn context_ranks_owners_last_and_caps_them() {
+        let (_dir, src) = owner_heavy_repo();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let result = build_context(&store, &["fromTemplate".to_string()]).unwrap();
+        let names: Vec<&str> = result.connected.iter().map(|n| n.name.as_str()).collect();
+        let owners: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| n.ends_with("::<module>"))
+            .collect();
+        assert_eq!(owners.len(), 3, "{names:?}");
+        assert!(
+            owners.iter().all(|n| n.starts_with("styles/s")),
+            "owners are labelled by path: {names:?}"
+        );
+        let first_owner = names
+            .iter()
+            .position(|n| n.ends_with("::<module>"))
+            .unwrap();
+        assert!(
+            names[first_owner..]
+                .iter()
+                .all(|n| n.ends_with("::<module>")),
+            "owners rank after every real symbol: {names:?}"
+        );
+        assert!(names.contains(&"getThemeColor"), "{names:?}");
+        assert_eq!(result.module_owners_omitted, 3, "{result:?}");
+        assert!(
+            !names.contains(&nestweaver_schema::MODULE_OWNER_NAME),
+            "{names:?}"
+        );
+    }
+
+    /// The labels of `names` that are owners, and whether every owner ranks
+    /// after every non-owner.
+    fn owners_listed_last(names: &[&str]) -> (usize, bool) {
+        let is_owner = |n: &&str| n.ends_with("::<module>");
+        let owners = names.iter().filter(|n| is_owner(n)).count();
+        let first_owner = names.iter().position(is_owner).unwrap_or(names.len());
+        (owners, names[first_owner..].iter().all(is_owner))
+    }
+
+    /// nw-113: feature context labels owners by path, ranks them after every
+    /// real symbol and lists at most three, counting the rest.
+    #[test]
+    fn feature_context_ranks_owners_last_and_caps_them() {
+        let (_dir, src) = owner_heavy_repo();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let repo = store.list_repos(None).unwrap().remove(0);
+        let feature = crate::config::FeatureConfig {
+            name: "theme".to_string(),
+            description: None,
+            repos: vec![repo.name.clone().unwrap_or(repo.url.clone())],
+            entry_points: vec!["fromTemplate".to_string()],
+        };
+        let result = super::build_feature_context(&store, &feature, &[], &[], None, None).unwrap();
+        assert!(result.unmatched_entry_points.is_empty(), "{result:?}");
+        let names: Vec<&str> = result.connected.iter().map(|n| n.name.as_str()).collect();
+        let (owners, last) = owners_listed_last(&names);
+        assert_eq!(owners, 3, "{names:?}");
+        assert!(last, "owners rank after every real symbol: {names:?}");
+        assert!(
+            !names.contains(&nestweaver_schema::MODULE_OWNER_NAME),
+            "{names:?}"
+        );
+        assert_eq!(result.module_owners_omitted, 3, "{result:?}");
+    }
+
+    /// nw-113: brain context labels owners by path, ranks them after every
+    /// other connected node and lists at most three, counting the rest.
+    #[test]
+    fn brain_context_ranks_owners_last_and_caps_them() {
+        let (_dir, src) = owner_heavy_repo();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let result = super::build_brain_context(&store, &["fromTemplate".to_string()]).unwrap();
+        let titles: Vec<&str> = result.connected.iter().map(|n| n.title.as_str()).collect();
+        let (owners, last) = owners_listed_last(&titles);
+        assert_eq!(owners, 3, "{titles:?}");
+        assert!(last, "owners rank after every other node: {titles:?}");
+        assert!(
+            !titles.contains(&nestweaver_schema::MODULE_OWNER_NAME),
+            "{titles:?}"
+        );
+        assert_eq!(result.module_owners_omitted, 3, "{result:?}");
+    }
+
+    /// nw-113: `symbol` resolves `path::<module>` to that file's owner, and
+    /// an ambiguous `<module>` lists every candidate labelled by its path.
+    #[test]
+    fn symbol_lookup_resolves_and_labels_owners_by_file() {
+        let (_dir, src) = owner_heavy_repo();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        match super::lookup_symbol(&store, "s1.style.js::<module>", None).unwrap() {
+            super::LookupResult::Found(detail) => {
+                assert_eq!(detail.symbol.file_path, "styles/s1.style.js");
+                assert!(detail.symbol.is_module_owner());
+            }
+            _ => panic!("s1.style.js::<module> must resolve"),
+        }
+        match super::lookup_symbol(&store, "<module>", None).unwrap() {
+            super::LookupResult::Ambiguous(candidates) => {
+                assert_eq!(candidates.len(), 6);
+                for c in &candidates {
+                    assert_eq!(c.name, format!("{}::<module>", c.file_path));
+                }
+            }
+            _ => panic!("<module> is ambiguous"),
+        }
+    }
+
+    /// The hub-of-owners shape: `fromTemplate` is called at load time by
+    /// `owners` style files and starts a chain of real collaborators, so
+    /// the owners soak up the walk's mass and the deep end of the chain
+    /// falls under the PPR score floor.
+    fn hub_of_owners_repo(owners: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(src.join("styles")).unwrap();
+        fs::write(
+            src.join("theme.js"),
+            format!(
+                "{}function fromTemplate(t) {{ return {}(t); }}\nmodule.exports = {{ fromTemplate }};\n",
+                CHAIN
+                    .windows(2)
+                    .map(|pair| format!("function {}(k) {{ return {}(k); }}\n", pair[0], pair[1]))
+                    .chain(std::iter::once(format!(
+                        "function {}(k) {{ return k; }}\n",
+                        CHAIN[CHAIN.len() - 1]
+                    )))
+                    .collect::<String>(),
+                CHAIN[0]
+            ),
+        )
+        .unwrap();
+        for i in 0..owners {
+            fs::write(
+                src.join(format!("styles/s{i}.style.js")),
+                "const { fromTemplate } = require('../theme');\nexport const dark = fromTemplate({});\n",
+            )
+            .unwrap();
+        }
+        (dir, src)
+    }
+
+    /// A chain long enough that its far end falls under the PPR score floor
+    /// once the owners dilute the walk, and stays above it without them.
+    const CHAIN: [&str; 20] = [
+        "stepA", "stepB", "stepC", "stepD", "stepE", "stepF", "stepG", "stepH", "stepI", "stepJ",
+        "stepK", "stepL", "stepM", "stepN", "stepO", "stepP", "stepQ", "stepR", "stepS", "stepT",
+    ];
+
+    /// How far down the chain the walk itself reaches with 400 owners. Past
+    /// the floor the walk still scores these; further down the push stops.
+    /// Without the refill, code context lists only through `stepG` and the
+    /// unified scope only through `stepM`.
+    const REACHED: usize = 15;
+
+    /// nw-113 final round: when the owner cap hides owners, the connected
+    /// list is refilled with real symbols from below the score floor, up to
+    /// the limit; owners keep at most three slots, listed last.
+    #[test]
+    fn context_refills_real_symbols_behind_capped_owners() {
+        let (_dir, src) = hub_of_owners_repo(400);
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let result =
+            super::build_context_with_intent(&store, &["fromTemplate".to_string()], None, Some(30))
+                .unwrap();
+        let names: Vec<&str> = result.connected.iter().map(|n| n.name.as_str()).collect();
+        for step in &CHAIN[..REACHED] {
+            assert!(names.contains(step), "{step} missing: {names:?}");
+        }
+        let (owners, last) = owners_listed_last(&names);
+        assert_eq!(owners, 3, "{names:?}");
+        assert!(last, "{names:?}");
+        assert_eq!(result.module_owners_omitted, 397, "{result:?}");
+        assert!(names.len() <= 30, "{names:?}");
+    }
+
+    /// nw-113 final review Minor 2: a limit that leaves no room for the
+    /// listed owners trims them, and counts them in `module_owners_omitted`
+    /// rather than in `connected_total`.
+    #[test]
+    fn context_counts_owners_the_limit_trims() {
+        let (_dir, src) = hub_of_owners_repo(400);
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let result =
+            super::build_context_with_intent(&store, &["fromTemplate".to_string()], None, Some(5))
+                .unwrap();
+        let names: Vec<&str> = result.connected.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names.len(), 5, "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.ends_with("::<module>")),
+            "{names:?}"
+        );
+        assert_eq!(result.module_owners_omitted, 400, "{result:?}");
+        let total = result.connected_total.unwrap();
+        assert!(total > 5, "{total}");
+        let unlimited =
+            super::build_context_with_intent(&store, &["fromTemplate".to_string()], None, None)
+                .unwrap();
+        assert_eq!(
+            unlimited.connected_total.unwrap(),
+            total + 3,
+            "trimmed owners leave the total: {unlimited:?}"
+        );
+    }
+
+    /// nw-113 R1: a star where the hub reaches `per_kind` `<module>` owners
+    /// and `per_kind` real symbols, all under the score floor. Owner edges
+    /// are a little stronger, so a cut that does not tell them apart fills
+    /// its budget with owners. Returns the store and the hub's UID.
+    fn owner_star(per_kind: usize) -> (nestweaver_store::GraphStore, String) {
+        use nestweaver_schema::uid::symbol_uid;
+        let repo = "repo:t:1";
+        let sym = |uid: String, name: &str, path: String, owner: bool| nestweaver_schema::Symbol {
+            uid,
+            name: name.to_string(),
+            kind: if owner {
+                nestweaver_schema::SymbolKind::Module
+            } else {
+                nestweaver_schema::SymbolKind::Function
+            },
+            repo_uid: repo.to_string(),
+            file_path: path,
+            start_line: 1,
+            end_line: 1,
+            signature: String::new(),
+            summary: None,
+            content_hash: "hash".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: owner,
+            entry_point_kind: owner.then_some(nestweaver_schema::EntryPointKind::ModuleInit),
+            visibility: nestweaver_schema::Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        let edge = |source: &str, target: &str, confidence: f32| nestweaver_schema::ResolvedEdge {
+            source_uid: source.to_string(),
+            target_uid: target.to_string(),
+            edge_type: nestweaver_schema::EdgeType::Calls,
+            confidence,
+            link_type: None,
+            evidence: Vec::new(),
+        };
+        let hub = symbol_uid(repo, "src/hub.js", "hub", 1);
+        let mut symbols = vec![sym(hub.clone(), "hub", "src/hub.js".into(), false)];
+        let mut edges = Vec::new();
+        for i in 0..per_kind {
+            let path = format!("src/f{i}.js");
+            let owner = symbol_uid(repo, &path, nestweaver_schema::MODULE_OWNER_NAME, 1);
+            let real = symbol_uid(repo, &path, &format!("real_{i}"), 2);
+            symbols.push(sym(
+                owner.clone(),
+                nestweaver_schema::MODULE_OWNER_NAME,
+                path.clone(),
+                true,
+            ));
+            symbols.push(sym(real.clone(), &format!("real_{i}"), path, false));
+            edges.push(edge(&hub, &owner, 1.0));
+            edges.push(edge(&hub, &real, 0.9));
+        }
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        store.batch_insert_symbols(&symbols).unwrap();
+        store.batch_insert_edges(&edges).unwrap();
+        (store, hub)
+    }
+
+    fn real_listed(result: &super::ContextResult) -> usize {
+        result
+            .connected
+            .iter()
+            .filter(|node| node.name.starts_with("real_"))
+            .count()
+    }
+
+    /// nw-113 R1: the below-floor keep follows the requested limit, so a
+    /// limit past `PPR_BELOW_FLOOR_KEEP` lists every real caller, as 12.0.4
+    /// did, and the list is complete.
+    #[test]
+    fn context_keep_follows_the_requested_limit() {
+        let per_kind = 2_500;
+        let (store, hub) = owner_star(per_kind);
+        let result =
+            super::build_context_with_intent(&store, std::slice::from_ref(&hub), None, Some(3_000))
+                .unwrap();
+        assert_eq!(
+            real_listed(&result),
+            per_kind,
+            "{} listed",
+            result.connected.len()
+        );
+        assert_ne!(result.truncated, Some(true), "{:?}", result.connected_total);
+        assert_eq!(result.truncated_by, None);
+        assert_eq!(result.connected_total, Some(per_kind));
+    }
+
+    /// nw-113 R1: with no limit the keep stays at `PPR_BELOW_FLOOR_KEEP`;
+    /// when it had to cut real rows the refill wanted, the result says so
+    /// rather than claiming a complete list.
+    #[test]
+    fn context_discloses_real_rows_the_below_floor_keep_cut() {
+        let per_kind = 2_500;
+        let (store, hub) = owner_star(per_kind);
+        let result =
+            super::build_context_with_intent(&store, std::slice::from_ref(&hub), None, None)
+                .unwrap();
+        assert_eq!(
+            real_listed(&result),
+            nestweaver_store::PPR_BELOW_FLOOR_KEEP,
+            "{} listed",
+            result.connected.len()
+        );
+        assert_eq!(result.truncated, Some(true), "{:?}", result.connected_total);
+        assert_eq!(result.truncated_by, Some(super::TruncationCause::Limit));
+        assert_eq!(result.connected_total, Some(per_kind));
+    }
+
+    /// The same refill on feature context.
+    #[test]
+    fn feature_context_refills_real_symbols_behind_capped_owners() {
+        let (_dir, src) = hub_of_owners_repo(400);
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let repo = store.list_repos(None).unwrap().remove(0);
+        let feature = crate::config::FeatureConfig {
+            name: "theme".to_string(),
+            description: None,
+            repos: vec![repo.name.clone().unwrap_or(repo.url.clone())],
+            entry_points: vec!["fromTemplate".to_string()],
+        };
+        let result =
+            super::build_feature_context(&store, &feature, &[], &[], None, Some(30)).unwrap();
+        let names: Vec<&str> = result.connected.iter().map(|n| n.name.as_str()).collect();
+        for step in &CHAIN[..REACHED] {
+            assert!(names.contains(step), "{step} missing: {names:?}");
+        }
+        let (owners, last) = owners_listed_last(&names);
+        assert_eq!(owners, 3, "{names:?}");
+        assert!(last, "{names:?}");
+    }
+
+    /// The same refill on brain context, which has no engine-side limit: it
+    /// returns enough real candidates for any caller limit the owners would
+    /// have filled.
+    #[test]
+    fn brain_context_refills_real_symbols_behind_capped_owners() {
+        let (_dir, src) = hub_of_owners_repo(400);
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let result = super::build_brain_context(&store, &["fromTemplate".to_string()]).unwrap();
+        let titles: Vec<&str> = result.connected.iter().map(|n| n.title.as_str()).collect();
+        for step in &CHAIN[..REACHED] {
+            assert!(titles.contains(step), "{step} missing: {titles:?}");
+        }
+        let (owners, last) = owners_listed_last(&titles);
+        assert_eq!(owners, 3, "{titles:?}");
+        assert!(last, "{titles:?}");
+    }
+
+    /// The very hot hub of the final review's I1 probe: `hub` is imported
+    /// and called at load time by `files` files, each of which also has a
+    /// real caller `h<i>`. At 3,000 files the owners push every caller,
+    /// themselves included, under the PPR score floor.
+    fn very_hot_hub_repo(files: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(src.join("f")).unwrap();
+        fs::write(
+            src.join("hub.js"),
+            "function hub() { return 1; }\nmodule.exports = { hub };\n",
+        )
+        .unwrap();
+        for i in 0..files {
+            fs::write(
+                src.join(format!("f/f{i}.js")),
+                format!(
+                    "const {{ hub }} = require('../hub');\nhub();\n\
+                     function h{i}() {{ return hub(); }}\nmodule.exports = {{ h{i} }};\n"
+                ),
+            )
+            .unwrap();
+        }
+        (dir, src)
+    }
+
+    /// nw-113 final review I1: when owners push every node under the floor,
+    /// the owner cap hides nothing, yet code, feature and brain context
+    /// must still fill their lists with the hub's real callers.
+    #[test]
+    fn contexts_refill_a_very_hot_hub_whose_owners_sink_under_the_floor() {
+        let (_dir, src) = very_hot_hub_repo(3_000);
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let real_callers = |names: Vec<&str>| {
+            names
+                .iter()
+                .filter(|n| n.starts_with('h') && n[1..].parse::<usize>().is_ok())
+                .count()
+        };
+
+        let code =
+            super::build_context_with_intent(&store, &["hub".to_string()], None, Some(20)).unwrap();
+        let names: Vec<&str> = code.connected.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names.len(), 20, "{names:?}");
+        assert!(real_callers(names.clone()) >= 17, "{names:?}");
+        assert!(
+            code.connected_total.unwrap() > 20,
+            "more callers than listed: {:?}",
+            code.connected_total
+        );
+
+        let repo = store.list_repos(None).unwrap().remove(0);
+        let feature = crate::config::FeatureConfig {
+            name: "hub".to_string(),
+            description: None,
+            repos: vec![repo.name.clone().unwrap_or(repo.url.clone())],
+            entry_points: vec!["hub".to_string()],
+        };
+        let feat =
+            super::build_feature_context(&store, &feature, &[], &[], None, Some(20)).unwrap();
+        let names: Vec<&str> = feat.connected.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names.len(), 20, "{names:?}");
+        assert!(real_callers(names.clone()) >= 17, "{names:?}");
+
+        let brain = super::build_brain_context(&store, &["hub".to_string()]).unwrap();
+        let titles: Vec<&str> = brain.connected.iter().map(|n| n.title.as_str()).collect();
+        assert!(
+            real_callers(titles.clone()) >= 30,
+            "{} {titles:?}",
+            titles.len()
+        );
+    }
+
+    /// nw-113 final review Minor 1: a refill candidate that the semantic
+    /// leg already put in `connected` is not listed a second time.
+    #[test]
+    fn brain_context_refill_skips_nodes_another_leg_already_listed() {
+        struct FixedEmbed;
+        impl super::EmbedQueryFn for FixedEmbed {
+            fn embed_query(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![1.0, 0.0, 0.0, 0.0])
+            }
+        }
+        let (dir, src) = hub_of_owners_repo(400);
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        // `stepN` is past the unified scope's floor, so it is in the refill
+        // pool; an embedding equal to the query's makes the semantic leg
+        // list it too.
+        let step_n = store.lookup_symbols_by_name("stepN").unwrap().remove(0).uid;
+        assert!(store.add_embedding(&step_n, vec![1.0, 0.0, 0.0, 0.0]));
+        // Fused, not seeded: the semantic hit reaches `connected` as a
+        // non-seed through the fusion, which needs a BM25 index (empty here).
+        let tantivy =
+            nestweaver_store::TantivyIndex::open_or_create(&dir.path().join("t")).unwrap();
+        let config = HybridSearchConfig {
+            always_blend_semantic: false,
+            ..HybridSearchConfig::default()
+        };
+        let result = super::build_brain_context_hybrid(
+            &store,
+            &["fromTemplate".to_string()],
+            Some(&tantivy),
+            &config,
+            None,
+            Some(&FixedEmbed),
+        )
+        .unwrap();
+        let titles: Vec<&str> = result.connected.iter().map(|n| n.title.as_str()).collect();
+        assert!(result.semantic_applied, "{:?}", result.semantic_unavailable);
+        assert!(titles.contains(&"stepN"), "{titles:?}");
+        let mut seen = std::collections::HashSet::new();
+        for node in &result.connected {
+            assert!(
+                seen.insert(node.uid.as_str()),
+                "{} twice: {titles:?}",
+                node.title
+            );
+        }
+    }
+
+    /// `owner_heavy_repo` plus a class whose method name is shared with a
+    /// free function, so `Class::method` has something to narrow.
+    fn qualified_seed_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, src) = owner_heavy_repo();
+        fs::write(
+            src.join("hub.js"),
+            "class Hub { makeListener() { return 1; } }\n\
+             function makeListener() { return 2; }\n\
+             module.exports = { Hub, makeListener };\n",
+        )
+        .unwrap();
+        (dir, src)
+    }
+
+    /// nw-113 final round: brain context accepts `path::name`,
+    /// `path::<module>` and `Class::method` seeds through the strict
+    /// resolver, including the owner labels it prints itself.
+    #[test]
+    fn brain_context_resolves_qualified_seeds() {
+        let (_dir, src) = qualified_seed_repo();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        for (spec, want) in [
+            (
+                "styles/s2.style.js::<module>",
+                "styles/s2.style.js::<module>",
+            ),
+            ("theme.js::fromTemplate", "fromTemplate"),
+            ("Hub::makeListener", "makeListener"),
+        ] {
+            let result = super::build_brain_context(&store, &[spec.to_string()])
+                .unwrap_or_else(|e| panic!("{spec}: {e:#}"));
+            let seeds: Vec<(&str, &str)> = result
+                .seeds
+                .iter()
+                .map(|n| (n.title.as_str(), n.kind.as_str()))
+                .collect();
+            assert_eq!(seeds.len(), 1, "{spec}: {seeds:?}");
+            assert_eq!(seeds[0].0, want, "{spec}: {seeds:?}");
+        }
+        let hub = super::build_brain_context(&store, &["Hub::makeListener".to_string()]).unwrap();
+        assert_eq!(hub.seeds[0].kind, "Symbol/Method", "{:?}", hub.seeds);
+        let miss = super::build_brain_context(&store, &["Nope::makeListener".to_string()])
+            .expect_err("a qualifier naming nothing is not found");
+        assert!(
+            format!("{miss:#}").starts_with("No seeds resolved."),
+            "{miss:#}"
+        );
+    }
+
+    /// nw-113 final round: feature entry points accept qualified names.
+    #[test]
+    fn feature_context_resolves_qualified_entry_points() {
+        let (_dir, src) = qualified_seed_repo();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let repo = store.list_repos(None).unwrap().remove(0);
+        let feature = crate::config::FeatureConfig {
+            name: "theme".to_string(),
+            description: None,
+            repos: vec![repo.name.clone().unwrap_or(repo.url.clone())],
+            entry_points: vec![
+                "styles/s2.style.js::<module>".to_string(),
+                "Hub::makeListener".to_string(),
+            ],
+        };
+        let result = super::build_feature_context(&store, &feature, &[], &[], None, None).unwrap();
+        assert!(result.unmatched_entry_points.is_empty(), "{result:?}");
+        let mut seeds: Vec<(&str, &str)> = result
+            .seeds
+            .iter()
+            .map(|n| (n.name.as_str(), n.kind.as_str()))
+            .collect();
+        seeds.sort();
+        assert_eq!(
+            seeds,
+            [
+                ("makeListener", "Method"),
+                ("styles/s2.style.js::<module>", "Module")
+            ]
+        );
+    }
+
+    /// nw-113 final round: `symbol --json` keeps each neighbour's raw
+    /// `name` and adds a labelled `display_name`, so an owner caller reads
+    /// `path::<module>` there as on every other surface; the payload still
+    /// deserializes (the daemon route reads it back).
+    #[test]
+    fn symbol_detail_json_labels_owner_neighbours() {
+        let (_dir, src) = owner_heavy_repo();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let super::LookupResult::Found(detail) =
+            super::lookup_symbol(&store, "fromTemplate", None).unwrap()
+        else {
+            panic!("fromTemplate resolves")
+        };
+        let json = serde_json::to_value(&*detail).unwrap();
+        let owner = json["callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == nestweaver_schema::MODULE_OWNER_NAME)
+            .unwrap_or_else(|| panic!("{json}"));
+        assert_eq!(
+            owner["display_name"],
+            format!("{}::<module>", owner["file_path"].as_str().unwrap())
+        );
+        assert_eq!(json["symbol"]["display_name"], "fromTemplate");
+        let back: super::SymbolDetail = serde_json::from_value(json).unwrap();
+        assert_eq!(back.callers.len(), detail.callers.len());
+    }
+
+    /// nw-113 final round: a `symbol` miss gets the same suggestions as
+    /// `impact`; a UID miss gets none.
+    #[test]
+    fn symbol_lookup_suggestions_match_impact() {
+        let (_dir, src) = qualified_seed_repo();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        assert_eq!(
+            super::symbol_lookup_suggestions(&store, "nope.js::fromTemplate", None),
+            ["theme.js::fromTemplate"]
+        );
+        assert_eq!(
+            super::symbol_lookup_suggestions(&store, "Wrong::makeListener", None),
+            ["hub.js::Hub::makeListener", "hub.js::makeListener"]
+        );
+        assert!(super::symbol_lookup_suggestions(&store, "sym:repo:x:1", None).is_empty());
+    }
+
+    /// nw-113: `path::<module>` seeds context with that file's owner.
+    #[test]
+    fn context_seeds_a_file_qualified_owner() {
+        let (_dir, src) = owner_heavy_repo();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        for spec in ["styles/s2.style.js::<module>", "s2.style.js::<module>"] {
+            let result = build_context(&store, &[spec.to_string()]).unwrap();
+            let seeds: Vec<&str> = result.seeds.iter().map(|n| n.name.as_str()).collect();
+            assert_eq!(seeds, ["styles/s2.style.js::<module>"], "{spec}");
+        }
     }
 
     #[test]
@@ -1587,6 +2532,10 @@ pub struct FeatureContextResult {
     pub truncated_by: Option<TruncationCause>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<usize>,
+    /// nw-113: connected `<module>` owners left out by
+    /// [`CONTEXT_MODULE_OWNER_CAP`], as on [`ContextResult`].
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub module_owners_omitted: usize,
     /// nw-674: declared `repos` that did not resolve cleanly, so a feature
     /// scoped to fewer repos than declared says so.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1636,8 +2585,10 @@ pub fn build_feature_context(
 
     for entry_point in &feature.entry_points {
         // Use exact name match, then filter to feature repos only.
+        // nw-113: `path::name` and `Class::method` narrow through the same
+        // strict resolver as `context` and `impact`.
         let matches = store
-            .lookup_symbols_by_name(entry_point)
+            .lookup_symbols_by_spec(entry_point)
             .map_err(|e| anyhow::anyhow!(e))?;
         // nw-674: unscoped ONLY when nothing is indexed at all. Keying this on
         // an empty RESOLVED set meant a feature whose every declared repo
@@ -1691,17 +2642,32 @@ pub fn build_feature_context(
         );
     }
 
-    let ppr_scores = store
-        .personalized_pagerank_with_intent(&seed_uids, 0.85, 20, &GraphScope::unified(), intent)
+    let walk = store
+        .personalized_pagerank_with_floor(
+            &seed_uids,
+            0.85,
+            20,
+            &GraphScope::unified(),
+            intent,
+            None,
+            CONTEXT_PPR_FLOOR,
+            // nw-113 R1: keep enough below-floor rows to refill the whole
+            // list the caller asked for (bucketed and bounded by the store).
+            limit.unwrap_or(nestweaver_store::PPR_BELOW_FLOOR_KEEP),
+        )
         .map_err(|e| anyhow::anyhow!(e))?;
+    let SplitWalk {
+        ranked: ppr_scores,
+        pool: refill_pool,
+        deep_owners,
+        pool_cut,
+    } = split_refill_pool(walk, &seed_uids);
 
     let seed_set: std::collections::HashSet<&str> = seed_uids.iter().map(|s| s.as_str()).collect();
     let mut seeds: Vec<ContextNode> = Vec::new();
-    let mut connected: Vec<ContextNode> = Vec::new();
-    let mut connected_total: usize = 0;
+    let mut ranked: Vec<ContextNode> = Vec::new();
+    let mut owner_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Apply limit to PPR results (seeds are always included).
-    let effective_limit = limit.unwrap_or(usize::MAX);
     let ppr_uids: Vec<&str> = ppr_scores.iter().map(|(u, _)| u.as_str()).collect();
     let sym_map = store
         .batch_lookup_symbols(&ppr_uids)
@@ -1714,7 +2680,7 @@ pub fn build_feature_context(
         };
         let node = ContextNode {
             uid: sym.uid.clone(),
-            name: sym.name.clone(),
+            name: sym.display_name().into_owned(),
             kind: sym.kind.to_string(),
             file_path: sym.file_path.clone(),
             start_line: sym.start_line,
@@ -1724,12 +2690,36 @@ pub fn build_feature_context(
         if seed_set.contains(uid.as_str()) {
             seeds.push(node);
         } else {
-            connected_total += 1;
-            if connected.len() < effective_limit {
-                connected.push(node);
+            if sym.is_module_owner() {
+                owner_uids.insert(sym.uid.clone());
             }
+            ranked.push(node);
         }
     }
+    // nw-113: the same owner ordering, cap and refill as
+    // `build_context_with_intent`.
+    let mut module_owners_omitted =
+        rank_module_owners_last(&mut ranked, |node| owner_uids.contains(&node.uid));
+    let owners_listed = ranked
+        .iter()
+        .filter(|node| owner_uids.contains(&node.uid))
+        .count();
+    let (take, refill_available, _) = refill_count(
+        module_owners_omitted + deep_owners,
+        ranked.len(),
+        limit,
+        refill_pool.len(),
+        pool_cut,
+    );
+    let refill = context_nodes(store, &refill_pool[..take])?;
+    // Apply limit to PPR results (seeds are always included).
+    let mut connected_total = ranked.len() + refill_available;
+    insert_refill(&mut ranked, owners_listed, refill);
+    let owners_trimmed =
+        truncate_counting_owners(&mut ranked, limit, |node| owner_uids.contains(&node.uid));
+    module_owners_omitted += owners_trimmed;
+    connected_total -= owners_trimmed;
+    let connected = ranked;
 
     // Only include links whose both ends are repos declared in this feature.
     let feature_links: Vec<LinkInfo> = links
@@ -1765,6 +2755,7 @@ pub fn build_feature_context(
         truncated: Some(limit_truncated),
         truncated_by: TruncationCause::resolve(false, limit_truncated),
         token_budget: None,
+        module_owners_omitted,
         repo_issues,
     })
 }
@@ -1937,6 +2928,16 @@ pub struct BrainContextResult {
     /// higher than the count of candidates that could actually be rendered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admitted_before_cap: Option<usize>,
+    /// nw-113: connected `<module>` owners left out by
+    /// [`CONTEXT_MODULE_OWNER_CAP`], as on [`ContextResult`].
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub module_owners_omitted: usize,
+    /// nw-113 R1: real symbols the refill would have added to `connected`
+    /// but the store's below-floor keep (`PPR_BELOW_FLOOR_KEEP`) withheld.
+    /// `connected` is then incomplete: a renderer adds this to its `total`
+    /// and reports the list truncated.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub below_floor_rows_cut: usize,
 }
 
 /// Surface a project's curated member notes into the rendered `connected`
@@ -2408,6 +3409,24 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             continue;
         }
 
+        // nw-113: a qualified name (`path::name`, `path::<module>`,
+        // `Class::method`) resolves through the same strict resolver as
+        // `context` and `impact`. A qualifier that names nothing is a miss:
+        // a substring search would ignore it and seed the wrong symbols.
+        if nestweaver_schema::QualifiedSpec::parse(trimmed).is_some() {
+            let qualified = store
+                .lookup_symbols_by_spec(trimmed)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            if !qualified.is_empty() {
+                seed_name_tally.record_exact(qualified.len());
+                seed_uids.extend(qualified.into_iter().map(|s| s.uid));
+                resolved_inputs.push(trimmed.to_string());
+            } else {
+                unresolved.push(raw.clone());
+            }
+            continue;
+        }
+
         // Fall back to symbol name search. Respect the caller's configured
         // [`HybridSearchConfig::seed_resolution`] (sourced from
         // `[seed_resolution]` in instance config) so user overrides actually
@@ -2702,16 +3721,31 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     // nw-181: this path already carries the daemon's disconnect/timeout flag,
     // so hand it to PPR — the most expensive stage — instead of letting a
     // 193k-node push loop run for a client that is already gone.
-    let mut ppr = store
-        .personalized_pagerank_with_intent_cancellable(
+    let walk = store
+        .personalized_pagerank_with_floor(
             &seed_uids,
             damping,
             20,
             &GraphScope::unified(),
             intent,
             cancel.map(|flag| flag.as_ref()),
+            // A capped hydration (`investigate`) never refills, so it walks
+            // at the standard floor and caches no below-floor tail.
+            if render_cap.is_some() {
+                nestweaver_store::PPR_MIN_SCORE
+            } else {
+                CONTEXT_PPR_FLOOR
+            },
+            // No engine-side limit here: the default keep.
+            nestweaver_store::PPR_BELOW_FLOOR_KEEP,
         )
         .map_err(|e| anyhow::anyhow!(e))?;
+    let SplitWalk {
+        ranked: mut ppr,
+        pool: refill_pool,
+        deep_owners,
+        pool_cut,
+    } = split_refill_pool(walk, &seed_uids);
 
     // nw-609: bound each container expansion to its most central members.
     // Every member personalized the walk above, so the PPR score of a member
@@ -2723,6 +3757,9 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     // Demoted members are not dropped outright: one that scores like any
     // other non-seed stays a candidate and surfaces in `connected` in score
     // order; the rest never reach fusion or hydration (see below).
+    // nw-113 Minor 1: the members the cut drops never reach `connected`, and
+    // the refill below must not bring them back.
+    let mut container_dropped = std::collections::HashSet::new();
     if !container_expansions.is_empty() {
         let cut = cap_container_expansions(
             &container_expansions,
@@ -2735,6 +3772,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         direct_seed_uids.retain(|uid| !cut.demoted.contains(uid));
         // nw-609 review: bounded hydration -- see `cap_container_expansions`.
         ppr.retain(|(uid, _)| !cut.dropped.contains(uid));
+        container_dropped = cut.dropped;
     }
 
     // ── Hybrid retrieval: fuse PPR + BM25 + semantic ──────────────────────
@@ -2837,6 +3875,50 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         }
     }
 
+    // nw-113: owners rank after every other connected node and only
+    // `CONTEXT_MODULE_OWNER_CAP` are listed, as in code context. Applied
+    // before pinning so a seed the caller named keeps its pinned place.
+    let module_owners_omitted = rank_module_owners_last(&mut connected, |node| {
+        nestweaver_schema::uid::is_module_owner_uid(&node.uid)
+    });
+    // nw-113: refill the places the hidden owners would have taken, as in
+    // code context. Brain context has no engine-side limit, so it returns as
+    // many real symbols as owners were hidden and the caller's limit cuts.
+    // Not for a capped hydration (`investigate`), whose entries never list
+    // owners and whose cap is its own.
+    let mut below_floor_rows_cut = 0;
+    if render_cap.is_none() {
+        let owners_listed = connected
+            .iter()
+            .filter(|node| nestweaver_schema::uid::is_module_owner_uid(&node.uid))
+            .count();
+        // nw-113 Minor 1: the BM25 and semantic legs can list a node the
+        // walk scored under the floor; it is not listed twice.
+        let listed: std::collections::HashSet<&str> = seeds
+            .iter()
+            .chain(&connected)
+            .map(|node| node.uid.as_str())
+            .collect();
+        let pool: Vec<&(String, f64)> = refill_pool
+            .iter()
+            .filter(|(uid, _)| !listed.contains(uid.as_str()) && !container_dropped.contains(uid))
+            .collect();
+        let (take, _, cut) = refill_count(
+            module_owners_omitted + deep_owners,
+            connected.len(),
+            None,
+            pool.len(),
+            pool_cut,
+        );
+        below_floor_rows_cut = cut;
+        let mut refill = Vec::with_capacity(take);
+        for (uid, score) in pool.into_iter().take(take) {
+            if let Some(node) = render_brain_node(store, uid, *score)? {
+                refill.push(node);
+            }
+        }
+        insert_refill(&mut connected, owners_listed, refill);
+    }
     pin_direct_seeds_in_connected(&seeds, &mut connected, &direct_seed_uids);
     // nw-670 re-review N7: only notes/sections the caller NAMED pin their
     // code — not every member a `vlt:`/`repo:` container seed expanded to.
@@ -2895,6 +3977,8 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         seeds_truncated: seed_name_tally.truncated(),
         seed_resolution_limit: seed_name_tally.resolved().map(|_| SEED_NAME_MATCH_LIMIT),
         admitted_before_cap: render_cap.map(|_| admitted_before_cap),
+        module_owners_omitted,
+        below_floor_rows_cut,
     })
 }
 
@@ -3528,9 +4612,9 @@ pub(crate) fn render_brain_node(
     if uid.starts_with("sym:") {
         match store.lookup_symbol(uid) {
             Ok(s) => Ok(Some(BrainNode {
+                title: s.display_name().into_owned(),
                 uid: s.uid,
                 kind: format!("Symbol/{}", s.kind),
-                title: s.name,
                 location: format!("{}:{}", s.file_path, s.start_line),
                 relevance: score,
                 inline_body: None,
@@ -4167,9 +5251,13 @@ pub fn generate_repo_map_bounded(
     store: &GraphStore,
     token_budget: usize,
 ) -> Result<RepoMap, anyhow::Error> {
-    let ranked = store
+    let mut ranked = store
         .symbols_by_pagerank(None)
         .map_err(|e| anyhow::anyhow!(e))?;
+    // nw-113: a `<module>` owner declares nothing, so it is no skeleton line
+    // (it printed as an empty `Module`), and a file whose only symbol is its
+    // owner has no entry.
+    ranked.retain(|sym| !sym.is_module_owner());
 
     // nw-645: rank by CALLABLE PageRank. Raw order let a `require`-bound
     // `Constant` (`const knex = require('knex')`) that the resolver credits
@@ -5100,6 +6188,37 @@ mod repo_map_tests {
             tokens <= budget,
             "token count {tokens} exceeds budget {budget}; output was:\n{map}"
         );
+    }
+
+    /// nw-113: an owner is not a declaration, so repo-map never lists it,
+    /// and a file whose only symbol is its owner has no entry at all.
+    #[test]
+    fn repo_map_hides_module_owners() {
+        let (_dir, src) = make_test_repo();
+        fs::write(src.join("boot.js"), "formatDate(1);\n").unwrap();
+        fs::write(
+            src.join("start.js"),
+            "function start() { return 1; }\nstart();\n",
+        )
+        .unwrap();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        assert!(
+            store
+                .symbols_in_file("boot.js")
+                .unwrap()
+                .iter()
+                .any(|s| s.is_module_owner()),
+            "fixture mints an owner"
+        );
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        let map = generate_repo_map_bounded(&store, 100_000).unwrap();
+        assert!(!map.map.contains("Module"), "{}", map.map);
+        assert!(!map.map.contains("boot.js"), "{}", map.map);
+        assert!(map.map.contains("start.js"), "{}", map.map);
+        assert_eq!(map.files_total, 3, "{}", map.map);
     }
 
     #[test]

@@ -1699,12 +1699,12 @@ mod tests {
         // so we deliberately make no assertion about it.
     }
 
-    /// nw-008 hub cap: when a changed file has more reverse-dependents than the
-    /// `MAX_AFFECTED_FILES` cap, the transitive re-resolution pass is skipped
-    /// (bounded work) but the incremental index still completes and advances the
-    /// stored SHA. A periodic full re-index is the backstop for hubs.
+    /// nw-008 hub cap: when a changed file has more direct dependents than the
+    /// `MAX_AFFECTED_FILES` cap, the incremental index still re-resolves every
+    /// one of them (nw-113: the cap bounds only the transitive expansion), so
+    /// their edges into the re-keyed hub survive, and it advances the SHA.
     #[test]
-    fn incremental_hub_cap_skips_reresolution_but_advances_sha() {
+    fn incremental_hub_past_cap_keeps_direct_dependents_and_advances_sha() {
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("source");
 
@@ -1782,6 +1782,23 @@ mod tests {
             tracker.count(&job.repo_id),
             1,
             "the hub update must take the incremental path"
+        );
+        let hub = store
+            .lookup_symbols_by_repo(&r_uid)
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.name == "hubFunc")
+            .expect("hubFunc should be indexed");
+        assert_eq!(hub.start_line, 2, "the hub must have been re-keyed");
+        assert_eq!(
+            store
+                .callers_of(&hub.uid)
+                .unwrap()
+                .iter()
+                .filter(|caller| caller.name.starts_with("dep"))
+                .count(),
+            IMPORTERS,
+            "every direct dependent must keep its edge into the re-keyed hub"
         );
     }
 

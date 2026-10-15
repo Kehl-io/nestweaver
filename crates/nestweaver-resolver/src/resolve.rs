@@ -5,7 +5,7 @@ use nestweaver_schema::{
 };
 use rayon::prelude::*;
 
-use crate::imports::{ImportGraph, build_import_graph_with_languages};
+use crate::imports::{ImportGraph, NamedBinding, build_import_graph_with_languages};
 use crate::types::TypeEnvironment;
 use crate::util::parent_dir;
 use crate::workspace::WorkspaceContext;
@@ -146,7 +146,16 @@ pub fn resolve_references_with_file_languages(
         .iter()
         .map(|(_, symbols, _)| {
             let mut v: Vec<&RawSymbol> = symbols.iter().collect();
-            v.sort_by_key(|s| s.start_line);
+            // nw-113: the `<module>` owner sorts ahead of any symbol on its
+            // line, so it is always first whatever order the symbols arrive
+            // in (the parser's, or the store's when `build_reresolve_edges`
+            // rebuilds them). `resolve_single_reference` relies on that to
+            // find it in O(1).
+            v.sort_by_key(|s| (s.start_line, !s.is_module_owner()));
+            debug_assert!(
+                v.iter().skip(1).all(|s| !s.is_module_owner()),
+                "the <module> owner must sort first"
+            );
             v
         })
         .collect();
@@ -236,6 +245,7 @@ pub fn resolve_references_with_file_languages(
                 .iter()
                 .filter(|reference| reference.kind == ReferenceKind::LocalBinding)
                 .collect();
+            let scope_index = FileScopeIndex::build(&local_bindings, sorted_syms);
             let calls_by_identity = scoped_call_reference_index(references);
             for assignment in &env.call_assignments {
                 let Some(calls) = calls_by_identity.get(&(
@@ -258,6 +268,7 @@ pub fn resolve_references_with_file_languages(
                     file_path,
                     calls[0],
                     &local_bindings,
+                    &scope_index,
                     sorted_syms,
                     &symbol_map,
                     &extends_map,
@@ -333,23 +344,26 @@ pub fn resolve_references_with_file_languages(
                 .iter()
                 .filter(|reference| {
                     reference.kind == ReferenceKind::LocalBinding
-                        && !graph.bindings_of(file_path).iter().any(|binding| {
-                            binding.local_name == reference.name
-                                && if let Some(scope) = reference.scope {
+                        && !graph
+                            .bindings_named(file_path, &reference.name)
+                            .any(|binding| {
+                                if let Some(scope) = reference.scope {
                                     binding
                                         .scope
                                         .is_some_and(|import| import.position == scope.position)
                                 } else {
                                     binding.start_line == reference.start_line
                                 }
-                        })
+                            })
                 })
                 .collect();
+            let scope_index = FileScopeIndex::build(&local_bindings, sorted_syms);
             for reference in references {
                 if let Some(edge) = resolve_single_reference(
                     file_path,
                     reference,
                     &local_bindings,
+                    &scope_index,
                     sorted_syms,
                     &symbol_map,
                     &extends_map,
@@ -454,6 +468,7 @@ fn resolve_single_reference(
     file_path: &str,
     reference: &RawReference,
     local_bindings: &[&RawReference],
+    scope_index: &FileScopeIndex<'_>,
     sorted_syms: &[&RawSymbol],
     symbol_map: &std::collections::HashMap<String, Vec<(&str, &RawSymbol)>>,
     extends_map: &std::collections::HashMap<String, Vec<String>>,
@@ -488,16 +503,39 @@ fn resolve_single_reference(
     //   ModuleScope — the line belongs to no symbol. There is no source symbol to
     //                name, and this pass declines to invent one. See the note on
     //                `Enclosing` for why the obvious candidates were rejected.
+    //
+    // nw-113: in a file that has a `<module>` owner (the parser minted one
+    // because a call there sits outside every code-bearing span), a CALL at
+    // module scope, or one the degenerate fallback would pin on a one-line
+    // function above it, belongs to the module (CodeQL: JS `TopLevel`, Python
+    // `Module`). In JS/TS/Python/PHP spans are exact, so a degenerate guess
+    // there is always module-level code. Other reference kinds keep today's
+    // behaviour: the owner is for executed calls, not type mentions or field
+    // reads.
+    // The owner always sorts first (asserted where `sorted_syms` is built).
+    let module_owner = || {
+        sorted_syms
+            .first()
+            .copied()
+            .filter(|s| edge_type == EdgeType::Calls && s.is_module_owner())
+    };
     let source_sym = match find_enclosing_symbol(sorted_syms, reference.start_line) {
-        Enclosing::Exact(s) | Enclosing::Degenerate(s) => s,
-        Enclosing::ModuleScope => return None,
+        Enclosing::Exact(s) => s,
+        Enclosing::Degenerate(s) => module_owner().unwrap_or(s),
+        Enclosing::ModuleScope => module_owner()?,
     };
     let source_uid = symbol_uid(repo_uid, file_path, &source_sym.name, source_sym.start_line);
 
     // nw-724: a parameter, let, or lambda binding is the target. Do not
     // continue on to a same-named function in this file or another.
     if reference.receiver.is_none()
-        && name_is_locally_bound(local_bindings, sorted_syms, reference, language)
+        && name_is_locally_bound(
+            local_bindings,
+            scope_index,
+            sorted_syms,
+            reference,
+            language,
+        )
     {
         return Some(unresolved_edge(source_uid, &reference.name, edge_type));
     }
@@ -594,7 +632,7 @@ fn resolve_single_reference(
             // segment's binding cannot establish the complete receiver's type.
             if let Some(call_scope) = reference.scope {
                 if let Some(declaration) =
-                    active_lexical_binding(local_bindings, reference, receiver, language)
+                    active_lexical_binding(scope_index, reference, receiver, language)
                 {
                     env.lookup_declaration(receiver, declaration.scope?, call_scope.position)
                 } else if language == Language::Rust {
@@ -618,7 +656,13 @@ fn resolve_single_reference(
 
         if let Some(binding) = receiver_type.filter(|binding| {
             reference.scope.is_some()
-                || !name_is_locally_bound(local_bindings, sorted_syms, reference, language)
+                || !name_is_locally_bound(
+                    local_bindings,
+                    scope_index,
+                    sorted_syms,
+                    reference,
+                    language,
+                )
                 || binding.line >= source_sym.start_line
         }) {
             let method_name = &reference.name;
@@ -643,7 +687,7 @@ fn resolve_single_reference(
             let constructor_shadowed = binding.source
                 == crate::type_extractors::BindingSource::Constructor
                 && matches!(language, Language::JavaScript | Language::TypeScript)
-                && active_lexical_binding(local_bindings, reference, unqualified_type, language)
+                && active_lexical_binding(scope_index, reference, unqualified_type, language)
                     .is_some();
             let origin = if constructor_shadowed {
                 None
@@ -803,7 +847,13 @@ fn resolve_single_reference(
         }
     }
 
-    if name_is_locally_bound(local_bindings, sorted_syms, reference, language) {
+    if name_is_locally_bound(
+        local_bindings,
+        scope_index,
+        sorted_syms,
+        reference,
+        language,
+    ) {
         return Some(unresolved_edge(source_uid, &reference.name, edge_type));
     }
 
@@ -845,24 +895,36 @@ fn resolve_single_reference(
     // Aliased import (`use path::to::original as name;`): the binding records
     // the original name and the file it was imported from.
     let module_binding = rust_path_import_positions.and_then(|positions| {
-        graph.bindings_of(file_path).iter().find(|binding| {
+        let receiver = reference.receiver.as_deref()?;
+        graph.bindings_named(file_path, receiver).find(|binding| {
             binding.original_name == "*"
-                && reference.receiver.as_deref() == Some(binding.local_name.as_str())
                 && binding
                     .scope
                     .is_some_and(|scope| positions.contains(&scope.position))
         })
     });
+    // Only a binding named like the call or its receiver can match below, so
+    // look those up by name instead of scanning every import in the file.
     let binding = module_binding.or_else(|| {
-        graph.bindings_of(file_path).iter().find(|binding| {
-            let owner = find_enclosing_symbol(sorted_syms, binding.start_line).symbol();
+        let candidates =
+            graph.bindings_named_either(file_path, name, reference.receiver.as_deref());
+        candidates.into_iter().find(|binding| {
             let in_scope =
                 if let (Some(binding_scope), Some(call_scope)) = (binding.scope, reference.scope) {
                     binding_scope.start <= call_scope.position
                         && call_scope.position < binding_scope.end
-                        && binding_scope.initialized_at <= call_scope.position
+                        && (binding_scope.initialized_at <= call_scope.position
+                            // nw-113: a function body written above a
+                            // `require` runs later, once the binding is
+                            // initialized (the exemption `name_is_locally_bound`
+                            // gives a nested body). Top-level code, even in a
+                            // block or an IIFE, runs first: it has no source
+                            // but the module owner.
+                            || !source_sym.is_module_owner()
+                                && call_scope.start > binding_scope.start
+                                && call_scope.end <= binding_scope.end)
                 } else {
-                    owner.is_none_or(|owner| {
+                    scoping_owner(sorted_syms, binding.start_line, language).is_none_or(|owner| {
                         owner.start_line == source_sym.start_line && owner.name == source_sym.name
                     })
                 };
@@ -882,32 +944,79 @@ fn resolve_single_reference(
                 })
                 && if binding.original_name == "*" {
                     reference.receiver.as_deref() == Some(binding.local_name.as_str())
+                        // nw-801: a CommonJS module bound whole (`import x =
+                        // require('…')`, `const x = require('…')`) can itself
+                        // be called. A bare `x()` names that import, never a
+                        // same-named declaration elsewhere in the file.
+                        || matches!(language, Language::JavaScript | Language::TypeScript)
+                            && reference.receiver.is_none()
+                            && binding.local_name == *name
                 } else {
                     (binding.local_name == *name && reference.receiver.is_none())
                         || reference.receiver.as_deref() == Some(binding.local_name.as_str())
                 }
         })
     });
-    if binding.is_some_and(|binding| binding.source_file.is_none()) {
-        return Some(unresolved_edge(source_uid, &reference.name, edge_type));
-    }
+    // nw-113: an unresolved import binding still shadows every same-file
+    // declaration except a nested one: a strictly narrower visible
+    // declarator (both scopes contain the call, so the widths nest), or a
+    // function declaration whose innermost enclosing function or method also
+    // contains the call (see `nested_inside_binding`). Single-file passes
+    // (watcher, incremental index) see an import of a sibling file as
+    // unresolved because the sibling is not in the resolution set, so without
+    // that exception they dropped the nested edge the full index keeps.
+    let unresolved_binding = binding.filter(|binding| binding.source_file.is_none());
 
     // Priority 1: Same file. A local symbol shadows an import alias of the
     // same name, so this check runs on the reference's own name, before any
-    // alias rewriting.
+    // alias rewriting. nw-113: a block-scoped declaration shadows only inside
+    // its block, and the innermost visible declaration wins. A receiver that
+    // names an import (`Modal.latestProps` after `import { Modal }`) denotes
+    // that import's member, never a same-file symbol of the bare member name,
+    // even when the file stem matches the receiver (`Modal.test.js`).
+    let mut same_file_out_of_scope = false;
     if let Some(syms) = symbol_map.get(name.as_str())
-        && let Some((_, sym)) = syms.iter().find(|(f, sym)| {
-            *f == file_path
-                && !(language == Language::Rust
-                    && reference.receiver.is_some()
-                    && binding.is_some())
-                && exact_rust_call.is_none_or(|assignment| {
-                    assignment
-                        .local_callee_line
-                        .is_some_and(|line| sym.start_line == line)
-                })
-                && candidate_matches(reference, file_path, f, sym, language, graph)
-        })
+        && let Some((_, sym)) = syms
+            .iter()
+            .filter(|(f, sym)| {
+                *f == file_path
+                    && !(reference.receiver.is_some() && binding.is_some())
+                    && exact_rust_call.is_none_or(|assignment| {
+                        assignment
+                            .local_callee_line
+                            .is_some_and(|line| sym.start_line == line)
+                    })
+                    && candidate_matches(reference, file_path, f, sym, language, graph)
+            })
+            // Records rejections as a side effect; `min_by_key` consumes the
+            // whole iterator, so every candidate is seen. An unresolved import
+            // admits only a nested declaration. That test runs per candidate,
+            // before the innermost is chosen, so a rejected homonym (a sibling
+            // function's nested `f`) cannot hide an admissible one.
+            .filter_map(|candidate| {
+                let width =
+                    same_file_declaration_scope(scope_index, candidate.1, reference, language);
+                same_file_out_of_scope |= width.is_none();
+                let width = width?;
+                unresolved_binding
+                    .is_none_or(|binding| {
+                        binding
+                            .scope
+                            .is_some_and(|scope| width < scope.end - scope.start)
+                            || nested_inside_binding(
+                                sorted_syms,
+                                candidate.1,
+                                reference,
+                                binding,
+                                language,
+                            )
+                    })
+                    .then_some((width, candidate))
+            })
+            // The innermost scope wins; a tie goes to the earliest declaration,
+            // so the choice never depends on `symbol_map` order.
+            .min_by_key(|(width, (_, sym))| (*width, sym.start_line))
+            .map(|(_, candidate)| candidate)
     {
         let target_uid = symbol_uid(repo_uid, file_path, &sym.name, sym.start_line);
         let confidence = confidence_score(MatchType::SameFileExact, language);
@@ -923,6 +1032,12 @@ fn resolve_single_reference(
                 note: None,
             }],
         });
+    }
+
+    // Otherwise an import whose source is not in this resolution set binds
+    // nothing: no sibling homonym or later tier may stand in for it.
+    if unresolved_binding.is_some() {
+        return Some(unresolved_edge(source_uid, &reference.name, edge_type));
     }
 
     if exact_rust_call.is_some_and(|assignment| {
@@ -947,15 +1062,24 @@ fn resolve_single_reference(
         {
             return Some(unresolved_edge(source_uid, name, edge_type));
         }
+        // nw-801: calling a whole-module binding calls what the module
+        // exports as its value, which no export name identifies.
+        if binding.original_name == "*"
+            && reference.receiver.is_none()
+            && matches!(language, Language::JavaScript | Language::TypeScript)
+        {
+            return Some(unresolved_edge(source_uid, name, edge_type));
+        }
         let original = if binding.original_name == "*" {
             name.as_str()
         } else {
             binding.original_name.as_str()
         };
-        let source_file = binding
-            .source_file
-            .as_deref()
-            .expect("unresolved binding handled above");
+        // An unresolved binding returned above; this only keeps the
+        // invariant local.
+        let Some(source_file) = binding.source_file.as_deref() else {
+            return Some(unresolved_edge(source_uid, name, edge_type));
+        };
         let exact_exports = matches!(language, Language::JavaScript | Language::TypeScript);
         // A Rust type path resolves through the same bounded named type route
         // as a typed value. Keep the terminal declaration's byte identity so
@@ -1374,6 +1498,18 @@ fn resolve_single_reference(
         return Some(unresolved_edge(source_uid, name, edge_type));
     }
 
+    // nw-113: the name is declared in this file, but only inside blocks that
+    // do not contain this call (Priority 1 rejected every such candidate for
+    // scope). An ES module cannot see a sibling file's function without
+    // importing it, so the same-directory fallback below would fabricate the
+    // edge. Only reachable when the JS/TS file has no imports at all: a file
+    // with imports already returned unresolved above for an unbound name, so
+    // this does not protect import resolution. A name not declared in this
+    // file at all still takes the same-directory fallback.
+    if same_file_out_of_scope {
+        return Some(unresolved_edge(source_uid, name, edge_type));
+    }
+
     // Priority 4: Same package/directory
     //
     // nw-150: for a METHOD call this fallback invents edges. `knex.where(..)`
@@ -1564,11 +1700,9 @@ fn rust_public_type_origin(
         }
         let public_uses = &type_envs.get(&file)?.rust_public_root_uses;
         let bindings: Vec<_> = graph
-            .bindings_of(&file)
-            .iter()
+            .bindings_named(&file, &name)
             .filter(|binding| {
-                binding.local_name == name
-                    && binding.original_name != "*"
+                binding.original_name != "*"
                     && binding
                         .scope
                         .is_some_and(|scope| public_uses.contains(&scope.position))
@@ -1631,13 +1765,11 @@ fn typed_receiver_origin(
         // Named aliases retain their original declaration spelling. Unresolved
         // exact imports cannot be rescued by another resolved glob.
         let named: Vec<_> = graph
-            .bindings_of(source_file)
-            .iter()
+            .bindings_named(source_file, type_name)
             .filter(|binding| {
-                binding.local_name == type_name
-                    && binding.scope.is_some_and(|scope| {
-                        origin.named_import_positions.contains(&scope.position)
-                    })
+                binding
+                    .scope
+                    .is_some_and(|scope| origin.named_import_positions.contains(&scope.position))
                     && imports.iter().any(|(specifier, file)| {
                         selected_paths.contains(specifier)
                             && binding.source_file.as_deref() == Some(file.as_str())
@@ -1711,11 +1843,9 @@ fn typed_receiver_origin(
         return None;
     }
     let imports: Vec<_> = graph
-        .bindings_of(source_file)
-        .iter()
+        .bindings_named(source_file, type_name)
         .filter(|binding| {
-            binding.local_name == type_name
-                && binding.original_name != "*"
+            binding.original_name != "*"
                 && binding.scope.is_none_or(|scope| {
                     reference.scope.is_some_and(|call| {
                         scope.start <= call.position
@@ -1794,9 +1924,8 @@ fn method_belongs_to_origin(
                     *owner_file == file
                         && matches!(owner.kind, SymbolKind::Class | SymbolKind::Enum)
                 })
-                && graph.bindings_of(file).iter().any(|binding| {
-                    binding.local_name == origin.name
-                        && binding.original_name == origin.name
+                && graph.bindings_named(file, &origin.name).any(|binding| {
+                    binding.original_name == origin.name
                         && binding.source_file.as_deref() == Some(origin.file.as_str())
                 }))
 }
@@ -1921,13 +2050,16 @@ fn path_denotes(candidate_file: &str, sym: &RawSymbol, qualifier: &str) -> bool 
 /// symbol at or before the use, and it is not the declaration of a graph
 /// symbol of that name (a `const len = ...` that IS the symbol).
 fn active_lexical_binding<'a>(
-    bindings: &[&'a RawReference],
+    scope_index: &FileScopeIndex<'a>,
     reference: &RawReference,
     name: &str,
     language: Language,
 ) -> Option<&'a RawReference> {
     let at = reference.scope?.position;
-    bindings
+    // nw-113 (perf): only the file's scoped bindings of this name, from the
+    // per-file index, instead of every binding in the file per reference.
+    scope_index
+        .named(name)
         .iter()
         .copied()
         .filter(|binding| {
@@ -1952,8 +2084,255 @@ fn active_lexical_binding<'a>(
         })
 }
 
+/// nw-113 (perf): per-file lookups for Priority 1 scoping, built once per
+/// file next to `local_bindings`. Before this, every same-file candidate of
+/// every bare call scanned all of the file's bindings and then all of its
+/// symbols, which is O(calls x candidates x (bindings + symbols)) and
+/// measured cubic on a file of many same-named locals (bug-hunt #1).
+pub(crate) struct FileScopeIndex<'a> {
+    /// Scoped bindings (`LocalBinding`s with a byte scope: declarators,
+    /// parameters, and `catch` and `for … of/in` bindings), by name, sorted by
+    /// line. A candidate's own declarators are a binary search over its span;
+    /// `active_lexical_binding` reads one name's list instead of every binding
+    /// in the file.
+    declarators: std::collections::HashMap<&'a str, Vec<&'a RawReference>>,
+    /// `covering[l - 1]`: how many code-bearing symbols (never the `<module>`
+    /// owner) contain line `l`.
+    covering: Vec<u32>,
+}
+
+impl<'a> FileScopeIndex<'a> {
+    pub(crate) fn build(local_bindings: &[&'a RawReference], sorted_syms: &[&RawSymbol]) -> Self {
+        let mut declarators: std::collections::HashMap<&'a str, Vec<&'a RawReference>> =
+            std::collections::HashMap::new();
+        for binding in local_bindings
+            .iter()
+            .filter(|binding| binding.scope.is_some())
+        {
+            declarators
+                .entry(binding.name.as_str())
+                .or_default()
+                .push(binding);
+        }
+        for bindings in declarators.values_mut() {
+            bindings.sort_by_key(|binding| binding.start_line);
+        }
+        let code: Vec<&&RawSymbol> = sorted_syms.iter().filter(|s| can_contain_code(s)).collect();
+        let last = code
+            .iter()
+            .map(|s| s.end_line.max(s.start_line) as usize)
+            .max()
+            .unwrap_or(0);
+        let mut delta = vec![0i64; last + 1];
+        for s in code {
+            delta[(s.start_line.max(1) - 1) as usize] += 1;
+            delta[s.end_line.max(s.start_line) as usize] -= 1;
+        }
+        let mut depth = 0i64;
+        let covering = delta[..last]
+            .iter()
+            .map(|change| {
+                depth += change;
+                depth as u32
+            })
+            .collect();
+        Self {
+            declarators,
+            covering,
+        }
+    }
+
+    /// Every scoped binding named `name`, in line order.
+    fn named(&self, name: &str) -> &[&'a RawReference] {
+        self.declarators.get(name).map_or(&[], Vec::as_slice)
+    }
+
+    /// Every scoped binding named `name` (not only declarators: parameters,
+    /// `catch` and loop bindings too) whose line lies in `start..=end`. The
+    /// caller picks the declaration among them by width.
+    fn declarators_in(&self, name: &str, start: u32, end: u32) -> &[&'a RawReference] {
+        let Some(bindings) = self.declarators.get(name) else {
+            return &[];
+        };
+        let lo = bindings.partition_point(|binding| binding.start_line < start);
+        let hi = bindings.partition_point(|binding| binding.start_line <= end);
+        &bindings[lo..hi.max(lo)]
+    }
+
+    /// How many code-bearing symbols contain `line`.
+    fn covering(&self, line: u32) -> u32 {
+        (line as usize)
+            .checked_sub(1)
+            .and_then(|index| self.covering.get(index))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// nw-113: where a same-file callable `sym` is visible from `reference`.
+///
+/// A `const f = () => …` declared in a block is a graph `Function` whose
+/// declaring `LocalBinding` carries that block's byte range. Returns:
+/// - `None` when the declaration is not visible at the call (its own
+///   declarator's block excludes the call position);
+/// - `Some(width)` with that block's width when it is, so the innermost
+///   visible declarator wins;
+/// - `Some(usize::MAX)` (unfiltered, base behaviour) for everything that
+///   carries no shadowing information: a symbol that is not a declarator
+///   (function declarations, nested or not; methods; class fields;
+///   assignment forms such as `exports.f = function …` and
+///   `obj.f = function …`; every non-`Function` kind), and a module-level
+///   declarator, which is visible everywhere. All-`MAX` ties keep the base
+///   first-match order.
+///
+/// Module level is decided by symbol nesting: a declarator is module-level
+/// when no code-bearing symbol other than `sym` contains its own binding's
+/// line. A declarator inside a function, method or test-runner callback is
+/// scoped. Residuals:
+/// - (base behaviour) a declarator with no enclosing symbol reads as
+///   module-level and ties with a module `function f`, falling back to
+///   source order: a bare top-level block `{ const f = … }`, an IIFE
+///   `(() => { const f = … })()`, or an anonymous top-level callback
+///   `app.get('/', () => { const f = … })`;
+/// - containment is decided per LINE, so a module-level declarator that
+///   shares a line with another symbol's span (a sibling function on the
+///   same line, a function's closing-brace line, minified code) counts as
+///   scoped, and can then outrank a nested `function` declaration.
+///
+/// Only a symbol whose signature (after `export`/`declare`/`await`) starts
+/// with a declarator keyword (`const`/`let`/`var`/`using`) is scoped. A same-named
+/// local declared inside any other symbol's body is not that symbol's
+/// declaration and must never scope it. The signature is the node's first
+/// line, which for a declaration always starts with that keyword.
+///
+/// A declarator's own block encloses any same-named local declared inside
+/// an initializer in its span (`let a = { g() { let f = 1; return f; } },
+/// f = () => 2;` puts the inner `f` ahead of `f`'s own declarator), so among
+/// the in-span same-named scoped bindings the one with the WIDEST scope is
+/// the symbol's declaration. A same-named parameter, `catch` or loop binding
+/// in that span is always narrower than the declarator's own binding, so it
+/// is never chosen.
+///
+/// Gated to bare JS/TS calls (plan validation): Rust has its own exact gate,
+/// and receiver calls (`Api.get()`, `this.x()`) are matched by
+/// `candidate_matches`, so neither may be filtered here.
+fn same_file_declaration_scope(
+    scope_index: &FileScopeIndex<'_>,
+    sym: &RawSymbol,
+    reference: &RawReference,
+    language: Language,
+) -> Option<usize> {
+    if !matches!(language, Language::JavaScript | Language::TypeScript)
+        || reference.receiver.is_some()
+        || sym.kind != SymbolKind::Function
+        || !is_declarator_form(&sym.signature)
+    {
+        return Some(usize::MAX);
+    }
+    let Some(call) = reference.scope else {
+        return Some(usize::MAX);
+    };
+    let Some(declaration) = scope_index
+        // The declarator may sit on a later line than the declaration
+        // (`const a = 1,\n  b = () => 2;`), so join by the symbol's span,
+        // not its first line.
+        .declarators_in(&sym.name, sym.start_line, sym.end_line.max(sym.start_line))
+        .iter()
+        .filter_map(|binding| binding.scope.map(|scope| (binding.start_line, scope)))
+        .max_by_key(|(_, scope)| scope.end - scope.start)
+    else {
+        return Some(usize::MAX);
+    };
+    let (line, declaration) = declaration;
+    if !(declaration.start <= call.position && call.position < declaration.end) {
+        return None;
+    }
+    // Module level: no other code-bearing symbol contains the declarator, so
+    // it is visible everywhere and ranks like an unscoped symbol. `sym` is a
+    // code-bearing `Function` whose span contains `line` (the join above), so
+    // it alone covers the line exactly when no other symbol does.
+    let module_level = scope_index.covering(line) <= 1;
+    Some(if module_level {
+        usize::MAX
+    } else {
+        declaration.end - declaration.start
+    })
+}
+
+/// nw-113: whether same-file function `sym` is lexically visible at the call
+/// in place of the unresolved import `binding`. Only a `Function` qualifies
+/// (a bare call never reaches a method). Its INNERMOST enclosing code-bearing
+/// symbol (other than itself) must be a function or method (a lexical
+/// function scope, never a class, interface, trait or extension), must
+/// contain the call, and must lie strictly within the binding's owner (or
+/// anywhere, for a module-level import). Containment is by line, as in
+/// `same_file_declaration_scope`'s module-level test.
+///
+/// Residuals:
+/// - (nw-787) a block-nested `function f` binds a call after its block, which
+///   is sloppy-mode semantics, not strict-mode block scoping;
+/// - (nw-787) the full index binds by name regardless of this rule when the
+///   import resolves, so a sibling function's nested `f`, a callback's nested
+///   `f`, or a method `f` still binds there; single-file passes now leave
+///   those unresolved and so differ from the full index for those shapes;
+/// - anonymous callbacks: in `function g() { [1].forEach(() => { function f()
+///   {} }); return f(); }` the unnamed callback is not a symbol, so `g` is
+///   `f`'s innermost container and the call binds `f` in every mode;
+/// - the shared boundary line: when `function f() {} } function h() {` sits
+///   on one line, the tie-break credits `f` to `h`.
+fn nested_inside_binding(
+    sorted_syms: &[&RawSymbol],
+    sym: &RawSymbol,
+    reference: &RawReference,
+    binding: &NamedBinding,
+    language: Language,
+) -> bool {
+    if sym.kind != SymbolKind::Function {
+        return false;
+    }
+    let contains = |outer: &RawSymbol, line: u32| {
+        outer.start_line <= line && line <= outer.end_line.max(outer.start_line)
+    };
+    let same = |a: &RawSymbol, b: &RawSymbol| a.name == b.name && a.start_line == b.start_line;
+    let Some(container) = sorted_syms
+        .iter()
+        .take_while(|other| other.start_line <= sym.start_line)
+        .filter(|other| {
+            !same(other, sym) && can_contain_code(other) && contains(other, sym.start_line)
+        })
+        // Innermost: the narrowest span, the later start on a tie. The tie
+        // assumes the candidate follows the shared line's boundary.
+        .min_by_key(|other| {
+            (
+                other.end_line.max(other.start_line) - other.start_line,
+                std::cmp::Reverse(other.start_line),
+            )
+        })
+    else {
+        return false;
+    };
+    let binding_owner = scoping_owner(sorted_syms, binding.start_line, language);
+    matches!(container.kind, SymbolKind::Function | SymbolKind::Method)
+        && contains(container, reference.start_line)
+        && binding_owner.is_none_or(|owner| {
+            !same(owner, container)
+                && contains(owner, container.start_line)
+                && contains(owner, container.end_line)
+        })
+}
+
+/// A JS/TS `const`/`let`/`var`/`using` declaration's first line, after any
+/// `export`/`declare`/`await` modifiers (`await using f = …`).
+fn is_declarator_form(signature: &str) -> bool {
+    signature
+        .split_whitespace()
+        .find(|word| !matches!(*word, "export" | "declare" | "await"))
+        .is_some_and(|word| matches!(word, "const" | "let" | "var" | "using"))
+}
+
 fn name_is_locally_bound(
     bindings: &[&RawReference],
+    scope_index: &FileScopeIndex<'_>,
     sorted_syms: &[&RawSymbol],
     reference: &RawReference,
     language: Language,
@@ -1964,7 +2343,7 @@ fn name_is_locally_bound(
             .as_deref()
             .and_then(|receiver| receiver.split('.').next())
             .unwrap_or(&reference.name);
-        return active_lexical_binding(bindings, reference, name, language).is_some_and(
+        return active_lexical_binding(scope_index, reference, name, language).is_some_and(
             |binding| {
                 !binding.scope.is_some_and(|scope| {
                     scope.initialized_at > scope.position
@@ -2149,16 +2528,45 @@ impl<'a> Enclosing<'a> {
 /// Those are not missing edges — they are edges with fabricated sources, which
 /// is worse, because a caller cannot tell them from real ones. A `Constant`,
 /// `Variable`, `Property` or `Field` has no body and cannot call anything.
-fn can_contain_code(kind: SymbolKind) -> bool {
+///
+/// The rule itself lives on `SymbolKind::contains_code` so the parser's
+/// `<module>` minting gate applies the same definition (nw-113).
+///
+/// nw-113: the per-file `<module>` owner is code-bearing by kind but is never
+/// a container. Its whole-file span would otherwise enclose every line, make
+/// every declaration look nested, and own every module-level reference. It is
+/// only the CALLS source for module-level calls (see
+/// `resolve_single_reference`), so every container test goes through here.
+fn can_contain_code(symbol: &RawSymbol) -> bool {
+    symbol.kind.contains_code() && !symbol.is_module_owner()
+}
+
+/// nw-113: the symbol whose body scopes a binding declared on `line`, or
+/// `None` for module scope. Only an exact span scopes. JS/TS/Python/PHP spans
+/// are exact (the languages that mint a `<module>` owner), so a degenerate
+/// guess there is module-level code: it reads as module scope, mirroring how
+/// `resolve_single_reference` maps a degenerate call source to the owner. In
+/// other languages the guess stands, matching the source it is compared to.
+fn scoping_owner<'a>(
+    sorted_syms: &'a [&'a RawSymbol],
+    line: u32,
+    language: Language,
+) -> Option<&'a RawSymbol> {
+    match find_enclosing_symbol(sorted_syms, line) {
+        Enclosing::Exact(symbol) => Some(symbol),
+        Enclosing::Degenerate(_) if has_exact_spans(language) => None,
+        Enclosing::Degenerate(symbol) => Some(symbol),
+        Enclosing::ModuleScope => None,
+    }
+}
+
+/// The languages whose code-bearing spans always cover their bodies, so a
+/// line outside every span is module-level code (and may get a `<module>`
+/// owner).
+fn has_exact_spans(language: Language) -> bool {
     matches!(
-        kind,
-        SymbolKind::Function
-            | SymbolKind::Method
-            | SymbolKind::Class
-            | SymbolKind::Module
-            | SymbolKind::Interface
-            | SymbolKind::Trait
-            | SymbolKind::Extension
+        language,
+        Language::JavaScript | Language::TypeScript | Language::Python | Language::Php
     )
 }
 
@@ -2213,7 +2621,7 @@ fn find_enclosing_symbol<'a>(symbols: &'a [&'a RawSymbol], ref_line: u32) -> Enc
     if let Some(enclosing) = symbols[..idx]
         .iter()
         .rev()
-        .find(|s| ref_line <= s.end_line.max(s.start_line) && can_contain_code(s.kind))
+        .find(|s| ref_line <= s.end_line.max(s.start_line) && can_contain_code(s))
         .copied()
     {
         return Enclosing::Exact(enclosing);
@@ -2221,7 +2629,7 @@ fn find_enclosing_symbol<'a>(symbols: &'a [&'a RawSymbol], ref_line: u32) -> Enc
     symbols[..idx]
         .iter()
         .rev()
-        .find(|s| s.end_line <= s.start_line && can_contain_code(s.kind))
+        .find(|s| s.end_line <= s.start_line && can_contain_code(s))
         .copied()
         .map_or(Enclosing::ModuleScope, Enclosing::Degenerate)
 }
@@ -8346,6 +8754,705 @@ function varAfterInitialization() { var svc = new Service(); return svc.run(); }
         );
     }
 
+    /// Targets of the CALLS edges whose source is `caller` in `path`.
+    fn call_targets(
+        files: &ReviewParsedFiles,
+        edges: &[ResolvedEdge],
+        path: &str,
+        caller: &str,
+    ) -> Vec<String> {
+        let source = uid(files, path, caller);
+        let mut targets: Vec<String> = edges
+            .iter()
+            .filter(|edge| edge.source_uid == source && edge.edge_type == EdgeType::Calls)
+            .map(|edge| edge.target_uid.clone())
+            .collect();
+        targets.sort();
+        targets.dedup();
+        targets
+    }
+
+    /// `uid` for the symbol named `name` declared on `line` (1-based) in `path`.
+    fn uid_at(files: &ReviewParsedFiles, path: &str, name: &str, line: u32) -> String {
+        let symbol = files
+            .iter()
+            .find(|(file, _, _)| file == path)
+            .unwrap()
+            .1
+            .iter()
+            .find(|symbol| symbol.name == name && symbol.start_line == line)
+            .unwrap_or_else(|| panic!("no {name} declared on line {line} of {path}"));
+        symbol_uid("repo:test:abc", path, name, symbol.start_line)
+    }
+
+    /// nw-113 (block scope). The block-local `sendPacket` exists only inside
+    /// its block; after the block the name is the import again (a JS runtime
+    /// control returns the imported provider's 7).
+    #[test]
+    fn a_block_local_callable_does_not_shadow_an_import_outside_its_block() {
+        let lib = (
+            "src/lib.ts",
+            "export function sendPacket(): number { return 7; }\n",
+        );
+        let lexical = (
+            "src/lexical.ts",
+            r#"import { sendPacket } from "./lib";
+export function namedCaller() {
+  return sendPacket();
+}
+export function lexicalCaller() {
+  {
+    const sendPacket = () => 42;
+    sendPacket();
+  }
+  return sendPacket();
+}
+export function innerOnly() {
+  {
+    const sendPacket = () => 1;
+    return sendPacket();
+  }
+}
+"#,
+        );
+        let (files, edges) = review_edges(&[lib, lexical], Language::TypeScript);
+        let imported = uid(&files, "src/lib.ts", "sendPacket");
+        let block_local = uid_at(&files, "src/lexical.ts", "sendPacket", 7);
+        let inner_only_local = uid_at(&files, "src/lexical.ts", "sendPacket", 14);
+
+        // Control: plain import resolution works in this fixture.
+        assert_eq!(
+            call_targets(&files, &edges, "src/lexical.ts", "namedCaller"),
+            vec![imported.clone()]
+        );
+        // Inside the block: the block-local. After it: the import.
+        let mut expected = vec![block_local, imported.clone()];
+        expected.sort();
+        assert_eq!(
+            call_targets(&files, &edges, "src/lexical.ts", "lexicalCaller"),
+            expected
+        );
+        // Counterweight: a call that never leaves the block stays local.
+        assert_eq!(
+            call_targets(&files, &edges, "src/lexical.ts", "innerOnly"),
+            vec![inner_only_local]
+        );
+    }
+
+    /// nw-113 (watcher parity). The watcher and the CLI incremental index
+    /// resolve a changed file ALONE before re-resolving cross-file edges, so
+    /// the import's source file is absent and its binding is unresolved. The
+    /// block-local declaration must still shadow that binding inside its
+    /// block, exactly as it does when the imported file is present.
+    #[test]
+    fn a_block_local_callable_shadows_an_import_whose_source_is_absent() {
+        let lexical = (
+            "src/lexical.ts",
+            r#"import { sendPacket } from "./lib";
+export function lexicalCaller() {
+  {
+    const sendPacket = () => 42;
+    sendPacket();
+  }
+  return sendPacket();
+}
+"#,
+        );
+        let (files, edges) = review_edges(&[lexical], Language::TypeScript);
+        let block_local = uid_at(&files, "src/lexical.ts", "sendPacket", 4);
+        let mut expected = vec![block_local, "unresolved:sendPacket".to_string()];
+        expected.sort();
+        assert_eq!(
+            call_targets(&files, &edges, "src/lexical.ts", "lexicalCaller"),
+            expected,
+            "{edges:#?}"
+        );
+    }
+
+    /// nw-113 (watcher parity). A nested `function` declaration carries no
+    /// declarator width, but it still shadows a module import inside its
+    /// enclosing function. Resolved alone (import source absent) the call
+    /// must bind it, exactly as the full index does with the source present.
+    #[test]
+    fn a_nested_function_shadows_an_import_whose_source_is_absent() {
+        let lib = ("src/lib.ts", "export function f(): number { return 7; }\n");
+        let nested = (
+            "src/nested.ts",
+            r#"import { f } from "./lib";
+export function g() {
+  function f() { return 1; }
+  return f();
+}
+"#,
+        );
+        for inputs in [&[nested][..], &[lib, nested][..]] {
+            let (files, edges) = review_edges(inputs, Language::TypeScript);
+            assert_eq!(
+                call_targets(&files, &edges, "src/nested.ts", "g"),
+                vec![uid_at(&files, "src/nested.ts", "f", 3)],
+                "{edges:#?}"
+            );
+        }
+    }
+
+    /// nw-113 (review of the nested-declaration rule). With an npm import of
+    /// `f` (never resolvable), a same-file `function f` binds a bare call only
+    /// when the innermost function or method enclosing `f` also contains the
+    /// call. `Some(line)` expects the `f` declared on that line; `None`
+    /// expects only `unresolved:f`.
+    #[test]
+    fn a_nested_function_shadows_an_npm_import_only_from_its_innermost_function() {
+        let cases: [(&str, &str, &str, Option<u32>); 11] = [
+            // S3: nested in g, called in g.
+            (
+                "S3",
+                "function g() {\n  function f() { return 1; }\n  return f();\n}\n",
+                "g",
+                Some(3),
+            ),
+            // Module-level f: the import cannot coexist with it, and it is
+            // not nested, so the unresolved import keeps the call.
+            (
+                "module-level",
+                "function f() { return 1; }\nfunction g() {\n  return f();\n}\n",
+                "g",
+                None,
+            ),
+            // S4: f is nested in a separate top-level function h.
+            (
+                "S4",
+                "function h() {\n  function f() {}\n}\nfunction g() {\n  return f();\n}\n",
+                "g",
+                None,
+            ),
+            // A1 (known residual): the anonymous callback is not a symbol, so
+            // g reads as f's innermost container and the call binds f.
+            (
+                "A1",
+                "function g() {\n  [1].forEach(() => {\n    function f() {}\n  });\n  return f();\n}\n",
+                "g",
+                Some(4),
+            ),
+            // F1: f is visible only inside its sibling h.
+            (
+                "F1",
+                "function outer() {\n  function h() {\n    function f() { return 1; }\n  }\n  function g() {\n    return f();\n  }\n}\n",
+                "g",
+                None,
+            ),
+            // F2: f is local to the arrow callback.
+            (
+                "F2",
+                "function g() {\n  const cb = () => {\n    function f() { return 1; }\n  };\n  return f();\n}\n",
+                "g",
+                None,
+            ),
+            // F3: a bare call never reaches a method.
+            (
+                "F3",
+                "class C {\n  f() { return 1; }\n  m() {\n    return f();\n  }\n}\n",
+                "m",
+                None,
+            ),
+            // F6: f and g are siblings in outer, which contains the call.
+            (
+                "F6",
+                "function outer() {\n  function f() { return 1; }\n  function g() {\n    return f();\n  }\n}\n",
+                "g",
+                Some(3),
+            ),
+            // F7: f nested in method m, called in m.
+            (
+                "F7",
+                "class C {\n  m() {\n    function f() { return 1; }\n    return f();\n  }\n}\n",
+                "m",
+                Some(4),
+            ),
+            // I2: an earlier sibling's nested homonym must not hide g's own.
+            (
+                "sibling-homonym",
+                "function h() {\n  function f() { return 1; }\n  return 0;\n}\nfunction g() {\n  function f() { return 2; }\n  return f();\n}\n",
+                "g",
+                Some(7),
+            ),
+            // F4 (known residual, nw-787): a block-nested function declaration
+            // binds after its block, which is sloppy-mode semantics.
+            (
+                "F4",
+                "function g() {\n  {\n    function f() { return 1; }\n  }\n  return f();\n}\n",
+                "g",
+                Some(4),
+            ),
+        ];
+        for (label, body, caller, expected) in cases {
+            let source = format!("import {{ f }} from \"react\";\n{body}");
+            let (files, edges) = review_edges(&[("src/app.ts", &source)], Language::TypeScript);
+            let expected = match expected {
+                Some(line) => vec![uid_at(&files, "src/app.ts", "f", line)],
+                None => vec!["unresolved:f".to_string()],
+            };
+            // Only the calls to `f` (A1's `forEach` call is not under test).
+            let targets: Vec<String> = call_targets(&files, &edges, "src/app.ts", caller)
+                .into_iter()
+                .filter(|target| !target.starts_with("unresolved:") || target == "unresolved:f")
+                .collect();
+            assert_eq!(targets, expected, "{label}: {edges:#?}");
+        }
+    }
+
+    /// nw-113 (full index). An npm import never resolves to a file, so a
+    /// block-local declarator shadowing it binds inside its block, and the
+    /// call after the block stays unresolved.
+    #[test]
+    fn a_block_local_callable_shadows_an_npm_import_inside_its_block() {
+        let app = (
+            "src/app.ts",
+            r#"import { useState } from "react";
+export function component() {
+  {
+    const useState = () => 0;
+    useState();
+  }
+  return useState();
+}
+"#,
+        );
+        let (files, edges) = review_edges(&[app], Language::TypeScript);
+        let mut expected = vec![
+            uid_at(&files, "src/app.ts", "useState", 4),
+            "unresolved:useState".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(
+            call_targets(&files, &edges, "src/app.ts", "component"),
+            expected,
+            "{edges:#?}"
+        );
+    }
+
+    /// nw-113 (block scope). Sibling and nested blocks: each call binds the
+    /// innermost declaration whose block contains it, never a sibling's.
+    #[test]
+    fn same_file_callables_bind_the_innermost_containing_declaration() {
+        let lib = (
+            "src/lib.ts",
+            "export function sendPacket(): number { return 7; }\n",
+        );
+        let scopes = (
+            "src/scopes.ts",
+            r#"import { sendPacket } from "./lib";
+export function siblings() {
+  {
+    const sendPacket = () => 1;
+  }
+  {
+    return sendPacket();
+  }
+}
+export function nested() {
+  const sendPacket = () => 2;
+  {
+    const sendPacket = () => 3;
+    sendPacket();
+  }
+  return sendPacket();
+}
+export function multi() {
+  {
+    const first = 1,
+      sendPacket = () => 5;
+  }
+  return sendPacket();
+}
+"#,
+        );
+        let (files, edges) = review_edges(&[lib, scopes], Language::TypeScript);
+        let imported = uid(&files, "src/lib.ts", "sendPacket");
+        let outer = uid_at(&files, "src/scopes.ts", "sendPacket", 11);
+        let inner = uid_at(&files, "src/scopes.ts", "sendPacket", 13);
+
+        assert_eq!(
+            call_targets(&files, &edges, "src/scopes.ts", "siblings"),
+            vec![imported],
+            "a sibling block's declaration is not visible"
+        );
+        let mut expected = vec![outer, inner];
+        expected.sort();
+        assert_eq!(
+            call_targets(&files, &edges, "src/scopes.ts", "nested"),
+            expected,
+            "inner call binds the inner declaration, outer call the function-level one"
+        );
+        assert_eq!(
+            call_targets(&files, &edges, "src/scopes.ts", "multi"),
+            vec![uid(&files, "src/lib.ts", "sendPacket")],
+            "a declarator on a later line of its declaration is still block-scoped"
+        );
+    }
+
+    /// nw-113 (block scope). A name declared in this file only inside a block
+    /// that does not contain the call is unresolved: an ES module cannot see a
+    /// sibling file's function without importing it, so the same-directory
+    /// fallback must not bind it.
+    #[test]
+    fn an_out_of_scope_block_local_does_not_fall_back_to_a_sibling_file() {
+        let a = (
+            "src/a.ts",
+            r#"export function caller() {
+  {
+    const helper = () => 1;
+  }
+  return helper();
+}
+"#,
+        );
+        let b = ("src/b.ts", "export function helper() { return 2; }\n");
+        let (files, edges) = review_edges(&[a, b], Language::TypeScript);
+        let sibling = uid(&files, "src/b.ts", "helper");
+        let targets = call_targets(&files, &edges, "src/a.ts", "caller");
+        assert_eq!(targets, vec!["unresolved:helper".to_string()]);
+        assert!(
+            !edges.iter().any(|edge| edge.target_uid == sibling),
+            "{edges:#?}"
+        );
+    }
+
+    /// nw-113 counterweight (code review). A `function` declaration has no
+    /// declarator binding of its own, so a same-named local declared inside
+    /// its body must not scope the function to that body.
+    #[test]
+    fn a_function_declaration_is_not_scoped_by_a_same_named_local_in_its_body() {
+        let body = r#"function format(x: number) {
+  const format = new Intl.NumberFormat();
+  return format.format(x);
+}
+"#;
+        let lib = ("src/lib.ts", "export function other() { return 1; }\n");
+        let with_import = format!(
+            "import {{ other }} from \"./lib\";\n{body}export function caller() {{ other(); return format(1); }}\n"
+        );
+        let (files, edges) = review_edges(&[lib, ("src/a.ts", &with_import)], Language::TypeScript);
+        let mut expected = vec![
+            uid(&files, "src/lib.ts", "other"),
+            uid_at(&files, "src/a.ts", "format", 2),
+        ];
+        expected.sort();
+        assert_eq!(call_targets(&files, &edges, "src/a.ts", "caller"), expected);
+
+        let without_import = format!("{body}export function caller() {{ return format(1); }}\n");
+        let (files, edges) = review_edges(&[("src/a.ts", &without_import)], Language::TypeScript);
+        assert_eq!(
+            call_targets(&files, &edges, "src/a.ts", "caller"),
+            vec![uid_at(&files, "src/a.ts", "format", 1)]
+        );
+
+        // Receiver-gate case (not the declaration-form check): `c.items()` has
+        // a receiver, so the declaration-scope filter never sees it.
+        let method = "class C { items() { const items = [1]; return items; } }\nexport function useIt(c: C) { return c.items(); }\n";
+        let (files, edges) = review_edges(&[("src/c.ts", method)], Language::TypeScript);
+        assert_eq!(
+            call_targets(&files, &edges, "src/c.ts", "useIt"),
+            vec![uid(&files, "src/c.ts", "items")],
+            "a receiver call to a method is not filtered by block scope"
+        );
+
+        // `async` on its own line: the symbol's signature starts at `function`.
+        let split_modifier = "async\nfunction format(x: number) {\n  const format = new Intl.NumberFormat();\n  return format.format(x);\n}\nexport function caller() { return format(1); }\n";
+        let (files, edges) = review_edges(&[("src/s.ts", split_modifier)], Language::TypeScript);
+        assert_eq!(
+            call_targets(&files, &edges, "src/s.ts", "caller"),
+            vec![uid_at(&files, "src/s.ts", "format", 2)]
+        );
+    }
+
+    /// nw-113 (code review 2): an assignment-form function (`exports.f =`,
+    /// `module.exports.f =`, `obj.f =`) has no declarator of its own, so a
+    /// same-named local inside its body must not scope it. The parser mints
+    /// no symbol for `obj.f = function` (only CommonJS exports, nw-687), so
+    /// that case is unresolved on base too; it is pinned unchanged.
+    #[test]
+    fn assignment_form_functions_are_not_scoped_by_a_same_named_inner_local() {
+        for (path, target, has_symbol) in [
+            ("src/exp.js", "exports.format = function (x) {", true),
+            ("src/mod.js", "module.exports.format = function (x) {", true),
+            ("src/obj.js", "obj.format = function (x) {", false),
+        ] {
+            let source = format!(
+                "const obj = {{}};\n{target}\n  const format = new Intl.NumberFormat();\n  return format.format(x);\n}};\nfunction caller() {{ return format(1); }}\n"
+            );
+            let (files, edges) = review_edges(&[(path, &source)], Language::JavaScript);
+            let expected: Vec<String> = files[0]
+                .1
+                .iter()
+                .filter(|symbol| symbol.name == "format" && symbol.kind == SymbolKind::Function)
+                .map(|symbol| symbol_uid("repo:test:abc", path, "format", symbol.start_line))
+                .collect();
+            let expected = if has_symbol {
+                assert_eq!(expected.len(), 1, "{path}: {:#?}", files[0].1);
+                expected
+            } else {
+                assert!(expected.is_empty(), "{path}: {:#?}", files[0].1);
+                vec!["unresolved:format".to_string()]
+            };
+            assert_eq!(
+                call_targets(&files, &edges, path, "caller"),
+                expected,
+                "{path}: {:#?}",
+                files[0].1
+            );
+        }
+    }
+
+    /// nw-113 (code review 2): a module-level declarator is visible everywhere
+    /// and carries no shadowing information, so it must not outrank a nested
+    /// `function` declaration that the call actually reaches.
+    #[test]
+    fn a_module_level_declarator_does_not_outrank_a_nested_function_declaration() {
+        let source = "// header\nfunction g() {\n  function f() { return 1; }\n  return f();\n}\nconst f = () => 2;\n";
+        let (files, edges) = review_edges(&[("src/n.ts", source)], Language::TypeScript);
+        assert_eq!(
+            call_targets(&files, &edges, "src/n.ts", "g"),
+            vec![uid_at(&files, "src/n.ts", "f", 3)]
+        );
+    }
+
+    /// nw-113 (code review 3): module level is decided by symbol nesting, not
+    /// by which bindings happen to exist. A declarator inside `g` (directly or
+    /// in a block) is scoped to `g` even when nothing outside `g` binds a name,
+    /// so it outranks the unscoped module `function f`.
+    #[test]
+    fn a_function_local_declarator_outranks_a_module_function_declaration() {
+        // Multi-line: a call on the same line as a one-line arrow is credited
+        // to the arrow (the known caller-by-line residual).
+        for (path, source, line) in [
+            (
+                "src/m1.ts",
+                "function f() { return 1; }\nexport function g() {\n  const f = () => 2;\n  return f();\n}\n",
+                3,
+            ),
+            (
+                "src/m2.ts",
+                "function f() { return 1; }\nexport function g() {\n  {\n    const f = () => 2;\n    return f();\n  }\n}\n",
+                4,
+            ),
+        ] {
+            let (files, edges) = review_edges(&[(path, source)], Language::TypeScript);
+            assert_eq!(
+                call_targets(&files, &edges, path, "g"),
+                vec![uid_at(&files, path, "f", line)],
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn declarator_form_recognises_declaration_keywords_after_modifiers() {
+        for signature in [
+            "const f = () => 1;",
+            "export const f = () => 1;",
+            "let f = () => 1;",
+            "var f = function () {};",
+            "using f = open();",
+            "await using f = open();",
+            "export declare const f: () => void;",
+        ] {
+            assert!(is_declarator_form(signature), "{signature}");
+        }
+        for signature in [
+            "function f() {}",
+            "async function f() {}",
+            "exports.f = function () {}",
+            "obj.f = function () {}",
+            "f() {}",
+        ] {
+            assert!(!is_declarator_form(signature), "{signature}");
+        }
+    }
+
+    /// Documented residual (nw-113): containment is decided per line, so a
+    /// module-level `const f` sharing line 1 with `function h` reads as
+    /// scoped and outranks `g`'s nested `function f`. Pins today's binding to
+    /// the module const; a column-aware fix must update this deliberately.
+    #[test]
+    fn residual_same_line_module_declarator_outranks_a_nested_function_declaration() {
+        let source = "function h() { return 0; } const f = () => 2;\nfunction g() {\n  function f() { return 1; }\n  return f();\n}\n";
+        let (files, edges) = review_edges(&[("src/n1.ts", source)], Language::TypeScript);
+        assert_eq!(
+            call_targets(&files, &edges, "src/n1.ts", "g"),
+            vec![uid_at(&files, "src/n1.ts", "f", 1)]
+        );
+    }
+
+    /// nw-113 (code review): a declarator's own scope is the widest same-named
+    /// declarator binding in its span, not the earliest. An earlier
+    /// declarator's local `f` must not scope the later `f`. One line on
+    /// purpose: a later-line declarator called within its own scope is
+    /// already unresolved on main (`name_is_locally_bound` joins a binding to
+    /// its symbol by start line), and `let`/an object method on purpose: an
+    /// inner `const f` would share the symbol's uid and replace it.
+    #[test]
+    fn a_declarator_is_scoped_by_its_own_binding_not_an_earlier_inner_local() {
+        let source = "let a = { g() { let f = 1; return f; } }, f = () => 2;\nexport function readIt() {\n  return f();\n}\n";
+        let (files, edges) = review_edges(&[("src/d.ts", source)], Language::TypeScript);
+        let f = files[0]
+            .1
+            .iter()
+            .find(|symbol| symbol.name == "f" && symbol.kind == SymbolKind::Function)
+            .unwrap();
+        assert_eq!(
+            call_targets(&files, &edges, "src/d.ts", "readIt"),
+            vec![symbol_uid("repo:test:abc", "src/d.ts", "f", f.start_line)]
+        );
+    }
+
+    /// nw-113 counterweights (code review): unchanged from main. A receiver
+    /// call is never filtered by a block-declared same-file candidate, and a
+    /// parameter binding never counts as a declarator.
+    #[test]
+    fn block_scope_filter_ignores_receiver_calls_and_parameter_bindings() {
+        let receiver = (
+            "src/r.ts",
+            r#"export function make() {
+  {
+    const get = () => 1;
+  }
+}
+export function use(o: any) {
+  return o.get();
+}
+"#,
+        );
+        let parameter = (
+            "src/p.ts",
+            r#"function value(value: number) {
+  return value;
+}
+export function readIt() {
+  return value();
+}
+"#,
+        );
+        let (files, edges) = review_edges(&[receiver, parameter], Language::TypeScript);
+        assert_eq!(
+            call_targets(&files, &edges, "src/r.ts", "use"),
+            vec!["unresolved:get".to_string()],
+            "a receiver call is not filtered by block scope"
+        );
+        // Receiver-gate case (discriminating): `this` matches any same-file
+        // candidate, so the block-declared `get` is bound today. The
+        // declaration-scope filter must not reject it.
+        let this_call = (
+            "src/t.ts",
+            "export function use() {\n  {\n    const get = () => 1;\n  }\n  return this.get();\n}\n",
+        );
+        let (this_files, this_edges) = review_edges(&[this_call], Language::TypeScript);
+        assert_eq!(
+            call_targets(&this_files, &this_edges, "src/t.ts", "use"),
+            vec![uid(&this_files, "src/t.ts", "get")],
+            "a `this` receiver call keeps its same-file candidate"
+        );
+        assert_eq!(
+            call_targets(&files, &edges, "src/p.ts", "readIt"),
+            vec![uid(&files, "src/p.ts", "value")],
+            "a same-named parameter is not a declarator"
+        );
+        // A CommonJS function is not a declarator, so its same-named
+        // parameter (the only in-span binding) never scopes it.
+        let commonjs = (
+            "src/cjs.js",
+            "exports.value = function (value) { return value; };\nfunction readIt() { return value(); }\n",
+        );
+        let (cjs_files, cjs_edges) = review_edges(&[commonjs], Language::JavaScript);
+        assert_eq!(
+            call_targets(&cjs_files, &cjs_edges, "src/cjs.js", "readIt"),
+            vec![uid(&cjs_files, "src/cjs.js", "value")],
+            "a parameter binding does not scope a symbol"
+        );
+    }
+
+    /// Counterweight: a module-scope callable still wins over any import
+    /// lookup, and a function declared elsewhere in the file still resolves
+    /// same-file (no LocalBinding exists for a `function` declaration).
+    #[test]
+    fn module_scope_same_file_callables_still_resolve_first() {
+        let source = r#"const helper = () => 1;
+function declared() { return 2; }
+export function caller() {
+  helper();
+  return declared();
+}
+"#;
+        let (files, edges) = review_edges(&[("src/m.ts", source)], Language::TypeScript);
+        let mut expected = vec![
+            uid(&files, "src/m.ts", "helper"),
+            uid(&files, "src/m.ts", "declared"),
+        ];
+        expected.sort();
+        assert_eq!(call_targets(&files, &edges, "src/m.ts", "caller"), expected);
+    }
+
+    /// Counterweights from plan validation: the filter must not reject
+    /// (a) a receiver call into a namespace body (a `statement_block`), or
+    /// (b) a symbol whose declaration line also declares a same-named
+    /// parameter. The same block as one line must behave like the multiline one.
+    #[test]
+    fn block_scope_filter_spares_receivers_parameters_and_one_line_blocks() {
+        let namespace = (
+            "src/api.ts",
+            r#"export namespace Api {
+  export const get = () => 1;
+}
+export function useApi() {
+  return Api.get();
+}
+"#,
+        );
+        let setter = (
+            "src/box.ts",
+            r#"export class Box {
+  set value(value: number) { this.v = value; }
+  v = 0;
+}
+function value() { return 2; }
+export function readIt() { return value(); }
+"#,
+        );
+        let lib = (
+            "src/lib.ts",
+            "export function sendPacket(): number { return 7; }\n",
+        );
+        let one_line = (
+            "src/oneline.ts",
+            "import { sendPacket } from \"./lib\";\nexport function lexicalCaller() {\n  { const sendPacket = () => 42; sendPacket(); }\n  return sendPacket();\n}\n",
+        );
+        let (files, edges) =
+            review_edges(&[namespace, setter, lib, one_line], Language::TypeScript);
+        let before = |path: &str, caller: &str| call_targets(&files, &edges, path, caller);
+        // Known residual (tracked separately): the parser emits no symbol for a TS namespace, so Api.get() is unresolved today. This test only pins that nw-113 leaves it unchanged.
+        assert_eq!(
+            before("src/api.ts", "useApi"),
+            vec!["unresolved:get".to_string()],
+            "a receiver call into a namespace body is not touched by the block-scope filter"
+        );
+        // Known residual (tracked separately): a bare JS/TS call can bind a same-named setter/method. This test only pins that nw-113 leaves it unchanged; the declaration-scope filter must not affect candidates without declarator bindings.
+        assert_eq!(
+            before("src/box.ts", "readIt"),
+            vec![uid_at(&files, "src/box.ts", "value", 2)],
+            "a same-line parameter binding does not change same-file selection"
+        );
+        // Known residual (tracked on nw-113): the caller is chosen by LINE, so a call on the same line as a one-line arrow declaration is credited to the arrow (a sendPacket -> sendPacket self-edge), not to lexicalCaller. This assertion pins the nw-113 fix itself: the call AFTER the block binds the import, not the block-local.
+        assert_eq!(
+            before("src/oneline.ts", "lexicalCaller"),
+            vec![uid(&files, "src/lib.ts", "sendPacket")]
+        );
+        let one_line_local = uid_at(&files, "src/oneline.ts", "sendPacket", 3);
+        assert_eq!(
+            before("src/oneline.ts", "sendPacket"),
+            vec![one_line_local],
+            "today's same-line self-edge; a caller-attribution fix must update this deliberately"
+        );
+    }
+
     #[test]
     fn review_unresolved_exports_cannot_prove_a_star_target() {
         let mut failures = Vec::new();
@@ -8497,5 +9604,1084 @@ function varAfterInitialization() { var svc = new Service(); return svc.run(); }
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// nw-113 (ownerless): a top-level call is owned by the file's `<module>`,
+    /// and the call still yields its IMPORTS by-product.
+    #[test]
+    fn a_top_level_call_is_owned_by_the_module() {
+        let lib = (
+            "src/lib.ts",
+            "export function flushBuffer(): number { return 8; }\n",
+        );
+        let ownerless = (
+            "src/ownerless.ts",
+            "import { flushBuffer } from \"./lib\";\nflushBuffer();\n",
+        );
+        let (files, edges) = review_edges(&[lib, ownerless], Language::TypeScript);
+        let owner = nestweaver_schema::MODULE_OWNER_NAME;
+        assert_eq!(
+            call_targets(&files, &edges, "src/ownerless.ts", owner),
+            vec![uid(&files, "src/lib.ts", "flushBuffer")],
+            "{edges:#?}"
+        );
+        let owner_uid = uid(&files, "src/ownerless.ts", owner);
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.source_uid == owner_uid && edge.edge_type == EdgeType::Imports),
+            "{edges:#?}"
+        );
+    }
+
+    /// Validation case: a one-line function above the call used to become
+    /// its fabricated caller through the degenerate fallback.
+    #[test]
+    fn a_one_line_function_above_a_top_level_call_does_not_own_it() {
+        let lib = (
+            "src/lib.ts",
+            "export function flushBuffer(): number { return 8; }\n",
+        );
+        let file = (
+            "src/oneline.ts",
+            "import { flushBuffer } from \"./lib\";\nexport const add = (a: number, b: number) => a + b;\nflushBuffer();\n",
+        );
+        let (files, edges) = review_edges(&[lib, file], Language::TypeScript);
+        let target = vec![uid(&files, "src/lib.ts", "flushBuffer")];
+        assert_eq!(
+            call_targets(
+                &files,
+                &edges,
+                "src/oneline.ts",
+                nestweaver_schema::MODULE_OWNER_NAME
+            ),
+            target,
+            "{edges:#?}"
+        );
+        assert!(call_targets(&files, &edges, "src/oneline.ts", "add").is_empty());
+    }
+
+    /// E2: a one-line function called at top level is called by the module,
+    /// not by itself.
+    #[test]
+    fn a_top_level_call_of_a_one_line_function_is_not_a_self_edge() {
+        let file = ("src/e2.ts", "function helper() {}\nhelper();\n");
+        let (files, edges) = review_edges(&[file], Language::TypeScript);
+        let helper = uid(&files, "src/e2.ts", "helper");
+        assert_eq!(
+            call_targets(
+                &files,
+                &edges,
+                "src/e2.ts",
+                nestweaver_schema::MODULE_OWNER_NAME
+            ),
+            vec![helper.clone()],
+            "{edges:#?}"
+        );
+        assert!(
+            call_targets(&files, &edges, "src/e2.ts", "helper").is_empty(),
+            "{edges:#?}"
+        );
+    }
+
+    /// E7: Python's `__main__` guard is module code; the module calls `main`.
+    #[test]
+    fn a_python_main_guard_call_is_owned_by_the_module() {
+        let file = (
+            "app.py",
+            "def main():\n    pass\n\nif __name__ == \"__main__\":\n    main()\n",
+        );
+        let (files, edges) = review_edges(&[file], Language::Python);
+        assert_eq!(
+            call_targets(
+                &files,
+                &edges,
+                "app.py",
+                nestweaver_schema::MODULE_OWNER_NAME
+            ),
+            vec![uid(&files, "app.py", "main")],
+            "{edges:#?}"
+        );
+    }
+
+    /// Counterweights: calls inside functions keep their function owner, and
+    /// non-call references at module scope (a type annotation) get NO edge
+    /// from the owner.
+    #[test]
+    fn the_owner_takes_only_top_level_calls() {
+        let lib = (
+            "src/lib.ts",
+            "export function a(): number { return 1; }\nexport interface User { id: number }\n",
+        );
+        let mixed = (
+            "src/mixed.ts",
+            "import { a, User } from \"./lib\";\nexport function f() {\n  return a();\n}\nconst u: User = { id: 1 };\na();\n",
+        );
+        let (files, edges) = review_edges(&[lib, mixed], Language::TypeScript);
+        let target = vec![uid(&files, "src/lib.ts", "a")];
+        assert_eq!(call_targets(&files, &edges, "src/mixed.ts", "f"), target);
+        let owner = uid(&files, "src/mixed.ts", nestweaver_schema::MODULE_OWNER_NAME);
+        let owner_edges: Vec<_> = edges.iter().filter(|e| e.source_uid == owner).collect();
+        assert!(
+            owner_edges
+                .iter()
+                .all(|e| matches!(e.edge_type, EdgeType::Calls | EdgeType::Imports)),
+            "the owner must not collect Uses/Accesses: {owner_edges:?}"
+        );
+        let user = uid(&files, "src/lib.ts", "User");
+        assert!(
+            !owner_edges.iter().any(|e| e.target_uid == user),
+            "a module-level type reference is not owned by <module>: {owner_edges:?}"
+        );
+        assert_eq!(
+            call_targets(
+                &files,
+                &edges,
+                "src/mixed.ts",
+                nestweaver_schema::MODULE_OWNER_NAME
+            ),
+            target
+        );
+    }
+
+    /// E1: the whole-file owner is never a container. With a top-level call
+    /// present (so the owner exists), the nested `f` is still `g`'s binding
+    /// and the module-level declarator `f` is still module level.
+    #[test]
+    fn the_module_owner_is_not_a_declaration_container() {
+        let file = (
+            "src/e1.ts",
+            "function g() {\n  function f() { return 1; }\n  return f();\n}\nconst f = () => 2;\nboot();\n",
+        );
+        let (files, edges) = review_edges(&[file], Language::TypeScript);
+        assert!(
+            files[0]
+                .1
+                .iter()
+                .any(|s| s.name == nestweaver_schema::MODULE_OWNER_NAME),
+            "fixture must mint the owner"
+        );
+        assert_eq!(
+            call_targets(&files, &edges, "src/e1.ts", "g"),
+            vec![uid_at(&files, "src/e1.ts", "f", 2)],
+            "{edges:#?}"
+        );
+    }
+
+    /// Express-style registration: a call inside an anonymous callback at
+    /// module scope has no named container, so the module owns it.
+    #[test]
+    fn a_call_in_a_module_level_callback_is_owned_by_the_module() {
+        let lib = (
+            "src/lib.ts",
+            "export function handle(): number { return 1; }\n",
+        );
+        let app = (
+            "src/app.ts",
+            "import { handle } from \"./lib\";\napp.get('/', () => {\n  handle();\n});\n",
+        );
+        let (files, edges) = review_edges(&[lib, app], Language::TypeScript);
+        let mut expected = vec![
+            uid(&files, "src/lib.ts", "handle"),
+            "unresolved:get".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(
+            call_targets(
+                &files,
+                &edges,
+                "src/app.ts",
+                nestweaver_schema::MODULE_OWNER_NAME
+            ),
+            expected,
+            "{edges:#?}"
+        );
+    }
+
+    /// PHP: the degenerate guess (a one-line function above a top-level call)
+    /// becomes the module owner, not a self-edge.
+    #[test]
+    fn a_php_top_level_call_after_a_one_line_function_is_owned_by_the_module() {
+        let file = (
+            "src/boot.php",
+            "<?php\nfunction helper() { return 1; }\nhelper();\n",
+        );
+        let (files, edges) = review_edges(&[file], Language::Php);
+        assert_eq!(
+            call_targets(
+                &files,
+                &edges,
+                "src/boot.php",
+                nestweaver_schema::MODULE_OWNER_NAME
+            ),
+            vec![uid(&files, "src/boot.php", "helper")],
+            "{edges:#?}"
+        );
+        assert!(
+            call_targets(&files, &edges, "src/boot.php", "helper").is_empty(),
+            "{edges:#?}"
+        );
+    }
+
+    /// Non-call references keep today's degenerate guess even when the file
+    /// has an owner: a module-level type reference (Uses) and property reads
+    /// (Accesses) after a one-line function stay on that function. Pinned so
+    /// a later change to the guess is deliberate.
+    #[test]
+    fn module_level_uses_and_accesses_keep_the_degenerate_guess() {
+        let lib = (
+            "src/lib.ts",
+            "export function a(): number { return 1; }\nexport interface User { id: number }\n",
+        );
+        let ts = (
+            "src/m.ts",
+            "import { a, User } from \"./lib\";\nexport function one() { return 1; }\nconst u: User = { id: 1 };\na();\n",
+        );
+        let (files, edges) = review_edges(&[lib, ts], Language::TypeScript);
+        let one = uid(&files, "src/m.ts", "one");
+        let user = uid(&files, "src/lib.ts", "User");
+        assert!(
+            edges.iter().any(|e| e.edge_type == EdgeType::Uses
+                && e.source_uid == one
+                && e.target_uid == user),
+            "{edges:#?}"
+        );
+        let js = (
+            "src/m.js",
+            "function one() { return 1; }\nconst c = make();\nconsole.log(c.port);\none();\n",
+        );
+        let (files, edges) = review_edges(&[js], Language::JavaScript);
+        let one = uid(&files, "src/m.js", "one");
+        let owner = uid(&files, "src/m.js", nestweaver_schema::MODULE_OWNER_NAME);
+        let accesses: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Accesses)
+            .collect();
+        assert!(!accesses.is_empty(), "{edges:#?}");
+        assert!(
+            accesses.iter().all(|e| e.source_uid == one),
+            "{accesses:#?}"
+        );
+        assert!(
+            edges
+                .iter()
+                .filter(|e| e.source_uid == owner)
+                .all(|e| matches!(e.edge_type, EdgeType::Calls | EdgeType::Imports))
+        );
+    }
+
+    /// Languages outside the owner gate keep the degenerate guess unchanged:
+    /// no `<module>` symbol, and a Lua one-line function still owns the
+    /// module-level calls after it.
+    #[test]
+    fn languages_without_an_owner_keep_the_degenerate_guess() {
+        let lua = (
+            "boot.lua",
+            "local function helper() return 1 end\nprint('x')\nhelper()\n",
+        );
+        let (files, edges) = review_edges(&[lua], Language::Lua);
+        assert!(
+            !files[0]
+                .1
+                .iter()
+                .any(|s| s.name == nestweaver_schema::MODULE_OWNER_NAME)
+        );
+        let helper = uid(&files, "boot.lua", "helper");
+        let mut expected = vec![helper.clone(), "unresolved:print".to_string()];
+        expected.sort();
+        assert_eq!(
+            call_targets(&files, &edges, "boot.lua", "helper"),
+            expected,
+            "{edges:#?}"
+        );
+
+        let vue = (
+            "src/App.vue",
+            "<script>\nfunction helper() { return 1; }\nhelper();\n</script>\n",
+        );
+        let (files, _) = review_edges(&[vue], Language::Vue);
+        assert!(
+            !files[0]
+                .1
+                .iter()
+                .any(|s| s.name == nestweaver_schema::MODULE_OWNER_NAME),
+            "{:?}",
+            files[0].1
+        );
+    }
+
+    /// nw-113 review: symbols rebuilt from the store (`build_reresolve_edges`)
+    /// arrive in DB order, not parser order, so a same-line symbol can precede
+    /// the owner. The owner must still sort first and own the call.
+    #[test]
+    fn the_module_owner_sorts_first_from_symbols_in_db_order() {
+        let path = "src/db_order.ts";
+        let source = "function f() {}\nf();\n";
+        let parsed = parse_source(Path::new(path), source).unwrap();
+        let mut symbols = parsed.symbols;
+        assert!(symbols[0].is_module_owner(), "{symbols:?}");
+        assert_eq!(
+            symbols[1].start_line, 1,
+            "fixture: f shares the owner's line"
+        );
+        symbols.swap(0, 1);
+        let files = vec![(path.to_string(), symbols, parsed.references)];
+        let edges = resolve_references(&files, Language::TypeScript, "repo:test:abc");
+        assert_eq!(
+            call_targets(&files, &edges, path, nestweaver_schema::MODULE_OWNER_NAME),
+            vec![uid(&files, path, "f")],
+            "{edges:#?}"
+        );
+    }
+
+    /// nw-791 (nw-113 B2): calls inside a generator belong to the generator,
+    /// and callers of the generator get an edge. No `<module>` owner.
+    #[test]
+    fn generator_bodies_own_their_calls() {
+        let lib = ("src/lib.js", "export function helper(x) { return x; }\n");
+        let saga = (
+            "src/g.js",
+            "import { helper } from './lib';\nexport function* gen(v) { yield helper(v); }\nasync function* agen(v) { yield helper(v); }\nexport function use(v) { return [...gen(v)]; }\n",
+        );
+        let (files, edges) = review_edges(&[lib, saga], Language::JavaScript);
+        let helper = vec![uid(&files, "src/lib.js", "helper")];
+        assert_eq!(
+            call_targets(&files, &edges, "src/g.js", "gen"),
+            helper,
+            "{edges:#?}"
+        );
+        assert_eq!(
+            call_targets(&files, &edges, "src/g.js", "agen"),
+            helper,
+            "{edges:#?}"
+        );
+        assert_eq!(
+            call_targets(&files, &edges, "src/g.js", "use"),
+            vec![uid(&files, "src/g.js", "gen")],
+            "{edges:#?}"
+        );
+        assert!(
+            !files[1].1.iter().any(|s| s.is_module_owner()),
+            "{:?}",
+            files[1].1
+        );
+    }
+
+    /// nw-800: a `catch (f)` parameter and a `for (const f of …)` /
+    /// `for (const f in …)` / `for (let f = …; …)` loop variable are local
+    /// bindings scoped to their clause or loop. A bare `f()` inside one is
+    /// local and never binds the same-file `function f`; a bare `f()` after
+    /// it, outside that clause or loop, still does.
+    #[test]
+    fn catch_and_loop_variables_are_local_to_their_clause() {
+        for (path, language) in [
+            ("src/clauses.js", Language::JavaScript),
+            ("src/clauses.ts", Language::TypeScript),
+        ] {
+            let source = "function f() {}\n\
+                export function viaCatch() { try { work(); } catch (f) { f(); } }\n\
+                export function viaForOf(xs) { for (const f of xs) { f(); } }\n\
+                export function viaForIn(o) { for (const f in o) { f(); } }\n\
+                export function viaFor() { for (let f = make(); f; ) { f(); } }\n\
+                export function afterCatch() { try { work(); } catch (f) { log(f); } f(); }\n\
+                export function afterForOf(xs) { for (const f of xs) { log(f); } f(); }\n\
+                export function afterFor() { for (let f = make(); f; ) { log(f); } f(); }\n";
+            let (files, edges) = review_edges(&[(path, source)], language);
+            let f = uid(&files, path, "f");
+            for caller in ["viaCatch", "viaForOf", "viaForIn", "viaFor"] {
+                assert!(
+                    !call_targets(&files, &edges, path, caller).contains(&f),
+                    "{path}: {caller} must not bind the module f: {edges:#?}"
+                );
+            }
+            for caller in ["afterCatch", "afterForOf", "afterFor"] {
+                assert!(
+                    call_targets(&files, &edges, path, caller).contains(&f),
+                    "{path}: {caller} calls the module f outside the clause: {edges:#?}"
+                );
+            }
+        }
+    }
+
+    /// nw-113 final QA round 2 (item 13): an unparenthesised arrow parameter
+    /// (`f => f()`, `async f => f()`) is a local binding scoped to the arrow,
+    /// exactly like `(f) => f()`. It must not bind the imported `f`, at top
+    /// level (a false `<module>` edge) or inside a function or method. A call
+    /// after the arrow still binds the import.
+    #[test]
+    fn bare_arrow_parameters_shadow_imports() {
+        for (ext, language) in [("js", Language::JavaScript), ("ts", Language::TypeScript)] {
+            let lib = format!("src/lib.{ext}");
+            let a = format!("src/a.{ext}");
+            let a_source = "import { f, g } from './lib';\n\
+                 export const items = [1].map(g => g());\n\
+                 [1].forEach(f => {\n\
+                 \x20 f();\n\
+                 });\n\
+                 [2].map(async f => f());\n\
+                 export const run = f => f();\n\
+                 export class K { cb1() { return [1].map(f => f()); } }\n\
+                 export function inner() { return [1].map(g => g()); }\n\
+                 export function after() { [1].map(g => g); return g(); }\n";
+            let (files, edges) = review_edges(
+                &[
+                    (&lib, "export function f() {}\nexport function g() {}\n"),
+                    (&a, a_source),
+                ],
+                language,
+            );
+            let f = uid(&files, &lib, "f");
+            let g = uid(&files, &lib, "g");
+            let mut callers: Vec<&str> = edges
+                .iter()
+                .filter(|e| {
+                    e.edge_type == EdgeType::Calls && (e.target_uid == f || e.target_uid == g)
+                })
+                .map(|e| e.source_uid.as_str())
+                .collect();
+            callers.sort();
+            callers.dedup();
+            assert_eq!(
+                callers,
+                vec![uid(&files, &a, "after").as_str()],
+                "{a}: only `after` calls the import: {edges:#?}"
+            );
+        }
+    }
+
+    /// nw-113 final review M1: a generator's parameters and `var`s are scoped
+    /// to the generator, like any function's. They used to leak to program
+    /// scope and shadow a same-named module function everywhere.
+    #[test]
+    fn generator_parameters_and_vars_stay_inside_the_generator() {
+        for (path, language) in [
+            ("src/saga.js", Language::JavaScript),
+            ("src/saga.ts", Language::TypeScript),
+        ] {
+            let source = "function* saga(action) { var step = 1; yield action; }\n\
+                 const expr = function* (other) { yield other; };\n\
+                 function action() {}\n\
+                 function step() {}\n\
+                 function other() {}\n\
+                 export function caller() { return [action(), step(), other()]; }\n";
+            let (files, edges) = review_edges(&[(path, source)], language);
+            let mut expected = vec![
+                uid(&files, path, "action"),
+                uid(&files, path, "other"),
+                uid(&files, path, "step"),
+            ];
+            expected.sort();
+            assert_eq!(
+                call_targets(&files, &edges, path, "caller"),
+                expected,
+                "{path}: {edges:#?}"
+            );
+        }
+    }
+
+    /// nw-803: ESM imports are hoisted. A function written above the
+    /// `import` line sees the imported name, and a parameter of that name
+    /// still shadows it.
+    #[test]
+    fn esm_imports_bind_code_written_above_them() {
+        for (lib, a, language) in [
+            ("src/lib.ts", "src/a.ts", Language::TypeScript),
+            ("src/lib.js", "src/a.js", Language::JavaScript),
+        ] {
+            let lib_source = "export function helper() { return 1; }\n";
+            let a_source = "export function early() { return helper(); }\n\
+                 export function shadowed(helper) { return helper(); }\n\
+                 import { helper } from './lib';\n\
+                 export function late() { return helper(); }\n";
+            let (files, edges) = review_edges(&[(lib, lib_source), (a, a_source)], language);
+            let helper = vec![uid(&files, lib, "helper")];
+            for caller in ["early", "late"] {
+                assert_eq!(
+                    call_targets(&files, &edges, a, caller),
+                    helper,
+                    "{a}: {caller}: {edges:#?}"
+                );
+            }
+            assert!(
+                !call_targets(&files, &edges, a, "shadowed").contains(&helper[0]),
+                "{a}: a parameter shadows the import: {edges:#?}"
+            );
+        }
+    }
+
+    /// nw-113 final review M5: a CommonJS `require` runs where written, but a
+    /// function body above it runs later, after the binding is initialized,
+    /// so its calls through the binding resolve. Top-level code above the
+    /// `require` (including a top-level block) runs first and does not bind.
+    #[test]
+    fn a_function_above_a_require_sees_the_binding_but_top_level_code_does_not() {
+        for (lib, a, language, import) in [
+            (
+                "src/lib.js",
+                "src/a.js",
+                Language::JavaScript,
+                "const lib = require('./lib');",
+            ),
+            (
+                "src/lib.ts",
+                "src/a.ts",
+                Language::TypeScript,
+                "import lib = require('./lib');",
+            ),
+        ] {
+            let lib_source = "export function helper() { return 1; }\n";
+            let a_source = format!(
+                "function early() {{ return lib.helper(); }}\n\
+                 lib.helper();\n\
+                 {{ lib.helper(); }}\n\
+                 {import}\n\
+                 function late() {{ return lib.helper(); }}\n"
+            );
+            let (files, edges) = review_edges(&[(lib, lib_source), (a, &a_source)], language);
+            let helper = uid(&files, lib, "helper");
+            for caller in ["early", "late"] {
+                assert_eq!(
+                    call_targets(&files, &edges, a, caller),
+                    vec![helper.clone()],
+                    "{a}: {caller}: {edges:#?}"
+                );
+            }
+            assert!(
+                !call_targets(&files, &edges, a, nestweaver_schema::MODULE_OWNER_NAME)
+                    .contains(&helper),
+                "{a}: top-level code above the require runs first: {edges:#?}"
+            );
+        }
+    }
+
+    /// Timing probe for whole-module bindings (nw-113 item 15). Run with
+    /// `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn whole_module_binding_timing_probe() {
+        let n: usize = std::env::var("NW_PROBE_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3000);
+        type Shape = (&'static str, &'static str, Language, fn(usize) -> String);
+        let shapes: [Shape; 3] = [
+            ("import =", "src/a.ts", Language::TypeScript, |i| {
+                format!("import m{i} = require('./lib');\nexport function q{i}() {{ m{i}(); }}\n")
+            }),
+            ("import * as", "src/a.ts", Language::TypeScript, |i| {
+                format!("import * as m{i} from './lib';\nexport function q{i}() {{ m{i}.f(); }}\n")
+            }),
+            ("require", "src/a.js", Language::JavaScript, |i| {
+                format!("const m{i} = require('./lib');\nfunction q{i}() {{ m{i}.f(); }}\n")
+            }),
+        ];
+        for (label, path, language, line) in shapes {
+            let source: String = (0..n).map(line).collect();
+            let lib = if language == Language::TypeScript {
+                "src/lib.ts"
+            } else {
+                "src/lib.js"
+            };
+            let started = std::time::Instant::now();
+            let (_files, edges) = review_edges(
+                &[(lib, "export function f() {}\n"), (path, &source)],
+                language,
+            );
+            eprintln!(
+                "{label} x{n}: {:?} ({} edges)",
+                started.elapsed(),
+                edges.len()
+            );
+        }
+    }
+
+    /// nw-113 final review Minor 7: the receiver rule in Python.
+    /// `helpers.run()` inside a function named `run`, after `import helpers`,
+    /// never binds the same-file `run`.
+    #[test]
+    fn a_receiver_call_never_binds_a_same_file_name_in_python() {
+        let (files, edges) = review_edges(
+            &[
+                ("helpers.py", "def run():\n    return 1\n"),
+                (
+                    "main.py",
+                    "import helpers\n\n\ndef run():\n    return helpers.run()\n",
+                ),
+            ],
+            Language::Python,
+        );
+        let same_file = uid(&files, "main.py", "run");
+        assert!(
+            !edges.iter().any(|edge| edge.target_uid == same_file),
+            "{edges:#?}"
+        );
+    }
+
+    /// nw-113 final review Minor 7: the receiver rule in PHP. `X::m()` after
+    /// `use Lib\X;` must not bind the same-file `m`, but it does: the parser
+    /// records no receiver for a `scoped_call_expression`, so the rule never
+    /// sees one. Fixing it changes parser output (a parsed-cache bump) and
+    /// every PHP static call's resolution (`self::`, `static::`, `parent::`),
+    /// so it is reported rather than fixed in nw-113.
+    #[test]
+    #[ignore = "PHP static calls carry no receiver; see the doc comment"]
+    fn a_receiver_call_never_binds_a_same_file_name_in_php() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "src/Lib/X.php",
+                    "<?php\nnamespace Lib;\nclass X { public static function m() { return 1; } }\n",
+                ),
+                (
+                    "src/main.php",
+                    "<?php\nuse Lib\\X;\nfunction m() { return X::m(); }\n",
+                ),
+            ],
+            Language::Php,
+        );
+        let same_file = uid(&files, "src/main.php", "m");
+        assert!(
+            !edges.iter().any(|edge| edge.target_uid == same_file),
+            "{edges:#?}"
+        );
+    }
+
+    /// nw-113 final watch parity O3: a member access with a receiver
+    /// (`Modal.latestProps`) never falls back to a same-file symbol of the
+    /// bare member name, so `latestProps` gets no self-ACCESSES edge. The
+    /// same holds for a call through the import (`Modal.render()`).
+    #[test]
+    fn a_member_access_never_binds_a_same_file_name() {
+        for (ext, language) in [("js", Language::JavaScript), ("ts", Language::TypeScript)] {
+            let modal = format!("src/Modal.{ext}");
+            let test = format!("src/Modal.test.{ext}");
+            let (files, edges) = review_edges(
+                &[
+                    (&modal, "export function Modal(props) { return null; }\n"),
+                    (
+                        &test,
+                        "import { Modal } from './Modal';\nconst latestProps = () => Modal.latestProps;\nexport function render() { return Modal.render(); }\n",
+                    ),
+                ],
+                language,
+            );
+            for name in ["latestProps", "render"] {
+                let same_file = uid(&files, &test, name);
+                assert!(
+                    !edges.iter().any(|edge| edge.target_uid == same_file),
+                    "{test}: {name}: {edges:#?}"
+                );
+            }
+        }
+    }
+
+    /// nw-113 final QA round 2 (item 14): an expression-body arrow written
+    /// above a CommonJS `require` runs later, like any function body, so its
+    /// call binds the required name. Top-level code above the `require`,
+    /// including a concise callback, still runs first and does not bind.
+    #[test]
+    fn a_concise_arrow_above_a_require_sees_the_binding() {
+        let lib = ("src/lib.js", "export function f() { return 1; }\n");
+        let b = (
+            "src/b.js",
+            "const fb = () => f();\n\
+             const fb2 = () =>\n\
+             \x20 f();\n\
+             [1].map(() => f());\n\
+             const { f } = require('./lib');\n\
+             module.exports = { fb, fb2 };\n",
+        );
+        let c = (
+            "src/c.js",
+            "function outer() {\n\
+             \x20 const fb6 = () => f();\n\
+             \x20 const { f } = require('./lib');\n\
+             \x20 return fb6;\n\
+             }\n\
+             module.exports = { outer };\n",
+        );
+        let (files, edges) = review_edges(&[lib, b, c], Language::JavaScript);
+        let f = vec![uid(&files, "src/lib.js", "f")];
+        for (path, caller) in [("src/b.js", "fb"), ("src/b.js", "fb2"), ("src/c.js", "fb6")] {
+            assert_eq!(
+                call_targets(&files, &edges, path, caller),
+                f,
+                "{path}: {caller}: {edges:#?}"
+            );
+        }
+        assert!(
+            !call_targets(
+                &files,
+                &edges,
+                "src/b.js",
+                nestweaver_schema::MODULE_OWNER_NAME
+            )
+            .contains(&f[0]),
+            "top-level code above the require runs first: {edges:#?}"
+        );
+    }
+
+    /// nw-113 final review M2: a receiver call on a `catch` or `for … of`
+    /// variable is unresolved, as one on a parameter is (nw-724), even when
+    /// the variable shadows a namespace import whose module has the member.
+    #[test]
+    fn receiver_calls_on_catch_and_loop_variables_are_unresolved() {
+        for (ext, language) in [("js", Language::JavaScript), ("ts", Language::TypeScript)] {
+            let svc = format!("src/svc.{ext}");
+            let e = format!("src/e.{ext}");
+            let run = format!("src/run.{ext}");
+            let run_source = "import * as svc from './svc';\n\
+                 import * as e from './e';\n\
+                 export function loop(list) { for (const svc of list) svc.start(); }\n\
+                 export function caught() { try { work(); } catch (e) { e.report(); } }\n\
+                 export function control() { svc.start(); e.report(); }\n";
+            let (files, edges) = review_edges(
+                &[
+                    (&svc, "export function start() {}\n"),
+                    (&e, "export function report() {}\n"),
+                    (&run, run_source),
+                ],
+                language,
+            );
+            let start = uid(&files, &svc, "start");
+            let report = uid(&files, &e, "report");
+            let mut control = vec![start.clone(), report.clone()];
+            control.sort();
+            assert_eq!(
+                call_targets(&files, &edges, &run, "control"),
+                control,
+                "{run}: {edges:#?}"
+            );
+            assert_eq!(
+                call_targets(&files, &edges, &run, "loop"),
+                vec!["unresolved:start".to_string()],
+                "{run}: {edges:#?}"
+            );
+            assert!(
+                !call_targets(&files, &edges, &run, "caught").contains(&report),
+                "{run}: {edges:#?}"
+            );
+        }
+    }
+
+    /// nw-113 final review M3: `export import x = require('…')` binds `x`
+    /// like `import x = require('…')`.
+    #[test]
+    fn ts_export_import_equals_require_binds_like_an_import() {
+        let lib = ("src/lib.ts", "export function helper() { return 1; }\n");
+        let a = (
+            "src/a.ts",
+            "export import util = require('./lib');\n\
+             export function use() { return util.helper(); }\n",
+        );
+        let (files, edges) = review_edges(&[lib, a], Language::TypeScript);
+        assert_eq!(
+            call_targets(&files, &edges, "src/a.ts", "use"),
+            vec![uid(&files, "src/lib.ts", "helper")],
+            "{edges:#?}"
+        );
+    }
+
+    /// nw-113 final review M3: calling a whole-module binding bare (`ns()`,
+    /// `x()`) calls the module's value, which no export name identifies, so
+    /// the call is unresolved and never binds a same-named export.
+    #[test]
+    fn bare_calls_on_whole_module_bindings_are_unresolved() {
+        for (ext, language) in [("js", Language::JavaScript), ("ts", Language::TypeScript)] {
+            let ns = format!("src/ns.{ext}");
+            let rel = format!("src/rel.{ext}");
+            let a = format!("src/a.{ext}");
+            let a_source = "import * as ns from './ns';\n\
+                 const rel = require('./rel');\n\
+                 export function use() { return [ns(), rel()]; }\n";
+            let (files, edges) = review_edges(
+                &[
+                    (&ns, "export function ns() { return 1; }\n"),
+                    (&rel, "export function rel() { return 2; }\n"),
+                    (&a, a_source),
+                ],
+                language,
+            );
+            assert_eq!(
+                call_targets(&files, &edges, &a, "use"),
+                vec!["unresolved:ns".to_string(), "unresolved:rel".to_string()],
+                "{a}: {edges:#?}"
+            );
+        }
+    }
+
+    /// nw-113 final review M3: a hoisted import is visible above its line, and
+    /// a block-local or function-local declarator there still shadows it.
+    #[test]
+    fn a_local_declarator_shadows_a_hoisted_import_above_the_import_line() {
+        for (lib, a, language) in [
+            ("src/lib.ts", "src/a.ts", Language::TypeScript),
+            ("src/lib.js", "src/a.js", Language::JavaScript),
+        ] {
+            let a_source = "export function local() {\n  const helper = () => 2;\n  return helper();\n}\n\
+                 export function block() {\n  {\n    const helper = () => 3;\n    helper();\n  }\n  return helper();\n}\n\
+                 import { helper } from './lib';\n";
+            let (files, edges) = review_edges(
+                &[
+                    (lib, "export function helper() { return 1; }\n"),
+                    (a, a_source),
+                ],
+                language,
+            );
+            let imported = uid(&files, lib, "helper");
+            assert_eq!(
+                call_targets(&files, &edges, a, "local"),
+                vec![uid_at(&files, a, "helper", 2)],
+                "{a}: {edges:#?}"
+            );
+            let mut block = vec![uid_at(&files, a, "helper", 7), imported];
+            block.sort();
+            assert_eq!(
+                call_targets(&files, &edges, a, "block"),
+                block,
+                "{a}: {edges:#?}"
+            );
+        }
+    }
+
+    /// nw-801: TS `import x = require('…')` binds `x` exactly like
+    /// `import * as x from '…'`. A package import leaves `x()` external
+    /// instead of falling through to a nested same-named declaration, and a
+    /// relative import resolves `x.member()` into that module.
+    #[test]
+    fn ts_import_equals_require_binds_like_an_import() {
+        let lib = ("src/lib.ts", "export function helper() { return 1; }\n");
+        let a = (
+            "src/a.ts",
+            "import debug = require('debug');\n\
+             import lib = require('./lib');\n\
+             export function run() { function debug(m: string) { return m; } return debug('in'); }\n\
+             export function use() { return debug('out') + lib.helper(); }\n",
+        );
+        let (files, edges) = review_edges(&[lib, a], Language::TypeScript);
+        assert_eq!(
+            call_targets(&files, &edges, "src/a.ts", "use"),
+            vec![
+                uid(&files, "src/lib.ts", "helper"),
+                "unresolved:debug".to_string()
+            ],
+            "{edges:#?}"
+        );
+    }
+
+    /// nw-113 B1: a `.js` arrow with a bare parameter is a function: it owns
+    /// its body's calls and its callers get an edge.
+    #[test]
+    fn bare_parameter_arrows_own_their_calls() {
+        let lib = (
+            "src/lib.js",
+            "export function helper(x) { return x + 1; }\n",
+        );
+        let a = (
+            "src/a.js",
+            "import { helper } from './lib';\nconst clamp = (value, min, max) => Math.min(Math.max(value, min), max);\nconst normalizeDirection = value => helper(clamp(Number(value) || 0, 0, 360));\nconst parseDistance = value => { const parsed = helper(value); return parsed; };\nexport function use(v) { return normalizeDirection(v) + parseDistance(v); }\n",
+        );
+        let (files, edges) = review_edges(&[lib, a], Language::JavaScript);
+        let normalize = call_targets(&files, &edges, "src/a.js", "normalizeDirection");
+        for target in [
+            uid(&files, "src/lib.js", "helper"),
+            uid(&files, "src/a.js", "clamp"),
+        ] {
+            assert!(normalize.contains(&target), "{target} in {normalize:?}");
+        }
+        let mut uses = vec![
+            uid(&files, "src/a.js", "normalizeDirection"),
+            uid(&files, "src/a.js", "parseDistance"),
+        ];
+        uses.sort();
+        assert_eq!(
+            call_targets(&files, &edges, "src/a.js", "use"),
+            uses,
+            "{edges:#?}"
+        );
+        assert!(
+            !files[1].1.iter().any(|s| s.is_module_owner()),
+            "{:?}",
+            files[1].1
+        );
+    }
+
+    /// nw-113 final review I1: an aliased import below a one-line function is
+    /// module scope, not the one-line function's. The degenerate fallback
+    /// guesses that function as the binding's owner, while the call's source is
+    /// the `<module>` owner, so the binding read as out of scope and the call
+    /// had no edge (baseline: `one -> lib.helper`).
+    #[test]
+    fn an_aliased_python_import_after_a_one_line_function_still_binds() {
+        let lib = ("lib.py", "def helper():\n    return 1\n");
+        let main = (
+            "main3.py",
+            "def one(): return 1\nfrom lib import helper as h\nh()\n",
+        );
+        let (files, edges) = review_edges(&[lib, main], Language::Python);
+        assert_eq!(
+            call_targets(
+                &files,
+                &edges,
+                "main3.py",
+                nestweaver_schema::MODULE_OWNER_NAME
+            ),
+            vec![uid(&files, "lib.py", "helper")],
+            "{edges:#?}"
+        );
+        // The same import is module scope for a later function too, in a file
+        // with no top-level call (so no owner).
+        let later = (
+            "later.py",
+            "def one(): return 1\nfrom lib import helper as h\ndef two():\n    return h()\n",
+        );
+        let (files, edges) = review_edges(&[lib, later], Language::Python);
+        assert_eq!(
+            call_targets(&files, &edges, "later.py", "two"),
+            vec![uid(&files, "lib.py", "helper")],
+            "{edges:#?}"
+        );
+    }
+
+    /// nw-113 final review I1: an npm import below a one-line arrow is module
+    /// scope, so a function nested in `g` still shadows it inside `g`.
+    #[test]
+    fn a_nested_function_shadows_an_npm_import_below_a_one_line_function() {
+        for (path, language, head) in [
+            (
+                "src/degen.ts",
+                Language::TypeScript,
+                "export const id = (x: number) => x;\nimport { f } from \"react\";\n",
+            ),
+            (
+                "src/degen.js",
+                Language::JavaScript,
+                "export const id = (x) => x;\nimport { f } from \"react\";\n",
+            ),
+            (
+                "src/degen_cjs.js",
+                Language::JavaScript,
+                "const id = (x) => x;\nconst { f } = require(\"react\");\n",
+            ),
+        ] {
+            // Multi-line, so the call's line belongs to `g` alone (one-line
+            // code is credited per line, a known residual).
+            let source = format!(
+                "{head}function g() {{\n  function f() {{ return 1; }}\n  return f();\n}}\n"
+            );
+            let (files, edges) = review_edges(&[(path, &source)], language);
+            assert_eq!(
+                call_targets(&files, &edges, path, "g"),
+                vec![uid_at(&files, path, "f", 4)],
+                "{path}: {edges:#?}"
+            );
+        }
+    }
+
+    /// nw-113 final review I1 (JS): a module-level aliased import below a
+    /// one-line arrow binds a top-level call.
+    #[test]
+    fn an_aliased_js_import_after_a_one_line_function_still_binds() {
+        let lib = ("src/lib.js", "export function helper() { return 1; }\n");
+        let main = (
+            "src/main.js",
+            "export const one = () => 1;\nimport { helper as h } from './lib';\nh();\n",
+        );
+        let (files, edges) = review_edges(&[lib, main], Language::JavaScript);
+        assert_eq!(
+            call_targets(
+                &files,
+                &edges,
+                "src/main.js",
+                nestweaver_schema::MODULE_OWNER_NAME
+            ),
+            vec![uid(&files, "src/lib.js", "helper")],
+            "{edges:#?}"
+        );
+    }
+
+    /// nw-113 perf (bug-hunt #1): the per-candidate work is bounded. In a file
+    /// with N same-named declarators, one candidate's lookup returns exactly
+    /// its own declarator (not all N), and the module-level test is one array
+    /// read that never counts the `<module>` owner.
+    #[test]
+    fn file_scope_index_bounds_per_candidate_work() {
+        let n = 200u32;
+        let mut source: String = (0..n)
+            .map(|i| format!("function c{i}() {{ const f = () => {i}; return f(); }}\n"))
+            .collect();
+        source.push_str("const g = () => 1;\nboot();\n");
+        let parsed = parse_source(Path::new("src/big.ts"), &source).unwrap();
+        assert!(
+            parsed.symbols[0].is_module_owner(),
+            "fixture mints an owner"
+        );
+        let mut syms: Vec<&RawSymbol> = parsed.symbols.iter().collect();
+        syms.sort_by_key(|s| (s.start_line, !s.is_module_owner()));
+        let bindings: Vec<&RawReference> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::LocalBinding)
+            .collect();
+        let index = FileScopeIndex::build(&bindings, &syms);
+
+        let fs: Vec<&&RawSymbol> = syms.iter().filter(|s| s.name == "f").collect();
+        assert_eq!(fs.len(), n as usize);
+        for f in fs {
+            let found = index.declarators_in("f", f.start_line, f.end_line.max(f.start_line));
+            assert_eq!(found.len(), 1, "only f@{}'s own declarator", f.start_line);
+            assert_eq!(found[0].start_line, f.start_line);
+            // Inside c{i}: covered by c{i} and f, so not module level.
+            assert_eq!(index.covering(f.start_line), 2);
+        }
+        // `g` is module level: only g covers its line; the owner never counts.
+        let g = syms.iter().find(|s| s.name == "g").unwrap();
+        assert_eq!(index.covering(g.start_line), 1);
+        assert_eq!(index.covering(n + 2), 0, "the top-level call line");
+        assert!(index.declarators_in("missing", 1, n).is_empty());
+    }
+
+    /// nw-113 perf repro (bug-hunt #1): N functions in one file, each with
+    /// `const f = () => N; return f();`. Ignored; run with `--ignored
+    /// --nocapture` to print timings. Not a timing assertion.
+    #[test]
+    #[ignore]
+    fn bench_same_name_declarators_in_one_file() {
+        for n in [1000usize, 2000, 3000] {
+            let source: String = (0..n)
+                .map(|i| format!("function c{i}() {{ const f = () => {i}; return f(); }}\n"))
+                .collect();
+            let parsed = parse_source(Path::new("src/big.ts"), &source).unwrap();
+            let files = vec![("src/big.ts".to_string(), parsed.symbols, parsed.references)];
+            let started = std::time::Instant::now();
+            let edges = resolve_references(&files, Language::TypeScript, "repo:test:abc");
+            eprintln!(
+                "BENCH n={n} resolve={:?} edges={}",
+                started.elapsed(),
+                edges.len()
+            );
+        }
+        // The realistic shape from the bug hunt: 400 components in one file,
+        // each with 40 locals and `const render = () => …; return render();`.
+        let source: String = (0..400)
+            .map(|i| {
+                let locals: String = (0..40)
+                    .map(|j| format!("  const v{j} = compute{j}({i});\n"))
+                    .collect();
+                format!(
+                    "export function C{i}() {{\n{locals}  const render = () => v0 + v39;\n  return render();\n}}\n"
+                )
+            })
+            .collect();
+        let parsed = parse_source(Path::new("src/big.ts"), &source).unwrap();
+        let files = vec![("src/big.ts".to_string(), parsed.symbols, parsed.references)];
+        let started = std::time::Instant::now();
+        let edges = resolve_references(&files, Language::TypeScript, "repo:test:abc");
+        eprintln!(
+            "BENCH components=400 lines={} resolve={:?} edges={}",
+            source.lines().count(),
+            started.elapsed(),
+            edges.len()
+        );
     }
 }

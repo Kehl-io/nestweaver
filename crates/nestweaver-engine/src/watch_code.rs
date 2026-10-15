@@ -2527,12 +2527,40 @@ fn prepare_code_file(
         parsed.symbols.clone(),
         parsed.references.clone(),
     )];
-    let resolved_edges =
-        resolve_references_with_context(&file_data, lang, r_uid, &workspace_ctx, None, None);
-    let resolved_edges: Vec<_> = resolved_edges
+    // nw-113 P1: the file's type environment, built as the index builds it,
+    // so `this.m()` / `self.m()` resolve `type_aware` here too rather than
+    // falling back to `same_file`. Cross-file return-type seeding needs the
+    // whole repo's symbols and stays with the index.
+    let env = nestweaver_resolver::types::TypeEnvironment::build(
+        &source,
+        lang,
+        &parsed.symbols,
+        &parsed.type_bindings,
+    );
+    let type_envs: std::collections::HashMap<String, _> = (env.binding_count() > 0
+        || env.has_scoped_call_assignments())
+    .then(|| (rel_str.clone(), env))
+    .into_iter()
+    .collect();
+    let resolved_edges = resolve_references_with_context(
+        &file_data,
+        lang,
+        r_uid,
+        &workspace_ctx,
+        Some(&type_envs),
+        None,
+    );
+    let mut resolved_edges: Vec<_> = resolved_edges
         .into_iter()
         .filter(|e| !e.target_uid.starts_with("unresolved:"))
         .collect();
+    // MEMBER_OF is intra-file, so the file's own pass emits it, as the index
+    // does; the replacement's `DETACH DELETE` removed the old ones.
+    resolved_edges.extend(crate::index::file_member_of_edges(
+        r_uid,
+        &rel_str,
+        &parsed.symbols,
+    ));
 
     Ok(PreparedCodeFile {
         rel_path: rel_str,
@@ -3451,6 +3479,97 @@ mod tests {
         assert_eq!(symbols(&store), symbols(&fresh));
     }
 
+    /// nw-113 (watcher parity). A watcher batch resolves the saved file on
+    /// its own before re-resolving cross-file edges, so the imported file is
+    /// absent from that pass. The same-file CALLS edge to a block-local
+    /// callable that shadows an import must survive the batch, matching a
+    /// fresh index of the same tree.
+    #[test]
+    fn watcher_keeps_same_file_call_to_block_local_that_shadows_an_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        std::fs::write(
+            repo_root.join("lib.ts"),
+            "export function sendPacket(): number { return 7; }\n",
+        )
+        .unwrap();
+        let lexical = |value: u32| {
+            format!(
+                "import {{sendPacket}} from \"./lib\";\nexport function lexicalCaller() {{\n  {{\n    const sendPacket = () => {value};\n    sendPacket();\n  }}\n  return sendPacket();\n}}\n"
+            )
+        };
+        std::fs::write(repo_root.join("lexical.ts"), lexical(42)).unwrap();
+        // A nested `function` declaration shadows the import the same way.
+        let nested = |value: u32| {
+            format!(
+                "import {{sendPacket}} from \"./lib\";\nexport function nestedCaller() {{\n  function sendPacket() {{ return {value}; }}\n  return sendPacket();\n}}\n"
+            )
+        };
+        std::fs::write(repo_root.join("nested.ts"), nested(1)).unwrap();
+        let root = std::fs::canonicalize(&repo_root).unwrap();
+        let repo_url = format!("file://{}", root.display());
+        let r_uid = nestweaver_schema::repo_uid("test", &repo_url);
+        let (_, store) =
+            crate::index::index_directory_in_memory(&root, "test", &repo_url, "sha1").unwrap();
+        let block_local = store
+            .symbols_in_file("lexical.ts")
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "sendPacket" && s.start_line == 4)
+            .expect("block-local sendPacket should be indexed")
+            .uid;
+        let lexical_caller = uid_of(&store, &r_uid, "lexicalCaller");
+        let calls_block_local = |db: &GraphStore| {
+            db.callees_with_edge_types_of(&lexical_caller)
+                .unwrap()
+                .iter()
+                .any(|(s, kind)| s.uid == block_local && kind == "CALLS")
+        };
+        assert!(calls_block_local(&store), "precondition: index binds it");
+
+        std::fs::write(root.join("lexical.ts"), lexical(43)).unwrap();
+        std::fs::write(root.join("nested.ts"), nested(2)).unwrap();
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            &[root.join("lexical.ts"), root.join("nested.ts")],
+        );
+        assert!(
+            calls_block_local(&store),
+            "the watcher batch dropped lexicalCaller -> block-local sendPacket"
+        );
+        let nested_local = store
+            .symbols_in_file("nested.ts")
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "sendPacket")
+            .expect("nested sendPacket should be indexed")
+            .uid;
+        assert!(
+            store
+                .callees_with_edge_types_of(&uid_of(&store, &r_uid, "nestedCaller"))
+                .unwrap()
+                .iter()
+                .any(|(s, kind)| s.uid == nested_local && kind == "CALLS"),
+            "the watcher batch dropped nestedCaller -> nested sendPacket"
+        );
+
+        let (_, fresh) =
+            crate::index::index_directory_in_memory(&root, "test", &repo_url, "fresh").unwrap();
+        let topology = |db: &GraphStore| {
+            db.load_typed_edges()
+                .unwrap()
+                .into_iter()
+                .map(|(a, b, kind, _, _)| (a, b, kind))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(topology(&store), topology(&fresh));
+    }
+
     #[test]
     fn directory_move_rebuilds_mixed_controller_and_spec_contracts() {
         let dir = tempfile::tempdir().unwrap();
@@ -3665,6 +3784,219 @@ mod tests {
                 .all(|symbol| symbol.name != "helper"),
             "a policy-excluded rename must not leave stale source coverage"
         );
+    }
+
+    /// Write `files` under a fresh repo dir, index it in memory, and return
+    /// the store, repo uid, canonical root and `file://` url.
+    fn index_files(
+        dir: &tempfile::TempDir,
+        files: &[(&str, String)],
+    ) -> (GraphStore, String, PathBuf, String) {
+        let repo_root = dir.path().join("repo");
+        for (rel, body) in files {
+            let path = repo_root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let root = std::fs::canonicalize(&repo_root).unwrap();
+        let repo_url = format!("file://{}", root.display());
+        let r_uid = nestweaver_schema::repo_uid("test", &repo_url);
+        let (_, store) =
+            crate::index::index_directory_in_memory(&root, "test", &repo_url, "sha1").unwrap();
+        (store, r_uid, root, repo_url)
+    }
+
+    /// Edge topology keyed by endpoints and kind, as a multiset so a
+    /// duplicated re-insert is caught too.
+    fn edge_multiset(
+        db: &GraphStore,
+    ) -> std::collections::BTreeMap<(String, String, String), usize> {
+        let mut out = std::collections::BTreeMap::new();
+        for (a, b, kind, _, _) in db.load_typed_edges().unwrap() {
+            *out.entry((a, b, kind)).or_insert(0) += 1;
+        }
+        out
+    }
+
+    fn assert_matches_fresh(store: &GraphStore, root: &Path, repo_url: &str, what: &str) {
+        let (_, fresh) =
+            crate::index::index_directory_in_memory(root, "test", repo_url, "fresh").unwrap();
+        let (live, fresh) = (edge_multiset(store), edge_multiset(&fresh));
+        let missing: Vec<_> = fresh
+            .iter()
+            .filter(|(k, n)| live.get(*k) != Some(n))
+            .collect();
+        let extra: Vec<_> = live
+            .iter()
+            .filter(|(k, n)| fresh.get(*k) != Some(n))
+            .collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "{what}: watcher differs from fresh\nmissing/miscounted: {missing:#?}\nextra: {extra:#?}"
+        );
+    }
+
+    /// Edges with their kind and evidence kinds, as a multiset, so a
+    /// `type_aware` edge downgraded to `same_file` is a difference too.
+    fn edge_evidence_multiset(
+        db: &GraphStore,
+    ) -> std::collections::BTreeMap<(String, String, String, String), usize> {
+        let mut out = std::collections::BTreeMap::new();
+        for (a, b, kind, _, evidence) in db.load_typed_edges().unwrap() {
+            *out.entry((a, b, kind, evidence)).or_insert(0) += 1;
+        }
+        out
+    }
+
+    /// nw-113 final watch parity P1: a watcher pass over a file with a class
+    /// keeps every MEMBER_OF edge and the `type_aware` `this.m()` /
+    /// `self.m()` calls, exactly as a fresh index has them (JS, TS, Python).
+    #[test]
+    fn watcher_keeps_member_of_and_type_aware_edges_of_an_edited_class() {
+        for (path, body) in [
+            (
+                "a.js",
+                "class A {\n  constructor() {\n    this.x = 1;\n  }\n  run() {\n    return this.go();\n  }\n  go() {\n    return 1;\n  }\n}\nexport default A;\n",
+            ),
+            (
+                "b.ts",
+                "export class B {\n  run() {\n    return this.go();\n  }\n  go() {\n    return 1;\n  }\n}\n",
+            ),
+            (
+                "c.py",
+                "class A:\n    def run(self):\n        return self.go()\n\n    def go(self):\n        return 1\n",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, r_uid, root, repo_url) = index_files(&dir, &[(path, body.to_string())]);
+            let before = edge_evidence_multiset(&store);
+            assert!(
+                before.keys().any(|(_, _, kind, _)| kind == "MEMBER_OF"),
+                "{path}: precondition: the index has MEMBER_OF: {before:#?}"
+            );
+            let file = root.join(path);
+            let comment = if path.ends_with(".py") { "# e" } else { "// e" };
+            std::fs::write(&file, format!("{comment}\n{body}")).unwrap();
+            let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+            process_fixture_batch(&watcher, &store, &r_uid, &root, &[file]);
+            let (_, fresh) =
+                crate::index::index_directory_in_memory(&root, "test", &repo_url, "fresh").unwrap();
+            let (live, fresh) = (
+                edge_evidence_multiset(&store),
+                edge_evidence_multiset(&fresh),
+            );
+            assert_eq!(live, fresh, "{path}: watcher differs from fresh");
+        }
+    }
+
+    /// The two barrel shapes: a local re-export and a `from` re-export.
+    const BARRELS: [&str; 2] = [
+        "import { WithTheme } from './WithTheme';\nexport default WithTheme;\n",
+        "export { default } from './WithTheme';\n",
+    ];
+
+    fn barrel_fixture(barrel: &str) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "lib/withTheme/WithTheme.js",
+                "export function WithTheme(C) { return C; }\nexport default WithTheme;\n".into(),
+            ),
+            ("lib/withTheme/index.js", barrel.into()),
+            (
+                "app/Title.js",
+                "import withTheme from '../lib/withTheme';\nexport function Title() { return withTheme(1); }\nexport default withTheme(Title);\n".into(),
+            ),
+        ]
+    }
+
+    /// nw-113 batch C (O1a). An edited file's outgoing edges through an
+    /// unchanged default-re-exporting barrel survive its watcher batch.
+    #[test]
+    fn watcher_keeps_edited_files_edges_through_a_default_barrel() {
+        for barrel in BARRELS {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, r_uid, root, repo_url) = index_files(&dir, &barrel_fixture(barrel));
+            let title = uid_of(&store, &r_uid, "Title");
+            assert!(
+                store
+                    .callees_of(&title)
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.name == "WithTheme"),
+                "precondition: the index binds Title -> WithTheme through the barrel"
+            );
+            let body = std::fs::read_to_string(root.join("app/Title.js")).unwrap();
+            std::fs::write(root.join("app/Title.js"), format!("{body}// edit\n")).unwrap();
+            let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+            process_fixture_batch(
+                &watcher,
+                &store,
+                &r_uid,
+                &root,
+                &[root.join("app/Title.js")],
+            );
+            assert_matches_fresh(&store, &root, &repo_url, "edited importer of a barrel");
+        }
+    }
+
+    /// nw-113 batch C (O1b). Inbound edges that reach a line-shifted file
+    /// through an unchanged barrel are restored by the watcher batch.
+    #[test]
+    fn watcher_restores_inbound_barrel_edges_to_a_line_shifted_file() {
+        for barrel in BARRELS {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, r_uid, root, repo_url) = index_files(&dir, &barrel_fixture(barrel));
+            let hub = root.join("lib/withTheme/WithTheme.js");
+            let body = std::fs::read_to_string(&hub).unwrap();
+            std::fs::write(&hub, format!("// top\n{body}")).unwrap();
+            let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+            process_fixture_batch(&watcher, &store, &r_uid, &root, &[hub]);
+            assert_matches_fresh(&store, &root, &repo_url, "line-shifted barrel target");
+        }
+    }
+
+    /// nw-113 batch C (watch-parity bug 1). 210 HOC files give the hub more
+    /// direct dependents (their `<module>` owners) than the transitive cap.
+    /// A line shift in the hub must still re-resolve every direct importer:
+    /// `D -> WithTheme` survives, and the graph equals a fresh index.
+    #[test]
+    fn watcher_reresolves_direct_importers_when_the_transitive_cap_trips() {
+        let mut files = barrel_fixture(BARRELS[0]);
+        files.retain(|(path, _)| *path != "app/Title.js");
+        for i in 1..=210 {
+            files.push((
+                Box::leak(format!("app/T{i}.js").into_boxed_str()),
+                format!(
+                    "import withTheme from '../lib/withTheme';\n\nfunction T{i}(props) {{\n  return props;\n}}\n\nexport default withTheme(T{i});\n"
+                ),
+            ));
+        }
+        files.push((
+            "app/D.js",
+            "import { WithTheme } from '../lib/withTheme/WithTheme';\nexport function D() { return WithTheme(1); }\n".into(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root, repo_url) = index_files(&dir, &files);
+        let d_calls_hub = |db: &GraphStore| {
+            let (d, hub) = (uid_of(db, &r_uid, "D"), uid_of(db, &r_uid, "WithTheme"));
+            db.load_typed_edges()
+                .unwrap()
+                .into_iter()
+                .filter(|(a, b, _, _, _)| *a == d && *b == hub)
+                .map(|(_, _, kind, _, _)| kind)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let both: std::collections::BTreeSet<String> =
+            ["CALLS".to_string(), "IMPORTS".to_string()].into();
+        assert_eq!(d_calls_hub(&store), both, "precondition");
+
+        let hub = root.join("lib/withTheme/WithTheme.js");
+        let body = std::fs::read_to_string(&hub).unwrap();
+        std::fs::write(&hub, format!("// top\n{body}")).unwrap();
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        process_fixture_batch(&watcher, &store, &r_uid, &root, &[hub]);
+        assert_eq!(d_calls_hub(&store), both, "D -> WithTheme lost its edges");
+        assert_matches_fresh(&store, &root, &repo_url, "hub past the transitive cap");
     }
 
     /// Regression (CRITICAL — edge loss across watch reindex): a watcher

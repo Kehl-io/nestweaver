@@ -3655,7 +3655,7 @@ fn call_originates_from_builtin(path: &str, name: &str) -> bool {
             "vars",
             "zip",
         ],
-        "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" => &[
+        "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" => &[
             "Array",
             "BigInt",
             "Boolean",
@@ -3757,8 +3757,11 @@ fn specifier_names_package(specifier: &str, package: &str) -> bool {
 }
 
 fn containing_symbol_for_line(symbols: &[RawSymbol], line: u32) -> Option<&RawSymbol> {
-    symbols
-        .iter()
+    // nw-113: the per-file `<module>` owner spans the whole file and would
+    // otherwise claim every line; it owns only top-level CALLS, which the
+    // resolver attributes itself.
+    let candidates = || symbols.iter().filter(|s| !s.is_module_owner());
+    candidates()
         .filter(|s| s.start_line <= line && line <= s.end_line)
         .max_by_key(|s| s.start_line)
         .or_else(|| {
@@ -3767,11 +3770,51 @@ fn containing_symbol_for_line(symbols: &[RawSymbol], line: u32) -> Option<&RawSy
             // ends before `line` must NOT claim module-level code that comes
             // after it (same misattribution class as the resolver's
             // find_enclosing_symbol fix).
-            symbols
-                .iter()
+            candidates()
                 .filter(|s| s.start_line <= line && s.end_line <= s.start_line)
                 .max_by_key(|s| s.start_line)
         })
+}
+
+/// The MEMBER_OF edges of one file: from each symbol whose `parent_name`
+/// names a class, interface, enum or trait declared in the same file to that
+/// container. Shared by the index and the live watcher (nw-113 P1), so a
+/// watcher pass over a file with a class keeps its members.
+pub(crate) fn file_member_of_edges(
+    r_uid: &str,
+    rel_path: &str,
+    raw_symbols: &[RawSymbol],
+) -> Vec<nestweaver_schema::ResolvedEdge> {
+    use nestweaver_schema::SymbolKind;
+    let containers: HashMap<&str, String> = raw_symbols
+        .iter()
+        .filter(|symbol| {
+            matches!(
+                symbol.kind,
+                SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum | SymbolKind::Trait
+            )
+        })
+        .map(|symbol| {
+            (
+                symbol.name.as_str(),
+                symbol_uid(r_uid, rel_path, &symbol.name, symbol.start_line),
+            )
+        })
+        .collect();
+    raw_symbols
+        .iter()
+        .filter_map(|symbol| {
+            let parent_uid = containers.get(symbol.parent_name.as_deref()?)?;
+            Some(nestweaver_schema::ResolvedEdge {
+                source_uid: symbol_uid(r_uid, rel_path, &symbol.name, symbol.start_line),
+                target_uid: parent_uid.clone(),
+                edge_type: nestweaver_schema::EdgeType::MemberOf,
+                confidence: 1.0,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+        })
+        .collect()
 }
 
 struct IndexResolution {
@@ -3820,7 +3863,7 @@ impl IndexResolution {
 fn prepare_index_resolution(
     prep: PrepareIndexResolution<'_>,
 ) -> Result<IndexResolution, anyhow::Error> {
-    use nestweaver_schema::{EdgeType, ResolvedEdge};
+    use nestweaver_schema::ResolvedEdge;
     use rayon::prelude::*;
 
     let PrepareIndexResolution {
@@ -4016,56 +4059,21 @@ fn prepare_index_resolution(
         );
     }
 
-    let member_of_edges = {
-        let container_kinds = [
-            nestweaver_schema::SymbolKind::Class,
-            nestweaver_schema::SymbolKind::Interface,
-            nestweaver_schema::SymbolKind::Enum,
-            nestweaver_schema::SymbolKind::Trait,
-        ];
-
-        let mut container_map: HashMap<(String, String), String> = HashMap::new();
-        for (rel_path, raw_symbols, _, _) in parsed_files_for_resolver {
-            for raw_sym in raw_symbols {
-                if container_kinds.contains(&raw_sym.kind) {
-                    let uid = symbol_uid(r_uid, rel_path, &raw_sym.name, raw_sym.start_line);
-                    container_map.insert((rel_path.clone(), raw_sym.name.clone()), uid);
-                }
-            }
-        }
-
-        let mut member_of_edges: Vec<ResolvedEdge> = Vec::new();
-        // nw-726. MEMBER_OF is intra-file. An incremental resolution deletes
-        // resolved edges only for the affected files, then inserts every edge
-        // this pass built. Emitting MEMBER_OF for files outside that set
-        // inserts a second copy of edges the delete did not touch.
-        for (rel_path, raw_symbols, _, _) in parsed_files_for_resolver {
-            if resolve_filter
+    // nw-726. MEMBER_OF is intra-file. An incremental resolution deletes
+    // resolved edges only for the affected files, then inserts every edge
+    // this pass built. Emitting MEMBER_OF for files outside that set
+    // inserts a second copy of edges the delete did not touch.
+    let member_of_edges: Vec<ResolvedEdge> = parsed_files_for_resolver
+        .iter()
+        .filter(|(rel_path, _, _, _)| {
+            resolve_filter
                 .as_ref()
-                .is_some_and(|filter| !filter.contains(rel_path.as_str()))
-            {
-                continue;
-            }
-            for raw_sym in raw_symbols {
-                if let Some(parent_name) = &raw_sym.parent_name {
-                    let key = (rel_path.clone(), parent_name.clone());
-                    if let Some(parent_uid) = container_map.get(&key) {
-                        let child_uid =
-                            symbol_uid(r_uid, rel_path, &raw_sym.name, raw_sym.start_line);
-                        member_of_edges.push(ResolvedEdge {
-                            source_uid: child_uid,
-                            target_uid: parent_uid.clone(),
-                            edge_type: EdgeType::MemberOf,
-                            confidence: 1.0,
-                            link_type: None,
-                            evidence: Vec::new(),
-                        });
-                    }
-                }
-            }
-        }
-        member_of_edges
-    };
+                .is_none_or(|filter| filter.contains(rel_path.as_str()))
+        })
+        .flat_map(|(rel_path, raw_symbols, _, _)| {
+            file_member_of_edges(r_uid, rel_path, raw_symbols)
+        })
+        .collect();
 
     resolve_pb.finish_and_clear();
     let resolution = IndexResolution {
@@ -8044,9 +8052,22 @@ fn partition_changed_removed(
 ///
 /// Returns the reverse-dependents to re-resolve (`affected \ changed \
 /// removed`), bounded by [`crate::resolution_cache::MAX_HOPS`] hops and a
-/// `MAX_AFFECTED_FILES` total cap. On exceeding the total cap the pass is
-/// skipped (empty set returned) — a periodic full re-index is the backstop for
-/// hub/widely-imported files.
+/// `MAX_AFFECTED_FILES` cap on the TRANSITIVE expansion.
+///
+/// The first hop, the direct dependents, is always kept, whatever its size.
+/// Re-resolution only rebuilds edges with an endpoint in a changed file, and
+/// every file holding such an edge is by definition a direct dependent, so
+/// dropping any of them loses edges for certain (nw-113: a hub's `<module>`
+/// owners alone could exceed the cap, and the whole pass used to be skipped).
+/// The cap counts files, owners included, and only stops the expansion past
+/// the first hop. Files beyond it hold no edge into a changed file; they are
+/// resolution context only, so deferring them is logged rather than repaired.
+///
+/// The direct dependents do have a safety ceiling,
+/// [`MAX_DIRECT_DEPENDENTS`]. Past it the pass is skipped with a warning
+/// naming the remedy, as every capped pass was before nw-113: re-resolving
+/// thousands of files inside one write transaction costs more than the
+/// incremental index it serves.
 ///
 /// **CRITICAL ORDERING:** this must run BEFORE `begin_transaction`; the
 /// per-file `DETACH DELETE` in the mutation loop destroys the very edges this
@@ -8061,11 +8082,36 @@ pub(crate) fn collect_reverse_dep_files(
     changed: &std::collections::HashSet<String>,
     removed: &std::collections::HashSet<String>,
 ) -> std::collections::HashSet<String> {
+    collect_reverse_dep_files_with_ceiling(store, r_uid, changed, removed, MAX_DIRECT_DEPENDENTS)
+}
+
+/// Safety ceiling on the direct dependents [`collect_reverse_dep_files`]
+/// re-resolves; past it the pass is skipped with a warning.
+const MAX_DIRECT_DEPENDENTS: usize = 5_000;
+
+#[cfg(test)]
+thread_local! {
+    /// `files_referencing_file` calls made by
+    /// [`collect_reverse_dep_files_with_ceiling`] on this thread.
+    static TEST_REVERSE_DEP_QUERY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Direct-dependent count past which re-resolution logs its size and time.
+const LARGE_REVERSE_DEP_SET: usize = 200;
+
+/// [`collect_reverse_dep_files`] with an injectable direct-dependent ceiling.
+fn collect_reverse_dep_files_with_ceiling(
+    store: &nestweaver_store::GraphStore,
+    r_uid: &str,
+    changed: &std::collections::HashSet<String>,
+    removed: &std::collections::HashSet<String>,
+    direct_ceiling: usize,
+) -> std::collections::HashSet<String> {
     use std::collections::HashSet;
 
-    /// Upper bound on total files touched by the transitive re-resolution pass.
-    /// Beyond this the pass is skipped (full re-index is the backstop) so a
-    /// change to a widely-imported hub file does not cascade unbounded.
+    /// Upper bound on files the TRANSITIVE expansion may add past the direct
+    /// dependents, so a change to a widely-imported hub does not cascade
+    /// unbounded. The direct dependents are never capped.
     const MAX_AFFECTED_FILES: usize = 200;
 
     let mut seeds: HashSet<String> = changed.clone();
@@ -8076,9 +8122,26 @@ pub(crate) fn collect_reverse_dep_files(
 
     let mut affected = seeds.clone();
     let mut frontier = seeds;
-    for _ in 0..crate::resolution_cache::MAX_HOPS {
+    for hop in 0..crate::resolution_cache::MAX_HOPS {
+        // Past hop 0, any new file would exceed the cap once `affected`
+        // already fills it, so the hop's queries could only be discarded.
+        // Skipping them saves one query per direct dependent (seconds on a
+        // hub with hundreds of importers).
+        if hop > 0 && affected.len() >= MAX_AFFECTED_FILES {
+            tracing::warn!(
+                affected = affected.len(),
+                hop,
+                cap = MAX_AFFECTED_FILES,
+                "transitive re-resolution affected-file cap reached; re-resolving the \
+                 direct dependents only and skipping the transitive expansion, whose files hold \
+                 no edge into a changed file"
+            );
+            break;
+        }
         let mut next: HashSet<String> = HashSet::new();
         for file in &frontier {
+            #[cfg(test)]
+            TEST_REVERSE_DEP_QUERY_COUNT.with(|count| count.set(count.get() + 1));
             match store.files_referencing_file(r_uid, file) {
                 Ok(rdeps) => {
                     for dep in rdeps {
@@ -8095,15 +8158,33 @@ pub(crate) fn collect_reverse_dep_files(
         if next.is_empty() {
             break; // fixed point — no more transitive reverse-dependents
         }
-        if affected.len() + next.len() > MAX_AFFECTED_FILES {
+        if hop == 0 && next.len() > direct_ceiling {
             tracing::warn!(
-                affected = affected.len(),
-                next = next.len(),
-                cap = MAX_AFFECTED_FILES,
-                "transitive re-resolution affected-file cap exceeded; skipping pass \
-                 (full re-index is the backstop)"
+                direct_dependents = next.len(),
+                ceiling = direct_ceiling,
+                "re-resolution direct-dependent ceiling exceeded; skipping the pass. \
+                 Re-run `nestweaver index --repo <path>` (incremental) to retry, or \
+                 `nestweaver index --repo <path> --force` to rebuild every edge"
             );
             return HashSet::new();
+        }
+        if hop == 0 && next.len() > LARGE_REVERSE_DEP_SET {
+            tracing::info!(
+                direct_dependents = next.len(),
+                "large direct-dependent set; re-resolving every direct dependent"
+            );
+        }
+        if hop > 0 && affected.len() + next.len() > MAX_AFFECTED_FILES {
+            tracing::warn!(
+                affected = affected.len(),
+                deferred = next.len(),
+                hop,
+                cap = MAX_AFFECTED_FILES,
+                "transitive re-resolution affected-file cap exceeded; re-resolving the \
+                 direct dependents only and deferring the transitive files, which hold \
+                 no edge into a changed file"
+            );
+            break;
         }
         affected.extend(next.iter().cloned());
         frontier = next;
@@ -8130,7 +8211,20 @@ fn reresolve_affected_dependents(
 
     let db_symbols = nestweaver_store::GraphStore::lookup_symbols_by_repo_on(conn, r_uid)
         .with_context(|| "lookup_symbols_by_repo_on for forward edge resolution")?;
-    let insertable = build_reresolve_edges(reader, r_uid, changed, rdeps, &db_symbols, None)?;
+    let known_files = nestweaver_store::GraphStore::list_files_by_repo_on(conn, r_uid)
+        .with_context(|| "list_files_by_repo_on for forward edge resolution")?
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect();
+    let insertable = build_reresolve_edges(
+        reader,
+        r_uid,
+        changed,
+        rdeps,
+        &db_symbols,
+        &known_files,
+        None,
+    )?;
 
     // Runs inside the same transaction as the mutation loop.
     let count = insertable.len();
@@ -8171,12 +8265,23 @@ pub(crate) fn prepare_watcher_reresolve_edges(
         !inputs.changed.contains(&symbol.file_path) && !inputs.removed.contains(&symbol.file_path)
     });
     symbols.extend_from_slice(inputs.replacement_symbols);
+    // Symbol-less files (a barrel `index.js` that only re-exports) have no
+    // Symbol row, so they are known only by their File node.
+    let mut known_files: std::collections::HashSet<String> = store
+        .list_files_by_repo(r_uid)
+        .with_context(|| "list_files_by_repo for watcher edge preparation")?
+        .into_iter()
+        .map(|(_, path)| path)
+        .filter(|path| !inputs.removed.contains(path))
+        .collect();
+    known_files.extend(inputs.changed.iter().cloned());
     build_reresolve_edges(
         reader,
         r_uid,
         inputs.changed,
         inputs.rdeps,
         &symbols,
+        &known_files,
         Some(inputs.prepared_file_data),
     )
 }
@@ -8194,12 +8299,48 @@ pub(crate) fn prepare_watcher_reresolve_edges(
 ///
 /// `db_symbols` must be the repo's live symbol set (post-mutation), used to
 /// give the resolver visibility into unchanged files' symbols as targets.
+/// `known_files` is the repo's live file set. It adds the JS/TS files that
+/// have no symbols at all, such as a barrel `index.js` that only re-exports:
+/// without them an import through the barrel cannot resolve, and the
+/// hydration below can never reach the barrel's forwarding references.
 fn build_reresolve_edges(
     reader: &dyn crate::content_reader::ContentReader,
     r_uid: &str,
     changed: &std::collections::HashSet<String>,
     rdeps: &std::collections::HashSet<String>,
     db_symbols: &[nestweaver_schema::Symbol],
+    known_files: &std::collections::HashSet<String>,
+    prepared_file_data: Option<&PreparedFileData>,
+) -> Result<Vec<nestweaver_schema::ResolvedEdge>, anyhow::Error> {
+    let started = std::time::Instant::now();
+    let edges = build_reresolve_edges_unlogged(
+        reader,
+        r_uid,
+        changed,
+        rdeps,
+        db_symbols,
+        known_files,
+        prepared_file_data,
+    );
+    // The direct dependents are uncapped below `MAX_DIRECT_DEPENDENTS`, so a
+    // large set is logged with its cost.
+    if rdeps.len() > LARGE_REVERSE_DEP_SET {
+        tracing::info!(
+            dependents = rdeps.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "re-resolved a large reverse-dependent set"
+        );
+    }
+    edges
+}
+
+fn build_reresolve_edges_unlogged(
+    reader: &dyn crate::content_reader::ContentReader,
+    r_uid: &str,
+    changed: &std::collections::HashSet<String>,
+    rdeps: &std::collections::HashSet<String>,
+    db_symbols: &[nestweaver_schema::Symbol],
+    known_files: &std::collections::HashSet<String>,
     prepared_file_data: Option<&PreparedFileData>,
 ) -> Result<Vec<nestweaver_schema::ResolvedEdge>, anyhow::Error> {
     // S = changed ∪ rdeps — files whose references need re-resolution.
@@ -8299,6 +8440,22 @@ fn build_reresolve_edges(
         // Empty references: we only need these files as resolution
         // targets, not as resolution sources.
         file_data.push((file_path, symbols, Vec::new()));
+    }
+    // Symbol-less JS/TS files. Only JS/TS: the hydration below is what gives
+    // such a file its forwarding references, and it is JS/TS only.
+    let mut symbol_less: Vec<&String> = known_files
+        .iter()
+        .filter(|path| !file_languages.contains_key(*path) && !scope.contains(*path))
+        .filter(|path| reader.accepts_path(Path::new(path.as_str())))
+        .collect();
+    symbol_less.sort();
+    for file_path in symbol_less {
+        if let Some(language @ (Language::JavaScript | Language::TypeScript)) =
+            detect_language(&reader.root().join(file_path))
+        {
+            file_languages.insert(file_path.clone(), language);
+            file_data.push((file_path.clone(), Vec::new(), Vec::new()));
+        }
     }
 
     let workspace_ctx = if file_languages.values().any(|language| {
@@ -8675,6 +8832,49 @@ fn content_hash_hex(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nw-113: cross-repo inference attributes a line to a real symbol, never
+    /// to the whole-file module owner.
+    #[test]
+    fn containing_symbol_for_line_skips_the_module_owner() {
+        use nestweaver_schema::{EntryPointKind, SymbolKind};
+        let symbol = |name: &str,
+                      kind: SymbolKind,
+                      start_line: u32,
+                      end_line: u32,
+                      entry: Option<EntryPointKind>| RawSymbol {
+            name: name.to_string(),
+            kind,
+            start_line,
+            end_line,
+            signature: String::new(),
+            content_hash: String::new(),
+            is_entry_point: entry.is_some(),
+            entry_point_kind: entry,
+            visibility: nestweaver_schema::Visibility::Private,
+            type_info: None,
+            parent_name: None,
+            scope_chain: None,
+        };
+        let symbols = vec![
+            symbol(
+                nestweaver_schema::MODULE_OWNER_NAME,
+                SymbolKind::Module,
+                1,
+                20,
+                Some(EntryPointKind::ModuleInit),
+            ),
+            symbol("f", SymbolKind::Function, 3, 5, None),
+        ];
+        assert_eq!(
+            containing_symbol_for_line(&symbols, 4).map(|s| s.name.as_str()),
+            Some("f")
+        );
+        assert!(containing_symbol_for_line(&symbols, 10).is_none());
+        // The degenerate fallback must not pick it either.
+        let owner_only = &symbols[..1];
+        assert!(containing_symbol_for_line(owner_only, 2).is_none());
+    }
 
     /// A symlink row is disclosed by a vault only, and only when it could
     /// have held a note; a code repo keeps its silent skip.
@@ -11433,6 +11633,68 @@ function hello(name) { return "Hello " + name; }
         assert!(result.skipped_files.is_empty());
     }
 
+    /// nw-113 item 16: `.mjs`/`.cjs` (JavaScript) and `.mts`/`.cts`
+    /// (TypeScript) files are indexed, and their imports resolve: an explicit
+    /// `./lib.mjs`, a CommonJS `require('./lib.cjs')`, and an extensionless
+    /// `./util` that reaches `util.mts`.
+    #[test]
+    fn index_module_format_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        for (path, body) in [
+            ("lib.mjs", "export function esmLib() { return 1; }\n"),
+            (
+                "main.mjs",
+                "import { esmLib } from './lib.mjs';\nexport function esmMain() { return esmLib(); }\n",
+            ),
+            (
+                "lib.cjs",
+                "function cjsLib() { return 1; }\nmodule.exports = { cjsLib };\n",
+            ),
+            (
+                "main.cjs",
+                "const { cjsLib } = require('./lib.cjs');\nfunction cjsMain() { return cjsLib(); }\nmodule.exports = { cjsMain };\n",
+            ),
+            (
+                "util.mts",
+                "export function mtsUtil(x: number): number { return x; }\n",
+            ),
+            (
+                "main.cts",
+                "import { mtsUtil } from './util';\nexport function ctsMain(): number { return mtsUtil(1); }\n",
+            ),
+        ] {
+            fs::write(src.join(path), body).unwrap();
+        }
+        let (result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        assert_eq!(result.files_count, 6, "{:?}", result.skipped_files);
+        let uid_of = |file: &str, name: &str| {
+            store
+                .symbols_in_file(file)
+                .unwrap()
+                .into_iter()
+                .find(|symbol| symbol.name == name)
+                .unwrap_or_else(|| panic!("{file}: {name} is indexed"))
+                .uid
+        };
+        let edges = store.load_typed_edges().unwrap();
+        for (caller_file, caller, callee_file, callee) in [
+            ("main.mjs", "esmMain", "lib.mjs", "esmLib"),
+            ("main.cjs", "cjsMain", "lib.cjs", "cjsLib"),
+            ("main.cts", "ctsMain", "util.mts", "mtsUtil"),
+        ] {
+            let (from, to) = (uid_of(caller_file, caller), uid_of(callee_file, callee));
+            assert!(
+                edges
+                    .iter()
+                    .any(|(a, b, kind, _, _)| *a == from && *b == to && kind == "CALLS"),
+                "{caller} -> {callee}: {edges:#?}"
+            );
+        }
+    }
+
     /// A plain local index persists the working-tree location as
     /// `root_path` on the Repo node, independent of the identity url.
     #[test]
@@ -14072,6 +14334,116 @@ module.exports = { check, plain };\n";
         );
     }
 
+    /// nw-113 batch C: past the cap the transitive expansion stops, but the
+    /// direct dependents (and earlier hops) are kept rather than the whole
+    /// set being dropped.
+    #[test]
+    fn reverse_dep_cap_defers_only_the_transitive_remainder() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("hub.js"), "export function hub() { return 1; }\n").unwrap();
+        fs::write(
+            src.join("mid.js"),
+            "import { hub } from './hub.js';\nexport function mid() { return hub(); }\n",
+        )
+        .unwrap();
+        for i in 0..205 {
+            fs::write(
+                src.join(format!("leaf{i}.js")),
+                format!("import {{ mid }} from './mid.js';\nexport function leaf{i}() {{ return mid(); }}\n"),
+            )
+            .unwrap();
+        }
+        let (_, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/cap", "sha").unwrap();
+        let repo = repo_uid("test", "https://example.com/cap");
+        let rdeps = collect_reverse_dep_files(
+            &store,
+            &repo,
+            &std::collections::HashSet::from(["hub.js".to_string()]),
+            &Default::default(),
+        );
+        assert_eq!(
+            rdeps,
+            std::collections::HashSet::from(["mid.js".to_string()])
+        );
+    }
+
+    /// nw-113 final watch parity P4: once the direct dependents alone fill
+    /// the transitive cap, hop 1 can only exceed it, so its per-file
+    /// `files_referencing_file` queries are never run. Every direct dependent
+    /// is still kept.
+    #[test]
+    fn reverse_dep_cap_skips_the_transitive_queries_once_hop_zero_fills_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("hub.js"), "export function hub() { return 1; }\n").unwrap();
+        for i in 0..205 {
+            fs::write(
+                src.join(format!("dep{i}.js")),
+                format!("import {{ hub }} from './hub.js';\nexport function dep{i}() {{ return hub(); }}\n"),
+            )
+            .unwrap();
+        }
+        let (_, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/p4", "sha").unwrap();
+        let repo = repo_uid("test", "https://example.com/p4");
+        TEST_REVERSE_DEP_QUERY_COUNT.with(|count| count.set(0));
+        let rdeps = collect_reverse_dep_files(
+            &store,
+            &repo,
+            &std::collections::HashSet::from(["hub.js".to_string()]),
+            &Default::default(),
+        );
+        assert_eq!(rdeps.len(), 205, "every direct dependent is kept");
+        assert_eq!(
+            TEST_REVERSE_DEP_QUERY_COUNT.with(std::cell::Cell::get),
+            1,
+            "only the hop-0 query for hub.js runs"
+        );
+    }
+
+    /// nw-113: past the direct-dependent ceiling the pass is skipped (the
+    /// old warning path), and at the ceiling every direct dependent is kept.
+    #[test]
+    fn reverse_dep_ceiling_skips_the_pass_past_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("hub.js"), "export function hub() { return 1; }\n").unwrap();
+        for i in 0..3 {
+            fs::write(
+                src.join(format!("dep{i}.js")),
+                format!("import {{ hub }} from './hub.js';\nexport function dep{i}() {{ return hub(); }}\n"),
+            )
+            .unwrap();
+        }
+        let (_, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/ceil", "sha").unwrap();
+        let repo = repo_uid("test", "https://example.com/ceil");
+        let changed = std::collections::HashSet::from(["hub.js".to_string()]);
+        let collect = |ceiling| {
+            collect_reverse_dep_files_with_ceiling(
+                &store,
+                &repo,
+                &changed,
+                &Default::default(),
+                ceiling,
+            )
+        };
+        assert_eq!(
+            collect(3).len(),
+            3,
+            "at the ceiling every dependent is kept"
+        );
+        assert!(
+            collect(2).is_empty(),
+            "past the ceiling the pass is skipped"
+        );
+    }
+
     #[test]
     fn mixed_language_watcher_reresolve_keeps_javascript_imports() {
         let dir = tempfile::tempdir().unwrap();
@@ -14107,6 +14479,7 @@ module.exports = { check, plain };\n";
             &changed,
             &std::collections::HashSet::new(),
             &symbols,
+            &Default::default(),
             None,
         )
         .unwrap();
@@ -14198,6 +14571,7 @@ module.exports = { check, plain };\n";
             &changed,
             &Default::default(),
             &symbols,
+            &Default::default(),
             None,
         )
         .unwrap();
@@ -14232,6 +14606,7 @@ module.exports = { check, plain };\n";
             &changed,
             &Default::default(),
             &symbols,
+            &Default::default(),
             Some(&prepared),
         )
         .unwrap();
@@ -14254,6 +14629,7 @@ module.exports = { check, plain };\n";
             &changed,
             &Default::default(),
             &symbols,
+            &Default::default(),
             None,
         )
         .unwrap();
@@ -14559,6 +14935,83 @@ module.exports = { check, plain };\n";
         assert!(
             !clusters_path.exists(),
             "node-UID-keyed cluster output must be invalidated after deletion"
+        );
+    }
+
+    /// nw-113 (incremental parity). The git-diff incremental path resolves
+    /// each changed file alone, then re-resolves only cross-file edges, so
+    /// the same-file edge to a block-local callable that shadows an import
+    /// must come out of the single-file pass.
+    #[test]
+    fn incremental_index_keeps_same_file_call_to_block_local_that_shadows_an_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("lib.ts"),
+            "export function sendPacket(): number { return 7; }\n",
+        )
+        .unwrap();
+        let lexical = |value: u32| {
+            format!(
+                "import {{sendPacket}} from \"./lib\";\nexport function lexicalCaller() {{\n  {{\n    const sendPacket = () => {value};\n    sendPacket();\n  }}\n  return sendPacket();\n}}\n"
+            )
+        };
+        fs::write(repo.join("lexical.ts"), lexical(42)).unwrap();
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        let repo_url = "https://example.com/nw-113-incremental";
+        index_directory(
+            &repo,
+            &db_path,
+            "test",
+            repo_url,
+            &git(&["rev-parse", "HEAD"]),
+        )
+        .unwrap();
+
+        let calls_block_local = || {
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            let symbols = store.symbols_in_file("lexical.ts").unwrap();
+            let block_local = symbols
+                .iter()
+                .find(|s| s.name == "sendPacket" && s.start_line == 4)
+                .expect("block-local sendPacket should be indexed");
+            let caller = symbols
+                .iter()
+                .find(|s| s.name == "lexicalCaller")
+                .expect("lexicalCaller should be indexed");
+            store
+                .callees_with_edge_types_of(&caller.uid)
+                .unwrap()
+                .iter()
+                .any(|(s, kind)| s.uid == block_local.uid && kind == "CALLS")
+        };
+        assert!(calls_block_local(), "precondition: full index binds it");
+
+        fs::write(repo.join("lexical.ts"), lexical(43)).unwrap();
+        git(&["commit", "-q", "-am", "edit lexical.ts"]);
+        let result = incremental_index(&repo, &db_path, "test", repo_url).unwrap();
+        assert!(
+            !result.fell_back_to_full,
+            "must exercise the incremental path"
+        );
+        assert!(
+            calls_block_local(),
+            "the incremental index dropped lexicalCaller -> block-local sendPacket"
         );
     }
 

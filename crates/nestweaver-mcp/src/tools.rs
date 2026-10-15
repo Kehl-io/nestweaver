@@ -113,7 +113,8 @@ fn candidates_json(candidates: &[nestweaver_schema::Symbol]) -> Value {
     ordered.sort_by(|a, b| {
         (&a.file_path, a.start_line, &a.uid).cmp(&(&b.file_path, b.start_line, &b.uid))
     });
-    json!(ordered.into_iter().take(50).map(|symbol| json!({"uid":symbol.uid,"name":symbol.name,"file_path":symbol.file_path,"start_line":symbol.start_line})).collect::<Vec<_>>())
+    // nw-113: an owner candidate is named `path::<module>`, never bare.
+    json!(ordered.into_iter().take(50).map(|symbol| json!({"uid":symbol.uid,"name":symbol.display_name(),"file_path":symbol.file_path,"start_line":symbol.start_line})).collect::<Vec<_>>())
 }
 
 fn name_lookup_ambiguous_payload(
@@ -199,7 +200,12 @@ fn resolve_symbol_strict(
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
     repo_filter: Option<&str>,
 ) -> Result<StrictNameResolve, anyhow::Error> {
-    if name_or_uid.contains(':') {
+    // nw-113: a `file::name` or `Class::method` spec also contains ':' but is
+    // no UID, so it skips the UID lookup and goes straight to the qualified
+    // name lookup below.
+    let qualified = !name_or_uid.starts_with("sym:")
+        && nestweaver_schema::split_file_qualifier(name_or_uid).is_some();
+    if name_or_uid.contains(':') && !qualified {
         match store.lookup_symbol(name_or_uid) {
             Ok(symbol) => {
                 if !repo_is_visible(&symbol.repo_uid, visible) {
@@ -221,8 +227,8 @@ fn resolve_symbol_strict(
         }
     } else {
         let mut matches = store
-            .lookup_symbols_by_name(name_or_uid)
-            .map_err(|e| anyhow!("lookup_symbols_by_name: {e}"))?;
+            .lookup_symbols_by_spec(name_or_uid)
+            .map_err(|e| anyhow!("lookup_symbols_by_spec: {e}"))?;
         matches.retain(|symbol| repo_is_visible(&symbol.repo_uid, visible));
         let matches = filter_name_matches_by_repo(store, matches, repo_filter, visible)?;
         Ok(classify_name_matches(matches))
@@ -4315,7 +4321,7 @@ fn dispatch_tool_arm(
 ) -> Result<Value, anyhow::Error> {
     match name {
         "brain_context" => tool_brain_context(store, tantivy, args, embed_model, cancel, visible),
-        "code_context" => tool_code_context(store, args),
+        "code_context" => tool_code_context(store, args, visible),
         "brain_search" => tool_brain_search(store, tantivy, args, visible),
         "note_get" => tool_note_get(store, args),
         "backlinks" => tool_backlinks(store, args),
@@ -5436,28 +5442,20 @@ fn read_symbols_from_repo_roots(
 }
 
 /// Resolve a symbol spec to its `repo_uid` by looking up the symbol in the store.
+///
+/// The same resolution `read_symbols` itself applies, so a `file::name`
+/// target (nw-113) groups under the repo of the file it names.
 fn resolve_repo_for_spec(store: &GraphStore, spec: &str) -> Option<String> {
-    if spec.starts_with("sym:") {
-        return store.lookup_symbol(spec).ok().map(|s| s.repo_uid);
-    }
-    let name = spec
-        .rsplit("::")
+    nestweaver_engine::read_symbols::resolve_spec(store, spec)
+        .into_iter()
         .next()
-        .unwrap_or(spec)
-        .rsplit('.')
-        .next()
-        .unwrap_or(spec);
-    store
-        .lookup_symbols_by_name(name)
-        .ok()
-        .and_then(|syms| syms.into_iter().next())
         .map(|s| s.repo_uid)
 }
 
 fn tool_schema_read_symbols() -> Value {
     json!({
         "name": "read_symbols",
-        "description": "Read indexed symbol source spans. MCP output is bounded to 20KB logical / 40KB escaped; read truncation metadata and narrow targets or sections to continue.\n\nGuidelines:\n- Accepts UIDs (sym:...), bare names, or FQNs; ambiguous names return candidate UIDs to disambiguate\n- Use include_neighbors to also return adjacent symbols in the same file\n- Use token_budget to cap combined output size\n\nLimitations:\n- Only reads indexed code symbols, not markdown notes (use note_get for those)\n- When `root` is omitted, file paths resolve from the owning repo's `local_root` in the graph, then the server working directory\n- Refused for repository-scoped identities because a caller-selected filesystem root cannot prove the source bytes belong to the authorized repository\n\nIn server mode (bare clones), bodies may be empty with a server_note explaining the limitation.",
+        "description": "Read indexed symbol source spans. MCP output is bounded to 20KB logical / 40KB escaped; read truncation metadata and narrow targets or sections to continue.\n\nGuidelines:\n- Accepts UIDs (sym:...), bare names, FQNs, `path::name`, `Class::method` or `path::Class::method` (narrowed by file and container like brain_impact); a qualifier that names nothing falls back to the last segment and is listed in `qualifier_ignored`; ambiguous names return candidates with uid and file_path plus a `hint` on how to pick one\n- `path::<module>` reads a file's top-level code (the module owner), with function, class and method bodies elided as `⋮`\n- Use include_neighbors to also return adjacent symbols in the same file\n- Use token_budget to cap combined output size; a first symbol larger than the budget is cut to fit and flagged `body_truncated` (a budget of 0 returns the first symbol whole)\n\nLimitations:\n- Only reads indexed code symbols, not markdown notes (use note_get for those)\n- When `root` is omitted, file paths resolve from the owning repo's `local_root` in the graph, then the server working directory\n- Refused for repository-scoped identities because a caller-selected filesystem root cannot prove the source bytes belong to the authorized repository\n\nIn server mode (bare clones), bodies may be empty with a server_note explaining the limitation.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5495,7 +5493,7 @@ fn tool_schema_read_symbols() -> Value {
                 },
                 "token_budget": {
                     "type": "integer",
-                    "description": "Approximate requested token cap for combined source. Native CLI retains the first symbol in full and drops later symbols after this budget. Omission removes that token cap; 0 requests only the first symbol. MCP independently applies its 20KB logical / 40KB escaped wire bound, which may truncate even the first symbol; inspect output_budget and retry narrowly."
+                    "description": "Approximate requested token cap for combined source. Native CLI cuts a first symbol larger than this budget to fit (`body_truncated: true`, with a closing marker line) and drops later symbols after this budget. Omission removes that token cap; 0 requests only the first symbol, in full. MCP independently applies its 20KB logical / 40KB escaped wire bound, which may truncate even the first symbol; inspect output_budget and retry narrowly."
                 },
                 "root": {
                     "type": "string",
@@ -6709,13 +6707,34 @@ fn note_did_you_mean(store: &GraphStore, title: &str) -> Vec<String> {
 /// no dependency on this crate's type). Re-raise exactly that failure, and
 /// nothing else, as a [`ToolTargetNotFound`] keyed on `seeds`. The message,
 /// which carries the `nestweaver investigate` hint (nw-511), is kept whole.
-fn seeds_not_found(error: anyhow::Error, seeds: &[String], prefixes: &[&str]) -> anyhow::Error {
+///
+/// nw-113: a qualified seed (`path::name`, `Class::method`) that named
+/// nothing gets the same `path::name` suggestions as `brain_impact`, scoped
+/// to what the caller may see. Public so the CLI's direct route reports a
+/// miss through the same envelope as the daemon route.
+pub fn seeds_not_found(
+    store: &GraphStore,
+    error: anyhow::Error,
+    seeds: &[String],
+    prefixes: &[&str],
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> anyhow::Error {
     let matched = error
         .chain()
         .map(ToString::to_string)
         .find(|message| prefixes.iter().any(|prefix| message.starts_with(prefix)));
     match matched {
-        Some(message) => target_not_found(message, "seeds", json!(seeds), &[]),
+        Some(message) => {
+            let did_you_mean =
+                nestweaver_engine::did_you_mean::qualified_seed_suggestions(store, seeds, |s| {
+                    repo_is_visible(&s.repo_uid, visible)
+                })
+                .unwrap_or_else(|error| {
+                    tracing::warn!("qualified_seed_suggestions lookup failed: {error:#}");
+                    Vec::new()
+                });
+            target_not_found(message, "seeds", json!(seeds), &did_you_mean)
+        }
         None => error,
     }
 }
@@ -6908,7 +6927,7 @@ pub fn validate_brain_context_kinds(kinds: &[String]) -> Result<(), anyhow::Erro
 fn tool_schema_code_context() -> Value {
     json!({
         "name": "code_context",
-        "description": "Structural subgraph around seed SYMBOLS: personalized PageRank over the code graph alone. Returns the seeds plus the most relevant connected symbols, ranked.\n\nGuidelines:\n- Use when the question is about code structure — what surrounds this function, what is near this class\n- Seeds are symbol names or `sym:` UIDs\n\nLimitations:\n- CODE ONLY. It does not consider notes, tags, or wikilinks, and it does not resolve taxonomy aliases — use brain_context for the unified code+notes view\n- Relevance is PPR over the symbol graph, so scores are NOT comparable with brain_context's, which ranks over a different graph",
+        "description": "Structural subgraph around seed SYMBOLS: personalized PageRank over the code graph alone. Returns the seeds plus the most relevant connected symbols, ranked.\n\nGuidelines:\n- Use when the question is about code structure — what surrounds this function, what is near this class\n- Seeds are symbol names, `sym:` UIDs, or `path::name` (`path::<module>` seeds a file's top-level code)\n- Module owners (`path::<module>`, a file's top-level code) rank after every real symbol; at most 3 are listed and the rest are counted in `module_owners_omitted` (absent when 0), their places refilled with lower-scored real symbols up to the limit\n\nLimitations:\n- CODE ONLY. It does not consider notes, tags, or wikilinks, and it does not resolve taxonomy aliases — use brain_context for the unified code+notes view\n- Relevance is PPR over the symbol graph, so scores are NOT comparable with brain_context's, which ranks over a different graph",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -6946,7 +6965,7 @@ fn tool_schema_code_context() -> Value {
 fn tool_schema_brain_context() -> Value {
     json!({
         "name": "brain_context",
-        "description": "Retrieve PPR-ranked structural context from the knowledge graph, seeded by symbol names, note titles, or keywords. Returns mixed-kind results (Symbol, Note, Section, Tag, Heading) within a token budget.\n\nGuidelines:\n- Primary entry point for understanding a topic — use before reading files\n- Seed with specific names (e.g. 'AuthService.validate'), not broad terms\n- Filter with repos, tags, path_prefix, kinds for precision; use response_format 'concise' unless you need full bodies\n\nLimitations:\n- Only searches indexed repos/vaults — check stale_check if results seem stale\n- Ranked by graph proximity, not recency (use recency_weight to add time decay)\n- A `brain watcher batch` publication no longer fails this call closed: it SUCCEEDS and discloses the open window on the response with `publication_in_progress: true`, `marker_age_s`, `in_flight_note_paths` (max 20) and `in_flight_note_paths_truncated`. Read those before trusting the result — the answer came from a graph still being written to, and the named notes are mid-publication. KNOWN GAP: those keys reach every MCP route, but CLI `--json` verbs that reshape the response into a typed struct (e.g. `nestweaver hubs --json`) drop them silently\n- A full `index` publication still fails CLOSED with 'index publication TRANSIENT/WEDGED', and so does a WEDGED watcher marker. This refers to INDEX PUBLICATION, not a dirty git working tree: editing files in a repo does NOT cause it, and NestWeaver is fully usable while you work. TRANSIENT resolves on its own — retry. WEDGED means a prior indexer died mid-publication; ASK THE OPERATOR to run the `nestweaver repair` command named in the error — repair is a destructive publication recovery with no MCP tool, so it cannot be done from here — or check brain_status.index_publication.",
+        "description": "Retrieve PPR-ranked structural context from the knowledge graph, seeded by symbol names, note titles, or keywords. Returns mixed-kind results (Symbol, Note, Section, Tag, Heading) within a token budget.\n\nGuidelines:\n- Primary entry point for understanding a topic — use before reading files\n- Seed with specific names (e.g. 'AuthService.validate'), not broad terms\n- A seed may be qualified: `path::name`, `path::<module>` (a file's top-level code) or `Class::method`, resolved like brain_impact; a qualifier that names nothing does not resolve\n- Filter with repos, tags, path_prefix, kinds for precision; use response_format 'concise' unless you need full bodies\n- Module owners (`path::<module>`, a file's top-level code) rank after every real node; at most 3 are listed and the rest are counted in `module_owners_omitted` (absent when 0), their places refilled with lower-scored real symbols\n\nLimitations:\n- Only searches indexed repos/vaults — check stale_check if results seem stale\n- Ranked by graph proximity, not recency (use recency_weight to add time decay)\n- A `brain watcher batch` publication no longer fails this call closed: it SUCCEEDS and discloses the open window on the response with `publication_in_progress: true`, `marker_age_s`, `in_flight_note_paths` (max 20) and `in_flight_note_paths_truncated`. Read those before trusting the result — the answer came from a graph still being written to, and the named notes are mid-publication. KNOWN GAP: those keys reach every MCP route, but CLI `--json` verbs that reshape the response into a typed struct (e.g. `nestweaver hubs --json`) drop them silently\n- A full `index` publication still fails CLOSED with 'index publication TRANSIENT/WEDGED', and so does a WEDGED watcher marker. This refers to INDEX PUBLICATION, not a dirty git working tree: editing files in a repo does NOT cause it, and NestWeaver is fully usable while you work. TRANSIENT resolves on its own — retry. WEDGED means a prior indexer died mid-publication; ASK THE OPERATOR to run the `nestweaver repair` command named in the error — repair is a destructive publication recovery with no MCP tool, so it cannot be done from here — or check brain_status.index_publication.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -7071,10 +7090,9 @@ fn tool_schema_brain_context() -> Value {
 
 /// Truncate to `limit`, reporting whether anything was dropped.
 ///
-/// The caller asks the engine for `limit + 1` so the extra row proves more rows
-/// exist without paying for a second query; this drops it and says so. Silent
-/// truncation is the failure mode being avoided: a caller that cannot tell a
-/// complete answer from a capped one will treat the cap as the whole graph.
+/// Silent truncation is the failure mode being avoided: a caller that cannot
+/// tell a complete answer from a capped one will treat the cap as the whole
+/// graph.
 fn truncate_reporting<T>(items: &mut Vec<T>, limit: usize) -> bool {
     let truncated = items.len() > limit;
     if truncated {
@@ -7097,7 +7115,11 @@ fn truncate_reporting<T>(items: &mut Vec<T>, limit: usize) -> bool {
 /// help says "structural subgraph around seed symbols", so the direct path was
 /// the correct one and the daemon route was silently substituting a different
 /// capability.
-fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+fn tool_code_context(
+    store: &GraphStore,
+    args: Value,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<Value, anyhow::Error> {
     let seeds: Vec<String> = args
         .get("seeds")
         .and_then(|v| v.as_array())
@@ -7136,26 +7158,24 @@ fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         })
         .transpose()?;
 
-    // One over the cap, so `truncated` can be reported without a second pass:
-    // the extra row proves more exist, and is dropped before rendering.
-    // `saturating_add`, not `+`. Schema validation bounds `limit` on the MCP
-    // path, but this function is also reached from routes that do not validate
-    // against the schema, and `usize::MAX + 1` is a debug panic and a silent
-    // wrap to ZERO in release — which would turn "give me everything" into
-    // "give me nothing".
-    let mut result = nestweaver_engine::build_context_with_intent(
-        store,
-        &seeds,
-        intent,
-        Some(limit.saturating_add(1)),
-    )
-    .map_err(|error| {
-        seeds_not_found(
-            error,
-            &seeds,
-            &["No matching symbols found.", "No symbols found in file(s):"],
-        )
-    })?;
+    // Exactly the cap. This used to ask for one over it so the extra row
+    // proved more existed, but the engine reports `connected_total` itself,
+    // and the extra row was refilled and then trimmed off the tail, where the
+    // `<module>` owners rank, so one of the three listed owners was lost
+    // (nw-113 final review Minor 2). `truncate_reporting` below stays as a
+    // guard; the engine never returns more than `limit`.
+    let mut result =
+        nestweaver_engine::build_context_with_intent(store, &seeds, intent, Some(limit)).map_err(
+            |error| {
+                seeds_not_found(
+                    store,
+                    error,
+                    &seeds,
+                    &["No matching symbols found.", "No symbols found in file(s):"],
+                    visible,
+                )
+            },
+        )?;
     let truncated = truncate_reporting(&mut result.connected, limit);
 
     let render = |node: &nestweaver_engine::ContextNode| {
@@ -7222,6 +7242,9 @@ fn tool_code_context(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         "connected_count": returned,
         "returned": returned,
         "total": total,
+        // nw-113: connected `<module>` owners beyond the engine's cap of
+        // three, counted rather than listed (and not part of `total`).
+        "module_owners_omitted": result.module_owners_omitted,
         "limit": limit,
         "truncated": truncated_flag,
         // Emitted even when null, unlike the CLI's `skip_serializing_if`,
@@ -7379,7 +7402,7 @@ fn tool_brain_context(
         embed_model,
         cancel,
     )
-    .map_err(|error| seeds_not_found(error, &seeds, &["No seeds resolved."]))?;
+    .map_err(|error| seeds_not_found(store, error, &seeds, &["No seeds resolved."], visible))?;
 
     // Feature F6 (per-path ranking priors) is a deliberate no-op here: the MCP
     // server holds no InstanceConfig at the call site (same as F8, which uses
@@ -7669,9 +7692,17 @@ fn tool_brain_context(
     // along (`print_brain_context_text`), which makes this nw-259(a)'s shape
     // exactly: the human is told and the agent is not. The spellings are
     // `Bounded::merge_into`'s and `code_context`'s; no sixth one is invented.
-    let total = result.connected.len();
+    //
+    // nw-113 R1: the engine's refill can be cut short by the store's
+    // below-floor keep; those rows matched too, so they count in `total` and
+    // the list reports itself truncated by the row cap even when the caller's
+    // own caps did not bite.
+    let total = result.connected.len() + result.below_floor_rows_cut;
     let returned = connected_json.len();
     let truncated = returned < total;
+    let truncated_by = truncated_by.or(nestweaver_engine::TruncationCause::resolve(
+        false, truncated,
+    ));
     let mut resp = json!({
         "seeds_expanded": result.seeds.len(),
         // nw-393. The SEED cap, one layer upstream of the connected-list
@@ -7746,6 +7777,10 @@ fn tool_brain_context(
     // response then claimed a seed both resolved AND unresolved.
     if result.semantic_seed_count > 0 {
         resp["semantic_seed_count"] = json!(result.semantic_seed_count);
+    }
+    // nw-113: connected `<module>` owners the engine's cap left out.
+    if result.module_owners_omitted > 0 {
+        resp["module_owners_omitted"] = json!(result.module_owners_omitted);
     }
 
     // Feature F7: surface the PRF-mined expansion terms for auditing. Only
@@ -12485,7 +12520,7 @@ fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_brain_impact() -> Value {
     json!({
         "name": "brain_impact",
-        "description": "Trace reverse dependencies of a symbol to understand what might break if it changes. Returns confidence-weighted impact scores (0.0-1.0) decaying through the call graph.\n\nGuidelines:\n- Use BEFORE modifying a function, class, or interface\n- Results sorted by impact_score (highest risk first); type-aware resolution follows class hierarchies\n- Use response_format 'concise' for names only, 'detailed' for full metadata\n\nLimitations:\n- A bare `symbol` name resolves by EXACT match only, never substring/fuzzy -- a name `brain_search` finds hits for can still be not_found here; the not_found response (`isError: true`, like every lookup tool's miss) carries a bounded `did_you_mean` list of the closest substring matches when any exist\n- For forward call chains use flow_trace; for file-level impact use detect_changes or blast_radius\n- For cross-repo impact use cross_repo_contracts\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
+        "description": "Trace reverse dependencies of a symbol to understand what might break if it changes. Returns confidence-weighted impact scores (0.0-1.0) decaying through the call graph.\n\nGuidelines:\n- Use BEFORE modifying a function, class, or interface\n- Results sorted by impact_score (highest risk first); type-aware resolution follows class hierarchies\n- Use response_format 'concise' for names only, 'detailed' for full metadata\n- `symbol` may be `path::name`, `Class::method` or `path::Class::method`: the first qualifier narrows by file (exact repo-relative path, `/`-boundary suffix, or that suffix without its extension) and the rest by container, or every qualifier narrows by container; both readings are kept. One matching neither is not_found with `path::name` suggestions. `path::<module>` names a file's top-level code\n- A caller labelled `path::<module>` is that file's top-level code (the module owner)\n\nLimitations:\n- A bare `symbol` name resolves by EXACT match only, never substring/fuzzy -- a name `brain_search` finds hits for can still be not_found here; the not_found response (`isError: true`, like every lookup tool's miss) carries a bounded `did_you_mean` list of the closest substring matches when any exist\n- For forward call chains use flow_trace; for file-level impact use detect_changes or blast_radius\n- For cross-repo impact use cross_repo_contracts\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -12660,13 +12695,14 @@ fn tool_brain_impact(
         if concise {
             #[derive(serde::Serialize)]
             struct Row<'a> {
-                name: &'a str,
+                name: std::borrow::Cow<'a, str>,
                 depth: u32,
                 impact_score: f64,
             }
             bounded_metadata(
                 &Row {
-                    name: &n.name,
+                    // nw-113: an owner reads `path::<module>`, never bare.
+                    name: nestweaver_schema::symbol_display_name(&n.name, &n.file_path),
                     depth: n.depth,
                     impact_score: n.impact_score,
                 },
@@ -12676,7 +12712,7 @@ fn tool_brain_impact(
             #[derive(serde::Serialize)]
             struct Row<'a> {
                 uid: &'a str,
-                name: &'a str,
+                name: std::borrow::Cow<'a, str>,
                 file_path: &'a str,
                 start_line: u32,
                 edge_type: &'a str,
@@ -12687,7 +12723,7 @@ fn tool_brain_impact(
             bounded_metadata(
                 &Row {
                     uid: &n.uid,
-                    name: &n.name,
+                    name: nestweaver_schema::symbol_display_name(&n.name, &n.file_path),
                     file_path: &n.file_path,
                     start_line: n.start_line,
                     edge_type: &n.edge_type,
@@ -12848,7 +12884,7 @@ fn tool_brain_guide(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
 fn tool_schema_flow_trace() -> Value {
     json!({
         "name": "flow_trace",
-        "description": "Trace forward execution flow from a symbol: what it calls, what those call, and so on. Returns a tree of callees.\n\nGuidelines:\n- Best for tracing from entry points (main, request handlers) to understand execution paths\n- Every child carries `edge_type`: CALLS and IMPORTS are observed in code, CROSS_REPO_LINK is an INFERRED cross-repo link. A CROSS_REPO_LINK child is NOT an observed call — filter it out when you need a real execution path\n- Cycles are detected and pruned; use max_depth to control tree depth (default 10)\n- Classes are auto-expanded to their methods since classes have no direct CALLS edges\n\nLimitations:\n- For reverse dependencies ('what calls this?') use brain_impact instead\n- For general structural context use brain_context",
+        "description": "Trace forward execution flow from a symbol: what it calls, what those call, and so on. Returns a tree of callees.\n\nGuidelines:\n- Best for tracing from entry points (main, request handlers) to understand execution paths\n- Every child carries `edge_type`: CALLS and IMPORTS are observed in code, CROSS_REPO_LINK is an INFERRED cross-repo link. A CROSS_REPO_LINK child is NOT an observed call — filter it out when you need a real execution path\n- Cycles are detected and pruned; use max_depth to control tree depth (default 10)\n- Classes are auto-expanded to their methods since classes have no direct CALLS edges\n- `symbol` accepts `path::name`, `Class::method` and `path::Class::method` (narrows by file and container together) and `path::<module>` (a file's top-level code, labelled by its file)\n\nLimitations:\n- For reverse dependencies ('what calls this?') use brain_impact instead\n- For general structural context use brain_context",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -13041,10 +13077,12 @@ fn tool_flow_trace(
     // can no longer decide which occurrence of a node is the canonical one,
     // because DFS order was exactly what made the answer non-monotone.
     let frontier = flow_frontier(store, &[root.uid.as_str()], &blocked, &opts)?;
+    // nw-113: an owner root reads `path::<module>`, never bare.
+    let root_name = root.display_name().into_owned();
     let tree = build_flow_tree(
         store,
         &root.uid,
-        &root.name,
+        &root_name,
         &root.file_path,
         0,
         &frontier,
@@ -13053,7 +13091,7 @@ fn tool_flow_trace(
 
     let mut payload = json!({
         "root_uid": root.uid,
-        "root_name": root.name,
+        "root_name": root_name,
         "max_depth": max_depth,
         "tree": tree,
     });
@@ -13504,7 +13542,7 @@ fn build_flow_tree(
 fn tool_schema_detect_changes() -> Value {
     json!({
         "name": "detect_changes",
-        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high, or unknown when a changed file maps to no indexed symbols — never read unknown as low)\n- `risk` and `gate_state` are the verdict `blast_radius` returns for the same files at its default depth (nw-544), so a gate built on either tool agrees; `affected_processes` is detail, not a risk input\n- Gate on `gate_state`, not `status` (nw-467): a run that merely stopped at its configured depth is `status: partial` but `gate_state: ok` — bounded, not broken, and the normal state at the default depth. `degraded-unknown` means stale/errored/refused/cancelled and requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts\n- `resolver_stale_repos`, when present, is repo UIDs with generation-mismatched edges that own or are linked to a changed file (a stale repo unrelated to the change is only named in a `resolver-generation-stale-unrelated` warning) — a different population from `stale_check`'s or `hub_nodes`'s own `stale_repos` (same key name, different tools, different meanings — nw-371)",
+        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high, or unknown when a changed file maps to no indexed symbols — never read unknown as low)\n- `risk` and `gate_state` are the verdict `blast_radius` returns for the same files at its default depth (nw-544), so a gate built on either tool agrees; `affected_processes` is detail, not a risk input\n- A process whose `affected_symbol_count` is 0 is listed because a member file's top-level code (its `path::<module>` owner, never a changed symbol) changed; it carries `top_level_code_changed: true`\n- A changed file that is only top-level code gets a `changed-file-top-level-only` warning; files that load it only for its side effects are not tracked, so the run is `status: partial` and `gate_state: degraded-unknown`\n- Gate on `gate_state`, not `status` (nw-467): a run that merely stopped at its configured depth is `status: partial` but `gate_state: ok` — bounded, not broken, and the normal state at the default depth. `degraded-unknown` means stale/errored/refused/cancelled and requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts\n- `resolver_stale_repos`, when present, is repo UIDs with generation-mismatched edges that own or are linked to a changed file (a stale repo unrelated to the change is only named in a `resolver-generation-stale-unrelated` warning) — a different population from `stale_check`'s or `hub_nodes`'s own `stale_repos` (same key name, different tools, different meanings — nw-371)",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -13730,12 +13768,17 @@ fn tool_detect_changes_scoped(
         .iter()
         .take(limit)
         .map(|p| {
-            json!({
+            let mut process = json!({
                 "name": p.name,
                 "uid": p.uid,
                 "affected_symbol_count": p.affected_symbol_count,
                 "total_symbol_count": p.total_symbol_count,
-            })
+            });
+            // nw-113: why a process with 0 changed symbols is listed.
+            if p.top_level_code_changed {
+                process["top_level_code_changed"] = json!(true);
+            }
+            process
         })
         .collect();
 
@@ -13789,7 +13832,7 @@ fn tool_detect_changes_scoped(
 fn tool_schema_affected_tests() -> Value {
     json!({
         "name": "affected_tests",
-        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (at least one must be provided).\n\nREFUSAL: when a repo that owns a changed file (or shares a recorded cross-repo edge or a declared `[[links]]` entry with one) has edges that predate the running resolver, this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos`, a `remedies` array, `recommendation: \"run-full-suite\"`, and NO tier keys at all — a missing edge can only make the selection SMALLER, so an under-resolved graph silently drops a regression test while the gate still reports success. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required, a generation-stale repo is already at HEAD so a plain incremental index writes nothing) and call again. A stale repo unrelated to the change does not refuse; it is named in a `resolver-generation-stale-unrelated` warning notification.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n- `recommendation` is a machine-readable CI directive: 'selection-usable' requires a complete run with nonempty test files, or an explicitly documented docs-only/proven-empty exception; otherwise 'run-full-suite'. Documentation-only changes are disclosed as docs; unassessed source/config changes are disclosed and widen to the full suite\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n- `resolver_stale_repos` (repo UIDs, generation-mismatch) is NOT the same population as `_meta.stale_repos` (federation lag, present only via the hybrid client) or `stale_check`'s/`hub_nodes`'s own `stale_repos` (different tools, different populations under the same key name — nw-371)\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
+        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (at least one must be provided).\n\nREFUSAL: when a repo that owns a changed file (or shares a recorded cross-repo edge or a declared `[[links]]` entry with one) has edges that predate the running resolver, this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos`, a `remedies` array, `recommendation: \"run-full-suite\"`, and NO tier keys at all — a missing edge can only make the selection SMALLER, so an under-resolved graph silently drops a regression test while the gate still reports success. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required, a generation-stale repo is already at HEAD so a plain incremental index writes nothing) and call again. A stale repo unrelated to the change does not refuse; it is named in a `resolver-generation-stale-unrelated` warning notification.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive. Each test file is listed once, in its best tier\n- A test file whose own top level calls a changed function is selected; its module owner (`path::<module>`) is never a changed symbol or a test name. When none of that file's tests was reached, its `tests` is empty and `selected_by: \"top_level_code\"` says why; it counts as one test in the summary\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n- `recommendation` is a machine-readable CI directive: 'selection-usable' requires a complete run with nonempty test files, or an explicitly documented docs-only/proven-empty exception; otherwise 'run-full-suite'. Documentation-only changes are disclosed as docs; unassessed source/config changes are disclosed and widen to the full suite\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n- `resolver_stale_repos` (repo UIDs, generation-mismatch) is NOT the same population as `_meta.stale_repos` (federation lag, present only via the hybrid client) or `stale_check`'s/`hub_nodes`'s own `stale_repos` (different tools, different populations under the same key name — nw-371)\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -13996,7 +14039,9 @@ fn tool_affected_tests(
                     .to_string();
         }
         let count_tests = |tier: &[nestweaver_engine::affected_tests::AffectedTestFile]| {
-            tier.iter().map(|file| file.tests.len()).sum::<usize>()
+            tier.iter()
+                .map(nestweaver_engine::affected_tests::AffectedTestFile::test_count)
+                .sum::<usize>()
         };
         result.summary = format!(
             "{} tier-1, {} tier-2, {} tier-3 tests affected",
@@ -15107,27 +15152,8 @@ fn tool_brain_diff(
         .map(String::as_str)
         .collect();
 
-    let mut affected_symbols: Vec<Value> = Vec::new();
-    for file_path in &changed_paths {
-        if let Ok(syms) = store.symbols_in_file(file_path) {
-            for sym in syms {
-                // File paths are repository-relative and therefore collide
-                // across repositories. The selected visible repo is the
-                // authoritative owner; never attach same-path symbols from a
-                // hidden or merely different repository.
-                if sym.repo_uid != repo.uid || !repo_is_visible(&sym.repo_uid, visible) {
-                    continue;
-                }
-                affected_symbols.push(json!({
-                    "uid": sym.uid,
-                    "name": sym.name,
-                    "kind": sym.kind,
-                    "file_path": sym.file_path,
-                    "start_line": sym.start_line,
-                }));
-            }
-        }
-    }
+    let mut affected_symbols =
+        brain_diff_changed_symbols(store, &changed_paths, &repo.uid, visible);
 
     let all_changed: Vec<&str> = added
         .iter()
@@ -15156,6 +15182,41 @@ fn tool_brain_diff(
 }
 
 // ── 17. project_context ────────────────────────────────────────────────────
+
+/// The symbols of `brain_diff`'s changed files, as response rows.
+///
+/// File paths are repository-relative and therefore collide across
+/// repositories. The selected visible repo is the authoritative owner; never
+/// attach same-path symbols from a hidden or merely different repository.
+/// nw-113: a file's `<module>` owner is no changed symbol and is not listed.
+fn brain_diff_changed_symbols(
+    store: &GraphStore,
+    changed_paths: &[&str],
+    repo_uid: &str,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for file_path in changed_paths {
+        if let Ok(syms) = store.symbols_in_file(file_path) {
+            for sym in syms {
+                if sym.repo_uid != repo_uid
+                    || !repo_is_visible(&sym.repo_uid, visible)
+                    || sym.is_module_owner()
+                {
+                    continue;
+                }
+                rows.push(json!({
+                    "uid": sym.uid,
+                    "name": sym.name,
+                    "kind": sym.kind,
+                    "file_path": sym.file_path,
+                    "start_line": sym.start_line,
+                }));
+            }
+        }
+    }
+    rows
+}
 
 fn tool_schema_project_context() -> Value {
     json!({
@@ -16226,7 +16287,7 @@ fn tool_project_context(
 fn tool_schema_dead_code() -> Value {
     json!({
         "name": "dead_code",
-        "description": "Review statically unreachable symbols. Every tier is review-only, never deletion approval. High input remains accepted but returns an explicitly unavailable, unvalidated population; no High rows are emitted. Low includes all review candidates; Medium excludes explicitly public candidates. Check coverage, entry_points, undecodable_symbols, languages_without_entry_points and manifest_load_error before interpreting counts. Missing static references, dynamic dispatch and same-file-only bash trap resolution remain limitations. Resolver-stale graphs refuse with remedies. Optional repos scope uses a global reachability walk then filters results and totals. Pages are local to one database: use next_offset with expected_generation and page_token from the prior response. Changed publication, database, scope, filter or ordered population refuses continuation. Row order is confidence, PageRank, file, name, UID. Pages remain bounded to 1000 rows; traversal still examines the whole graph.",
+        "description": "Review statically unreachable symbols. Every tier is review-only, never deletion approval. High input remains accepted but returns an explicitly unavailable, unvalidated population; no High rows are emitted. Low includes all review candidates; Medium excludes explicitly public candidates. Check coverage, entry_points, module_owner_roots, undecodable_symbols, languages_without_entry_points and manifest_load_error before interpreting counts. Module owners (a file's top-level code) seed the walk and are never reported; they count in module_owner_roots, not entry_points, and coverage needs entry_points + module_owner_roots > 0. Missing static references, dynamic dispatch and same-file-only bash trap resolution remain limitations. Resolver-stale graphs refuse with remedies. Optional repos scope uses a global reachability walk then filters results and totals. Pages are local to one database: use next_offset with expected_generation and page_token from the prior response. Changed publication, database, scope, filter or ordered population refuses continuation. Row order is confidence, PageRank, file, name, UID. Pages remain bounded to 1000 rows; traversal still examines the whole graph.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -16807,7 +16868,7 @@ fn tool_bridge_nodes(
 fn tool_schema_blast_radius() -> Value {
     json!({
         "name": "blast_radius",
-        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High, or Unknown when a changed file maps to no indexed symbols — never read Unknown as Low) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\n`cochanged_files` lists historically co-changing files (git history, Jaccard confidence) with no static edge — an advisory recall supplement; absence of co-change data is disclosed via a `cochange-unavailable` note.\n\nTrust contract (read before trusting a green result):\n- status (complete/partial/degraded/failed) + gate_state (ok/degraded-unknown/risk-flagged) are TWO AXES, not one (nw-467). A run that stopped at its configured traversal budget is `status: partial` and still gates `ok` — it is BOUNDED, not degraded, and at the default depth of 3 that is the steady state, so `status == complete` is not a usable green light and `gate_state` is. A run that is stale, errored, refused or cancelled is degraded-unknown, NEVER risk-flagged — treat that one as 'unknown, review manually', not 'safe'. The bound itself is never hidden: `coverage.traversal_truncated` and the `depth-truncated` blind spot still report it\n- a graph whose edges predate the running resolver DEGRADES rather than refusing: status becomes at least 'degraded', gate_state becomes 'degraded-unknown', and a `resolver.generation-stale` notification names the repos and the `nestweaver index --repo <path> --force` remedy. On such a graph a missing edge UNDERSTATES impact, so a green result there is not a green result. (`affected_tests` refuses outright on the same condition — it is a selector, and a narrowed selection cannot be widened back by its caller.) Only a stale repo that owns a changed file, or shares a recorded cross-repo edge or a declared `[[links]]` entry with one that does, degrades; any other stale repo is named in a `resolver-generation-stale-unrelated` warning and does not\n- coverage (repos in scope / not indexed / stale / truncated) distinguishes 'no impact' from 'incomplete coverage'\n- blind_spots: inherent static gaps (dynamic-dispatch, reflection, config-wiring, codegen) plus run-specific ones (pruned-below-threshold, depth-truncated, not-indexed)\n- THREE fields on this response are named `stale_repos` or a variant of it, and they mean three different things (nw-371): `coverage.stale_repos` is behind-git-HEAD repos (objects with `repo_uid`+`commits_behind`); `resolver_stale_repos` (top-level) is repo UIDs whose edges predate/postdate this resolver generation; `_meta.stale_repos`, present only via the hybrid client, is FEDERATION lag (an upstream server's data being behind). None is interchangeable with `stale_check`'s or `hub_nodes`'/`bridge_nodes`'s own `stale_repos`, which are separate tools with separate populations under the same key name.\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection (declared in blind_spots, not silently)\n- Response size scales with number of changed files and graph density\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results. On an authenticated server with an [authz] policy, repository-restricted callers are refused before seed resolution or traversal: the global walk cannot yet be computed on an authorization-induced subgraph, and redacting after traversal would preserve reachability created through hidden intermediates.",
+        "description": "Assess full blast radius of file changes: maps to symbols, traces reverse dependencies, groups by cluster, and returns risk level (Low/Medium/High, or Unknown when a changed file maps to no indexed symbols — never read Unknown as Low) with impact scores.\n\nGuidelines:\n- Use BEFORE merging a PR; pass repo-relative changed file paths\n- A changed file that is only top-level code has no callers: a `changed-file-top-level-only` warning names its `path::<module>` owner and the first 10 symbols it calls, and the symbols it calls are listed apart in `top_level_callees` (`edge_type: TOP_LEVEL_CALL`). They are not dependents: they are left out of `affected_symbols`, `affected_symbol_count`, the clusters and `risk_level`. Files that load it only for its side effects (`import './x'`) are not tracked, so such a run is `status: partial` and `gate_state: degraded-unknown`\n- Each affected symbol has impact_score (0.0-1.0) decaying through the call graph\n- For single-symbol impact use brain_impact; for cross-repo use cross_repo_contracts\n\n`cochanged_files` lists historically co-changing files (git history, Jaccard confidence) with no static edge — an advisory recall supplement; absence of co-change data is disclosed via a `cochange-unavailable` note.\n\nTrust contract (read before trusting a green result):\n- status (complete/partial/degraded/failed) + gate_state (ok/degraded-unknown/risk-flagged) are TWO AXES, not one (nw-467). A run that stopped at its configured traversal budget is `status: partial` and still gates `ok` — it is BOUNDED, not degraded, and at the default depth of 3 that is the steady state, so `status == complete` is not a usable green light and `gate_state` is. A run that is stale, errored, refused or cancelled is degraded-unknown, NEVER risk-flagged — treat that one as 'unknown, review manually', not 'safe'. The bound itself is never hidden: `coverage.traversal_truncated` and the `depth-truncated` blind spot still report it\n- a graph whose edges predate the running resolver DEGRADES rather than refusing: status becomes at least 'degraded', gate_state becomes 'degraded-unknown', and a `resolver.generation-stale` notification names the repos and the `nestweaver index --repo <path> --force` remedy. On such a graph a missing edge UNDERSTATES impact, so a green result there is not a green result. (`affected_tests` refuses outright on the same condition — it is a selector, and a narrowed selection cannot be widened back by its caller.) Only a stale repo that owns a changed file, or shares a recorded cross-repo edge or a declared `[[links]]` entry with one that does, degrades; any other stale repo is named in a `resolver-generation-stale-unrelated` warning and does not\n- coverage (repos in scope / not indexed / stale / truncated) distinguishes 'no impact' from 'incomplete coverage'\n- blind_spots: inherent static gaps (dynamic-dispatch, reflection, config-wiring, codegen) plus run-specific ones (pruned-below-threshold, depth-truncated, not-indexed)\n- THREE fields on this response are named `stale_repos` or a variant of it, and they mean three different things (nw-371): `coverage.stale_repos` is behind-git-HEAD repos (objects with `repo_uid`+`commits_behind`); `resolver_stale_repos` (top-level) is repo UIDs whose edges predate/postdate this resolver generation; `_meta.stale_repos`, present only via the hybrid client, is FEDERATION lag (an upstream server's data being behind). None is interchangeable with `stale_check`'s or `hub_nodes`'/`bridge_nodes`'s own `stale_repos`, which are separate tools with separate populations under the same key name.\n\nLimitations:\n- Static analysis only — misses dynamic dispatch and reflection (declared in blind_spots, not silently)\n- Response size scales with number of changed files and graph density\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results. On an authenticated server with an [authz] policy, repository-restricted callers are refused before seed resolution or traversal: the global walk cannot yet be computed on an authorization-induced subgraph, and redacting after traversal would preserve reachability created through hidden intermediates.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -17300,7 +17361,7 @@ fn tool_blast_radius(
 fn tool_schema_get_summary() -> Value {
     json!({
         "name": "get_summary",
-        "description": "Generate deterministic architectural summaries at three granularity levels: symbol, file, or cluster. Derived from graph data, no LLM needed.\n\nGuidelines:\n- level 'symbol' = per-function/class with callers/callees, 'file' = per-file exports, 'cluster' = community architecture\n- Use target to filter to a specific file, symbol, or cluster name\n- Use token_budget to cap output size for context windows\n\nLimitations:\n- Summaries reflect indexed graph state — may be stale if index is behind HEAD\n- For specific symbol source code use read_symbols; for call chains use flow_trace",
+        "description": "Generate deterministic architectural summaries at three granularity levels: symbol, file, or cluster. Derived from graph data, no LLM needed.\n\nGuidelines:\n- level 'symbol' = per-function/class with callers/callees (at most 3 module-owner callers `path::<module>`, then `+N more files' top-level code`), 'file' = per-file exports, 'cluster' = community architecture\n- Use target to filter to a specific file, symbol, or cluster name\n- Use token_budget to cap output size for context windows\n\nLimitations:\n- Summaries reflect indexed graph state — may be stale if index is behind HEAD\n- For specific symbol source code use read_symbols; for call chains use flow_trace",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -19089,9 +19150,9 @@ fn vault_add_source_payload(
 #[cfg(feature = "daemon")]
 fn dir_is_markdown_dominant(dir: &std::path::Path) -> bool {
     const CODE_EXTS: &[&str] = &[
-        "rs", "js", "ts", "jsx", "tsx", "py", "go", "java", "c", "h", "cpp", "hpp", "cc", "cs",
-        "rb", "php", "swift", "kt", "scala", "lua", "sh", "sql", "hcl", "dart", "ex", "exs", "zig",
-        "m", "mm",
+        "rs", "js", "ts", "jsx", "tsx", "mjs", "cjs", "mts", "cts", "py", "go", "java", "c", "h",
+        "cpp", "hpp", "cc", "cs", "rb", "php", "swift", "kt", "scala", "lua", "sh", "sql", "hcl",
+        "dart", "ex", "exs", "zig", "m", "mm",
     ];
     let mut md = 0usize;
     let mut code = 0usize;
@@ -19510,7 +19571,7 @@ fn arg_root_opt(args: &Value) -> Option<std::path::PathBuf> {
 fn tool_schema_investigate() -> Value {
     json!({
         "name": "investigate",
-        "description": "Orient on an unfamiliar topic in ONE call: runs hybrid PPR+BM25 retrieval, groups results into architectural domains, inlines high-confidence source bodies, and returns a token-budgeted map with a bundle_id for drill-down.\n\nGuidelines:\n- Use scope 'project:<slug>' or 'repo:<name>' to restrict; omit for unrestricted\n- Entries with is_seed: true are direct query/seed hits and are listed first; the rest are graph-connected neighbors\n- Under 'project:<slug>' scope ONLY: within the is_seed/connected groups, entries with matched_query: \"exact\" (query text or a token is a case-sensitive full match on the symbol's name) are pinned first, up to 5; matched_query: \"partial\" (substring match) is NOT pinned, it only gets a 5x fused-score boost and keeps its ranked position; every other entry follows in plain fused-score order. This exists because 'project:' seeds every member unconditionally, so a query naming one specific member symbol could otherwise lose to a flood of stronger-scoring member notes and never appear. An exact pin survives even on projects with 100+ members (it is rebuilt directly if the internal render cap would have dropped it) and exact names are looked up directly, so a path-deboosted test/mirror file is still pinned. Remaining misses are true name collisions beyond the resolver's cap of 5 exact matches. matched_query is never present under 'vault'/'repo:'/'all' scope, and is absent under 'project:' scope too when neither exact nor partial applies (most entries)\n- Drill into entries with investigate_expand (by asset_id) or fill all bodies with investigate_hydrate\n- `returned`/`total`/`truncated` describe the map; `dropped_reasons` says WHICH cap cut. `token_budget` is recoverable by raising it; `retrieval_breadth` is an internal bound that is NOT — narrow the query or pass a scope instead. `more_available` counts only the token-budget loop\n\nLimitations:\n- Token budget hard-capped at 16000\n- Bundles expire 24h after creation",
+        "description": "Orient on an unfamiliar topic in ONE call: runs hybrid PPR+BM25 retrieval, groups results into architectural domains, inlines high-confidence source bodies, and returns a token-budgeted map with a bundle_id for drill-down.\n\nGuidelines:\n- Use scope 'project:<slug>' or 'repo:<name>' to restrict; omit for unrestricted\n- Entries with is_seed: true are direct query/seed hits and are listed first; the rest are graph-connected neighbors\n- Under 'project:<slug>' scope ONLY: within the is_seed/connected groups, entries with matched_query: \"exact\" (query text or a token is a case-sensitive full match on the symbol's name) are pinned first, up to 5; matched_query: \"partial\" (substring match) is NOT pinned, it only gets a 5x fused-score boost and keeps its ranked position; every other entry follows in plain fused-score order. This exists because 'project:' seeds every member unconditionally, so a query naming one specific member symbol could otherwise lose to a flood of stronger-scoring member notes and never appear. An exact pin survives even on projects with 100+ members (it is rebuilt directly if the internal render cap would have dropped it) and exact names are looked up directly, so a path-deboosted test/mirror file is still pinned. Remaining misses are true name collisions beyond the resolver's cap of 5 exact matches. matched_query is never present under 'vault'/'repo:'/'all' scope, and is absent under 'project:' scope too when neither exact nor partial applies (most entries)\n- Drill into entries with investigate_expand (by asset_id) or fill all bodies with investigate_hydrate\n- Module owners (a file's top-level code) are never entries; investigate_expand labels an owner neighbour `path::<module>`\n- `returned`/`total`/`truncated` describe the map; `dropped_reasons` says WHICH cap cut. `token_budget` is recoverable by raising it; `retrieval_breadth` is an internal bound that is NOT — narrow the query or pass a scope instead. `more_available` counts only the token-budget loop\n\nLimitations:\n- Token budget hard-capped at 16000\n- Bundles expire 24h after creation",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -20246,6 +20307,53 @@ mod project_context_bug12_tests {
             ));
         }
         assert!(!project_member_uid("tag:shared", &members));
+    }
+
+    /// nw-113 final round: a qualified seed that names nothing is the
+    /// not-found envelope with the same `path::name` suggestions
+    /// `brain_impact` gives, on `brain_context` and `code_context` alike.
+    #[test]
+    fn a_qualified_context_seed_miss_carries_did_you_mean() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&mk_symbol(
+                "sym:repo:a:order_total:1",
+                "repo:a",
+                "shop/pricing.py",
+                "order_total",
+            ))
+            .unwrap();
+        for tool in ["brain_context", "code_context"] {
+            let miss = dispatch(
+                &store,
+                None,
+                tool,
+                json!({ "seeds": ["nope.py::order_total"] }),
+                None,
+            )
+            .unwrap_err();
+            let envelope = not_found_envelope(&miss).unwrap_or_else(|| panic!("{tool}: {miss:#}"));
+            assert_eq!(
+                envelope["did_you_mean"],
+                json!(["shop/pricing.py::order_total"]),
+                "{tool}: {envelope}"
+            );
+        }
+        let bare = dispatch(
+            &store,
+            None,
+            "code_context",
+            json!({ "seeds": ["totally_bogus_xyz"] }),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            not_found_envelope(&bare)
+                .unwrap()
+                .get("did_you_mean")
+                .is_none(),
+            "a bare miss with no hits carries no suggestions"
+        );
     }
 
     /// A `vlt:` seed for a vault with no notes is a business error
@@ -32381,7 +32489,7 @@ mod seed_cap_disclosure_tests {
         [
             (
                 "code_context",
-                tool_code_context(store, json!({ "seeds": ["validate"] })).unwrap(),
+                tool_code_context(store, json!({ "seeds": ["validate"] }), None).unwrap(),
             ),
             (
                 "brain_context",
@@ -32477,7 +32585,7 @@ mod seed_cap_disclosure_tests {
         for (tool, payload) in [
             (
                 "code_context",
-                tool_code_context(&store, json!({ "seeds": [uid] })).unwrap(),
+                tool_code_context(&store, json!({ "seeds": [uid] }), None).unwrap(),
             ),
             (
                 "brain_context",
@@ -32782,6 +32890,198 @@ mod ambiguous_name_contract_tests {
                 _ => panic!("hidden exact name stole visible substring resolution"),
             }
         }
+    }
+
+    /// nw-113: `path::<module>` names one file's owner in `brain_impact` and
+    /// `flow_trace`; impact rows label owners `path::<module>`; an ambiguous
+    /// owner lookup lists every candidate with its file.
+    #[test]
+    fn module_owner_is_addressable_and_labelled_by_file() {
+        use nestweaver_engine::index_directory_in_memory;
+        let dir = tempfile::tempdir().unwrap();
+        for (rel, src) in [
+            (
+                "index.js",
+                "const { listen } = require('./src/server');\nlisten();\n",
+            ),
+            (
+                "src/controllers/index.js",
+                "const { listen } = require('../server');\nlisten();\n",
+            ),
+            (
+                "src/server.js",
+                "function listen() { return 1; }\nmodule.exports = { listen };\n",
+            ),
+        ] {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, src).unwrap();
+        }
+        let (_repo, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/r", "sha").unwrap();
+
+        let impact = tool_brain_impact(&store, json!({ "symbol": "listen" }), None, None).unwrap();
+        let mut names: Vec<&str> = impact["impact_nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n["name"].as_str())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["index.js::<module>", "src/controllers/index.js::<module>"],
+            "{impact}"
+        );
+
+        for spec in [
+            "src/controllers/index.js::<module>",
+            "controllers/index.js::<module>",
+        ] {
+            let flow = tool_flow_trace(&store, json!({ "symbol": spec }), None, None).unwrap();
+            assert_ne!(flow["status"], "ambiguous", "{spec}: {flow}");
+            assert!(flow.to_string().contains("listen"), "{spec}: {flow}");
+            assert_eq!(
+                flow["root_name"], "src/controllers/index.js::<module>",
+                "{spec}: {flow}"
+            );
+            assert_eq!(
+                flow["tree"]["name"], "src/controllers/index.js::<module>",
+                "{spec}: {flow}"
+            );
+            let impact = tool_brain_impact(&store, json!({ "symbol": spec }), None, None).unwrap();
+            assert_eq!(impact["status"], "ok", "{spec}: {impact}");
+            let owner = store
+                .symbols_in_file("src/controllers/index.js")
+                .unwrap()
+                .into_iter()
+                .find(|s| s.is_module_owner())
+                .unwrap();
+            assert_eq!(impact["target"], owner.uid, "{spec}: {impact}");
+        }
+
+        let ambiguous_flow =
+            tool_flow_trace(&store, json!({ "symbol": "<module>" }), None, None).unwrap();
+        assert_eq!(ambiguous_flow["status"], "ambiguous", "{ambiguous_flow}");
+        assert!(
+            ambiguous_flow["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("pass a UID or path::name"),
+            "{ambiguous_flow}"
+        );
+        assert!(
+            tool_flow_trace(
+                &store,
+                json!({ "symbol": "nope/missing.js::listen" }),
+                None,
+                None
+            )
+            .is_err(),
+            "a qualifier naming no file is not found"
+        );
+
+        let ambiguous =
+            tool_brain_impact(&store, json!({ "symbol": "<module>" }), None, None).unwrap();
+        assert_eq!(ambiguous["status"], "ambiguous", "{ambiguous}");
+        let mut candidates: Vec<(String, String)> = ambiguous["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["name"].as_str().unwrap().to_string(),
+                    c["file_path"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        candidates.sort();
+        assert_eq!(
+            candidates,
+            [
+                ("index.js::<module>".to_string(), "index.js".to_string()),
+                (
+                    "src/controllers/index.js::<module>".to_string(),
+                    "src/controllers/index.js".to_string()
+                ),
+            ],
+            "{ambiguous}"
+        );
+    }
+
+    /// nw-113 final review Minor 2: `code_context` lists the same three
+    /// owners as the engine. Asking the engine for `limit + 1` let the refill
+    /// fill that extra row and the trim then cut the last owner.
+    #[test]
+    fn code_context_lists_three_owners_behind_a_full_refill() {
+        use nestweaver_engine::index_directory_in_memory;
+        let dir = tempfile::tempdir().unwrap();
+        let chain: Vec<String> = (0..20).map(|i| format!("step{i}")).collect();
+        let mut theme = String::new();
+        for pair in chain.windows(2) {
+            theme.push_str(&format!(
+                "function {}(k) {{ return {}(k); }}\n",
+                pair[0], pair[1]
+            ));
+        }
+        theme.push_str("function step19(k) { return k; }\n");
+        theme.push_str(
+            "function fromTemplate(t) { return step0(t); }\nmodule.exports = { fromTemplate };\n",
+        );
+        std::fs::write(dir.path().join("theme.js"), theme).unwrap();
+        std::fs::create_dir_all(dir.path().join("styles")).unwrap();
+        for i in 0..400 {
+            std::fs::write(
+                dir.path().join(format!("styles/s{i}.style.js")),
+                "const { fromTemplate } = require('../theme');\nexport const dark = fromTemplate({});\n",
+            )
+            .unwrap();
+        }
+        let (_repo, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/r", "sha").unwrap();
+        let payload = tool_code_context(
+            &store,
+            json!({ "seeds": ["fromTemplate"], "limit": 10 }),
+            None,
+        )
+        .unwrap();
+        let names: Vec<&str> = payload["connected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n["name"].as_str())
+            .collect();
+        let owners = names.iter().filter(|n| n.ends_with("::<module>")).count();
+        assert_eq!(names.len(), 10, "{names:?}");
+        assert_eq!(owners, 3, "{names:?}");
+        assert_eq!(payload["module_owners_omitted"], 397, "{payload}");
+        assert_eq!(payload["truncated"], true, "{payload}");
+    }
+
+    /// nw-113: `brain_diff` never lists a changed file's owner as a changed
+    /// symbol.
+    #[test]
+    fn brain_diff_does_not_list_module_owners() {
+        use nestweaver_engine::index_directory_in_memory;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mongo.js"),
+            "function connectToMongo() { return 1; }\nconnectToMongo();\n",
+        )
+        .unwrap();
+        let (_repo, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/r", "sha").unwrap();
+        let repo_uid = store.list_repos(None).unwrap()[0].uid.clone();
+        assert!(
+            store
+                .symbols_in_file("mongo.js")
+                .unwrap()
+                .iter()
+                .any(|s| s.is_module_owner())
+        );
+        let rows = brain_diff_changed_symbols(&store, &["mongo.js"], &repo_uid, None);
+        let names: Vec<&str> = rows.iter().filter_map(|r| r["name"].as_str()).collect();
+        assert_eq!(names, ["connectToMongo"], "{rows:?}");
     }
 
     #[test]

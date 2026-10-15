@@ -100,6 +100,15 @@ fn sanitize_resolution(resolution: f64) -> f64 {
     }
 }
 
+/// nw-113: `<module>` owners take no part in community detection. An owner
+/// is a caller only: as a member it pulled every file that calls one helper
+/// at load time into an owner-only star around it, and an edgeless owner
+/// became a one-member `<module>` cluster. Dropping the node drops its edges,
+/// since an edge counts only when both endpoints are indexed.
+fn retain_cluster_candidates(symbols: &mut Vec<SymbolBasic>) {
+    symbols.retain(|symbol| !nestweaver_schema::uid::is_module_owner_uid(&symbol.uid));
+}
+
 /// Run Louvain-style local-moving community detection on the code graph.
 ///
 /// Loads all Symbol nodes and code-level edges (CALLS, IMPORTS, EXTENDS_SYM,
@@ -112,10 +121,11 @@ pub fn compute_clusters(store: &GraphStore, resolution: f64) -> Result<Clusterin
     // also persisted to the sidecar JSON — and NaN/inf serialize as `null`,
     // which then fails to parse in `load_clusters` (f64 != null).
     let resolution = sanitize_resolution(resolution);
-    let (symbols, edges) = store
+    let (mut symbols, edges) = store
         .load_code_symbols_and_edges()
         .map_err(|e| anyhow::anyhow!(e))
         .context("failed to load graph data for clustering")?;
+    retain_cluster_candidates(&mut symbols);
 
     if symbols.is_empty() {
         return Ok(ClusteringOutput {
@@ -254,10 +264,11 @@ pub fn compute_clusters_scoped(
     // the typed failure's class and candidates.
     let resolved_repos = crate::node_scope::resolve_repo_filter(store, repo_selectors, None)?;
 
-    let (symbols, edges) = store
+    let (mut symbols, edges) = store
         .load_code_symbols_and_edges()
         .map_err(|e| anyhow::anyhow!(e))
         .context("failed to load graph data for scoped clustering")?;
+    retain_cluster_candidates(&mut symbols);
 
     let mut scope_repos: Vec<String> = resolved_repos.iter().cloned().collect();
     scope_repos.sort();
@@ -438,7 +449,15 @@ fn derive_cluster_name(members: &[ClusterMember]) -> String {
     {
         return common;
     }
-    members[0].name.clone()
+    // nw-113: never name a cluster after a file's `<module>` owner.
+    // `ClusterMember` carries no entry kind, so this is the kind-and-name half
+    // of `nestweaver_schema::is_module_owner`.
+    members
+        .iter()
+        .find(|m| !(m.kind == "Module" && m.name == nestweaver_schema::MODULE_OWNER_NAME))
+        .unwrap_or(&members[0])
+        .name
+        .clone()
 }
 
 /// Find the longest common directory prefix of a set of file paths.
@@ -694,6 +713,84 @@ mod tests {
             },
         ];
         assert_eq!(derive_cluster_name(&members), "src/auth");
+    }
+
+    /// nw-113: a cluster's name never falls back to the `<module>` owner.
+    #[test]
+    fn derive_cluster_name_skips_the_module_owner() {
+        let member = |name: &str, kind: &str| ClusterMember {
+            uid: name.to_string(),
+            name: name.to_string(),
+            // A root-level file has no common directory, so the name falls
+            // back to a member's name.
+            file_path: "ownerless.ts".to_string(),
+            kind: kind.to_string(),
+        };
+        let members = vec![
+            member(nestweaver_schema::MODULE_OWNER_NAME, "Module"),
+            member("flushBuffer", "Function"),
+        ];
+        assert_eq!(derive_cluster_name(&members), "flushBuffer");
+    }
+
+    /// nw-113: owners take no part in community detection. Six style files
+    /// that call one helper at top level would otherwise form an owner-only
+    /// star around it, and an edgeless owner a one-member `<module>` cluster.
+    #[test]
+    fn module_owners_are_not_cluster_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path();
+        std::fs::create_dir_all(src.join("styles")).unwrap();
+        std::fs::write(
+            src.join("theme.js"),
+            "function fromTemplate(t) { return t; }\nmodule.exports = { fromTemplate };\n",
+        )
+        .unwrap();
+        for i in 0..6 {
+            std::fs::write(
+                src.join(format!("styles/s{i}.style.js")),
+                "const { fromTemplate } = require('../theme');\nexport const dark = fromTemplate({});\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(src.join("mocks.js"), "jest.mock('firebase-admin');\n").unwrap();
+        let (_r, store) =
+            crate::index::index_directory_in_memory(src, "test", "https://example.com/r", "sha")
+                .unwrap();
+        let repo = store.list_repos(None).unwrap()[0].uid.clone();
+        let check = |communities: &[CommunityInfo]| {
+            for community in communities {
+                assert!(
+                    community
+                        .members
+                        .iter()
+                        .all(|m| !nestweaver_schema::uid::is_module_owner_uid(&m.uid)),
+                    "{community:?}"
+                );
+                assert_ne!(community.name, nestweaver_schema::MODULE_OWNER_NAME);
+                assert_eq!(community.member_count, community.members.len());
+            }
+        };
+        let real = store
+            .list_all_symbols()
+            .unwrap()
+            .iter()
+            .filter(|s| !s.is_module_owner())
+            .count();
+        let global = compute_clusters(&store, 0.5).unwrap();
+        check(&global.communities);
+        assert_eq!(
+            global
+                .communities
+                .iter()
+                .map(|c| c.member_count)
+                .sum::<usize>(),
+            real,
+            "every real symbol and no owner is a member: {:?}",
+            global.communities
+        );
+        let scoped = compute_clusters_scoped(&store, &[repo], Some(0.5)).unwrap();
+        check(&scoped.communities);
     }
 
     #[test]

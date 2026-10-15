@@ -41,10 +41,10 @@ pub use db::StoreConnection as DbConnection;
 /// without depending on `lbug` directly.
 pub use db::{StoreRows, StoreStatement};
 pub use ranking::{
-    DEFAULT_GIT_ACTIVITY_WEIGHT, GIT_ACTIVITY_MULT_MAX, GIT_ACTIVITY_MULT_MIN, GraphScope,
-    PPR_MIN_SCORE, PathDeboostRule, QueryIntent, SEED_PATH_FACTOR_MAX, SEED_PATH_FACTOR_MIN,
-    ScopedEdgeQuery, SeedResolutionConfig, default_kind_priority, detect_intent,
-    git_activity_multiplier,
+    DEFAULT_GIT_ACTIVITY_WEIGHT, FloorWalk, GIT_ACTIVITY_MULT_MAX, GIT_ACTIVITY_MULT_MIN,
+    GraphScope, PPR_BELOW_FLOOR_KEEP, PPR_BELOW_FLOOR_KEEP_MAX, PPR_MIN_SCORE, PathDeboostRule,
+    QueryIntent, SEED_PATH_FACTOR_MAX, SEED_PATH_FACTOR_MIN, ScopedEdgeQuery, SeedResolutionConfig,
+    below_floor_keep_bucket, default_kind_priority, detect_intent, git_activity_multiplier,
 };
 pub use read::{
     BacklinkRow, BrokenWikilinkRow, CodeEdge, CodeGraph, CrossRepoRef, NoteKeysetPage, NoteLite,
@@ -472,11 +472,160 @@ mod tests {
         assert!(uids.contains(&"s2"));
     }
 
+    /// nw-113: `file::name` narrows a name lookup by repo-relative path or
+    /// path suffix; a non-path qualifier keeps resolving by name.
+    #[test]
+    fn lookup_by_spec_narrows_by_file_qualifier() {
+        let store = test_store();
+        for (uid, path) in [("s1", "app/wsgi.py"), ("s2", "tests/conftest.py")] {
+            store
+                .insert_symbol(&make_symbol(uid, "app", "repo-1", path))
+                .unwrap();
+        }
+        let uids = |spec: &str| -> Vec<String> {
+            let mut uids: Vec<_> = store
+                .lookup_symbols_by_spec(spec)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.uid)
+                .collect();
+            uids.sort();
+            uids
+        };
+        assert_eq!(uids("wsgi.py::app"), ["s1"]);
+        assert_eq!(uids("conftest::app"), ["s2"]);
+        assert_eq!(uids("app/wsgi.py::app"), ["s1"]);
+        assert_eq!(uids("app"), ["s1", "s2"]);
+        assert!(
+            uids("Flask::app").is_empty(),
+            "a qualifier naming no file and no container is not found"
+        );
+        assert!(uids("nope/missing.py::app").is_empty());
+        assert!(uids("wsgi.py::missing").is_empty());
+    }
+
+    /// nw-113: a `Class::method` spec narrows by the `MEMBER_OF` container
+    /// name; a container that does not own the method is not found rather
+    /// than resolving to another class's method by its last segment.
+    #[test]
+    fn lookup_by_spec_narrows_by_container() {
+        let store = test_store();
+        for (uid, name) in [("foo", "Foo"), ("baz", "Baz")] {
+            let mut class = make_symbol(uid, name, "repo-1", "src/a.js");
+            class.kind = SymbolKind::Class;
+            store.insert_symbol(&class).unwrap();
+        }
+        for (uid, name, parent) in [("foo-bar", "bar", "foo"), ("baz-qux", "qux", "baz")] {
+            let mut method = make_symbol(uid, name, "repo-1", "src/a.js");
+            method.kind = SymbolKind::Method;
+            store.insert_symbol(&method).unwrap();
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: uid.to_string(),
+                    target_uid: parent.to_string(),
+                    edge_type: EdgeType::MemberOf,
+                    confidence: 1.0,
+                    link_type: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+        let uids = |spec: &str| -> Vec<String> {
+            store
+                .lookup_symbols_by_spec(spec)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.uid)
+                .collect()
+        };
+        assert_eq!(uids("Foo::bar"), ["foo-bar"]);
+        assert!(uids("Foo::qux").is_empty());
+        assert_eq!(uids("Baz::qux"), ["baz-qux"]);
+        assert_eq!(uids("a.js::qux"), ["baz-qux"]);
+        // Pinned: `mod` is neither `bar`'s file nor the container above
+        // `Foo`, so the module-qualified `mod::Foo::bar` is not found.
+        assert!(uids("mod::Foo::bar").is_empty());
+    }
+
     #[test]
     fn lookup_missing_symbol_returns_not_found() {
         let store = test_store();
         let err = store.lookup_symbol("nonexistent").unwrap_err();
         assert!(matches!(err, crate::StoreError::NotFound));
+    }
+
+    /// nw-113 final round: file and container narrow together. `Svc::run`
+    /// where `Svc` is both a file stem (`a/Svc.ts`) and a class in another
+    /// file (`b.ts`) considers every container match instead of letting the
+    /// stem win; `path::Class::method` narrows by both; a container chain
+    /// matches nested classes; a leading `/` or a `\` separator is normalised.
+    #[test]
+    fn lookup_by_spec_combines_file_and_container() {
+        let store = test_store();
+        let add = |uid: &str, name: &str, path: &str, kind: SymbolKind, parent: Option<&str>| {
+            let mut symbol = make_symbol(uid, name, "repo-1", path);
+            symbol.kind = kind;
+            store.insert_symbol(&symbol).unwrap();
+            if let Some(parent) = parent {
+                store
+                    .insert_edge(&ResolvedEdge {
+                        source_uid: uid.to_string(),
+                        target_uid: parent.to_string(),
+                        edge_type: EdgeType::MemberOf,
+                        confidence: 1.0,
+                        link_type: None,
+                        evidence: Vec::new(),
+                    })
+                    .unwrap();
+            }
+        };
+        add("a-svc", "Svc", "a/Svc.ts", SymbolKind::Class, None);
+        add(
+            "a-run",
+            "run",
+            "a/Svc.ts",
+            SymbolKind::Method,
+            Some("a-svc"),
+        );
+        add("b-svc", "Svc", "b.ts", SymbolKind::Class, None);
+        add("b-run", "run", "b.ts", SymbolKind::Method, Some("b-svc"));
+        add("b-other", "Other", "b.ts", SymbolKind::Class, None);
+        add(
+            "b-other-run",
+            "run",
+            "b.ts",
+            SymbolKind::Method,
+            Some("b-other"),
+        );
+        add("outer", "Outer", "n.ts", SymbolKind::Class, None);
+        add("inner", "Inner", "n.ts", SymbolKind::Class, Some("outer"));
+        add("m", "m", "n.ts", SymbolKind::Method, Some("inner"));
+        let uids = |spec: &str| -> Vec<String> {
+            let mut uids: Vec<_> = store
+                .lookup_symbols_by_spec(spec)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.uid)
+                .collect();
+            uids.sort();
+            uids
+        };
+        assert_eq!(uids("Svc::run"), ["a-run", "b-run"], "stem must not win");
+        assert_eq!(uids("b.ts::Svc::run"), ["b-run"]);
+        assert_eq!(uids("b.ts::Other::run"), ["b-other-run"]);
+        assert_eq!(uids("b.ts::run"), ["b-other-run", "b-run"], "ambiguous");
+        assert_eq!(uids("a/Svc.ts::Svc::run"), ["a-run"]);
+        assert!(uids("a/Svc.ts::Other::run").is_empty());
+        assert_eq!(uids("/b.ts::Svc::run"), ["b-run"]);
+        assert_eq!(uids("a\\Svc.ts::run"), ["a-run"]);
+        assert_eq!(uids("Outer::Inner::m"), ["m"]);
+        assert_eq!(uids("Inner::m"), ["m"]);
+        assert_eq!(uids("n.ts::Outer::Inner::m"), ["m"]);
+        assert!(
+            uids("Outer::m").is_empty(),
+            "the direct container must match"
+        );
+        assert!(uids("Other::Inner::m").is_empty());
     }
 
     #[test]

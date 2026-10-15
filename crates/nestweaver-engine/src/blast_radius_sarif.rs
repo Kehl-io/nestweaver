@@ -301,6 +301,7 @@ mod tests {
             affected_symbols: vec![],
             affected_symbol_count: 0,
             affected_clusters: vec![],
+            top_level_callees: vec![],
             risk_level: RiskLevel::Low,
             summary: "0 changed, 0 affected".to_string(),
             org_wide: None,

@@ -603,7 +603,7 @@ fn detect_js_ts_with(
 
     // ── Barrel / index files ──
     //
-    // Files named index.{ts,js,tsx,jsx} serve as barrel re-export files or
+    // Files named index.{ts,js,tsx,jsx,mjs,cjs,mts,cts} serve as barrel re-export files or
     // package entry points. Exported symbols from these files are entry points
     // because they form the public API surface of their directory.
     let is_index_file = file_name == "index.ts"
@@ -611,7 +611,9 @@ fn detect_js_ts_with(
         || file_name == "index.tsx"
         || file_name == "index.jsx"
         || file_name == "index.mjs"
-        || file_name == "index.cjs";
+        || file_name == "index.cjs"
+        || file_name == "index.mts"
+        || file_name == "index.cts";
     if is_index_file && matches!(kind, "function" | "class" | "constant") && !name.starts_with('_')
     {
         return Some(EntryPointKind::Main);
@@ -620,16 +622,17 @@ fn detect_js_ts_with(
     // ── Main / entry files ──
     //
     // Common entry file names at the root or src/ level: main.ts, app.ts, etc.
-    let is_entry_file = file_name == "main.ts"
-        || file_name == "main.js"
-        || file_name == "main.tsx"
-        || file_name == "main.jsx"
-        || file_name == "app.ts"
-        || file_name == "app.js"
-        || file_name == "app.tsx"
-        || file_name == "app.jsx"
-        || file_name == "server.ts"
-        || file_name == "server.js";
+    // nw-113: and their module-format twins (`.mjs`, `.cjs`, `.mts`, `.cts`).
+    let is_entry_file = file_name
+        .split_once('.')
+        .is_some_and(|(stem, ext)| match stem {
+            "main" | "app" => matches!(
+                ext,
+                "ts" | "js" | "tsx" | "jsx" | "mjs" | "cjs" | "mts" | "cts"
+            ),
+            "server" => matches!(ext, "ts" | "js" | "mjs" | "cjs" | "mts" | "cts"),
+            _ => false,
+        });
     if is_entry_file && matches!(kind, "function" | "class" | "constant") && !name.starts_with('_')
     {
         return Some(EntryPointKind::Main);
@@ -2123,6 +2126,35 @@ mod tests {
     fn detects_app_tsx_entry_file() {
         let result = detect_entry_point("App", "src/app.tsx", "function", None, "typescript");
         assert_eq!(result, Some(EntryPointKind::Main));
+    }
+
+    /// nw-113 final review Minor 6: module-format index and entry files.
+    #[test]
+    fn detects_module_format_index_and_entry_files() {
+        for file in [
+            "src/lib/index.mts",
+            "src/lib/index.cts",
+            "src/main.mjs",
+            "src/main.cjs",
+            "src/main.mts",
+            "src/main.cts",
+            "src/app.mjs",
+            "src/app.cjs",
+            "src/app.mts",
+            "src/app.cts",
+            "src/server.mjs",
+            "src/server.cjs",
+            "src/server.mts",
+            "src/server.cts",
+        ] {
+            let language = if file.ends_with("ts") {
+                "typescript"
+            } else {
+                "javascript"
+            };
+            let result = detect_entry_point("createThing", file, "function", None, language);
+            assert_eq!(result, Some(EntryPointKind::Main), "{file}");
+        }
     }
 
     #[test]

@@ -10,6 +10,8 @@ pub enum EntryPointKind {
     LambdaHandler,
     CronJob,
     CliCommand,
+    /// nw-113: a file's top-level code, run when the module is loaded.
+    ModuleInit,
 }
 
 impl fmt::Display for EntryPointKind {
@@ -22,6 +24,7 @@ impl fmt::Display for EntryPointKind {
             Self::LambdaHandler => write!(f, "lambda_handler"),
             Self::CronJob => write!(f, "cron_job"),
             Self::CliCommand => write!(f, "cli_command"),
+            Self::ModuleInit => write!(f, "module_init"),
         }
     }
 }
@@ -42,7 +45,237 @@ pub enum SymbolKind {
     Variable,
 }
 
+/// nw-113: name of the per-file symbol that owns top-level calls. Not a valid
+/// identifier in JS, TS, Python or PHP, so it cannot collide with a real
+/// declaration.
+pub const MODULE_OWNER_NAME: &str = "<module>";
+
+/// nw-113: whether a symbol is the parser's per-file `<module>` owner of
+/// top-level calls. The single definition every consumer uses: kind `Module`,
+/// name [`MODULE_OWNER_NAME`] and entry kind `ModuleInit` together, so a real
+/// module (a Rust `mod`, a Python package) is never mistaken for it.
+pub fn is_module_owner(
+    kind: SymbolKind,
+    name: &str,
+    entry_point_kind: Option<EntryPointKind>,
+) -> bool {
+    kind == SymbolKind::Module
+        && name == MODULE_OWNER_NAME
+        && entry_point_kind == Some(EntryPointKind::ModuleInit)
+}
+
+/// nw-113: the one display label of a `<module>` owner,
+/// `<repo-relative path>::<module>`. Every user-facing surface that names an
+/// owner uses this, so an owner is never shown as a bare `<module>` (which
+/// cannot be told apart from the owners of other files) or with a blank name.
+pub fn module_owner_label(file_path: &str) -> String {
+    format!("{file_path}::{MODULE_OWNER_NAME}")
+}
+
+/// nw-113: a symbol's display name when only its name and path are at hand
+/// (a JSON row, a transport struct). `<module>` is not an identifier in any
+/// indexed language, so the name alone identifies an owner here; with a full
+/// [`Symbol`] prefer [`Symbol::display_name`].
+pub fn symbol_display_name<'a>(name: &'a str, file_path: &str) -> std::borrow::Cow<'a, str> {
+    if name == MODULE_OWNER_NAME {
+        std::borrow::Cow::Owned(module_owner_label(file_path))
+    } else {
+        std::borrow::Cow::Borrowed(name)
+    }
+}
+
+/// nw-113: how many connected `<module>` owners a context answer lists; the
+/// rest are counted in `module_owners_omitted`. In schema so the engine and
+/// the federation merge apply one cap.
+pub const MODULE_OWNER_CONTEXT_CAP: usize = 3;
+
+/// nw-113: whether a display label names a `<module>` owner (see
+/// [`module_owner_label`]). `<module>` is not an identifier in any indexed
+/// language, so the label alone identifies an owner.
+pub fn is_module_owner_label(label: &str) -> bool {
+    label == MODULE_OWNER_NAME || label.ends_with(&format!("::{MODULE_OWNER_NAME}"))
+}
+
+/// nw-113: the one phrase for owners a capped list leaves out.
+pub fn omitted_module_owners_phrase(omitted: usize) -> String {
+    format!("+{omitted} more files' top-level code")
+}
+
+/// nw-113: a caller list with every real caller and at most
+/// [`MODULE_OWNER_CONTEXT_CAP`] owner labels, in their order, followed by
+/// [`omitted_module_owners_phrase`] when owners were left out. Keeps a
+/// helper called at load time from many files to a short list.
+pub fn cap_module_owner_labels(labels: &[String]) -> Vec<String> {
+    let (owners, mut capped): (Vec<&String>, Vec<String>) = (
+        labels.iter().filter(|l| is_module_owner_label(l)).collect(),
+        labels
+            .iter()
+            .filter(|l| !is_module_owner_label(l))
+            .cloned()
+            .collect(),
+    );
+    capped.extend(
+        owners
+            .iter()
+            .take(MODULE_OWNER_CONTEXT_CAP)
+            .map(|l| (*l).clone()),
+    );
+    let omitted = owners.len().saturating_sub(MODULE_OWNER_CONTEXT_CAP);
+    if omitted > 0 {
+        capped.push(omitted_module_owners_phrase(omitted));
+    }
+    capped
+}
+
+/// nw-113: split a `file::name` lookup spec into its file qualifier and
+/// name. `None` when the spec has no `::` or either half is empty.
+pub fn split_file_qualifier(spec: &str) -> Option<(&str, &str)> {
+    spec.rsplit_once("::")
+        .filter(|(qualifier, name)| !qualifier.is_empty() && !name.is_empty())
+}
+
+/// nw-113: a qualified lookup spec, `[file::][Container::…]name`.
+///
+/// The segments before the name are qualifiers. They are read two ways and
+/// a candidate matches if either holds:
+/// - **container chain:** every qualifier names the candidate's `MEMBER_OF`
+///   chain, innermost last (`Outer::Inner::m`, `Svc::run`);
+/// - **file, then container chain:** the first qualifier names the
+///   candidate's file ([`file_qualifier_rank`]) and the rest name its
+///   container chain (`b.ts::Svc::run`, `wsgi.py::app`).
+///
+/// Neither reading wins over the other: `Svc::run` keeps a method of class
+/// `Svc` in `b.ts` as well as the `run` in `a/Svc.ts` whose file stem is
+/// `Svc`, so the lookup is ambiguous rather than silently picking one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualifiedSpec<'a> {
+    /// The segments before the name, outermost first.
+    pub qualifiers: Vec<&'a str>,
+    /// The last segment: the symbol name looked up.
+    pub name: &'a str,
+}
+
+impl<'a> QualifiedSpec<'a> {
+    /// Parse `spec`. `None` for an unqualified spec (no `::`) or one with an
+    /// empty segment (`::x`, `a::::b`).
+    pub fn parse(spec: &'a str) -> Option<Self> {
+        let mut segments: Vec<&str> = spec.split("::").collect();
+        if segments.len() < 2 || segments.iter().any(|segment| segment.is_empty()) {
+            return None;
+        }
+        let name = segments.pop()?;
+        Some(Self {
+            qualifiers: segments,
+            name,
+        })
+    }
+
+    /// How many `MEMBER_OF` levels a match can need: one per qualifier.
+    pub fn max_container_depth(&self) -> usize {
+        self.qualifiers.len()
+    }
+
+    /// Keep the `candidates` (symbols named [`Self::name`]) this spec names.
+    ///
+    /// `chain_of(uid)` returns a candidate's container names, innermost
+    /// first (`["Inner", "Outer"]` for `Outer::Inner::m`); at least
+    /// [`Self::max_container_depth`] levels are needed for an exact answer.
+    /// Container matches are kept whatever their file. Among file matches
+    /// only the best file rank is kept: an exact path beats a path suffix,
+    /// which beats a suffix without the extension. Empty when nothing
+    /// matches, so a strict lookup can report not found instead of guessing.
+    pub fn select<'c>(
+        &self,
+        candidates: Vec<Symbol>,
+        chain_of: impl Fn(&str) -> &'c [String],
+    ) -> Vec<Symbol> {
+        let chain_matches = |qualifiers: &[&str], chain: &[String]| {
+            qualifiers.len() <= chain.len()
+                && qualifiers
+                    .iter()
+                    .rev()
+                    .zip(chain)
+                    .all(|(qualifier, container)| *qualifier == container)
+        };
+        let ranked: Vec<(Symbol, bool, Option<u8>)> = candidates
+            .into_iter()
+            .map(|symbol| {
+                let chain = chain_of(&symbol.uid);
+                let by_container = chain_matches(&self.qualifiers, chain);
+                let by_file = file_qualifier_rank(self.qualifiers[0], &symbol.file_path)
+                    .filter(|_| chain_matches(&self.qualifiers[1..], chain));
+                (symbol, by_container, by_file)
+            })
+            .collect();
+        let best_file = ranked.iter().filter_map(|(_, _, rank)| *rank).min();
+        ranked
+            .into_iter()
+            .filter(|(_, by_container, by_file)| {
+                *by_container || (by_file.is_some() && *by_file == best_file)
+            })
+            .map(|(symbol, _, _)| symbol)
+            .collect()
+    }
+}
+
+/// How closely a `file::name` qualifier names a symbol's file: an exact
+/// repo-relative path beats a path suffix, which beats a suffix without the
+/// extension (`conftest` for `tests/conftest.py`, the file-stem match).
+/// Suffixes only match on a `/` boundary, so `x.js` never matches
+/// `index.js`. A leading `./` or `/` is ignored and `\` reads as `/`, so a
+/// Windows-style or root-anchored path names the same file.
+fn file_qualifier_rank(qualifier: &str, file_path: &str) -> Option<u8> {
+    let normalised = qualifier.replace('\\', "/");
+    let mut qualifier = normalised.as_str();
+    while let Some(rest) = qualifier
+        .strip_prefix("./")
+        .or_else(|| qualifier.strip_prefix('/'))
+    {
+        qualifier = rest;
+    }
+    if qualifier.is_empty() {
+        return None;
+    }
+    let suffix_of = |path: &str| {
+        path == qualifier
+            || path
+                .strip_suffix(qualifier)
+                .is_some_and(|head| head.ends_with('/'))
+    };
+    if file_path == qualifier {
+        return Some(0);
+    }
+    if suffix_of(file_path) {
+        return Some(1);
+    }
+    let file_name_start = file_path.rfind('/').map_or(0, |slash| slash + 1);
+    let stem = match file_path[file_name_start..].rfind('.') {
+        Some(dot) if dot > 0 => &file_path[..file_name_start + dot],
+        _ => return None,
+    };
+    suffix_of(stem).then_some(2)
+}
+
 impl SymbolKind {
+    /// Kinds that have a body and can therefore be the source of a call
+    /// (nw-349/nw-435). Data kinds (`Constant`, `Variable`, `Property`,
+    /// `Enum`, `TypeAlias`) have no body and cannot call anything. The
+    /// resolver uses this to pick enclosing symbols and the parser uses it to
+    /// decide whether a top-level call needs a `<module>` owner (nw-113), so
+    /// both apply the same rule.
+    pub fn contains_code(self) -> bool {
+        matches!(
+            self,
+            Self::Function
+                | Self::Method
+                | Self::Class
+                | Self::Module
+                | Self::Interface
+                | Self::Trait
+                | Self::Extension
+        )
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             SymbolKind::Function => "Function",
@@ -195,6 +428,23 @@ pub struct Symbol {
     /// `None` for symbols that haven't been re-indexed with scope-chain extraction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_id: Option<String>,
+}
+
+impl Symbol {
+    /// nw-113: see [`is_module_owner`].
+    pub fn is_module_owner(&self) -> bool {
+        is_module_owner(self.kind, &self.name, self.entry_point_kind)
+    }
+
+    /// nw-113: the name to show a user: [`module_owner_label`] for an owner,
+    /// the plain name for every other symbol.
+    pub fn display_name(&self) -> std::borrow::Cow<'_, str> {
+        if self.is_module_owner() {
+            std::borrow::Cow::Owned(module_owner_label(&self.file_path))
+        } else {
+            std::borrow::Cow::Borrowed(&self.name)
+        }
+    }
 }
 
 // ── Brain extension: markdown nodes ────────────────────────────────────────
@@ -381,7 +631,169 @@ pub struct Contract {
 
 #[cfg(test)]
 mod tests {
-    use super::Repo;
+    use super::{Repo, SymbolKind};
+
+    fn symbol_at(name: &str, file_path: &str) -> super::Symbol {
+        super::Symbol {
+            uid: format!("sym:{file_path}:{name}"),
+            name: name.into(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:r".into(),
+            file_path: file_path.into(),
+            start_line: 1,
+            end_line: 1,
+            signature: String::new(),
+            summary: None,
+            content_hash: String::new(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: super::Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    fn owner_at(file_path: &str) -> super::Symbol {
+        let mut owner = symbol_at(super::MODULE_OWNER_NAME, file_path);
+        owner.kind = SymbolKind::Module;
+        owner.is_entry_point = true;
+        owner.entry_point_kind = Some(super::EntryPointKind::ModuleInit);
+        owner
+    }
+
+    fn paths(symbols: &[super::Symbol]) -> Vec<&str> {
+        symbols.iter().map(|s| s.file_path.as_str()).collect()
+    }
+
+    /// nw-113: an owner is always shown as `<path>::<module>`.
+    #[test]
+    fn owner_display_name_carries_its_repo_relative_path() {
+        assert_eq!(
+            owner_at("src/controllers/index.js").display_name(),
+            "src/controllers/index.js::<module>"
+        );
+        assert_eq!(symbol_at("listen", "index.js").display_name(), "listen");
+        assert_eq!(
+            super::symbol_display_name(super::MODULE_OWNER_NAME, "wsgi.py"),
+            "wsgi.py::<module>"
+        );
+        assert_eq!(super::symbol_display_name("app", "wsgi.py"), "app");
+    }
+
+    /// nw-113: `file::name` narrows by exact path, then a unique path suffix,
+    /// then a suffix without the extension; a qualifier that names no file
+    /// and no container matches nothing.
+    #[test]
+    fn file_qualifier_narrows_by_path_suffix() {
+        let narrow = |candidates: Vec<super::Symbol>, spec: &str| {
+            let spec = super::QualifiedSpec::parse(spec).expect("qualified");
+            spec.select(candidates, |_| &[])
+        };
+        let owners = || {
+            vec![
+                owner_at("index.js"),
+                owner_at("src/controllers/index.js"),
+                owner_at("app/wsgi.py"),
+                owner_at("tests/conftest.py"),
+            ]
+        };
+        let owner = |path: &str| format!("{path}::<module>");
+        assert_eq!(paths(&narrow(owners(), &owner("index.js"))), ["index.js"]);
+        assert_eq!(
+            paths(&narrow(owners(), &owner("controllers/index.js"))),
+            ["src/controllers/index.js"]
+        );
+        assert_eq!(paths(&narrow(owners(), &owner("wsgi.py"))), ["app/wsgi.py"]);
+        assert_eq!(paths(&narrow(owners(), &owner("wsgi"))), ["app/wsgi.py"]);
+        assert_eq!(
+            paths(&narrow(owners(), &owner("./tests/conftest.py"))),
+            ["tests/conftest.py"]
+        );
+        assert_eq!(
+            paths(&narrow(owners(), &owner("/tests/conftest.py"))),
+            ["tests/conftest.py"],
+            "a leading slash is ignored"
+        );
+        assert_eq!(
+            paths(&narrow(owners(), &owner("src\\controllers\\index.js"))),
+            ["src/controllers/index.js"],
+            "a backslash reads as a slash"
+        );
+        assert!(
+            narrow(owners(), &owner("x.js")).is_empty(),
+            "no boundary match"
+        );
+        assert!(narrow(owners(), &owner("Class")).is_empty(), "not a path");
+        let utils = vec![symbol_at("f", "a/util.py"), symbol_at("f", "b/util.py")];
+        assert_eq!(
+            narrow(utils, "util.py::f").len(),
+            2,
+            "an ambiguous suffix stays ambiguous"
+        );
+        assert_eq!(
+            super::split_file_qualifier("src/a.js::<module>"),
+            Some(("src/a.js", "<module>"))
+        );
+        assert_eq!(super::split_file_qualifier("<module>"), None);
+        assert_eq!(super::split_file_qualifier("::x"), None);
+        assert_eq!(super::QualifiedSpec::parse("<module>"), None);
+        assert_eq!(super::QualifiedSpec::parse("a::::b"), None);
+        assert_eq!(
+            super::QualifiedSpec::parse("b.ts::Svc::run"),
+            Some(super::QualifiedSpec {
+                qualifiers: vec!["b.ts", "Svc"],
+                name: "run"
+            })
+        );
+    }
+
+    /// nw-113: one predicate identifies the per-file `<module>` owner; a real
+    /// symbol of the same kind or name is never mistaken for it.
+    #[test]
+    fn module_owner_needs_its_kind_name_and_entry_kind() {
+        use super::{EntryPointKind, MODULE_OWNER_NAME, is_module_owner};
+        let init = Some(EntryPointKind::ModuleInit);
+        assert!(is_module_owner(SymbolKind::Module, MODULE_OWNER_NAME, init));
+        assert!(!is_module_owner(
+            SymbolKind::Function,
+            MODULE_OWNER_NAME,
+            init
+        ));
+        assert!(!is_module_owner(SymbolKind::Module, "utils", init));
+        assert!(!is_module_owner(
+            SymbolKind::Module,
+            MODULE_OWNER_NAME,
+            None
+        ));
+        assert!(!is_module_owner(
+            SymbolKind::Module,
+            MODULE_OWNER_NAME,
+            Some(EntryPointKind::Main)
+        ));
+    }
+
+    /// The resolver and the parser share one code-bearing rule (nw-113).
+    #[test]
+    fn code_bearing_kinds_are_the_ones_with_bodies() {
+        use SymbolKind as K;
+        for kind in [
+            K::Function,
+            K::Method,
+            K::Class,
+            K::Module,
+            K::Interface,
+            K::Trait,
+            K::Extension,
+        ] {
+            assert!(kind.contains_code(), "{kind:?}");
+        }
+        for kind in [K::Enum, K::Constant, K::Variable, K::Property, K::TypeAlias] {
+            assert!(!kind.contains_code(), "{kind:?}");
+        }
+    }
 
     fn repo(url: &str, root_path: Option<&str>) -> Repo {
         Repo {

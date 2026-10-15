@@ -637,6 +637,96 @@ pub struct ScopedEdgeQuery {
 /// same bar every other non-seed already meets.
 pub const PPR_MIN_SCORE: f64 = 1e-4;
 
+/// nw-113: the least number of real (non-owner) nodes scoring at or under
+/// [`PPR_MIN_SCORE`] a walk with a lower floor keeps (best first) in what it
+/// returns and caches. The context builders draw their refill from this
+/// tail; a builder with a larger limit asks for a larger keep (see
+/// [`below_floor_keep_bucket`]). An uncapped floor-0 walk is the whole
+/// reachable graph, and caching 128 of those grew the daemon by gigabytes on
+/// a large brain.
+pub const PPR_BELOW_FLOOR_KEEP: usize = 1_000;
+
+/// nw-113 R1: the most below-floor real rows any walk keeps, however large
+/// the limit behind it. Past this a context list discloses itself truncated.
+pub const PPR_BELOW_FLOOR_KEEP_MAX: usize = 20_000;
+
+/// nw-113 R1: the below-floor keep a walk actually uses for a `requested`
+/// one (normally the caller's list limit): at least
+/// [`PPR_BELOW_FLOOR_KEEP`], otherwise the next power of two at or above the
+/// request, never past [`PPR_BELOW_FLOOR_KEEP_MAX`]. Bucketed so the result
+/// cache, which is keyed by it, holds a handful of shapes rather than one per
+/// limit.
+pub fn below_floor_keep_bucket(requested: usize) -> usize {
+    if requested <= PPR_BELOW_FLOOR_KEEP {
+        return PPR_BELOW_FLOOR_KEEP;
+    }
+    requested
+        .checked_next_power_of_two()
+        .map_or(PPR_BELOW_FLOOR_KEEP_MAX, |bucket| {
+            bucket.min(PPR_BELOW_FLOOR_KEEP_MAX)
+        })
+}
+
+/// nw-113: a personalized PageRank walk, `rows` best first, with what a
+/// floor below [`PPR_MIN_SCORE`] left out of it (see [`bound_below_floor`]).
+/// A walk at the standard floor leaves nothing out, so both counts are 0.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FloorWalk {
+    /// `(uid, score)` pairs, best first.
+    pub rows: Vec<(String, f64)>,
+    /// `<module>` owners that scored at or under [`PPR_MIN_SCORE`]. Counted,
+    /// never kept: the context builders only list owners above the floor, and
+    /// need this number for `module_owners_omitted` and the refill.
+    pub owners_below_floor: usize,
+    /// Real (non-owner) rows at or under [`PPR_MIN_SCORE`] that fell past the
+    /// below-floor keep. A caller whose list would have reached them must
+    /// report itself truncated.
+    pub rows_cut: usize,
+}
+
+/// nw-113: cut a walk run under a floor lower than [`PPR_MIN_SCORE`] to every
+/// seed, every node above that floor, and the best `keep` of the real rows
+/// under it. `results` is sorted
+/// best first, so the kept tail is its head. Owners under the floor are
+/// counted, not kept, so on a hub that thousands of files call at top level
+/// they cannot crowd the real callers out of the budget (nw-113 R1). A walk
+/// at the standard floor is returned as is.
+fn bound_below_floor(
+    results: Vec<(String, f64)>,
+    seed_uids: &[String],
+    min_score: f64,
+    keep: usize,
+) -> FloorWalk {
+    if min_score >= PPR_MIN_SCORE {
+        return FloorWalk {
+            rows: results,
+            ..FloorWalk::default()
+        };
+    }
+    let seeds: std::collections::HashSet<&str> = seed_uids.iter().map(String::as_str).collect();
+    let mut owners_below_floor = 0usize;
+    let mut below = 0usize;
+    let rows = results
+        .into_iter()
+        .filter(|(uid, score)| {
+            if *score > PPR_MIN_SCORE || seeds.contains(uid.as_str()) {
+                return true;
+            }
+            if nestweaver_schema::uid::is_module_owner_uid(uid) {
+                owners_below_floor += 1;
+                return false;
+            }
+            below += 1;
+            below <= keep
+        })
+        .collect();
+    FloorWalk {
+        rows,
+        owners_below_floor,
+        rows_cut: below.saturating_sub(keep),
+    }
+}
+
 /// Describes which slice of the graph PageRank / PPR runs over.
 ///
 /// The algorithm itself is node-type-agnostic — `GraphScope` is what turns
@@ -1209,6 +1299,48 @@ impl GraphStore {
         intent: Option<QueryIntent>,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<Vec<(String, f64)>, StoreError> {
+        self.personalized_pagerank_with_floor(
+            seed_uids,
+            damping,
+            max_iterations,
+            scope,
+            intent,
+            cancel,
+            PPR_MIN_SCORE,
+            PPR_BELOW_FLOOR_KEEP,
+        )
+        .map(|walk| walk.rows)
+    }
+
+    /// [`Self::personalized_pagerank_with_intent_cancellable`] with the
+    /// score floor as a parameter: non-seed nodes scoring at or below
+    /// `min_score` are left out. nw-113: the context builders ask for a floor
+    /// of `0.0` so that, when capped `<module>` owners soaked up the walk's
+    /// mass, they can refill their list with real symbols that scored under
+    /// [`PPR_MIN_SCORE`]. Under a floor below [`PPR_MIN_SCORE`] only the best
+    /// `below_floor_keep` real rows of those (bucketed by
+    /// [`below_floor_keep_bucket`]) are returned and cached; the owners and the
+    /// real rows past that cut are only counted, on the returned [`FloorWalk`].
+    /// The keep is ignored at the standard floor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn personalized_pagerank_with_floor(
+        &self,
+        seed_uids: &[String],
+        damping: f64,
+        max_iterations: u32,
+        scope: &GraphScope,
+        intent: Option<QueryIntent>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        min_score: f64,
+        below_floor_keep: usize,
+    ) -> Result<FloorWalk, StoreError> {
+        // Normalised before it keys the cache: walks with different keeps
+        // never share an entry, and a standard-floor walk ignores it.
+        let below_floor_keep = if min_score < PPR_MIN_SCORE {
+            below_floor_keep_bucket(below_floor_keep)
+        } else {
+            0
+        };
         let ensure_active = || -> Result<(), StoreError> {
             Self::check_read_deadline()?;
             if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
@@ -1254,6 +1386,8 @@ impl GraphStore {
             sorted_seeds.sort();
             sorted_seeds.hash(&mut hasher);
             damping.to_bits().hash(&mut hasher);
+            min_score.to_bits().hash(&mut hasher);
+            below_floor_keep.hash(&mut hasher);
             max_iterations.hash(&mut hasher);
             s_hash.hash(&mut hasher);
             intent.hash(&mut hasher);
@@ -1345,7 +1479,7 @@ impl GraphStore {
         let config = PprConfig {
             damping: effective_damping,
             max_iterations,
-            min_score: PPR_MIN_SCORE,
+            min_score,
             interaction_scores,
             interaction_bias_weight: 0.05,
         };
@@ -1359,6 +1493,7 @@ impl GraphStore {
             Some(&cancelled as &dyn Fn() -> bool),
         )
         .ok_or(StoreError::Cancelled(crate::error::CancelReason::Timeout))?;
+        let results = bound_below_floor(results, seed_uids, min_score, below_floor_keep);
         let cache_result = results.clone();
         ensure_active()?;
 
@@ -4313,5 +4448,178 @@ mod tests {
             (base_b - after_b).abs() < 1e-9,
             "unscored file should keep base pagerank (neutral): {base_b} vs {after_b}"
         );
+    }
+
+    /// nw-113 final review I2: a floor-0 walk keeps every node that clears
+    /// `PPR_MIN_SCORE` but only the best `PPR_BELOW_FLOOR_KEEP` of the rest,
+    /// both in what it returns and in what the result cache holds, so a
+    /// daemon answering many context calls does not cache whole-graph walks.
+    #[test]
+    fn floor_zero_walk_bounds_below_floor_rows_returned_and_cached() {
+        let store = test_store();
+        let leaves = super::PPR_BELOW_FLOOR_KEEP + 4_000;
+        let mut symbols = vec![make_symbol("HUB", "hub")];
+        symbols.extend((0..leaves).map(|i| make_symbol(&format!("L{i}"), &format!("leaf_{i}"))));
+        store.batch_insert_symbols(&symbols).unwrap();
+        let edges: Vec<_> = (0..leaves)
+            .map(|i| make_calls_edge("HUB", &format!("L{i}")))
+            .collect();
+        store.batch_insert_edges(&edges).unwrap();
+        let seeds = vec!["HUB".to_owned()];
+        let walk = store
+            .personalized_pagerank_with_floor(
+                &seeds,
+                0.85,
+                20,
+                &GraphScope::code_only(),
+                None,
+                None,
+                0.0,
+                super::PPR_BELOW_FLOOR_KEEP,
+            )
+            .unwrap();
+        let below = |rows: &[(String, f64)]| {
+            rows.iter()
+                .filter(|(uid, score)| uid != "HUB" && *score <= super::PPR_MIN_SCORE)
+                .count()
+        };
+        assert_eq!(
+            below(&walk.rows),
+            super::PPR_BELOW_FLOOR_KEEP,
+            "{}",
+            walk.rows.len()
+        );
+        assert_eq!(walk.rows_cut, 4_000);
+        assert!(walk.rows.windows(2).all(|w| w[0].1 >= w[1].1), "best first");
+        let cache = store.ppr_result_cache.lock().unwrap();
+        let cached_max = cache.iter().map(|(_, walk)| walk.rows.len()).max().unwrap();
+        assert!(
+            cached_max <= 1 + super::PPR_BELOW_FLOOR_KEEP,
+            "cached {cached_max} rows"
+        );
+    }
+
+    /// nw-113 R1: on a hub that thousands of files call at top level, the
+    /// `<module>` owners tie with the real callers under the floor. They must
+    /// not use up the below-floor keep: the walk keeps the best
+    /// `PPR_BELOW_FLOOR_KEEP` real rows and only counts the owners.
+    #[test]
+    fn floor_zero_walk_keeps_real_rows_when_owners_crowd_the_floor() {
+        let store = test_store();
+        let per_kind = 2_500;
+        let hub = "HUB";
+        let owner = |i: usize| {
+            nestweaver_schema::uid::symbol_uid(
+                "repo:t:1",
+                &format!("src/f{i}.js"),
+                nestweaver_schema::MODULE_OWNER_NAME,
+                1,
+            )
+        };
+        let real = |i: usize| format!("R{i}");
+        let mut symbols = vec![make_symbol(hub, "hub")];
+        for i in 0..per_kind {
+            symbols.push(make_symbol(&owner(i), "<module>"));
+            symbols.push(make_symbol(&real(i), &format!("real_{i}")));
+        }
+        store.batch_insert_symbols(&symbols).unwrap();
+        // Owners are reached a little more strongly, so a cut that does not
+        // tell them apart fills the whole budget with owners.
+        let mut edges = Vec::new();
+        for i in 0..per_kind {
+            edges.push(make_calls_edge(hub, &owner(i)));
+            let mut edge = make_calls_edge(hub, &real(i));
+            edge.confidence = 0.9;
+            edges.push(edge);
+        }
+        store.batch_insert_edges(&edges).unwrap();
+        let walk = store
+            .personalized_pagerank_with_floor(
+                &[hub.to_owned()],
+                0.85,
+                20,
+                &GraphScope::code_only(),
+                None,
+                None,
+                0.0,
+                super::PPR_BELOW_FLOOR_KEEP,
+            )
+            .unwrap();
+        let rows = &walk.rows;
+        let real_below = rows
+            .iter()
+            .filter(|(uid, score)| uid.starts_with('R') && *score <= super::PPR_MIN_SCORE)
+            .count();
+        assert_eq!(real_below, super::PPR_BELOW_FLOOR_KEEP, "{}", rows.len());
+        assert!(
+            !rows
+                .iter()
+                .any(|(uid, _)| nestweaver_schema::uid::is_module_owner_uid(uid)),
+            "below-floor owners are counted, not kept"
+        );
+        assert_eq!(walk.owners_below_floor, per_kind);
+        assert_eq!(walk.rows_cut, per_kind - super::PPR_BELOW_FLOOR_KEEP);
+        let cache = store.ppr_result_cache.lock().unwrap();
+        let cached_max = cache.iter().map(|(_, walk)| walk.rows.len()).max().unwrap();
+        assert!(
+            cached_max <= 1 + super::PPR_BELOW_FLOOR_KEEP,
+            "cached {cached_max} rows"
+        );
+    }
+
+    /// nw-113 R1: the keep follows the caller's limit in power-of-two
+    /// buckets, never under the default and never past the safety bound.
+    #[test]
+    fn below_floor_keep_buckets_the_requested_limit() {
+        use super::{PPR_BELOW_FLOOR_KEEP, PPR_BELOW_FLOOR_KEEP_MAX, below_floor_keep_bucket};
+        assert_eq!(below_floor_keep_bucket(0), PPR_BELOW_FLOOR_KEEP);
+        assert_eq!(below_floor_keep_bucket(500), PPR_BELOW_FLOOR_KEEP);
+        assert_eq!(below_floor_keep_bucket(1_000), PPR_BELOW_FLOOR_KEEP);
+        assert_eq!(below_floor_keep_bucket(1_001), 1_024);
+        assert_eq!(below_floor_keep_bucket(3_000), 4_096);
+        assert_eq!(below_floor_keep_bucket(16_384), 16_384);
+        assert_eq!(below_floor_keep_bucket(16_385), PPR_BELOW_FLOOR_KEEP_MAX);
+        assert_eq!(
+            below_floor_keep_bucket(usize::MAX),
+            PPR_BELOW_FLOOR_KEEP_MAX
+        );
+    }
+
+    /// nw-113 R1: walks with different keeps are cached apart, so a small
+    /// keep's cut never answers a larger request.
+    #[test]
+    fn floor_zero_walks_with_different_keeps_never_share_a_cache_entry() {
+        let store = test_store();
+        let leaves = super::PPR_BELOW_FLOOR_KEEP + 4_000;
+        let mut symbols = vec![make_symbol("HUB", "hub")];
+        symbols.extend((0..leaves).map(|i| make_symbol(&format!("L{i}"), &format!("leaf_{i}"))));
+        store.batch_insert_symbols(&symbols).unwrap();
+        let edges: Vec<_> = (0..leaves)
+            .map(|i| make_calls_edge("HUB", &format!("L{i}")))
+            .collect();
+        store.batch_insert_edges(&edges).unwrap();
+        let seeds = vec!["HUB".to_owned()];
+        let walk = |keep| {
+            store
+                .personalized_pagerank_with_floor(
+                    &seeds,
+                    0.85,
+                    20,
+                    &GraphScope::code_only(),
+                    None,
+                    None,
+                    0.0,
+                    keep,
+                )
+                .unwrap()
+        };
+        let small = walk(super::PPR_BELOW_FLOOR_KEEP);
+        let large = walk(leaves);
+        assert_eq!(small.rows_cut, leaves - super::PPR_BELOW_FLOOR_KEEP);
+        assert_eq!(small.rows.len(), 1 + super::PPR_BELOW_FLOOR_KEEP);
+        assert_eq!(large.rows_cut, 0);
+        assert_eq!(large.rows.len(), 1 + leaves);
+        assert_eq!(walk(super::PPR_BELOW_FLOOR_KEEP), small, "cache hit");
+        assert_eq!(store.ppr_result_cache.lock().unwrap().len(), 2);
     }
 }

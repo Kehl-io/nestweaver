@@ -280,7 +280,14 @@ pub fn generate_symbol_summaries_bounded(
     if let Some(t) = target {
         let needle = t.to_lowercase();
         symbols.retain(|s| {
-            s.name.to_lowercase().contains(&needle)
+            // nw-113: a `<module>` owner matches by its exact name, file path
+            // or uid, never as a "module" substring hit.
+            let name_hit = if s.is_module_owner() {
+                s.name.eq_ignore_ascii_case(t)
+            } else {
+                s.name.to_lowercase().contains(&needle)
+            };
+            name_hit
                 || s.file_path.to_lowercase().contains(&needle)
                 || s.uid.eq_ignore_ascii_case(t)
         });
@@ -312,11 +319,18 @@ pub fn generate_symbol_summaries_bounded(
             .map(|(callers, callees)| (callers.as_slice(), callees.as_slice()))
             .unwrap_or_default();
 
+        // nw-113: an owner has no signature; it is named `path::<module>`.
+        let sig = if sym.is_module_owner() {
+            sym.display_name()
+        } else {
+            std::borrow::Cow::Borrowed(sym.signature.as_str())
+        };
+        // nw-113: at most three owner callers, then a count, so a helper
+        // called at load time from many files keeps a one-line summary.
         let content = format!(
             "{kind} {sig} | callers: [{callers}] | callees: [{callees}] | file: {file}:{line}",
             kind = sym.kind,
-            sig = sym.signature,
-            callers = caller_names.join(", "),
+            callers = nestweaver_schema::cap_module_owner_labels(caller_names).join(", "),
             callees = callee_names.join(", "),
             file = sym.file_path,
             line = sym.start_line,
@@ -327,7 +341,7 @@ pub fn generate_symbol_summaries_bounded(
         summaries.push(Summary {
             level: SummaryLevel::Symbol,
             target_uid: sym.uid.clone(),
-            target_name: sym.name.clone(),
+            target_name: sym.display_name().into_owned(),
             content,
             token_estimate,
             file_path: None,
@@ -346,16 +360,23 @@ pub fn generate_symbol_summaries_bounded(
 
 /// File-level: exports and import sources per file.
 ///
-/// Format: `{file}: exports {n} symbols: {name1} ({kind}), ... | imports from: [files]`
+/// Format: `{file}: exports {n} symbols: {name1} ({kind}), ... | imports from: [files]`,
+/// or `{file}: imports from: [files]` for a file that exports nothing (nw-113:
+/// a file that is only top-level code).
 fn generate_file_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
     let symbols = store
         .list_all_symbols()
         .map_err(|e| anyhow::anyhow!("list_all_symbols: {e}"))?;
 
-    // Group symbols by file path.
+    // Group symbols by file path. nw-113: a `<module>` owner is not an export,
+    // but its file still gets a summary, and its calls (below) still count
+    // as the file's imports.
     let mut by_file: BTreeMap<String, Vec<&nestweaver_schema::Symbol>> = BTreeMap::new();
     for sym in &symbols {
-        by_file.entry(sym.file_path.clone()).or_default().push(sym);
+        let entry = by_file.entry(sym.file_path.clone()).or_default();
+        if !sym.is_module_owner() {
+            entry.push(sym);
+        }
     }
 
     // Build a set of file paths that each file imports from, by checking
@@ -404,13 +425,27 @@ fn generate_file_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
             })
             .unwrap_or_default();
 
-        let content = format!(
-            "{file}: exports {n} symbols: {exports} | imports from: [{imports}]",
-            file = file_path,
-            n = file_symbols.len(),
-            exports = export_list.join(", "),
-            imports = import_files.join(", "),
-        );
+        // nw-113: a file that is only top-level code exports nothing; it
+        // gets no empty `exports 0 symbols:` clause, and when its code calls
+        // nothing indexed in another file it has nothing to say at all (QA
+        // N3: no content-free `imports from: []` line).
+        if file_symbols.is_empty() && import_files.is_empty() {
+            continue;
+        }
+        let content = if file_symbols.is_empty() {
+            format!(
+                "{file_path}: imports from: [{imports}]",
+                imports = import_files.join(", "),
+            )
+        } else {
+            format!(
+                "{file}: exports {n} symbols: {exports} | imports from: [{imports}]",
+                file = file_path,
+                n = file_symbols.len(),
+                exports = export_list.join(", "),
+                imports = import_files.join(", "),
+            )
+        };
 
         let token_estimate = content.len().div_ceil(4);
 
@@ -831,6 +866,150 @@ pub fn render_text(summaries: &[Summary]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nw-113: the `<module>` owner is not an export. A file summary lists
+    /// only real symbols, while the owner's calls still count as imports, and
+    /// a "module" target does not pull in every file's owner.
+    #[test]
+    fn summaries_do_not_list_the_module_owner() {
+        use crate::index::index_directory_in_memory;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("lib.ts"),
+            "export function flushBuffer() { return 8; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("ownerless.ts"),
+            "import { flushBuffer } from './lib';\nflushBuffer();\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("silent.ts"), "console.log('ready');\n").unwrap();
+        let (_r, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/r", "sha").unwrap();
+
+        let files = generate_summaries(&store, SummaryLevel::File).unwrap();
+        let ownerless = files
+            .iter()
+            .find(|summary| summary.target_name == "src/ownerless.ts")
+            .expect("file summary");
+        // nw-113 final round: no empty `exports 0 symbols:  |` clause for a
+        // file that is only top-level code.
+        assert_eq!(
+            ownerless.content, "src/ownerless.ts: imports from: [src/lib.ts]",
+            "{}",
+            ownerless.content
+        );
+        assert!(
+            !ownerless.content.contains("<module>"),
+            "{}",
+            ownerless.content
+        );
+        assert!(
+            ownerless.content.contains("imports from: [src/lib.ts]"),
+            "{}",
+            ownerless.content
+        );
+
+        // QA N3: a file that is only top-level code calling nothing indexed
+        // has nothing to say, so it gets no `imports from: []` line.
+        assert!(
+            files
+                .iter()
+                .all(|summary| summary.target_name != "src/silent.ts"),
+            "{files:#?}"
+        );
+
+        let targeted = generate_symbol_summaries_bounded(&store, Some("module"), 100).unwrap();
+        assert!(
+            targeted
+                .summaries
+                .iter()
+                .all(|summary| !summary.target_name.ends_with("<module>")),
+            "{:?}",
+            targeted.summaries
+        );
+
+        // nw-113: the owner is named `path::<module>` in its own summary and
+        // in its callees' caller lists, never blank or bare.
+        let callee = generate_symbol_summaries_bounded(&store, Some("flushBuffer"), 100).unwrap();
+        let callee = callee
+            .summaries
+            .iter()
+            .find(|summary| summary.target_name == "flushBuffer")
+            .expect("flushBuffer summary");
+        assert!(
+            callee
+                .content
+                .contains("callers: [src/ownerless.ts::<module>]"),
+            "{}",
+            callee.content
+        );
+        let owner = generate_symbol_summaries_bounded(&store, Some("ownerless"), 100).unwrap();
+        let owner = owner
+            .summaries
+            .iter()
+            .find(|summary| summary.target_name == "src/ownerless.ts::<module>")
+            .expect("owner summary");
+        assert!(
+            owner
+                .content
+                .starts_with("Module src/ownerless.ts::<module> | callers: []"),
+            "{}",
+            owner.content
+        );
+    }
+
+    /// nw-113 final round: a symbol called at load time from many files
+    /// lists at most three owner callers, then counts the rest, so one
+    /// summary line stays small; real callers are all listed.
+    #[test]
+    fn symbol_summary_caps_owner_callers() {
+        use crate::index::index_directory_in_memory;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("theme.ts"),
+            "export function fromTemplate() { return 8; }\n\
+             export function realCaller() { return fromTemplate(); }\n",
+        )
+        .unwrap();
+        for i in 0..7 {
+            std::fs::write(
+                src.join(format!("s{i}.style.ts")),
+                "import { fromTemplate } from './theme';\nfromTemplate();\n",
+            )
+            .unwrap();
+        }
+        let (_r, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/r", "sha").unwrap();
+        let summaries = generate_symbol_summaries_bounded(&store, Some("fromTemplate"), 100)
+            .unwrap()
+            .summaries;
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.target_name == "fromTemplate")
+            .expect("fromTemplate summary");
+        assert_eq!(
+            summary.content.matches("::<module>").count(),
+            3,
+            "{}",
+            summary.content
+        );
+        assert!(
+            summary.content.contains("realCaller"),
+            "{}",
+            summary.content
+        );
+        assert!(
+            summary.content.contains("+4 more files' top-level code"),
+            "{}",
+            summary.content
+        );
+    }
 
     #[test]
     fn summary_level_roundtrip() {

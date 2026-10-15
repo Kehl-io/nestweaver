@@ -6,7 +6,7 @@
 //! (`neighbors`) and is token-budget aware. Comment stripping is a planned
 //! follow-up (default-off; deferred to avoid false-elision risk).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use nestweaver_schema::Symbol;
@@ -42,6 +42,11 @@ pub struct SymbolWindow {
     /// only the end changed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relocated_from_line: Option<u32>,
+    /// nw-804: the body alone was larger than `token_budget`, so only its
+    /// first lines are returned, followed by a marker line naming what was
+    /// cut. `start_line`/`end_line` still give the whole symbol's span.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub body_truncated: bool,
 }
 
 /// A spec that matched more than one symbol.
@@ -49,6 +54,49 @@ pub struct SymbolWindow {
 pub struct AmbiguousMatch {
     pub query: String,
     pub candidate_uids: Vec<String>,
+    /// nw-113: every candidate with its display name and file, in the same
+    /// order as `candidate_uids`, so a caller can pick one (or qualify the
+    /// name as `path::name`) without a second lookup. `serde(default)` keeps
+    /// an older daemon's response readable.
+    #[serde(default)]
+    pub candidates: Vec<AmbiguousCandidate>,
+    /// nw-113: how to pick one candidate, fitted to the query: a UID always
+    /// works; `path::name` is offered only when the caller did not already
+    /// qualify the name and the candidates are in different files, and
+    /// `path::Class::name` when each candidate has its own class. Empty from
+    /// an older daemon.
+    #[serde(default)]
+    pub hint: String,
+}
+
+/// nw-113: a `read-symbols` target whose qualifier named no file and no
+/// container, so it was resolved by its last segment alone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualifierIgnored {
+    pub query: String,
+    pub note: String,
+}
+
+/// One candidate of an [`AmbiguousMatch`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AmbiguousCandidate {
+    pub uid: String,
+    pub name: String,
+    pub kind: String,
+    pub file_path: String,
+    pub start_line: u32,
+}
+
+impl From<&Symbol> for AmbiguousCandidate {
+    fn from(symbol: &Symbol) -> Self {
+        Self {
+            uid: symbol.uid.clone(),
+            name: symbol.display_name().into_owned(),
+            kind: symbol.kind.to_string(),
+            file_path: symbol.file_path.clone(),
+            start_line: symbol.start_line,
+        }
+    }
 }
 
 // `Deserialize` so the CLI can parse a daemon response back into the SAME type
@@ -66,7 +114,9 @@ pub struct ReadSymbolsResult {
     /// UIDs dropped because the token budget was exhausted.
     pub dropped: Vec<String>,
     pub truncated: bool,
-    /// Set when the FIRST symbol alone exceeded `token_budget`.
+    /// Set when the FIRST symbol alone exceeded `token_budget` even after it
+    /// was cut to fit (nw-804: only a budget smaller than the truncation
+    /// marker, or a budget of 0, which returns the first symbol whole).
     ///
     /// One symbol is always returned, because an empty answer to "read this
     /// symbol" is useless. That guarantee is deliberate — but it was kept
@@ -75,6 +125,10 @@ pub struct ReadSymbolsResult {
     /// (nw-111). The guarantee stays; the silence does not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_exceeded_by_first_symbol: Option<BudgetOverrun>,
+    /// nw-113: targets whose `path::` or `Class::` qualifier named nothing
+    /// and were resolved by their last segment instead. Absent when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub qualifier_ignored: Vec<QualifierIgnored>,
 }
 
 /// How far the mandatory first symbol overran the requested budget.
@@ -88,6 +142,10 @@ pub struct BudgetOverrun {
 }
 
 /// Read lines `start..=end` (1-based, inclusive) from one already-read file.
+/// nw-113: the line placed between runs of top-level code when reading a
+/// `<module>` owner, where function, class and method bodies were skipped.
+pub const ELISION: &str = "⋮";
+
 fn read_span(text: &str, start: u32, end: u32) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
     if start == 0 || start as usize > lines.len() {
@@ -287,6 +345,42 @@ fn relocate(text: &str, name: &str, len: u32) -> Option<(u32, u32)> {
     Some((start, start + len.max(1) - 1))
 }
 
+/// nw-113: the current top-level code of a file whose parse still has a
+/// `<module>` owner: the lines outside every code-bearing span, as runs
+/// joined by [`ELISION`]. Whitespace-only runs are dropped. `None` when the
+/// file no longer has top-level calls (the owner is gone), which reads as a
+/// stale span like any other vanished symbol.
+fn module_owner_body(text: &str, parsed: &nestweaver_parser::ParsedFile) -> Option<(u32, String)> {
+    let owner = parsed.symbols.iter().find(|raw| raw.is_module_owner())?;
+    let lines: Vec<&str> = text.lines().collect();
+    let mut covered = vec![false; lines.len()];
+    for raw in parsed
+        .symbols
+        .iter()
+        .filter(|raw| raw.kind.contains_code() && !raw.is_module_owner())
+    {
+        let start = (raw.start_line.max(1) as usize - 1).min(lines.len());
+        let end = (raw.end_line.max(raw.start_line) as usize).min(lines.len());
+        covered[start..end].iter_mut().for_each(|line| *line = true);
+    }
+    let mut runs: Vec<Vec<&str>> = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    for (line, is_covered) in lines.iter().zip(&covered) {
+        if *is_covered {
+            runs.push(std::mem::take(&mut current));
+        } else {
+            current.push(line);
+        }
+    }
+    runs.push(current);
+    let runs: Vec<String> = runs
+        .into_iter()
+        .filter(|run| run.iter().any(|line| !line.trim().is_empty()))
+        .map(|run| run.join("\n").trim_matches('\n').to_string())
+        .collect();
+    Some((owner.end_line, runs.join(&format!("\n{ELISION}\n"))))
+}
+
 /// Re-parse the current file to verify the symbol's actual start and end.
 /// The indexed line count is not safe after a file edit: a shorter definition
 /// can pull the next symbol into the window, and a longer one is truncated.
@@ -327,25 +421,161 @@ fn verified_current_span(
     ))
 }
 
-/// Resolve a spec (`sym:` UID, bare name, or dotted/`::` FQN) to candidate symbols.
-fn resolve(store: &GraphStore, spec: &str) -> Vec<Symbol> {
+/// Resolve a spec (`sym:` UID, bare name, `file::name`,
+/// `file::Class::method`, `Class::method`, or a dotted FQN) to candidate
+/// symbols.
+///
+/// nw-113: a qualified spec resolves through the strict
+/// [`GraphStore::lookup_symbols_by_spec`] first, so a file and container
+/// narrow together. When the qualifiers name nothing, the lookup falls back
+/// to the last segment, so a module path such as `net::inner::send` keeps
+/// resolving by name; [`resolve_spec_detailed`] reports that fallback.
+pub fn resolve_spec(store: &GraphStore, spec: &str) -> Vec<Symbol> {
+    resolve_spec_detailed(store, spec).symbols
+}
+
+/// What [`resolve_spec_detailed`] found for one spec.
+#[derive(Debug, Default)]
+pub struct SpecResolution {
+    pub symbols: Vec<Symbol>,
+    /// The leading qualifiers named nothing and a shorter reading answered
+    /// instead: `(dropped qualifiers, reading that answered)`, e.g.
+    /// `("zzz", "Svc::run")` or `("nothere.ts", "run")`.
+    pub qualifier_ignored: Option<(String, String)>,
+}
+
+/// [`resolve_spec`], also saying whether a qualifier was dropped.
+///
+/// nw-113 final review Minor 4: when the full spec names nothing, the
+/// shorter qualified readings are tried outermost qualifier first
+/// (`zzz::Svc::run`, then `Svc::run`) before the last segment alone.
+pub fn resolve_spec_detailed(store: &GraphStore, spec: &str) -> SpecResolution {
     if spec.starts_with("sym:") {
-        return store.lookup_symbol(spec).ok().into_iter().collect();
+        return SpecResolution {
+            symbols: store.lookup_symbol(spec).ok().into_iter().collect(),
+            qualifier_ignored: None,
+        };
     }
-    // FQN forms: take the last path segment as the symbol name.
-    let name = spec
-        .rsplit("::")
-        .next()
-        .unwrap_or(spec)
-        .rsplit('.')
-        .next()
-        .unwrap_or(spec);
-    store.lookup_symbols_by_name(name).unwrap_or_default()
+    if let Some(qualified) = nestweaver_schema::QualifiedSpec::parse(spec) {
+        let strict = store.lookup_symbols_by_spec(spec).unwrap_or_default();
+        if !strict.is_empty() {
+            return SpecResolution {
+                symbols: strict,
+                qualifier_ignored: None,
+            };
+        }
+        let segments: Vec<&str> = spec.split("::").collect();
+        for drop in 1..segments.len() - 1 {
+            let reading = segments[drop..].join("::");
+            let symbols = store.lookup_symbols_by_spec(&reading).unwrap_or_default();
+            if !symbols.is_empty() {
+                return SpecResolution {
+                    symbols,
+                    qualifier_ignored: Some((segments[..drop].join("::"), reading)),
+                };
+            }
+        }
+        let name = last_dotted_segment(qualified.name);
+        let symbols = store.lookup_symbols_by_name(name).unwrap_or_default();
+        return SpecResolution {
+            qualifier_ignored: (!symbols.is_empty())
+                .then(|| (qualified.qualifiers.join("::"), qualified.name.to_string())),
+            symbols,
+        };
+    }
+    SpecResolution {
+        symbols: store
+            .lookup_symbols_by_name(last_dotted_segment(spec))
+            .unwrap_or_default(),
+        qualifier_ignored: None,
+    }
+}
+
+/// nw-113: the [`AmbiguousMatch::hint`] for `candidates` of `spec`.
+fn ambiguity_hint(store: &GraphStore, spec: &str, candidates: &[Symbol]) -> String {
+    let uids: Vec<&str> = candidates.iter().map(|s| s.uid.as_str()).collect();
+    let containers = store.container_chains(&uids, 1).unwrap_or_default();
+    let class_of = |s: &Symbol| containers.get(&s.uid).and_then(|chain| chain.first());
+    // Candidates in a class are told apart by `path::Class::name`.
+    let mut seen = HashSet::new();
+    let classes_distinct = candidates
+        .iter()
+        .filter_map(|s| class_of(s).map(|class| (s.file_path.as_str(), class.as_str())))
+        .all(|pair| seen.insert(pair));
+    let classed = candidates.iter().filter(|s| class_of(s).is_some()).count();
+    if classes_distinct && classed == candidates.len() {
+        return "pass a UID or path::Class::name".to_string();
+    }
+    // `path::name` only helps when it names one candidate each: every
+    // candidate in its own file, and not already the file the caller named.
+    let mut files = HashSet::new();
+    let files_distinct = candidates
+        .iter()
+        .all(|s| files.insert(s.file_path.as_str()));
+    if files_distinct && nestweaver_schema::QualifiedSpec::parse(spec).is_none() {
+        return "pass a UID or path::name".to_string();
+    }
+    // nw-113 final review Minor 4: same-file candidates, or a `path::name`
+    // that would still match two, are told apart by their class where they
+    // have one, and otherwise only by UID.
+    if classed > 0 && classes_distinct {
+        return "pass a UID or path::Class::name".to_string();
+    }
+    "pass a UID".to_string()
+}
+
+/// Dotted FQN forms (`pkg.mod.func`): the last segment is the symbol name.
+fn last_dotted_segment(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
 }
 
 /// Estimate the token cost of a window (chars/4 + small metadata overhead).
 fn window_cost(body: &str) -> usize {
     body.len() / 4 + 16
+}
+
+/// nw-804: the leading whole lines of `body` that fit `budget` (by
+/// [`window_cost`]) together with a closing marker line naming the cut. A
+/// first line too long to fit (minified code) is cut at a char boundary. The
+/// marker is always kept, so a budget smaller than the marker alone still
+/// overruns and is reported as such by the caller.
+fn truncate_to_budget(body: &str, budget: usize) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let total = lines.len();
+    let allowance = budget.saturating_sub(window_cost("")) * 4;
+    let marker = |kept: usize| {
+        format!(
+            "{ELISION} truncated: {} of {total} lines omitted to fit the {budget}-token \
+             budget; raise --token-budget for the whole body",
+            total - kept
+        )
+    };
+    let mut kept = String::new();
+    let mut kept_lines = 0;
+    for line in &lines {
+        let next = kept.len() + line.len() + 1;
+        if next + marker(kept_lines + 1).len() > allowance {
+            break;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+        kept_lines += 1;
+    }
+    if kept_lines == 0
+        && let Some(first) = lines.first()
+    {
+        let room = allowance.saturating_sub(marker(0).len() + 1);
+        let mut end = room.min(first.len());
+        while !first.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end > 0 {
+            kept.push_str(&first[..end]);
+            kept.push('\n');
+        }
+    }
+    kept.push_str(&marker(kept_lines));
+    kept
 }
 
 pub fn read_symbols(
@@ -379,13 +609,27 @@ pub fn read_symbols_budgeted(
     // 1. Resolve specs → primary symbols (preserving input order).
     let mut primary: Vec<Symbol> = Vec::new();
     for spec in specs {
-        let candidates = resolve(store, spec);
+        let SpecResolution {
+            symbols: candidates,
+            qualifier_ignored,
+        } = resolve_spec_detailed(store, spec);
+        if let Some((qualifier, name)) = qualifier_ignored {
+            result.qualifier_ignored.push(QualifierIgnored {
+                query: spec.clone(),
+                note: format!(
+                    "qualifier '{qualifier}' names no file or container of '{name}'; \
+                     matched by '{name}' alone"
+                ),
+            });
+        }
         match candidates.len() {
             0 => result.not_found.push(spec.clone()),
             1 => primary.push(candidates.into_iter().next().expect("len == 1")),
             _ => result.ambiguous.push(AmbiguousMatch {
                 query: spec.clone(),
                 candidate_uids: candidates.iter().map(|s| s.uid.clone()).collect(),
+                candidates: candidates.iter().map(AmbiguousCandidate::from).collect(),
+                hint: ambiguity_hint(store, spec, &candidates),
             }),
         }
     }
@@ -396,6 +640,8 @@ pub fn read_symbols_budgeted(
     for sym in primary {
         if neighbors > 0 {
             let mut in_file = store.symbols_in_file(&sym.file_path).unwrap_or_default();
+            // nw-113: the whole-file `<module>` owner is never a neighbour.
+            in_file.retain(|s| !s.is_module_owner() || s.uid == sym.uid);
             in_file.sort_by_key(|s| s.start_line);
             if let Some(idx) = in_file.iter().position(|s| s.uid == sym.uid) {
                 let lo = idx.saturating_sub(neighbors as usize);
@@ -438,6 +684,18 @@ pub fn read_symbols_budgeted(
                 })
         });
         let body_opt = current.as_ref().and_then(|(text, parsed)| {
+            if sym.is_module_owner() {
+                let owner = parsed
+                    .as_ref()
+                    .and_then(|parsed| module_owner_body(text, parsed));
+                // The owner always spans the whole file, so a changed line
+                // count is not a relocation: follow the file's end only.
+                if let Some((current_end, _)) = owner {
+                    end_line = current_end;
+                }
+                stale_span = owner.is_none();
+                return owner.map(|(_, body)| body);
+            }
             match parsed
                 .as_ref()
                 .and_then(|parsed| verified_current_span(text, parsed, &sym))
@@ -456,8 +714,8 @@ pub fn read_symbols_budgeted(
             }
         });
         let body_available = body_opt.is_some();
-        let body = body_opt.unwrap_or_default();
-        let cost = window_cost(&body);
+        let mut body = body_opt.unwrap_or_default();
+        let mut cost = window_cost(&body);
         let may_exempt = exempt_first_symbol && result.symbols.is_empty();
         if let Some(budget) = token_budget
             && !may_exempt
@@ -468,27 +726,44 @@ pub fn read_symbols_budgeted(
             continue;
         }
         // The first symbol of a fresh call is exempt from the budget so the
-        // caller never gets an empty answer — but say so rather than reporting
-        // a clean result that silently blew the budget.
+        // caller never gets an empty answer. nw-804: it is cut to fit rather
+        // than returned whole, and the cut is marked in the body and flagged.
+        // A budget of 0 keeps its documented meaning, "only the first symbol",
+        // and returns it whole.
+        let mut body_truncated = false;
         if let Some(budget) = token_budget
             && may_exempt
             && cost > budget
         {
+            if budget > 0 {
+                body = truncate_to_budget(&body, budget);
+                cost = window_cost(&body);
+                body_truncated = true;
+            }
             result.truncated = true;
-            result.budget_exceeded_by_first_symbol = Some(BudgetOverrun {
-                requested_tokens: budget,
-                returned_tokens: cost,
-                note: format!(
-                    "the first symbol alone costs ~{cost} tokens, over the requested \
-                     budget of {budget}; it is returned whole because an empty result \
-                     answers nothing, so this response EXCEEDS the budget"
-                ),
-            });
+            // Only a budget too small for even the cut window still overruns;
+            // that is said, never silent (nw-111).
+            if cost > budget {
+                result.budget_exceeded_by_first_symbol = Some(BudgetOverrun {
+                    requested_tokens: budget,
+                    returned_tokens: cost,
+                    note: format!(
+                        "the first symbol{} still costs ~{cost} tokens, over the requested \
+                         budget of {budget}; it is returned because an empty result answers \
+                         nothing, so this response EXCEEDS the budget",
+                        if body_truncated {
+                            ", cut to its truncation marker,"
+                        } else {
+                            ""
+                        }
+                    ),
+                });
+            }
         }
         used += cost;
         result.symbols.push(SymbolWindow {
+            name: sym.display_name().into_owned(),
             uid: sym.uid,
-            name: sym.name,
             kind: sym.kind.to_string(),
             path: sym.file_path,
             start_line,
@@ -498,6 +773,7 @@ pub fn read_symbols_budgeted(
             is_neighbor,
             stale_span,
             relocated_from_line,
+            body_truncated,
         });
     }
 
@@ -569,6 +845,7 @@ pub fn read_symbols_from_repo_roots(
         merged.symbols.extend(partial.symbols);
         merged.not_found.extend(partial.not_found);
         merged.ambiguous.extend(partial.ambiguous);
+        merged.qualifier_ignored.extend(partial.qualifier_ignored);
         merged.dropped.extend(partial.dropped);
         merged.truncated = merged.truncated || partial.truncated;
         if merged.budget_exceeded_by_first_symbol.is_none() {
@@ -579,7 +856,7 @@ pub fn read_symbols_from_repo_roots(
 }
 
 fn repo_uid_for_spec(store: &GraphStore, spec: &str) -> Option<String> {
-    resolve(store, spec)
+    resolve_spec(store, spec)
         .into_iter()
         .next()
         .map(|symbol| symbol.repo_uid)
@@ -840,6 +1117,334 @@ mod tests {
         let res = read_symbols(store, &[name.to_string()], &reader, 0, None);
         assert_eq!(res.symbols.len(), 1, "{name} must resolve: {res:?}");
         res.symbols.into_iter().next().unwrap()
+    }
+
+    /// Write every `(rel, src)` under a fresh tempdir and index it.
+    fn fixture_files(files: &[(&str, &str)]) -> (tempfile::TempDir, GraphStore) {
+        let dir = tempfile::tempdir().unwrap();
+        for (rel, src) in files {
+            let path = dir.path().join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, src).unwrap();
+        }
+        let (_r, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/r", "sha").unwrap();
+        (dir, store)
+    }
+
+    /// nw-113: `path::<module>` reads that file's owner, `file::name` narrows
+    /// an ordinary name by file, and an ambiguous suffix is still reported,
+    /// now with every candidate's path.
+    #[test]
+    fn file_qualifier_narrows_owner_and_symbol_lookups() {
+        let (dir, store) = fixture_files(&[
+            (
+                "index.js",
+                "function app() { return 1; }
+app();
+",
+            ),
+            (
+                "src/controllers/index.js",
+                "function app() { return 2; }
+app();
+",
+            ),
+            ("src/wsgi.py", "def app():\n    return 3\n\napp()\n"),
+        ]);
+        let reader = FilesystemReader::new(dir.path());
+        let read = |spec: &str| read_symbols(&store, &[spec.to_string()], &reader, 0, None);
+
+        let res = read("wsgi.py::<module>");
+        assert_eq!(res.symbols.len(), 1, "{res:?}");
+        assert_eq!(res.symbols[0].path, "src/wsgi.py");
+        assert_eq!(res.symbols[0].name, "src/wsgi.py::<module>");
+
+        let res = read("src/controllers/index.js::<module>");
+        assert_eq!(res.symbols.len(), 1, "{res:?}");
+        assert_eq!(res.symbols[0].path, "src/controllers/index.js");
+
+        let res = read("index.js::<module>");
+        assert_eq!(res.symbols.len(), 1, "an exact path wins: {res:?}");
+        assert_eq!(res.symbols[0].path, "index.js");
+
+        let res = read("controllers/index.js::app");
+        assert_eq!(res.symbols.len(), 1, "{res:?}");
+        assert_eq!(res.symbols[0].path, "src/controllers/index.js");
+
+        let res = read("wsgi::app");
+        assert_eq!(res.symbols.len(), 1, "{res:?}");
+        assert_eq!(res.symbols[0].path, "src/wsgi.py");
+
+        let res = read("<module>");
+        assert!(res.symbols.is_empty(), "{res:?}");
+        let [ambiguous] = res.ambiguous.as_slice() else {
+            panic!("{res:?}")
+        };
+        let mut paths: Vec<&str> = ambiguous
+            .candidates
+            .iter()
+            .map(|c| c.file_path.as_str())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            ["index.js", "src/controllers/index.js", "src/wsgi.py"]
+        );
+        assert!(
+            ambiguous
+                .candidates
+                .iter()
+                .all(|c| c.name == format!("{}::<module>", c.file_path)),
+            "{ambiguous:?}"
+        );
+        assert_eq!(ambiguous.candidate_uids.len(), 3);
+    }
+
+    /// nw-113 final round: `path::Class::method` narrows by file and class;
+    /// a qualifier that names nothing falls back to the last segment and says
+    /// so in `qualifier_ignored`; the ambiguity hint never asks for the
+    /// `path::name` the caller already passed, nor for one that cannot help.
+    #[test]
+    fn qualifier_fallback_is_disclosed_and_hints_fit_the_query() {
+        let (dir, store) = fixture_files(&[
+            (
+                "a/svc.ts",
+                "export class Svc { run() { return 1; } }\n\
+                 export function strip(a: string) { return a; }\n",
+            ),
+            (
+                "b/svc.ts",
+                "export class Svc { run() { return 2; } }\n\
+                 export class Other { run() { return 3; } }\n\
+                 export function strip(b: string) { return b; }\n",
+            ),
+        ]);
+        let reader = FilesystemReader::new(dir.path());
+        let read = |spec: &str| read_symbols(&store, &[spec.to_string()], &reader, 0, None);
+
+        let res = read("a/svc.ts::Svc::run");
+        assert_eq!(res.symbols.len(), 1, "{res:?}");
+        assert_eq!(res.symbols[0].path, "a/svc.ts");
+        assert!(res.qualifier_ignored.is_empty(), "{res:?}");
+
+        let res = read("nothere.ts::missing");
+        assert!(res.qualifier_ignored.is_empty(), "a miss is not a fallback");
+        assert_eq!(res.not_found, ["nothere.ts::missing"]);
+        let res = read("nothere.ts::Other");
+        assert_eq!(res.symbols.len(), 1, "fallback still reads: {res:?}");
+        let [ignored] = res.qualifier_ignored.as_slice() else {
+            panic!("{res:?}")
+        };
+        assert_eq!(ignored.query, "nothere.ts::Other");
+        assert!(ignored.note.contains("nothere.ts"), "{ignored:?}");
+
+        let res = read("nothere.ts::run");
+        let [ambiguous] = res.ambiguous.as_slice() else {
+            panic!("{res:?}")
+        };
+        assert!(!ambiguous.hint.contains("path::name"), "{ambiguous:?}");
+        assert!(ambiguous.hint.contains("UID"), "{ambiguous:?}");
+        assert_eq!(res.qualifier_ignored.len(), 1, "{res:?}");
+
+        let res = read("b/svc.ts::run");
+        let [ambiguous] = res.ambiguous.as_slice() else {
+            panic!("{res:?}")
+        };
+        assert!(!ambiguous.hint.contains("--repo"), "{ambiguous:?}");
+        assert!(
+            !ambiguous.hint.contains("pass a UID or path::name"),
+            "{ambiguous:?}"
+        );
+
+        let res = read("run");
+        let [ambiguous] = res.ambiguous.as_slice() else {
+            panic!("{res:?}")
+        };
+        assert_eq!(ambiguous.hint, "pass a UID or path::Class::name");
+
+        let res = read("strip");
+        let [ambiguous] = res.ambiguous.as_slice() else {
+            panic!("{res:?}")
+        };
+        assert_eq!(ambiguous.hint, "pass a UID or path::name");
+    }
+
+    /// nw-113 final review Minor 4: the hint never offers a `path::name`
+    /// that would still be ambiguous, offers `path::Class::name` when a class
+    /// tells same-file candidates apart, and `zzz::Svc::run` reads as
+    /// `Svc::run` before it falls back to `run`.
+    #[test]
+    fn ambiguity_hints_offer_only_what_disambiguates() {
+        let (dir, store) = fixture_files(&[
+            (
+                "a/svc.ts",
+                "export class Svc { run() { return 1; } }\n\
+                 export class Other { run() { return 3; } }\n",
+            ),
+            ("b/svc.ts", "export class Svc { run() { return 2; } }\n"),
+            (
+                "c.ts",
+                "export class Job { go() { return 1; } }\nexport function go() { return 2; }\n",
+            ),
+            (
+                "d.py",
+                "def helper():\n    return 1\n\n\ndef helper():\n    return 2\n",
+            ),
+            ("e.py", "def helper():\n    return 3\n"),
+        ]);
+        let reader = FilesystemReader::new(dir.path());
+        let read = |spec: &str| read_symbols(&store, &[spec.to_string()], &reader, 0, None);
+
+        let res = read("c.ts::go");
+        let [ambiguous] = res.ambiguous.as_slice() else {
+            panic!("{res:?}")
+        };
+        assert_eq!(ambiguous.hint, "pass a UID or path::Class::name", "{res:?}");
+
+        let res = read("helper");
+        let [ambiguous] = res.ambiguous.as_slice() else {
+            panic!("{res:?}")
+        };
+        assert_eq!(ambiguous.candidates.len(), 3, "{res:?}");
+        assert_eq!(
+            ambiguous.hint, "pass a UID",
+            "d.py::helper is still two: {res:?}"
+        );
+
+        let res = read("zzz::Svc::run");
+        let [ambiguous] = res.ambiguous.as_slice() else {
+            panic!("{res:?}")
+        };
+        let mut paths: Vec<&str> = ambiguous
+            .candidates
+            .iter()
+            .map(|c| c.file_path.as_str())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            ["a/svc.ts", "b/svc.ts"],
+            "Other::run is not Svc::run"
+        );
+        let [ignored] = res.qualifier_ignored.as_slice() else {
+            panic!("{res:?}")
+        };
+        assert!(ignored.note.contains("'zzz'"), "{ignored:?}");
+        assert!(ignored.note.contains("'Svc::run'"), "{ignored:?}");
+    }
+
+    /// nw-113 review: the owner is never a neighbour window; reading the
+    /// first real symbol with neighbours does not drag in `<module>`.
+    #[test]
+    fn neighbour_expansion_skips_the_module_owner() {
+        let (dir, store) = fixture_file(
+            "src/app.ts",
+            "export function f() {\n  return 1;\n}\nexport function g() {\n  return 2;\n}\nf();\n",
+        );
+        let reader = FilesystemReader::new(dir.path());
+        let res = read_symbols(&store, &["f".to_string()], &reader, 1, None);
+        let names: Vec<&str> = res.symbols.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, vec!["f", "g"], "{res:?}");
+    }
+
+    /// nw-113 review: the owner always spans the whole file, so a changed line
+    /// count is not a relocation; only `end_line` follows the file.
+    #[test]
+    fn an_owner_read_never_reports_a_relocation() {
+        let (dir, store) = fixture_file(
+            "src/app.ts",
+            "export function f() {\n  return 1;\n}\nf();\n",
+        );
+        let owner = store
+            .symbols_in_file("src/app.ts")
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.is_module_owner())
+            .expect("fixture mints an owner");
+        assert_eq!(owner.end_line, 4);
+        std::fs::write(
+            dir.path().join("src/app.ts"),
+            "export function f() {\n  return 1;\n}\nf();\nf();\n",
+        )
+        .unwrap();
+        let w = read_one(&dir, &store, &owner.uid);
+        assert_eq!(w.relocated_from_line, None, "{w:?}");
+        assert_eq!((w.start_line, w.end_line), (1, 5), "{w:?}");
+        assert!(!w.stale_span && w.body_available, "{w:?}");
+    }
+
+    /// nw-804: one symbol larger than `token_budget` is truncated to fit,
+    /// with a marker line in the body and `body_truncated` in the JSON, for
+    /// an ordinary function and a `<module>` owner alike. Its first lines are
+    /// kept, and a budget the cut fits within is not reported as overrun.
+    #[test]
+    fn a_symbol_larger_than_the_budget_is_truncated_with_a_marker() {
+        let body: String = (0..400)
+            .map(|i| format!("  total += step({i});\n"))
+            .collect();
+        let calls: String = (0..400).map(|i| format!("step({i});\n")).collect();
+        let (dir, store) = fixture_file(
+            "src/big.js",
+            &format!(
+                "function step(n) {{ return n; }}\nfunction big(total) {{\n{body}  return total;\n}}\n{calls}"
+            ),
+        );
+        let owner = store
+            .symbols_in_file("src/big.js")
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.is_module_owner())
+            .expect("fixture mints an owner");
+        let reader = FilesystemReader::new(dir.path());
+        for (spec, first_line) in [
+            ("big", "function big(total) {"),
+            (owner.uid.as_str(), "step(0);"),
+        ] {
+            let res = read_symbols(&store, &[spec.to_string()], &reader, 0, Some(200));
+            assert_eq!(res.symbols.len(), 1, "{spec}: {res:?}");
+            let w = &res.symbols[0];
+            assert!(w.body_truncated, "{spec}: {w:?}");
+            assert!(res.truncated, "{spec}");
+            assert!(w.body.starts_with(first_line), "{spec}: {}", w.body);
+            let marker = w.body.lines().last().unwrap();
+            assert!(
+                marker.starts_with(ELISION) && marker.contains("truncated"),
+                "{spec}: {marker}"
+            );
+            assert!(window_cost(&w.body) <= 200, "{spec}: {}", w.body.len());
+            assert!(
+                res.budget_exceeded_by_first_symbol.is_none(),
+                "{spec}: the truncated window fits the budget"
+            );
+            let json = serde_json::to_value(&res).unwrap();
+            assert_eq!(json["symbols"][0]["body_truncated"], true, "{json}");
+        }
+        let res = read_symbols(&store, &["big".to_string()], &reader, 0, None);
+        assert!(!res.symbols[0].body_truncated, "no budget, no cut");
+    }
+
+    /// nw-113: reading `<module>` returns the file's top-level code: the lines
+    /// outside every function, class and method, with an elision marker
+    /// between runs, not the whole file and not an empty stale window.
+    #[test]
+    fn reading_the_module_owner_returns_only_top_level_code() {
+        let (dir, store) = fixture_file(
+            "src/app.ts",
+            "import { flushBuffer } from './lib';\nexport function f() {\n  return 1;\n}\n\nflushBuffer();\nf();\n",
+        );
+        let owner = store
+            .symbols_in_file("src/app.ts")
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.is_module_owner())
+            .expect("fixture mints an owner");
+        let w = read_one(&dir, &store, &owner.uid);
+        assert!(w.body_available && !w.stale_span, "{w:?}");
+        assert_eq!(
+            w.body,
+            format!("import {{ flushBuffer }} from './lib';\n{ELISION}\nflushBuffer();\nf();")
+        );
     }
 
     /// nw-689: the repo changed since indexing, so the stored span now holds

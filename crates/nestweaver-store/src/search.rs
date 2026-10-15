@@ -1315,6 +1315,10 @@ impl EmbeddingIndex {
                 if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
                     return None;
                 }
+                // nw-113: `<module>` owners are never embedded; skip a stale one.
+                if nestweaver_schema::uid::is_module_owner_uid(uid) {
+                    return None;
+                }
                 // Exclude any stored vector whose dimension differs from the
                 // query's. `.zip()` would otherwise truncate to the shorter and
                 // return a plausible-but-wrong similarity (dot over a prefix,
@@ -1352,6 +1356,7 @@ impl EmbeddingIndex {
                             .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
                             || self.deleted_base_uids.contains(&row.uid)
                             || self.embeddings.contains_key(&row.uid)
+                            || nestweaver_schema::uid::is_module_owner_uid(&row.uid)
                         {
                             return None;
                         }
@@ -1470,6 +1475,8 @@ impl EmbeddingIndex {
                 Some(prefix) => uid.contains(prefix),
                 None => true,
             })
+            // nw-113: `<module>` owners are never embedded; skip a stale one.
+            .filter(|(uid, _)| !nestweaver_schema::uid::is_module_owner_uid(uid))
             .filter_map(|(uid, emb)| {
                 // See vector_search_cancellable: a dimension mismatch must be
                 // excluded, not silently truncated by `.zip()`.
@@ -1504,6 +1511,7 @@ impl EmbeddingIndex {
                         if self.deleted_base_uids.contains(&row.uid)
                             || self.embeddings.contains_key(&row.uid)
                             || uid_prefix.is_some_and(|prefix| !row.uid.contains(prefix))
+                            || nestweaver_schema::uid::is_module_owner_uid(&row.uid)
                         {
                             return None;
                         }
@@ -2400,6 +2408,28 @@ mod tests {
             Some(("sentence-transformers/model-a".to_string(), 3)),
             "a checkpoint with no produced vectors must not overwrite the fingerprint"
         );
+    }
+
+    /// nw-113: `<module>` owners are never embedded; a stale sidecar that still
+    /// holds one must not surface it, and top-k must still fill `limit`.
+    #[test]
+    fn vector_search_skips_module_owner_vectors() {
+        let owner = nestweaver_schema::uid::symbol_uid(
+            "repo:default:abc",
+            "src/a.ts",
+            nestweaver_schema::MODULE_OWNER_NAME,
+            1,
+        );
+        let mut idx = EmbeddingIndex::new();
+        assert!(idx.add(&owner, vec![1.0_f32, 0.0, 0.0], false));
+        assert!(idx.add("sym:real", vec![0.9_f32, 0.1, 0.0], false));
+        let query = vec![1.0_f32, 0.0, 0.0];
+        let plain = idx.try_vector_search(&query, 1).unwrap();
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].0, "sym:real");
+        let filtered = idx.vector_search_filtered(&query, 1, None).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "sym:real");
     }
 
     #[test]

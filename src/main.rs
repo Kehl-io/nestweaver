@@ -1416,10 +1416,20 @@ fn report_context_lookup_failure(error: &anyhow::Error, json: bool, seeds: &[Str
     // uses; the direct route has no gRPC status and keeps its chain.
     let message = daemon_application_error(error).unwrap_or_else(|| format!("{error:#}"));
     if message.contains("No matching symbols") || message.contains("No symbols found") {
+        // nw-113: a qualified seed that named nothing carries the same
+        // `path::name` suggestions `impact` gives.
+        let candidates = envelope_did_you_mean(error);
         if json {
-            print_json_not_found_detail("seeds", &serde_json::json!(seeds), Some(&message));
+            println!(
+                "{}",
+                nestweaver_schema::responses::with_did_you_mean(
+                    json_not_found_payload("seeds", &serde_json::json!(seeds), Some(&message)),
+                    &candidates,
+                )
+            );
         }
         eprintln!("{message}");
+        eprint_did_you_mean(&candidates);
         EXIT_NOT_FOUND
     } else if message.contains("Ambiguous") {
         if json {
@@ -3139,11 +3149,52 @@ fn impact_json_not_found(symbol: &str) -> serde_json::Value {
 /// stayed silent about any suggestions found). Always stderr: `--json` is
 /// the parseable contract, and clig.dev's "send messaging to stderr" is the
 /// standing convention every other not-found text line in this file follows.
-fn eprint_impact_not_found(name_or_uid: &str, candidates: &[String]) {
+///
+/// nw-113: `symbol` and `flow-trace` print their misses through this too,
+/// so every symbol-lookup command answers a miss with the same sentence and
+/// the same `path::name` suggestions.
+fn eprint_symbol_not_found(name_or_uid: &str, candidates: &[String]) {
     eprintln!("Symbol '{name_or_uid}' not found.");
-    if !candidates.is_empty() {
-        eprintln!("Did you mean: {}?", candidates.join(", "));
+    eprint_did_you_mean(candidates);
+}
+
+/// nw-113: the shared "Did you mean" line, printed only when there are
+/// suggestions. `context` and `brain context` add it under their own
+/// not-found message.
+fn eprint_did_you_mean(candidates: &[String]) {
+    if let Some(line) = nestweaver_engine::did_you_mean::did_you_mean_line(candidates) {
+        eprintln!("{line}");
     }
+}
+
+/// nw-113: the `did_you_mean` suggestions a lookup miss carries in its
+/// not-found envelope, in-process or across the daemon. Empty when there
+/// are none.
+fn envelope_did_you_mean(error: &anyhow::Error) -> Vec<String> {
+    nestweaver_mcp::tools::not_found_envelope(error)
+        .as_ref()
+        .map(value_did_you_mean)
+        .unwrap_or_default()
+}
+
+/// The `did_you_mean` array of a JSON payload, or empty.
+fn value_did_you_mean(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("did_you_mean")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// [`print_json_not_found`] plus the miss's `did_you_mean` (absent when
+/// empty, the nw-481 convention).
+fn print_json_not_found_suggesting(target_key: &str, target: &str, candidates: &[String]) {
+    println!(
+        "{}",
+        nestweaver_schema::responses::with_did_you_mean(
+            json_not_found_payload(target_key, &serde_json::json!(target), None),
+            candidates,
+        )
+    );
 }
 
 /// Render a `dead-code` result as text from its JSON payload.
@@ -4007,6 +4058,12 @@ mod blast_radius_exit_code_tests {
 /// cross-repo link rather than an observed call, and omitting the label is what
 /// let fabricated cross-language execution paths read as real ones (nw-111).
 fn render_flow_trace_text(payload: &serde_json::Value) {
+    render_flow_trace_text_to(&mut std::io::stdout().lock(), payload);
+}
+
+/// [`render_flow_trace_text`] into any writer, so the text is testable. A
+/// failed write (a closed pipe) is ignored.
+fn render_flow_trace_text_to(out: &mut impl std::io::Write, payload: &serde_json::Value) {
     // nw-390. The JSON payload marks every place the tree was CUT — a
     // depth-capped node, a node whose canonical expansion lives elsewhere, and
     // rows a visibility policy removed. The text renderer read NONE of them, so
@@ -4052,23 +4109,28 @@ fn render_flow_trace_text(payload: &serde_json::Value) {
         }
     }
 
-    fn walk(node: &serde_json::Value, depth: usize) {
-        let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+    fn walk(out: &mut impl std::io::Write, node: &serde_json::Value, depth: usize) {
         let edge = node.get("edge_type").and_then(|v| v.as_str());
         let path = node.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+        // nw-113: an owner reads `path::<module>` even from an older peer
+        // that sent it bare.
+        let name = nestweaver_schema::symbol_display_name(
+            node.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+            path,
+        );
         let indent = "  ".repeat(depth + 1);
         let cut = cut_marker(node);
-        match edge {
-            Some(e) => println!("{indent}{name}  [{e}]  {path}{cut}"),
-            None => println!("{indent}{name}  {path}{cut}"),
-        }
+        let _ = match edge {
+            Some(e) => writeln!(out, "{indent}{name}  [{e}]  {path}{cut}"),
+            None => writeln!(out, "{indent}{name}  {path}{cut}"),
+        };
         for child in node
             .get("children")
             .and_then(|v| v.as_array())
             .into_iter()
             .flatten()
         {
-            walk(child, depth + 1);
+            walk(out, child, depth + 1);
         }
     }
 
@@ -4077,7 +4139,15 @@ fn render_flow_trace_text(payload: &serde_json::Value) {
         .or_else(|| payload.get("name"))
         .and_then(|v| v.as_str())
         .unwrap_or("?");
-    println!("Flow trace from '{root_name}':");
+    // nw-113: the owner root is labelled by its file, as in the tree.
+    let root_path = payload
+        .get("tree")
+        .unwrap_or(payload)
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let root_name = nestweaver_schema::symbol_display_name(root_name, root_path);
+    let _ = writeln!(out, "Flow trace from '{root_name}':");
 
     // A class root expands to one tree per method.
     //
@@ -4108,19 +4178,158 @@ fn render_flow_trace_text(payload: &serde_json::Value) {
                 .get("methods_total")
                 .and_then(serde_json::Value::as_u64)
             {
-                Some(total) => println!("  (showing {shown} of {total} methods)"),
-                None => println!("  (method list truncated)"),
+                Some(total) => {
+                    let _ = writeln!(out, "  (showing {shown} of {total} methods)");
+                }
+                None => {
+                    let _ = writeln!(out, "  (method list truncated)");
+                }
             }
         }
         for tree in trees {
-            walk(tree, 0);
+            walk(out, tree, 0);
         }
         return;
     }
     if let Some(tree) = payload.get("tree") {
-        walk(tree, 0);
+        walk(out, tree, 0);
     } else {
-        walk(payload, 0);
+        walk(out, payload, 0);
+    }
+}
+
+#[cfg(test)]
+mod context_header_tests {
+    /// nw-113: the header says owners are listed last, since they rank after
+    /// every real symbol rather than by relevance.
+    /// nw-113 final round: a body cut to fit the budget is reported as such,
+    /// never as "0 symbol(s) dropped"; a dropped symbol keeps its own line.
+    #[test]
+    fn read_symbols_truncation_lines_name_what_was_cut() {
+        let window = |truncated: bool| nestweaver_engine::read_symbols::SymbolWindow {
+            uid: "sym:x".into(),
+            name: "big".into(),
+            kind: "Function".into(),
+            path: "src/big.rs".into(),
+            start_line: 1,
+            end_line: 900,
+            body: "fn big() {".into(),
+            body_available: true,
+            is_neighbor: false,
+            stale_span: false,
+            relocated_from_line: None,
+            body_truncated: truncated,
+        };
+        let cut = nestweaver_engine::read_symbols::ReadSymbolsResult {
+            symbols: vec![window(true)],
+            truncated: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::read_symbols_truncation_lines(&cut),
+            ["body truncated to fit the token budget"]
+        );
+        let dropped = nestweaver_engine::read_symbols::ReadSymbolsResult {
+            symbols: vec![window(false)],
+            dropped: vec!["sym:y".into()],
+            truncated: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::read_symbols_truncation_lines(&dropped),
+            ["truncated: 1 symbol(s) dropped for token budget"]
+        );
+        let whole = nestweaver_engine::read_symbols::ReadSymbolsResult {
+            symbols: vec![window(false)],
+            ..Default::default()
+        };
+        assert!(super::read_symbols_truncation_lines(&whole).is_empty());
+    }
+
+    #[test]
+    fn connected_header_says_owners_are_listed_last() {
+        assert_eq!(
+            super::connected_symbols_header(4, 2, 0),
+            "Connected (4 symbols, ranked by relevance; top-level `<module>` owners listed last):"
+        );
+    }
+
+    /// nw-113 final review Minor 3: with no owner listed or left out, both
+    /// headings are 12.0.4's, word for word.
+    #[test]
+    fn connected_headers_without_owners_keep_the_baseline_text() {
+        assert_eq!(
+            super::connected_symbols_header(4, 0, 0),
+            "Connected (4 symbols, ranked by relevance):"
+        );
+        assert_eq!(
+            super::cli::brain_render::brain_connected_header(5, 11, None, 0, 0),
+            "Connected (5 of 11, ranked by relevance):"
+        );
+        assert_eq!(
+            super::cli::brain_render::brain_connected_header(5, 11, Some((40, 100)), 0, 0),
+            "Connected (5 of 11, ~40/100 tokens, ranked by relevance):"
+        );
+    }
+
+    /// nw-113 final round: code and brain context headers both say how many
+    /// owners the cap left out of the count, so `11 of 11` is never printed
+    /// beside `+3 more files' top-level code` without a word.
+    #[test]
+    fn connected_headers_count_omitted_owners_alike() {
+        let clause = "top-level `<module>` owners listed last, 3 more not counted";
+        assert_eq!(
+            super::connected_symbols_header(4, 3, 3),
+            format!("Connected (4 symbols, ranked by relevance; {clause}):")
+        );
+        assert_eq!(
+            super::cli::brain_render::brain_connected_header(11, 11, None, 3, 3),
+            format!("Connected (11 of 11, ranked by relevance; {clause}):")
+        );
+        assert_eq!(
+            super::cli::brain_render::brain_connected_header(5, 11, Some((40, 100)), 1, 0),
+            "Connected (5 of 11, ~40/100 tokens, ranked by relevance; top-level `<module>` \
+             owners listed last):"
+        );
+        assert_eq!(
+            super::connected_symbols_header(4, 0, 2),
+            "Connected (4 symbols, ranked by relevance; top-level `<module>` owners listed \
+             last, 2 more not counted):"
+        );
+    }
+}
+
+#[cfg(test)]
+mod flow_trace_text_tests {
+    /// nw-113: an owner root is labelled `path::<module>` in the heading and
+    /// the root row, even when the payload names it bare.
+    #[test]
+    fn owner_root_is_labelled_by_its_file() {
+        let payload = serde_json::json!({
+            "root_name": "<module>",
+            "tree": {
+                "name": "<module>",
+                "file_path": "src/a.js",
+                "children": [
+                    { "name": "listen", "file_path": "src/server.js", "edge_type": "CALLS", "children": [] }
+                ],
+            },
+        });
+        let mut out = Vec::new();
+        super::render_flow_trace_text_to(&mut out, &payload);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with("Flow trace from 'src/a.js::<module>':\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n  src/a.js::<module>  src/a.js\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n    listen  [CALLS]  src/server.js\n"),
+            "{text}"
+        );
     }
 }
 
@@ -4397,7 +4606,13 @@ fn render_affected_tests_result(
                 "  {} (conf {:.2}) — {}",
                 file.test_file,
                 file.confidence,
-                file.tests.join(", ")
+                // nw-113: a file its own top-level code selected names no
+                // test; the text says why it runs.
+                if file.tests.is_empty() && file.selected_by.is_some() {
+                    "(top-level code)".to_string()
+                } else {
+                    file.tests.join(", ")
+                }
             );
         }
         println!();
@@ -4740,7 +4955,9 @@ fn render_dead_code_text(payload: &serde_json::Value) {
         // symbol falls out unreachable. That is the absence of a finding, not
         // a finding, and it has to be said before the numbers rather than
         // after them.
-        if entry_points == 0 && total > 0 {
+        // nw-113: `<module>` owners seed the walk too; they are counted in
+        // `module_owner_roots`, not `entry_points`.
+        if entry_points == 0 && num("module_owner_roots") == 0 && total > 0 {
             println!(
                 "Coverage DEGRADED: no entry point was found, so the reachability walk had \
                  no seed and every symbol below is unreachable BY CONSTRUCTION. This is not \
@@ -6254,10 +6471,13 @@ enum Commands {
     /// Read a symbol's source span (start_line..end_line) — just the symbol,
     /// not the whole file. Optionally include adjacent symbols; token-budget aware.
     #[command(
-        after_help = "Examples:\n  nestweaver read-symbols greet --neighbors 1\n  nestweaver read-symbols sym:... --token-budget 4000 --json"
+        after_help = "Examples:\n  nestweaver read-symbols greet --neighbors 1\n  nestweaver read-symbols src/app.js::init\n  nestweaver read-symbols 'src/app.js::<module>'\n  nestweaver read-symbols sym:... --token-budget 4000 --json"
     )]
     ReadSymbols {
-        /// Symbol UIDs, names, or FQNs to read.
+        /// Symbol UIDs, names, FQNs, or path::name specs to read. The path is a
+        /// repo-relative path or a suffix of one; path::<module> reads the
+        /// file's top-level code, with function, class and method bodies
+        /// elided as ⋮.
         #[arg(required = true)]
         targets: Vec<String>,
         #[arg(
@@ -6268,7 +6488,7 @@ enum Commands {
         neighbors: u8,
         #[arg(
             long = "token-budget",
-            help = "Approximate token budget for the combined output"
+            help = "Approximate token budget for the combined output. A first symbol larger than the budget is cut to fit and marked body_truncated; 0 returns the first symbol whole"
         )]
         token_budget: Option<usize>,
         #[arg(
@@ -6374,7 +6594,7 @@ enum Commands {
     /// Traverses incoming CALLS, IMPORTS, EXTENDS, and IMPLEMENTS edges
     /// to find all symbols that would be affected by a change.
     #[command(
-        after_help = "Examples:\n  nestweaver impact \"processPayment\" --depth 5\n  nestweaver impact \"sym:repo:...:abc:42\" --confidence 0.8 --json\n  nestweaver impact \"processPayment\" --depth 15 --min-score 0\n\nNote: paths whose decayed impact score falls below --min-score (default 0.10)\nare pruned; a depth-4 chain of 0.5-confidence edges scores 0.0625 and is dropped.\nWhen pruning occurs the CLI says so in a text note. JSON always uses the same\nobject envelope with `nodes` and `impact_nodes` aliases, counts, and truncation\nflags. Pass --min-score 0 to disable score pruning; depth and result limits\nstill apply."
+        after_help = "Examples:\n  nestweaver impact \"processPayment\" --depth 5\n  nestweaver impact \"src/app.js::<module>\"\n  nestweaver impact \"sym:repo:...:abc:42\" --confidence 0.8 --json\n  nestweaver impact \"processPayment\" --depth 15 --min-score 0\n\nNote: paths whose decayed impact score falls below --min-score (default 0.10)\nare pruned; a depth-4 chain of 0.5-confidence edges scores 0.0625 and is dropped.\nWhen pruning occurs the CLI says so in a text note. JSON always uses the same\nobject envelope with `nodes` and `impact_nodes` aliases, counts, and truncation\nflags. Pass --min-score 0 to disable score pruning; depth and result limits\nstill apply."
     )]
     Impact {
         /// Symbol name or UID to analyze
@@ -6384,6 +6604,12 @@ enum Commands {
         /// it is, the not_found response (JSON and text) carries
         /// `did_you_mean` suggestions from the closest substring matches,
         /// when any exist.
+        ///
+        /// A path::name spec narrows by file (a repo-relative path or a suffix
+        /// of one), then by container (Class::method); one matching neither is
+        /// not found, with path::name suggestions. path::<module> names a
+        /// file's top-level code. Callers that are top-level code are labelled
+        /// path::<module>.
         name_or_uid: String,
         #[arg(
             long,
@@ -6813,11 +7039,14 @@ enum Commands {
     /// Pass symbol names, UIDs, or file paths. Returns connected symbols
     /// ranked by structural relevance via Personalized PageRank.
     /// Use --feature with --config to resolve a declared feature bundle instead.
+    /// Files' top-level code (path::<module>) ranks after every real symbol;
+    /// at most 3 are listed and the rest are counted as "+N more files'
+    /// top-level code".
     #[command(
-        after_help = "Examples:\n  nestweaver context processPayment CheckoutService\n  nestweaver context src/checkout/payment.ts\n  nestweaver context sym:repo:...:abc:42\n  nestweaver context --feature device-pairing --config ./instance.toml"
+        after_help = "Examples:\n  nestweaver context processPayment CheckoutService\n  nestweaver context src/checkout/payment.ts\n  nestweaver context src/app.js::init 'src/app.js::<module>'\n  nestweaver context sym:repo:...:abc:42\n  nestweaver context --feature device-pairing --config ./instance.toml"
     )]
     Context {
-        /// Symbol names, UIDs, or file paths to seed from (not required when --feature is set)
+        /// Symbol names, UIDs, path::name specs, or file paths to seed from (not required when --feature is set)
         #[arg(required_unless_present = "feature")]
         seeds: Vec<String>,
         #[arg(long, help = "Feature name from instance config")]
@@ -7839,7 +8068,9 @@ enum Commands {
         after_help = "Examples:\n  nestweaver flow-trace handleRequest\n  nestweaver flow-trace \"sym:repo:...:abc:42\" --max-depth 3 --json"
     )]
     FlowTrace {
-        #[arg(help = "Symbol name or full UID to trace from")]
+        #[arg(
+            help = "Symbol name, path::name spec (path::<module> for a file's top-level code), or full UID to trace from"
+        )]
         symbol: String,
         #[arg(
             long,
@@ -11289,6 +11520,16 @@ fn print_pr_impact_hook(result: &BlastRadiusResult, breaking: &[BreakingChange])
                 pr_impact_degraded_reason(result)
             );
         }
+    }
+
+    // nw-113: a changed file that is only top-level code says so and names
+    // what that code calls (`top_level_callees`, never affected symbols).
+    for note in result
+        .notifications
+        .iter()
+        .filter(|n| n.descriptor == "changed-file-top-level-only")
+    {
+        println!("  {}", note.message);
     }
 
     // Top ~5 affected symbols (already sorted by impact_score, descending).
@@ -18226,28 +18467,30 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // The SAME default the `code_context` tool applies. A cap on
                     // one route only is how these two drifted apart before.
                     let effective = limit.unwrap_or(nestweaver_engine::CODE_CONTEXT_DEFAULT_LIMIT);
-                    // Ask for one MORE than the cap, exactly as the
-                    // `code_context` tool does, so the extra row proves more
-                    // exist. Without this the direct path applied the same 500
-                    // cap as the daemon route but could not TELL it had — a
-                    // capped answer rendered identically to a complete one,
-                    // which is the silent truncation the cap was supposed to
-                    // stop being.
-                    build_context_with_intent(
-                        &store,
-                        &seeds,
-                        parsed_intent,
-                        Some(effective.saturating_add(1)),
-                    )
-                    .map(|mut result| {
-                        let truncated = result.connected.len() > effective;
-                        if truncated {
-                            result.connected.truncate(effective);
-                        }
-                        result.limit = Some(effective);
-                        result.truncated = Some(truncated);
-                        result
-                    })
+                    // Exactly the cap, as the `code_context` tool asks: the
+                    // engine's `connected_total` is what proves more exist, so
+                    // a capped answer never renders as a complete one. Asking
+                    // for one more let the refill fill that row and the trim
+                    // cut a `<module>` owner off the tail (nw-113).
+                    build_context_with_intent(&store, &seeds, parsed_intent, Some(effective))
+                        .map(|mut result| {
+                            let returned = result.connected.len();
+                            let truncated = result.connected_total.unwrap_or(returned) > returned;
+                            result.limit = Some(effective);
+                            result.truncated = Some(truncated);
+                            result
+                        })
+                        // nw-113: the same envelope, and so the same suggestions,
+                        // as the `code_context` tool on the daemon route.
+                        .map_err(|error| {
+                            nestweaver_mcp::tools::seeds_not_found(
+                                &store,
+                                error,
+                                &seeds,
+                                &["No matching symbols found.", "No symbols found in file(s):"],
+                                None,
+                            )
+                        })
                 }
             };
             match built {
@@ -20378,10 +20621,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         rendered.contains("not found") || rendered.contains("no symbol found")
                     } =>
                 {
+                    // nw-113: the tool's envelope carries the same
+                    // suggestions `impact` gives a miss.
+                    let candidates = envelope_did_you_mean(&error);
                     if json {
-                        print_json_not_found("symbol", &symbol);
+                        print_json_not_found_suggesting("symbol", &symbol, &candidates);
                     }
-                    eprintln!("Symbol '{symbol}' not found.");
+                    eprint_symbol_not_found(&symbol, &candidates);
                     return Ok((EXIT_NOT_FOUND, None));
                 }
                 Err(error) => return Err(error),
@@ -20872,6 +21118,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         affected_symbols: Vec::new(),
                         affected_symbol_count: 0,
                         affected_clusters: Vec::new(),
+                        top_level_callees: Vec::new(),
                         risk_level: RiskLevel::Low,
                         summary: "No changed files detected.".to_string(),
                         org_wide: None,
@@ -22507,9 +22754,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                         .map_err(|e| anyhow::anyhow!("deserialize: {e}"))?;
                                 let s = &d.symbol;
                                 if out.verbose {
-                                    println!("Symbol: {} [{}]", s.name, s.uid);
+                                    println!("Symbol: {} [{}]", s.display_name(), s.uid);
                                 } else {
-                                    println!("Symbol: {}", s.name);
+                                    println!("Symbol: {}", s.display_name());
                                 }
                                 println!("Kind: {}", s.kind);
                                 println!("File: {}:{}", s.file_path, s.start_line);
@@ -22522,12 +22769,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                         if out.verbose {
                                             println!(
                                                 "  {} ({}:{}) [{}]",
-                                                c.name, c.file_path, c.start_line, c.uid
+                                                c.display_name(),
+                                                c.file_path,
+                                                c.start_line,
+                                                c.uid
                                             );
                                         } else {
                                             println!(
                                                 "  {} ({}:{})",
-                                                c.name, c.file_path, c.start_line
+                                                c.display_name(),
+                                                c.file_path,
+                                                c.start_line
                                             );
                                         }
                                     }
@@ -22540,12 +22792,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                         if out.verbose {
                                             println!(
                                                 "  {} ({}:{}) [{}]",
-                                                c.name, c.file_path, c.start_line, c.uid
+                                                c.display_name(),
+                                                c.file_path,
+                                                c.start_line,
+                                                c.uid
                                             );
                                         } else {
                                             println!(
                                                 "  {} ({}:{})",
-                                                c.name, c.file_path, c.start_line
+                                                c.display_name(),
+                                                c.file_path,
+                                                c.start_line
                                             );
                                         }
                                     }
@@ -22579,14 +22836,17 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                         _ => {
                             // not_found
+                            // nw-113: the daemon sends the same suggestions
+                            // `impact` gives a miss.
+                            let candidates = value_did_you_mean(&value);
                             if json {
                                 // nw-399: through the shared emitter. These
                                 // bytes are the MODEL every other not-found arm
                                 // was changed to copy, so they must not be a
                                 // second, independent copy of the shape.
-                                print_json_not_found("name", &name_or_uid);
+                                print_json_not_found_suggesting("name", &name_or_uid, &candidates);
                             } else {
-                                eprintln!("Symbol '{name_or_uid}' not found.");
+                                eprint_symbol_not_found(&name_or_uid, &candidates);
                             }
                             return Ok((EXIT_NOT_FOUND, None));
                         }
@@ -22604,9 +22864,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     } else {
                         let s = &detail.symbol;
                         if out.verbose {
-                            println!("Symbol: {} [{}]", s.name, s.uid);
+                            println!("Symbol: {} [{}]", s.display_name(), s.uid);
                         } else {
-                            println!("Symbol: {}", s.name);
+                            println!("Symbol: {}", s.display_name());
                         }
                         println!("Kind: {}", s.kind);
                         println!("File: {}:{}", s.file_path, s.start_line);
@@ -22620,10 +22880,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 if out.verbose {
                                     println!(
                                         "  {} ({}:{}) [{}]",
-                                        c.name, c.file_path, c.start_line, c.uid
+                                        c.display_name(),
+                                        c.file_path,
+                                        c.start_line,
+                                        c.uid
                                     );
                                 } else {
-                                    println!("  {} ({}:{})", c.name, c.file_path, c.start_line);
+                                    println!(
+                                        "  {} ({}:{})",
+                                        c.display_name(),
+                                        c.file_path,
+                                        c.start_line
+                                    );
                                 }
                             }
                         }
@@ -22636,10 +22904,18 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 if out.verbose {
                                     println!(
                                         "  {} ({}:{}) [{}]",
-                                        c.name, c.file_path, c.start_line, c.uid
+                                        c.display_name(),
+                                        c.file_path,
+                                        c.start_line,
+                                        c.uid
                                     );
                                 } else {
-                                    println!("  {} ({}:{})", c.name, c.file_path, c.start_line);
+                                    println!(
+                                        "  {} ({}:{})",
+                                        c.display_name(),
+                                        c.file_path,
+                                        c.start_line
+                                    );
                                 }
                             }
                         }
@@ -22647,10 +22923,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     Ok((EXIT_SUCCESS, None))
                 }
                 LookupResult::NotFound => {
+                    let candidates = nestweaver_engine::symbol_lookup_suggestions(
+                        &store,
+                        &name_or_uid,
+                        instance.as_deref(),
+                    );
                     if json {
-                        print_json_not_found("name", &name_or_uid);
+                        print_json_not_found_suggesting("name", &name_or_uid, &candidates);
                     } else {
-                        eprintln!("Symbol '{name_or_uid}' not found.");
+                        eprint_symbol_not_found(&name_or_uid, &candidates);
                     }
                     Ok((EXIT_NOT_FOUND, None))
                 }
@@ -23235,7 +23516,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                             .collect()
                                     })
                                     .unwrap_or_default();
-                                eprint_impact_not_found(&name_or_uid, &candidates);
+                                eprint_symbol_not_found(&name_or_uid, &candidates);
                             }
                             return Ok((EXIT_NOT_FOUND, None));
                         }
@@ -23376,7 +23657,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         #[derive(serde::Serialize)]
                         struct ImpactNodeJson<'a> {
                             uid: &'a str,
-                            name: &'a str,
+                            name: std::borrow::Cow<'a, str>,
                             file_path: &'a str,
                             start_line: u32,
                             edge_type: &'a str,
@@ -23393,7 +23674,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             .iter()
                             .map(|&n| ImpactNodeJson {
                                 uid: &n.uid,
-                                name: &n.name,
+                                name: nestweaver_schema::symbol_display_name(&n.name, &n.file_path),
                                 file_path: &n.file_path,
                                 start_line: n.start_line,
                                 edge_type: &n.edge_type,
@@ -23481,7 +23762,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 println!(
                                     "  [depth {}] {} via {} ({:.2}) — {}:{} [{}]",
                                     n.depth,
-                                    n.name,
+                                    nestweaver_schema::symbol_display_name(&n.name, &n.file_path),
                                     n.edge_type,
                                     n.confidence,
                                     n.file_path,
@@ -23492,7 +23773,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 println!(
                                     "  [depth {}] {} via {} ({:.2}) — {}:{}",
                                     n.depth,
-                                    n.name,
+                                    nestweaver_schema::symbol_display_name(&n.name, &n.file_path),
                                     n.edge_type,
                                     n.confidence,
                                     n.file_path,
@@ -23556,7 +23837,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             )?
                         );
                     } else {
-                        eprint_impact_not_found(&name_or_uid, &candidates);
+                        eprint_symbol_not_found(&name_or_uid, &candidates);
                     }
                     Ok((EXIT_NOT_FOUND, None))
                 }
@@ -27156,7 +27437,10 @@ enum ResolveResult {
 /// Resolve a name-or-uid to a UID.
 /// Returns `Ambiguous` when the name matches multiple symbols (callers should report and exit 3).
 fn resolve_uid(store: &GraphStore, name_or_uid: &str) -> anyhow::Result<ResolveResult> {
-    if name_or_uid.contains(':') {
+    // nw-113: a `file::name` spec contains ':' but is a qualified name.
+    let qualified = !name_or_uid.starts_with("sym:")
+        && nestweaver_schema::split_file_qualifier(name_or_uid).is_some();
+    if name_or_uid.contains(':') && !qualified {
         // Treat as UID directly.
         match store.lookup_symbol(name_or_uid) {
             Ok(sym) => Ok(ResolveResult::Found(sym.uid)),
@@ -27165,7 +27449,7 @@ fn resolve_uid(store: &GraphStore, name_or_uid: &str) -> anyhow::Result<ResolveR
         }
     } else {
         let mut matches = store
-            .lookup_symbols_by_name(name_or_uid)
+            .lookup_symbols_by_spec(name_or_uid)
             .map_err(|e| anyhow::anyhow!(e))?;
         match matches.len() {
             0 => Ok(ResolveResult::NotFound),
@@ -27231,6 +27515,29 @@ fn resolve_uid_with_repo_filter(
     }
 }
 
+/// The `Connected (...)` heading of code and feature context. nw-113: owners
+/// rank after every real symbol, not by relevance, and the heading says so.
+///
+/// nw-113 final round: when the owner cap left owners out, the heading says
+/// how many, in the words `brain context`'s heading uses.
+///
+/// nw-113 final review Minor 3: with no owner listed or left out, it is
+/// 12.0.4's heading.
+fn connected_symbols_header(count: usize, owners_listed: usize, owners_omitted: usize) -> String {
+    let owners = cli::brain_render::owner_order_clause(owners_listed, owners_omitted)
+        .map(|clause| format!("; {clause}"))
+        .unwrap_or_default();
+    format!("Connected ({count} symbols, ranked by relevance{owners}):")
+}
+
+/// How many of `nodes` are `<module>` owners, for [`connected_symbols_header`].
+fn owners_listed(nodes: &[nestweaver_engine::ContextNode]) -> usize {
+    nodes
+        .iter()
+        .filter(|node| nestweaver_schema::uid::is_module_owner_uid(&node.uid))
+        .count()
+}
+
 /// Print a human-readable representation of a `ContextResult`.
 fn print_context_text(result: &ContextResult) {
     // nw-393: `Seeds (5 resolved):` was printed for a bare-name input that
@@ -27260,8 +27567,12 @@ fn print_context_text(result: &ContextResult) {
     if !result.connected.is_empty() {
         println!();
         println!(
-            "Connected ({} symbols, ranked by relevance):",
-            result.connected.len()
+            "{}",
+            connected_symbols_header(
+                result.connected.len(),
+                owners_listed(&result.connected),
+                result.module_owners_omitted,
+            )
         );
         for node in &result.connected {
             println!(
@@ -27277,6 +27588,14 @@ fn print_context_text(result: &ContextResult) {
     // notice belongs to the RESULT, not to the timing line that happened to
     // carry it. Printed after the rows, where a reader who scrolled to the end
     // of a short list is looking.
+    // nw-113: owners beyond the engine's cap are counted, not listed.
+    if result.module_owners_omitted > 0 {
+        println!(
+            "  +{} more files' top-level code",
+            result.module_owners_omitted
+        );
+    }
+
     if let Some(notice) =
         context_truncation_notice(result.truncated_by, result.limit, result.token_budget)
     {
@@ -27331,8 +27650,12 @@ fn print_feature_context_text(result: &FeatureContextResult) {
     if !result.connected.is_empty() {
         println!();
         println!(
-            "Connected ({} symbols, ranked by relevance):",
-            result.connected.len()
+            "{}",
+            connected_symbols_header(
+                result.connected.len(),
+                owners_listed(&result.connected),
+                result.module_owners_omitted,
+            )
         );
         for node in &result.connected {
             println!(
@@ -27340,6 +27663,14 @@ fn print_feature_context_text(result: &FeatureContextResult) {
                 node.name, node.kind, node.file_path, node.start_line, node.relevance
             );
         }
+    }
+
+    // nw-113: owners beyond the engine's cap are counted, not listed.
+    if result.module_owners_omitted > 0 {
+        println!(
+            "  +{} more files' top-level code",
+            result.module_owners_omitted
+        );
     }
 
     // Same reason as `print_context_text`: `--stats` is off by default and a
@@ -27518,6 +27849,32 @@ fn render_read_symbols_unreadable_root(
     Ok((EXIT_ERROR, None))
 }
 
+/// nw-113: what a `read-symbols` budget cut says: a dropped symbol is
+/// counted, and a first symbol cut to fit is reported as a body truncation
+/// rather than as "0 symbol(s) dropped".
+fn read_symbols_truncation_lines(
+    res: &nestweaver_engine::read_symbols::ReadSymbolsResult,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if res.symbols.iter().any(|w| w.body_truncated) {
+        lines.push("body truncated to fit the token budget".to_string());
+    }
+    if res.truncated && !res.dropped.is_empty() {
+        lines.push(format!(
+            "truncated: {} symbol(s) dropped for token budget",
+            res.dropped.len()
+        ));
+    }
+    // A first symbol returned whole over the budget (a budget of 0, or one
+    // smaller than the cut marker) says so in its own words.
+    if lines.is_empty()
+        && let Some(overrun) = &res.budget_exceeded_by_first_symbol
+    {
+        lines.push(overrun.note.clone());
+    }
+    lines
+}
+
 /// Render a `read_symbols` result and compute its exit code.
 ///
 /// Shared by the daemon and direct paths so `--json` and the exit-code
@@ -27536,18 +27893,33 @@ fn render_read_symbols(
         for nf in &res.not_found {
             eprintln!("not found: {nf}");
         }
+        // nw-113: a dropped qualifier is said out loud, not silently
+        // answered with whatever shares the last segment.
+        for ignored in &res.qualifier_ignored {
+            eprintln!("warning: {}: {}", ignored.query, ignored.note);
+        }
         for a in &res.ambiguous {
+            // An older daemon sends no hint; its answer was this one.
+            let hint = if a.hint.is_empty() {
+                "pass a UID or path::name"
+            } else {
+                a.hint.as_str()
+            };
             eprintln!(
-                "ambiguous: {} \u{2192} {} candidates (pass a UID)",
+                "ambiguous: {} \u{2192} {} candidates ({hint})",
                 a.query,
                 a.candidate_uids.len()
             );
+            // nw-113: name each candidate's file, so `path::name` can pick one.
+            for c in &a.candidates {
+                eprintln!(
+                    "  {} [{}] {} {}:{}",
+                    c.uid, c.kind, c.name, c.file_path, c.start_line
+                );
+            }
         }
-        if res.truncated {
-            eprintln!(
-                "truncated: {} symbol(s) dropped for token budget",
-                res.dropped.len()
-            );
+        for line in read_symbols_truncation_lines(res) {
+            eprintln!("{line}");
         }
     }
     // Exit 2 when targets were requested but none resolved to a symbol
@@ -31034,6 +31406,8 @@ mod context_json_renderer_tests {
             seeds_truncated: None,
             seed_resolution_limit: None,
             admitted_before_cap: None,
+            module_owners_omitted: 0,
+            below_floor_rows_cut: 0,
         }
     }
 
@@ -31076,6 +31450,17 @@ mod context_json_renderer_tests {
         let value = brain_context_json_value(&result, 2, Some(10_000), &upstream);
         assert_eq!(value["total"], 10);
         assert_eq!(value["truncated_by"], "limit");
+    }
+
+    /// nw-113: the engine's omitted-owner count reaches the CLI JSON.
+    #[test]
+    fn brain_context_json_reports_omitted_owners() {
+        let mut result = degraded_context();
+        let value = brain_context_json_value(&result, 30, None, &Default::default());
+        assert!(value.get("module_owners_omitted").is_none(), "{value}");
+        result.module_owners_omitted = 4;
+        let value = brain_context_json_value(&result, 30, None, &Default::default());
+        assert_eq!(value["module_owners_omitted"], 4, "{value}");
     }
 
     #[test]
@@ -35078,6 +35463,7 @@ credential_method = "gh"
             is_neighbor: false,
             stale_span: false,
             relocated_from_line: None,
+            body_truncated: false,
         };
         let out = read_symbols_window_text(&w);
         assert!(
@@ -35106,6 +35492,7 @@ credential_method = "gh"
             is_neighbor: false,
             stale_span: true,
             relocated_from_line: None,
+            body_truncated: false,
         };
         let out = read_symbols_window_text(&w);
         assert!(out.contains("source changed since indexing"), "{out:?}");
@@ -35131,6 +35518,7 @@ credential_method = "gh"
             is_neighbor: false,
             stale_span: false,
             relocated_from_line: Some(10),
+            body_truncated: false,
         };
         let out = read_symbols_window_text(&w);
         assert!(out.contains("moved from line 10 since indexing"), "{out:?}");
@@ -35154,6 +35542,7 @@ credential_method = "gh"
             is_neighbor: false,
             stale_span: false,
             relocated_from_line: None,
+            body_truncated: false,
         };
         let text = read_symbols_window_text(&w);
         let body: Vec<&str> = text.lines().skip(1).collect();
@@ -35184,6 +35573,7 @@ credential_method = "gh"
             is_neighbor: false,
             stale_span: false,
             relocated_from_line: None,
+            body_truncated: false,
         };
         let res = nestweaver_engine::read_symbols::ReadSymbolsResult {
             symbols: vec![unreadable("greet")],
@@ -40581,6 +40971,7 @@ mod resolver_generation_gate_tests {
             affected_symbols: Vec::new(),
             affected_symbol_count: 0,
             affected_clusters: Vec::new(),
+            top_level_callees: Vec::new(),
             risk_level: RiskLevel::Low,
             summary: "1 changed symbol, 0 affected".to_string(),
             org_wide: None,
@@ -41054,6 +41445,37 @@ mod cli_honesty_sweep_tests {
             publication_text_note(None).is_none(),
             "an ordinary read must print no publication note"
         );
+    }
+
+    // ── nw-113 ───────────────────────────────────────────────────────────
+
+    /// A miss's `did_you_mean` is read from the tool's not-found envelope,
+    /// so `flow-trace`, `context` and `brain context` print the suggestions
+    /// the tool computed; a miss without them yields none.
+    #[test]
+    fn did_you_mean_is_read_from_the_not_found_envelope() {
+        let with = nestweaver_mcp::tools::target_not_found(
+            "no symbol found: 'nope.py::f'",
+            "symbol",
+            serde_json::json!("nope.py::f"),
+            &["shop/a.py::f".to_string()],
+        )
+        .context("flow_trace failed");
+        assert_eq!(envelope_did_you_mean(&with), ["shop/a.py::f"]);
+        let without = nestweaver_mcp::tools::target_not_found(
+            "no symbol found: 'x'",
+            "symbol",
+            serde_json::json!("x"),
+            &[],
+        );
+        assert!(envelope_did_you_mean(&without).is_empty());
+        assert!(envelope_did_you_mean(&anyhow::anyhow!("boom")).is_empty());
+        let payload = cli::brain::brain_context_not_found_payload(
+            "No seeds resolved.",
+            &["nope.py::f".to_string()],
+            &["shop/a.py::f".to_string()],
+        );
+        assert_eq!(payload["did_you_mean"], serde_json::json!(["shop/a.py::f"]));
     }
 
     // ── nw-399 ───────────────────────────────────────────────────────────

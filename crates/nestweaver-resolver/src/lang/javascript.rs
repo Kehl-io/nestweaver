@@ -10,8 +10,9 @@ use crate::workspace::{
 ///
 /// For relative imports (starting with `.` or `..`):
 ///   - Try exact path
-///   - Try with .js, .ts, .tsx, .jsx extensions
-///   - Try as directory index: /index.js, /index.ts, /index.tsx, /index.jsx
+///   - Try with .js, .ts, .tsx, .jsx extensions, then .mts, .cts, .mjs, .cjs
+///   - Try as directory index: /index.js, /index.ts, /index.tsx, /index.jsx,
+///     then /index.mts, /index.cts, /index.mjs, /index.cjs
 ///
 /// For non-relative imports (bare specifiers):
 ///   - Try tsconfig path aliases (e.g., `@/utils` -> `src/utils`)
@@ -59,15 +60,24 @@ fn resolve_relative(
     }
 
     // Try with extensions
-    for ext in &[".js", ".ts", ".tsx", ".jsx"] {
+    for ext in &[".js", ".ts", ".tsx", ".jsx", ".mts", ".cts", ".mjs", ".cjs"] {
         let candidate = format!("{normalized}{ext}");
         if known_files.contains(&candidate.as_str()) {
             return Some(candidate);
         }
     }
 
-    // Try as directory index
-    for ext in &["/index.js", "/index.ts", "/index.tsx", "/index.jsx"] {
+    // Try as directory index (nw-113: module-format indexes too)
+    for ext in &[
+        "/index.js",
+        "/index.ts",
+        "/index.tsx",
+        "/index.jsx",
+        "/index.mts",
+        "/index.cts",
+        "/index.mjs",
+        "/index.cjs",
+    ] {
         let candidate = format!("{normalized}{ext}");
         if known_files.contains(&candidate.as_str()) {
             return Some(candidate);
@@ -203,6 +213,17 @@ mod tests {
         let known = set(&["src/utils.ts"]);
         let result = resolve_import("src/main.ts", "./utils", &known, &empty_ctx());
         assert_eq!(result, Some("src/utils.ts".to_string()));
+    }
+
+    /// nw-113 final review Minor 6: a module-format barrel.
+    #[test]
+    fn resolves_module_format_barrel_import() {
+        for index in ["index.mts", "index.cts", "index.mjs", "index.cjs"] {
+            let file = format!("src/utils/{index}");
+            let known = set(&[file.as_str()]);
+            let result = resolve_import("src/main.mjs", "./utils", &known, &empty_ctx());
+            assert_eq!(result, Some(file.clone()), "{index}");
+        }
     }
 
     #[test]
@@ -415,6 +436,38 @@ mod tests {
             &empty_ctx(),
         );
         assert_eq!(result, Some("src/common/errors/index.ts".to_string()));
+    }
+
+    /// nw-113 item 16: an extensionless specifier reaches a `.mts`, `.cts`,
+    /// `.mjs` or `.cjs` module, after the classic extensions.
+    #[test]
+    fn extensionless_specifiers_reach_module_format_files() {
+        let known = set(&[
+            "src/a.mts",
+            "src/b.cts",
+            "src/c.mjs",
+            "src/d.cjs",
+            "src/e.ts",
+            "src/e.mts",
+        ]);
+        for (specifier, expected) in [
+            ("./a", "src/a.mts"),
+            ("./b", "src/b.cts"),
+            ("./c", "src/c.mjs"),
+            ("./d", "src/d.cjs"),
+            ("./c.mjs", "src/c.mjs"),
+            ("./e", "src/e.ts"),
+        ] {
+            assert_eq!(
+                resolve_import("src/main.ts", specifier, &known, &empty_ctx()),
+                Some(expected.to_string()),
+                "{specifier}"
+            );
+        }
+        assert_eq!(
+            crate::workspace::try_resolve_with_extensions("src/a", &known),
+            Some("src/a.mts".to_string())
+        );
     }
 
     #[test]

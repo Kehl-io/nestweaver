@@ -641,7 +641,7 @@ pub(crate) fn print_brain_context_text(
         // Same correction as the JSON twin: on the daemon route
         // `result.connected` is post-cut, so `Connected (N of M)` printed
         // `N of N` and the HUMAN route lost the disclosure it has had all along.
-        let total = upstream.total(result.connected.len(), cut);
+        let total = upstream.total(result.connected.len() + result.below_floor_rows_cut, cut);
         let used_tokens: usize = result
             .connected
             .iter()
@@ -650,13 +650,21 @@ pub(crate) fn print_brain_context_text(
             // the right one. Unchanged from before nw-316.
             .map(|n| render_cost_tokens(n, false))
             .sum();
-        match token_budget {
-            Some(budget) => println!(
-                "Connected ({} of {}, ~{}/{} tokens, ranked by relevance):",
-                cut, total, used_tokens, budget
-            ),
-            None => println!("Connected ({} of {}, ranked by relevance):", cut, total),
-        }
+        println!(
+            "{}",
+            brain_connected_header(
+                cut,
+                total,
+                token_budget.map(|budget| (used_tokens, budget)),
+                result
+                    .connected
+                    .iter()
+                    .take(cut)
+                    .filter(|n| nestweaver_schema::uid::is_module_owner_uid(&n.uid))
+                    .count(),
+                result.module_owners_omitted,
+            )
+        );
         for n in result.connected.iter().take(cut) {
             if n.location.is_empty() {
                 println!("  {:.4}  {}  [{}]", n.relevance, n.title, n.kind);
@@ -673,6 +681,46 @@ pub(crate) fn print_brain_context_text(
             }
         }
     }
+    // nw-113: owners beyond the engine's cap are counted, not listed.
+    if result.module_owners_omitted > 0 {
+        println!(
+            "  +{} more files' top-level code",
+            result.module_owners_omitted
+        );
+    }
+}
+
+/// nw-113: how a `Connected (...)` heading describes owners: listed last,
+/// and how many the cap left out of the count. Shared by code, feature and
+/// brain context so their headings say the same thing. `None` when no owner
+/// is listed or left out: the heading is then 12.0.4's (final review
+/// Minor 3).
+pub(crate) fn owner_order_clause(owners_listed: usize, owners_omitted: usize) -> Option<String> {
+    match (owners_listed, owners_omitted) {
+        (0, 0) => None,
+        (_, 0) => Some("top-level `<module>` owners listed last".to_string()),
+        (_, omitted) => Some(format!(
+            "top-level `<module>` owners listed last, {omitted} more not counted"
+        )),
+    }
+}
+
+/// `brain context`'s `Connected (N of M, ...)` heading. `tokens` is
+/// `(used, budget)` under `--token-budget`.
+pub(crate) fn brain_connected_header(
+    shown: usize,
+    total: usize,
+    tokens: Option<(usize, usize)>,
+    owners_listed: usize,
+    owners_omitted: usize,
+) -> String {
+    let tokens = tokens
+        .map(|(used, budget)| format!(", ~{used}/{budget} tokens"))
+        .unwrap_or_default();
+    let owners = owner_order_clause(owners_listed, owners_omitted)
+        .map(|clause| format!("; {clause}"))
+        .unwrap_or_default();
+    format!("Connected ({shown} of {total}{tokens}, ranked by relevance{owners}):")
 }
 
 /// Render a daemon-routed `BrainSearchResponse` in the same shape as the
@@ -1246,7 +1294,12 @@ pub(crate) fn brain_context_json_value(
     // On the direct route `result.connected` IS the pre-cut list, so its length
     // is the total. On the daemon route it is what survived the daemon's cut,
     // and the honest total came over the wire.
-    let total = upstream.total(result.connected.len(), returned);
+    // nw-113 R1: rows the store's below-floor keep withheld from the engine's
+    // refill matched as well, so they count in the local total.
+    let total = upstream.total(
+        result.connected.len() + result.below_floor_rows_cut,
+        returned,
+    );
     let truncated = returned < total;
     let budget_cut =
         token_budget.map(|budget| token_budgeted_truncate(&result.connected, budget, false));
@@ -1260,7 +1313,11 @@ pub(crate) fn brain_context_json_value(
         "truncated": truncated,
         // Emitted even when null, matching the MCP twin: one shape parses
         // both routes.
-        "truncated_by": truncated_by.map(nestweaver_engine::TruncationCause::as_str).or(upstream.truncated_by.as_deref()),
+        "truncated_by": truncated_by
+            .map(nestweaver_engine::TruncationCause::as_str)
+            .or(upstream.truncated_by.as_deref())
+            .or_else(|| (result.below_floor_rows_cut > 0 && truncated)
+                .then_some(nestweaver_engine::TruncationCause::Limit.as_str())),
         "semantic_applied": result.semantic_applied,
         "semantic_unavailable": result.semantic_unavailable,
         "degraded_components": result.degraded_components,
@@ -1299,6 +1356,10 @@ pub(crate) fn brain_context_json_value(
     }
     if result.semantic_seed_count > 0 {
         resp["semantic_seed_count"] = serde_json::json!(result.semantic_seed_count);
+    }
+    // nw-113: connected `<module>` owners the engine's cap left out.
+    if result.module_owners_omitted > 0 {
+        resp["module_owners_omitted"] = serde_json::json!(result.module_owners_omitted);
     }
 
     // Feature F7: surface PRF-mined expansion terms for auditing.

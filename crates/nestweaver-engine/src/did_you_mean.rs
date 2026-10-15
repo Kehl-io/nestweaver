@@ -42,13 +42,16 @@ pub const DID_YOU_MEAN_OVER_FETCH: usize = DID_YOU_MEAN_LIMIT * 4;
 /// then path/kind tie-breaks, then file path) comes from that search and is
 /// already deterministic.
 ///
-/// `query` MUST be a bare name, never a UID. Every caller already branches
+/// `query` is a bare name or a `path::name` spec, never a UID. A
+/// `path::name` miss (nw-113) is searched by its name half and each
+/// suggestion is returned as `path::name`, a spec that resolves to that
+/// symbol. Every caller already branches
 /// on `name_or_uid.contains(':')` to route UID input to an exact lookup
 /// (`resolve_uid`, `tool_brain_impact`'s UID branch); a UID substring-matched
 /// against symbol NAMES is never a useful suggestion, so callers should skip
 /// calling this entirely for UID input. (nw-481 counterweight: `impact
 /// <uid-with-colon>` carries no `did_you_mean` key.) This function ALSO
-/// checks `query.contains(':')` itself and returns an empty list — defense
+/// returns an empty list for any other `:` form itself — defense
 /// in depth, so a future caller that forgets that branch still fails safe
 /// instead of substring-searching symbol names for a UID and returning
 /// nonsense. A query that is empty, or whitespace-only after trimming, is
@@ -83,26 +86,98 @@ pub fn did_you_mean_candidates(
     query: &str,
     keep: impl Fn(&Symbol) -> bool,
 ) -> Result<Vec<String>, anyhow::Error> {
-    if query.contains(':') || query.trim().is_empty() {
+    // nw-113: a qualified miss is searched by its last segment and answered
+    // with `path::name` specs (`path::Container::name` for a member); any
+    // other `:` form (a UID) gets nothing.
+    let qualified = if query.starts_with("sym:") {
+        None
+    } else {
+        nestweaver_schema::QualifiedSpec::parse(query)
+    };
+    let search = qualified.as_ref().map_or(query, |spec| spec.name);
+    if search.contains(':') || search.trim().is_empty() {
         return Ok(Vec::new());
     }
 
     let page = store
         .search_symbols_by_name_page(
-            query,
+            search,
             DID_YOU_MEAN_OVER_FETCH,
             &SeedResolutionConfig::default(),
         )
         .map_err(|e| anyhow::anyhow!("search_symbols_by_name_page: {e}"))?;
+    let visible: Vec<&Symbol> = page.symbols.iter().filter(|s| keep(s)).collect();
+    // One container level is enough for the suggestion to resolve: the
+    // lookup matches a container chain from its innermost end.
+    let containers = if qualified.is_some() {
+        let uids: Vec<&str> = visible.iter().map(|s| s.uid.as_str()).collect();
+        store
+            .container_chains(&uids, 1)
+            .map_err(|e| anyhow::anyhow!("container_chains: {e}"))?
+    } else {
+        Default::default()
+    };
 
     let mut seen_names = std::collections::HashSet::new();
     let mut names = Vec::with_capacity(DID_YOU_MEAN_LIMIT);
-    for candidate in page.symbols.iter().filter(|s| keep(s)) {
+    for candidate in visible {
         if names.len() == DID_YOU_MEAN_LIMIT {
             break;
         }
-        if seen_names.insert(candidate.name.clone()) {
-            names.push(candidate.name.clone());
+        let suggestion = if qualified.is_some() {
+            match containers
+                .get(&candidate.uid)
+                .and_then(|chain| chain.first())
+            {
+                Some(container) => {
+                    format!("{}::{container}::{}", candidate.file_path, candidate.name)
+                }
+                None => format!("{}::{}", candidate.file_path, candidate.name),
+            }
+        } else {
+            candidate.display_name().into_owned()
+        };
+        if seen_names.insert(suggestion.clone()) {
+            names.push(suggestion);
+        }
+    }
+    Ok(names)
+}
+
+/// The one text rendering of `did_you_mean` suggestions every CLI miss
+/// prints: `Did you mean: a, b?`. `None` when there are none, so no line is
+/// printed.
+pub fn did_you_mean_line(candidates: &[String]) -> Option<String> {
+    (!candidates.is_empty()).then(|| format!("Did you mean: {}?", candidates.join(", ")))
+}
+
+/// nw-113: suggestions for every qualified seed in `seeds` (`path::name`,
+/// `Class::method`), merged in seed order, deduplicated and bounded by
+/// [`DID_YOU_MEAN_LIMIT`]. `context` and `brain context` call this when no
+/// seed resolved; a bare-name seed gets none, since those commands fall back
+/// to a substring search that already had its chance.
+///
+/// # Errors
+/// Only on a store failure; callers treat it as best-effort like
+/// [`did_you_mean_candidates`].
+pub fn qualified_seed_suggestions(
+    store: &GraphStore,
+    seeds: &[String],
+    keep: impl Fn(&Symbol) -> bool,
+) -> Result<Vec<String>, anyhow::Error> {
+    let mut names: Vec<String> = Vec::new();
+    for seed in seeds {
+        let seed = seed.trim();
+        if seed.starts_with("sym:") || nestweaver_schema::QualifiedSpec::parse(seed).is_none() {
+            continue;
+        }
+        for name in did_you_mean_candidates(store, seed, &keep)? {
+            if names.len() == DID_YOU_MEAN_LIMIT {
+                return Ok(names);
+            }
+            if !names.contains(&name) {
+                names.push(name);
+            }
         }
     }
     Ok(names)
@@ -153,6 +228,73 @@ mod tests {
         let names = did_you_mean_candidates(&store, "project_context", always_keep).unwrap();
 
         assert_eq!(names, vec!["tool_project_context".to_string()]);
+    }
+
+    /// nw-113: a qualified miss is searched by its name half, and each
+    /// suggestion is a `path::name` spec that resolves to that symbol.
+    #[test]
+    fn qualified_miss_suggests_path_qualified_names() {
+        let store = GraphStore::in_memory().unwrap();
+        let mut listen = symbol("s1", "listen", "repo:a");
+        listen.file_path = "src/server.js".to_string();
+        store.insert_symbol(&listen).unwrap();
+
+        let names = did_you_mean_candidates(&store, "nope/missing.js::liste", always_keep).unwrap();
+        assert_eq!(names, vec!["src/server.js::listen".to_string()]);
+        assert!(
+            did_you_mean_candidates(&store, "sym:repo:a:x", always_keep)
+                .unwrap()
+                .is_empty(),
+            "a UID gets no suggestion"
+        );
+    }
+
+    /// nw-113 final round: a `Class::method` or `path::Class::method` miss
+    /// suggests specs that keep the container, so each one resolves to a
+    /// single method; a bare-name suggestion still drops nothing.
+    #[test]
+    fn qualified_miss_suggestions_keep_the_container_chain() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+        let store = GraphStore::in_memory().unwrap();
+        for (uid, name, path, parent) in [
+            ("a-svc", "Svc", "a/Svc.ts", None),
+            ("a-run", "run", "a/Svc.ts", Some("a-svc")),
+            ("b-svc", "Svc", "b.ts", None),
+            ("b-run", "run", "b.ts", Some("b-svc")),
+        ] {
+            let mut s = symbol(uid, name, "repo:a");
+            s.file_path = path.to_string();
+            store.insert_symbol(&s).unwrap();
+            if let Some(parent) = parent {
+                store
+                    .insert_edge(&ResolvedEdge {
+                        source_uid: uid.to_string(),
+                        target_uid: parent.to_string(),
+                        edge_type: EdgeType::MemberOf,
+                        confidence: 1.0,
+                        link_type: None,
+                        evidence: Vec::new(),
+                    })
+                    .unwrap();
+            }
+        }
+        let mut names = did_you_mean_candidates(&store, "WrongClass::run", always_keep).unwrap();
+        names.sort();
+        assert_eq!(names, ["a/Svc.ts::Svc::run", "b.ts::Svc::run"]);
+        let mut names =
+            did_you_mean_candidates(&store, "src/a/svc.ts::Svc::run", always_keep).unwrap();
+        names.sort();
+        assert_eq!(names, ["a/Svc.ts::Svc::run", "b.ts::Svc::run"]);
+    }
+
+    /// One text rendering of the suggestions, for every CLI miss.
+    #[test]
+    fn did_you_mean_line_renders_or_is_absent() {
+        assert_eq!(did_you_mean_line(&[]), None);
+        assert_eq!(
+            did_you_mean_line(&["a.ts::f".to_string(), "b.ts::f".to_string()]).as_deref(),
+            Some("Did you mean: a.ts::f, b.ts::f?")
+        );
     }
 
     /// Counterweight: a genuine miss (no substring hits at all) returns an

@@ -4521,7 +4521,7 @@ impl DaemonService {
             let limit: usize = 64; // Max nodes per watcher cycle
 
             // Symbols
-            if let Ok(symbols) = store.list_all_symbols() {
+            if let Ok(symbols) = store.list_embeddable_symbols() {
                 for sym in symbols
                     .iter()
                     .filter(|s| !store.has_embedding(&s.uid))
@@ -6578,7 +6578,7 @@ fn plan_embeddings(store: &GraphStore, scope: &str, force: bool) -> Result<Embed
 
     if scopes.symbols {
         let symbols = store
-            .list_all_symbols()
+            .list_embeddable_symbols()
             .map_err(|error| embedding_store_status("symbols", error.into()))?;
         scoped += symbols.len() as u64;
         eligible += symbols
@@ -10905,8 +10905,16 @@ impl NestWeaverDaemon for DaemonService {
                 nestweaver_engine::LookupResult::Found(detail) => {
                     serde_json::json!({ "status": "found", "detail": *detail })
                 }
+                // nw-113: the same suggestions `impact` gives a miss.
                 nestweaver_engine::LookupResult::NotFound => {
-                    serde_json::json!({ "status": "not_found" })
+                    nestweaver_schema::responses::with_did_you_mean(
+                        serde_json::json!({ "status": "not_found" }),
+                        &nestweaver_engine::symbol_lookup_suggestions(
+                            &state.store,
+                            name_or_uid,
+                            instance,
+                        ),
+                    )
                 }
                 nestweaver_engine::LookupResult::Ambiguous(candidates) => {
                     serde_json::json!({ "status": "ambiguous", "candidates": candidates })
@@ -11670,7 +11678,7 @@ impl NestWeaverDaemon for DaemonService {
 
                 if do_symbols {
                     let symbols = store
-                        .list_all_symbols()
+                        .list_embeddable_symbols()
                         .map_err(|error| embedding_store_status("symbols", error.into()))?;
                     scoped += symbols.len() as u64;
                     let to_embed: Vec<_> = symbols

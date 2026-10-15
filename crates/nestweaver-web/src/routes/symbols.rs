@@ -30,6 +30,21 @@ pub async fn search(
     Ok(Json(json).into_response())
 }
 
+/// nw-113: a file's symbol list as JSON, its `<module>` owner labelled
+/// `path::<module>` rather than bare.
+fn labelled_symbols_json(
+    symbols: Vec<nestweaver_schema::Symbol>,
+) -> serde_json::Result<serde_json::Value> {
+    let symbols: Vec<_> = symbols
+        .into_iter()
+        .map(|mut symbol| {
+            symbol.name = symbol.display_name().into_owned();
+            symbol
+        })
+        .collect();
+    serde_json::to_value(&symbols)
+}
+
 #[derive(Deserialize, Default)]
 pub struct SymbolLookupParams {
     pub kind: Option<String>,
@@ -44,7 +59,7 @@ async fn symbols_for_file(state: &AppState, path: &str) -> Result<Response, ApiE
     if symbols.is_empty() {
         return Err(ApiError::not_found(format!("file '{path}' not found")));
     }
-    let json = serde_json::to_value(&symbols)?;
+    let json = labelled_symbols_json(symbols)?;
     Ok(Json(json).into_response())
 }
 
@@ -69,7 +84,7 @@ pub async fn symbol_by_uid(
         nestweaver_engine::LookupResult::NotFound => {
             let symbols = state.store.symbols_in_file(&uid)?;
             if !symbols.is_empty() {
-                let json = serde_json::to_value(&symbols)?;
+                let json = labelled_symbols_json(symbols)?;
                 return Ok(Json(json).into_response());
             }
             Err(ApiError::not_found(format!("symbol '{uid}' not found")))
@@ -98,7 +113,7 @@ pub async fn symbols_in_file(
     Query(params): Query<FileParams>,
 ) -> Result<Response, ApiError> {
     let symbols = state.store.symbols_in_file(&params.path)?;
-    let json = serde_json::to_value(&symbols)?;
+    let json = labelled_symbols_json(symbols)?;
     Ok(Json(json).into_response())
 }
 
@@ -144,6 +159,49 @@ pub async fn symbols_top(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nw-113: the file's symbol list labels its owner `path::<module>`.
+    #[tokio::test]
+    async fn symbols_in_file_labels_the_module_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.js"), "function f() {}\nf();\n").unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        nestweaver_engine::index_directory_with_store(
+            &store,
+            &src,
+            &db_path,
+            "test",
+            "https://example.com/r",
+            "sha",
+            false,
+            None,
+        )
+        .unwrap();
+        let state = AppState::new(store, None, db_path);
+        let response = symbols_in_file(
+            State(state),
+            Query(FileParams {
+                path: "a.js".to_string(),
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the file lists its symbols"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let symbols: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let mut names: Vec<&str> = symbols
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["name"].as_str())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a.js::<module>", "f"], "{symbols}");
+    }
 
     /// During a dirty index publication the top-symbols route must say
     /// "ranking unavailable" (503), never answer 200 with an empty list — an

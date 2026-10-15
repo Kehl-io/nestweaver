@@ -102,6 +102,13 @@ pub struct DeadCodeResult {
     /// Measured on a real C++ corpus: 0 of 11,730 reachable, 1,523 called dead
     /// at medium confidence, `coverage: "complete"`.
     pub entry_points: usize,
+    /// nw-113: per-file `<module>` owners that also seeded the walk. They own
+    /// the calls a file makes at load time, so they are roots, but they are
+    /// neither declared entry points nor type-only/declaration symbols, so
+    /// they are counted here and in neither `entry_points` nor
+    /// `excluded_count`.
+    #[serde(default)]
+    pub module_owner_roots: usize,
     /// Languages present in this corpus (by file extension) whose symbols
     /// include ZERO entry points, even though the language contributed at
     /// least one analysed symbol.
@@ -161,7 +168,7 @@ impl DeadCodeResult {
         // nothing to walk to, so nothing was concluded and nothing is offered
         // for deletion. Every other zero-seed run reports 100% dead.
         self.undecodable_symbols == 0
-            && (self.entry_points > 0 || self.total_symbols == 0)
+            && (self.entry_points + self.module_owner_roots > 0 || self.total_symbols == 0)
             && self.languages_without_entry_points.is_empty()
     }
 }
@@ -397,6 +404,7 @@ pub fn serialize_dead_code_page(
         "excluded_count": result.excluded_count, "dead_percentage": result.dead_percentage,
         "coverage": if result.coverage_is_complete() && manifest_load_error.is_none() {"complete"} else {"degraded"},
         "undecodable_symbols": result.undecodable_symbols, "entry_points": result.entry_points,
+        "module_owner_roots": result.module_owner_roots,
         "languages_without_entry_points": result.languages_without_entry_points,
         "min_confidence": request.min_confidence, "requested_min_confidence": request.min_confidence,
         "review_only": true, "high_confidence_available": false,
@@ -799,10 +807,25 @@ fn detect_dead_code_inner(
         .into_iter()
         .map(str::to_string)
         .collect();
+    // nw-113: an owner is excluded from the report below, but it is not a
+    // "type-only/declaration symbol" and is not counted as one.
     let excluded_count = raw_symbols
         .iter()
-        .filter(|s| is_excluded_from_dead_code(s) || function_local.contains(&s.uid))
+        .filter(|s| {
+            !s.is_module_owner()
+                && (is_excluded_from_dead_code(s) || function_local.contains(&s.uid))
+        })
         .count();
+    // nw-113: a file's `<module>` owner is a `Module`, so it is excluded from
+    // the report and the totals like every other module, but it is still an
+    // entry point: it owns the calls the file makes at load time. Seed it
+    // here, before the exclusion drops it, or a function called only at
+    // module load reads as dead.
+    let module_owners: Vec<(String, String)> = raw_symbols
+        .iter()
+        .filter(|s| s.is_module_owner() && s.is_entry_point)
+        .map(|s| (s.uid.clone(), s.file_path.clone()))
+        .collect();
     let all_symbols: Vec<_> = raw_symbols
         .into_iter()
         .filter(|s| !is_excluded_from_dead_code(s) && !function_local.contains(&s.uid))
@@ -833,6 +856,7 @@ fn detect_dead_code_inner(
             // discloses too.
             undecodable_symbols,
             entry_points: 0,
+            module_owner_roots: 0,
             languages_without_entry_points: vec![],
             scope,
         });
@@ -951,6 +975,17 @@ fn detect_dead_code_inner(
             if is_entry {
                 *lang_entries.entry(label).or_insert(0) += 1;
             }
+        }
+    }
+    let module_owner_roots = module_owners.len();
+    for (uid, file_path) in module_owners {
+        entry_point_uids.push(uid);
+        if let Some(lang) = detect_language(std::path::Path::new(&file_path))
+            && language_has_entry_point_model(lang)
+        {
+            *lang_entries
+                .entry(format!("{lang:?}").to_lowercase())
+                .or_insert(0) += 1;
         }
     }
     let mut languages_without_entry_points: Vec<String> = lang_totals
@@ -1268,7 +1303,9 @@ fn detect_dead_code_inner(
         dead_percentage,
         excluded_count,
         undecodable_symbols,
-        entry_points: entry_point_uids.len(),
+        // nw-113: owners seed the walk but are reported on their own.
+        entry_points: entry_point_uids.len() - module_owner_roots,
+        module_owner_roots,
         languages_without_entry_points,
         scope,
     })
@@ -1307,6 +1344,7 @@ mod page_contract_tests {
             excluded_count: 0,
             undecodable_symbols: 0,
             entry_points: 1,
+            module_owner_roots: 0,
             languages_without_entry_points: vec![],
             scope: Some(DeadCodeScope {
                 repos: vec!["repo:a".into()],
@@ -1498,6 +1536,59 @@ mod tests {
     use super::*;
     use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
     use nestweaver_store::GraphStore;
+
+    /// nw-113, end to end through the real index pipeline: a function called
+    /// only at a file's top level has a caller (the file's `<module>` owner,
+    /// an entry point), so it is live. The owner itself is never reported.
+    #[test]
+    fn a_function_called_only_at_module_load_is_not_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("src/lib.ts"),
+            "export function flushBuffer() { return 8; }\nfunction orphan() { return 9; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/ownerless.ts"),
+            "import { flushBuffer } from \"./lib\";\nflushBuffer();\n",
+        )
+        .unwrap();
+        let db = dir.path().join("graph.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        crate::index::index_directory_with_store(
+            &store,
+            &repo,
+            &db,
+            "default",
+            "https://example.com/acme/ownerless.git",
+            "sha",
+            false,
+            None,
+        )
+        .unwrap();
+
+        let result = detect_dead_code(&store).unwrap();
+        let dead: Vec<&str> = result
+            .unreachable_symbols
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect();
+        assert!(!dead.contains(&"flushBuffer"), "{dead:?}");
+        assert!(dead.contains(&"orphan"), "{dead:?}");
+        assert!(
+            !dead.contains(&nestweaver_schema::MODULE_OWNER_NAME),
+            "{dead:?}"
+        );
+        // nw-113: the owner seeds the walk but is neither an "entry point"
+        // nor a "type-only/declaration symbol" in the header counts; it is
+        // reported on its own, and the walk still counts as seeded.
+        assert_eq!(result.entry_points, 0, "{result:?}");
+        assert_eq!(result.excluded_count, 0, "{result:?}");
+        assert_eq!(result.module_owner_roots, 1, "{result:?}");
+        assert!(result.coverage_is_complete(), "{result:?}");
+    }
 
     fn make_symbol(uid: &str, name: &str, is_entry: bool) -> Symbol {
         Symbol {

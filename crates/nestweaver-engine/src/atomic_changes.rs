@@ -108,17 +108,29 @@ pub fn diff_symbols(
     file_path: &str,
     repo_url: &str,
 ) -> Vec<AtomicChange> {
+    // nw-113: the `<module>` owner exists while a file has top-level calls;
+    // it is not an API anything imports, so gaining or losing it (or editing
+    // the top-level code it hashes) is not a symbol change. Everything that
+    // feeds `classify_change` comes through here or `compute_rename_moves`.
+    let old_symbols: Vec<&RawSymbol> = old_symbols
+        .iter()
+        .filter(|s| !s.is_module_owner())
+        .collect();
+    let new_symbols: Vec<&RawSymbol> = new_symbols
+        .iter()
+        .filter(|s| !s.is_module_owner())
+        .collect();
     let mut changes = Vec::new();
 
     // Build canonical_id -> symbol maps
     let old_map: HashMap<String, &RawSymbol> = old_symbols
         .iter()
-        .map(|s| (raw_symbol_canonical_id(s, file_path, repo_url), s))
+        .map(|s| (raw_symbol_canonical_id(s, file_path, repo_url), *s))
         .collect();
 
     let new_map: HashMap<String, &RawSymbol> = new_symbols
         .iter()
-        .map(|s| (raw_symbol_canonical_id(s, file_path, repo_url), s))
+        .map(|s| (raw_symbol_canonical_id(s, file_path, repo_url), *s))
         .collect();
 
     let mut matched_old: HashSet<String> = HashSet::new();
@@ -560,6 +572,8 @@ fn is_dynamic_language_file(path: &str) -> bool {
         || path.ends_with(".jsx")
         || path.ends_with(".ts")
         || path.ends_with(".tsx")
+        || path.ends_with(".mts")
+        || path.ends_with(".cts")
         || path.ends_with(".rb")
         || path.ends_with(".lua")
         || path.ends_with(".php")
@@ -928,7 +942,7 @@ pub fn analyze_impact(
                                 .canonical_id
                                 .clone()
                                 .unwrap_or_default(),
-                            affected_name: importer.name.clone(),
+                            affected_name: importer.display_name().into_owned(),
                             affected_repo_url: repo_url,
                             affected_file: importer.file_path.clone(),
                             affected_line: importer.start_line,
@@ -965,7 +979,7 @@ pub fn analyze_impact(
                                 .canonical_id
                                 .clone()
                                 .unwrap_or_default(),
-                            affected_name: importer.name.clone(),
+                            affected_name: importer.display_name().into_owned(),
                             affected_repo_url: repo_url,
                             affected_file: importer.file_path.clone(),
                             affected_line: importer.start_line,
@@ -1057,7 +1071,7 @@ fn collect_transitive_references(
                 change_canonical_id: change_canonical_id.to_string(),
                 change_kind: change_kind.to_string(),
                 affected_canonical_id: ref_sym.canonical_id.clone().unwrap_or_default(),
-                affected_name: ref_sym.name.clone(),
+                affected_name: ref_sym.display_name().into_owned(),
                 affected_repo_url: repo_url,
                 affected_file: ref_sym.file_path.clone(),
                 affected_line: ref_sym.start_line,
@@ -1076,6 +1090,23 @@ fn collect_transitive_references(
 
 #[cfg(test)]
 mod tests {
+
+    /// nw-113: the `<module>` owner is an artefact of top-level calls, not an
+    /// API. Removing a file's last top-level call must not read as a Breaking
+    /// removal, and adding one must not read as a new symbol.
+    #[test]
+    fn module_owner_changes_are_not_symbol_changes() {
+        let with_call = "export function f() { return 1; }\nf();\n";
+        let without_call = "export function f() { return 1; }\n";
+        for (old, new) in [(with_call, without_call), (without_call, with_call)] {
+            let changes =
+                compute_file_changes(old, new, "src/a.ts", "https://example.com/r.git").unwrap();
+            assert!(
+                changes.is_empty(),
+                "a top-level call edit is not a symbol change: {changes:?}"
+            );
+        }
+    }
     use super::*;
 
     const REPO_URL: &str = "https://github.com/acme/api";

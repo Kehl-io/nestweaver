@@ -47,6 +47,15 @@ pub fn symbol_uid(repo_uid: &str, file_path: &str, name: &str, line: u32) -> Str
     )
 }
 
+/// nw-113: whether `uid` is a per-file `<module>` owner's [`symbol_uid`]: its
+/// name hash is `<module>`'s and its line is 1. Lets a vector index drop a
+/// stale owner vector without a store lookup per hit.
+pub fn is_module_owner_uid(uid: &str) -> bool {
+    static SUFFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let suffix = SUFFIX.get_or_init(|| format!(":{}:1", truncated_hash(crate::MODULE_OWNER_NAME)));
+    uid.starts_with("sym:") && uid.ends_with(suffix.as_str())
+}
+
 /// The repo uid inside a `sym:{repo_uid}:{path_hash}:{name_hash}:{line}` uid.
 ///
 /// Parses from the right because the repo uid itself contains colons
@@ -524,6 +533,23 @@ pub fn scoped_contract_uid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nw-113: a `<module>` owner's UID is recognisable on its own (its name
+    /// hash at line 1), so stale vector hits can be dropped without a lookup.
+    #[test]
+    fn module_owner_uids_are_recognised_without_a_lookup() {
+        let repo = "repo:default:abc123";
+        let owner = symbol_uid(repo, "src/a.ts", crate::MODULE_OWNER_NAME, 1);
+        assert!(is_module_owner_uid(&owner));
+        assert!(!is_module_owner_uid(&symbol_uid(repo, "src/a.ts", "f", 1)));
+        assert!(!is_module_owner_uid(&symbol_uid(
+            repo,
+            "src/a.ts",
+            crate::MODULE_OWNER_NAME,
+            2
+        )));
+        assert!(!is_module_owner_uid("note:vault:abc"));
+    }
 
     #[test]
     fn repo_uid_of_symbol_uid_round_trips_symbol_uid() {

@@ -25,6 +25,42 @@ pub struct NamedBinding {
     pub start_line: u32,
 }
 
+/// One file's named bindings, in declaration order, indexed by local name.
+///
+/// nw-113: a reference looks up the bindings of its own name (or receiver).
+/// Scanning every binding in the file per reference was quadratic in the
+/// number of imports: 3,000 `import x = require()` lines took seconds.
+#[derive(Debug, Default)]
+struct FileBindings {
+    all: Vec<NamedBinding>,
+    /// local name → indices into `all`, ascending.
+    by_name: HashMap<String, Vec<usize>>,
+}
+
+impl FileBindings {
+    fn push(&mut self, binding: NamedBinding) {
+        self.by_name
+            .entry(binding.local_name.clone())
+            .or_default()
+            .push(self.all.len());
+        self.all.push(binding);
+    }
+
+    fn named(&self, name: &str) -> &[usize] {
+        self.by_name.get(name).map_or(&[], Vec::as_slice)
+    }
+}
+
+impl From<Vec<NamedBinding>> for FileBindings {
+    fn from(bindings: Vec<NamedBinding>) -> Self {
+        let mut file = Self::default();
+        for binding in bindings {
+            file.push(binding);
+        }
+        file
+    }
+}
+
 /// Tracks what each file exports and what it imports.
 pub struct ImportGraph {
     /// file → [(specifier, resolved_file)]
@@ -32,7 +68,7 @@ pub struct ImportGraph {
     /// file → [exported_symbol_names]
     exports: HashMap<String, Vec<String>>,
     /// file → [named bindings (aliased imports)]
-    named_bindings: HashMap<String, Vec<NamedBinding>>,
+    named_bindings: HashMap<String, FileBindings>,
     export_aliases: HashMap<String, HashMap<String, (String, Option<String>)>>,
     /// Exact literal-method declaration keyed by terminal exported name.
     literal_export_lines: HashMap<String, HashMap<String, u32>>,
@@ -68,8 +104,45 @@ impl ImportGraph {
     pub fn bindings_of(&self, file: &str) -> &[NamedBinding] {
         self.named_bindings
             .get(file)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+            .map_or(&[], |bindings| bindings.all.as_slice())
+    }
+
+    /// The named bindings of `file` whose local name is `name`, in
+    /// declaration order. An indexed lookup, not a scan of the file.
+    pub fn bindings_named<'a>(
+        &'a self,
+        file: &str,
+        name: &str,
+    ) -> impl Iterator<Item = &'a NamedBinding> + 'a {
+        let (all, indices) = self
+            .named_bindings
+            .get(file)
+            .map_or((&[][..], &[][..]), |bindings| {
+                (bindings.all.as_slice(), bindings.named(name))
+            });
+        indices.iter().map(move |&index| &all[index])
+    }
+
+    /// The named bindings of `file` whose local name is `name` or
+    /// `receiver`, in declaration order (the order `bindings_of` gives).
+    pub fn bindings_named_either<'a>(
+        &'a self,
+        file: &str,
+        name: &str,
+        receiver: Option<&str>,
+    ) -> Vec<&'a NamedBinding> {
+        let Some(bindings) = self.named_bindings.get(file) else {
+            return Vec::new();
+        };
+        let mut indices: Vec<usize> = bindings.named(name).to_vec();
+        if let Some(receiver) = receiver.filter(|receiver| *receiver != name) {
+            indices.extend_from_slice(bindings.named(receiver));
+            indices.sort_unstable();
+        }
+        indices
+            .into_iter()
+            .map(|index| &bindings.all[index])
+            .collect()
     }
 
     /// Add an AST-proven same-file inline type route without a file/name fallback.
@@ -95,7 +168,7 @@ impl ImportGraph {
                 rust_inline_modules: Some(import.module_path.clone()),
                 start_line: import.line,
             };
-            if let Some(existing) = bindings.iter_mut().find(|binding| {
+            if let Some(existing) = bindings.all.iter_mut().find(|binding| {
                 binding.local_name == import.local_name
                     && binding
                         .scope
@@ -280,7 +353,7 @@ pub(crate) fn build_import_graph_with_languages(
 
     let mut exports: HashMap<String, Vec<String>> = HashMap::new();
     let mut resolved_imports: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    let mut named_bindings: HashMap<String, Vec<NamedBinding>> = HashMap::new();
+    let mut named_bindings: HashMap<String, FileBindings> = HashMap::new();
     let mut export_aliases = HashMap::new();
     let mut literal_export_lines = HashMap::new();
     let mut star_exports = HashMap::new();
@@ -563,7 +636,7 @@ pub(crate) fn build_import_graph_with_languages(
         }
         resolved_imports.insert(file_path.clone(), imports);
         if !bindings.is_empty() {
-            named_bindings.insert(file_path.clone(), bindings);
+            named_bindings.insert(file_path.clone(), bindings.into());
         }
     }
 
@@ -820,7 +893,10 @@ mod tests {
             literal_export_lines: HashMap::new(),
             resolved_imports: HashMap::new(),
             exports: HashMap::new(),
-            named_bindings: bindings,
+            named_bindings: bindings
+                .into_iter()
+                .map(|(file, bindings)| (file, bindings.into()))
+                .collect(),
             export_aliases: HashMap::new(),
             star_exports: HashMap::new(),
             go_packages: HashMap::new(),
@@ -904,6 +980,59 @@ mod tests {
             !imports.iter().any(|(spec, _)| spec == "lodash"),
             "lodash should not be resolved"
         );
+    }
+
+    /// nw-113 item 15: the by-name lookups return exactly the bindings a
+    /// scan of `bindings_of` would, in the same declaration order.
+    #[test]
+    fn indexed_binding_lookups_match_a_scan_in_order() {
+        let binding = |local: &str, line: u32| NamedBinding {
+            rust_inline_modules: None,
+            scope: None,
+            local_name: local.into(),
+            original_name: "*".into(),
+            source_file: Some("lib.ts".into()),
+            start_line: line,
+        };
+        let graph = ImportGraph {
+            literal_export_lines: HashMap::new(),
+            resolved_imports: HashMap::new(),
+            exports: HashMap::new(),
+            named_bindings: HashMap::from([(
+                "a.ts".to_string(),
+                vec![
+                    binding("m", 1),
+                    binding("f", 2),
+                    binding("other", 3),
+                    binding("m", 4),
+                    binding("f", 5),
+                ]
+                .into(),
+            )]),
+            export_aliases: HashMap::new(),
+            star_exports: HashMap::new(),
+            go_packages: HashMap::new(),
+            unresolved_exports: HashMap::new(),
+            incomplete_stars: HashSet::new(),
+        };
+        let lines = |bindings: Vec<&NamedBinding>| -> Vec<u32> {
+            bindings.iter().map(|binding| binding.start_line).collect()
+        };
+        assert_eq!(lines(graph.bindings_named("a.ts", "m").collect()), [1, 4]);
+        assert_eq!(
+            lines(graph.bindings_named_either("a.ts", "f", Some("m"))),
+            [1, 2, 4, 5]
+        );
+        assert_eq!(
+            lines(graph.bindings_named_either("a.ts", "m", Some("m"))),
+            [1, 4]
+        );
+        assert_eq!(
+            lines(graph.bindings_named_either("a.ts", "f", None)),
+            [2, 5]
+        );
+        assert!(graph.bindings_named("b.ts", "m").next().is_none());
+        assert_eq!(graph.bindings_of("a.ts").len(), 5);
     }
 
     #[test]

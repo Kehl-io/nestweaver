@@ -413,9 +413,9 @@ where
 
         if do_symbols {
             let all = store
-                .list_all_symbols()
+                .list_embeddable_symbols()
                 .map_err(|e| anyhow::anyhow!(e))
-                .context("list_all_symbols")?;
+                .context("list_embeddable_symbols")?;
             let to_embed: Vec<_> = if force {
                 all.iter().collect()
             } else {
@@ -633,9 +633,9 @@ where
 
             if do_symbols {
                 let all = store
-                    .list_all_symbols()
+                    .list_embeddable_symbols()
                     .map_err(|e| anyhow::anyhow!(e))
-                    .context("list_all_symbols")?;
+                    .context("list_embeddable_symbols")?;
                 let to_embed: Vec<_> = if force {
                     all.iter().collect()
                 } else {

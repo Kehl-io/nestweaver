@@ -436,7 +436,8 @@ function graphAttribute<T>(graph: GraphInstance, name: string): T | null {
 
 function affectedTestCount(tests: AffectedTestsResult): number {
   return [...tests.tier_1, ...tests.tier_2, ...tests.tier_3].reduce(
-    (count, file) => count + file.tests.length,
+    // A file its own top-level code selected names no test but counts as one.
+    (count, file) => count + (file.tests.length || (file.selected_by ? 1 : 0)),
     0,
   );
 }
@@ -490,7 +491,11 @@ function affectedTestRows(
         status,
         location: file.test_file,
         metadata: [
-          file.tests.length > 0 ? `tests ${file.tests.join(", ")}` : null,
+          file.tests.length > 0
+            ? `tests ${file.tests.join(", ")}`
+            : file.selected_by === "top_level_code"
+              ? "selected by its top-level code"
+              : null,
           `confidence ${file.confidence.toFixed(2)}`,
         ].filter(Boolean).join(", "),
       });

@@ -266,7 +266,50 @@ use std::path::Path;
 ///     Rust macro call-result receivers retain their syntax instead of becoming
 ///     bare calls that bind unrelated same-named methods.
 ///     Re-index existing repositories with `nestweaver index --repo <path> --force`.
-pub const RESOLVER_GENERATION: u32 = 9;
+/// 10 — nw-113: a JS/TS `const f = () => …` declared inside a block used to
+///     win same-file resolution for every bare call to `f` in the file, so a
+///     call outside the block bound to the block-local instead of the
+///     imported `f` it actually reaches. A same-file candidate declared by a
+///     `const`/`let`/`var`/`using` declarator inside a block is now scoped
+///     by that block, and the innermost visible declaration wins. Everything
+///     else keeps the generation-9 first-match order: function declarations
+///     (nested or not), methods, CommonJS and other assignment forms
+///     (`exports.f = function …`), module-level declarators, which are
+///     visible everywhere, and receiver calls. In a JS/TS file with no
+///     imports, a name declared only in blocks that do not contain the call
+///     is now unresolved instead of falling back to a same-directory
+///     sibling's function. A call inside a block to a block-local declarator
+///     (or to a function declaration whose innermost enclosing function or
+///     method also contains the call) that shadows an import whose source
+///     cannot be resolved (an npm package or a missing file) now binds the
+///     local instead of being unresolved, so
+///     watcher and incremental passes keep that same-file edge. Edges written
+///     by generation 9 keep the wrong target until re-indexed:
+///     `nestweaver index --repo <path> --force`.
+///     Folded into the same bump (nw-113 part 2): a JS/TS/Python/PHP file in
+///     which a call sits outside every function, class and method (a bare
+///     top-level call, an IIFE, an Express-style handler registered at load,
+///     a decorator, a `__main__` guard) gains one `<module>` symbol
+///     (`Module`, entry point `module_init`) that owns those calls. A
+///     function invoked at module load has a caller and is no longer
+///     reported dead, and a one-line function above such a call no longer
+///     owns it. The owner is never an enclosing container and is the source
+///     of CALLS (and their IMPORTS by-product) only. An owner with an
+///     outgoing CALLS edge is also a `<repo-relative path>::<module>`
+///     process; one without is not. Parsed cache 6 reparses older records.
+///     Also folded in: JS/TS generators are `Function` symbols that scope
+///     their parameters and vars, CommonJS `function*` exports included
+///     (nw-791); a `.js` bare-parameter arrow is a function; `catch`
+///     parameters and `for` loop variables are scoped to their clause
+///     (nw-800); ESM import bindings are hoisted to their scope's start, and a
+///     function above a CommonJS `require` sees its binding (nw-803); TS
+///     `import x = require` and `export import x = require` bind like an
+///     import, and a bare call on a whole-module binding stays unresolved
+///     (nw-801); `.ts` and `.tsx` keep their own type bindings (nw-805); a
+///     broken file with no real symbols, or a lowercase JSX tag, mints no
+///     owner; an import below a one-line function is module scope; and a
+///     sibling's nested homonym no longer hides the caller's own.
+pub const RESOLVER_GENERATION: u32 = 10;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would

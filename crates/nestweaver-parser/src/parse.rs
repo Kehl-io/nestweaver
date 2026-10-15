@@ -2,7 +2,9 @@ use crate::entry_points::detect_entry_point;
 use crate::language::detect_language;
 use crate::scope_chain::extract_scope_chain;
 use bumpalo::Bump;
-use nestweaver_schema::{EntryPointKind, Language, SymbolKind, TypeInfo, Visibility};
+use nestweaver_schema::{
+    EntryPointKind, Language, MODULE_OWNER_NAME, SymbolKind, TypeInfo, Visibility,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -62,9 +64,16 @@ pub enum ParseError {
 /// is a JSX/TSX file (where we append extra JSX patterns).  The
 /// `is_type_query` flag distinguishes the symbol-extraction query from the
 /// type-binding query for the same language.
+/// nw-805: the key also names the grammar the query is compiled against.
+/// `.ts` and `.tsx` share one type-query source but not one grammar, and a
+/// query compiled for one grammar matches nothing on the other's trees (node
+/// kind ids differ). Keyed without the grammar, whichever file a parse worker
+/// reached first decided the grammar for both kinds, so an index silently lost
+/// every type binding of the other kind and two indexes of one tree differed.
 #[derive(Hash, Eq, PartialEq, Clone)]
 struct QueryCacheKey {
     lang: Language,
+    grammar: tree_sitter::Language,
     is_jsx: bool,
     is_type_query: bool,
 }
@@ -77,7 +86,7 @@ static QUERY_CACHE: OnceLock<Mutex<HashMap<QueryCacheKey, Arc<Query>>>> = OnceLo
 
 /// Return a cached (or freshly compiled) `Query` wrapped in an `Arc`.
 ///
-/// The first call for a given `(lang, is_jsx, is_type_query)` triple compiles
+/// The first call for a given `(lang, grammar, is_jsx, is_type_query)` key compiles
 /// the S-expression source string and stores the result; subsequent calls
 /// return the cached `Arc` without recompiling.
 ///
@@ -162,6 +171,13 @@ pub struct RawSymbol {
     pub scope_chain: Option<String>,
 }
 
+impl RawSymbol {
+    /// nw-113: see [`nestweaver_schema::is_module_owner`].
+    pub fn is_module_owner(&self) -> bool {
+        nestweaver_schema::is_module_owner(self.kind, &self.name, self.entry_point_kind)
+    }
+}
+
 /// Byte positions for JS/TS lexical binding selection, including same-line scopes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LexicalScope {
@@ -234,7 +250,10 @@ impl ParsedFile {
     /// incremental index, `parse_batch`), so the routes cannot disagree about
     /// what "unparsable" means.
     pub fn unparsable_skip(&self, display_path: impl Into<String>) -> Option<SkippedFile> {
-        (self.has_syntax_errors && self.symbols.is_empty()).then(|| {
+        // nw-113: the `<module>` owner is never an extractable symbol; it
+        // must not hide a parse error that left no real symbol behind.
+        let no_real_symbols = self.symbols.iter().all(RawSymbol::is_module_owner);
+        (self.has_syntax_errors && no_real_symbols).then(|| {
             SkippedFile::new(
                 display_path,
                 SkipReasonCode::ParseError,
@@ -1437,6 +1456,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         &ts_lang,
         QueryCacheKey {
             lang,
+            grammar: ts_lang.clone(),
             is_jsx,
             is_type_query: false,
         },
@@ -1498,6 +1518,10 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     // than recovered afterward from `references` (which does not retain the
     // AST node).
     let mut top_level_called: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // nw-113: rows (1-based) of JS/TS/Python/PHP calls, checked against
+    // symbol spans after the capture loop. `require(...)` is an import
+    // mechanism, not executable module code worth an owner.
+    let mut top_level_call_lines: Vec<u32> = Vec::new();
 
     let mut cursor = QueryCursor::new();
     let source_bytes = source.as_bytes();
@@ -1759,7 +1783,10 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     && kind == SymbolKind::Property
                     && matches!(node.kind(), "field_definition" | "public_field_definition")
                     && node.child_by_field_name("value").is_some_and(|value| {
-                        matches!(value.kind(), "arrow_function" | "function_expression")
+                        matches!(
+                            value.kind(),
+                            "arrow_function" | "function_expression" | "generator_function"
+                        )
                     })
                 {
                     kind = SymbolKind::Method;
@@ -1942,6 +1969,16 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     && name.starts_with(|c: char| c.is_ascii_lowercase())
                 {
                     continue;
+                }
+
+                // nw-113: recorded after the intrinsic-element filter above, so
+                // a lowercase JSX tag (an HTML element, not a call) never mints
+                // an owner.
+                if kind == ReferenceKind::Call
+                    && matches!(lang_str, "javascript" | "typescript" | "python" | "php")
+                    && name != "require"
+                {
+                    top_level_call_lines.push(node.start_position().row as u32 + 1);
                 }
 
                 // Extract receiver for method calls: in `obj.method()`,
@@ -2208,6 +2245,18 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         }
     }
 
+    // nw-113: top-level code has an owner, and the owner is the module
+    // (CodeQL: JS `TopLevel`, Python `Module`). A tree with errors and no real
+    // symbol gets none: its "top-level" lines are error-recovered spans (a
+    // component body the parser could not see), and the file must stay
+    // disclosed as a parse error (edge-diff B3).
+    let error_without_symbols = tree.root_node().has_error() && symbols.is_empty();
+    if !error_without_symbols
+        && let Some(owner) = module_owner_symbol(source, &symbols, &top_level_call_lines)
+    {
+        symbols.insert(0, owner);
+    }
+
     // Type extraction: walk the same tree with type-specific queries
     let type_bindings =
         extract_types_from_tree(&tree, &ts_lang, source_bytes, lang, &local_bindings);
@@ -2218,6 +2267,79 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         references,
         type_bindings,
         has_syntax_errors: tree.root_node().has_error(),
+    })
+}
+
+/// nw-113: the per-file `<module>` owner, when some call line lies outside
+/// every code-bearing symbol span. That is the resolver's attribution rule
+/// (by line, `SymbolKind::contains_code`), so the owner exists exactly when
+/// the resolver would otherwise drop or misattribute a call. A call inside an
+/// anonymous function at module level (an IIFE, an Express handler, a Python
+/// lambda) counts: it runs, or is registered, at load time and has no named
+/// container. Class bodies and calls inside named functions are covered by
+/// their symbols' spans.
+///
+/// Coverage is one difference-array sweep, O(lines + symbols + calls). The
+/// owner's hash covers only the uncovered (top-level) lines, so an edit inside
+/// a function body does not read as a change to `<module>`. Only code-bearing
+/// spans count as covered: lines inside a data symbol (a multi-line
+/// `const cfg = { ... }`, a module-level `Variable` or `Constant`) are
+/// top-level code that runs at load, so they count toward the hash.
+fn module_owner_symbol(
+    source: &str,
+    symbols: &[RawSymbol],
+    call_lines: &[u32],
+) -> Option<RawSymbol> {
+    if call_lines.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = source.lines().collect();
+    let line_count = lines.len();
+    let mut delta = vec![0i32; line_count + 1];
+    for symbol in symbols.iter().filter(|symbol| symbol.kind.contains_code()) {
+        let start = (symbol.start_line.max(1) as usize - 1).min(line_count);
+        let end = (symbol.end_line.max(symbol.start_line) as usize).min(line_count);
+        if start < end {
+            delta[start] += 1;
+            delta[end] -= 1;
+        }
+    }
+    let mut depth = 0;
+    let covered: Vec<bool> = delta[..line_count]
+        .iter()
+        .map(|change| {
+            depth += change;
+            depth > 0
+        })
+        .collect();
+    let top_level = |line: u32| {
+        (line as usize)
+            .checked_sub(1)
+            .and_then(|index| covered.get(index))
+            .is_some_and(|covered| !covered)
+    };
+    if !call_lines.iter().any(|line| top_level(*line)) {
+        return None;
+    }
+    let region: String = lines
+        .iter()
+        .zip(&covered)
+        .filter(|(_, covered)| !**covered)
+        .flat_map(|(text, _)| [*text, "\n"])
+        .collect();
+    Some(RawSymbol {
+        name: MODULE_OWNER_NAME.to_string(),
+        kind: SymbolKind::Module,
+        start_line: 1,
+        end_line: line_count.max(1) as u32,
+        signature: String::new(),
+        content_hash: sha256_hex(&region),
+        is_entry_point: true,
+        entry_point_kind: Some(EntryPointKind::ModuleInit),
+        visibility: Visibility::Private,
+        type_info: None,
+        parent_name: None,
+        scope_chain: None,
     })
 }
 
@@ -3034,7 +3156,7 @@ fn collect_local_bindings(
     TEST_LOCAL_BINDING_WALK_COUNT.with(|count| count.set(count.get() + 1));
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if is_local_binding_site(node.kind()) {
+        if is_local_binding_site(node.kind()) || is_js_clause_binding_site(node, lang) {
             emit_binding_names(node, source_bytes, references, lang);
         }
         let mut cursor = node.walk();
@@ -3065,6 +3187,25 @@ fn is_local_binding_site(kind: &str) -> bool {
     )
 }
 
+/// nw-800: a JS/TS `catch (f)` parameter and the declared variable of a
+/// `for (const f of …)` / `for (let f in …)` loop bind `f` for that clause or
+/// loop. A loop without a declaration keyword (`for (f of xs)`) assigns an
+/// existing name and binds nothing. The classic `for (let f = …; …)` header
+/// is an ordinary `variable_declarator`, already a binding site.
+///
+/// An unparenthesised arrow parameter (`f => f()`) is the arrow's `parameter`
+/// field, an identifier with no `formal_parameters` around it, so it is
+/// matched here and scoped to the arrow like `(f) => f()`.
+fn is_js_clause_binding_site(node: tree_sitter::Node<'_>, lang: Language) -> bool {
+    matches!(lang, Language::JavaScript | Language::TypeScript)
+        && match node.kind() {
+            "catch_clause" => node.child_by_field_name("parameter").is_some(),
+            "for_in_statement" => node.child_by_field_name("kind").is_some(),
+            "arrow_function" => node.child_by_field_name("parameter").is_some(),
+            _ => false,
+        }
+}
+
 fn emit_binding_names(
     node: tree_sitter::Node<'_>,
     source_bytes: &[u8],
@@ -3074,6 +3215,9 @@ fn emit_binding_names(
     let root = match node.kind() {
         "let_declaration" | "for_expression" => node.child_by_field_name("pattern"),
         "variable_declarator" => node.child_by_field_name("name"),
+        "catch_clause" => node.child_by_field_name("parameter"),
+        "for_in_statement" => node.child_by_field_name("left"),
+        "arrow_function" => node.child_by_field_name("parameter"),
         _ => Some(node),
     };
     let Some(root) = root else {
@@ -3141,7 +3285,7 @@ fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
         if matches!(parent.kind(), "variable_declarator" | "let_declaration") {
             initialized_at = parent.end_byte();
         }
-        if parent.kind() == "variable_declaration" {
+        if parent.kind() == "variable_declaration" || is_var_loop_variable(parent, node) {
             function_scoped = true;
             hoisted_var = true;
         }
@@ -3153,13 +3297,16 @@ fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
                 | "parameters"
                 | "parameter"
                 | "closure_parameters"
-        ) {
+        ) || is_bare_arrow_parameter(parent, node)
+        {
             function_scoped = true;
         }
         if matches!(
             parent.kind(),
             "function_declaration"
                 | "function_expression"
+                | "generator_function_declaration"
+                | "generator_function"
                 | "arrow_function"
                 | "method_definition"
                 | "function_item"
@@ -3174,9 +3321,30 @@ fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
                 hoisted_var,
             });
         }
+        // nw-113: an expression-body arrow (`() => f()`) has no block, but
+        // its body is still a function body that runs later. Scope what is
+        // written in it to the arrow, as a block body is scoped to its block,
+        // so a closure above a CommonJS `require` sees the binding.
+        if is_concise_arrow_body(parent, node) && !function_scoped {
+            return Some(LexicalScope {
+                start: parent.start_byte(),
+                end: parent.end_byte(),
+                position: node.start_byte(),
+                initialized_at,
+                hoisted_var,
+            });
+        }
+        // nw-800: a `catch` parameter is scoped to its clause, and a `let` or
+        // `const` declared in a loop header to that loop. A declaration in
+        // the loop body or the catch body stops at its own block first.
         if matches!(
             parent.kind(),
-            "statement_block" | "block" | "declaration_list"
+            "statement_block"
+                | "block"
+                | "declaration_list"
+                | "catch_clause"
+                | "for_statement"
+                | "for_in_statement"
         ) && !function_scoped
             || matches!(parent.kind(), "program" | "source_file")
         {
@@ -3191,6 +3359,36 @@ fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
         current = parent.parent();
     }
     None
+}
+
+/// `node` is written in the expression body of the arrow `parent`.
+fn is_concise_arrow_body(parent: tree_sitter::Node<'_>, node: tree_sitter::Node<'_>) -> bool {
+    parent.kind() == "arrow_function"
+        && parent.child_by_field_name("body").is_some_and(|body| {
+            body.kind() != "statement_block"
+                && body.start_byte() <= node.start_byte()
+                && node.end_byte() <= body.end_byte()
+        })
+}
+
+/// `f => f()`: the bare `parameter` of an arrow is scoped to that arrow.
+fn is_bare_arrow_parameter(parent: tree_sitter::Node<'_>, node: tree_sitter::Node<'_>) -> bool {
+    parent.kind() == "arrow_function"
+        && parent
+            .child_by_field_name("parameter")
+            .is_some_and(|parameter| parameter.id() == node.id())
+}
+
+/// `for (var f of …)`: `var` hoists `f` to the enclosing function like any
+/// other `var` declaration, rather than scoping it to the loop.
+fn is_var_loop_variable(parent: tree_sitter::Node<'_>, node: tree_sitter::Node<'_>) -> bool {
+    parent.kind() == "for_in_statement"
+        && parent
+            .child_by_field_name("kind")
+            .is_some_and(|kind| kind.kind() == "var")
+        && parent.child_by_field_name("left").is_some_and(|left| {
+            left.start_byte() <= node.start_byte() && node.end_byte() <= left.end_byte()
+        })
 }
 
 fn is_type_node(kind: &str) -> bool {
@@ -3923,6 +4121,7 @@ fn extract_types_from_tree(
         ts_lang,
         QueryCacheKey {
             lang,
+            grammar: ts_lang.clone(),
             is_jsx: false,
             is_type_query: true,
         },
@@ -5071,7 +5270,7 @@ fn collect_js_import_bindings(
                 && key.kind() == "property_identifier"
                 && matches!(
                     value.kind(),
-                    "identifier" | "function_expression" | "arrow_function"
+                    "identifier" | "function_expression" | "arrow_function" | "generator_function"
                 )
             {
                 references.push(RawReference {
@@ -5105,6 +5304,51 @@ fn collect_js_import_bindings(
         let (specifier, bindings): (String, Vec<(tree_sitter::Node<'_>, String)>) = match statement
             .kind()
         {
+            // nw-801: TS `import x = require('pkg')` binds `x` to the whole
+            // module, exactly like `const x = require('pkg')`. The specifier
+            // sits on the clause, not the statement, so the import query
+            // never captures it either.
+            "import_statement" if import_require_clause(statement).is_some() => {
+                let Some(clause) = import_require_clause(statement) else {
+                    continue;
+                };
+                let mut cursor = clause.walk();
+                let local = clause
+                    .named_children(&mut cursor)
+                    .find(|node| node.kind() == "identifier");
+                let (Some(local), Some(spec)) = (local, clause.child_by_field_name("source"))
+                else {
+                    continue;
+                };
+                let specifier = strip_quotes(&text(spec));
+                references.push(RawReference {
+                    scope: None,
+                    name: specifier.clone(),
+                    kind: ReferenceKind::Import,
+                    start_line: statement.start_position().row as u32 + 1,
+                    context: text(statement),
+                    receiver: None,
+                });
+                (specifier, vec![(local, "*".into())])
+            }
+            // `export import x = require('pkg')`: the TS grammar recovers it
+            // as `export import x = require` (an `import_alias`) followed by
+            // a `('pkg')` expression statement. Read it as the clause above.
+            "import_alias" => {
+                let Some((local, spec)) = exported_import_require(statement, source) else {
+                    continue;
+                };
+                let specifier = strip_quotes(&text(spec));
+                references.push(RawReference {
+                    scope: None,
+                    name: specifier.clone(),
+                    kind: ReferenceKind::Import,
+                    start_line: statement.start_position().row as u32 + 1,
+                    context: text(statement),
+                    receiver: None,
+                });
+                (specifier, vec![(local, "*".into())])
+            }
             "import_statement" => {
                 let Some(spec) = statement.child_by_field_name("source") else {
                     continue;
@@ -5224,11 +5468,26 @@ fn collect_js_import_bindings(
             }
             _ => continue,
         };
+        // nw-803: an ESM `import … from` is hoisted: its binding is live from
+        // the top of its scope, so code written above the import line sees
+        // it. `require()` and TS `import x = require()` run where written, so
+        // their binding initializes at the declaration: code above it in the
+        // same scope does not see it. A function body written above it still
+        // does, since it runs later; the resolver exempts nested bodies.
+        let hoisted =
+            statement.kind() == "import_statement" && import_require_clause(statement).is_none();
         for (local, original) in bindings {
             let name = text(local);
             let start_line = local.start_position().row as u32 + 1;
             references.push(RawReference {
-                scope: lexical_scope(local),
+                scope: lexical_scope(local).map(|scope| LexicalScope {
+                    initialized_at: if hoisted {
+                        scope.start
+                    } else {
+                        scope.initialized_at
+                    },
+                    ..scope
+                }),
                 name: name.clone(),
                 kind: ReferenceKind::ImportAlias,
                 start_line,
@@ -5247,6 +5506,42 @@ fn collect_js_import_bindings(
             }
         }
     }
+}
+
+/// The local name and specifier of `export import x = require('pkg')`, which
+/// the TS grammar error-recovers as `(export_statement (import_alias x
+/// require))` followed by `(expression_statement (parenthesized_expression
+/// (string)))`.
+fn exported_import_require<'a>(
+    alias: tree_sitter::Node<'a>,
+    source: &[u8],
+) -> Option<(tree_sitter::Node<'a>, tree_sitter::Node<'a>)> {
+    let export = alias
+        .parent()
+        .filter(|node| node.kind() == "export_statement")?;
+    let mut cursor = alias.walk();
+    let mut names = alias
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "identifier");
+    let local = names.next()?;
+    names
+        .next()
+        .filter(|node| node.utf8_text(source) == Ok("require"))?;
+    let spec = export
+        .next_named_sibling()
+        .filter(|node| node.kind() == "expression_statement")?
+        .named_child(0)
+        .filter(|node| node.kind() == "parenthesized_expression")?
+        .named_child(0)
+        .filter(|node| node.kind() == "string")?;
+    Some((local, spec))
+}
+
+fn import_require_clause(statement: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    let mut cursor = statement.walk();
+    statement
+        .named_children(&mut cursor)
+        .find(|node| node.kind() == "import_require_clause")
 }
 
 /// Exact module-level object literals and constructor instances expose their own
@@ -5652,6 +5947,39 @@ mod tests {
             result_b.symbols.iter().any(|s| s.name == "bar"),
             "expected bar in second parse (cache path)"
         );
+    }
+
+    /// nw-113 item 16: `.mts`/`.cts` parse with the TypeScript grammar (type
+    /// annotations, `import x = require()`), `.mjs`/`.cjs` with JavaScript.
+    #[test]
+    fn module_format_extensions_parse_with_their_grammar() {
+        let ts = "import lib = require('./lib');\n\
+                  export function typed(x: number): number { return lib.f(x); }\n";
+        for path in ["a.mts", "a.cts"] {
+            let parsed = parse_source(Path::new(path), ts).unwrap();
+            assert!(
+                parsed.symbols.iter().any(|s| s.name == "typed"),
+                "{path}: {:?}",
+                parsed.symbols
+            );
+            assert!(
+                parsed
+                    .references
+                    .iter()
+                    .any(|r| r.kind == ReferenceKind::Call && r.name == "f"),
+                "{path}: {:?}",
+                parsed.references
+            );
+        }
+        let js = "const { f } = require('./lib');\nexport function run() { return f(); }\n";
+        for path in ["a.mjs", "a.cjs"] {
+            let parsed = parse_source(Path::new(path), js).unwrap();
+            assert!(
+                parsed.symbols.iter().any(|s| s.name == "run"),
+                "{path}: {:?}",
+                parsed.symbols
+            );
+        }
     }
 
     /// TSX and TS files use different query sources; both should parse correctly
@@ -11490,6 +11818,40 @@ class UserService {
         );
     }
 
+    /// nw-805: `.ts` and `.tsx` share one type-query source but parse with
+    /// different grammars. The compiled query cache was keyed without the
+    /// grammar, so whichever file a worker parsed first fixed the grammar for
+    /// both, and every file of the other kind silently lost all its type
+    /// bindings. That made two indexes of one tree differ. Both kinds must
+    /// keep their bindings whichever is parsed first, every time.
+    #[test]
+    fn ts_and_tsx_type_bindings_do_not_depend_on_parse_order() {
+        let source = "import { Api } from './api';\n\
+                      export function run(api: Api) {\n  \
+                        const client = new Api();\n  \
+                        return api.health() && client.health();\n\
+                      }\n";
+        let bindings = |path: &str| {
+            let mut found: Vec<_> = parse_source(Path::new(path), source)
+                .unwrap()
+                .type_bindings
+                .into_iter()
+                .map(|b| (b.var_name, b.type_name, b.line))
+                .collect();
+            found.sort();
+            found
+        };
+        let expected = vec![
+            ("api".to_string(), "Api".to_string(), 2),
+            ("client".to_string(), "Api".to_string(), 3),
+        ];
+        for order in [["a.tsx", "b.ts"], ["b.ts", "a.tsx"], ["a.tsx", "b.ts"]] {
+            for path in order {
+                assert_eq!(bindings(path), expected, "{path} after {order:?}");
+            }
+        }
+    }
+
     #[test]
     fn type_queries_compile_for_all_languages() {
         let languages: Vec<(&str, tree_sitter::Language, &str)> = vec![
@@ -13526,5 +13888,544 @@ mod review_macro_mapping_tests {
                 .expect("macro value call captured");
             assert_eq!(call.receiver.as_deref(), receiver, "{call:#?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod module_owner_tests {
+    use super::*;
+
+    fn module_owner(parsed: &ParsedFile) -> Option<&RawSymbol> {
+        parsed
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == MODULE_OWNER_NAME)
+    }
+
+    /// nw-113: a call outside every function/class/method gets one owner.
+    #[test]
+    fn a_top_level_call_mints_one_module_owner() {
+        for (path, source) in [
+            (
+                "ownerless.ts",
+                "import { flushBuffer } from './lib';\nflushBuffer();\n",
+            ),
+            (
+                "ownerless.js",
+                "import { flushBuffer } from './lib.js';\nflushBuffer();\n",
+            ),
+            (
+                "ownerless.py",
+                "from lib import flush_buffer\nflush_buffer()\n",
+            ),
+            (
+                "ownerless.php",
+                "<?php\nfunction helper() { return 1; }\nflush_buffer();\n",
+            ),
+            // A one-line function above the call must not absorb it.
+            (
+                "oneline.ts",
+                "export const add = (a: number, b: number) => a + b;\nflushBuffer();\n",
+            ),
+        ] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            let owners: Vec<_> = parsed
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.name == MODULE_OWNER_NAME)
+                .collect();
+            assert_eq!(owners.len(), 1, "{path}: exactly one owner");
+            let owner = owners[0];
+            assert_eq!(owner.kind, SymbolKind::Module, "{path}");
+            assert_eq!(owner.start_line, 1, "{path}");
+            assert!(owner.end_line >= 2, "{path}: spans the file");
+            assert!(owner.is_entry_point, "{path}");
+            assert_eq!(
+                owner.entry_point_kind,
+                Some(EntryPointKind::ModuleInit),
+                "{path}"
+            );
+        }
+    }
+
+    /// nw-113 review: one rule for the gate and the attribution. A call line
+    /// outside every code-bearing span mints the owner even when the call sits
+    /// in an anonymous function: that code runs, or is registered, at load
+    /// time, and the resolver credits it to `<module>` by line.
+    #[test]
+    fn load_time_code_mints_an_owner_spanning_the_whole_file() {
+        for (path, source) in [
+            ("iife.js", "(function () {\n  foo();\n})();\n"),
+            ("arrow_iife.ts", "(() => {\n  foo();\n})();\n"),
+            (
+                "express.ts",
+                "import { handle } from './lib';\napp.get('/', () => {\n  handle();\n});\n",
+            ),
+            ("lambda.py", "x = lambda: foo()\n"),
+            (
+                "deco.py",
+                "import functools\n\n@functools.lru_cache(maxsize=1)\ndef f():\n    return 1\n",
+            ),
+            (
+                "main_guard.py",
+                "def main():\n    pass\n\nif __name__ == \"__main__\":\n    main()\n",
+            ),
+            ("await.ts", "import { main } from './lib';\nawait main();\n"),
+            (
+                "main.tsx",
+                "import { createRoot } from 'react-dom/client';\nimport { App } from './App';\ncreateRoot(document.getElementById('root')!).render(<App />);\n",
+            ),
+            ("boot.php", "<?php\nrequire_once 'lib.php';\nhelper();\n"),
+        ] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            let owner = module_owner(&parsed)
+                .unwrap_or_else(|| panic!("{path}: owner expected, symbols: {:?}", parsed.symbols));
+            assert_eq!(owner.start_line, 1, "{path}");
+            assert_eq!(
+                owner.end_line,
+                source.lines().count() as u32,
+                "{path}: spans exactly the file"
+            );
+        }
+    }
+
+    /// Declarations only: a `.d.ts` file executes nothing, and an anonymous
+    /// callback inside a named function is that function's code.
+    #[test]
+    fn declarations_and_callbacks_inside_functions_mint_nothing() {
+        for (path, source) in [
+            (
+                "types.d.ts",
+                "export declare function f(): void;\ndeclare const x: number;\nexport interface I { m(): void }\n",
+            ),
+            (
+                "callback.ts",
+                "import { a } from './lib';\nexport function f() {\n  [1].forEach(() => a());\n}\n",
+            ),
+            (
+                "lambda_in_def.py",
+                "def f():\n    g = lambda: a()\n    return g\n",
+            ),
+        ] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            assert!(
+                module_owner(&parsed).is_none(),
+                "{path}: no owner expected, symbols: {:?}",
+                parsed.symbols
+            );
+        }
+    }
+
+    /// nw-113 review: the owner's hash covers only its own (top-level) lines,
+    /// so editing a function body does not read as a change to `<module>`.
+    #[test]
+    fn the_owner_hash_covers_only_top_level_lines() {
+        let hash = |source: &str| {
+            module_owner(&parse_source(Path::new("hash.ts"), source).unwrap())
+                .expect("owner")
+                .content_hash
+                .clone()
+        };
+        let base = hash("export function f() {\n  return 1;\n}\nf();\n");
+        assert_eq!(
+            base,
+            hash("export function f() {\n  const two = 2;\n  return two;\n}\nf();\n"),
+            "a function-body edit must not change the owner hash"
+        );
+        assert_ne!(
+            base,
+            hash("export function f() {\n  return 1;\n}\nf(1);\n"),
+            "a top-level edit must change the owner hash"
+        );
+    }
+
+    /// Counterweights from validation: no owner for calls that already have
+    /// a code-bearing owner, for `require`, or for files with no calls.
+    #[test]
+    fn calls_with_an_owner_or_require_only_mint_nothing() {
+        for (path, source) in [
+            (
+                "inside.ts",
+                "import { a } from './lib';\nexport function f() {\n  a();\n}\nconst g = () => {\n  a();\n};\nclass C {\n  m() { a(); }\n}\n",
+            ),
+            (
+                "cjs.js",
+                "const lib = require('./lib');\nmodule.exports = { lib };\n",
+            ),
+            (
+                "spec.test.ts",
+                "import { a } from './lib';\ndescribe('a', () => {\n  it('works', () => {\n    a();\n  });\n});\n",
+            ),
+            (
+                "klass.py",
+                "class C:\n    x = compute()\n    def m(self):\n        a()\n",
+            ),
+            (
+                "inside.php",
+                "<?php\nfunction f() { a(); }\nclass C { function m() { a(); } }\n",
+            ),
+            ("plain.ts", "export const x = 1;\n"),
+        ] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            assert!(
+                module_owner(&parsed).is_none(),
+                "{path}: no owner expected, symbols: {:?}",
+                parsed.symbols
+            );
+        }
+    }
+
+    /// The owner sorts first, keeping `symbols` ordered by `start_line`.
+    #[test]
+    fn the_module_owner_keeps_symbols_sorted() {
+        let parsed = parse_source(
+            Path::new("mixed.ts"),
+            "export function f() {\n  return 1;\n}\nf();\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.symbols[0].name, MODULE_OWNER_NAME);
+        assert!(
+            parsed
+                .symbols
+                .windows(2)
+                .all(|w| w[0].start_line <= w[1].start_line)
+        );
+    }
+}
+
+#[cfg(test)]
+mod generator_and_bare_arrow_tests {
+    use super::*;
+
+    fn kind_of(parsed: &ParsedFile, name: &str) -> Option<SymbolKind> {
+        parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.kind)
+    }
+
+    /// nw-791 (nw-113 regression B2): generator functions are functions.
+    /// Without a symbol their bodies read as top-level code owned by
+    /// `<module>`, and their callers got no edge.
+    #[test]
+    fn generator_functions_are_function_symbols() {
+        let source = "export function* rootSaga() { yield f(); }\n\
+                      export default function* defSaga() { yield g(); }\n\
+                      async function* agen(v) { yield h(v); }\n\
+                      function* plain() { yield 1; }\n\
+                      const expr = function* () { yield 2; };\n\
+                      let asyncExpr = async function* () { yield 3; };\n";
+        for path in ["saga.js", "saga.ts"] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            for name in ["rootSaga", "defSaga", "agen", "plain", "expr", "asyncExpr"] {
+                assert_eq!(
+                    kind_of(&parsed, name),
+                    Some(SymbolKind::Function),
+                    "{path}: {name}: {:?}",
+                    parsed.symbols
+                );
+            }
+            assert!(
+                !parsed.symbols.iter().any(|s| s.is_module_owner()),
+                "{path}: generator bodies are not top-level code: {:?}",
+                parsed.symbols
+            );
+        }
+    }
+
+    /// The scoped `LocalBinding`s named `name`.
+    fn local_scopes(parsed: &ParsedFile, name: &str) -> Vec<LexicalScope> {
+        parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::LocalBinding && r.name == name)
+            .filter_map(|r| r.scope)
+            .collect()
+    }
+
+    /// nw-113 final review M1: a generator's parameter and `var` are scoped to
+    /// the generator, not the program.
+    #[test]
+    fn generator_parameters_and_vars_are_scoped_to_the_generator() {
+        let source = "function* saga(action) { var step = 1; yield action; }\n\
+                      const expr = function* (other) { yield other; };\n";
+        for path in ["g.js", "g.ts"] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            let saga_end = source.find('\n').unwrap();
+            for name in ["action", "step"] {
+                let scopes = local_scopes(&parsed, name);
+                assert!(
+                    !scopes.is_empty() && scopes.iter().all(|s| s.start == 0 && s.end == saga_end),
+                    "{path}: {name}: {scopes:?}"
+                );
+            }
+            let other = local_scopes(&parsed, "other");
+            assert!(
+                !other.is_empty() && other.iter().all(|s| s.start > saga_end),
+                "{path}: {other:?}"
+            );
+        }
+    }
+
+    /// nw-113 final QA round 2 (item 13): a bare arrow parameter is a
+    /// LocalBinding scoped to its arrow, like a parenthesised one.
+    #[test]
+    fn bare_arrow_parameters_are_scoped_to_their_arrow() {
+        let source = "[1].map(f => f());\nconst run = async g => { g(); };\n";
+        for path in ["a.js", "a.ts"] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            let f_arrow = source.find("f =>").unwrap();
+            let f = local_scopes(&parsed, "f");
+            assert!(
+                f.len() == 1 && f[0].start == f_arrow && f[0].end == source.find(");\n").unwrap(),
+                "{path}: {f:?}"
+            );
+            let g_arrow = source.find("async g").unwrap();
+            let g = local_scopes(&parsed, "g");
+            assert!(
+                g.len() == 1 && g[0].start == g_arrow && g[0].end == source.len() - 2,
+                "{path}: {g:?}"
+            );
+        }
+    }
+
+    /// nw-113 final review M3 (nw-800): a `for (var f of …)` binding hoists to
+    /// the enclosing function; destructured loop and `catch` bindings are
+    /// scoped to their loop or clause; `for (f of xs)` with no keyword
+    /// assigns an existing name and binds nothing.
+    #[test]
+    fn loop_and_catch_bindings_have_their_js_scopes() {
+        let source = "function run(xs) {\n\
+                      \x20 for (var f of xs) { f(); }\n\
+                      \x20 for (const { a, b: [c] } of xs) { a(); c(); }\n\
+                      \x20 try { work(); } catch ({ message, code: [d] }) { d(); }\n\
+                      \x20 for (g of xs) { g(); }\n\
+                      }\n";
+        for path in ["l.js", "l.ts"] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            let run = (0, source.len() - 1);
+            let f = local_scopes(&parsed, "f");
+            assert!(
+                f.len() == 1 && (f[0].start, f[0].end) == run && f[0].hoisted_var,
+                "{path}: var f hoists to run: {f:?}"
+            );
+            let loop_start = source.find("for (const").unwrap();
+            for name in ["a", "c"] {
+                let scopes = local_scopes(&parsed, name);
+                assert!(
+                    scopes.len() == 1 && scopes[0].start == loop_start,
+                    "{path}: {name} is the loop's: {scopes:?}"
+                );
+            }
+            let catch_start = source.find("catch").unwrap();
+            for name in ["message", "d"] {
+                let scopes = local_scopes(&parsed, name);
+                assert!(
+                    scopes.len() == 1 && scopes[0].start == catch_start,
+                    "{path}: {name} is the clause's: {scopes:?}"
+                );
+            }
+            assert!(
+                local_scopes(&parsed, "g").is_empty(),
+                "{path}: for (g of xs) binds nothing: {:?}",
+                parsed.references
+            );
+        }
+    }
+
+    /// nw-113 final review M3 (nw-803): an ESM import binding initializes at
+    /// its scope's start (hoisted); `import x = require` and
+    /// `export import x = require` initialize where written.
+    #[test]
+    fn import_equals_require_is_not_hoisted() {
+        let source = "function early() { return lib.helper(); }\n\
+                      import { helper } from './lib';\n\
+                      import lib = require('./lib');\n\
+                      export import other = require('./other');\n";
+        let parsed = parse_source(Path::new("a.ts"), source).unwrap();
+        let alias = |name: &str| {
+            parsed
+                .references
+                .iter()
+                .find(|r| r.kind == ReferenceKind::ImportAlias && r.name == name)
+                .and_then(|r| r.scope)
+                .unwrap_or_else(|| panic!("{name}: {:?}", parsed.references))
+        };
+        assert_eq!(alias("helper").initialized_at, 0, "ESM import is hoisted");
+        for (name, line) in [("lib", "import lib"), ("other", "export import other")] {
+            let scope = alias(name);
+            assert!(
+                scope.initialized_at >= source.find(line).unwrap(),
+                "{name} initializes where written: {scope:?}"
+            );
+        }
+    }
+
+    /// nw-113 final review M1: a CommonJS export assigned a generator is a
+    /// function, as one assigned a function expression is, and a class field
+    /// holding a generator is a method, as one holding an arrow is.
+    #[test]
+    fn commonjs_and_class_field_generators_are_callables() {
+        let source = "exports.gen = function* () { yield 1; };\n\
+                      module.exports.gen2 = function* () { yield 2; };\n\
+                      class C {\n  run = function* () { yield 3; };\n}\n";
+        for path in ["cjs.js", "cjs.ts"] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            for name in ["gen", "gen2"] {
+                assert_eq!(
+                    kind_of(&parsed, name),
+                    Some(SymbolKind::Function),
+                    "{path}: {name}: {:?}",
+                    parsed.symbols
+                );
+            }
+            assert_eq!(
+                kind_of(&parsed, "run"),
+                Some(SymbolKind::Method),
+                "{path}: {:?}",
+                parsed.symbols
+            );
+        }
+    }
+
+    /// nw-113 regression B1: an arrow with a bare (unparenthesised) parameter
+    /// is a function, in `.js` as in `.ts`, not a module `Constant`.
+    #[test]
+    fn bare_parameter_arrows_are_function_symbols() {
+        let source = "const normalize = value => helper(value);\n\
+                      export const parse = value => { const p = helper(value); return p; };\n\
+                      const later = async value => helper(value);\n\
+                      const limit = 10;\n";
+        for path in ["a.js", "a.ts", "a.jsx"] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            for name in ["normalize", "parse", "later"] {
+                assert_eq!(
+                    kind_of(&parsed, name),
+                    Some(SymbolKind::Function),
+                    "{path}: {name}: {:?}",
+                    parsed.symbols
+                );
+            }
+            assert_eq!(
+                kind_of(&parsed, "limit"),
+                Some(SymbolKind::Constant),
+                "{path}"
+            );
+            assert!(
+                !parsed.symbols.iter().any(|s| s.is_module_owner()),
+                "{path}: arrow bodies are not top-level code: {:?}",
+                parsed.symbols
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod parse_error_owner_tests {
+    use super::*;
+
+    /// edge-diff B3 repro (freeplay-app GymCard.js): a self-closing JSX tag
+    /// split across lines leaves a tree with errors and no real symbols.
+    const BROKEN: &str = "import { style } from './lib';\n\
+export function G(a) {\n\
+  return (\n\
+    <T>\n\
+      {a && (\n\
+        <V s={style(a)}/\n\
+        >\n\
+      )}\n\
+    </T>\n\
+  );\n\
+}\n";
+
+    /// nw-113 B3: no owner from error-recovered spans, and the file is still
+    /// disclosed as a parse error instead of silently indexed.
+    #[test]
+    fn a_broken_file_with_no_real_symbols_gets_no_owner_and_stays_skipped() {
+        let parsed = parse_source(Path::new("G.js"), BROKEN).unwrap();
+        assert!(parsed.has_syntax_errors, "fixture must have syntax errors");
+        assert!(
+            !parsed.symbols.iter().any(|s| s.is_module_owner()),
+            "{:?}",
+            parsed.symbols
+        );
+        assert!(
+            parsed.unparsable_skip("G.js").is_some(),
+            "{:?}",
+            parsed.symbols
+        );
+    }
+
+    /// The owner never counts as an extractable symbol for the skip decision.
+    #[test]
+    fn an_owner_alone_does_not_make_a_broken_file_parsable() {
+        let parsed = ParsedFile {
+            path: "G.js".to_string(),
+            symbols: vec![RawSymbol {
+                name: MODULE_OWNER_NAME.to_string(),
+                kind: SymbolKind::Module,
+                start_line: 1,
+                end_line: 3,
+                signature: String::new(),
+                content_hash: String::new(),
+                is_entry_point: true,
+                entry_point_kind: Some(EntryPointKind::ModuleInit),
+                visibility: Visibility::Private,
+                type_info: None,
+                parent_name: None,
+                scope_chain: None,
+            }],
+            references: Vec::new(),
+            type_bindings: Vec::new(),
+            has_syntax_errors: true,
+        };
+        assert!(parsed.unparsable_skip("G.js").is_some());
+    }
+
+    /// bug-hunt #3: lowercase JSX tags are HTML elements the parser drops,
+    /// not calls, so a file whose only top-level "calls" are such tags mints
+    /// no (edge-less) owner. A component tag at top level still does.
+    #[test]
+    fn lowercase_jsx_tags_alone_mint_no_owner() {
+        let html_only = parse_source(
+            Path::new("a.jsx"),
+            "export const el = (<div><span/></div>);\n",
+        )
+        .unwrap();
+        assert!(
+            !html_only.symbols.iter().any(|s| s.is_module_owner()),
+            "{:?}",
+            html_only.symbols
+        );
+        let component = parse_source(
+            Path::new("b.jsx"),
+            "import { App } from './App';\nexport const el = (<div><App/></div>);\n",
+        )
+        .unwrap();
+        assert!(
+            component.symbols.iter().any(|s| s.is_module_owner()),
+            "{:?}",
+            component.symbols
+        );
+    }
+
+    /// Counterweight: a file with errors but real symbols keeps its owner.
+    #[test]
+    fn a_broken_file_with_real_symbols_keeps_its_owner() {
+        let source = "export function a() { return 1; }\nboot();\nconst = ;\n";
+        let parsed = parse_source(Path::new("b.js"), source).unwrap();
+        assert!(parsed.has_syntax_errors, "fixture must have syntax errors");
+        assert!(
+            parsed.symbols.iter().any(|s| s.name == "a"),
+            "{:?}",
+            parsed.symbols
+        );
+        assert!(
+            parsed.symbols.iter().any(|s| s.is_module_owner()),
+            "{:?}",
+            parsed.symbols
+        );
+        assert!(parsed.unparsable_skip("b.js").is_none());
     }
 }

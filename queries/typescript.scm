@@ -2,6 +2,12 @@
 (function_declaration
   name: (identifier) @name) @definition.function
 
+; Generator declarations (nw-791): `function* g()`, `async function* g()`,
+; `export default function* g()`. Without a symbol their bodies read as
+; top-level code and their callers got no edge.
+(generator_function_declaration
+  name: (identifier) @name) @definition.function
+
 (function_signature
   name: (identifier) @name) @definition.function
 
@@ -9,12 +15,12 @@
 (lexical_declaration
   (variable_declarator
     name: (identifier) @name
-    value: [(arrow_function) (function_expression)])) @definition.function
+    value: [(arrow_function) (function_expression) (generator_function)])) @definition.function
 
 (variable_declaration
   (variable_declarator
     name: (identifier) @name
-    value: [(arrow_function) (function_expression)])) @definition.function
+    value: [(arrow_function) (function_expression) (generator_function)])) @definition.function
 
 ; Export-wrapped arrow functions
 (export_statement
@@ -24,8 +30,9 @@
       value: (arrow_function)))) @definition.function
 
 ; CommonJS exports (nw-687): `module.exports.X = function|arrow` and
-; `exports.X = function|arrow` define X. Only function values: re-exporting an
-; existing binding (`module.exports.x = x`) defines nothing new, and a plain
+; `exports.X = function|arrow` define X, and so does a generator (`function*`).
+; Only function values: re-exporting an existing binding
+; (`module.exports.x = x`) defines nothing new, and a plain
 ; `obj.handler = function` stays a non-definition (the object must be exactly
 ; `module.exports` or `exports`).
 (assignment_expression
@@ -34,7 +41,7 @@
       object: (identifier) @_module
       property: (property_identifier) @_exports)
     property: (property_identifier) @name)
-  right: [(arrow_function) (function_expression)]
+  right: [(arrow_function) (function_expression) (generator_function)]
   (#eq? @_module "module")
   (#eq? @_exports "exports")) @definition.function
 
@@ -42,7 +49,7 @@
   left: (member_expression
     object: (identifier) @_exports
     property: (property_identifier) @name)
-  right: [(arrow_function) (function_expression)]
+  right: [(arrow_function) (function_expression) (generator_function)]
   (#eq? @_exports "exports")) @definition.function
 
 ; Class declarations
@@ -88,7 +95,7 @@
   (variable_declarator
     name: (identifier) @name
     value: (_) @_val)
-  (#not-match? @_val "^(\\(|(async[ \t]+)?function|async[ \t]*\\(|async[ \t]+[A-Za-z_$][A-Za-z0-9_$]*[ \t]*=>|class)")) @definition.const
+  (#not-match? @_val "^(\\(|(async[ \t]+)?function|async[ \t]*\\(|async[ \t]+[A-Za-z_$][A-Za-z0-9_$]*[ \t]*=>|[A-Za-z_$][A-Za-z0-9_$]*[ \t]*=>|class)")) @definition.const
 
 ; Test-runner blocks (Jest/Vitest/Mocha): test('name', fn), it('name', fn),
 ; describe('name', fn). Captured as a definition so the calls inside the

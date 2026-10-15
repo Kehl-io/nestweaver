@@ -942,7 +942,7 @@ pub struct GraphStore {
     /// LRU cache for PPR result vectors keyed by a hash of
     /// `(sorted seed_uids, damping, max_iterations, scope_hash, intent, graph_generation)`.
     /// Repeated queries with the same seeds skip the iterative PPR computation entirely.
-    pub(crate) ppr_result_cache: Mutex<lru::LruCache<u64, Vec<(String, f64)>>>,
+    pub(crate) ppr_result_cache: Mutex<lru::LruCache<u64, crate::ranking::FloorWalk>>,
     /// Set when the engine reported a COMMITTED write whose checkpoint it had
     /// to defer (see [`crate::error::CheckpointFailure::CommittedCheckpointDeferred`]).
     /// The data is durable; the handle needs a reopen so recovery can finish
