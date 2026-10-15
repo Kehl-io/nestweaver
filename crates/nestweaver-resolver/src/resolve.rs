@@ -9860,6 +9860,39 @@ export function readIt() { return value(); }
         );
     }
 
+    /// nw-791 (nw-113 B2): calls inside a generator belong to the generator,
+    /// and callers of the generator get an edge. No `<module>` owner.
+    #[test]
+    fn generator_bodies_own_their_calls() {
+        let lib = ("src/lib.js", "export function helper(x) { return x; }\n");
+        let saga = (
+            "src/g.js",
+            "import { helper } from './lib';\nexport function* gen(v) { yield helper(v); }\nasync function* agen(v) { yield helper(v); }\nexport function use(v) { return [...gen(v)]; }\n",
+        );
+        let (files, edges) = review_edges(&[lib, saga], Language::JavaScript);
+        let helper = vec![uid(&files, "src/lib.js", "helper")];
+        assert_eq!(
+            call_targets(&files, &edges, "src/g.js", "gen"),
+            helper,
+            "{edges:#?}"
+        );
+        assert_eq!(
+            call_targets(&files, &edges, "src/g.js", "agen"),
+            helper,
+            "{edges:#?}"
+        );
+        assert_eq!(
+            call_targets(&files, &edges, "src/g.js", "use"),
+            vec![uid(&files, "src/g.js", "gen")],
+            "{edges:#?}"
+        );
+        assert!(
+            !files[1].1.iter().any(|s| s.is_module_owner()),
+            "{:?}",
+            files[1].1
+        );
+    }
+
     /// nw-113 perf (bug-hunt #1): the per-candidate work is bounded. In a file
     /// with N same-named declarators, one candidate's lookup returns exactly
     /// its own declarator (not all N), and the module-level test is one array

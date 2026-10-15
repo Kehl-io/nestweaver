@@ -2,6 +2,12 @@
 (function_declaration
   name: (identifier) @name) @definition.function
 
+; Generator declarations (nw-791): `function* g()`, `async function* g()`,
+; `export default function* g()`. Without a symbol their bodies read as
+; top-level code and their callers got no edge.
+(generator_function_declaration
+  name: (identifier) @name) @definition.function
+
 (function_signature
   name: (identifier) @name) @definition.function
 
@@ -9,12 +15,12 @@
 (lexical_declaration
   (variable_declarator
     name: (identifier) @name
-    value: [(arrow_function) (function_expression)])) @definition.function
+    value: [(arrow_function) (function_expression) (generator_function)])) @definition.function
 
 (variable_declaration
   (variable_declarator
     name: (identifier) @name
-    value: [(arrow_function) (function_expression)])) @definition.function
+    value: [(arrow_function) (function_expression) (generator_function)])) @definition.function
 
 ; Export-wrapped arrow functions
 (export_statement

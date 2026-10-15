@@ -13829,3 +13829,45 @@ mod module_owner_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod generator_and_bare_arrow_tests {
+    use super::*;
+
+    fn kind_of(parsed: &ParsedFile, name: &str) -> Option<SymbolKind> {
+        parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.kind)
+    }
+
+    /// nw-791 (nw-113 regression B2): generator functions are functions.
+    /// Without a symbol their bodies read as top-level code owned by
+    /// `<module>`, and their callers got no edge.
+    #[test]
+    fn generator_functions_are_function_symbols() {
+        let source = "export function* rootSaga() { yield f(); }\n\
+                      export default function* defSaga() { yield g(); }\n\
+                      async function* agen(v) { yield h(v); }\n\
+                      function* plain() { yield 1; }\n\
+                      const expr = function* () { yield 2; };\n\
+                      let asyncExpr = async function* () { yield 3; };\n";
+        for path in ["saga.js", "saga.ts"] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            for name in ["rootSaga", "defSaga", "agen", "plain", "expr", "asyncExpr"] {
+                assert_eq!(
+                    kind_of(&parsed, name),
+                    Some(SymbolKind::Function),
+                    "{path}: {name}: {:?}",
+                    parsed.symbols
+                );
+            }
+            assert!(
+                !parsed.symbols.iter().any(|s| s.is_module_owner()),
+                "{path}: generator bodies are not top-level code: {:?}",
+                parsed.symbols
+            );
+        }
+    }
+}
