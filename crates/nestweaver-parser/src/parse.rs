@@ -64,9 +64,16 @@ pub enum ParseError {
 /// is a JSX/TSX file (where we append extra JSX patterns).  The
 /// `is_type_query` flag distinguishes the symbol-extraction query from the
 /// type-binding query for the same language.
+/// nw-805: the key also names the grammar the query is compiled against.
+/// `.ts` and `.tsx` share one type-query source but not one grammar, and a
+/// query compiled for one grammar matches nothing on the other's trees (node
+/// kind ids differ). Keyed without the grammar, whichever file a parse worker
+/// reached first decided the grammar for both kinds, so an index silently lost
+/// every type binding of the other kind and two indexes of one tree differed.
 #[derive(Hash, Eq, PartialEq, Clone)]
 struct QueryCacheKey {
     lang: Language,
+    grammar: tree_sitter::Language,
     is_jsx: bool,
     is_type_query: bool,
 }
@@ -79,7 +86,7 @@ static QUERY_CACHE: OnceLock<Mutex<HashMap<QueryCacheKey, Arc<Query>>>> = OnceLo
 
 /// Return a cached (or freshly compiled) `Query` wrapped in an `Arc`.
 ///
-/// The first call for a given `(lang, is_jsx, is_type_query)` triple compiles
+/// The first call for a given `(lang, grammar, is_jsx, is_type_query)` key compiles
 /// the S-expression source string and stores the result; subsequent calls
 /// return the cached `Arc` without recompiling.
 ///
@@ -1449,6 +1456,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         &ts_lang,
         QueryCacheKey {
             lang,
+            grammar: ts_lang.clone(),
             is_jsx,
             is_type_query: false,
         },
@@ -4034,6 +4042,7 @@ fn extract_types_from_tree(
         ts_lang,
         QueryCacheKey {
             lang,
+            grammar: ts_lang.clone(),
             is_jsx: false,
             is_type_query: true,
         },
@@ -11599,6 +11608,40 @@ class UserService {
             Some("UserService".to_string()),
             "method inside class UserService should have parent_name = UserService"
         );
+    }
+
+    /// nw-805: `.ts` and `.tsx` share one type-query source but parse with
+    /// different grammars. The compiled query cache was keyed without the
+    /// grammar, so whichever file a worker parsed first fixed the grammar for
+    /// both, and every file of the other kind silently lost all its type
+    /// bindings. That made two indexes of one tree differ. Both kinds must
+    /// keep their bindings whichever is parsed first, every time.
+    #[test]
+    fn ts_and_tsx_type_bindings_do_not_depend_on_parse_order() {
+        let source = "import { Api } from './api';\n\
+                      export function run(api: Api) {\n  \
+                        const client = new Api();\n  \
+                        return api.health() && client.health();\n\
+                      }\n";
+        let bindings = |path: &str| {
+            let mut found: Vec<_> = parse_source(Path::new(path), source)
+                .unwrap()
+                .type_bindings
+                .into_iter()
+                .map(|b| (b.var_name, b.type_name, b.line))
+                .collect();
+            found.sort();
+            found
+        };
+        let expected = vec![
+            ("api".to_string(), "Api".to_string(), 2),
+            ("client".to_string(), "Api".to_string(), 3),
+        ];
+        for order in [["a.tsx", "b.ts"], ["b.ts", "a.tsx"], ["a.tsx", "b.ts"]] {
+            for path in order {
+                assert_eq!(bindings(path), expected, "{path} after {order:?}");
+            }
+        }
     }
 
     #[test]
