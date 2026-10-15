@@ -3882,6 +3882,50 @@ mod tests {
         }
     }
 
+    /// nw-113 batch C (watch-parity bug 1). 210 HOC files give the hub more
+    /// direct dependents (their `<module>` owners) than the transitive cap.
+    /// A line shift in the hub must still re-resolve every direct importer:
+    /// `D -> WithTheme` survives, and the graph equals a fresh index.
+    #[test]
+    fn watcher_reresolves_direct_importers_when_the_transitive_cap_trips() {
+        let mut files = barrel_fixture(BARRELS[0]);
+        files.retain(|(path, _)| *path != "app/Title.js");
+        for i in 1..=210 {
+            files.push((
+                Box::leak(format!("app/T{i}.js").into_boxed_str()),
+                format!(
+                    "import withTheme from '../lib/withTheme';\n\nfunction T{i}(props) {{\n  return props;\n}}\n\nexport default withTheme(T{i});\n"
+                ),
+            ));
+        }
+        files.push((
+            "app/D.js",
+            "import { WithTheme } from '../lib/withTheme/WithTheme';\nexport function D() { return WithTheme(1); }\n".into(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root, repo_url) = index_files(&dir, &files);
+        let d_calls_hub = |db: &GraphStore| {
+            let (d, hub) = (uid_of(db, &r_uid, "D"), uid_of(db, &r_uid, "WithTheme"));
+            db.load_typed_edges()
+                .unwrap()
+                .into_iter()
+                .filter(|(a, b, _, _, _)| *a == d && *b == hub)
+                .map(|(_, _, kind, _, _)| kind)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let both: std::collections::BTreeSet<String> =
+            ["CALLS".to_string(), "IMPORTS".to_string()].into();
+        assert_eq!(d_calls_hub(&store), both, "precondition");
+
+        let hub = root.join("lib/withTheme/WithTheme.js");
+        let body = std::fs::read_to_string(&hub).unwrap();
+        std::fs::write(&hub, format!("// top\n{body}")).unwrap();
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        process_fixture_batch(&watcher, &store, &r_uid, &root, &[hub]);
+        assert_eq!(d_calls_hub(&store), both, "D -> WithTheme lost its edges");
+        assert_matches_fresh(&store, &root, &repo_url, "hub past the transitive cap");
+    }
+
     #[test]
     fn watch_reindex_preserves_cross_file_edges() {
         let dir = tempfile::tempdir().unwrap();

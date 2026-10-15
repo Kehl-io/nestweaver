@@ -8046,9 +8046,16 @@ fn partition_changed_removed(
 ///
 /// Returns the reverse-dependents to re-resolve (`affected \ changed \
 /// removed`), bounded by [`crate::resolution_cache::MAX_HOPS`] hops and a
-/// `MAX_AFFECTED_FILES` total cap. On exceeding the total cap the pass is
-/// skipped (empty set returned) — a periodic full re-index is the backstop for
-/// hub/widely-imported files.
+/// `MAX_AFFECTED_FILES` cap on the TRANSITIVE expansion.
+///
+/// The first hop, the direct dependents, is always kept, whatever its size.
+/// Re-resolution only rebuilds edges with an endpoint in a changed file, and
+/// every file holding such an edge is by definition a direct dependent, so
+/// dropping any of them loses edges for certain (nw-113: a hub's `<module>`
+/// owners alone could exceed the cap, and the whole pass used to be skipped).
+/// The cap counts files, owners included, and only stops the expansion past
+/// the first hop. Files beyond it hold no edge into a changed file; they are
+/// resolution context only, so deferring them is logged rather than repaired.
 ///
 /// **CRITICAL ORDERING:** this must run BEFORE `begin_transaction`; the
 /// per-file `DETACH DELETE` in the mutation loop destroys the very edges this
@@ -8065,9 +8072,9 @@ pub(crate) fn collect_reverse_dep_files(
 ) -> std::collections::HashSet<String> {
     use std::collections::HashSet;
 
-    /// Upper bound on total files touched by the transitive re-resolution pass.
-    /// Beyond this the pass is skipped (full re-index is the backstop) so a
-    /// change to a widely-imported hub file does not cascade unbounded.
+    /// Upper bound on files the TRANSITIVE expansion may add past the direct
+    /// dependents, so a change to a widely-imported hub does not cascade
+    /// unbounded. The direct dependents are never capped.
     const MAX_AFFECTED_FILES: usize = 200;
 
     let mut seeds: HashSet<String> = changed.clone();
@@ -8078,7 +8085,7 @@ pub(crate) fn collect_reverse_dep_files(
 
     let mut affected = seeds.clone();
     let mut frontier = seeds;
-    for _ in 0..crate::resolution_cache::MAX_HOPS {
+    for hop in 0..crate::resolution_cache::MAX_HOPS {
         let mut next: HashSet<String> = HashSet::new();
         for file in &frontier {
             match store.files_referencing_file(r_uid, file) {
@@ -8097,15 +8104,17 @@ pub(crate) fn collect_reverse_dep_files(
         if next.is_empty() {
             break; // fixed point — no more transitive reverse-dependents
         }
-        if affected.len() + next.len() > MAX_AFFECTED_FILES {
+        if hop > 0 && affected.len() + next.len() > MAX_AFFECTED_FILES {
             tracing::warn!(
                 affected = affected.len(),
-                next = next.len(),
+                deferred = next.len(),
+                hop,
                 cap = MAX_AFFECTED_FILES,
-                "transitive re-resolution affected-file cap exceeded; skipping pass \
-                 (full re-index is the backstop)"
+                "transitive re-resolution affected-file cap exceeded; re-resolving the \
+                 direct dependents only and deferring the transitive files, which hold \
+                 no edge into a changed file"
             );
-            return HashSet::new();
+            break;
         }
         affected.extend(next.iter().cloned());
         frontier = next;
@@ -14159,6 +14168,42 @@ module.exports = { check, plain };\n";
             vec![repo_uid("test", "https://example.com/rust")],
             "blast-radius of daemon_exit.rs must stay in one repo, got {:?}",
             result.coverage.repos_in_scope
+        );
+    }
+
+    /// nw-113 batch C: past the cap the transitive expansion stops, but the
+    /// direct dependents (and earlier hops) are kept rather than the whole
+    /// set being dropped.
+    #[test]
+    fn reverse_dep_cap_defers_only_the_transitive_remainder() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("hub.js"), "export function hub() { return 1; }\n").unwrap();
+        fs::write(
+            src.join("mid.js"),
+            "import { hub } from './hub.js';\nexport function mid() { return hub(); }\n",
+        )
+        .unwrap();
+        for i in 0..205 {
+            fs::write(
+                src.join(format!("leaf{i}.js")),
+                format!("import {{ mid }} from './mid.js';\nexport function leaf{i}() {{ return mid(); }}\n"),
+            )
+            .unwrap();
+        }
+        let (_, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/cap", "sha").unwrap();
+        let repo = repo_uid("test", "https://example.com/cap");
+        let rdeps = collect_reverse_dep_files(
+            &store,
+            &repo,
+            &std::collections::HashSet::from(["hub.js".to_string()]),
+            &Default::default(),
+        );
+        assert_eq!(
+            rdeps,
+            std::collections::HashSet::from(["mid.js".to_string()])
         );
     }
 
