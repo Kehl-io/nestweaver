@@ -344,16 +344,17 @@ pub fn resolve_references_with_file_languages(
                 .iter()
                 .filter(|reference| {
                     reference.kind == ReferenceKind::LocalBinding
-                        && !graph.bindings_of(file_path).iter().any(|binding| {
-                            binding.local_name == reference.name
-                                && if let Some(scope) = reference.scope {
+                        && !graph
+                            .bindings_named(file_path, &reference.name)
+                            .any(|binding| {
+                                if let Some(scope) = reference.scope {
                                     binding
                                         .scope
                                         .is_some_and(|import| import.position == scope.position)
                                 } else {
                                     binding.start_line == reference.start_line
                                 }
-                        })
+                            })
                 })
                 .collect();
             let scope_index = FileScopeIndex::build(&local_bindings, sorted_syms);
@@ -894,17 +895,20 @@ fn resolve_single_reference(
     // Aliased import (`use path::to::original as name;`): the binding records
     // the original name and the file it was imported from.
     let module_binding = rust_path_import_positions.and_then(|positions| {
-        graph.bindings_of(file_path).iter().find(|binding| {
+        let receiver = reference.receiver.as_deref()?;
+        graph.bindings_named(file_path, receiver).find(|binding| {
             binding.original_name == "*"
-                && reference.receiver.as_deref() == Some(binding.local_name.as_str())
                 && binding
                     .scope
                     .is_some_and(|scope| positions.contains(&scope.position))
         })
     });
+    // Only a binding named like the call or its receiver can match below, so
+    // look those up by name instead of scanning every import in the file.
     let binding = module_binding.or_else(|| {
-        graph.bindings_of(file_path).iter().find(|binding| {
-            let owner = scoping_owner(sorted_syms, binding.start_line, language);
+        let candidates =
+            graph.bindings_named_either(file_path, name, reference.receiver.as_deref());
+        candidates.into_iter().find(|binding| {
             let in_scope =
                 if let (Some(binding_scope), Some(call_scope)) = (binding.scope, reference.scope) {
                     binding_scope.start <= call_scope.position
@@ -920,7 +924,7 @@ fn resolve_single_reference(
                                 && call_scope.start > binding_scope.start
                                 && call_scope.end <= binding_scope.end)
                 } else {
-                    owner.is_none_or(|owner| {
+                    scoping_owner(sorted_syms, binding.start_line, language).is_none_or(|owner| {
                         owner.start_line == source_sym.start_line && owner.name == source_sym.name
                     })
                 };
@@ -1695,11 +1699,9 @@ fn rust_public_type_origin(
         }
         let public_uses = &type_envs.get(&file)?.rust_public_root_uses;
         let bindings: Vec<_> = graph
-            .bindings_of(&file)
-            .iter()
+            .bindings_named(&file, &name)
             .filter(|binding| {
-                binding.local_name == name
-                    && binding.original_name != "*"
+                binding.original_name != "*"
                     && binding
                         .scope
                         .is_some_and(|scope| public_uses.contains(&scope.position))
@@ -1762,13 +1764,11 @@ fn typed_receiver_origin(
         // Named aliases retain their original declaration spelling. Unresolved
         // exact imports cannot be rescued by another resolved glob.
         let named: Vec<_> = graph
-            .bindings_of(source_file)
-            .iter()
+            .bindings_named(source_file, type_name)
             .filter(|binding| {
-                binding.local_name == type_name
-                    && binding.scope.is_some_and(|scope| {
-                        origin.named_import_positions.contains(&scope.position)
-                    })
+                binding
+                    .scope
+                    .is_some_and(|scope| origin.named_import_positions.contains(&scope.position))
                     && imports.iter().any(|(specifier, file)| {
                         selected_paths.contains(specifier)
                             && binding.source_file.as_deref() == Some(file.as_str())
@@ -1842,11 +1842,9 @@ fn typed_receiver_origin(
         return None;
     }
     let imports: Vec<_> = graph
-        .bindings_of(source_file)
-        .iter()
+        .bindings_named(source_file, type_name)
         .filter(|binding| {
-            binding.local_name == type_name
-                && binding.original_name != "*"
+            binding.original_name != "*"
                 && binding.scope.is_none_or(|scope| {
                     reference.scope.is_some_and(|call| {
                         scope.start <= call.position
@@ -1925,9 +1923,8 @@ fn method_belongs_to_origin(
                     *owner_file == file
                         && matches!(owner.kind, SymbolKind::Class | SymbolKind::Enum)
                 })
-                && graph.bindings_of(file).iter().any(|binding| {
-                    binding.local_name == origin.name
-                        && binding.original_name == origin.name
+                && graph.bindings_named(file, &origin.name).any(|binding| {
+                    binding.original_name == origin.name
                         && binding.source_file.as_deref() == Some(origin.file.as_str())
                 }))
 }
@@ -10152,6 +10149,46 @@ export function readIt() { return value(); }
                 !call_targets(&files, &edges, a, nestweaver_schema::MODULE_OWNER_NAME)
                     .contains(&helper),
                 "{a}: top-level code above the require runs first: {edges:#?}"
+            );
+        }
+    }
+
+    /// Timing probe for whole-module bindings (nw-113 item 15). Run with
+    /// `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn whole_module_binding_timing_probe() {
+        let n: usize = std::env::var("NW_PROBE_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3000);
+        let shapes: [(&str, &str, Language, fn(usize) -> String); 3] = [
+            ("import =", "src/a.ts", Language::TypeScript, |i| {
+                format!("import m{i} = require('./lib');\nexport function q{i}() {{ m{i}(); }}\n")
+            }),
+            ("import * as", "src/a.ts", Language::TypeScript, |i| {
+                format!("import * as m{i} from './lib';\nexport function q{i}() {{ m{i}.f(); }}\n")
+            }),
+            ("require", "src/a.js", Language::JavaScript, |i| {
+                format!("const m{i} = require('./lib');\nfunction q{i}() {{ m{i}.f(); }}\n")
+            }),
+        ];
+        for (label, path, language, line) in shapes {
+            let source: String = (0..n).map(line).collect();
+            let lib = if language == Language::TypeScript {
+                "src/lib.ts"
+            } else {
+                "src/lib.js"
+            };
+            let started = std::time::Instant::now();
+            let (_files, edges) = review_edges(
+                &[(lib, "export function f() {}\n"), (path, &source)],
+                language,
+            );
+            eprintln!(
+                "{label} x{n}: {:?} ({} edges)",
+                started.elapsed(),
+                edges.len()
             );
         }
     }
