@@ -88,6 +88,9 @@ pub struct CpuThrottle {
     cpu_clock: Box<dyn Fn() -> Duration + Send + Sync>,
     sleep: Box<dyn Fn(Duration) + Send + Sync>,
     window: Mutex<Window>,
+    /// Set by [`interrupt_waits`](Self::interrupt_waits): every current and
+    /// future wait returns at once.
+    interrupted: AtomicBool,
     /// nw-812 test seam: how many times [`check`](Self::check) ran.
     #[cfg(test)]
     checks: std::sync::atomic::AtomicUsize,
@@ -247,6 +250,7 @@ impl CpuThrottle {
             cpu_clock,
             sleep,
             window: Mutex::new(window),
+            interrupted: AtomicBool::new(false),
             #[cfg(test)]
             checks: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -277,12 +281,23 @@ impl CpuThrottle {
         self.wait_within(budget.saturating_sub(WRITE_RESERVE), cancel);
     }
 
+    /// End every current and future wait (sticky). The daemon calls this
+    /// when it begins shutting down: paths without a job cancel token (the
+    /// vault parse) would otherwise hold the drain for up to
+    /// [`MAX_WAIT_PER_CHECK`]. Work then runs unthrottled to its end, which
+    /// on a draining daemon is a short, bounded tail.
+    pub fn interrupt_waits(&self) {
+        self.interrupted.store(true, Ordering::Relaxed);
+    }
+
     /// Wait (in [`MAX_SLEEP`] slices, at most [`MAX_WAIT_PER_CHECK`]) until
     /// the window's total is at most `limit`.
     fn wait_within(&self, limit: Duration, cancel: Option<&AtomicBool>) {
         let mut slept = Duration::ZERO;
         while slept < MAX_WAIT_PER_CHECK {
-            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            if self.interrupted.load(Ordering::Relaxed)
+                || cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+            {
                 return;
             }
             let now_wall = (self.wall_clock)();
@@ -769,5 +784,46 @@ mod tests {
         rig.advance(Duration::from_secs(5), Duration::from_secs(40));
         rig.throttle.reserve_write_headroom(None);
         assert!(rig.sleeps().is_empty());
+    }
+
+    // ── nw-812 review I2: waits are interruptible without a cancel token ─
+
+    #[test]
+    fn interrupt_waits_releases_a_waiting_worker() {
+        // The vault parse has no job cancel token; a daemon shutdown must
+        // still be able to end a throttle wait instead of blocking ~190 s.
+        let rig = rig(secs(72));
+        rig.advance(Duration::from_secs(5), Duration::from_secs(80));
+        rig.throttle.interrupt_waits();
+        rig.throttle.check();
+        rig.throttle.reserve_write_headroom(None);
+        assert!(rig.sleeps().is_empty(), "slept {:?}", rig.sleeps().len());
+    }
+
+    #[test]
+    fn interrupt_waits_ends_a_wait_already_in_progress() {
+        let throttle = Arc::new(StdMutex::new(None::<Arc<CpuThrottle>>));
+        let slices = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let t = {
+            let throttle = Arc::clone(&throttle);
+            let slices = Arc::clone(&slices);
+            Arc::new(CpuThrottle::with_clocks(
+                secs(72),
+                Box::new(|| Duration::from_secs(5)),
+                Box::new(|| Duration::from_secs(80)),
+                Box::new(move |_| {
+                    // Shutdown arrives during the first sleep slice.
+                    slices.fetch_add(1, Ordering::SeqCst);
+                    if let Some(t) = throttle.lock().unwrap().as_ref() {
+                        t.interrupt_waits();
+                    }
+                }),
+            ))
+        };
+        *throttle.lock().unwrap() = Some(Arc::clone(&t));
+        t.check();
+        assert_eq!(slices.load(Ordering::SeqCst), 1);
+        // Break the Arc cycle.
+        throttle.lock().unwrap().take();
     }
 }

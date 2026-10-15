@@ -3033,6 +3033,11 @@ fn begin_shutdown_drain(state: Arc<DaemonState>, trigger: &'static str) {
         return;
     }
 
+    // nw-812: release any index worker waiting on the CPU budget, so the
+    // drain is not held up to ~190 s by a throttle wait (the vault parse has
+    // no job cancel token to end it otherwise).
+    nestweaver_engine::cpu_throttle::CpuThrottle::global().interrupt_waits();
+
     // Stop any active watcher BEFORE the drain wait — an orphaned watcher's
     // blocking thread would otherwise pin shutdown (Tokio's runtime drop waits
     // for blocking threads) until someone kills the process.
