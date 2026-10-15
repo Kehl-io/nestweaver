@@ -1276,6 +1276,9 @@ pub fn build_context_with_intent(
             effective_intent,
             None,
             CONTEXT_PPR_FLOOR,
+            // nw-113 R1: keep enough below-floor rows to refill the whole
+            // list the caller asked for (bucketed and bounded by the store).
+            limit.unwrap_or(nestweaver_store::PPR_BELOW_FLOOR_KEEP),
         )
         .map_err(|e| anyhow::anyhow!(e))?;
     let SplitWalk {
@@ -1838,15 +1841,12 @@ mod context_tests {
         );
     }
 
-    /// nw-113 R1: a star where the hub reaches thousands of `<module>`
-    /// owners and thousands of real symbols, all under the score floor. The
-    /// walk keeps at most `PPR_BELOW_FLOOR_KEEP` real rows; when it had to
-    /// cut real rows the refill wanted, the result says so rather than
-    /// claiming a complete list.
-    #[test]
-    fn context_discloses_real_rows_the_below_floor_keep_cut() {
+    /// nw-113 R1: a star where the hub reaches `per_kind` `<module>` owners
+    /// and `per_kind` real symbols, all under the score floor. Owner edges
+    /// are a little stronger, so a cut that does not tell them apart fills
+    /// its budget with owners. Returns the store and the hub's UID.
+    fn owner_star(per_kind: usize) -> (nestweaver_store::GraphStore, String) {
         use nestweaver_schema::uid::symbol_uid;
-        let per_kind = 2_500;
         let repo = "repo:t:1";
         let sym = |uid: String, name: &str, path: String, owner: bool| nestweaver_schema::Symbol {
             uid,
@@ -1900,17 +1900,50 @@ mod context_tests {
         let store = nestweaver_store::GraphStore::in_memory().unwrap();
         store.batch_insert_symbols(&symbols).unwrap();
         store.batch_insert_edges(&edges).unwrap();
+        (store, hub)
+    }
 
-        let result =
-            super::build_context_with_intent(&store, std::slice::from_ref(&hub), None, Some(3_000))
-                .unwrap();
-        let real_listed = result
+    fn real_listed(result: &super::ContextResult) -> usize {
+        result
             .connected
             .iter()
             .filter(|node| node.name.starts_with("real_"))
-            .count();
+            .count()
+    }
+
+    /// nw-113 R1: the below-floor keep follows the requested limit, so a
+    /// limit past `PPR_BELOW_FLOOR_KEEP` lists every real caller, as 12.0.4
+    /// did, and the list is complete.
+    #[test]
+    fn context_keep_follows_the_requested_limit() {
+        let per_kind = 2_500;
+        let (store, hub) = owner_star(per_kind);
+        let result =
+            super::build_context_with_intent(&store, std::slice::from_ref(&hub), None, Some(3_000))
+                .unwrap();
         assert_eq!(
-            real_listed,
+            real_listed(&result),
+            per_kind,
+            "{} listed",
+            result.connected.len()
+        );
+        assert_ne!(result.truncated, Some(true), "{:?}", result.connected_total);
+        assert_eq!(result.truncated_by, None);
+        assert_eq!(result.connected_total, Some(per_kind));
+    }
+
+    /// nw-113 R1: with no limit the keep stays at `PPR_BELOW_FLOOR_KEEP`;
+    /// when it had to cut real rows the refill wanted, the result says so
+    /// rather than claiming a complete list.
+    #[test]
+    fn context_discloses_real_rows_the_below_floor_keep_cut() {
+        let per_kind = 2_500;
+        let (store, hub) = owner_star(per_kind);
+        let result =
+            super::build_context_with_intent(&store, std::slice::from_ref(&hub), None, None)
+                .unwrap();
+        assert_eq!(
+            real_listed(&result),
             nestweaver_store::PPR_BELOW_FLOOR_KEEP,
             "{} listed",
             result.connected.len()
@@ -2618,6 +2651,9 @@ pub fn build_feature_context(
             intent,
             None,
             CONTEXT_PPR_FLOOR,
+            // nw-113 R1: keep enough below-floor rows to refill the whole
+            // list the caller asked for (bucketed and bounded by the store).
+            limit.unwrap_or(nestweaver_store::PPR_BELOW_FLOOR_KEEP),
         )
         .map_err(|e| anyhow::anyhow!(e))?;
     let SplitWalk {
@@ -3700,6 +3736,8 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             } else {
                 CONTEXT_PPR_FLOOR
             },
+            // No engine-side limit here: the default keep.
+            nestweaver_store::PPR_BELOW_FLOOR_KEEP,
         )
         .map_err(|e| anyhow::anyhow!(e))?;
     let SplitWalk {
