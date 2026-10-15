@@ -3380,7 +3380,13 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             &GraphScope::unified(),
             intent,
             cancel.map(|flag| flag.as_ref()),
-            CONTEXT_PPR_FLOOR,
+            // A capped hydration (`investigate`) never refills, so it walks
+            // at the standard floor and caches no below-floor tail.
+            if render_cap.is_some() {
+                nestweaver_store::PPR_MIN_SCORE
+            } else {
+                CONTEXT_PPR_FLOOR
+            },
         )
         .map_err(|e| anyhow::anyhow!(e))?;
     let (mut ppr, refill_pool) = split_refill_pool(walk, &seed_uids);

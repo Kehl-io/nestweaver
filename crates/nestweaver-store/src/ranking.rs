@@ -637,6 +637,40 @@ pub struct ScopedEdgeQuery {
 /// same bar every other non-seed already meets.
 pub const PPR_MIN_SCORE: f64 = 1e-4;
 
+/// nw-113: how many non-seed nodes scoring at or under [`PPR_MIN_SCORE`] a
+/// walk with a lower floor keeps (best first) in what it returns and caches.
+/// The context builders draw their refill from this tail, so it only needs
+/// to cover any list limit a caller realistically asks for; past that, an
+/// uncapped floor-0 walk is the whole reachable graph, and caching 128 of
+/// those grew the daemon by gigabytes on a large brain.
+pub const PPR_BELOW_FLOOR_KEEP: usize = 1_000;
+
+/// nw-113: cut a walk run under a floor lower than [`PPR_MIN_SCORE`] to every
+/// seed, every node above that floor, and the best
+/// [`PPR_BELOW_FLOOR_KEEP`] of the rest. `results` is sorted best first, so
+/// the kept tail is its head. A walk at the standard floor is returned as is.
+fn bound_below_floor(
+    results: Vec<(String, f64)>,
+    seed_uids: &[String],
+    min_score: f64,
+) -> Vec<(String, f64)> {
+    if min_score >= PPR_MIN_SCORE {
+        return results;
+    }
+    let seeds: std::collections::HashSet<&str> = seed_uids.iter().map(String::as_str).collect();
+    let mut below = 0usize;
+    results
+        .into_iter()
+        .filter(|(uid, score)| {
+            if *score > PPR_MIN_SCORE || seeds.contains(uid.as_str()) {
+                return true;
+            }
+            below += 1;
+            below <= PPR_BELOW_FLOOR_KEEP
+        })
+        .collect()
+}
+
 /// Describes which slice of the graph PageRank / PPR runs over.
 ///
 /// The algorithm itself is node-type-agnostic — `GraphScope` is what turns
@@ -1225,7 +1259,8 @@ impl GraphStore {
     /// `min_score` are left out. nw-113: the context builders ask for a floor
     /// of `0.0` so that, when capped `<module>` owners soaked up the walk's
     /// mass, they can refill their list with real symbols that scored under
-    /// [`PPR_MIN_SCORE`].
+    /// [`PPR_MIN_SCORE`]. Under a floor below [`PPR_MIN_SCORE`] only the best
+    /// [`PPR_BELOW_FLOOR_KEEP`] of those are returned and cached.
     #[allow(clippy::too_many_arguments)]
     pub fn personalized_pagerank_with_floor(
         &self,
@@ -1388,6 +1423,7 @@ impl GraphStore {
             Some(&cancelled as &dyn Fn() -> bool),
         )
         .ok_or(StoreError::Cancelled(crate::error::CancelReason::Timeout))?;
+        let results = bound_below_floor(results, seed_uids, min_score);
         let cache_result = results.clone();
         ensure_active()?;
 
@@ -4341,6 +4377,48 @@ mod tests {
         assert!(
             (base_b - after_b).abs() < 1e-9,
             "unscored file should keep base pagerank (neutral): {base_b} vs {after_b}"
+        );
+    }
+
+    /// nw-113 final review I2: a floor-0 walk keeps every node that clears
+    /// `PPR_MIN_SCORE` but only the best `PPR_BELOW_FLOOR_KEEP` of the rest,
+    /// both in what it returns and in what the result cache holds, so a
+    /// daemon answering many context calls does not cache whole-graph walks.
+    #[test]
+    fn floor_zero_walk_bounds_below_floor_rows_returned_and_cached() {
+        let store = test_store();
+        let leaves = super::PPR_BELOW_FLOOR_KEEP + 4_000;
+        let mut symbols = vec![make_symbol("HUB", "hub")];
+        symbols.extend((0..leaves).map(|i| make_symbol(&format!("L{i}"), &format!("leaf_{i}"))));
+        store.batch_insert_symbols(&symbols).unwrap();
+        let edges: Vec<_> = (0..leaves)
+            .map(|i| make_calls_edge("HUB", &format!("L{i}")))
+            .collect();
+        store.batch_insert_edges(&edges).unwrap();
+        let seeds = vec!["HUB".to_owned()];
+        let walk = store
+            .personalized_pagerank_with_floor(
+                &seeds,
+                0.85,
+                20,
+                &GraphScope::code_only(),
+                None,
+                None,
+                0.0,
+            )
+            .unwrap();
+        let below = |rows: &[(String, f64)]| {
+            rows.iter()
+                .filter(|(uid, score)| uid != "HUB" && *score <= super::PPR_MIN_SCORE)
+                .count()
+        };
+        assert_eq!(below(&walk), super::PPR_BELOW_FLOOR_KEEP, "{}", walk.len());
+        assert!(walk.windows(2).all(|w| w[0].1 >= w[1].1), "best first");
+        let cache = store.ppr_result_cache.lock().unwrap();
+        let cached_max = cache.iter().map(|(_, rows)| rows.len()).max().unwrap();
+        assert!(
+            cached_max <= 1 + super::PPR_BELOW_FLOOR_KEEP,
+            "cached {cached_max} rows"
         );
     }
 }

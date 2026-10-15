@@ -42,7 +42,7 @@ pub use db::StoreConnection as DbConnection;
 pub use db::{StoreRows, StoreStatement};
 pub use ranking::{
     DEFAULT_GIT_ACTIVITY_WEIGHT, GIT_ACTIVITY_MULT_MAX, GIT_ACTIVITY_MULT_MIN, GraphScope,
-    PPR_MIN_SCORE, PathDeboostRule, QueryIntent, SEED_PATH_FACTOR_MAX, SEED_PATH_FACTOR_MIN,
+    PPR_BELOW_FLOOR_KEEP, PPR_MIN_SCORE, PathDeboostRule, QueryIntent, SEED_PATH_FACTOR_MAX, SEED_PATH_FACTOR_MIN,
     ScopedEdgeQuery, SeedResolutionConfig, default_kind_priority, detect_intent,
     git_activity_multiplier,
 };
