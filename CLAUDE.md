@@ -148,10 +148,11 @@ process"). A live launchd probe on macOS 27 tripped the monitor and ran on.
 Parse workers still run at `QOS_CLASS_UTILITY` on macOS, which is what keeps
 the machine responsive during an index.
 
-Setting `NESTWEAVER_INDEX_CPU_PERCENT` to 1–40 opts in to the nw-812 budget,
-unchanged: the average percent of ONE core the daemon's process CPU (all
-threads, since process start) may use over a rolling 180s window (40 = 72s
-per 180s, also the maximum). The budget is one per process, so back-to-back
+Setting `NESTWEAVER_INDEX_CPU_PERCENT` to 1–40 opts in to the nw-812 budget:
+the average percent of ONE core the daemon's process CPU (all threads, since
+process start) may use over a rolling 180s window (40 = 72s per 180s, also the
+maximum). 1–11 are raised to 12 (21.6s): a budget at or under the 20s write
+reserve leaves no headroom for the pre-write wait below. The budget is one per process, so back-to-back
 indexes share it. Parse and type-env workers only wait once the window
 exceeds the budget. The write phase runs under the write gate and is never
 throttled; instead, before taking the gate an index waits until the window
@@ -172,7 +173,11 @@ database, publication root or operation journal is gone, and empty pre-nw-811
 records that are older than 24h, unheld, and match no live database named by a
 daemon boot log or `--db`. It never removes a record some process holds.
 `daemon gc --dry-run` reports what would go and skips the launch-agent and
-directory sweeps. See `docs/architecture/filesystem-authority.md`.
+directory sweeps. `daemon gc --db X` limits the prune to records whose scope
+belongs to X and leaves legacy records alone; without `--db` the whole
+registry is swept. A registry the sweep refuses (a non-private root) is a
+warning, and gc still exits 0 when its other sweeps succeeded. See
+`docs/architecture/filesystem-authority.md`.
 
 **The daemon is the sole writer to the DB file.** Never run `sqlite3` or other
 tools against the DB while the daemon is running. Bypassing the daemon risks
@@ -202,11 +207,11 @@ by an error message the tool can print, so they belong somewhere findable.
 | `NESTWEAVER_INDEX_TIMEOUT_SECS` | 1800 | Overall ceiling for one index. On expiry the daemon requests cancellation and reports a non-terminal warning naming this variable. Cancellation is COOPERATIVE and only observed up to the pre-write boundary, so the final stream event says whether the run aborted before writing or committed anyway (committed-after-cancellation names `index --force` as the repair). |
 | `NESTWEAVER_DRAIN_TIMEOUT_SECS` | 660 | Drain ceiling for BOTH shutdown routes — the gRPC `Shutdown` RPC (`daemon restart`) and SIGTERM (`daemon stop`), which share one drain. With an in-flight write OR a genuinely running index job (the drain reads the worker pool's own in-flight counter, not the `indexing_active` flag) it is NOT a deadline: the daemon cannot abort either, so past this point it keeps waiting, keeps serving most reads (`embed`/`plan_embed` excepted — they take the write gate), logs the in-flight count, and names `daemon stop --force` / `kill -9` as the escapes. With only a STUCK `indexing_active` flag (set, but no worker job in flight) it IS a deadline: the daemon signals shutdown at the ceiling, which stops read service, because that flag cannot clear once the worker pool is drained with a non-empty queue. Also derives `NESTWEAVER_STOP_GRACE_SECS`, the launchd plist's `ExitTimeOut` (ceiling + 60 — deliberately later than the stop grace, so the CLI gives up watching before launchd kills), and the client's owner-release wait (ceiling + 5s). |
 | `NESTWEAVER_STOP_GRACE_SECS` | drain ceiling + 30 (690) | How long `daemon stop` waits for the daemon to exit. This is NOT a kill deadline: when it expires with the daemon still draining, `daemon stop` re-probes the socket, reports what it observed, leaves the daemon running, and exits non-zero. It does not SIGKILL — see the daemon-architecture section for why an automatic escalation was the defect. Listeners stay up for the whole window in a write drain (and in a genuinely-running-index drain), so waiting is not an outage (individual reads can still stall for seconds while a write commits); only in a stuck-flag index drain does the ceiling broadcast close them 30s before this expires, and the message says so. `daemon stop --force` ignores this variable and uses a short fixed 10s window before SIGKILL, abandoning any in-flight write. |
-| `NESTWEAVER_INDEX_CPU_PERCENT` | disabled | Opt-in index CPU budget (nw-814): average percent of one core over a rolling 180s window of the daemon's process CPU. `1`–`40` enable it (40 = 72s per 180s, the maximum); unset, `0`, `41`–`99` and `>=100` leave it off. macOS does not kill the daemon for CPU use, so this is not needed for stability. See the throttling note above and the launchd note below. |
+| `NESTWEAVER_INDEX_CPU_PERCENT` | disabled | Opt-in index CPU budget (nw-814): average percent of one core over a rolling 180s window of the daemon's process CPU. `1`–`40` enable it (40 = 72s per 180s, the maximum; `1`–`11` are raised to `12` = 21.6s, the smallest budget with room beyond the 20s write reserve); unset, `0`, `41`–`99` and `>=100` leave it off. macOS does not kill the daemon for CPU use, so this is not needed for stability. See the throttling note above and the launchd note below. |
 | `NESTWEAVER_ALLOW_NO_DAEMON` | unset | CI-only explicit permit. Requires the unpublished internal CI test artifact and a GitHub Actions runner context. Standard artifacts ignore bypass requests; never use for local tests or recovery. |
 | `NESTWEAVER_UI_ALLOWED_HOSTS` | unset | Comma-separated extra hostnames admitted by the local UI for a deliberate reverse proxy. Requests otherwise require a loopback Host (`localhost`, `127.0.0.1`, or `[::1]`); an Origin, when present, must match Host. Configure the proxy to forward the browser's Host unchanged. |
 | `NESTWEAVER_SOCK_FALLBACK_DIR` | `/tmp/nw-sock-<uid>` | Root of the /tmp socket-fallback tree (used when the runtime socket path would exceed the 104-byte `sun_path` limit). Test support: daemon, client, and `daemon gc` all read it, so a test points every one of them at one scratch directory and never sweeps the operator's real fallback root. Not for normal use. |
-| `NESTWEAVER_AUTHORITY_DIR` | account registry | Test support, DEBUG BUILDS ONLY: absolute path of the authority registry (nw-811). `.cargo/config.toml` points it at `target/test-authority` for everything cargo runs, so test and scratch databases stop growing `~/.local/state/nestweaver/authority`. Release binaries ignore it, so an ambient variable cannot split their lock authority. |
+| `NESTWEAVER_AUTHORITY_DIR` | account registry | Test support, DEBUG BUILDS ONLY: absolute path of the authority registry (nw-811), honoured only for a scope under the system temp dir (`std::env::temp_dir()`, `/tmp`; on macOS `/private/var/folders`, `/private/tmp`). `.cargo/config.toml` points it at `target/test-authority` for everything cargo runs, so tempdir test databases stop growing `~/.local/state/nestweaver/authority`. A real database always uses the account registry, even under `cargo run`, so a `cargo run` CLI and the launchd daemon (or two worktrees) still exclude each other on it. Release binaries ignore it entirely, so `cargo test --release` still writes tempdir records to the account registry; `daemon gc` reclaims them once their scope is gone. |
 | `NESTWEAVER_LBUG_MAX_THREADS` | 1 | Engine thread-pool size. `1` closes the nw-073 eviction-vs-read race; raise only if you measure a query-latency cost. |
 | `NESTWEAVER_LBUG_BUFFER_POOL_BYTES` | auto | Buffer pool size. A larger pool avoids eviction when the working set fits. |
 | `NESTWEAVER_LBUG_AUTO_CHECKPOINT` | on | `0`/`false` defers auto-checkpoints; reduces the #678 corruption trigger during bulk load. |
