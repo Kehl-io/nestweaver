@@ -426,7 +426,12 @@ fn generate_file_summaries(store: &GraphStore) -> Result<Vec<Summary>> {
             .unwrap_or_default();
 
         // nw-113: a file that is only top-level code exports nothing; it
-        // gets no empty `exports 0 symbols:` clause.
+        // gets no empty `exports 0 symbols:` clause, and when its code calls
+        // nothing indexed in another file it has nothing to say at all (QA
+        // N3: no content-free `imports from: []` line).
+        if file_symbols.is_empty() && import_files.is_empty() {
+            continue;
+        }
         let content = if file_symbols.is_empty() {
             format!(
                 "{file_path}: imports from: [{imports}]",
@@ -881,6 +886,7 @@ mod tests {
             "import { flushBuffer } from './lib';\nflushBuffer();\n",
         )
         .unwrap();
+        std::fs::write(src.join("silent.ts"), "console.log('ready');\n").unwrap();
         let (_r, store) =
             index_directory_in_memory(dir.path(), "test", "https://example.com/r", "sha").unwrap();
 
@@ -905,6 +911,15 @@ mod tests {
             ownerless.content.contains("imports from: [src/lib.ts]"),
             "{}",
             ownerless.content
+        );
+
+        // QA N3: a file that is only top-level code calling nothing indexed
+        // has nothing to say, so it gets no `imports from: []` line.
+        assert!(
+            files
+                .iter()
+                .all(|summary| summary.target_name != "src/silent.ts"),
+            "{files:#?}"
         );
 
         let targeted = generate_symbol_summaries_bounded(&store, Some("module"), 100).unwrap();
