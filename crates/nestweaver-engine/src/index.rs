@@ -8083,6 +8083,13 @@ pub(crate) fn collect_reverse_dep_files(
 /// re-resolves; past it the pass is skipped with a warning.
 const MAX_DIRECT_DEPENDENTS: usize = 5_000;
 
+#[cfg(test)]
+thread_local! {
+    /// `files_referencing_file` calls made by
+    /// [`collect_reverse_dep_files_with_ceiling`] on this thread.
+    static TEST_REVERSE_DEP_QUERY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Direct-dependent count past which re-resolution logs its size and time.
 const LARGE_REVERSE_DEP_SET: usize = 200;
 
@@ -8110,8 +8117,25 @@ fn collect_reverse_dep_files_with_ceiling(
     let mut affected = seeds.clone();
     let mut frontier = seeds;
     for hop in 0..crate::resolution_cache::MAX_HOPS {
+        // Past hop 0, any new file would exceed the cap once `affected`
+        // already fills it, so the hop's queries could only be discarded.
+        // Skipping them saves one query per direct dependent (seconds on a
+        // hub with hundreds of importers).
+        if hop > 0 && affected.len() >= MAX_AFFECTED_FILES {
+            tracing::warn!(
+                affected = affected.len(),
+                hop,
+                cap = MAX_AFFECTED_FILES,
+                "transitive re-resolution affected-file cap reached; re-resolving the \
+                 direct dependents only and skipping the transitive expansion, whose files hold \
+                 no edge into a changed file"
+            );
+            break;
+        }
         let mut next: HashSet<String> = HashSet::new();
         for file in &frontier {
+            #[cfg(test)]
+            TEST_REVERSE_DEP_QUERY_COUNT.with(|count| count.set(count.get() + 1));
             match store.files_referencing_file(r_uid, file) {
                 Ok(rdeps) => {
                     for dep in rdeps {
@@ -14337,6 +14361,41 @@ module.exports = { check, plain };\n";
         assert_eq!(
             rdeps,
             std::collections::HashSet::from(["mid.js".to_string()])
+        );
+    }
+
+    /// nw-113 final watch parity P4: once the direct dependents alone fill
+    /// the transitive cap, hop 1 can only exceed it, so its per-file
+    /// `files_referencing_file` queries are never run. Every direct dependent
+    /// is still kept.
+    #[test]
+    fn reverse_dep_cap_skips_the_transitive_queries_once_hop_zero_fills_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("hub.js"), "export function hub() { return 1; }\n").unwrap();
+        for i in 0..205 {
+            fs::write(
+                src.join(format!("dep{i}.js")),
+                format!("import {{ hub }} from './hub.js';\nexport function dep{i}() {{ return hub(); }}\n"),
+            )
+            .unwrap();
+        }
+        let (_, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/p4", "sha").unwrap();
+        let repo = repo_uid("test", "https://example.com/p4");
+        TEST_REVERSE_DEP_QUERY_COUNT.with(|count| count.set(0));
+        let rdeps = collect_reverse_dep_files(
+            &store,
+            &repo,
+            &std::collections::HashSet::from(["hub.js".to_string()]),
+            &Default::default(),
+        );
+        assert_eq!(rdeps.len(), 205, "every direct dependent is kept");
+        assert_eq!(
+            TEST_REVERSE_DEP_QUERY_COUNT.with(std::cell::Cell::get),
+            1,
+            "only the hop-0 query for hub.js runs"
         );
     }
 
