@@ -230,7 +230,7 @@ carries these JS/TS parser and resolver fixes:
 | A broken file with no real symbols gets no owner; a lowercase JSX tag (`<div/>`) never mints one | Such files stay disclosed as parse errors and add no empty owners |
 | A top-level call through an import written below a one-line function resolves (JS/TS/Python/PHP), and a sibling's nested homonym no longer hides the caller's own nested function | Those calls keep their edges |
 | A member access or call through an imported receiver (`Modal.latestProps` after `import { Modal }`) never binds a same-file symbol of the member's name | The false self-`ACCESSES` edge in a file named like its import (`Modal.test.js`) is gone |
-| `.mjs`/`.cjs` files are indexed as JavaScript and `.mts`/`.cts` as TypeScript; an extensionless import also reaches them | Those files, and the calls into them, appear in the graph |
+| `.mjs`/`.cjs` files are indexed as JavaScript and `.mts`/`.cts` as TypeScript; an extensionless import also reaches them, a directory import reaches its `index.mjs`/`.cjs`/`.mts`/`.cts`, and `index`, `main`, `app` and `server` files in those extensions are entry files like their `.js`/`.ts` twins | Those files, and the calls into them, appear in the graph |
 
 Graphs indexed at generation 9 need the same forced re-index. All these kinds of staleness have the same remedy and the
 same symptom list. Until you re-index:
