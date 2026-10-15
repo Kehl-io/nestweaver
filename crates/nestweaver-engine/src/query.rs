@@ -940,34 +940,55 @@ pub(crate) const CONTEXT_PPR_FLOOR: f64 = 0.0;
 /// `(uid, score)` pairs, best first.
 type ScoredUids = Vec<(String, f64)>;
 
+/// nw-113: a [`CONTEXT_PPR_FLOOR`] walk split by [`split_refill_pool`].
+pub(crate) struct SplitWalk {
+    /// The ranking every context builder used before: seeds, and nodes
+    /// above `PPR_MIN_SCORE`, best first.
+    pub(crate) ranked: ScoredUids,
+    /// The non-seed, non-owner nodes under that floor, best first.
+    pub(crate) pool: ScoredUids,
+    /// How many `<module>` owners scored under that floor. They are never
+    /// listed, but they took the walk's mass all the same: on a very hot hub
+    /// they push every node, themselves included, under the floor, and the
+    /// owner cap then has nothing to hide (final review I1).
+    pub(crate) deep_owners: usize,
+}
+
 /// nw-113: split a [`CONTEXT_PPR_FLOOR`] walk into the ranking every context
-/// builder used before (seeds, and nodes above `PPR_MIN_SCORE`) and the
-/// refill pool: the non-seed, non-owner nodes under that floor, best first.
-pub(crate) fn split_refill_pool(walk: ScoredUids, seeds: &[String]) -> (ScoredUids, ScoredUids) {
+/// builder used before and the refill pool, counting the owners under the
+/// floor. The store keeps only the best `PPR_BELOW_FLOOR_KEEP` rows under the
+/// floor, so `deep_owners` counts the owners among those.
+pub(crate) fn split_refill_pool(walk: ScoredUids, seeds: &[String]) -> SplitWalk {
     let seeds: std::collections::HashSet<&str> = seeds.iter().map(String::as_str).collect();
     let (ranked, deep): (Vec<_>, Vec<_>) = walk.into_iter().partition(|(uid, score)| {
         seeds.contains(uid.as_str()) || *score > nestweaver_store::PPR_MIN_SCORE
     });
-    let pool = deep
+    let (owners, pool): (Vec<_>, Vec<_>) = deep
         .into_iter()
-        .filter(|(uid, _)| !nestweaver_schema::uid::is_module_owner_uid(uid))
-        .collect();
-    (ranked, pool)
+        .partition(|(uid, _)| nestweaver_schema::uid::is_module_owner_uid(uid));
+    SplitWalk {
+        ranked,
+        pool,
+        deep_owners: owners.len(),
+    }
 }
 
-/// nw-113: how many refill candidates a context list takes. Only a list
-/// whose owner cap hid owners is refilled, and with at most as many real
-/// symbols as owners were hidden: the list grows back to the length it
-/// would have had with every owner listed, never past `limit`.
-/// `listed` is the list's length so far, owners included.
+/// nw-113: how a context list is refilled. `owners_hidden` is every owner
+/// the walk reached that the list does not show: those the cap left out and
+/// those under the floor. The list takes at most that many real symbols from
+/// the pool, so it grows back to the length it would have had if the owners'
+/// mass had gone to real symbols, never past `limit`. `listed` is the list's
+/// length so far, owners included. Returns `(take, available)`: how many to
+/// insert now, and how many the pool could supply (for `connected_total`).
 pub(crate) fn refill_count(
-    owners_omitted: usize,
+    owners_hidden: usize,
     listed: usize,
     limit: Option<usize>,
     pool: usize,
-) -> usize {
+) -> (usize, usize) {
+    let available = owners_hidden.min(pool);
     let room = limit.map_or(usize::MAX, |limit| limit.saturating_sub(listed));
-    owners_omitted.min(pool).min(room)
+    (available.min(room), available)
 }
 
 /// nw-113: put `refill` after the real nodes of `ranked` and before its
@@ -1223,7 +1244,11 @@ pub fn build_context_with_intent(
             CONTEXT_PPR_FLOOR,
         )
         .map_err(|e| anyhow::anyhow!(e))?;
-    let (ppr_results, refill_pool) = split_refill_pool(walk, &seed_uids);
+    let SplitWalk {
+        ranked: ppr_results,
+        pool: refill_pool,
+        deep_owners,
+    } = split_refill_pool(walk, &seed_uids);
 
     let seed_set: std::collections::HashSet<&str> = seed_uids.iter().map(|s| s.as_str()).collect();
 
@@ -1276,9 +1301,8 @@ pub fn build_context_with_intent(
         .iter()
         .filter(|node| owner_uids.contains(&node.uid))
         .count();
-    let refill_available = module_owners_omitted.min(refill_pool.len());
-    let take = refill_count(
-        module_owners_omitted,
+    let (take, refill_available) = refill_count(
+        module_owners_omitted + deep_owners,
         ranked.len(),
         limit,
         refill_pool.len(),
@@ -1781,6 +1805,77 @@ mod context_tests {
         let (owners, last) = owners_listed_last(&titles);
         assert_eq!(owners, 3, "{titles:?}");
         assert!(last, "{titles:?}");
+    }
+
+    /// The very hot hub of the final review's I1 probe: `hub` is imported
+    /// and called at load time by `files` files, each of which also has a
+    /// real caller `h<i>`. At 3,000 files the owners push every caller,
+    /// themselves included, under the PPR score floor.
+    fn very_hot_hub_repo(files: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(src.join("f")).unwrap();
+        fs::write(
+            src.join("hub.js"),
+            "function hub() { return 1; }\nmodule.exports = { hub };\n",
+        )
+        .unwrap();
+        for i in 0..files {
+            fs::write(
+                src.join(format!("f/f{i}.js")),
+                format!(
+                    "const {{ hub }} = require('../hub');\nhub();\n\
+                     function h{i}() {{ return hub(); }}\nmodule.exports = {{ h{i} }};\n"
+                ),
+            )
+            .unwrap();
+        }
+        (dir, src)
+    }
+
+    /// nw-113 final review I1: when owners push every node under the floor,
+    /// the owner cap hides nothing, yet code, feature and brain context
+    /// must still fill their lists with the hub's real callers.
+    #[test]
+    fn contexts_refill_a_very_hot_hub_whose_owners_sink_under_the_floor() {
+        let (_dir, src) = very_hot_hub_repo(3_000);
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let real_callers = |names: Vec<&str>| {
+            names
+                .iter()
+                .filter(|n| n.starts_with('h') && n[1..].parse::<usize>().is_ok())
+                .count()
+        };
+
+        let code =
+            super::build_context_with_intent(&store, &["hub".to_string()], None, Some(20))
+                .unwrap();
+        let names: Vec<&str> = code.connected.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names.len(), 20, "{names:?}");
+        assert!(real_callers(names.clone()) >= 17, "{names:?}");
+        assert!(
+            code.connected_total.unwrap() > 20,
+            "more callers than listed: {:?}",
+            code.connected_total
+        );
+
+        let repo = store.list_repos(None).unwrap().remove(0);
+        let feature = crate::config::FeatureConfig {
+            name: "hub".to_string(),
+            description: None,
+            repos: vec![repo.name.clone().unwrap_or(repo.url.clone())],
+            entry_points: vec!["hub".to_string()],
+        };
+        let feat =
+            super::build_feature_context(&store, &feature, &[], &[], None, Some(20)).unwrap();
+        let names: Vec<&str> = feat.connected.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names.len(), 20, "{names:?}");
+        assert!(real_callers(names.clone()) >= 17, "{names:?}");
+
+        let brain = super::build_brain_context(&store, &["hub".to_string()]).unwrap();
+        let titles: Vec<&str> = brain.connected.iter().map(|n| n.title.as_str()).collect();
+        assert!(real_callers(titles.clone()) >= 30, "{} {titles:?}", titles.len());
     }
 
     /// `owner_heavy_repo` plus a class whose method name is shared with a
@@ -2319,7 +2414,11 @@ pub fn build_feature_context(
             CONTEXT_PPR_FLOOR,
         )
         .map_err(|e| anyhow::anyhow!(e))?;
-    let (ppr_scores, refill_pool) = split_refill_pool(walk, &seed_uids);
+    let SplitWalk {
+        ranked: ppr_scores,
+        pool: refill_pool,
+        deep_owners,
+    } = split_refill_pool(walk, &seed_uids);
 
     let seed_set: std::collections::HashSet<&str> = seed_uids.iter().map(|s| s.as_str()).collect();
     let mut seeds: Vec<ContextNode> = Vec::new();
@@ -2362,9 +2461,8 @@ pub fn build_feature_context(
         .iter()
         .filter(|node| owner_uids.contains(&node.uid))
         .count();
-    let refill_available = module_owners_omitted.min(refill_pool.len());
-    let take = refill_count(
-        module_owners_omitted,
+    let (take, refill_available) = refill_count(
+        module_owners_omitted + deep_owners,
         ranked.len(),
         limit,
         refill_pool.len(),
@@ -3389,7 +3487,11 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             },
         )
         .map_err(|e| anyhow::anyhow!(e))?;
-    let (mut ppr, refill_pool) = split_refill_pool(walk, &seed_uids);
+    let SplitWalk {
+        ranked: mut ppr,
+        pool: refill_pool,
+        deep_owners,
+    } = split_refill_pool(walk, &seed_uids);
 
     // nw-609: bound each container expansion to its most central members.
     // Every member personalized the walk above, so the PPR score of a member
@@ -3531,8 +3633,8 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             .iter()
             .filter(|node| nestweaver_schema::uid::is_module_owner_uid(&node.uid))
             .count();
-        let take = refill_count(
-            module_owners_omitted,
+        let (take, _) = refill_count(
+            module_owners_omitted + deep_owners,
             connected.len(),
             None,
             refill_pool.len(),
