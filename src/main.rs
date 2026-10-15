@@ -6326,10 +6326,13 @@ enum Commands {
     /// Read a symbol's source span (start_line..end_line) — just the symbol,
     /// not the whole file. Optionally include adjacent symbols; token-budget aware.
     #[command(
-        after_help = "Examples:\n  nestweaver read-symbols greet --neighbors 1\n  nestweaver read-symbols sym:... --token-budget 4000 --json"
+        after_help = "Examples:\n  nestweaver read-symbols greet --neighbors 1\n  nestweaver read-symbols src/app.js::init\n  nestweaver read-symbols 'src/app.js::<module>'\n  nestweaver read-symbols sym:... --token-budget 4000 --json"
     )]
     ReadSymbols {
-        /// Symbol UIDs, names, or FQNs to read.
+        /// Symbol UIDs, names, FQNs, or path::name specs to read. The path is a
+        /// repo-relative path or a suffix of one; path::<module> reads the
+        /// file's top-level code, with function, class and method bodies
+        /// elided as ⋮.
         #[arg(required = true)]
         targets: Vec<String>,
         #[arg(
@@ -6340,7 +6343,7 @@ enum Commands {
         neighbors: u8,
         #[arg(
             long = "token-budget",
-            help = "Approximate token budget for the combined output"
+            help = "Approximate token budget for the combined output. A first symbol larger than the budget is cut to fit and marked body_truncated; 0 returns the first symbol whole"
         )]
         token_budget: Option<usize>,
         #[arg(
@@ -6446,7 +6449,7 @@ enum Commands {
     /// Traverses incoming CALLS, IMPORTS, EXTENDS, and IMPLEMENTS edges
     /// to find all symbols that would be affected by a change.
     #[command(
-        after_help = "Examples:\n  nestweaver impact \"processPayment\" --depth 5\n  nestweaver impact \"sym:repo:...:abc:42\" --confidence 0.8 --json\n  nestweaver impact \"processPayment\" --depth 15 --min-score 0\n\nNote: paths whose decayed impact score falls below --min-score (default 0.10)\nare pruned; a depth-4 chain of 0.5-confidence edges scores 0.0625 and is dropped.\nWhen pruning occurs the CLI says so in a text note. JSON always uses the same\nobject envelope with `nodes` and `impact_nodes` aliases, counts, and truncation\nflags. Pass --min-score 0 to disable score pruning; depth and result limits\nstill apply."
+        after_help = "Examples:\n  nestweaver impact \"processPayment\" --depth 5\n  nestweaver impact \"src/app.js::<module>\"\n  nestweaver impact \"sym:repo:...:abc:42\" --confidence 0.8 --json\n  nestweaver impact \"processPayment\" --depth 15 --min-score 0\n\nNote: paths whose decayed impact score falls below --min-score (default 0.10)\nare pruned; a depth-4 chain of 0.5-confidence edges scores 0.0625 and is dropped.\nWhen pruning occurs the CLI says so in a text note. JSON always uses the same\nobject envelope with `nodes` and `impact_nodes` aliases, counts, and truncation\nflags. Pass --min-score 0 to disable score pruning; depth and result limits\nstill apply."
     )]
     Impact {
         /// Symbol name or UID to analyze
@@ -6456,6 +6459,12 @@ enum Commands {
         /// it is, the not_found response (JSON and text) carries
         /// `did_you_mean` suggestions from the closest substring matches,
         /// when any exist.
+        ///
+        /// A path::name spec narrows by file (a repo-relative path or a suffix
+        /// of one), then by container (Class::method); one matching neither is
+        /// not found, with path::name suggestions. path::<module> names a
+        /// file's top-level code. Callers that are top-level code are labelled
+        /// path::<module>.
         name_or_uid: String,
         #[arg(
             long,
@@ -6885,11 +6894,14 @@ enum Commands {
     /// Pass symbol names, UIDs, or file paths. Returns connected symbols
     /// ranked by structural relevance via Personalized PageRank.
     /// Use --feature with --config to resolve a declared feature bundle instead.
+    /// Files' top-level code (path::<module>) ranks after every real symbol;
+    /// at most 3 are listed and the rest are counted as "+N more files'
+    /// top-level code".
     #[command(
-        after_help = "Examples:\n  nestweaver context processPayment CheckoutService\n  nestweaver context src/checkout/payment.ts\n  nestweaver context sym:repo:...:abc:42\n  nestweaver context --feature device-pairing --config ./instance.toml"
+        after_help = "Examples:\n  nestweaver context processPayment CheckoutService\n  nestweaver context src/checkout/payment.ts\n  nestweaver context src/app.js::init 'src/app.js::<module>'\n  nestweaver context sym:repo:...:abc:42\n  nestweaver context --feature device-pairing --config ./instance.toml"
     )]
     Context {
-        /// Symbol names, UIDs, or file paths to seed from (not required when --feature is set)
+        /// Symbol names, UIDs, path::name specs, or file paths to seed from (not required when --feature is set)
         #[arg(required_unless_present = "feature")]
         seeds: Vec<String>,
         #[arg(long, help = "Feature name from instance config")]
@@ -7911,7 +7923,9 @@ enum Commands {
         after_help = "Examples:\n  nestweaver flow-trace handleRequest\n  nestweaver flow-trace \"sym:repo:...:abc:42\" --max-depth 3 --json"
     )]
     FlowTrace {
-        #[arg(help = "Symbol name or full UID to trace from")]
+        #[arg(
+            help = "Symbol name, path::name spec (path::<module> for a file's top-level code), or full UID to trace from"
+        )]
         symbol: String,
         #[arg(
             long,
