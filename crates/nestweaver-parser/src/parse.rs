@@ -1783,7 +1783,10 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     && kind == SymbolKind::Property
                     && matches!(node.kind(), "field_definition" | "public_field_definition")
                     && node.child_by_field_name("value").is_some_and(|value| {
-                        matches!(value.kind(), "arrow_function" | "function_expression")
+                        matches!(
+                            value.kind(),
+                            "arrow_function" | "function_expression" | "generator_function"
+                        )
                     })
                 {
                     kind = SymbolKind::Method;
@@ -3295,6 +3298,8 @@ fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
             parent.kind(),
             "function_declaration"
                 | "function_expression"
+                | "generator_function_declaration"
+                | "generator_function"
                 | "arrow_function"
                 | "method_definition"
                 | "function_item"
@@ -5227,7 +5232,7 @@ fn collect_js_import_bindings(
                 && key.kind() == "property_identifier"
                 && matches!(
                     value.kind(),
-                    "identifier" | "function_expression" | "arrow_function"
+                    "identifier" | "function_expression" | "arrow_function" | "generator_function"
                 )
             {
                 references.push(RawReference {
@@ -14003,6 +14008,33 @@ mod generator_and_bare_arrow_tests {
             assert!(
                 !parsed.symbols.iter().any(|s| s.is_module_owner()),
                 "{path}: generator bodies are not top-level code: {:?}",
+                parsed.symbols
+            );
+        }
+    }
+
+    /// nw-113 final review M1: a CommonJS export assigned a generator is a
+    /// function, as one assigned a function expression is, and a class field
+    /// holding a generator is a method, as one holding an arrow is.
+    #[test]
+    fn commonjs_and_class_field_generators_are_callables() {
+        let source = "exports.gen = function* () { yield 1; };\n\
+                      module.exports.gen2 = function* () { yield 2; };\n\
+                      class C {\n  run = function* () { yield 3; };\n}\n";
+        for path in ["cjs.js", "cjs.ts"] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            for name in ["gen", "gen2"] {
+                assert_eq!(
+                    kind_of(&parsed, name),
+                    Some(SymbolKind::Function),
+                    "{path}: {name}: {:?}",
+                    parsed.symbols
+                );
+            }
+            assert_eq!(
+                kind_of(&parsed, "run"),
+                Some(SymbolKind::Method),
+                "{path}: {:?}",
                 parsed.symbols
             );
         }

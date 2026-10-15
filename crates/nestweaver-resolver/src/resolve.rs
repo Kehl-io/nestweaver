@@ -9991,6 +9991,36 @@ export function readIt() { return value(); }
         }
     }
 
+    /// nw-113 final review M1: a generator's parameters and `var`s are scoped
+    /// to the generator, like any function's. They used to leak to program
+    /// scope and shadow a same-named module function everywhere.
+    #[test]
+    fn generator_parameters_and_vars_stay_inside_the_generator() {
+        for (path, language) in [
+            ("src/saga.js", Language::JavaScript),
+            ("src/saga.ts", Language::TypeScript),
+        ] {
+            let source = "function* saga(action) { var step = 1; yield action; }\n\
+                 const expr = function* (other) { yield other; };\n\
+                 function action() {}\n\
+                 function step() {}\n\
+                 function other() {}\n\
+                 export function caller() { return [action(), step(), other()]; }\n";
+            let (files, edges) = review_edges(&[(path, source)], language);
+            let mut expected = vec![
+                uid(&files, path, "action"),
+                uid(&files, path, "other"),
+                uid(&files, path, "step"),
+            ];
+            expected.sort();
+            assert_eq!(
+                call_targets(&files, &edges, path, "caller"),
+                expected,
+                "{path}: {edges:#?}"
+            );
+        }
+    }
+
     /// nw-803: ESM imports are hoisted. A function written above the
     /// `import` line sees the imported name, and a parameter of that name
     /// still shadows it.

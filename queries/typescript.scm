@@ -30,8 +30,9 @@
       value: (arrow_function)))) @definition.function
 
 ; CommonJS exports (nw-687): `module.exports.X = function|arrow` and
-; `exports.X = function|arrow` define X. Only function values: re-exporting an
-; existing binding (`module.exports.x = x`) defines nothing new, and a plain
+; `exports.X = function|arrow` define X, and so does a generator (`function*`).
+; Only function values: re-exporting an existing binding
+; (`module.exports.x = x`) defines nothing new, and a plain
 ; `obj.handler = function` stays a non-definition (the object must be exactly
 ; `module.exports` or `exports`).
 (assignment_expression
@@ -40,7 +41,7 @@
       object: (identifier) @_module
       property: (property_identifier) @_exports)
     property: (property_identifier) @name)
-  right: [(arrow_function) (function_expression)]
+  right: [(arrow_function) (function_expression) (generator_function)]
   (#eq? @_module "module")
   (#eq? @_exports "exports")) @definition.function
 
@@ -48,7 +49,7 @@
   left: (member_expression
     object: (identifier) @_exports
     property: (property_identifier) @name)
-  right: [(arrow_function) (function_expression)]
+  right: [(arrow_function) (function_expression) (generator_function)]
   (#eq? @_exports "exports")) @definition.function
 
 ; Class declarations
