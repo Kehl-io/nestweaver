@@ -245,6 +245,7 @@ pub fn resolve_references_with_file_languages(
                 .iter()
                 .filter(|reference| reference.kind == ReferenceKind::LocalBinding)
                 .collect();
+            let scope_index = FileScopeIndex::build(&local_bindings, sorted_syms);
             let calls_by_identity = scoped_call_reference_index(references);
             for assignment in &env.call_assignments {
                 let Some(calls) = calls_by_identity.get(&(
@@ -267,6 +268,7 @@ pub fn resolve_references_with_file_languages(
                     file_path,
                     calls[0],
                     &local_bindings,
+                    &scope_index,
                     sorted_syms,
                     &symbol_map,
                     &extends_map,
@@ -354,11 +356,13 @@ pub fn resolve_references_with_file_languages(
                         })
                 })
                 .collect();
+            let scope_index = FileScopeIndex::build(&local_bindings, sorted_syms);
             for reference in references {
                 if let Some(edge) = resolve_single_reference(
                     file_path,
                     reference,
                     &local_bindings,
+                    &scope_index,
                     sorted_syms,
                     &symbol_map,
                     &extends_map,
@@ -463,6 +467,7 @@ fn resolve_single_reference(
     file_path: &str,
     reference: &RawReference,
     local_bindings: &[&RawReference],
+    scope_index: &FileScopeIndex<'_>,
     sorted_syms: &[&RawSymbol],
     symbol_map: &std::collections::HashMap<String, Vec<(&str, &RawSymbol)>>,
     extends_map: &std::collections::HashMap<String, Vec<String>>,
@@ -523,7 +528,13 @@ fn resolve_single_reference(
     // nw-724: a parameter, let, or lambda binding is the target. Do not
     // continue on to a same-named function in this file or another.
     if reference.receiver.is_none()
-        && name_is_locally_bound(local_bindings, sorted_syms, reference, language)
+        && name_is_locally_bound(
+            local_bindings,
+            scope_index,
+            sorted_syms,
+            reference,
+            language,
+        )
     {
         return Some(unresolved_edge(source_uid, &reference.name, edge_type));
     }
@@ -620,7 +631,7 @@ fn resolve_single_reference(
             // segment's binding cannot establish the complete receiver's type.
             if let Some(call_scope) = reference.scope {
                 if let Some(declaration) =
-                    active_lexical_binding(local_bindings, reference, receiver, language)
+                    active_lexical_binding(scope_index, reference, receiver, language)
                 {
                     env.lookup_declaration(receiver, declaration.scope?, call_scope.position)
                 } else if language == Language::Rust {
@@ -644,7 +655,13 @@ fn resolve_single_reference(
 
         if let Some(binding) = receiver_type.filter(|binding| {
             reference.scope.is_some()
-                || !name_is_locally_bound(local_bindings, sorted_syms, reference, language)
+                || !name_is_locally_bound(
+                    local_bindings,
+                    scope_index,
+                    sorted_syms,
+                    reference,
+                    language,
+                )
                 || binding.line >= source_sym.start_line
         }) {
             let method_name = &reference.name;
@@ -669,7 +686,7 @@ fn resolve_single_reference(
             let constructor_shadowed = binding.source
                 == crate::type_extractors::BindingSource::Constructor
                 && matches!(language, Language::JavaScript | Language::TypeScript)
-                && active_lexical_binding(local_bindings, reference, unqualified_type, language)
+                && active_lexical_binding(scope_index, reference, unqualified_type, language)
                     .is_some();
             let origin = if constructor_shadowed {
                 None
@@ -829,7 +846,13 @@ fn resolve_single_reference(
         }
     }
 
-    if name_is_locally_bound(local_bindings, sorted_syms, reference, language) {
+    if name_is_locally_bound(
+        local_bindings,
+        scope_index,
+        sorted_syms,
+        reference,
+        language,
+    ) {
         return Some(unresolved_edge(source_uid, &reference.name, edge_type));
     }
 
@@ -947,13 +970,8 @@ fn resolve_single_reference(
             // Records rejections as a side effect; `min_by_key` consumes the
             // whole iterator, so every candidate is seen.
             .filter_map(|candidate| {
-                let width = same_file_declaration_scope(
-                    local_bindings,
-                    sorted_syms,
-                    candidate.1,
-                    reference,
-                    language,
-                );
+                let width =
+                    same_file_declaration_scope(scope_index, candidate.1, reference, language);
                 same_file_out_of_scope |= width.is_none();
                 width.map(|width| (width, candidate))
             })
@@ -1999,13 +2017,16 @@ fn path_denotes(candidate_file: &str, sym: &RawSymbol, qualifier: &str) -> bool 
 /// symbol at or before the use, and it is not the declaration of a graph
 /// symbol of that name (a `const len = ...` that IS the symbol).
 fn active_lexical_binding<'a>(
-    bindings: &[&'a RawReference],
+    scope_index: &FileScopeIndex<'a>,
     reference: &RawReference,
     name: &str,
     language: Language,
 ) -> Option<&'a RawReference> {
     let at = reference.scope?.position;
-    bindings
+    // nw-113 (perf): only the file's scoped bindings of this name, from the
+    // per-file index, instead of every binding in the file per reference.
+    scope_index
+        .named(name)
         .iter()
         .copied()
         .filter(|binding| {
@@ -2028,6 +2049,88 @@ fn active_lexical_binding<'a>(
                 }),
             )
         })
+}
+
+/// nw-113 (perf): per-file lookups for Priority 1 scoping, built once per
+/// file next to `local_bindings`. Before this, every same-file candidate of
+/// every bare call scanned all of the file's bindings and then all of its
+/// symbols, which is O(calls x candidates x (bindings + symbols)) and
+/// measured cubic on a file of many same-named locals (bug-hunt #1).
+pub(crate) struct FileScopeIndex<'a> {
+    /// Scoped bindings (`LocalBinding`s with a byte scope: declarators and
+    /// parameters), by name, sorted by line. A candidate's own declarators are
+    /// a binary search over its span; `active_lexical_binding` reads one
+    /// name's list instead of every binding in the file.
+    declarators: std::collections::HashMap<&'a str, Vec<&'a RawReference>>,
+    /// `covering[l - 1]`: how many code-bearing symbols (never the `<module>`
+    /// owner) contain line `l`.
+    covering: Vec<u32>,
+}
+
+impl<'a> FileScopeIndex<'a> {
+    pub(crate) fn build(local_bindings: &[&'a RawReference], sorted_syms: &[&RawSymbol]) -> Self {
+        let mut declarators: std::collections::HashMap<&'a str, Vec<&'a RawReference>> =
+            std::collections::HashMap::new();
+        for binding in local_bindings
+            .iter()
+            .filter(|binding| binding.scope.is_some())
+        {
+            declarators
+                .entry(binding.name.as_str())
+                .or_default()
+                .push(binding);
+        }
+        for bindings in declarators.values_mut() {
+            bindings.sort_by_key(|binding| binding.start_line);
+        }
+        let code: Vec<&&RawSymbol> = sorted_syms.iter().filter(|s| can_contain_code(s)).collect();
+        let last = code
+            .iter()
+            .map(|s| s.end_line.max(s.start_line) as usize)
+            .max()
+            .unwrap_or(0);
+        let mut delta = vec![0i64; last + 1];
+        for s in code {
+            delta[(s.start_line.max(1) - 1) as usize] += 1;
+            delta[s.end_line.max(s.start_line) as usize] -= 1;
+        }
+        let mut depth = 0i64;
+        let covering = delta[..last]
+            .iter()
+            .map(|change| {
+                depth += change;
+                depth as u32
+            })
+            .collect();
+        Self {
+            declarators,
+            covering,
+        }
+    }
+
+    /// Every scoped binding named `name`, in line order.
+    fn named(&self, name: &str) -> &[&'a RawReference] {
+        self.declarators.get(name).map_or(&[], Vec::as_slice)
+    }
+
+    /// Declarator bindings named `name` whose line lies in `start..=end`.
+    fn declarators_in(&self, name: &str, start: u32, end: u32) -> &[&'a RawReference] {
+        let Some(bindings) = self.declarators.get(name) else {
+            return &[];
+        };
+        let lo = bindings.partition_point(|binding| binding.start_line < start);
+        let hi = bindings.partition_point(|binding| binding.start_line <= end);
+        &bindings[lo..hi.max(lo)]
+    }
+
+    /// How many code-bearing symbols contain `line`.
+    fn covering(&self, line: u32) -> u32 {
+        (line as usize)
+            .checked_sub(1)
+            .and_then(|index| self.covering.get(index))
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 /// nw-113: where a same-file callable `sym` is visible from `reference`.
@@ -2077,8 +2180,7 @@ fn active_lexical_binding<'a>(
 /// and receiver calls (`Api.get()`, `this.x()`) are matched by
 /// `candidate_matches`, so neither may be filtered here.
 fn same_file_declaration_scope(
-    local_bindings: &[&RawReference],
-    sorted_syms: &[&RawSymbol],
+    scope_index: &FileScopeIndex<'_>,
     sym: &RawSymbol,
     reference: &RawReference,
     language: Language,
@@ -2093,16 +2195,12 @@ fn same_file_declaration_scope(
     let Some(call) = reference.scope else {
         return Some(usize::MAX);
     };
-    let Some(declaration) = local_bindings
-        .iter()
+    let Some(declaration) = scope_index
         // The declarator may sit on a later line than the declaration
         // (`const a = 1,\n  b = () => 2;`), so join by the symbol's span,
         // not its first line.
-        .filter(|binding| {
-            binding.name == sym.name
-                && sym.start_line <= binding.start_line
-                && binding.start_line <= sym.end_line.max(sym.start_line)
-        })
+        .declarators_in(&sym.name, sym.start_line, sym.end_line.max(sym.start_line))
+        .iter()
         .filter_map(|binding| binding.scope.map(|scope| (binding.start_line, scope)))
         .max_by_key(|(_, scope)| scope.end - scope.start)
     else {
@@ -2113,18 +2211,10 @@ fn same_file_declaration_scope(
         return None;
     }
     // Module level: no other code-bearing symbol contains the declarator, so
-    // it is visible everywhere and ranks like an unscoped symbol.
-    // `sorted_syms` is sorted by `start_line`: stop at the first symbol that
-    // starts after the declarator's line.
-    let module_level = !sorted_syms
-        .iter()
-        .take_while(|other| other.start_line <= line)
-        .any(|other| {
-            !std::ptr::eq(*other, sym)
-                && can_contain_code(other)
-                && other.start_line <= line
-                && line <= other.end_line.max(other.start_line)
-        });
+    // it is visible everywhere and ranks like an unscoped symbol. `sym` is a
+    // code-bearing `Function` whose span contains `line` (the join above), so
+    // it alone covers the line exactly when no other symbol does.
+    let module_level = scope_index.covering(line) <= 1;
     Some(if module_level {
         usize::MAX
     } else {
@@ -2204,6 +2294,7 @@ fn is_declarator_form(signature: &str) -> bool {
 
 fn name_is_locally_bound(
     bindings: &[&RawReference],
+    scope_index: &FileScopeIndex<'_>,
     sorted_syms: &[&RawSymbol],
     reference: &RawReference,
     language: Language,
@@ -2214,7 +2305,7 @@ fn name_is_locally_bound(
             .as_deref()
             .and_then(|receiver| receiver.split('.').next())
             .unwrap_or(&reference.name);
-        return active_lexical_binding(bindings, reference, name, language).is_some_and(
+        return active_lexical_binding(scope_index, reference, name, language).is_some_and(
             |binding| {
                 !binding.scope.is_some_and(|scope| {
                     scope.initialized_at > scope.position
@@ -9766,6 +9857,91 @@ export function readIt() { return value(); }
             call_targets(&files, &edges, path, nestweaver_schema::MODULE_OWNER_NAME),
             vec![uid(&files, path, "f")],
             "{edges:#?}"
+        );
+    }
+
+    /// nw-113 perf (bug-hunt #1): the per-candidate work is bounded. In a file
+    /// with N same-named declarators, one candidate's lookup returns exactly
+    /// its own declarator (not all N), and the module-level test is one array
+    /// read that never counts the `<module>` owner.
+    #[test]
+    fn file_scope_index_bounds_per_candidate_work() {
+        let n = 200u32;
+        let mut source: String = (0..n)
+            .map(|i| format!("function c{i}() {{ const f = () => {i}; return f(); }}\n"))
+            .collect();
+        source.push_str("const g = () => 1;\nboot();\n");
+        let parsed = parse_source(Path::new("src/big.ts"), &source).unwrap();
+        assert!(
+            parsed.symbols[0].is_module_owner(),
+            "fixture mints an owner"
+        );
+        let mut syms: Vec<&RawSymbol> = parsed.symbols.iter().collect();
+        syms.sort_by_key(|s| (s.start_line, !s.is_module_owner()));
+        let bindings: Vec<&RawReference> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::LocalBinding)
+            .collect();
+        let index = FileScopeIndex::build(&bindings, &syms);
+
+        let fs: Vec<&&RawSymbol> = syms.iter().filter(|s| s.name == "f").collect();
+        assert_eq!(fs.len(), n as usize);
+        for f in fs {
+            let found = index.declarators_in("f", f.start_line, f.end_line.max(f.start_line));
+            assert_eq!(found.len(), 1, "only f@{}'s own declarator", f.start_line);
+            assert_eq!(found[0].start_line, f.start_line);
+            // Inside c{i}: covered by c{i} and f, so not module level.
+            assert_eq!(index.covering(f.start_line), 2);
+        }
+        // `g` is module level: only g covers its line; the owner never counts.
+        let g = syms.iter().find(|s| s.name == "g").unwrap();
+        assert_eq!(index.covering(g.start_line), 1);
+        assert_eq!(index.covering(n + 2), 0, "the top-level call line");
+        assert!(index.declarators_in("missing", 1, n).is_empty());
+    }
+
+    /// nw-113 perf repro (bug-hunt #1): N functions in one file, each with
+    /// `const f = () => N; return f();`. Ignored; run with `--ignored
+    /// --nocapture` to print timings. Not a timing assertion.
+    #[test]
+    #[ignore]
+    fn bench_same_name_declarators_in_one_file() {
+        for n in [1000usize, 2000, 3000] {
+            let source: String = (0..n)
+                .map(|i| format!("function c{i}() {{ const f = () => {i}; return f(); }}\n"))
+                .collect();
+            let parsed = parse_source(Path::new("src/big.ts"), &source).unwrap();
+            let files = vec![("src/big.ts".to_string(), parsed.symbols, parsed.references)];
+            let started = std::time::Instant::now();
+            let edges = resolve_references(&files, Language::TypeScript, "repo:test:abc");
+            eprintln!(
+                "BENCH n={n} resolve={:?} edges={}",
+                started.elapsed(),
+                edges.len()
+            );
+        }
+        // The realistic shape from the bug hunt: 400 components in one file,
+        // each with 40 locals and `const render = () => …; return render();`.
+        let source: String = (0..400)
+            .map(|i| {
+                let locals: String = (0..40)
+                    .map(|j| format!("  const v{j} = compute{j}({i});\n"))
+                    .collect();
+                format!(
+                    "export function C{i}() {{\n{locals}  const render = () => v0 + v39;\n  return render();\n}}\n"
+                )
+            })
+            .collect();
+        let parsed = parse_source(Path::new("src/big.ts"), &source).unwrap();
+        let files = vec![("src/big.ts".to_string(), parsed.symbols, parsed.references)];
+        let started = std::time::Instant::now();
+        let edges = resolve_references(&files, Language::TypeScript, "repo:test:abc");
+        eprintln!(
+            "BENCH components=400 lines={} resolve={:?} edges={}",
+            source.lines().count(),
+            started.elapsed(),
+            edges.len()
         );
     }
 }
