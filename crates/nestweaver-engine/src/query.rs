@@ -4270,9 +4270,13 @@ pub fn generate_repo_map_bounded(
     store: &GraphStore,
     token_budget: usize,
 ) -> Result<RepoMap, anyhow::Error> {
-    let ranked = store
+    let mut ranked = store
         .symbols_by_pagerank(None)
         .map_err(|e| anyhow::anyhow!(e))?;
+    // nw-113: a `<module>` owner declares nothing, so it is no skeleton line
+    // (it printed as an empty `Module`), and a file whose only symbol is its
+    // owner has no entry.
+    ranked.retain(|sym| !sym.is_module_owner());
 
     // nw-645: rank by CALLABLE PageRank. Raw order let a `require`-bound
     // `Constant` (`const knex = require('knex')`) that the resolver credits
@@ -5203,6 +5207,37 @@ mod repo_map_tests {
             tokens <= budget,
             "token count {tokens} exceeds budget {budget}; output was:\n{map}"
         );
+    }
+
+    /// nw-113: an owner is not a declaration, so repo-map never lists it,
+    /// and a file whose only symbol is its owner has no entry at all.
+    #[test]
+    fn repo_map_hides_module_owners() {
+        let (_dir, src) = make_test_repo();
+        fs::write(src.join("boot.js"), "formatDate(1);\n").unwrap();
+        fs::write(
+            src.join("start.js"),
+            "function start() { return 1; }\nstart();\n",
+        )
+        .unwrap();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        assert!(
+            store
+                .symbols_in_file("boot.js")
+                .unwrap()
+                .iter()
+                .any(|s| s.is_module_owner()),
+            "fixture mints an owner"
+        );
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        let map = generate_repo_map_bounded(&store, 100_000).unwrap();
+        assert!(!map.map.contains("Module"), "{}", map.map);
+        assert!(!map.map.contains("boot.js"), "{}", map.map);
+        assert!(map.map.contains("start.js"), "{}", map.map);
+        assert_eq!(map.files_total, 3, "{}", map.map);
     }
 
     #[test]
