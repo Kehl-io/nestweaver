@@ -8057,6 +8057,12 @@ fn partition_changed_removed(
 /// the first hop. Files beyond it hold no edge into a changed file; they are
 /// resolution context only, so deferring them is logged rather than repaired.
 ///
+/// The direct dependents do have a safety ceiling,
+/// [`MAX_DIRECT_DEPENDENTS`]. Past it the pass is skipped with a warning
+/// naming the remedy, as every capped pass was before nw-113: re-resolving
+/// thousands of files inside one write transaction costs more than the
+/// incremental index it serves.
+///
 /// **CRITICAL ORDERING:** this must run BEFORE `begin_transaction`; the
 /// per-file `DETACH DELETE` in the mutation loop destroys the very edges this
 /// query reads.
@@ -8069,6 +8075,24 @@ pub(crate) fn collect_reverse_dep_files(
     r_uid: &str,
     changed: &std::collections::HashSet<String>,
     removed: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    collect_reverse_dep_files_with_ceiling(store, r_uid, changed, removed, MAX_DIRECT_DEPENDENTS)
+}
+
+/// Safety ceiling on the direct dependents [`collect_reverse_dep_files`]
+/// re-resolves; past it the pass is skipped with a warning.
+const MAX_DIRECT_DEPENDENTS: usize = 5_000;
+
+/// Direct-dependent count past which re-resolution logs its size and time.
+const LARGE_REVERSE_DEP_SET: usize = 200;
+
+/// [`collect_reverse_dep_files`] with an injectable direct-dependent ceiling.
+fn collect_reverse_dep_files_with_ceiling(
+    store: &nestweaver_store::GraphStore,
+    r_uid: &str,
+    changed: &std::collections::HashSet<String>,
+    removed: &std::collections::HashSet<String>,
+    direct_ceiling: usize,
 ) -> std::collections::HashSet<String> {
     use std::collections::HashSet;
 
@@ -8103,6 +8127,22 @@ pub(crate) fn collect_reverse_dep_files(
         }
         if next.is_empty() {
             break; // fixed point — no more transitive reverse-dependents
+        }
+        if hop == 0 && next.len() > direct_ceiling {
+            tracing::warn!(
+                direct_dependents = next.len(),
+                ceiling = direct_ceiling,
+                "re-resolution direct-dependent ceiling exceeded; skipping the pass. \
+                 Re-run `nestweaver index --repo <path>` (incremental) to retry, or \
+                 `nestweaver index --repo <path> --force` to rebuild every edge"
+            );
+            return HashSet::new();
+        }
+        if hop == 0 && next.len() > LARGE_REVERSE_DEP_SET {
+            tracing::info!(
+                direct_dependents = next.len(),
+                "large direct-dependent set; re-resolving every direct dependent"
+            );
         }
         if hop > 0 && affected.len() + next.len() > MAX_AFFECTED_FILES {
             tracing::warn!(
@@ -8234,6 +8274,37 @@ pub(crate) fn prepare_watcher_reresolve_edges(
 /// without them an import through the barrel cannot resolve, and the
 /// hydration below can never reach the barrel's forwarding references.
 fn build_reresolve_edges(
+    reader: &dyn crate::content_reader::ContentReader,
+    r_uid: &str,
+    changed: &std::collections::HashSet<String>,
+    rdeps: &std::collections::HashSet<String>,
+    db_symbols: &[nestweaver_schema::Symbol],
+    known_files: &std::collections::HashSet<String>,
+    prepared_file_data: Option<&PreparedFileData>,
+) -> Result<Vec<nestweaver_schema::ResolvedEdge>, anyhow::Error> {
+    let started = std::time::Instant::now();
+    let edges = build_reresolve_edges_unlogged(
+        reader,
+        r_uid,
+        changed,
+        rdeps,
+        db_symbols,
+        known_files,
+        prepared_file_data,
+    );
+    // The direct dependents are uncapped below `MAX_DIRECT_DEPENDENTS`, so a
+    // large set is logged with its cost.
+    if rdeps.len() > LARGE_REVERSE_DEP_SET {
+        tracing::info!(
+            dependents = rdeps.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "re-resolved a large reverse-dependent set"
+        );
+    }
+    edges
+}
+
+fn build_reresolve_edges_unlogged(
     reader: &dyn crate::content_reader::ContentReader,
     r_uid: &str,
     changed: &std::collections::HashSet<String>,
@@ -14204,6 +14275,45 @@ module.exports = { check, plain };\n";
         assert_eq!(
             rdeps,
             std::collections::HashSet::from(["mid.js".to_string()])
+        );
+    }
+
+    /// nw-113: past the direct-dependent ceiling the pass is skipped (the
+    /// old warning path), and at the ceiling every direct dependent is kept.
+    #[test]
+    fn reverse_dep_ceiling_skips_the_pass_past_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("hub.js"), "export function hub() { return 1; }\n").unwrap();
+        for i in 0..3 {
+            fs::write(
+                src.join(format!("dep{i}.js")),
+                format!("import {{ hub }} from './hub.js';\nexport function dep{i}() {{ return hub(); }}\n"),
+            )
+            .unwrap();
+        }
+        let (_, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/ceil", "sha").unwrap();
+        let repo = repo_uid("test", "https://example.com/ceil");
+        let changed = std::collections::HashSet::from(["hub.js".to_string()]);
+        let collect = |ceiling| {
+            collect_reverse_dep_files_with_ceiling(
+                &store,
+                &repo,
+                &changed,
+                &Default::default(),
+                ceiling,
+            )
+        };
+        assert_eq!(
+            collect(3).len(),
+            3,
+            "at the ceiling every dependent is kept"
+        );
+        assert!(
+            collect(2).is_empty(),
+            "past the ceiling the pass is skipped"
         );
     }
 
