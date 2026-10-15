@@ -27381,6 +27381,14 @@ fn print_feature_context_text(result: &FeatureContextResult) {
         }
     }
 
+    // nw-113: owners beyond the engine's cap are counted, not listed.
+    if result.module_owners_omitted > 0 {
+        println!(
+            "  +{} more files' top-level code",
+            result.module_owners_omitted
+        );
+    }
+
     // Same reason as `print_context_text`: `--stats` is off by default and a
     // capped feature context printed identically to a complete one.
     if let Some(notice) =
@@ -31080,6 +31088,7 @@ mod context_json_renderer_tests {
             seeds_truncated: None,
             seed_resolution_limit: None,
             admitted_before_cap: None,
+            module_owners_omitted: 0,
         }
     }
 
@@ -31122,6 +31131,17 @@ mod context_json_renderer_tests {
         let value = brain_context_json_value(&result, 2, Some(10_000), &upstream);
         assert_eq!(value["total"], 10);
         assert_eq!(value["truncated_by"], "limit");
+    }
+
+    /// nw-113: the engine's omitted-owner count reaches the CLI JSON.
+    #[test]
+    fn brain_context_json_reports_omitted_owners() {
+        let mut result = degraded_context();
+        let value = brain_context_json_value(&result, 30, None, &Default::default());
+        assert!(value.get("module_owners_omitted").is_none(), "{value}");
+        result.module_owners_omitted = 4;
+        let value = brain_context_json_value(&result, 30, None, &Default::default());
+        assert_eq!(value["module_owners_omitted"], 4, "{value}");
     }
 
     #[test]

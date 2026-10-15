@@ -673,6 +673,13 @@ pub(crate) fn print_brain_context_text(
             }
         }
     }
+    // nw-113: owners beyond the engine's cap are counted, not listed.
+    if result.module_owners_omitted > 0 {
+        println!(
+            "  +{} more files' top-level code",
+            result.module_owners_omitted
+        );
+    }
 }
 
 /// Render a daemon-routed `BrainSearchResponse` in the same shape as the
@@ -1299,6 +1306,10 @@ pub(crate) fn brain_context_json_value(
     }
     if result.semantic_seed_count > 0 {
         resp["semantic_seed_count"] = serde_json::json!(result.semantic_seed_count);
+    }
+    // nw-113: connected `<module>` owners the engine's cap left out.
+    if result.module_owners_omitted > 0 {
+        resp["module_owners_omitted"] = serde_json::json!(result.module_owners_omitted);
     }
 
     // Feature F7: surface PRF-mined expansion terms for auditing.

@@ -7748,6 +7748,10 @@ fn tool_brain_context(
     if result.semantic_seed_count > 0 {
         resp["semantic_seed_count"] = json!(result.semantic_seed_count);
     }
+    // nw-113: connected `<module>` owners the engine's cap left out.
+    if result.module_owners_omitted > 0 {
+        resp["module_owners_omitted"] = json!(result.module_owners_omitted);
+    }
 
     // Feature F7: surface the PRF-mined expansion terms for auditing. Only
     // present when PRF was enabled and mined at least one term.

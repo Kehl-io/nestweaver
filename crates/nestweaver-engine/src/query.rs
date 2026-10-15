@@ -837,6 +837,24 @@ pub struct ContextResult {
 /// otherwise fill the list with near-identical owner rows.
 pub const CONTEXT_MODULE_OWNER_CAP: usize = 3;
 
+/// nw-113: move `<module>` owners after every other node and keep at most
+/// [`CONTEXT_MODULE_OWNER_CAP`] of them, preserving rank order within each
+/// group. Returns how many owners the cap left out, for the result's
+/// `module_owners_omitted`. Shared by code, feature and brain context so the
+/// three answer an owner-heavy neighbourhood the same way.
+pub(crate) fn rank_module_owners_last<T>(
+    nodes: &mut Vec<T>,
+    is_owner: impl Fn(&T) -> bool,
+) -> usize {
+    let (real, owners): (Vec<T>, Vec<T>) = std::mem::take(nodes)
+        .into_iter()
+        .partition(|node| !is_owner(node));
+    let omitted = owners.len().saturating_sub(CONTEXT_MODULE_OWNER_CAP);
+    *nodes = real;
+    nodes.extend(owners.into_iter().take(CONTEXT_MODULE_OWNER_CAP));
+    omitted
+}
+
 /// Detect whether an input string looks like a file path.
 fn is_file_path(input: &str) -> bool {
     input.contains('/')
@@ -1055,14 +1073,11 @@ pub fn build_context_with_intent(
     let seed_set: std::collections::HashSet<&str> = seed_uids.iter().map(|s| s.as_str()).collect();
 
     let mut seeds: Vec<ContextNode> = Vec::new();
-    let mut connected: Vec<ContextNode> = Vec::new();
-    // nw-113: connected `<module>` owners, kept aside so they rank after
-    // every real symbol and only `CONTEXT_MODULE_OWNER_CAP` are listed.
-    let mut owners: Vec<ContextNode> = Vec::new();
-    // Counted for EVERY resolved non-seed node, whether or not the cap let it
-    // through. This is the whole of nw-320.
-    let mut connected_total: usize = 0;
-    let effective_limit = limit.unwrap_or(usize::MAX);
+    // Every resolved non-seed node, in rank order, before any cap. Its length
+    // (once owners are capped) is `connected_total`, counted whether or not
+    // the row cap lets a node through. This is the whole of nw-320.
+    let mut ranked: Vec<ContextNode> = Vec::new();
+    let mut owner_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Batch-fetch all PPR-ranked symbols in a single query to avoid N+1 overhead.
     let ppr_uids: Vec<&str> = ppr_results.iter().map(|(u, _)| u.as_str()).collect();
@@ -1088,23 +1103,22 @@ pub fn build_context_with_intent(
 
         if seed_set.contains(uid.as_str()) {
             seeds.push(node);
-        } else if sym.is_module_owner() {
-            owners.push(node);
         } else {
-            connected_total += 1;
-            if connected.len() < effective_limit {
-                connected.push(node);
+            if sym.is_module_owner() {
+                owner_uids.insert(sym.uid.clone());
             }
+            ranked.push(node);
         }
     }
-    let listed_owners = owners.len().min(CONTEXT_MODULE_OWNER_CAP);
-    let module_owners_omitted = owners.len() - listed_owners;
-    connected_total += listed_owners;
-    for owner in owners.into_iter().take(listed_owners) {
-        if connected.len() < effective_limit {
-            connected.push(owner);
-        }
-    }
+    // nw-113: owners rank after every real symbol and only
+    // `CONTEXT_MODULE_OWNER_CAP` are listed; the rest are counted.
+    let module_owners_omitted =
+        rank_module_owners_last(&mut ranked, |node| owner_uids.contains(&node.uid));
+    let connected_total = ranked.len();
+    let connected: Vec<ContextNode> = ranked
+        .into_iter()
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
 
     // Collect cross-repo links for seed symbols.
     let mut cross_repo_links: Vec<CrossRepoLink> = Vec::new();
@@ -1405,6 +1419,61 @@ mod context_tests {
             !names.contains(&nestweaver_schema::MODULE_OWNER_NAME),
             "{names:?}"
         );
+    }
+
+    /// The labels of `names` that are owners, and whether every owner ranks
+    /// after every non-owner.
+    fn owners_listed_last(names: &[&str]) -> (usize, bool) {
+        let is_owner = |n: &&str| n.ends_with("::<module>");
+        let owners = names.iter().filter(|n| is_owner(n)).count();
+        let first_owner = names.iter().position(is_owner).unwrap_or(names.len());
+        (owners, names[first_owner..].iter().all(is_owner))
+    }
+
+    /// nw-113: feature context labels owners by path, ranks them after every
+    /// real symbol and lists at most three, counting the rest.
+    #[test]
+    fn feature_context_ranks_owners_last_and_caps_them() {
+        let (_dir, src) = owner_heavy_repo();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let repo = store.list_repos(None).unwrap().remove(0);
+        let feature = crate::config::FeatureConfig {
+            name: "theme".to_string(),
+            description: None,
+            repos: vec![repo.name.clone().unwrap_or(repo.url.clone())],
+            entry_points: vec!["fromTemplate".to_string()],
+        };
+        let result = super::build_feature_context(&store, &feature, &[], &[], None, None).unwrap();
+        assert!(result.unmatched_entry_points.is_empty(), "{result:?}");
+        let names: Vec<&str> = result.connected.iter().map(|n| n.name.as_str()).collect();
+        let (owners, last) = owners_listed_last(&names);
+        assert_eq!(owners, 3, "{names:?}");
+        assert!(last, "owners rank after every real symbol: {names:?}");
+        assert!(
+            !names.contains(&nestweaver_schema::MODULE_OWNER_NAME),
+            "{names:?}"
+        );
+        assert_eq!(result.module_owners_omitted, 3, "{result:?}");
+    }
+
+    /// nw-113: brain context labels owners by path, ranks them after every
+    /// other connected node and lists at most three, counting the rest.
+    #[test]
+    fn brain_context_ranks_owners_last_and_caps_them() {
+        let (_dir, src) = owner_heavy_repo();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let result = super::build_brain_context(&store, &["fromTemplate".to_string()]).unwrap();
+        let titles: Vec<&str> = result.connected.iter().map(|n| n.title.as_str()).collect();
+        let (owners, last) = owners_listed_last(&titles);
+        assert_eq!(owners, 3, "{titles:?}");
+        assert!(last, "owners rank after every other node: {titles:?}");
+        assert!(
+            !titles.contains(&nestweaver_schema::MODULE_OWNER_NAME),
+            "{titles:?}"
+        );
+        assert_eq!(result.module_owners_omitted, 3, "{result:?}");
     }
 
     /// nw-113: `symbol` resolves `path::<module>` to that file's owner, and
@@ -1716,6 +1785,10 @@ pub struct FeatureContextResult {
     pub truncated_by: Option<TruncationCause>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<usize>,
+    /// nw-113: connected `<module>` owners left out by
+    /// [`CONTEXT_MODULE_OWNER_CAP`], as on [`ContextResult`].
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub module_owners_omitted: usize,
     /// nw-674: declared `repos` that did not resolve cleanly, so a feature
     /// scoped to fewer repos than declared says so.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1826,11 +1899,9 @@ pub fn build_feature_context(
 
     let seed_set: std::collections::HashSet<&str> = seed_uids.iter().map(|s| s.as_str()).collect();
     let mut seeds: Vec<ContextNode> = Vec::new();
-    let mut connected: Vec<ContextNode> = Vec::new();
-    let mut connected_total: usize = 0;
+    let mut ranked: Vec<ContextNode> = Vec::new();
+    let mut owner_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Apply limit to PPR results (seeds are always included).
-    let effective_limit = limit.unwrap_or(usize::MAX);
     let ppr_uids: Vec<&str> = ppr_scores.iter().map(|(u, _)| u.as_str()).collect();
     let sym_map = store
         .batch_lookup_symbols(&ppr_uids)
@@ -1843,7 +1914,7 @@ pub fn build_feature_context(
         };
         let node = ContextNode {
             uid: sym.uid.clone(),
-            name: sym.name.clone(),
+            name: sym.display_name().into_owned(),
             kind: sym.kind.to_string(),
             file_path: sym.file_path.clone(),
             start_line: sym.start_line,
@@ -1853,12 +1924,21 @@ pub fn build_feature_context(
         if seed_set.contains(uid.as_str()) {
             seeds.push(node);
         } else {
-            connected_total += 1;
-            if connected.len() < effective_limit {
-                connected.push(node);
+            if sym.is_module_owner() {
+                owner_uids.insert(sym.uid.clone());
             }
+            ranked.push(node);
         }
     }
+    // nw-113: the same owner ordering and cap as `build_context_with_intent`.
+    let module_owners_omitted =
+        rank_module_owners_last(&mut ranked, |node| owner_uids.contains(&node.uid));
+    // Apply limit to PPR results (seeds are always included).
+    let connected_total = ranked.len();
+    let connected: Vec<ContextNode> = ranked
+        .into_iter()
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
 
     // Only include links whose both ends are repos declared in this feature.
     let feature_links: Vec<LinkInfo> = links
@@ -1894,6 +1974,7 @@ pub fn build_feature_context(
         truncated: Some(limit_truncated),
         truncated_by: TruncationCause::resolve(false, limit_truncated),
         token_budget: None,
+        module_owners_omitted,
         repo_issues,
     })
 }
@@ -2066,6 +2147,10 @@ pub struct BrainContextResult {
     /// higher than the count of candidates that could actually be rendered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admitted_before_cap: Option<usize>,
+    /// nw-113: connected `<module>` owners left out by
+    /// [`CONTEXT_MODULE_OWNER_CAP`], as on [`ContextResult`].
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub module_owners_omitted: usize,
 }
 
 /// Surface a project's curated member notes into the rendered `connected`
@@ -2966,6 +3051,12 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         }
     }
 
+    // nw-113: owners rank after every other connected node and only
+    // `CONTEXT_MODULE_OWNER_CAP` are listed, as in code context. Applied
+    // before pinning so a seed the caller named keeps its pinned place.
+    let module_owners_omitted = rank_module_owners_last(&mut connected, |node| {
+        nestweaver_schema::uid::is_module_owner_uid(&node.uid)
+    });
     pin_direct_seeds_in_connected(&seeds, &mut connected, &direct_seed_uids);
     // nw-670 re-review N7: only notes/sections the caller NAMED pin their
     // code — not every member a `vlt:`/`repo:` container seed expanded to.
@@ -3024,6 +3115,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         seeds_truncated: seed_name_tally.truncated(),
         seed_resolution_limit: seed_name_tally.resolved().map(|_| SEED_NAME_MATCH_LIMIT),
         admitted_before_cap: render_cap.map(|_| admitted_before_cap),
+        module_owners_omitted,
     })
 }
 
@@ -3657,9 +3749,9 @@ pub(crate) fn render_brain_node(
     if uid.starts_with("sym:") {
         match store.lookup_symbol(uid) {
             Ok(s) => Ok(Some(BrainNode {
+                title: s.display_name().into_owned(),
                 uid: s.uid,
                 kind: format!("Symbol/{}", s.kind),
-                title: s.name,
                 location: format!("{}:{}", s.file_path, s.start_line),
                 relevance: score,
                 inline_body: None,
