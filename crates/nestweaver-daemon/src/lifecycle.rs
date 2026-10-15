@@ -2894,22 +2894,27 @@ pub const AUTHORITY_LEGACY_MIN_AGE: std::time::Duration = std::time::Duration::f
 /// [`nestweaver_store::stable_anchor::prune_authority_registry_in`] for the
 /// per-entry rules; this adds the live-database protection for old entries
 /// that cannot name their own scope.
+///
+/// With `only_db` (`daemon gc --db`) the sweep is limited to the records
+/// whose scope belongs to that database ([`authority_keys_for_database`]);
+/// unidentifiable legacy records are left alone. Without it the whole
+/// registry is swept.
 pub fn gc_authority_registry(
     registry: Option<&Path>,
-    extra_db: Option<&Path>,
+    only_db: Option<&Path>,
     dry_run: bool,
 ) -> std::io::Result<AuthorityGcReport> {
     let registry = match registry {
         Some(registry) => registry.to_path_buf(),
         None => nestweaver_store::stable_anchor::authority_registry_root()?,
     };
-    gc_authority_registry_in(&registry, &persistent_state_root(), extra_db, dry_run)
+    gc_authority_registry_in(&registry, &persistent_state_root(), only_db, dry_run)
 }
 
 fn gc_authority_registry_in(
     registry: &Path,
     state_root: &Path,
-    extra_db: Option<&Path>,
+    only_db: Option<&Path>,
     dry_run: bool,
 ) -> std::io::Result<AuthorityGcReport> {
     let mut databases: std::collections::BTreeSet<PathBuf> = Default::default();
@@ -2921,16 +2926,18 @@ fn gc_authority_registry_in(
             }
         }
     }
-    databases.extend(extra_db.map(Path::to_path_buf));
+    databases.extend(only_db.map(Path::to_path_buf));
     databases.retain(|db| database_present(db));
     let protected = databases
         .iter()
         .flat_map(|db| authority_keys_for_database(db))
         .collect();
+    let only = only_db.map(authority_keys_for_database);
     let prune = nestweaver_store::stable_anchor::prune_authority_registry_in(
         registry,
         &nestweaver_store::stable_anchor::AuthorityPruneOptions {
             protected: &protected,
+            only: only.as_ref(),
             legacy_min_age: AUTHORITY_LEGACY_MIN_AGE,
             dry_run,
         },
@@ -4704,19 +4711,7 @@ mod tests {
         dir
     }
 
-    /// Sweep roots agreeing with the `with_xdg_state_and_runtime` overrides,
-    /// with a SCRATCH socket-fallback root. Tests must never run the sweep
-    /// against the operator's real `/tmp/nw-sock-<uid>`.
-    /// A path that really exists and is provably outside every temp prefix
-    /// [`is_temp_db_path`] recognises, for tests that need a stand-in "real
-    /// database" the sweep must keep.
-    ///
-    /// `CARGO_MANIFEST_DIR` is NOT safe for this: a git worktree checked out
-    /// under /tmp — routine when reviewing a branch — makes the manifest
-    /// directory itself match `is_temp_db_path`, so the guard assertion failed
-    /// for a reason that had nothing to do with the behaviour under test
-    /// (nw-194). The sweep only calls `.exists()`, so any stable system file
-    /// serves.
+    /// A scratch authority registry with the private mode the sweep requires.
     fn private_authority_registry() -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
         let registry = tempfile::tempdir().unwrap();
@@ -4829,6 +4824,59 @@ mod tests {
         assert!(registry.path().join(&live_root).exists());
     }
 
+    /// `daemon gc --db X` limits the registry prune to X's records: another
+    /// database's orphaned record and X's own legacy record stay.
+    #[test]
+    fn authority_gc_with_a_database_prunes_only_that_databases_records() {
+        use nestweaver_store::stable_anchor::anchor_key;
+        let state = tempfile::tempdir().unwrap();
+        let registry = private_authority_registry();
+        let gone = tempfile::tempdir().unwrap();
+        let data_dir = std::fs::canonicalize(gone.path()).unwrap();
+        let db = data_dir.join("graph.lbug");
+        drop(gone);
+        let mine = anchor_key("database-namespace", &data_dir);
+        let mine_legacy = anchor_key("publication-root", &data_dir);
+        let theirs = anchor_key("database-namespace", Path::new("/gone/other-scratch"));
+        let record = |key: &str, scope: &Path| {
+            use std::os::unix::fs::PermissionsExt;
+            let path = registry.path().join(key);
+            let mut bytes = b"nestweaver-authority v1\ndatabase-namespace\0".to_vec();
+            bytes.extend_from_slice(scope.as_os_str().as_encoded_bytes());
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        record(&mine, &data_dir);
+        record(&theirs, Path::new("/gone/other-scratch"));
+        seed_legacy_authority_record(registry.path(), &mine_legacy);
+        assert!(authority_keys_for_database(&db).contains(&mine));
+
+        let report =
+            gc_authority_registry_in(registry.path(), state.path(), Some(&db), false).unwrap();
+        assert_eq!(report.prune.removed_orphaned, 1);
+        assert_eq!(report.prune.removed_legacy, 0);
+        assert_eq!(report.prune.skipped_out_of_scope, 2);
+        assert!(!registry.path().join(&mine).exists());
+        assert!(registry.path().join(&theirs).exists());
+        assert!(registry.path().join(&mine_legacy).exists());
+
+        // Without --db the same registry is swept whole.
+        let report = gc_authority_registry_in(registry.path(), state.path(), None, false).unwrap();
+        assert_eq!(report.prune.removed_orphaned, 1);
+        assert_eq!(report.prune.removed_legacy, 1);
+        assert!(!registry.path().join(&theirs).exists());
+    }
+
+    /// A path that really exists and is provably outside every temp prefix
+    /// [`is_temp_db_path`] recognises, for tests that need a stand-in "real
+    /// database" the sweep must keep.
+    ///
+    /// `CARGO_MANIFEST_DIR` is NOT safe for this: a git worktree checked out
+    /// under /tmp — routine when reviewing a branch — makes the manifest
+    /// directory itself match `is_temp_db_path`, so the guard assertion failed
+    /// for a reason that had nothing to do with the behaviour under test
+    /// (nw-194). The sweep only calls `.exists()`, so any stable system file
+    /// serves.
     fn stable_non_temp_path() -> PathBuf {
         ["/bin/sh", "/usr/bin/env", "/etc/hosts"]
             .into_iter()
@@ -4837,6 +4885,9 @@ mod tests {
             .expect("no stable non-temp system file found")
     }
 
+    /// Sweep roots agreeing with the `with_xdg_state_and_runtime` overrides,
+    /// with a SCRATCH socket-fallback root. Tests must never run the sweep
+    /// against the operator's real `/tmp/nw-sock-<uid>`.
     fn scratch_gc_roots(state: &Path, runtime: &Path, fallback: &Path) -> DaemonGcRoots {
         DaemonGcRoots {
             state: state.join("nestweaver"),

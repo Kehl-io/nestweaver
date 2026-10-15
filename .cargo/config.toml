@@ -32,10 +32,12 @@ NESTWEAVER_LBUG_MAX_DB_SIZE = { value = "17179869184" }
 # own value; released binaries never see this.
 NESTWEAVER_INDEX_CPU_PERCENT = { value = "0" }
 
-# nw-811: keep test, scratch and `cargo run` authority records out of the
-# account registry (~/.local/state/nestweaver/authority), which every tempdir
-# database otherwise grew by one or more permanent entries. Honoured by debug
-# builds only; release binaries always use the account registry.
+# nw-811: keep test authority records out of the account registry
+# (~/.local/state/nestweaver/authority), which every tempdir database otherwise
+# grew by one or more permanent entries. Honoured by debug builds only, and
+# only for scopes under the system temp dir: a real database always uses the
+# account registry, even under `cargo run`, so a `cargo run` CLI and the
+# launchd daemon (or two worktrees) still exclude each other on it.
 NESTWEAVER_AUTHORITY_DIR = { value = "target/test-authority", relative = true }
 
 # No linker workaround is needed here, and none should be added. liblbug.a

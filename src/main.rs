@@ -8650,6 +8650,8 @@ enum DaemonAction {
     /// lock records whose database, publication root or operation journal no
     /// longer exists, plus old unheld records from earlier releases that match
     /// no live database. A record some process holds is never removed.
+    /// With `--db`, only that database's records are pruned and legacy
+    /// records are left alone. A registry that cannot be swept is a warning.
     Gc {
         /// Report what the authority-registry sweep would remove, and change
         /// nothing. Skips the launch-agent and directory sweeps.
@@ -16637,8 +16639,19 @@ fn run_daemon_gc(
             report.unidentified.len()
         );
     }
-    print_authority_gc(db.as_deref(), false, None)?;
+    if let Some(warning) = authority_gc_warning(db.as_deref(), None) {
+        eprintln!("warning: {warning}");
+    }
     Ok((EXIT_SUCCESS, None))
+}
+
+/// The registry sweep as the last step of a full `daemon gc`: a failure (an
+/// unsafe registry root, an unreadable directory) is a warning, not a gc
+/// failure, because the launch-agent and directory sweeps already succeeded.
+fn authority_gc_warning(db: Option<&Path>, registry: Option<&Path>) -> Option<String> {
+    print_authority_gc(db, false, registry)
+        .err()
+        .map(|error| format!("authority registry not swept: {error:#}"))
 }
 
 fn print_authority_gc(
@@ -16661,16 +16674,42 @@ fn print_authority_gc(
     );
     println!(
         "  kept: {} live scope, {} held by a process, {} legacy of {} live database(s), \
-         {} legacy too recent; {} foreign entr(ies) skipped, {} error(s).",
+         {} legacy too recent; {} foreign entr(ies) skipped, {} outside --db, {} error(s).",
         prune.kept_live,
         prune.kept_held,
         prune.kept_protected,
         report.live_databases,
         prune.kept_recent_legacy,
         prune.skipped_foreign,
+        prune.skipped_out_of_scope,
         prune.errors,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod authority_gc_warning_tests {
+    use super::*;
+
+    /// nw-811: a registry the sweep refuses (here: world-writable) is
+    /// reported as a warning; the full gc still exits 0 because its other
+    /// sweeps succeeded.
+    #[test]
+    fn an_unsafe_registry_is_a_warning_not_a_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let registry = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(registry.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let warning = authority_gc_warning(None, Some(registry.path()))
+            .expect("an unsafe registry must be reported");
+        assert!(
+            warning.contains("authority registry not swept"),
+            "{warning}"
+        );
+        assert!(warning.contains("private owner directory"), "{warning}");
+
+        std::fs::set_permissions(registry.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(authority_gc_warning(None, Some(registry.path())), None);
+    }
 }
 
 fn resolve_track_interactions(force_on: bool, force_off: bool, config_enabled: bool) -> bool {

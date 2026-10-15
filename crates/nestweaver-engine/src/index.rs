@@ -8906,23 +8906,33 @@ mod tests {
         );
     }
 
-    /// nw-113: cross-repo inference attributes a line to a real symbol, never
-    /// to the whole-file module owner.
     /// nw-811: cargo-run tests must not grow the account authority registry.
+    /// A test database lives under the system temp dir, so a debug build puts
+    /// its records in the override registry. A release build ignores the
+    /// override (CI's macOS job runs `cargo test --release`), so there the
+    /// record goes to the account registry, where gc reclaims it once the
+    /// scope is gone.
     #[test]
     fn an_index_under_the_authority_override_writes_nothing_to_the_default_registry() {
         use nestweaver_store::stable_anchor::{
-            anchor_key, authority_registry_root, default_authority_registry_root,
+            anchor_key, authority_registry_root_for, default_authority_registry_root,
         };
         let override_dir = PathBuf::from(
             std::env::var_os("NESTWEAVER_AUTHORITY_DIR")
                 .expect("cargo [env] sets NESTWEAVER_AUTHORITY_DIR for tests"),
         );
+        let account = default_authority_registry_root().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let scope = std::fs::canonicalize(dir.path()).unwrap();
+        let (expected, other) = if cfg!(debug_assertions) {
+            (&override_dir, &account)
+        } else {
+            (&account, &override_dir)
+        };
         // Checked before indexing so a missing override cannot write a record
         // into the real registry.
-        assert_eq!(authority_registry_root().unwrap(), override_dir);
+        assert_eq!(&authority_registry_root_for(&scope).unwrap(), expected);
 
-        let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::write(repo.join("app.py"), "def app_main():\n    return 1\n").unwrap();
@@ -8934,19 +8944,13 @@ mod tests {
         )
         .unwrap();
 
-        let key = anchor_key(
-            "database-namespace",
-            &std::fs::canonicalize(dir.path()).unwrap(),
-        );
-        assert!(override_dir.join(&key).exists());
-        assert!(
-            !default_authority_registry_root()
-                .unwrap()
-                .join(&key)
-                .exists()
-        );
+        let key = anchor_key("database-namespace", &scope);
+        assert!(expected.join(&key).exists());
+        assert!(!other.join(&key).exists());
     }
 
+    /// nw-113: cross-repo inference attributes a line to a real symbol, never
+    /// to the whole-file module owner.
     #[test]
     fn containing_symbol_for_line_skips_the_module_owner() {
         use nestweaver_schema::{EntryPointKind, SymbolKind};

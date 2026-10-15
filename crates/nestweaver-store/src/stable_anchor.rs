@@ -72,22 +72,75 @@ fn registry_root(uid: libc::uid_t) -> std::io::Result<PathBuf> {
     }
 }
 
-/// The registry this process's anchors live in.
+/// The registry an anchor on `canonical_scope` lives in.
 ///
-/// Debug builds honour an absolute `NESTWEAVER_AUTHORITY_DIR`, which
-/// `.cargo/config.toml` sets for everything cargo runs so test and scratch
-/// databases stay out of the account registry. Release builds never read it:
-/// an ambient variable must not be able to split a released binary's
-/// authority from another process's.
+/// Lock authority for a real database is always the account registry: any
+/// process (a `cargo run` CLI, the launchd daemon, another worktree) that
+/// anchors the same scope must meet on the same record. The test override
+/// ([`authority_override`]) applies only to scopes under the system temp
+/// directory, where test and scratch databases live, so test records stay out
+/// of the account registry without splitting authority over a real database.
+pub fn authority_registry_root_for(canonical_scope: &Path) -> std::io::Result<PathBuf> {
+    registry_root_for(canonical_scope, authority_override().as_deref())
+}
+
+fn registry_root_for(
+    canonical_scope: &Path,
+    override_dir: Option<&Path>,
+) -> std::io::Result<PathBuf> {
+    match override_dir {
+        Some(dir) if cfg!(debug_assertions) && is_under_system_temp(canonical_scope) => {
+            Ok(dir.to_path_buf())
+        }
+        _ => default_authority_registry_root(),
+    }
+}
+
+/// The registry `daemon gc` sweeps when none is named: the test override in
+/// a debug build that sets one (where test records go), otherwise the account
+/// registry.
 pub fn authority_registry_root() -> std::io::Result<PathBuf> {
-    #[cfg(debug_assertions)]
-    if let Some(dir) = std::env::var_os("NESTWEAVER_AUTHORITY_DIR")
+    match authority_override() {
+        Some(dir) => Ok(dir),
+        None => default_authority_registry_root(),
+    }
+}
+
+/// An absolute `NESTWEAVER_AUTHORITY_DIR`, read by debug builds only:
+/// `.cargo/config.toml` sets it for everything cargo runs. Release builds never
+/// read it, so an ambient variable cannot move a released binary's records.
+pub fn authority_override() -> Option<PathBuf> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    std::env::var_os("NESTWEAVER_AUTHORITY_DIR")
         .map(PathBuf::from)
         .filter(|dir| dir.is_absolute())
-    {
-        return Ok(dir);
-    }
-    default_authority_registry_root()
+}
+
+/// Whether `canonical_scope` lies under the system temp directory:
+/// `std::env::temp_dir()`, `/tmp`, and on macOS every per-user
+/// `/var/folders` temp root, each also in canonical form (`/private/tmp`,
+/// `/private/var/folders`).
+pub fn is_under_system_temp(canonical_scope: &Path) -> bool {
+    static ROOTS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+    ROOTS
+        .get_or_init(|| {
+            let mut roots = vec![std::env::temp_dir(), PathBuf::from("/tmp")];
+            if cfg!(target_os = "macos") {
+                roots.push(PathBuf::from("/var/folders"));
+            }
+            // Scopes arrive canonical (`/private/var/folders/…` on macOS);
+            // the spelled forms are kept for a caller that did not resolve.
+            let canonical: Vec<PathBuf> = roots
+                .iter()
+                .filter_map(|root| std::fs::canonicalize(root).ok())
+                .collect();
+            roots.extend(canonical);
+            roots
+        })
+        .iter()
+        .any(|root| canonical_scope.starts_with(root))
 }
 
 /// The account registry, ignoring any test override.
@@ -139,6 +192,10 @@ pub struct AuthorityPruneOptions<'a> {
     /// Entry names that belong to a known live database. They are kept even
     /// when the entry itself cannot say what it guards.
     pub protected: &'a std::collections::HashSet<String>,
+    /// When set, only these entry names are considered (`daemon gc --db`:
+    /// the keys of that one database). Every other entry is left alone, and
+    /// so is an unidentifiable entry even when its name is listed.
+    pub only: Option<&'a std::collections::HashSet<String>>,
     /// Minimum age before an unidentifiable (pre-v1, empty) entry may go.
     pub legacy_min_age: std::time::Duration,
     pub dry_run: bool,
@@ -162,6 +219,9 @@ pub struct AuthorityPruneReport {
     pub kept_recent_legacy: usize,
     /// Names, types, owners or modes this registry never creates.
     pub skipped_foreign: usize,
+    /// Entries outside [`AuthorityPruneOptions::only`], and unidentifiable
+    /// entries while it is set.
+    pub skipped_out_of_scope: usize,
     pub errors: usize,
 }
 
@@ -208,6 +268,10 @@ pub fn prune_authority_registry_in(
             report.skipped_foreign += 1;
             continue;
         };
+        if options.only.is_some_and(|only| !only.contains(name)) {
+            report.skipped_out_of_scope += 1;
+            continue;
+        }
         let path = root.join(name);
         let mut file = match std::fs::OpenOptions::new()
             .read(true)
@@ -244,6 +308,10 @@ pub fn prune_authority_registry_in(
                 continue;
             }
             Some(_) => {}
+            None if options.only.is_some() => {
+                report.skipped_out_of_scope += 1;
+                continue;
+            }
             None if options.protected.contains(name) => {
                 report.kept_protected += 1;
                 continue;
@@ -297,10 +365,11 @@ pub fn prune_authority_registry_in(
 
 impl StableAnchor {
     pub fn acquire(domain: &str, canonical_path: &Path, exclusive: bool) -> std::io::Result<Self> {
-        // A persistent account-bound path, never /tmp or (in release builds)
-        // environment overrides: clients and ordinary temporary-file cleaners
-        // cannot split authorities.
-        let root = authority_registry_root()?;
+        // A persistent account-bound path, never /tmp or (in release builds,
+        // or for any scope outside the system temp dir) environment
+        // overrides: clients and ordinary temporary-file cleaners cannot split
+        // authorities over a real database.
+        let root = authority_registry_root_for(canonical_path)?;
         Self::acquire_in(&root, domain, canonical_path, exclusive)
     }
 
@@ -440,6 +509,7 @@ mod tests {
             root,
             &AuthorityPruneOptions {
                 protected,
+                only: None,
                 legacy_min_age: std::time::Duration::from_secs(3600),
                 dry_run,
             },
@@ -564,6 +634,51 @@ mod tests {
         assert_eq!(registry_entries(root.path()), expected);
     }
 
+    /// `daemon gc --db X`: only X's records are pruned. Another database's
+    /// orphaned record and every unidentifiable record are left alone, even a
+    /// legacy one under X's own key.
+    #[test]
+    fn a_scoped_prune_touches_only_the_named_records() {
+        let root = private_root();
+        let mine = tempfile::tempdir().unwrap();
+        let theirs = tempfile::tempdir().unwrap();
+        let (mine_path, theirs_path) = (mine.path().to_path_buf(), theirs.path().to_path_buf());
+        drop(
+            StableAnchor::acquire_in(root.path(), "database-namespace", &mine_path, false).unwrap(),
+        );
+        drop(
+            StableAnchor::acquire_in(root.path(), "database-namespace", &theirs_path, false)
+                .unwrap(),
+        );
+        drop((mine, theirs));
+        let mine_key = anchor_key("database-namespace", &mine_path);
+        let theirs_key = anchor_key("database-namespace", &theirs_path);
+        let legacy_key = anchor_key("publication-root", &mine_path);
+        let legacy = root.path().join(&legacy_key);
+        std::fs::write(&legacy, b"").unwrap();
+        std::fs::set_permissions(&legacy, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        age(&legacy, 30 * 86_400);
+
+        let only = HashSet::from([mine_key.clone(), legacy_key.clone()]);
+        let report = prune_authority_registry_in(
+            root.path(),
+            &AuthorityPruneOptions {
+                protected: &HashSet::new(),
+                only: Some(&only),
+                legacy_min_age: std::time::Duration::from_secs(3600),
+                dry_run: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.removed_orphaned, 1);
+        assert_eq!(report.removed_legacy, 0);
+        assert_eq!(report.skipped_out_of_scope, 2);
+        let mut expected = vec![theirs_key, legacy_key];
+        expected.sort();
+        assert_eq!(registry_entries(root.path()), expected);
+    }
+
     /// GC unlinks a record only while holding its lock; an acquirer that
     /// opened the record just before the unlink must retry onto the fresh
     /// record rather than failing or holding the unlinked inode.
@@ -590,6 +705,46 @@ mod tests {
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         pruner.join().unwrap();
+    }
+
+    /// nw-811: a temp-dir scope (every test and scratch database) uses the
+    /// override in a debug build; a release build ignores it.
+    #[test]
+    fn a_temp_dir_scope_uses_the_override_in_debug_builds() {
+        let override_dir = private_root();
+        let scope = std::fs::canonicalize(tempfile::tempdir().unwrap().path()).unwrap();
+        assert!(is_under_system_temp(&scope), "{}", scope.display());
+        let expected = if cfg!(debug_assertions) {
+            override_dir.path().to_path_buf()
+        } else {
+            default_authority_registry_root().unwrap()
+        };
+        assert_eq!(
+            registry_root_for(&scope, Some(override_dir.path())).unwrap(),
+            expected
+        );
+    }
+
+    /// nw-811: a real database's lock authority is always the account
+    /// registry, so a `cargo run` CLI and the launchd daemon (or two
+    /// worktrees) still exclude each other on it.
+    #[test]
+    fn a_non_temp_scope_uses_the_account_registry_even_with_the_override_set() {
+        let override_dir = private_root();
+        let home = registry_root(unsafe { libc::geteuid() })
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        for scope in [Path::new("/srv/brains/main"), home.as_path()] {
+            assert!(!is_under_system_temp(scope), "{}", scope.display());
+            assert_eq!(
+                registry_root_for(scope, Some(override_dir.path())).unwrap(),
+                default_authority_registry_root().unwrap(),
+                "{}",
+                scope.display()
+            );
+        }
     }
 
     #[test]

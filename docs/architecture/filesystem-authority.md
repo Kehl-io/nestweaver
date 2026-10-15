@@ -22,11 +22,26 @@ unheld, and matches no anchor of a live database named by a daemon boot log
 or `--db` (data directory, publication root, slots and operation journals).
 Older binaries without the retry fail closed ("registry entry was replaced")
 if they lose that microsecond race; they never gain a second owner.
+`daemon gc --db X` limits the prune to the records whose scope belongs to X
+(its data directory, publication root, slots and operation journals) and
+leaves every legacy entry alone; without `--db` the whole registry is swept. A
+registry gc refuses to sweep (for example a root that is not a private owner
+directory) is reported as a warning, and gc still exits 0 when its launch-agent
+and directory sweeps succeeded.
 
-Debug builds alone honour an absolute `NESTWEAVER_AUTHORITY_DIR` registry
-override. `.cargo/config.toml` sets it to `target/test-authority` for every
-process cargo runs, so test suites and `cargo run` scratch databases no longer
-write to the account registry. Release builds ignore the variable.
+Lock authority for a real database is always the account registry. Debug
+builds honour an absolute `NESTWEAVER_AUTHORITY_DIR` registry override, and
+only for a scope under the system temp directory (`std::env::temp_dir()` and
+`/tmp`, canonical or not; on macOS that includes `/private/var/folders` and
+`/private/tmp`). `.cargo/config.toml` sets it to `target/test-authority` for
+every process cargo runs, so test suites, whose databases are tempdirs, no
+longer write to the account registry. A database anywhere else uses the
+account registry even under `cargo run`, so a `cargo run` CLI, the launchd
+daemon and every worktree still exclude each other on it. Release builds
+ignore the variable entirely, so a `cargo test --release` run (CI's macOS job)
+still writes its tempdir records to the account registry; `daemon gc` reclaims
+them, because their scope is gone. A debug `daemon gc` with the override set
+sweeps the override registry; a release binary sweeps the account registry.
 
 This is a cooperating-process protocol. It assumes the private registry and its ancestors remain
 intact. Account-home resolution uses `getpwuid_r`, avoiding temporary-directory
