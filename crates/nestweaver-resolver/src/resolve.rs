@@ -357,7 +357,8 @@ pub fn resolve_references_with_file_languages(
                             })
                 })
                 .collect();
-            let scope_index = FileScopeIndex::build(&local_bindings, sorted_syms);
+            let scope_index =
+                FileScopeIndex::build(&local_bindings, sorted_syms).with_hoisted(references);
             for reference in references {
                 if let Some(edge) = resolve_single_reference(
                     file_path,
@@ -489,6 +490,7 @@ fn resolve_single_reference(
         | ReferenceKind::PackageBinding
         | ReferenceKind::Uses
         | ReferenceKind::LocalBinding
+        | ReferenceKind::HoistedDeclaration
         | ReferenceKind::ExportAlias => return None,
     };
 
@@ -987,6 +989,7 @@ fn resolve_single_reference(
                             .is_some_and(|line| sym.start_line == line)
                     })
                     && candidate_matches(reference, file_path, f, sym, language, graph)
+                    && !bare_call_names_member(reference, sym, language)
             })
             // Records rejections as a side effect; `min_by_key` consumes the
             // whole iterator, so every candidate is seen. An unresolved import
@@ -994,8 +997,13 @@ fn resolve_single_reference(
             // before the innermost is chosen, so a rejected homonym (a sibling
             // function's nested `f`) cannot hide an admissible one.
             .filter_map(|candidate| {
-                let width =
-                    same_file_declaration_scope(scope_index, candidate.1, reference, language);
+                let width = same_file_declaration_scope(
+                    scope_index,
+                    sorted_syms,
+                    candidate.1,
+                    reference,
+                    language,
+                );
                 same_file_out_of_scope |= width.is_none();
                 let width = width?;
                 unresolved_binding
@@ -1533,6 +1541,7 @@ fn resolve_single_reference(
             })
             .filter(|(candidate_file, sym)| {
                 candidate_matches(reference, file_path, candidate_file, sym, language, graph)
+                    && !bare_call_names_member(reference, sym, language)
             })
             .collect();
         same_pkg.sort_by_key(|(path, _)| *path);
@@ -2010,6 +2019,18 @@ fn candidate_matches(
     }
 }
 
+/// nw-789: a bare JS/TS call never reaches a method, getter or setter
+/// declared in this file or a sibling one; those need a receiver
+/// (`this.x()`, `obj.x()`). Applied where the reference is the real call:
+/// the import tiers keep binding a method an import names (a destructured
+/// CommonJS export, or an imported member resolved with its receiver dropped).
+fn bare_call_names_member(reference: &RawReference, sym: &RawSymbol, language: Language) -> bool {
+    reference.kind == ReferenceKind::Call
+        && reference.receiver.is_none()
+        && sym.kind == SymbolKind::Method
+        && matches!(language, Language::JavaScript | Language::TypeScript)
+}
+
 fn is_callable_symbol(sym: &RawSymbol) -> bool {
     matches!(
         sym.kind,
@@ -2099,6 +2120,9 @@ pub(crate) struct FileScopeIndex<'a> {
     /// `covering[l - 1]`: how many code-bearing symbols (never the `<module>`
     /// owner) contain line `l`.
     covering: Vec<u32>,
+    /// nw-787: each nested JS/TS `function` declaration's visible region, by
+    /// name, keyed by the line of its name.
+    hoisted: std::collections::HashMap<&'a str, Vec<&'a RawReference>>,
 }
 
 impl<'a> FileScopeIndex<'a> {
@@ -2139,7 +2163,34 @@ impl<'a> FileScopeIndex<'a> {
         Self {
             declarators,
             covering,
+            hoisted: std::collections::HashMap::new(),
         }
+    }
+
+    /// Adds the file's `HoistedDeclaration`s (nw-787).
+    pub(crate) fn with_hoisted(mut self, references: &'a [RawReference]) -> Self {
+        for reference in references
+            .iter()
+            .filter(|reference| reference.kind == ReferenceKind::HoistedDeclaration)
+        {
+            self.hoisted
+                .entry(reference.name.as_str())
+                .or_default()
+                .push(reference);
+        }
+        self
+    }
+
+    /// The visible region of the nested `function name` declared on `line`.
+    /// A one-line nest of same-named declarations takes the outermost (the
+    /// first name on the line).
+    fn hoisted_region(&self, name: &str, line: u32) -> Option<nestweaver_parser::LexicalScope> {
+        self.hoisted
+            .get(name)?
+            .iter()
+            .filter(|reference| reference.start_line == line)
+            .filter_map(|reference| reference.scope)
+            .max_by_key(|scope| scope.end - scope.start)
     }
 
     /// Every scoped binding named `name`, in line order.
@@ -2178,9 +2229,9 @@ impl<'a> FileScopeIndex<'a> {
 /// - `Some(width)` with that block's width when it is, so the innermost
 ///   visible declarator wins;
 /// - `Some(usize::MAX)` (unfiltered, base behaviour) for everything that
-///   carries no shadowing information: a symbol that is not a declarator
-///   (function declarations, nested or not; methods; class fields;
-///   assignment forms such as `exports.f = function …` and
+///   carries no shadowing information: a symbol that is neither a declarator
+///   nor a nested function declaration (module-level function declarations;
+///   methods; class fields; assignment forms such as `exports.f = function …` and
 ///   `obj.f = function …`; every non-`Function` kind), and a module-level
 ///   declarator, which is visible everywhere. All-`MAX` ties keep the base
 ///   first-match order.
@@ -2216,22 +2267,50 @@ impl<'a> FileScopeIndex<'a> {
 /// Gated to bare JS/TS calls (plan validation): Rust has its own exact gate,
 /// and receiver calls (`Api.get()`, `this.x()`) are matched by
 /// `candidate_matches`, so neither may be filtered here.
+///
+/// nw-787: a nested `function` declaration is scoped the same way, by the
+/// region its `HoistedDeclaration` names (its enclosing function body, or in
+/// strict code its block, from the region's start because it is hoisted). A
+/// module-level one has none and stays `usize::MAX`. A Python `def` nested in
+/// a function or method is visible only inside that function; it carries no
+/// byte scope, so its width is its container's line span, which competes only
+/// with other Python candidates.
 fn same_file_declaration_scope(
     scope_index: &FileScopeIndex<'_>,
+    sorted_syms: &[&RawSymbol],
     sym: &RawSymbol,
     reference: &RawReference,
     language: Language,
 ) -> Option<usize> {
-    if !matches!(language, Language::JavaScript | Language::TypeScript)
-        || reference.receiver.is_some()
-        || sym.kind != SymbolKind::Function
-        || !is_declarator_form(&sym.signature)
-    {
+    if reference.receiver.is_some() || sym.kind != SymbolKind::Function {
+        return Some(usize::MAX);
+    }
+    if language == Language::Python {
+        if scope_index.covering(sym.start_line) <= 1 {
+            return Some(usize::MAX);
+        }
+        return match innermost_container(sorted_syms, sym) {
+            Some(container) if matches!(container.kind, SymbolKind::Function | SymbolKind::Method) => {
+                let end = container.end_line.max(container.start_line);
+                (container.start_line <= reference.start_line && reference.start_line <= end)
+                    .then(|| (end - container.start_line) as usize)
+            }
+            _ => Some(usize::MAX),
+        };
+    }
+    if !matches!(language, Language::JavaScript | Language::TypeScript) {
         return Some(usize::MAX);
     }
     let Some(call) = reference.scope else {
         return Some(usize::MAX);
     };
+    if !is_declarator_form(&sym.signature) {
+        return match scope_index.hoisted_region(&sym.name, sym.start_line) {
+            Some(region) => (region.start <= call.position && call.position < region.end)
+                .then_some(region.end - region.start),
+            None => Some(usize::MAX),
+        };
+    }
     let Some(declaration) = scope_index
         // The declarator may sit on a later line than the declaration
         // (`const a = 1,\n  b = () => 2;`), so join by the symbol's span,
@@ -2268,18 +2347,13 @@ fn same_file_declaration_scope(
 /// anywhere, for a module-level import). Containment is by line, as in
 /// `same_file_declaration_scope`'s module-level test.
 ///
-/// Residuals:
-/// - (nw-787) a block-nested `function f` binds a call after its block, which
-///   is sloppy-mode semantics, not strict-mode block scoping;
-/// - (nw-787) the full index binds by name regardless of this rule when the
-///   import resolves, so a sibling function's nested `f`, a callback's nested
-///   `f`, or a method `f` still binds there; single-file passes now leave
-///   those unresolved and so differ from the full index for those shapes;
-/// - anonymous callbacks: in `function g() { [1].forEach(() => { function f()
-///   {} }); return f(); }` the unnamed callback is not a symbol, so `g` is
-///   `f`'s innermost container and the call binds `f` in every mode;
-/// - the shared boundary line: when `function f() {} } function h() {` sits
-///   on one line, the tie-break credits `f` to `h`.
+/// nw-787: a JS/TS nested `function` declaration is filtered first by its
+/// byte region (`same_file_declaration_scope`) in every pass, so the
+/// shapes this line-based test cannot tell apart (a block function called
+/// after its block, a function nested in an anonymous callback) never reach
+/// it. It still decides a Python nested `def` and any candidate without a
+/// region. Residual: when `function f() {} } function h() {` sits on one
+/// line, the tie-break credits `f` to `h`.
 fn nested_inside_binding(
     sorted_syms: &[&RawSymbol],
     sym: &RawSymbol,
@@ -2294,21 +2368,7 @@ fn nested_inside_binding(
         outer.start_line <= line && line <= outer.end_line.max(outer.start_line)
     };
     let same = |a: &RawSymbol, b: &RawSymbol| a.name == b.name && a.start_line == b.start_line;
-    let Some(container) = sorted_syms
-        .iter()
-        .take_while(|other| other.start_line <= sym.start_line)
-        .filter(|other| {
-            !same(other, sym) && can_contain_code(other) && contains(other, sym.start_line)
-        })
-        // Innermost: the narrowest span, the later start on a tie. The tie
-        // assumes the candidate follows the shared line's boundary.
-        .min_by_key(|other| {
-            (
-                other.end_line.max(other.start_line) - other.start_line,
-                std::cmp::Reverse(other.start_line),
-            )
-        })
-    else {
+    let Some(container) = innermost_container(sorted_syms, sym) else {
         return false;
     };
     let binding_owner = scoping_owner(sorted_syms, binding.start_line, language);
@@ -2319,6 +2379,29 @@ fn nested_inside_binding(
                 && contains(owner, container.start_line)
                 && contains(owner, container.end_line)
         })
+}
+
+/// The innermost code-bearing symbol (never `sym` itself or the `<module>`
+/// owner) whose line span contains `sym`'s first line: the narrowest span,
+/// the later start on a tie, which assumes `sym` follows a shared line's
+/// boundary.
+fn innermost_container<'a>(sorted_syms: &[&'a RawSymbol], sym: &RawSymbol) -> Option<&'a RawSymbol> {
+    sorted_syms
+        .iter()
+        .take_while(|other| other.start_line <= sym.start_line)
+        .filter(|other| {
+            !(other.name == sym.name && other.start_line == sym.start_line)
+                && can_contain_code(other)
+                && other.start_line <= sym.start_line
+                && sym.start_line <= other.end_line.max(other.start_line)
+        })
+        .min_by_key(|other| {
+            (
+                other.end_line.max(other.start_line) - other.start_line,
+                std::cmp::Reverse(other.start_line),
+            )
+        })
+        .copied()
 }
 
 /// A JS/TS `const`/`let`/`var`/`using` declaration's first line, after any
@@ -8925,13 +9008,14 @@ export function g() {
                 "g",
                 None,
             ),
-            // A1 (known residual): the anonymous callback is not a symbol, so
-            // g reads as f's innermost container and the call binds f.
+            // A1 (nw-787): f's region is the anonymous callback's body, even
+            // though the callback is not a symbol, so the call in g is
+            // outside it.
             (
                 "A1",
                 "function g() {\n  [1].forEach(() => {\n    function f() {}\n  });\n  return f();\n}\n",
                 "g",
-                Some(4),
+                None,
             ),
             // F1: f is visible only inside its sibling h.
             (
@@ -8975,13 +9059,13 @@ export function g() {
                 "g",
                 Some(7),
             ),
-            // F4 (known residual, nw-787): a block-nested function declaration
-            // binds after its block, which is sloppy-mode semantics.
+            // F4 (nw-787): a block-nested function declaration is visible only
+            // in its block in strict code (every TS file).
             (
                 "F4",
                 "function g() {\n  {\n    function f() { return 1; }\n  }\n  return f();\n}\n",
                 "g",
-                Some(4),
+                None,
             ),
         ];
         for (label, body, caller, expected) in cases {
@@ -9269,17 +9353,17 @@ export function multi() {
         }
     }
 
-    /// Documented residual (nw-113): containment is decided per line, so a
-    /// module-level `const f` sharing line 1 with `function h` reads as
-    /// scoped and outranks `g`'s nested `function f`. Pins today's binding to
-    /// the module const; a column-aware fix must update this deliberately.
+    /// nw-787 (was a documented nw-113 residual). A module-level `const f`
+    /// sharing line 1 with `function h` reads as scoped (containment is per
+    /// line) with the whole module's width, but `g`'s nested `function f` now
+    /// carries its body's narrower byte region, so the innermost wins.
     #[test]
-    fn residual_same_line_module_declarator_outranks_a_nested_function_declaration() {
+    fn a_nested_function_declaration_outranks_a_same_line_module_declarator() {
         let source = "function h() { return 0; } const f = () => 2;\nfunction g() {\n  function f() { return 1; }\n  return f();\n}\n";
         let (files, edges) = review_edges(&[("src/n1.ts", source)], Language::TypeScript);
         assert_eq!(
             call_targets(&files, &edges, "src/n1.ts", "g"),
-            vec![uid_at(&files, "src/n1.ts", "f", 1)]
+            vec![uid_at(&files, "src/n1.ts", "f", 3)]
         );
     }
 
@@ -9434,11 +9518,11 @@ export function readIt() { return value(); }
             vec!["unresolved:get".to_string()],
             "a receiver call into a namespace body is not touched by the block-scope filter"
         );
-        // Known residual (tracked separately): a bare JS/TS call can bind a same-named setter/method. This test only pins that nw-113 leaves it unchanged; the declaration-scope filter must not affect candidates without declarator bindings.
+        // nw-789: a bare call never binds the setter; the free function wins.
         assert_eq!(
             before("src/box.ts", "readIt"),
-            vec![uid_at(&files, "src/box.ts", "value", 2)],
-            "a same-line parameter binding does not change same-file selection"
+            vec![uid_at(&files, "src/box.ts", "value", 5)],
+            "a bare call binds the free function, never the setter"
         );
         // Known residual (tracked on nw-113): the caller is chosen by LINE, so a call on the same line as a one-line arrow declaration is credited to the arrow (a sendPacket -> sendPacket self-edge), not to lexicalCaller. This assertion pins the nw-113 fix itself: the call AFTER the block binds the import, not the block-local.
         assert_eq!(
@@ -10683,5 +10767,270 @@ export function readIt() { return value(); }
             started.elapsed(),
             edges.len()
         );
+    }
+
+    /// nw-787: the JS/TS nested-function shapes, in the NORMAL resolution
+    /// path. Each body is resolved twice: with no import (a same-file name out
+    /// of scope is unresolved) and with `import { f } from "./lib"` where
+    /// `./lib` is present (an invisible nested `f` yields to the import, a
+    /// visible one shadows it). `Some(line)` names the expected same-file `f`
+    /// by its line in `body`; `None` expects no same-file `f`.
+    #[test]
+    fn nested_function_declarations_bind_only_where_visible() {
+        let cases: [(&str, &str, &str, Option<u32>); 13] = [
+            (
+                "F1",
+                "function outer() {\n  function h() {\n    function f() { return 1; }\n  }\n  function g() {\n    return f();\n  }\n}\n",
+                "g",
+                None,
+            ),
+            (
+                "F2",
+                "function g() {\n  const cb = () => {\n    function f() { return 1; }\n  };\n  return f();\n}\n",
+                "g",
+                None,
+            ),
+            (
+                "F3",
+                "class C {\n  f() { return 1; }\n  m() {\n    return f();\n  }\n}\n",
+                "m",
+                None,
+            ),
+            (
+                "F4",
+                "function g() {\n  {\n    function f() { return 1; }\n  }\n  return f();\n}\n",
+                "g",
+                None,
+            ),
+            (
+                "S4",
+                "function h() {\n  function f() {}\n}\nfunction g() {\n  return f();\n}\n",
+                "g",
+                None,
+            ),
+            (
+                "A1 anonymous callback",
+                "function g() {\n  [1].forEach(() => {\n    function f() {}\n  });\n  return f();\n}\n",
+                "g",
+                None,
+            ),
+            (
+                "F6",
+                "function outer() {\n  function f() { return 1; }\n  function g() {\n    return f();\n  }\n}\n",
+                "g",
+                Some(2),
+            ),
+            (
+                "F7",
+                "class C {\n  m() {\n    function f() { return 1; }\n    return f();\n  }\n}\n",
+                "m",
+                Some(3),
+            ),
+            (
+                "sibling-homonym",
+                "function h() {\n  function f() { return 1; }\n  return 0;\n}\nfunction g() {\n  function f() { return 2; }\n  return f();\n}\n",
+                "g",
+                Some(6),
+            ),
+            (
+                "sibling-homonym (methods)",
+                "class C {\n  m() {\n    function f() { return 1; }\n    return 0;\n  }\n  n() {\n    function f() { return 2; }\n    return f();\n  }\n}\n",
+                "n",
+                Some(7),
+            ),
+            (
+                "hoisted call before the declaration",
+                "function g() {\n  const x = f();\n  function f() { return 1; }\n  return x;\n}\n",
+                "g",
+                Some(3),
+            ),
+            (
+                "hoisted call before a block declaration",
+                "function g() {\n  {\n    f();\n    function f() { return 1; }\n  }\n}\n",
+                "g",
+                Some(4),
+            ),
+            (
+                "module-level declaration, file-wide",
+                "function g() {\n  const cb = () => {\n    {\n      return f();\n    }\n  };\n  return cb;\n}\nfunction f() { return 1; }\n",
+                "cb",
+                Some(9),
+            ),
+        ];
+        let lib = ("src/lib.ts", "export function f(): number { return 7; }\n");
+        let mut failures = Vec::new();
+        for (label, body, caller, expected) in cases {
+            for with_import in [false, true] {
+                // A module-level `f` and an import of `f` cannot coexist.
+                if with_import && label.starts_with("module-level") {
+                    continue;
+                }
+                let source = if with_import {
+                    format!("import {{ f }} from \"./lib\";\n{body}")
+                } else {
+                    body.to_string()
+                };
+                let inputs: Vec<(&str, &str)> = if with_import {
+                    vec![lib, ("src/app.ts", &source)]
+                } else {
+                    vec![("src/app.ts", &source)]
+                };
+                let (files, edges) = review_edges(&inputs, Language::TypeScript);
+                let want = match (expected, with_import) {
+                    (Some(line), _) => uid_at(&files, "src/app.ts", "f", line + with_import as u32),
+                    (None, false) => "unresolved:f".to_string(),
+                    (None, true) => uid(&files, "src/lib.ts", "f"),
+                };
+                let f_uids: Vec<String> = files
+                    .iter()
+                    .flat_map(|(path, symbols, _)| {
+                        symbols
+                            .iter()
+                            .filter(|symbol| symbol.name == "f")
+                            .map(move |symbol| {
+                                symbol_uid("repo:test:abc", path, "f", symbol.start_line)
+                            })
+                    })
+                    .collect();
+                let got: Vec<String> = call_targets(&files, &edges, "src/app.ts", caller)
+                    .into_iter()
+                    .filter(|target| target == "unresolved:f" || f_uids.contains(target))
+                    .collect();
+                if got != vec![want.clone()] {
+                    failures.push(format!(
+                        "{label} (import: {with_import}): want {want}, got {got:?}"
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// nw-787: a block-level `function` is block-scoped in strict code (TS,
+    /// an ES module, a `"use strict"` script) and, per ECMA-262 Annex B.3.3,
+    /// function-scoped in a sloppy script.
+    #[test]
+    fn a_block_function_is_block_scoped_only_in_strict_code() {
+        let body = "function g() {\n  {\n    function f() { return 1; }\n  }\n  return f();\n}\n";
+        for (path, prefix, block_scoped) in [
+            ("src/module.js", "export const x = 1;\n", true),
+            ("src/strict.js", "'use strict';\n", true),
+            ("src/script.js", "", false),
+            ("src/typed.ts", "", true),
+        ] {
+            let source = format!("{prefix}{body}");
+            let language = if path.ends_with(".ts") {
+                Language::TypeScript
+            } else {
+                Language::JavaScript
+            };
+            let (files, edges) = review_edges(&[(path, &source)], language);
+            let line = 3 + u32::from(!prefix.is_empty());
+            let want = if block_scoped {
+                "unresolved:f".to_string()
+            } else {
+                uid_at(&files, path, "f", line)
+            };
+            assert_eq!(call_targets(&files, &edges, path, "g"), vec![want], "{path}");
+        }
+    }
+
+    /// nw-787 (Python): a `def` nested in a function or method binds a bare
+    /// call only inside that function, so a sibling's nested homonym never
+    /// binds and never hides the caller's own; a module-level `def` binds
+    /// file-wide.
+    #[test]
+    fn python_nested_defs_bind_only_inside_their_function() {
+        let cases: [(&str, &str, &str, Option<u32>); 5] = [
+            (
+                "sibling-homonym",
+                "def h():\n    def f():\n        return 1\n    return 0\n\ndef g():\n    def f():\n        return 2\n    return f()\n",
+                "g",
+                Some(7),
+            ),
+            (
+                "nested in a sibling",
+                "def h():\n    def f():\n        return 1\n    return 0\n\ndef g():\n    return f()\n",
+                "g",
+                None,
+            ),
+            (
+                "module-level",
+                "def g():\n    return f()\n\ndef f():\n    return 1\n",
+                "g",
+                Some(4),
+            ),
+            (
+                "nested in a method, called there",
+                "class C:\n    def m(self):\n        def f():\n            return 1\n        return f()\n\n    def n(self):\n        return f()\n",
+                "m",
+                Some(3),
+            ),
+            (
+                "nested in a method, called from a sibling method",
+                "class C:\n    def m(self):\n        def f():\n            return 1\n        return f()\n\n    def n(self):\n        return f()\n",
+                "n",
+                None,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (label, source, caller, expected) in cases {
+            let (files, edges) = review_edges(&[("app.py", source)], Language::Python);
+            let want = match expected {
+                Some(line) => uid_at(&files, "app.py", "f", line),
+                None => "unresolved:f".to_string(),
+            };
+            let got = call_targets(&files, &edges, "app.py", caller);
+            if got != vec![want.clone()] {
+                failures.push(format!("{label}: want {want}, got {got:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// nw-789: a bare JS/TS call never binds a method, getter or setter; a
+    /// same-named free function wins, and receiver calls are unchanged.
+    #[test]
+    fn a_bare_call_never_binds_a_method_getter_or_setter() {
+        let source = r#"export class Box {
+  get size() { return 1; }
+  set value(v: number) { this.v = v; }
+  run() { return 2; }
+  v = 0;
+  use() { return this.run(); }
+}
+function value() { return 2; }
+export function readIt(b: Box) { size(); run(); b.run(); return value(); }
+"#;
+        for (path, language) in [
+            ("src/box.ts", Language::TypeScript),
+            ("src/box.js", Language::JavaScript),
+        ] {
+            let source = if language == Language::JavaScript {
+                source.replace(": number", "").replace("(b: Box)", "(b)")
+            } else {
+                source.to_string()
+            };
+            let (files, edges) = review_edges(&[(path, &source)], language);
+            let targets = call_targets(&files, &edges, path, "readIt");
+            for method in [("size", 2), ("value", 3)] {
+                let method_uid = uid_at(&files, path, method.0, method.1);
+                assert!(
+                    !targets.contains(&method_uid),
+                    "{path}: a bare {}() bound the accessor: {targets:?}",
+                    method.0
+                );
+            }
+            assert!(
+                targets.contains(&uid_at(&files, path, "value", 8)),
+                "{path}: the free function must win: {targets:?}"
+            );
+            assert!(targets.contains(&"unresolved:run".to_string()), "{path}: {targets:?}");
+            assert_eq!(
+                call_targets(&files, &edges, path, "use"),
+                vec![uid_at(&files, path, "run", 4)],
+                "{path}: this.run() is unchanged"
+            );
+        }
     }
 }
