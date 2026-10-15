@@ -1070,10 +1070,11 @@ fn resolve_single_reference(
         } else {
             binding.original_name.as_str()
         };
-        let source_file = binding
-            .source_file
-            .as_deref()
-            .expect("unresolved binding handled above");
+        // An unresolved binding returned above; this only keeps the
+        // invariant local.
+        let Some(source_file) = binding.source_file.as_deref() else {
+            return Some(unresolved_edge(source_uid, name, edge_type));
+        };
         let exact_exports = matches!(language, Language::JavaScript | Language::TypeScript);
         // A Rust type path resolves through the same bounded named type route
         // as a typed value. Keep the terminal declaration's byte identity so
