@@ -11,7 +11,9 @@
 //! The limit is per PROCESS, so there is one budget per process
 //! ([`CpuThrottle::global`]): back-to-back indexes (boot reconcile of several
 //! repos, a watcher batch plus a forced index, code then vault) share it, and
-//! CPU spent before the throttle is first consulted is billed too.
+//! CPU spent before the throttle is first consulted is billed too. The daemon
+//! samples the window every [`SAMPLE_INTERVAL`], so CPU spent between indexes
+//! is billed where it happened.
 //!
 //! nw-812: this replaced a 5 s duty-cycle window that budgeted half of ONE
 //! core for the whole multi-threaded process and billed nothing for the first
@@ -72,6 +74,10 @@ const SUB_WINDOW: Duration = Duration::from_secs(10);
 /// CPU from outside the throttled work keeps refilling the window, and then
 /// the worker proceeds rather than block indefinitely.
 const MAX_WAIT_PER_CHECK: Duration = Duration::from_secs(190);
+
+/// How often the daemon calls [`CpuThrottle::sample`]: at most one
+/// sub-window, so a gap between measurements never spans more than one.
+pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Upper bound on a single sleep slice, so a waiting worker re-measures and
 /// notices cancellation promptly.
@@ -347,6 +353,18 @@ impl CpuThrottle {
             (self.sleep)(nap);
             slept += nap;
         }
+    }
+
+    /// Bill CPU used since the last measurement to the current bucket,
+    /// without waiting. The daemon calls this every [`SAMPLE_INTERVAL`]: CPU
+    /// spent between indexes (embedding, watcher batches, reconcilers,
+    /// queries) is then billed where it happened. Without it, a long gap's CPU
+    /// would be spread evenly over the gap and a burst at its end under-billed.
+    pub fn sample(&self) {
+        let mut window = self.window.lock().unwrap_or_else(|p| p.into_inner());
+        let now_wall = (self.wall_clock)();
+        let now_cpu = (self.cpu_clock)();
+        window.update(now_wall, now_cpu);
     }
 
     /// The window's current total (tests).
@@ -846,5 +864,53 @@ mod tests {
         assert_eq!(slices.load(Ordering::SeqCst), 1);
         // Break the Arc cycle.
         throttle.lock().unwrap().take();
+    }
+
+    // ── nw-812 re-review N1: sampling between indexes ────────────────────
+
+    /// One hour idle, then 80 s of outside CPU (embedding, reconcilers) in
+    /// the final 100 s, then an index. `sample` is the daemon's periodic
+    /// sampler (every SUB_WINDOW or less).
+    fn hour_idle_then_late_burn(rig: &Rig, sampled: bool) {
+        for step in 0..360 {
+            let cpu = if step >= 350 { 8 } else { 0 };
+            rig.advance(Duration::from_secs(10), Duration::from_secs(cpu));
+            if sampled {
+                rig.throttle.sample();
+            }
+        }
+    }
+
+    fn eleven_core_burst(rig: &Rig) -> Duration {
+        let before = rig.total_sleep();
+        for _ in 0..660 {
+            rig.throttle.check();
+            rig.advance(
+                Duration::from_secs_f64(6.0 / 660.0),
+                Duration::from_millis(100),
+            );
+        }
+        rig.total_sleep() - before
+    }
+
+    #[test]
+    fn sampled_late_outside_cpu_is_billed_where_it_happened() {
+        let rig = sim_rig();
+        hour_idle_then_late_burn(&rig, true);
+        assert!(
+            eleven_core_burst(&rig) > Duration::ZERO,
+            "80 s of recent outside CPU + a 66 s burst is over budget and must wait"
+        );
+    }
+
+    #[test]
+    fn unsampled_gap_is_spread_evenly_until_the_first_sample() {
+        // Without a sampler the gap's CPU is spread over the whole gap, so
+        // only ~4 s of the late 80 s lands in the window: the burst runs free.
+        // This is why the daemon samples every sub-window; spreading only
+        // matters before the first sample (CPU since process start).
+        let rig = sim_rig();
+        hour_idle_then_late_burn(&rig, false);
+        assert_eq!(eleven_core_burst(&rig), Duration::ZERO);
     }
 }
