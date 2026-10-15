@@ -117,6 +117,9 @@ struct Window {
     last_log: Option<Duration>,
     /// Write reserves currently claimed by indexes in their write phase.
     claimed: Duration,
+    /// A wait timed out with the window still over budget (outside CPU);
+    /// waits are skipped until the total falls back under the budget.
+    saturated: bool,
 }
 
 impl Window {
@@ -263,6 +266,7 @@ impl CpuThrottle {
             buckets: VecDeque::new(),
             last_log: None,
             claimed: Duration::ZERO,
+            saturated: false,
         };
         Self {
             target,
@@ -363,7 +367,12 @@ impl CpuThrottle {
                 } else {
                     limit
                 };
-                if total <= limit {
+                if window.saturated && total <= self.target.unwrap_or(limit) {
+                    window.saturated = false;
+                }
+                // Under the limit, or the window is saturated by CPU from
+                // outside the throttled work, where waiting cannot help.
+                if total <= limit || window.saturated {
                     if claim {
                         window.claimed += WRITE_RESERVE;
                     }
@@ -397,6 +406,24 @@ impl CpuThrottle {
             }
             (self.sleep)(nap);
             slept += nap;
+        }
+        // Waited the longest any debt could take and the window still has not
+        // recovered: CPU outside the throttled work (embedding, queries,
+        // other reconcilers) keeps refilling it. Stop making every later
+        // check wait out another full window until the total falls back
+        // under budget.
+        {
+            let mut window = self.window.lock().unwrap_or_else(|p| p.into_inner());
+            if !window.saturated {
+                window.saturated = true;
+                tracing::warn!(
+                    window_total_secs = window.total().as_secs_f64(),
+                    budget_secs = self.target.unwrap_or_default().as_secs_f64(),
+                    "index CPU window stayed over budget for a full {}s wait (CPU from outside \
+                     indexing); index work proceeds unthrottled until it recovers",
+                    MAX_WAIT_PER_CHECK.as_secs()
+                );
+            }
         }
         claim_now();
     }
@@ -1002,5 +1029,60 @@ mod tests {
         let third = rig.throttle.reserve_write_headroom(None);
         assert_eq!(rig.sleeps().len(), slept, "released reserves are reusable");
         drop(third);
+    }
+
+    // ── nw-812 re-review N2: starvation by outside CPU ───────────────────
+
+    /// Rig where every sleep lets half a core of OUTSIDE CPU (embedding,
+    /// queries) run: the window can never fall back under 72 s by waiting.
+    fn outside_cpu_rig() -> Rig {
+        let wall = Arc::new(StdMutex::new(Duration::ZERO));
+        let cpu = Arc::new(StdMutex::new(Duration::ZERO));
+        let sleeps = Arc::new(StdMutex::new(Vec::new()));
+        let throttle = {
+            let (wall_c, wall_s) = (Arc::clone(&wall), Arc::clone(&wall));
+            let (cpu_c, cpu_s) = (Arc::clone(&cpu), Arc::clone(&cpu));
+            let sleeps = Arc::clone(&sleeps);
+            CpuThrottle::with_clocks(
+                secs(72),
+                Box::new(move || *wall_c.lock().unwrap_or_else(|p| p.into_inner())),
+                Box::new(move || *cpu_c.lock().unwrap_or_else(|p| p.into_inner())),
+                Box::new(move |d| {
+                    *wall_s.lock().unwrap_or_else(|p| p.into_inner()) += d;
+                    *cpu_s.lock().unwrap_or_else(|p| p.into_inner()) += d / 2;
+                    sleeps.lock().unwrap_or_else(|p| p.into_inner()).push(d);
+                }),
+            )
+        };
+        Rig {
+            wall,
+            cpu,
+            sleeps,
+            throttle,
+        }
+    }
+
+    #[test]
+    fn outside_cpu_saturation_stops_repeated_full_waits() {
+        let rig = outside_cpu_rig();
+        rig.advance(Duration::from_secs(5), Duration::from_secs(80));
+        rig.throttle.check();
+        let first = rig.total_sleep();
+        assert_eq!(first, MAX_WAIT_PER_CHECK, "the first check waits it out");
+        // Every later check would otherwise wait another 190 s per file.
+        for _ in 0..10 {
+            rig.throttle.check();
+        }
+        assert_eq!(
+            rig.total_sleep(),
+            first,
+            "once outside CPU saturates the window, checks stop waiting"
+        );
+        // Saturation clears once the window drops back under budget.
+        rig.advance(Duration::from_secs(400), Duration::ZERO);
+        rig.throttle.check();
+        rig.advance(Duration::from_secs(5), Duration::from_secs(80));
+        rig.throttle.check();
+        assert!(rig.total_sleep() > first, "waiting resumes after recovery");
     }
 }
