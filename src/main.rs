@@ -11516,8 +11516,8 @@ fn print_pr_impact_hook(result: &BlastRadiusResult, breaking: &[BreakingChange])
         }
     }
 
-    // nw-113: a changed file that is only top-level code says so; its
-    // affected symbols below are what that code calls.
+    // nw-113: a changed file that is only top-level code says so and names
+    // what that code calls (`top_level_callees`, never affected symbols).
     for note in result
         .notifications
         .iter()
@@ -21112,6 +21112,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         affected_symbols: Vec::new(),
                         affected_symbol_count: 0,
                         affected_clusters: Vec::new(),
+                        top_level_callees: Vec::new(),
                         risk_level: RiskLevel::Low,
                         summary: "No changed files detected.".to_string(),
                         org_wide: None,
@@ -40963,6 +40964,7 @@ mod resolver_generation_gate_tests {
             affected_symbols: Vec::new(),
             affected_symbol_count: 0,
             affected_clusters: Vec::new(),
+            top_level_callees: Vec::new(),
             risk_level: RiskLevel::Low,
             summary: "1 changed symbol, 0 affected".to_string(),
             org_wide: None,

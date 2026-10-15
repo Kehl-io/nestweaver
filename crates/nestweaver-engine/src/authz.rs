@@ -208,6 +208,11 @@ pub fn redact_blast_radius_for_visibility(
         .changed_symbols
         .retain(|s| visible_only.allows(&s.repo_uid));
     result.affected_symbol_count = result.affected_symbols.len();
+    // nw-113: a top-level-only file's callees, under the same rule as the
+    // affected rows.
+    result
+        .top_level_callees
+        .retain(|s| s.ownership_resolved && visible_only.allows(&s.repo_uid));
 
     // Org items reference both a source/change repo and a destination/affected
     // repo. Authorize exclusively by their stable UIDs: display URLs/names may
@@ -620,6 +625,7 @@ mod tests {
             ],
             affected_symbol_count: 3,
             affected_clusters: vec![],
+            top_level_callees: vec![],
             risk_level: RiskLevel::Medium,
             summary: "s".to_string(),
             org_wide: Some(OrgWideImpact {
@@ -830,6 +836,21 @@ mod tests {
             result.summary
         );
         assert_eq!(result.affected_symbol_count, 2);
+    }
+
+    /// nw-113: a top-level-only file's callees are redacted like affected
+    /// rows.
+    #[test]
+    fn redact_only_drops_hidden_top_level_callees() {
+        let mut result = sample_result();
+        result.top_level_callees = vec![affected("t:a", "repo:a"), affected("t:b", "repo:b")];
+        redact_blast_radius_for_visibility(&mut result, &only(&["repo:a"]), &sample_repos());
+        let kept: Vec<&str> = result
+            .top_level_callees
+            .iter()
+            .map(|s| s.uid.as_str())
+            .collect();
+        assert_eq!(kept, ["t:a"]);
     }
 
     #[test]
