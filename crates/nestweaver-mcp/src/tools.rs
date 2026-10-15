@@ -7090,10 +7090,9 @@ fn tool_schema_brain_context() -> Value {
 
 /// Truncate to `limit`, reporting whether anything was dropped.
 ///
-/// The caller asks the engine for `limit + 1` so the extra row proves more rows
-/// exist without paying for a second query; this drops it and says so. Silent
-/// truncation is the failure mode being avoided: a caller that cannot tell a
-/// complete answer from a capped one will treat the cap as the whole graph.
+/// Silent truncation is the failure mode being avoided: a caller that cannot
+/// tell a complete answer from a capped one will treat the cap as the whole
+/// graph.
 fn truncate_reporting<T>(items: &mut Vec<T>, limit: usize) -> bool {
     let truncated = items.len() > limit;
     if truncated {
@@ -7159,28 +7158,24 @@ fn tool_code_context(
         })
         .transpose()?;
 
-    // One over the cap, so `truncated` can be reported without a second pass:
-    // the extra row proves more exist, and is dropped before rendering.
-    // `saturating_add`, not `+`. Schema validation bounds `limit` on the MCP
-    // path, but this function is also reached from routes that do not validate
-    // against the schema, and `usize::MAX + 1` is a debug panic and a silent
-    // wrap to ZERO in release — which would turn "give me everything" into
-    // "give me nothing".
-    let mut result = nestweaver_engine::build_context_with_intent(
-        store,
-        &seeds,
-        intent,
-        Some(limit.saturating_add(1)),
-    )
-    .map_err(|error| {
-        seeds_not_found(
-            store,
-            error,
-            &seeds,
-            &["No matching symbols found.", "No symbols found in file(s):"],
-            visible,
-        )
-    })?;
+    // Exactly the cap. This used to ask for one over it so the extra row
+    // proved more existed, but the engine reports `connected_total` itself,
+    // and the extra row was refilled and then trimmed off the tail, where the
+    // `<module>` owners rank, so one of the three listed owners was lost
+    // (nw-113 final review Minor 2). `truncate_reporting` below stays as a
+    // guard; the engine never returns more than `limit`.
+    let mut result =
+        nestweaver_engine::build_context_with_intent(store, &seeds, intent, Some(limit)).map_err(
+            |error| {
+                seeds_not_found(
+                    store,
+                    error,
+                    &seeds,
+                    &["No matching symbols found.", "No symbols found in file(s):"],
+                    visible,
+                )
+            },
+        )?;
     let truncated = truncate_reporting(&mut result.connected, limit);
 
     let render = |node: &nestweaver_engine::ContextNode| {
@@ -33002,6 +32997,55 @@ mod ambiguous_name_contract_tests {
             ],
             "{ambiguous}"
         );
+    }
+
+    /// nw-113 final review Minor 2: `code_context` lists the same three
+    /// owners as the engine. Asking the engine for `limit + 1` let the refill
+    /// fill that extra row and the trim then cut the last owner.
+    #[test]
+    fn code_context_lists_three_owners_behind_a_full_refill() {
+        use nestweaver_engine::index_directory_in_memory;
+        let dir = tempfile::tempdir().unwrap();
+        let chain: Vec<String> = (0..20).map(|i| format!("step{i}")).collect();
+        let mut theme = String::new();
+        for pair in chain.windows(2) {
+            theme.push_str(&format!(
+                "function {}(k) {{ return {}(k); }}\n",
+                pair[0], pair[1]
+            ));
+        }
+        theme.push_str("function step19(k) { return k; }\n");
+        theme.push_str(
+            "function fromTemplate(t) { return step0(t); }\nmodule.exports = { fromTemplate };\n",
+        );
+        std::fs::write(dir.path().join("theme.js"), theme).unwrap();
+        std::fs::create_dir_all(dir.path().join("styles")).unwrap();
+        for i in 0..400 {
+            std::fs::write(
+                dir.path().join(format!("styles/s{i}.style.js")),
+                "const { fromTemplate } = require('../theme');\nexport const dark = fromTemplate({});\n",
+            )
+            .unwrap();
+        }
+        let (_repo, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/r", "sha").unwrap();
+        let payload = tool_code_context(
+            &store,
+            json!({ "seeds": ["fromTemplate"], "limit": 10 }),
+            None,
+        )
+        .unwrap();
+        let names: Vec<&str> = payload["connected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n["name"].as_str())
+            .collect();
+        let owners = names.iter().filter(|n| n.ends_with("::<module>")).count();
+        assert_eq!(names.len(), 10, "{names:?}");
+        assert_eq!(owners, 3, "{names:?}");
+        assert_eq!(payload["module_owners_omitted"], 397, "{payload}");
+        assert_eq!(payload["truncated"], true, "{payload}");
     }
 
     /// nw-113: `brain_diff` never lists a changed file's owner as a changed

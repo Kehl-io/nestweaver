@@ -991,6 +991,27 @@ pub(crate) fn refill_count(
     (available.min(room), available)
 }
 
+/// nw-113 final review Minor 2: cut `ranked` (owners last) to `limit`.
+/// Owners the cut drops are counted like the ones the owner cap left out:
+/// the return value goes to `module_owners_omitted` and out of
+/// `connected_total`, so every route reports the same owners.
+pub(crate) fn truncate_counting_owners<T>(
+    ranked: &mut Vec<T>,
+    limit: Option<usize>,
+    is_owner: impl Fn(&T) -> bool,
+) -> usize {
+    let Some(limit) = limit else {
+        return 0;
+    };
+    let trimmed = ranked
+        .iter()
+        .skip(limit)
+        .filter(|node| is_owner(node))
+        .count();
+    ranked.truncate(limit);
+    trimmed
+}
+
 /// nw-113: put `refill` after the real nodes of `ranked` and before its
 /// listed owners (always its tail, see [`rank_module_owners_last`]).
 pub(crate) fn insert_refill<T>(ranked: &mut Vec<T>, owners_listed: usize, refill: Vec<T>) {
@@ -1292,7 +1313,7 @@ pub fn build_context_with_intent(
     }
     // nw-113: owners rank after every real symbol and only
     // `CONTEXT_MODULE_OWNER_CAP` are listed; the rest are counted.
-    let module_owners_omitted =
+    let mut module_owners_omitted =
         rank_module_owners_last(&mut ranked, |node| owner_uids.contains(&node.uid));
     // nw-113: refill the places the hidden owners would have taken with
     // real symbols that scored under the floor, so a helper called at load
@@ -1308,12 +1329,13 @@ pub fn build_context_with_intent(
         refill_pool.len(),
     );
     let refill = context_nodes(store, &refill_pool[..take])?;
-    let connected_total = ranked.len() + refill_available;
+    let mut connected_total = ranked.len() + refill_available;
     insert_refill(&mut ranked, owners_listed, refill);
-    let connected: Vec<ContextNode> = ranked
-        .into_iter()
-        .take(limit.unwrap_or(usize::MAX))
-        .collect();
+    let owners_trimmed =
+        truncate_counting_owners(&mut ranked, limit, |node| owner_uids.contains(&node.uid));
+    module_owners_omitted += owners_trimmed;
+    connected_total -= owners_trimmed;
+    let connected = ranked;
 
     // Collect cross-repo links for seed symbols.
     let mut cross_repo_links: Vec<CrossRepoLink> = Vec::new();
@@ -1764,6 +1786,36 @@ mod context_tests {
         assert!(last, "{names:?}");
         assert_eq!(result.module_owners_omitted, 397, "{result:?}");
         assert!(names.len() <= 30, "{names:?}");
+    }
+
+    /// nw-113 final review Minor 2: a limit that leaves no room for the
+    /// listed owners trims them, and counts them in `module_owners_omitted`
+    /// rather than in `connected_total`.
+    #[test]
+    fn context_counts_owners_the_limit_trims() {
+        let (_dir, src) = hub_of_owners_repo(400);
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let result =
+            super::build_context_with_intent(&store, &["fromTemplate".to_string()], None, Some(5))
+                .unwrap();
+        let names: Vec<&str> = result.connected.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names.len(), 5, "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.ends_with("::<module>")),
+            "{names:?}"
+        );
+        assert_eq!(result.module_owners_omitted, 400, "{result:?}");
+        let total = result.connected_total.unwrap();
+        assert!(total > 5, "{total}");
+        let unlimited =
+            super::build_context_with_intent(&store, &["fromTemplate".to_string()], None, None)
+                .unwrap();
+        assert_eq!(
+            unlimited.connected_total.unwrap(),
+            total + 3,
+            "trimmed owners leave the total: {unlimited:?}"
+        );
     }
 
     /// The same refill on feature context.
@@ -2507,7 +2559,7 @@ pub fn build_feature_context(
     }
     // nw-113: the same owner ordering, cap and refill as
     // `build_context_with_intent`.
-    let module_owners_omitted =
+    let mut module_owners_omitted =
         rank_module_owners_last(&mut ranked, |node| owner_uids.contains(&node.uid));
     let owners_listed = ranked
         .iter()
@@ -2521,12 +2573,13 @@ pub fn build_feature_context(
     );
     let refill = context_nodes(store, &refill_pool[..take])?;
     // Apply limit to PPR results (seeds are always included).
-    let connected_total = ranked.len() + refill_available;
+    let mut connected_total = ranked.len() + refill_available;
     insert_refill(&mut ranked, owners_listed, refill);
-    let connected: Vec<ContextNode> = ranked
-        .into_iter()
-        .take(limit.unwrap_or(usize::MAX))
-        .collect();
+    let owners_trimmed =
+        truncate_counting_owners(&mut ranked, limit, |node| owner_uids.contains(&node.uid));
+    module_owners_omitted += owners_trimmed;
+    connected_total -= owners_trimmed;
+    let connected = ranked;
 
     // Only include links whose both ends are repos declared in this feature.
     let feature_links: Vec<LinkInfo> = links
