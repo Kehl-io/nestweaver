@@ -491,6 +491,8 @@ fn detect_changes_impact_with_work_budget(
     // Step 1: collect all symbols in changed files.
     let mut affected_symbols = Vec::new();
     let mut affected_uids: HashSet<String> = HashSet::new();
+    // nw-113: changed files' `<module>` owners: walk seeds, not changed symbols.
+    let mut owner_seeds: HashSet<String> = HashSet::new();
     let mut status = AnalysisStatus::Complete;
     let mut notifications = Vec::new();
     // A stale repository degrades only when it owns or is linked to
@@ -525,6 +527,12 @@ fn detect_changes_impact_with_work_budget(
         }
         for sym in syms {
             GraphStore::check_read_deadline()?;
+            // nw-113: a file's `<module>` owner is no changed symbol, but it
+            // still seeds the walk so the file's own top-level process counts.
+            if sym.is_module_owner() {
+                owner_seeds.insert(sym.uid.clone());
+                continue;
+            }
             if affected_uids.insert(sym.uid.clone()) {
                 affected_symbols.push(AffectedSymbol {
                     uid: sym.uid.clone(),
@@ -535,7 +543,7 @@ fn detect_changes_impact_with_work_budget(
         }
     }
     // Early out: no changed file mapped to an indexed symbol → nothing to trace.
-    if affected_uids.is_empty() {
+    if affected_uids.is_empty() && owner_seeds.is_empty() {
         // Risk is assigned by `adopt_blast_verdict` (nw-544); Unknown until
         // then so this leg can never be mistaken for a verdict on its own.
         // Traversal has not started, so any non-Complete status here reflects
@@ -634,13 +642,9 @@ fn detect_changes_impact_with_work_budget(
     );
     let traversal_started = std::time::Instant::now();
     let mut remaining_steps = work_budget;
-    let ancestors = reachable_in_memory(
-        &rev_adj,
-        &affected_uids,
-        max_depth,
-        &mut remaining_steps,
-        deadline,
-    );
+    let seeds: HashSet<String> = affected_uids.union(&owner_seeds).cloned().collect();
+    let ancestors =
+        reachable_in_memory(&rev_adj, &seeds, max_depth, &mut remaining_steps, deadline);
     let mut work_budget_exceeded = ancestors.is_none();
     let mut affected_processes = Vec::new();
     if let Some(ancestors) = ancestors {
@@ -665,8 +669,10 @@ fn detect_changes_impact_with_work_budget(
                 work_budget_exceeded = true;
                 break; // Never publish the counts of an unfinished process.
             };
+            // A process whose only changed member is an owner (its file's
+            // top-level code changed) is affected, with no changed SYMBOL.
             let overlap = affected_uids.intersection(&members).count();
-            if overlap > 0 {
+            if overlap > 0 || !owner_seeds.is_disjoint(&members) {
                 let hash = crate::hash::blake3_hex(&format!("process:{}", ep.uid));
                 affected_processes.push(AffectedProcess {
                     name: derive_process_name(ep),
@@ -822,6 +828,33 @@ mod tests {
         assert!(
             !names.iter().any(|n| n.contains("edgeless")),
             "an owner with no outgoing call is no process: {names:?}"
+        );
+
+        // nw-113: a changed file's owner is no changed symbol.
+        assert!(
+            impact
+                .affected_symbols
+                .iter()
+                .all(|s| s.name != nestweaver_schema::MODULE_OWNER_NAME),
+            "{:?}",
+            impact.affected_symbols
+        );
+        assert!(
+            impact.affected_symbols.iter().any(|s| s.name == "listen"),
+            "{:?}",
+            impact.affected_symbols
+        );
+        let owner_only =
+            detect_changes_impact(&store, &["index.js".to_string()], 10, None).unwrap();
+        assert!(owner_only.affected_symbols.is_empty(), "{owner_only:?}");
+        assert_eq!(
+            owner_only
+                .affected_processes
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["index.js::<module>"],
+            "a changed file's top-level code still affects its own process"
         );
 
         let traced: Vec<String> = trace_processes(&store, 10)

@@ -624,6 +624,11 @@ pub fn analyze_blast_radius(
 
         for sym in syms {
             changed_repos.insert(sym.repo_uid.clone());
+            // nw-113: a file's `<module>` owner is no changed symbol. It has
+            // no callers, so it adds nothing to the walk, only to the counts.
+            if sym.is_module_owner() {
+                continue;
+            }
             if changed_uids.insert(sym.uid.clone()) {
                 changed_symbols.push(ChangedSymbol {
                     uid: sym.uid.clone(),
@@ -836,7 +841,8 @@ pub fn analyze_blast_radius(
                 change_name,
                 change_kind,
                 change_repo_uid,
-                affected_name: node.name.clone(),
+                affected_name: nestweaver_schema::symbol_display_name(&node.name, &node.file_path)
+                    .into_owned(),
                 affected_repo_uid: affected_repo.clone(),
                 affected_repo: repo_label,
                 affected_file: node.file_path.clone(),
@@ -856,8 +862,9 @@ pub fn analyze_blast_radius(
         }
 
         affected_symbols.push(AffectedSymbol {
+            // nw-113: an owner caller reads `path::<module>`.
+            name: nestweaver_schema::symbol_display_name(&node.name, &node.file_path).into_owned(),
             uid: node.uid,
-            name: node.name,
             file_path: node.file_path,
             kind,
             depth: node.depth,
@@ -1524,6 +1531,69 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("at least one"), "{error}");
+    }
+
+    /// nw-113 (pr-impact): a changed file's owner is no changed symbol; an
+    /// owner that calls a changed symbol is still affected, labelled
+    /// `path::<module>`.
+    #[test]
+    fn blast_radius_lists_owners_only_as_labelled_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        for (rel, src) in [
+            (
+                "src/jobs/utils.js",
+                "function createNewQueue(n) { return n; }\nmodule.exports = { createNewQueue };\n",
+            ),
+            (
+                "src/jobs/queues.js",
+                "const { createNewQueue } = require('./utils');\nconst q = createNewQueue('g');\n",
+            ),
+        ] {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, src).unwrap();
+        }
+        let (_r, store) = crate::index::index_directory_in_memory(
+            dir.path(),
+            "test",
+            "https://example.com/r",
+            "sha",
+        )
+        .unwrap();
+        let result = analyze_blast_radius(
+            &store,
+            &[
+                PathBuf::from("src/jobs/utils.js"),
+                PathBuf::from("src/jobs/queues.js"),
+            ],
+            &BlastRadiusOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let changed: Vec<&str> = result
+            .changed_symbols
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !changed.contains(&nestweaver_schema::MODULE_OWNER_NAME),
+            "{changed:?}"
+        );
+        assert!(changed.contains(&"createNewQueue"), "{changed:?}");
+        let affected: Vec<&str> = result
+            .affected_symbols
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            affected.contains(&"src/jobs/queues.js::<module>"),
+            "{affected:?}"
+        );
+        assert!(
+            !affected.contains(&nestweaver_schema::MODULE_OWNER_NAME),
+            "{affected:?}"
+        );
     }
 
     #[test]

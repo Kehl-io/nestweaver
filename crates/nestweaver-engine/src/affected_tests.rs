@@ -251,6 +251,8 @@ fn affected_tests_within(
     // layer (the 2.5.10 affected_tests daemon-crash/segfault report).
     let mut changed_symbols: Vec<ChangedSymbolRef> = Vec::new();
     let mut changed_uids: HashSet<String> = HashSet::new();
+    // nw-113: changed files' `<module>` owners, never listed as changed.
+    let mut changed_owners: Vec<ChangedSymbolRef> = Vec::new();
     // Changed files that resolved to zero indexed symbols (new file or stale
     // index) — non-test source files are disclosed as unassessed; test files
     // are ALWAYS included in tier 1 below (TIA/Develocity always-include rule).
@@ -288,6 +290,19 @@ fn affected_tests_within(
                     files_without_symbols.push(file_path);
                 }
                 for s in syms {
+                    // nw-113: a file's `<module>` owner is not a changed
+                    // symbol. It has no callers to walk from; it is kept
+                    // aside only so a changed test file whose sole symbol is
+                    // its top-level code is still selected below.
+                    if s.is_module_owner() {
+                        changed_owners.push(ChangedSymbolRef {
+                            uid: s.uid,
+                            name: s.name,
+                            file_path: s.file_path,
+                            repo_uid: s.repo_uid,
+                        });
+                        continue;
+                    }
                     if changed_uids.insert(s.uid.clone()) {
                         changed_symbols.push(ChangedSymbolRef {
                             uid: s.uid,
@@ -387,8 +402,9 @@ fn affected_tests_within(
     };
 
     // A changed symbol may itself be a test (a test was edited). Such tests are
-    // directly affected — treat them as tier 1 (depth 1).
-    for cs in &changed_symbols {
+    // directly affected — treat them as tier 1 (depth 1). A changed test
+    // file's owner selects that file without being counted as a test.
+    for cs in changed_symbols.iter().chain(&changed_owners) {
         let is_test = sym_by_uid
             .get(&cs.uid)
             .map(|s| is_test_symbol(s))
@@ -658,7 +674,11 @@ fn group_by_file(mut syms: Vec<AffectedTestSymbol>) -> Vec<AffectedTestFile> {
                 confidence: sym.confidence,
             }
         });
-        if seen_tests.insert((sym.test_file.clone(), sym.name.clone())) {
+        // nw-113: an owner selects its test file (its top-level code calls
+        // the change) but is not a test, so it is neither listed nor counted.
+        if !nestweaver_schema::uid::is_module_owner_uid(&sym.symbol_uid)
+            && seen_tests.insert((sym.test_file.clone(), sym.name.clone()))
+        {
             entry.tests.push(sym.name.clone());
         }
         if sym.confidence > entry.confidence {
@@ -1055,6 +1075,108 @@ mod tests {
         let result = affected_tests(&store, &["src/lib.ts".to_string()]).expect("affected");
         let t1_files: Vec<&str> = result.tier_1.iter().map(|f| f.test_file.as_str()).collect();
         assert_eq!(t1_files, vec!["src/lib.test.ts"], "{result:#?}");
+        // nw-113: the owner selects its file but is not itself a test.
+        assert!(result.tier_1[0].tests.is_empty(), "{result:#?}");
+        assert!(result.summary.starts_with("0 tier-1"), "{}", result.summary);
+    }
+
+    /// nw-113: a changed test file whose only symbol is its owner (a script
+    /// of top-level calls) is still selected, with no test counted.
+    #[test]
+    fn a_changed_owner_only_test_file_is_still_selected() {
+        use crate::index::index_directory_in_memory;
+        use std::fs;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("tests");
+        fs::create_dir_all(&src).expect("mkdir");
+        fs::write(src.join("test_smoke.py"), "import app\napp.run()\n").expect("write");
+        let (_result, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/repo", "abc123")
+                .expect("index");
+        let syms = store.symbols_in_file("tests/test_smoke.py").unwrap();
+        assert!(
+            syms.len() == 1 && syms[0].is_module_owner(),
+            "fixture holds only an owner: {syms:?}"
+        );
+        let result =
+            affected_tests(&store, &["tests/test_smoke.py".to_string()]).expect("affected");
+        assert!(result.changed_symbols.is_empty(), "{result:#?}");
+        let t1: Vec<&str> = result.tier_1.iter().map(|f| f.test_file.as_str()).collect();
+        assert_eq!(t1, ["tests/test_smoke.py"], "{result:#?}");
+        assert!(result.tier_1[0].tests.is_empty(), "{result:#?}");
+    }
+
+    /// nw-113: a changed file's owner is not a changed symbol and is not
+    /// counted as a test, even in a changed test file; the file's real
+    /// tests still are.
+    #[test]
+    fn a_changed_files_owner_is_neither_a_changed_symbol_nor_a_test() {
+        use crate::index::index_directory_in_memory;
+        use std::fs;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).expect("mkdir");
+        fs::write(
+            src.join("mongo.js"),
+            "function connectToMongo() { return 1; }\nconnectToMongo();\n",
+        )
+        .expect("write lib");
+        fs::write(
+            src.join("mongo.test.js"),
+            "const fixture = require('./fixture');\nfixture.load();\ntest('connects', () => {\n  expect(1).toBe(1);\n});\n",
+        )
+        .expect("write test");
+        let (_result, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/repo", "abc123")
+                .expect("index");
+        for file in ["src/mongo.js", "src/mongo.test.js"] {
+            assert!(
+                store
+                    .symbols_in_file(file)
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.is_module_owner()),
+                "fixture mints an owner in {file}"
+            );
+        }
+
+        let result = affected_tests(
+            &store,
+            &["src/mongo.js".to_string(), "src/mongo.test.js".to_string()],
+        )
+        .expect("affected");
+        assert!(
+            result
+                .changed_symbols
+                .iter()
+                .all(|s| s.name != nestweaver_schema::MODULE_OWNER_NAME),
+            "{:?}",
+            result.changed_symbols
+        );
+        assert!(
+            result
+                .changed_symbols
+                .iter()
+                .any(|s| s.name == "connectToMongo"),
+            "{:?}",
+            result.changed_symbols
+        );
+        let tests: Vec<&str> = result
+            .tier_1
+            .iter()
+            .flat_map(|f| f.tests.iter().map(String::as_str))
+            .collect();
+        assert!(tests.contains(&"test connects"), "{result:#?}");
+        assert!(!tests.iter().any(|t| t.contains("<module>")), "{result:#?}");
+        assert!(
+            result
+                .summary
+                .starts_with(&format!("{} tier-1", tests.len())),
+            "{}",
+            result.summary
+        );
     }
 
     #[test]

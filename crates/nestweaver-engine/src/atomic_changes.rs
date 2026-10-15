@@ -940,7 +940,7 @@ pub fn analyze_impact(
                                 .canonical_id
                                 .clone()
                                 .unwrap_or_default(),
-                            affected_name: importer.name.clone(),
+                            affected_name: importer.display_name().into_owned(),
                             affected_repo_url: repo_url,
                             affected_file: importer.file_path.clone(),
                             affected_line: importer.start_line,
@@ -977,7 +977,7 @@ pub fn analyze_impact(
                                 .canonical_id
                                 .clone()
                                 .unwrap_or_default(),
-                            affected_name: importer.name.clone(),
+                            affected_name: importer.display_name().into_owned(),
                             affected_repo_url: repo_url,
                             affected_file: importer.file_path.clone(),
                             affected_line: importer.start_line,
@@ -1069,7 +1069,7 @@ fn collect_transitive_references(
                 change_canonical_id: change_canonical_id.to_string(),
                 change_kind: change_kind.to_string(),
                 affected_canonical_id: ref_sym.canonical_id.clone().unwrap_or_default(),
-                affected_name: ref_sym.name.clone(),
+                affected_name: ref_sym.display_name().into_owned(),
                 affected_repo_url: repo_url,
                 affected_file: ref_sym.file_path.clone(),
                 affected_line: ref_sym.start_line,

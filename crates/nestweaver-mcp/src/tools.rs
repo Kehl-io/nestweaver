@@ -15108,27 +15108,8 @@ fn tool_brain_diff(
         .map(String::as_str)
         .collect();
 
-    let mut affected_symbols: Vec<Value> = Vec::new();
-    for file_path in &changed_paths {
-        if let Ok(syms) = store.symbols_in_file(file_path) {
-            for sym in syms {
-                // File paths are repository-relative and therefore collide
-                // across repositories. The selected visible repo is the
-                // authoritative owner; never attach same-path symbols from a
-                // hidden or merely different repository.
-                if sym.repo_uid != repo.uid || !repo_is_visible(&sym.repo_uid, visible) {
-                    continue;
-                }
-                affected_symbols.push(json!({
-                    "uid": sym.uid,
-                    "name": sym.name,
-                    "kind": sym.kind,
-                    "file_path": sym.file_path,
-                    "start_line": sym.start_line,
-                }));
-            }
-        }
-    }
+    let mut affected_symbols =
+        brain_diff_changed_symbols(store, &changed_paths, &repo.uid, visible);
 
     let all_changed: Vec<&str> = added
         .iter()
@@ -15157,6 +15138,41 @@ fn tool_brain_diff(
 }
 
 // ── 17. project_context ────────────────────────────────────────────────────
+
+/// The symbols of `brain_diff`'s changed files, as response rows.
+///
+/// File paths are repository-relative and therefore collide across
+/// repositories. The selected visible repo is the authoritative owner; never
+/// attach same-path symbols from a hidden or merely different repository.
+/// nw-113: a file's `<module>` owner is no changed symbol and is not listed.
+fn brain_diff_changed_symbols(
+    store: &GraphStore,
+    changed_paths: &[&str],
+    repo_uid: &str,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for file_path in changed_paths {
+        if let Ok(syms) = store.symbols_in_file(file_path) {
+            for sym in syms {
+                if sym.repo_uid != repo_uid
+                    || !repo_is_visible(&sym.repo_uid, visible)
+                    || sym.is_module_owner()
+                {
+                    continue;
+                }
+                rows.push(json!({
+                    "uid": sym.uid,
+                    "name": sym.name,
+                    "kind": sym.kind,
+                    "file_path": sym.file_path,
+                    "start_line": sym.start_line,
+                }));
+            }
+        }
+    }
+    rows
+}
 
 fn tool_schema_project_context() -> Value {
     json!({
@@ -32871,6 +32887,32 @@ mod ambiguous_name_contract_tests {
             ],
             "{ambiguous}"
         );
+    }
+
+    /// nw-113: `brain_diff` never lists a changed file's owner as a changed
+    /// symbol.
+    #[test]
+    fn brain_diff_does_not_list_module_owners() {
+        use nestweaver_engine::index_directory_in_memory;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mongo.js"),
+            "function connectToMongo() { return 1; }\nconnectToMongo();\n",
+        )
+        .unwrap();
+        let (_repo, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/r", "sha").unwrap();
+        let repo_uid = store.list_repos(None).unwrap()[0].uid.clone();
+        assert!(
+            store
+                .symbols_in_file("mongo.js")
+                .unwrap()
+                .iter()
+                .any(|s| s.is_module_owner())
+        );
+        let rows = brain_diff_changed_symbols(&store, &["mongo.js"], &repo_uid, None);
+        let names: Vec<&str> = rows.iter().filter_map(|r| r["name"].as_str()).collect();
+        assert_eq!(names, ["connectToMongo"], "{rows:?}");
     }
 
     #[test]
