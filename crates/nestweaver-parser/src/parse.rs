@@ -3192,11 +3192,16 @@ fn is_local_binding_site(kind: &str) -> bool {
 /// loop. A loop without a declaration keyword (`for (f of xs)`) assigns an
 /// existing name and binds nothing. The classic `for (let f = …; …)` header
 /// is an ordinary `variable_declarator`, already a binding site.
+///
+/// An unparenthesised arrow parameter (`f => f()`) is the arrow's `parameter`
+/// field, an identifier with no `formal_parameters` around it, so it is
+/// matched here and scoped to the arrow like `(f) => f()`.
 fn is_js_clause_binding_site(node: tree_sitter::Node<'_>, lang: Language) -> bool {
     matches!(lang, Language::JavaScript | Language::TypeScript)
         && match node.kind() {
             "catch_clause" => node.child_by_field_name("parameter").is_some(),
             "for_in_statement" => node.child_by_field_name("kind").is_some(),
+            "arrow_function" => node.child_by_field_name("parameter").is_some(),
             _ => false,
         }
 }
@@ -3212,6 +3217,7 @@ fn emit_binding_names(
         "variable_declarator" => node.child_by_field_name("name"),
         "catch_clause" => node.child_by_field_name("parameter"),
         "for_in_statement" => node.child_by_field_name("left"),
+        "arrow_function" => node.child_by_field_name("parameter"),
         _ => Some(node),
     };
     let Some(root) = root else {
@@ -3291,7 +3297,8 @@ fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
                 | "parameters"
                 | "parameter"
                 | "closure_parameters"
-        ) {
+        ) || is_bare_arrow_parameter(parent, node)
+        {
             function_scoped = true;
         }
         if matches!(
@@ -3339,6 +3346,14 @@ fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
         current = parent.parent();
     }
     None
+}
+
+/// `f => f()`: the bare `parameter` of an arrow is scoped to that arrow.
+fn is_bare_arrow_parameter(parent: tree_sitter::Node<'_>, node: tree_sitter::Node<'_>) -> bool {
+    parent.kind() == "arrow_function"
+        && parent
+            .child_by_field_name("parameter")
+            .is_some_and(|parameter| parameter.id() == node.id())
 }
 
 /// `for (var f of …)`: `var` hoists `f` to the enclosing function like any
@@ -14093,6 +14108,28 @@ mod generator_and_bare_arrow_tests {
             assert!(
                 !other.is_empty() && other.iter().all(|s| s.start > saga_end),
                 "{path}: {other:?}"
+            );
+        }
+    }
+
+    /// nw-113 final QA round 2 (item 13): a bare arrow parameter is a
+    /// LocalBinding scoped to its arrow, like a parenthesised one.
+    #[test]
+    fn bare_arrow_parameters_are_scoped_to_their_arrow() {
+        let source = "[1].map(f => f());\nconst run = async g => { g(); };\n";
+        for path in ["a.js", "a.ts"] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            let f_arrow = source.find("f =>").unwrap();
+            let f = local_scopes(&parsed, "f");
+            assert!(
+                f.len() == 1 && f[0].start == f_arrow && f[0].end == source.find(");\n").unwrap(),
+                "{path}: {f:?}"
+            );
+            let g_arrow = source.find("async g").unwrap();
+            let g = local_scopes(&parsed, "g");
+            assert!(
+                g.len() == 1 && g[0].start == g_arrow && g[0].end == source.len() - 2,
+                "{path}: {g:?}"
             );
         }
     }

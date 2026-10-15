@@ -10005,6 +10005,52 @@ export function readIt() { return value(); }
         }
     }
 
+    /// nw-113 final QA round 2 (item 13): an unparenthesised arrow parameter
+    /// (`f => f()`, `async f => f()`) is a local binding scoped to the arrow,
+    /// exactly like `(f) => f()`. It must not bind the imported `f`, at top
+    /// level (a false `<module>` edge) or inside a function or method. A call
+    /// after the arrow still binds the import.
+    #[test]
+    fn bare_arrow_parameters_shadow_imports() {
+        for (ext, language) in [("js", Language::JavaScript), ("ts", Language::TypeScript)] {
+            let lib = format!("src/lib.{ext}");
+            let a = format!("src/a.{ext}");
+            let a_source = "import { f, g } from './lib';\n\
+                 export const items = [1].map(g => g());\n\
+                 [1].forEach(f => {\n\
+                 \x20 f();\n\
+                 });\n\
+                 [2].map(async f => f());\n\
+                 export const run = f => f();\n\
+                 export class K { cb1() { return [1].map(f => f()); } }\n\
+                 export function inner() { return [1].map(g => g()); }\n\
+                 export function after() { [1].map(g => g); return g(); }\n";
+            let (files, edges) = review_edges(
+                &[
+                    (&lib, "export function f() {}\nexport function g() {}\n"),
+                    (&a, a_source),
+                ],
+                language,
+            );
+            let f = uid(&files, &lib, "f");
+            let g = uid(&files, &lib, "g");
+            let mut callers: Vec<&str> = edges
+                .iter()
+                .filter(|e| {
+                    e.edge_type == EdgeType::Calls && (e.target_uid == f || e.target_uid == g)
+                })
+                .map(|e| e.source_uid.as_str())
+                .collect();
+            callers.sort();
+            callers.dedup();
+            assert_eq!(
+                callers,
+                vec![uid(&files, &a, "after").as_str()],
+                "{a}: only `after` calls the import: {edges:#?}"
+            );
+        }
+    }
+
     /// nw-113 final review M1: a generator's parameters and `var`s are scoped
     /// to the generator, like any function's. They used to leak to program
     /// scope and shadow a same-named module function everywhere.
