@@ -5407,11 +5407,23 @@ fn collect_js_import_bindings(
             }
             _ => continue,
         };
+        // nw-803: an ESM `import … from` is hoisted: its binding is live from
+        // the top of its scope, so code written above the import line sees
+        // it. `require()` and TS `import x = require()` run where written.
+        let hoisted =
+            statement.kind() == "import_statement" && import_require_clause(statement).is_none();
         for (local, original) in bindings {
             let name = text(local);
             let start_line = local.start_position().row as u32 + 1;
             references.push(RawReference {
-                scope: lexical_scope(local),
+                scope: lexical_scope(local).map(|scope| LexicalScope {
+                    initialized_at: if hoisted {
+                        scope.start
+                    } else {
+                        scope.initialized_at
+                    },
+                    ..scope
+                }),
                 name: name.clone(),
                 kind: ReferenceKind::ImportAlias,
                 start_line,

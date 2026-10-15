@@ -9944,6 +9944,36 @@ export function readIt() { return value(); }
         }
     }
 
+    /// nw-803: ESM imports are hoisted. A function written above the
+    /// `import` line sees the imported name, and a parameter of that name
+    /// still shadows it.
+    #[test]
+    fn esm_imports_bind_code_written_above_them() {
+        for (lib, a, language) in [
+            ("src/lib.ts", "src/a.ts", Language::TypeScript),
+            ("src/lib.js", "src/a.js", Language::JavaScript),
+        ] {
+            let lib_source = "export function helper() { return 1; }\n";
+            let a_source = "export function early() { return helper(); }\n\
+                 export function shadowed(helper) { return helper(); }\n\
+                 import { helper } from './lib';\n\
+                 export function late() { return helper(); }\n";
+            let (files, edges) = review_edges(&[(lib, lib_source), (a, a_source)], language);
+            let helper = vec![uid(&files, lib, "helper")];
+            for caller in ["early", "late"] {
+                assert_eq!(
+                    call_targets(&files, &edges, a, caller),
+                    helper,
+                    "{a}: {caller}: {edges:#?}"
+                );
+            }
+            assert!(
+                !call_targets(&files, &edges, a, "shadowed").contains(&helper[0]),
+                "{a}: a parameter shadows the import: {edges:#?}"
+            );
+        }
+    }
+
     /// nw-801: TS `import x = require('…')` binds `x` exactly like
     /// `import * as x from '…'`. A package import leaves `x()` external
     /// instead of falling through to a nested same-named declaration, and a
