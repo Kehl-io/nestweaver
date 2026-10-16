@@ -1370,6 +1370,13 @@ impl BrainWatcher {
                     // failed reconciliation of those notes, not owed links.
                     Ok(Some(debt)) => (Some(debt.paths), anyhow::anyhow!(debt.error)),
                     Ok(None) => {
+                        // Clearing the vault's WHOLE debt key, not only
+                        // `paths`, is safe: batches are serial per vault (this
+                        // watcher's one thread runs them one at a time), so no
+                        // other batch can have recorded debt for this vault
+                        // since this replay began. Everything the key held was
+                        // in `paths` (the drift plus `also_replay`, which
+                        // carries the owed rows) and has just landed.
                         crate::index_md::record_vault_reconciliation_debt(
                             store.db_path(),
                             &self.vault_root,
