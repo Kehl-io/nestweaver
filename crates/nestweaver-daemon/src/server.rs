@@ -900,6 +900,33 @@ impl EmbedProgress {
     }
 }
 
+/// D5: an embed pass asked the store for a pipeline mismatch once per
+/// vector, under the embedding-index mutex. The answer only changes when the
+/// pipeline does, so a pass remembers the last pipeline that checked clean.
+#[cfg(feature = "embed")]
+#[derive(Default)]
+struct PassPipelineCheck {
+    verified: Option<nestweaver_schema::EmbeddingPipelineV2>,
+}
+
+#[cfg(feature = "embed")]
+impl PassPipelineCheck {
+    fn check<E>(
+        &mut self,
+        pipeline: &nestweaver_schema::EmbeddingPipelineV2,
+        mismatch: impl FnOnce() -> Result<Option<serde_json::Value>, E>,
+    ) -> Result<Option<serde_json::Value>, E> {
+        if self.verified.as_ref() == Some(pipeline) {
+            return Ok(None);
+        }
+        let diagnostic = mismatch()?;
+        if diagnostic.is_none() {
+            self.verified = Some(pipeline.clone());
+        }
+        Ok(diagnostic)
+    }
+}
+
 /// How often a running embed pass logs a progress line. The production
 /// incident had the daemon silent for ~13 hours of continuous work, which is
 /// what made "working" and "wedged" indistinguishable in the log.
@@ -11681,6 +11708,8 @@ impl NestWeaverDaemon for DaemonService {
                     );
                 };
 
+                // D5: the pipeline is checked once per pass, not per vector.
+                let mut pipeline_check = PassPipelineCheck::default();
                 if do_symbols {
                     let symbols = store
                         .list_embeddable_symbols()
@@ -11705,10 +11734,13 @@ impl NestWeaverDaemon for DaemonService {
                                         .pipeline_for_dimension(emb_dim)
                                         .map_err(|error| Status::internal(error.to_string()))?;
                                     if !force
-                                        && let Some(diagnostic) =
-                                            store.embedding_pipeline_mismatch(&pipeline).map_err(
-                                                |e| Status::failed_precondition(e.to_string()),
-                                            )?
+                                        && let Some(diagnostic) = pipeline_check
+                                            .check(&pipeline, || {
+                                                store.embedding_pipeline_mismatch(&pipeline)
+                                            })
+                                            .map_err(|e| {
+                                                Status::failed_precondition(e.to_string())
+                                            })?
                                     {
                                         return Err(Status::failed_precondition(format!(
                                             "embedding pipeline mismatch: {diagnostic}"
@@ -11765,10 +11797,13 @@ impl NestWeaverDaemon for DaemonService {
                                         .pipeline_for_dimension(emb_dim)
                                         .map_err(|error| Status::internal(error.to_string()))?;
                                     if !force
-                                        && let Some(diagnostic) =
-                                            store.embedding_pipeline_mismatch(&pipeline).map_err(
-                                                |e| Status::failed_precondition(e.to_string()),
-                                            )?
+                                        && let Some(diagnostic) = pipeline_check
+                                            .check(&pipeline, || {
+                                                store.embedding_pipeline_mismatch(&pipeline)
+                                            })
+                                            .map_err(|e| {
+                                                Status::failed_precondition(e.to_string())
+                                            })?
                                     {
                                         return Err(Status::failed_precondition(format!(
                                             "embedding pipeline mismatch: {diagnostic}"
@@ -11825,10 +11860,13 @@ impl NestWeaverDaemon for DaemonService {
                                         .pipeline_for_dimension(emb_dim)
                                         .map_err(|error| Status::internal(error.to_string()))?;
                                     if !force
-                                        && let Some(diagnostic) =
-                                            store.embedding_pipeline_mismatch(&pipeline).map_err(
-                                                |e| Status::failed_precondition(e.to_string()),
-                                            )?
+                                        && let Some(diagnostic) = pipeline_check
+                                            .check(&pipeline, || {
+                                                store.embedding_pipeline_mismatch(&pipeline)
+                                            })
+                                            .map_err(|e| {
+                                                Status::failed_precondition(e.to_string())
+                                            })?
                                     {
                                         return Err(Status::failed_precondition(format!(
                                             "embedding pipeline mismatch: {diagnostic}"
@@ -12944,6 +12982,38 @@ fn compact_embeddings_response(
         bytes_before,
         bytes_after,
         dry_run: false,
+    }
+}
+
+#[cfg(all(test, feature = "embed"))]
+mod pass_pipeline_check_tests {
+    use super::PassPipelineCheck;
+    use nestweaver_schema::EmbeddingPipelineV2;
+
+    #[test]
+    fn a_pass_checks_each_pipeline_once_not_once_per_vector() {
+        let a = EmbeddingPipelineV2::external("p", "model-a", 3);
+        let b = EmbeddingPipelineV2::external("p", "model-b", 3);
+        let mut check = PassPipelineCheck::default();
+        let mut store_checks = 0;
+        for _ in 0..1000 {
+            let result: Result<_, ()> = check.check(&a, || {
+                store_checks += 1;
+                Ok(None)
+            });
+            assert_eq!(result, Ok(None));
+        }
+        assert_eq!(store_checks, 1, "one store check per pass");
+
+        // A different pipeline is checked again; a mismatch is never cached.
+        for _ in 0..3 {
+            let result: Result<_, ()> = check.check(&b, || {
+                store_checks += 1;
+                Ok(Some(serde_json::json!({"mismatch": true})))
+            });
+            assert!(result.unwrap().is_some());
+        }
+        assert_eq!(store_checks, 4);
     }
 }
 
