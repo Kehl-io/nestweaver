@@ -660,6 +660,21 @@ pub fn is_manifest_input(path: &Path) -> bool {
             .contains(&name))
 }
 
+/// D3: a manifest capture ran out of its time budget. That is CONTENTION (a
+/// loaded machine, a slow disk), never evidence that the repository is
+/// wrong, so the daemon defers the whole snapshot rather than refusing the
+/// repository with an `index --repo` remedy that cannot help.
+#[derive(Debug, thiserror::Error)]
+#[error("manifest derivation exceeded its cooperative deadline")]
+pub struct ManifestCaptureDeadline;
+
+/// Whether `error` is a [`ManifestCaptureDeadline`] anywhere in its chain.
+pub fn is_manifest_capture_deadline(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<ManifestCaptureDeadline>())
+}
+
 pub fn capture_manifest_inputs(
     reader: &dyn ContentReader,
     remaining_bytes: &mut usize,
@@ -668,10 +683,9 @@ pub fn capture_manifest_inputs(
     let mut files = std::collections::BTreeMap::new();
     let inventory = reader.list_files()?;
     for path in inventory.into_iter().filter(|p| is_manifest_input(p)) {
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "manifest derivation exceeded its 60-second cooperative deadline"
-        );
+        if std::time::Instant::now() >= deadline {
+            return Err(ManifestCaptureDeadline.into());
+        }
         let content = reader.read_file(&path)?;
         anyhow::ensure!(
             content.len() <= *remaining_bytes,
@@ -682,10 +696,9 @@ pub fn capture_manifest_inputs(
             .map_err(|error| anyhow::anyhow!("{}: {error:#}", path.display()))?;
         files.insert(path, content);
     }
-    anyhow::ensure!(
-        std::time::Instant::now() < deadline,
-        "manifest derivation exceeded its 60-second cooperative deadline"
-    );
+    if std::time::Instant::now() >= deadline {
+        return Err(ManifestCaptureDeadline.into());
+    }
     Ok(ManifestInputs {
         root: reader.root().to_path_buf(),
         files,

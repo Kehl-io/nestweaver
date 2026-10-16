@@ -1548,6 +1548,41 @@ mod watcher_failure_disclosure_tests {
     }
 }
 
+/// D3: `brain status` read only the manifest sidecar, so a reconcile that
+/// kept failing (or kept deferring) showed `manifest_failures: []`. The
+/// runtime state is reported beside it, and a reconcile that is not
+/// progressing is a warning.
+fn disclose_manifest_recovery(
+    value: &mut serde_json::Value,
+    status: &nestweaver_engine::manifest::ManifestRecoveryStatus,
+) {
+    let message = status.error.as_ref().map(|error| error.message.clone());
+    value["manifest_recovery"] = serde_json::json!({
+        "state": status.state,
+        "attempts": status.attempts,
+        "retry_after_seconds": status.retry_after_seconds,
+        "error": message,
+    });
+    if !matches!(status.state, "deferred" | "blocked" | "retry_scheduled") {
+        return;
+    }
+    let warning = serde_json::json!({
+        "kind": "manifest_recovery",
+        "warning": format!(
+            "manifest reconciliation is {}: {}",
+            status.state,
+            message.as_deref().unwrap_or("no detail")
+        ),
+    });
+    match value
+        .get_mut("warnings")
+        .and_then(|warnings| warnings.as_array_mut())
+    {
+        Some(warnings) => warnings.push(warning),
+        None => value["warnings"] = serde_json::json!([warning]),
+    }
+}
+
 /// Attach a dead-watcher warning to a `brain status` document. Absence of a
 /// failure leaves the document unchanged, including when `warnings` is missing.
 fn disclose_watcher_failure(value: &mut serde_json::Value, failure: Option<&str>) {
@@ -10077,6 +10112,7 @@ impl NestWeaverDaemon for DaemonService {
             value["runtime_telemetry"] = serde_json::json!("available");
             value["watcher"] = watcher_status_json(&self.state);
             disclose_watcher_failure(&mut value, watcher_failure_message(&self.state).as_deref());
+            disclose_manifest_recovery(&mut value, &self.state.manifest_recovery.status());
             value["watcher_pid"] =
                 serde_json::json!(watcher_status(&self.state).and_then(|w| w.controller_pid));
             value["supervision"] =
@@ -25883,9 +25919,11 @@ repos = ["alpha"]
             .store
             .set_repo_index_policy("repo:beta", "a-different-policy")
             .unwrap();
-        let snapshot =
-            super::manifest_recovery::capture(&state, Instant::now() + Duration::from_secs(60))
-                .unwrap();
+        let snapshot = super::manifest_recovery::capture(
+            &state,
+            super::manifest_recovery::REPO_CAPTURE_BUDGET,
+        )
+        .unwrap();
         let refused: Vec<&str> = snapshot
             .failures
             .iter()
@@ -25999,14 +26037,100 @@ repos = ["alpha"]
         }
     }
 
+    /// D3: the capture deadline was shared by every repo and included the
+    /// write-gate wait, so after a 10-44 s gate wait all 45 repos were
+    /// refused in the same second, with an `index --repo` remedy each, on
+    /// four upgrade-day bursts. A long gate wait must not refuse anything.
+    #[tokio::test]
+    async fn a_long_write_gate_wait_refuses_no_repository() {
+        use nestweaver_engine::manifest;
+        let state = test_state_with_writer();
+        manifest_recovery_fixture(&state);
+        manifest::mark_manifest_reconciliation_pending(&state.db_path, "repository index").unwrap();
+        let budget = Duration::from_millis(300);
+        let before = super::manifest_recovery::capture(&state, budget).unwrap();
+        assert!(before.failures.is_empty(), "{:?}", before.failures);
+
+        // Another writer holds the gate for longer than the whole budget.
+        let held = state.write_gate.lock("code_link_reconcile").await;
+        let waiter = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { state.write_gate.lock("manifest_reconciliation").await })
+        };
+        tokio::time::sleep(budget * 2).await;
+        drop(held);
+        let lease = waiter.await.unwrap();
+        let guard = ConnectionGuard::write(&state).unwrap();
+        let owned = MutationWorkerOwnership {
+            _write_lease: lease,
+            _connection_guard: guard,
+        };
+        let result = super::manifest_recovery::reconcile(&state, before);
+        drop(owned);
+        result.expect("the snapshot must save after the gate is released");
+        assert_eq!(manifest::load_manifest_failures(&state.db_path), []);
+        assert!(manifest::current_manifest_snapshot(&state.store, &state.db_path).is_ok());
+        assert!(
+            manifest::manifest_debt_revision(&state.db_path)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// D3: a capture that runs out of its budget defers the whole snapshot as
+    /// contention. It refuses no repository and names no `index --repo`
+    /// remedy, and `brain status` shows the deferred runtime state.
+    #[test]
+    fn a_capture_deadline_is_deferred_contention_not_a_refusal() {
+        let state = test_state_with_writer();
+        manifest_recovery_fixture(&state);
+        let error = match super::manifest_recovery::capture(&state, Duration::ZERO) {
+            Ok(_) => panic!("a zero budget must defer the capture"),
+            Err(error) => error,
+        };
+        assert!(super::manifest_recovery::is_contention_deferral(&error));
+        let message = format!("{error:#}");
+        assert!(message.starts_with("deferred: contention"), "{message}");
+        assert!(!message.contains("index --repo"), "{message}");
+        assert_eq!(
+            nestweaver_engine::manifest::load_manifest_failures(&state.db_path),
+            []
+        );
+
+        state.manifest_recovery.publish(
+            "deferred",
+            0,
+            Some(30),
+            Some(nestweaver_engine::manifest::ManifestUnavailable::new(
+                nestweaver_engine::manifest::ManifestUnavailableReason::PendingSourceChange,
+                state.store.graph_generation(),
+                message.clone(),
+            )),
+        );
+        let mut status = serde_json::json!({ "manifest_failures": [] });
+        super::disclose_manifest_recovery(&mut status, &state.manifest_recovery.status());
+        assert_eq!(status["manifest_recovery"]["state"], "deferred");
+        assert_eq!(status["manifest_recovery"]["error"], message);
+        assert_eq!(status["warnings"][0]["kind"], "manifest_recovery");
+
+        // A ready runtime adds the state and no warning.
+        state.manifest_recovery.publish("ready", 0, None, None);
+        let mut status = serde_json::json!({});
+        super::disclose_manifest_recovery(&mut status, &state.manifest_recovery.status());
+        assert_eq!(status["manifest_recovery"]["state"], "ready");
+        assert!(status.get("warnings").is_none());
+    }
+
     #[tokio::test]
     async fn release_manifest_recovery_rejects_changed_inputs_and_corrupt_predecessor() {
         use nestweaver_engine::manifest;
         let state = test_state_with_writer();
         manifest_recovery_fixture(&state);
-        let before =
-            super::manifest_recovery::capture(&state, Instant::now() + Duration::from_secs(60))
-                .unwrap();
+        let before = super::manifest_recovery::capture(
+            &state,
+            super::manifest_recovery::REPO_CAPTURE_BUDGET,
+        )
+        .unwrap();
         let alpha = state.db_path.parent().unwrap().join("alpha/package.json");
         std::fs::write(&alpha, r#"{"name":"changed"}"#).unwrap();
         let guard = ConnectionGuard::write(&state).unwrap();
@@ -26017,9 +26141,11 @@ repos = ["alpha"]
         };
         assert!(super::manifest_recovery::reconcile(&state, before).is_err());
         assert!(!manifest::manifest_cache_path(&state.db_path).exists());
-        let before =
-            super::manifest_recovery::capture(&state, Instant::now() + Duration::from_secs(60))
-                .unwrap();
+        let before = super::manifest_recovery::capture(
+            &state,
+            super::manifest_recovery::REPO_CAPTURE_BUDGET,
+        )
+        .unwrap();
         std::fs::write(
             manifest::manifest_cache_path(&state.db_path),
             b"corrupt evidence",
@@ -26041,7 +26167,7 @@ repos = ["alpha"]
         std::fs::write(&path, "{").unwrap();
         // nw-705: a malformed source refuses its own repo, by name.
         let refused = |state: &DaemonState| {
-            super::manifest_recovery::capture(state, Instant::now() + Duration::from_secs(60))
+            super::manifest_recovery::capture(state, super::manifest_recovery::REPO_CAPTURE_BUDGET)
                 .unwrap()
                 .failures
                 .into_iter()

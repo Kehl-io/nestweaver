@@ -11,10 +11,42 @@ use std::path::Path;
 use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 
+/// D3: how long ONE repository's manifest capture may take. Each repo gets
+/// its own budget, started when its capture starts — after the write gate is
+/// held, for the re-captures under it — so neither a long gate wait nor the
+/// other repos' captures spend it.
+pub(super) const REPO_CAPTURE_BUDGET: Duration = Duration::from_secs(60);
+
+/// D3: a capture ran out of its budget. The whole snapshot is deferred and
+/// retried; no repository is refused and no `index --repo` remedy is named,
+/// because a re-index cannot cure contention.
+#[derive(Debug)]
+pub(super) struct CaptureDeferred {
+    repo: String,
+    budget_secs: u64,
+}
+
+impl std::fmt::Display for CaptureDeferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "deferred: contention: the manifest capture of {} exceeded its {}s budget; \
+             the snapshot is retried and no repository is refused",
+            self.repo, self.budget_secs
+        )
+    }
+}
+
+impl std::error::Error for CaptureDeferred {}
+
+pub(super) fn is_contention_deferral(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<CaptureDeferred>())
+}
+
 pub(super) struct Snapshot {
     generation: u64,
     identity: nestweaver_store::PublicationIdentity,
-    deadline: Instant,
+    repo_budget: Duration,
     inventory: String,
     debt: Option<Vec<u8>>,
     inputs: Vec<(String, ManifestInputs)>,
@@ -23,7 +55,7 @@ pub(super) struct Snapshot {
     pub(super) failures: Vec<manifest::ManifestRepoFailure>,
 }
 
-pub(super) fn capture(state: &DaemonState, deadline: Instant) -> anyhow::Result<Snapshot> {
+pub(super) fn capture(state: &DaemonState, repo_budget: Duration) -> anyhow::Result<Snapshot> {
     let generation = state.store.graph_generation();
     let identity = state
         .store
@@ -50,11 +82,19 @@ pub(super) fn capture(state: &DaemonState, deadline: Instant) -> anyhow::Result<
         // rest are still rebuilt; it used to fail the capture for EVERY repo.
         // A refused repo's partial reads do not spend the shared budget.
         let mut budget = remaining;
+        let deadline = Instant::now() + repo_budget;
         match capture_repo(state, config.as_ref(), limits, repo, &mut budget, deadline) {
             Ok((policy, captured)) => {
                 remaining = budget;
                 inventory.push(serde_json::json!({ "repo": repo, "policy": policy }));
                 inputs.push((repo.uid.clone(), captured));
+            }
+            Err(error) if manifest::is_manifest_capture_deadline(&error) => {
+                return Err(CaptureDeferred {
+                    repo: repo.uid.clone(),
+                    budget_secs: repo_budget.as_secs(),
+                }
+                .into());
             }
             Err(error) => {
                 let failure = manifest::ManifestRepoFailure::new(repo, format!("{error:#}"));
@@ -72,7 +112,7 @@ pub(super) fn capture(state: &DaemonState, deadline: Instant) -> anyhow::Result<
     Ok(Snapshot {
         generation,
         identity,
-        deadline,
+        repo_budget,
         inventory: serde_json::to_string(&inventory)?,
         debt: manifest::manifest_debt_revision(&state.db_path)?,
         inputs,
@@ -161,7 +201,7 @@ fn capture_repo(
         repo.uid
     );
     let captured = manifest::capture_manifest_inputs(reader.as_ref(), remaining, deadline)
-        .map_err(|e| anyhow::anyhow!("{}: {e:#}", repo.uid))?;
+        .map_err(|e| e.context(repo.uid.clone()))?;
     Ok((policy, captured))
 }
 
@@ -179,7 +219,7 @@ pub(super) fn reconcile(state: &DaemonState, before: Snapshot) -> anyhow::Result
             "refusing to replace a non-recoverable artifact: {problem}"
         );
     }
-    let after = capture(state, before.deadline)?;
+    let after = capture(state, before.repo_budget)?;
     anyhow::ensure!(
         before.generation == after.generation
             && before.identity == after.identity
@@ -215,7 +255,7 @@ pub(super) fn reconcile(state: &DaemonState, before: Snapshot) -> anyhow::Result
     )?;
     // Fail closed if an external editor changed bytes during the atomic save.
     // Leave durable debt; never let the new envelope hide this pending work.
-    let verified = capture(state, after.deadline)?;
+    let verified = capture(state, after.repo_budget)?;
     if after.identity != verified.identity
         || after.generation != verified.generation
         || after.inventory != verified.inventory
@@ -267,12 +307,33 @@ pub(super) fn refused_repos_changed(
             return true;
         };
         let mut budget = 32 * 1024 * 1024;
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + REPO_CAPTURE_BUDGET;
         match capture_repo(state, config.as_ref(), limits, repo, &mut budget, deadline) {
             Ok(_) => true,
             Err(error) => format!("{error:#}") != failure.reason,
         }
     })
+}
+
+/// D3: report a capture deferred by contention as `deferred`, with the
+/// contention message, rather than as refused repositories.
+fn publish_contention(
+    runtime: &manifest::ManifestRecoveryRuntime,
+    state: &DaemonState,
+    attempts: u32,
+    error: &anyhow::Error,
+) {
+    tracing::info!(error = %format_args!("{error:#}"), "manifest reconciliation deferred");
+    runtime.publish(
+        "deferred",
+        attempts,
+        Some(30),
+        Some(ManifestUnavailable::new(
+            ManifestUnavailableReason::PendingSourceChange,
+            state.store.graph_generation(),
+            format!("{error:#}"),
+        )),
+    );
 }
 
 /// Three immediate attempts, then a cooldown that can recover from repaired
@@ -409,12 +470,15 @@ pub(super) async fn run(state: Arc<DaemonState>) {
             continue;
         }
         let capture_state = Arc::clone(&state);
-        let snapshot = tokio::task::spawn_blocking(move || {
-            capture(&capture_state, Instant::now() + Duration::from_secs(60))
-        })
-        .await;
+        let snapshot =
+            tokio::task::spawn_blocking(move || capture(&capture_state, REPO_CAPTURE_BUDGET)).await;
         let snapshot = match snapshot {
             Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(error)) if is_contention_deferral(&error) => {
+                publish_contention(&runtime, &state, retry.attempts, &error);
+                delay = 30;
+                continue;
+            }
             other => {
                 let message = match other {
                     Ok(Err(e)) => format!("{e:#}"),
@@ -491,6 +555,13 @@ pub(super) async fn run(state: Arc<DaemonState>) {
                 retry = RetryBudget::default();
                 last_key.clear();
                 delay = 2;
+            }
+            Ok(Err(error)) if is_contention_deferral(&error) => {
+                // D3: contention is not a failed attempt. It does not spend
+                // the retry budget or end in "blocked".
+                retry = RetryBudget::default();
+                publish_contention(&runtime, &state, 0, &error);
+                delay = 30;
             }
             other => {
                 let message = match other {
