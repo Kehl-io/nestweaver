@@ -101,18 +101,8 @@ mod imp {
     /// Returns a token that disarms on drop, so an early return or a panic
     /// cannot leave the handler installed with a stale message.
     pub(crate) fn arm(path: &Path) -> Guard {
-        let text = format!(
-            "\nerror: the database at {} could not be opened: the storage engine \
-             crashed while reading it.\n\
-             This means the file is corrupt — the on-disk index describes a shape \
-             the engine then dereferenced, deep inside the file rather than in its \
-             header, so nothing could detect it beforehand.\n\
-             Recover it: restore the most recent backup with `nestweaver backup \
-             restore <archive>`, or delete this database and re-index the \
-             repositories it held.\n\
-             Do not keep retrying: this is deterministic, not transient.\n",
-            path.display()
-        );
+        let contended = crate::error::live_writer_holds_write_lease(path);
+        let text = super::crash_message(path, contended);
         {
             let mut message = MESSAGE.lock().unwrap_or_else(|e| e.into_inner());
             *message = text.into_bytes();
@@ -164,6 +154,56 @@ mod imp {
     /// exception handler, which nothing has asked for.
     pub(crate) fn arm(_path: &Path) -> Guard {
         Guard
+    }
+}
+
+/// The message the handler writes, built before the open.
+///
+/// V2: "deterministic, not transient" and "delete this database" are only
+/// provable when nothing else is writing the file. A read-only open that
+/// races a live writer's checkpoint can fault on a half-written page and
+/// succeed on retry, so that case gets a message that says so.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn crash_message(path: &std::path::Path, contended: bool) -> String {
+    if contended {
+        return format!(
+            "\nerror: the database at {} could not be opened: the storage engine \
+             crashed while reading it.\n\
+             Another process was writing this database at the time, so this is not \
+             proof the file is damaged: retry once the write finishes.\n\
+             Only if it repeats while nothing is writing the database is the file \
+             corrupt; then restore the most recent backup with `nestweaver backup \
+             restore <archive>`.\n",
+            path.display()
+        );
+    }
+    format!(
+        "\nerror: the database at {} could not be opened: the storage engine \
+         crashed while reading it.\n\
+         This means the file is corrupt — the on-disk index describes a shape \
+         the engine then dereferenced, deep inside the file rather than in its \
+         header, so nothing could detect it beforehand.\n\
+         Recover it: restore the most recent backup with `nestweaver backup \
+         restore <archive>`, or delete this database and re-index the \
+         repositories it held.\n\
+         Do not keep retrying: this is deterministic, not transient.\n",
+        path.display()
+    )
+}
+
+#[cfg(test)]
+mod crash_message_tests {
+    #[test]
+    fn a_crash_while_another_process_writes_is_not_called_deterministic() {
+        let path = std::path::Path::new("/tmp/brain.lbug");
+        let quiet = super::crash_message(path, false);
+        assert!(quiet.contains("delete this database"), "{quiet}");
+        assert!(quiet.contains("deterministic"), "{quiet}");
+        let contended = super::crash_message(path, true);
+        assert!(!contended.contains("delete this database"), "{contended}");
+        assert!(!contended.contains("deterministic"), "{contended}");
+        assert!(contended.contains("retry"), "{contended}");
+        assert!(contended.contains("/tmp/brain.lbug"), "{contended}");
     }
 }
 

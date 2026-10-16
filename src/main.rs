@@ -1041,6 +1041,28 @@ fn corruption_diagnostic(
             cause: drop_engine_retry_advice(&message),
         }
         .into(),
+        // V2: these say "delete this database ... deterministic". That is
+        // only provable when nothing else is writing the file: a read that
+        // races a live writer (the daemon mid-checkpoint, an index) can see
+        // a file shorter than its catalog or a half-written header and
+        // succeed on retry, which is what QA observed on 12.1.0.
+        CorruptionKind::FileTruncated
+        | CorruptionKind::EngineAssertion
+        | CorruptionKind::Unclassified
+            if nestweaver_store::live_writer_holds_write_lease(Path::new(&path)) =>
+        {
+            CliDiagnostic::DatabaseUnavailable {
+                cause: format!(
+                    "{}\nAnother process was writing this database while it was read, \
+                     so this is not proof the file is damaged: retry once the write \
+                     finishes. Only if it repeats while nothing is writing the \
+                     database is the file itself damaged.",
+                    drop_engine_retry_advice(&message)
+                ),
+                path,
+            }
+            .into()
+        }
         CorruptionKind::FileTruncated
         | CorruptionKind::EngineAssertion
         | CorruptionKind::Unclassified => CliDiagnostic::DatabaseCorrupt {
@@ -29889,6 +29911,90 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
             help.contains("outside the database file with 1696 pages"),
             "the engine's FACTS are the load-bearing part and must survive: {help}"
         );
+    }
+
+    /// V2: QA saw "delete this database ... deterministic, not transient" once
+    /// during a watcher batch, and the immediate retry succeeded. A transient
+    /// condition must never reach a corruption remedy.
+    #[test]
+    fn transient_conditions_never_reach_a_corruption_remedy() {
+        for raw in [
+            "backlinks RPC failed: query error: begin transaction: Cannot start a new \
+             write transaction in the system. Only one write transaction at a time is \
+             allowed in the system. The database file may be corrupted.",
+            "index publication TRANSIENT: an index publication is in flight (marker age \
+             3s). The database file may be corrupted.",
+            "health check timed out — daemon connected but unresponsive: catalog page \
+             range starts at 3567 and spans 5 pages, outside the database file with 1696 \
+             pages",
+        ] {
+            let report = into_diagnostic(anyhow::anyhow!("{raw}"));
+            let code = report.code().map(|c| c.to_string()).unwrap_or_default();
+            assert!(
+                !code.contains("corrupt"),
+                "transient condition classified as corruption ({code}): {raw}"
+            );
+            let rendered = format!(
+                "{report:?} {}",
+                report.help().map(|h| h.to_string()).unwrap_or_default()
+            );
+            assert!(!rendered.contains("delete this database"), "{rendered}");
+        }
+    }
+
+    /// V2: an engine read that races a LIVE writer (the daemon) is not proof
+    /// the file is damaged, so it must not say "delete this database". The
+    /// verdict-free counterweight below keeps a quiet database's corruption
+    /// report intact.
+    #[cfg(unix)]
+    #[test]
+    fn corruption_seen_while_another_process_writes_is_not_called_deterministic() {
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"LBUG").unwrap();
+        let messages = [
+            "catalog page range starts at 3567 and spans 5 pages, outside the database \
+             file with 1696 pages",
+            "Assertion failed in file \"<crate>/column.cpp\" on line 289: x <= y",
+            "Runtime exception: The database file may be corrupted.",
+        ];
+        let render = |engine: &str| {
+            let report = into_diagnostic(anyhow::anyhow!(
+                "failed to open database at {}: database error: {engine}",
+                db.display()
+            ));
+            let code = report.code().map(|c| c.to_string()).unwrap_or_default();
+            let help = report.help().map(|h| h.to_string()).unwrap_or_default();
+            (code, help)
+        };
+
+        // Nothing writing: the corruption verdict and its remedy stand.
+        for engine in messages {
+            let (code, help) = render(engine);
+            assert_eq!(code, "nestweaver::db_corrupt", "{engine}");
+            assert!(help.contains("delete this database"), "{help}");
+        }
+
+        // A live writer holds the lease (a raw flock, as another process would).
+        let lease = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.path().join("brain.lbug.write.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        for engine in messages {
+            let (code, help) = render(engine);
+            assert_ne!(code, "nestweaver::db_corrupt", "{engine}");
+            assert!(!help.contains("delete this database"), "{help}");
+            assert!(!help.contains("deterministic"), "{help}");
+            assert!(help.contains("retry"), "it must say what to do: {help}");
+        }
     }
 
     /// nw-332. The production WAL corruption reached the operator through
