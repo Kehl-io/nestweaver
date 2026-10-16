@@ -201,6 +201,19 @@ pub(crate) struct PendingReconciliation {
 pub(crate) struct SidecarDebt {
     pub(crate) paths: Vec<PathBuf>,
     pub(crate) error: String,
+    /// What is owed, which decides the logged and disclosed reason.
+    pub(crate) kind: DebtKind,
+}
+
+/// Why a [`SidecarDebt`] is owed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum DebtKind {
+    /// nw-668: the notes committed and their code links did not land.
+    #[default]
+    CodeLinks,
+    /// V1: another writer held the write transaction past every retry, so
+    /// the batch stopped part way; its notes are replayed whole.
+    BatchCollision,
 }
 
 #[cfg(test)]
@@ -245,6 +258,7 @@ fn owe(debt: &mut Option<SidecarDebt>, paths: &[PathBuf], error: &str) {
     debt.get_or_insert_with(|| SidecarDebt {
         paths: Vec::new(),
         error: error.to_string(),
+        kind: DebtKind::CodeLinks,
     })
     .paths
     .extend(paths.iter().cloned());
@@ -1140,7 +1154,29 @@ impl BrainWatcher {
                     }
                     paths.sort();
                     paths.dedup();
-                    owe(&mut refresh_debt, &paths, &format!("{error:#}"));
+                    refresh_debt = Some(SidecarDebt {
+                        paths,
+                        error: format!("{error:#}"),
+                        kind: DebtKind::BatchCollision,
+                    });
+                    // Notes committed before the collision have new
+                    // sections: re-queue their BM25 documents now from what
+                    // the graph holds, so search does not lose them until
+                    // the replay. No sources were read for them, so their
+                    // code links are left to the replay (they are owed).
+                    let note_tags: HashMap<_, _> = store.note_tag_sets()?.into_iter().collect();
+                    let sidecars_started = Instant::now();
+                    sidecar_debt = self.refresh_prepared_sidecars(
+                        store,
+                        tantivy,
+                        v_uid,
+                        &graph_paths,
+                        symbol_index.as_ref(),
+                        &note_tags,
+                        &HashMap::new(),
+                        &mut phase_timings,
+                    )?;
+                    phase_timings.sidecars_ms = sidecars_started.elapsed().as_millis() as u64;
                     None
                 }
                 Err(error) => return Err(error),
@@ -1443,21 +1479,36 @@ impl BrainWatcher {
                 next_attempt: Instant::now() + reconcile_retry_delay(self.reconcile_retry_base, 1),
             },
         };
-        tracing::error!(
-            vault = %self.vault_root.display(),
-            error = %debt.error,
-            notes = debt.paths.len(),
-            "BrainWatcher could not write code links for committed notes; they have none \
-             until the retry lands (retrying; `nestweaver brain refresh` also heals it)"
-        );
+        match debt.kind {
+            DebtKind::CodeLinks => tracing::error!(
+                vault = %self.vault_root.display(),
+                error = %debt.error,
+                notes = debt.paths.len(),
+                "BrainWatcher could not write code links for committed notes; they have none \
+                 until the retry lands (retrying; `nestweaver brain refresh` also heals it)"
+            ),
+            DebtKind::BatchCollision => tracing::warn!(
+                vault = %self.vault_root.display(),
+                error = %debt.error,
+                notes = debt.paths.len(),
+                "BrainWatcher batch stopped part way: another writer held the write \
+                 transaction past every retry; its notes are replayed on the retry backoff \
+                 (`nestweaver brain refresh` also heals it)"
+            ),
+        }
         // Merged, not replaced: rows an owed startup replay already disclosed
         // keep their own (startup) reason.
-        crate::index_md::record_vault_link_debt(
+        let subject = match debt.kind {
+            DebtKind::CodeLinks => crate::index_md::OWED_CODE_LINKS,
+            DebtKind::BatchCollision => crate::index_md::OWED_BATCH_COLLISION,
+        };
+        crate::index_md::record_vault_owed_paths(
             store.db_path(),
             &self.vault_root,
             &debt.paths,
             &debt.error,
             false,
+            subject,
         );
         next
     }
@@ -5253,6 +5304,7 @@ mod tests {
             SidecarDebt {
                 paths: vec![path.clone()],
                 error: "injected".to_string(),
+                kind: DebtKind::CodeLinks,
             },
         );
         assert!(merged.paths.is_none(), "still recomputes drift");
@@ -5574,6 +5626,45 @@ mod tests {
             !crate::sidecar_path(&fx.db_path, ".index-dirty").exists(),
             "the batch publication is finalized, not abandoned"
         );
+    }
+
+    /// V1 review (Minor 2): a batch stopped part way by a collision was
+    /// disclosed as "could not write code links", and the notes it had
+    /// already committed kept stale BM25 documents until the replay. The
+    /// reason now says what happened, and their documents are re-queued.
+    #[test]
+    fn v1_a_collision_part_way_is_named_and_requeues_committed_notes_for_search() {
+        let _guard = serial_watcher_test();
+        let fx = v1_fixture();
+        let tantivy = TantivyIndex::open_or_create(&fx.db_path.with_extension("tantivy")).unwrap();
+        let a = fx.root.join("a.md");
+        let b = fx.root.join("b.md");
+        fs::write(&a, "# A\n\nquokkaword see [[b]] and [[c]]\n").unwrap();
+        fs::write(&b, "# B\n\nquokkaword see [[a]] and [[c]]\n").unwrap();
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        crate::index_md::COLLIDE_AFTER_WATCHED_COMMITS.with(|n| n.set(Some(1)));
+        let result = watcher.process_batch(&fx.store, Some(&tantivy), &fx.v_uid, vec![a, b], &None);
+        crate::index_md::COLLIDE_AFTER_WATCHED_COMMITS.with(|n| n.set(None));
+        let debt = result
+            .expect("a collision must not end the watcher")
+            .expect("the batch is owed");
+        assert_eq!(debt.kind, DebtKind::BatchCollision);
+        assert!(
+            !tantivy.search("quokkaword", 10).unwrap().is_empty(),
+            "the note committed before the collision is searchable"
+        );
+        let _pending = watcher.owe_sidecar_retry(&fx.store, None, debt);
+        let reasons: Vec<String> = crate::index_md::load_skipped_notes_sidecar(&fx.db_path)
+            .skipped
+            .into_iter()
+            .map(|row| row.reason)
+            .filter(|reason| reason.contains("retrying ("))
+            .collect();
+        assert!(!reasons.is_empty());
+        for reason in &reasons {
+            assert!(reason.contains("stopped part way"), "{reason}");
+            assert!(!reason.contains("code links"), "{reason}");
+        }
     }
 
     /// nw-668 re-review (N1): owed link debt lives in the skipped-notes

@@ -1032,13 +1032,37 @@ pub(crate) fn record_vault_link_debt(
     error: &str,
     replace_existing: bool,
 ) {
+    record_vault_owed_paths(
+        db_path,
+        vault_root,
+        paths,
+        error,
+        replace_existing,
+        OWED_CODE_LINKS,
+    );
+}
+
+/// What a [`record_vault_link_debt`] row says is owed.
+pub(crate) const OWED_CODE_LINKS: &str = "brain watcher code links not yet written";
+
+/// V1: what a row says when a watched batch stopped part way on a
+/// write-transaction collision that outlasted every retry.
+pub(crate) const OWED_BATCH_COLLISION: &str = "brain watcher batch stopped part way (another \
+     writer held the write transaction past every retry); the notes are replayed";
+
+/// Record `paths` as owed a replay, saying `subject` is what is owed.
+pub(crate) fn record_vault_owed_paths(
+    db_path: Option<&Path>,
+    vault_root: &Path,
+    paths: &[PathBuf],
+    error: &str,
+    replace_existing: bool,
+    subject: &str,
+) {
     let Some(db_path) = db_path else {
         return;
     };
-    let reason = format!(
-        "{WATCH_RECONCILIATION_PENDING_REASON}: brain watcher code links not yet written; \
-         retrying ({error})"
-    );
+    let reason = format!("{WATCH_RECONCILIATION_PENDING_REASON}: {subject}; retrying ({error})");
     let owed_paths: HashSet<String> = paths
         .iter()
         .map(|path| path.to_string_lossy().into_owned())
@@ -3142,6 +3166,10 @@ thread_local! {
     /// Test override (V1) of [`WATCHED_COMMIT_ATTEMPTS`].
     pub(crate) static WATCHED_COMMIT_ATTEMPTS_OVERRIDE: std::cell::Cell<Option<u32>> =
         const { std::cell::Cell::new(None) };
+    /// Test failpoint (V1): let this many watched transactions commit, then
+    /// report every later one as a write-transaction collision.
+    pub(crate) static COLLIDE_AFTER_WATCHED_COMMITS: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Fully prepared before the first destructive write. The ordinary refresh
@@ -3488,6 +3516,17 @@ impl VaultRefreshPlan {
         #[cfg(not(test))]
         let max_attempts = WATCHED_COMMIT_ATTEMPTS;
         loop {
+            #[cfg(test)]
+            if let Some(remaining) = COLLIDE_AFTER_WATCHED_COMMITS.with(std::cell::Cell::get) {
+                if remaining == 0 {
+                    return Err(anyhow::anyhow!(
+                        "watched vault refresh (per-note transactions): Cannot start a new \
+                         write transaction in the system. Only one write transaction at a \
+                         time is allowed in the system."
+                    ));
+                }
+                COLLIDE_AFTER_WATCHED_COMMITS.with(|c| c.set(Some(remaining - 1)));
+            }
             let committed = {
                 let _lease = lease()?;
                 self.commit(
