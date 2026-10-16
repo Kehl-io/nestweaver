@@ -265,8 +265,13 @@ pub(crate) fn report_unresolved_repo_filter(error: &anyhow::Error, json: bool) -
         nestweaver_engine::RepoSelectorFailure::Ambiguous => EXIT_AMBIGUOUS,
         nestweaver_engine::RepoSelectorFailure::Malformed => EXIT_USAGE,
     };
-    // `error` is the machine word on the CLI, as it always was.
-    envelope["error"] = serde_json::json!(failure.status());
+    // `error` is the machine word on the CLI. 12.1.1 (B6): a miss reads
+    // "not found", the word every other not-found envelope uses (`symbol`,
+    // `impact`, `flow-trace`); `status` keeps the class (`not_found`).
+    envelope["error"] = serde_json::json!(match failure {
+        nestweaver_engine::RepoSelectorFailure::NotFound => "not found",
+        _ => failure.status(),
+    });
     let message = envelope
         .get("message")
         .and_then(|v| v.as_str())

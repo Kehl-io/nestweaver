@@ -16357,3 +16357,102 @@ fn investigate_scope_mistakes_are_user_errors_said_once() {
     let (code, _, stderr) = investigate("all", false);
     assert_eq!(code, Some(0), "{stderr}");
 }
+
+/// 12.1.1 (B9, B6): misses exit 2 and usage errors 64 on the commands that
+/// used to exit 0 or 1, and `hubs --repo` names a miss `"error":"not found"`
+/// like every other not-found envelope.
+#[test]
+fn not_found_and_usage_exit_codes_are_consistent() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "function exitCodeTarget(name) { return name; }\nexitCodeTarget('x');\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    let config = dir.path().join("instance.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "instance_id = \"exit-codes\"\n\n\
+             [snapshot_storage]\nbackend = \"local\"\npath = \"{0}/snapshots\"\n\n\
+             [workspace]\nbackend = \"local\"\npath = \"{0}/workspace\"\n\n\
+             [inference]\nendpoint = \"http://localhost:11434\"\n\
+             embedding_model = \"nomic-embed-text\"\nsummary_model = \"qwen2.5-coder:7b\"\n\n\
+             [git]\ncredential_method = \"gh\"\n\n\
+             [[features]]\nname = \"checkout\"\nrepos = []\nentry_points = [\"exitCodeTarget\"]\n",
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let output = nestweaver_cmd()
+            .args(args)
+            .arg("--db")
+            .arg(&db_path)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    };
+    let config_arg = config.to_string_lossy().to_string();
+
+    let (code, _, stderr) = run(&[
+        "context",
+        "--feature",
+        "nosuchfeature",
+        "--config",
+        &config_arg,
+    ]);
+    assert_eq!(code, Some(2), "context --feature miss: {stderr}");
+    assert!(stderr.contains("nosuchfeature"), "{stderr}");
+    let (code, stdout, stderr) = run(&[
+        "context",
+        "--feature",
+        "nosuchfeature",
+        "--config",
+        &config_arg,
+        "--json",
+    ]);
+    assert_eq!(code, Some(2), "{stderr}");
+    let payload: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(payload["error"], "not found", "{payload}");
+    assert_eq!(payload["feature"], "nosuchfeature", "{payload}");
+
+    let (code, _, stderr) = run(&["summary", "--level", "symbol", "--target", "zzzqqqnot"]);
+    assert_eq!(code, Some(2), "summary --target miss: {stderr}");
+    let (code, _, stderr) = run(&["summary", "--level", "bogus"]);
+    assert_eq!(code, Some(64), "summary --level bogus: {stderr}");
+    // Counterweight: a target that matches still succeeds.
+    let (code, _, stderr) = run(&["summary", "--level", "symbol", "--target", "exitCodeTarget"]);
+    assert_eq!(code, Some(0), "{stderr}");
+
+    let (code, stdout, stderr) = run(&["investigate", "exitCodeTarget", "--json"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let bundle: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let bundle_id = bundle["bundle_id"].as_str().unwrap().to_string();
+    let (code, _, stderr) = run(&["investigate-expand", &bundle_id, "--targets", "zzzz"]);
+    assert_eq!(
+        code,
+        Some(2),
+        "investigate-expand with nothing resolved: {stderr}"
+    );
+
+    let (code, stdout, stderr) = run(&["hubs", "--repo", "zzz-no-such-repo", "--json"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    let payload: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(payload["error"], "not found", "{payload}");
+}

@@ -1578,6 +1578,86 @@ fn print_json_not_found_detail(
 
 /// [`print_json_not_found_detail`]'s payload, split out so the envelope can be
 /// asserted without capturing stdout.
+/// 12.1.1 (B9): whether a `get_summary` answer for a `--target` matched
+/// nothing at all (nothing returned, nothing cut).
+fn summary_target_missed(value: &serde_json::Value) -> bool {
+    let count = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+    count("total")
+        .or_else(|| count("returned"))
+        .or_else(|| count("count"))
+        == Some(0)
+}
+
+/// 12.1.1 (B9): `summary --target` that matched nothing. Exit 2.
+fn report_summary_target_not_found(target: &str, json: bool) -> i32 {
+    let message = format!("no summary matches target '{target}'");
+    if json {
+        println!(
+            "{}",
+            json_not_found_payload("target", &serde_json::json!(target), Some(&message))
+        );
+    }
+    eprintln!("{message}");
+    EXIT_NOT_FOUND
+}
+
+/// 12.1.1 (B9): `investigate-expand` resolved none of its targets: exit 2,
+/// like any other lookup that found nothing. A partial resolution succeeds.
+fn investigate_expand_exit(value: &serde_json::Value) -> i32 {
+    let empty = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty)
+    };
+    if empty("expanded") && !empty("unresolved") {
+        EXIT_NOT_FOUND
+    } else {
+        EXIT_SUCCESS
+    }
+}
+
+/// 12.1.1 (B9): `context --feature <name>` naming no `[[features]]` entry:
+/// the not-found message (and `--json` envelope), with the declared feature
+/// names that contain the one asked for (or all of them, up to the
+/// suggestion bound, when none does) as `did_you_mean`. Exit 2.
+fn report_feature_not_found(
+    feature: &str,
+    config_path: &std::path::Path,
+    declared: &[&str],
+    json: bool,
+) -> i32 {
+    let needle = feature.to_lowercase();
+    let mut close: Vec<String> = declared
+        .iter()
+        .filter(|name| {
+            let lower = name.to_lowercase();
+            lower.contains(&needle) || needle.contains(&lower)
+        })
+        .map(|name| name.to_string())
+        .collect();
+    if close.is_empty() {
+        close = declared.iter().map(|name| name.to_string()).collect();
+    }
+    close.truncate(nestweaver_engine::did_you_mean::DID_YOU_MEAN_LIMIT);
+    let message = format!(
+        "feature '{feature}' not found in config {}",
+        config_path.display()
+    );
+    if json {
+        println!(
+            "{}",
+            nestweaver_schema::responses::with_did_you_mean(
+                json_not_found_payload("feature", &serde_json::json!(feature), Some(&message)),
+                &close,
+            )
+        );
+    }
+    eprintln!("{message}");
+    eprint_did_you_mean(&close);
+    EXIT_NOT_FOUND
+}
+
 fn json_not_found_payload(
     target_key: &str,
     target: &serde_json::Value,
@@ -18427,6 +18507,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("--config is required when using --feature"))?;
 
+                // 12.1.1 (B9): a feature the config does not declare is a
+                // miss (exit 2), on both routes, before either opens anything.
+                {
+                    let declared = nestweaver_engine::InstanceConfig::from_file(config_path)?;
+                    let names: Vec<&str> = declared
+                        .features
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|feature| feature.name.as_str())
+                        .collect();
+                    if !names.contains(&feature_name.as_str()) {
+                        return Ok((
+                            report_feature_not_found(feature_name, config_path, &names, json),
+                            None,
+                        ));
+                    }
+                }
+
                 // ── daemon guard (routed through HybridClient for upstream merge) ──
                 if use_daemon {
                     let instance_cfg = nestweaver_engine::InstanceConfig::from_file(config_path)?;
@@ -19690,8 +19789,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             target,
             config,
         } => {
-            let parsed_level: SummaryLevel =
-                level.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            // 12.1.1 (B9): a bad `--level` is a usage error (64), like a bad
+            // value clap rejects, not a failed run (1).
+            let parsed_level: SummaryLevel = match level.parse() {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    let error: String = error;
+                    eprintln!("error: invalid value '{level}' for '--level': {error}");
+                    return Ok((EXIT_USAGE, None));
+                }
+            };
             // nw-414: resolved through the same helper `hubs`/`bridges` use, so
             // `--config` alone (no `--db`) selects the instance's database
             // instead of falling back to `./nestweaver.lbug`. `db.unwrap_or_else(
@@ -19750,6 +19857,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         warn_stale_resolver_rankings_no_store(
                             &ResolverStaleness::from_daemon_response(&value, &db_path),
                         );
+                    }
+                    // 12.1.1 (B9): a `--target` that matched nothing is a
+                    // miss (exit 2), not "the graph may be empty".
+                    if let Some(target) = target.as_deref()
+                        && summary_target_missed(&value)
+                    {
+                        return Ok((report_summary_target_not_found(target, false), None));
                     }
                     if text.is_empty() {
                         println!("No summaries generated (graph may be empty).");
@@ -19950,6 +20064,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let truncated_by_budget = display.len() < total;
             let truncated_by_cap = cap_dropped > 0;
             let truncated = truncated_by_budget || truncated_by_cap;
+            // 12.1.1 (B9): a `--target` that matched nothing is a miss.
+            if let Some(target) = target.as_deref()
+                && total + cap_dropped == 0
+            {
+                return Ok((report_summary_target_not_found(target, json), None));
+            }
 
             // nw-370: hub level ONLY. `generate_hub_summaries_bounded` selects
             // and orders by the same degree/PageRank nw-103's import fan-out
@@ -24533,7 +24653,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     } else {
                         print!("{}", render_investigate_expand_text(&value));
                     }
-                    return Ok((EXIT_SUCCESS, None));
+                    return Ok((investigate_expand_exit(&value), None));
                 }
             }
 
@@ -24557,15 +24677,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     None => return Err(error),
                 },
             };
+            let value = serde_json::to_value(&result)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
-                print!(
-                    "{}",
-                    render_investigate_expand_text(&serde_json::to_value(&result)?)
-                );
+                print!("{}", render_investigate_expand_text(&value));
             }
-            Ok((EXIT_SUCCESS, None))
+            Ok((investigate_expand_exit(&value), None))
         }
 
         Commands::InvestigateHydrate {
