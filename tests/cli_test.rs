@@ -16103,3 +16103,100 @@ fn cli_operator_config_follows_current_on_each_invocation() {
             .success();
     }
 }
+
+/// 12.1.1 (B1): `read-symbols` with a qualifier that names no file or
+/// container is not found (exit 2) with `path::name` suggestions, the same as
+/// `symbol`. It used to drop the qualifier and answer with another file's
+/// symbol, and an owner-less `path::<module>` listed every owner (exit 3).
+#[test]
+fn read_symbols_qualifier_miss_is_not_found_with_suggestions() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+    for (rel, src) in [
+        (
+            "src/app.js",
+            "const { helper } = require('./util');\nhelper(1);\n",
+        ),
+        (
+            "src/other.js",
+            "const { helper } = require('./util');\nhelper(2);\n",
+        ),
+        (
+            "src/util.js",
+            "function helper(n) { return n; }\nmodule.exports = { helper };\n",
+        ),
+        (
+            "src/cache.js",
+            "class Cache {\n  get(k) { return k; }\n}\nmodule.exports = { Cache };\n",
+        ),
+    ] {
+        std::fs::write(repo_dir.join(rel), src).unwrap();
+    }
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    let read = |target: &str, json: bool| {
+        let mut cmd = nestweaver_cmd();
+        cmd.args(["read-symbols", target, "--db"])
+            .arg(&db_path)
+            .current_dir(dir.path());
+        if json {
+            cmd.arg("--json");
+        }
+        let output = cmd.output().unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or(serde_json::Value::Null);
+        (
+            output.status.code(),
+            payload,
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    };
+
+    // A wrong path.
+    let (code, payload, _) = read("nope.js::helper", true);
+    assert_eq!(code, Some(2), "{payload}");
+    assert_eq!(payload["symbols"], serde_json::json!([]), "{payload}");
+    assert_eq!(payload["not_found"], serde_json::json!(["nope.js::helper"]));
+    assert_eq!(
+        payload["did_you_mean"],
+        serde_json::json!(["src/util.js::helper"]),
+        "{payload}"
+    );
+    let (code, _, stderr) = read("nope.js::helper", false);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("Did you mean: src/util.js::helper?"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("warning:"), "{stderr}");
+
+    // An owner-less `path::<module>`: not found, not every owner.
+    let (code, payload, stderr) = read("src/util.js::<module>", true);
+    assert_eq!(code, Some(2), "{payload} {stderr}");
+    assert_eq!(payload["ambiguous"], serde_json::json!([]), "{payload}");
+    assert!(
+        !payload.to_string().contains("src/app.js::<module>"),
+        "{payload}"
+    );
+
+    // A wrong class.
+    let (code, payload, _) = read("Nope::get", true);
+    assert_eq!(code, Some(2), "{payload}");
+    assert_eq!(
+        payload["did_you_mean"],
+        serde_json::json!(["src/cache.js::Cache::get"]),
+        "{payload}"
+    );
+
+    // Counterweight: a real qualifier still reads.
+    let (code, payload, _) = read("src/cache.js::Cache::get", true);
+    assert_eq!(code, Some(0), "{payload}");
+    assert_eq!(payload["symbols"][0]["path"], "src/cache.js", "{payload}");
+}

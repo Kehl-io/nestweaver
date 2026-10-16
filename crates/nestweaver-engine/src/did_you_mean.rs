@@ -106,7 +106,21 @@ pub fn did_you_mean_candidates(
             &SeedResolutionConfig::default(),
         )
         .map_err(|e| anyhow::anyhow!("search_symbols_by_name_page: {e}"))?;
-    let visible: Vec<&Symbol> = page.symbols.iter().filter(|s| keep(s)).collect();
+    // 12.1.1 (B1/M1): a `path::<module>` miss is answered only with owners
+    // of a file of the same name. The first five owners in the graph, in
+    // path order, are no suggestion for a file that has none.
+    let same_file_name = |s: &Symbol| match qualified.as_ref() {
+        Some(spec) if spec.name == nestweaver_schema::MODULE_OWNER_NAME => {
+            let base = |path: &str| path.rsplit(['/', '\\']).next().unwrap_or(path).to_string();
+            base(&s.file_path) == base(spec.qualifiers[0])
+        }
+        _ => true,
+    };
+    let visible: Vec<&Symbol> = page
+        .symbols
+        .iter()
+        .filter(|s| keep(s) && same_file_name(s))
+        .collect();
     // One container level is enough for the suggestion to resolve: the
     // lookup matches a container chain from its innermost end.
     let containers = if qualified.is_some() {

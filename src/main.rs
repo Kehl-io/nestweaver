@@ -6503,7 +6503,10 @@ enum Commands {
         /// Symbol UIDs, names, FQNs, or path::name specs to read. The path is a
         /// repo-relative path or a suffix of one; path::<module> reads the
         /// file's top-level code, with function, class and method bodies
-        /// elided as ⋮.
+        /// elided as ⋮. A qualifier that names no file or container is not
+        /// found (exit 2), with path::name suggestions, like `symbol`; it is
+        /// never dropped to the bare name. A file with no top-level calls has
+        /// no owner, so its path::<module> is not found.
         #[arg(required = true)]
         targets: Vec<String>,
         #[arg(
@@ -28020,8 +28023,10 @@ fn render_read_symbols(
         for nf in &res.not_found {
             eprintln!("not found: {nf}");
         }
-        // nw-113: a dropped qualifier is said out loud, not silently
-        // answered with whatever shares the last segment.
+        // 12.1.1 (B1): a miss suggests `path::name` specs, like `symbol`.
+        eprint_did_you_mean(&res.did_you_mean);
+        // nw-113: a dropped leading qualifier is said out loud, not silently
+        // answered by the shorter qualified reading.
         for ignored in &res.qualifier_ignored {
             eprintln!("warning: {}: {}", ignored.query, ignored.note);
         }

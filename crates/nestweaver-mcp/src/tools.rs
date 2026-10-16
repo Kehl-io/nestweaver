@@ -5329,8 +5329,11 @@ fn try_read_symbols_from_bare(
         merged.not_found.extend(partial.not_found);
         merged.ambiguous.extend(partial.ambiguous);
         merged.dropped.extend(partial.dropped);
+        merged.qualifier_ignored.extend(partial.qualifier_ignored);
         merged.truncated = merged.truncated || partial.truncated;
     }
+    merged.did_you_mean =
+        nestweaver_engine::read_symbols::not_found_suggestions(store, &merged.not_found);
 
     Some(merged)
 }
@@ -5455,7 +5458,7 @@ fn resolve_repo_for_spec(store: &GraphStore, spec: &str) -> Option<String> {
 fn tool_schema_read_symbols() -> Value {
     json!({
         "name": "read_symbols",
-        "description": "Read indexed symbol source spans. MCP output is bounded to 20KB logical / 40KB escaped; read truncation metadata and narrow targets or sections to continue.\n\nGuidelines:\n- Accepts UIDs (sym:...), bare names, FQNs, `path::name`, `Class::method` or `path::Class::method` (narrowed by file and container like brain_impact); a qualifier that names nothing falls back to the last segment and is listed in `qualifier_ignored`; ambiguous names return candidates with uid and file_path plus a `hint` on how to pick one\n- `path::<module>` reads a file's top-level code (the module owner), with function, class and method bodies elided as `⋮`\n- Use include_neighbors to also return adjacent symbols in the same file\n- Use token_budget to cap combined output size; a first symbol larger than the budget is cut to fit and flagged `body_truncated` (a budget of 0 returns the first symbol whole)\n\nLimitations:\n- Only reads indexed code symbols, not markdown notes (use note_get for those)\n- When `root` is omitted, file paths resolve from the owning repo's `local_root` in the graph, then the server working directory\n- Refused for repository-scoped identities because a caller-selected filesystem root cannot prove the source bytes belong to the authorized repository\n\nIn server mode (bare clones), bodies may be empty with a server_note explaining the limitation.",
+        "description": "Read indexed symbol source spans. MCP output is bounded to 20KB logical / 40KB escaped; read truncation metadata and narrow targets or sections to continue.\n\nGuidelines:\n- Accepts UIDs (sym:...), bare names, FQNs, `path::name`, `Class::method` or `path::Class::method` (narrowed by file and container like brain_impact); a qualifier that names no file or container is not found, with `path::name` suggestions in `did_you_mean` (it is never dropped to the bare name; only a shorter reading that is still qualified, `zzz::Svc::run` as `Svc::run`, is tried, and is listed in `qualifier_ignored`); ambiguous names return candidates with uid and file_path plus a `hint` on how to pick one\n- `path::<module>` reads a file's top-level code (the module owner), with function, class and method bodies elided as `⋮`; a file with no top-level calls has no owner and is not found\n- Use include_neighbors to also return adjacent symbols in the same file\n- Use token_budget to cap combined output size; a first symbol larger than the budget is cut to fit and flagged `body_truncated` (a budget of 0 returns the first symbol whole)\n\nLimitations:\n- Only reads indexed code symbols, not markdown notes (use note_get for those)\n- When `root` is omitted, file paths resolve from the owning repo's `local_root` in the graph, then the server working directory\n- Refused for repository-scoped identities because a caller-selected filesystem root cannot prove the source bytes belong to the authorized repository\n\nIn server mode (bare clones), bodies may be empty with a server_note explaining the limitation.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -33015,6 +33018,80 @@ mod ambiguous_name_contract_tests {
             ],
             "{ambiguous}"
         );
+    }
+
+    /// 12.1.1 (M1): a `read_symbols` target whose qualifier names no file
+    /// or container is not found with `path::name` suggestions, like
+    /// `brain_impact`. It never returns another file's symbol, and an
+    /// owner-less `path::<module>` never lists every owner in the graph.
+    #[test]
+    fn read_symbols_qualifier_miss_is_not_found_with_suggestions() {
+        use nestweaver_engine::index_directory_in_memory;
+        let dir = tempfile::tempdir().unwrap();
+        for (rel, src) in [
+            (
+                "src/app.js",
+                "const { helper } = require('./util');\nhelper(1);\n",
+            ),
+            (
+                "src/util.js",
+                "function helper(n) { return n; }\nmodule.exports = { helper };\n",
+            ),
+            (
+                "src/cache.js",
+                "class Cache {\n  get(k) { return k; }\n}\nmodule.exports = { Cache };\n",
+            ),
+        ] {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, src).unwrap();
+        }
+        let (_repo, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/r", "sha").unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let read = |target: &str| {
+            tool_read_symbols(&store, json!({ "targets": [target], "root": root })).unwrap()
+        };
+
+        // A wrong path: `helper` is unique, but not in nope.js.
+        let miss = read("nope.js::helper");
+        assert_eq!(miss["status"], "not_found", "{miss}");
+        assert_eq!(miss["error"], "not found", "{miss}");
+        assert_eq!(miss["symbols"], json!([]), "{miss}");
+        assert!(miss.get("qualifier_ignored").is_none(), "{miss}");
+        assert_eq!(
+            miss["did_you_mean"],
+            json!(["src/util.js::helper"]),
+            "{miss}"
+        );
+
+        // An owner-less file: not found, never every owner.
+        for spec in ["src/util.js::<module>", "nosuch/file.js::<module>"] {
+            let miss = read(spec);
+            assert_eq!(miss["status"], "not_found", "{spec}: {miss}");
+            assert_eq!(miss["symbols"], json!([]), "{spec}: {miss}");
+            assert_eq!(miss["ambiguous"], json!([]), "{spec}: {miss}");
+            assert!(
+                !miss.to_string().contains("src/app.js::<module>"),
+                "{spec}: another file's owner: {miss}"
+            );
+        }
+
+        // A wrong class.
+        let miss = read("Nope::get");
+        assert_eq!(miss["status"], "not_found", "{miss}");
+        assert_eq!(
+            miss["did_you_mean"],
+            json!(["src/cache.js::Cache::get"]),
+            "{miss}"
+        );
+
+        // Counterweight: the right qualifiers still read.
+        let hit = read("src/cache.js::Cache::get");
+        assert_eq!(hit["symbols"][0]["path"], "src/cache.js", "{hit}");
+        assert!(hit.get("did_you_mean").is_none(), "{hit}");
+        let hit = read("src/app.js::<module>");
+        assert_eq!(hit["symbols"][0]["name"], "src/app.js::<module>", "{hit}");
     }
 
     /// nw-113 final review Minor 2: `code_context` lists the same three
