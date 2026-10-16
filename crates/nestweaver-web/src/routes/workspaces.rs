@@ -495,15 +495,10 @@ pub fn symbols_page(
             limit,
         )
         .map_err(|e| ApiError::from_ranking(e.into()))?;
-    // 12.1.1 (R1): an owner reads `path::<module>` on every consumer of this
-    // page (top symbols, overview landmarks, search hits), never bare.
-    let items = items
-        .into_iter()
-        .map(|mut symbol| {
-            symbol.name = symbol.display_name().into_owned();
-            symbol
-        })
-        .collect();
+    // 12.1.1 review (R1): the page returns the shared `Symbol` untouched, so
+    // `is_module_owner()` stays true for an owner on every Rust consumer. Each
+    // consumer labels an owner `path::<module>` in the JSON it renders (top
+    // symbols, overview landmarks, search hits), never bare.
     Ok(BoundedResults { items, total_count })
 }
 
@@ -687,11 +682,15 @@ pub fn note_search_hit(note: Note) -> serde_json::Value {
 }
 
 pub fn symbol_search_hit(symbol: Symbol) -> serde_json::Value {
+    // R1: an owner reads `path::<module>`; `name` stays the label the UI
+    // renders, and `display_name` names it explicitly.
+    let display_name = symbol.display_name().into_owned();
     json!({
         "uid": symbol.uid,
         "kind": "Symbol",
-        "name": symbol.name,
-        "title": symbol.name,
+        "name": display_name,
+        "display_name": display_name,
+        "title": display_name,
         "repo_uid": symbol.repo_uid,
         "file_path": symbol.file_path,
         "score": symbol.pagerank_score.unwrap_or(0.0),
@@ -856,4 +855,50 @@ fn repo_label(repo: &Repo) -> String {
         .filter(|segment| !segment.is_empty())
         .unwrap_or(&repo.uid)
         .to_string()
+}
+
+#[cfg(test)]
+mod r1_tests {
+    use super::*;
+
+    /// 12.1.1 review (R1): `symbols_page` overwrote the shared `Symbol`'s
+    /// `name` with its display label, so `is_module_owner()` was false for an
+    /// owner on every Rust consumer of the page. The page returns the symbol
+    /// untouched; the JSON a consumer renders carries the label.
+    #[test]
+    fn symbols_page_keeps_the_owner_a_module_owner_and_labels_it_in_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.js"), "function f() {}\nf();\n").unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        nestweaver_engine::index_directory_with_store(
+            &store,
+            &src,
+            &db_path,
+            "test",
+            "https://example.com/r",
+            "sha",
+            false,
+            None,
+        )
+        .unwrap();
+        let repo_uid = store.list_repos(None).unwrap()[0].uid.clone();
+        let Ok(workspace) = resolve_workspace(&store, Some(&repo_uid)) else {
+            panic!("the repo workspace resolves");
+        };
+        let Ok(page) = symbols_page(&store, &workspace, None, 50) else {
+            panic!("the page loads");
+        };
+        let owner = page
+            .items
+            .iter()
+            .find(|s| s.is_module_owner())
+            .expect("the owner is still a module owner");
+        assert_eq!(owner.name, nestweaver_schema::MODULE_OWNER_NAME);
+        let hit = symbol_search_hit(owner.clone());
+        assert_eq!(hit["name"], "a.js::<module>", "{hit}");
+        assert_eq!(hit["display_name"], "a.js::<module>", "{hit}");
+    }
 }

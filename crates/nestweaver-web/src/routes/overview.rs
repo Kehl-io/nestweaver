@@ -170,7 +170,8 @@ fn overview_response(state: &Arc<AppState>, params: &OverviewParams) -> Result<R
         .map(|symbol| OverviewLandmark {
             uid: symbol.uid.clone(),
             kind: "symbol".to_string(),
-            label: symbol.name.clone(),
+            // R1: an owner is labelled `path::<module>`, never bare.
+            label: symbol.display_name().into_owned(),
             location: symbol.file_path.clone(),
             score: symbol.pagerank_score.unwrap_or(0.0),
             reason: "High PageRank symbol".to_string(),
