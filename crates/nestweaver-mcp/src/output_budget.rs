@@ -5,7 +5,11 @@ use std::io::{self, Write};
 
 pub const LOGICAL_BYTES: usize = 20_000;
 pub const RESULT_BYTES: usize = 40_000;
-pub const CATALOGUE_BYTES: usize = 32_000;
+/// The whole `tools/list` catalogue, every tool's wire description included.
+/// 12.1.1 raised it from 32,000 so each of the 43 tools can carry a real
+/// description (what it does, its key arguments, and the lookup, owner, miss
+/// and cut behaviour that applies): agents choose tools from these alone.
+pub const CATALOGUE_BYTES: usize = 40_000;
 
 #[derive(Default)]
 struct Size(usize);

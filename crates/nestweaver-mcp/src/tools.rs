@@ -1468,53 +1468,143 @@ pub(crate) fn assert_wire_tool_contract(wire: &Value, full: &Value) {
     }
 }
 
-/// Complete authored wire summaries; argument captions carry usage details.
-/// Keep a summary for every registered tool instead of clipping prose.
+/// Complete authored wire descriptions, about 150 bytes each: what the tool
+/// does, its key arguments and the lookup, owner, miss and cut behaviour
+/// that applies. Agents choose tools from these, so they must carry that
+/// behaviour (12.1.1 raised the catalogue budget to 40,000 bytes for it).
+/// Argument captions carry the rest. Keep one for every registered tool
+/// instead of clipping prose.
 fn compact_tool_description(name: &str) -> &'static str {
     match name {
-        "brain_context" => "Ranked code+note context; seeds may be path::name.",
-        "code_context" => "Ranked code context; owners read path::<module>.",
-        "brain_search" => "Search notes and symbols.",
-        "note_get" => "Read note bodies and metadata.",
-        "backlinks" => "Find incoming note links.",
-        "brain_status" => "Show indexed source health.",
-        "brain_add_source" => "Index a vault or code repository.",
-        "brain_remove_source" => "Remove an indexed source.",
-        "prune_stale" => "Prune sources missing on disk.",
-        "compact_embeddings" => "Reclaim deleted-node vectors.",
-        "cross_repo_contracts" => "Find cross-repo symbol references.",
-        "brain_impact" => "Trace dependents of a symbol (path::name ok).",
-        "brain_guide" => "Generate a graph orientation guide.",
-        "flow_trace" => "Trace callees of a symbol (path::name ok).",
-        "detect_changes" => "Assess changed-file impact.",
-        "clusters" => "Group related code symbols.",
-        "stale_check" => "Check graph freshness.",
-        "set_extension" => "Set custom node metadata.",
-        "unset_extension" => "Remove custom node metadata.",
-        "query_extensions" => "Query custom node metadata.",
-        "brain_diff" => "Show changes since indexing.",
-        "project_context" => "Get ranked project context.",
-        "dead_code" => "Review unreachable code; check coverage first.",
-        "hub_nodes" => "Rank highly connected symbols.",
-        "bridge_nodes" => "Find architectural chokepoints.",
-        "blast_radius" => "Assess file-change blast radius.",
-        "get_summary" => "Summarize symbols/files/clusters.",
-        "read_symbols" => "Read symbol source; path::name, path::<module>.",
-        "regex_search" => "Search indexed text with regex.",
-        "count_patterns" => "Count indexed regex matches.",
-        "brain_broken_links" => "Find broken vault wikilinks.",
-        "brain_orphan_documents" => "Find notes without wikilinks.",
-        "brain_topic_clusters" => "Cluster notes by wikilinks.",
-        "brain_tag_graph" => "Show tag co-occurrence links.",
-        "brain_doc_stats" => "Summarize vault document health.",
-        "affected_tests" => "Prioritize affected test files.",
-        "investigate" => "Map a topic for investigation.",
-        "investigate_expand" => "Expand investigation map entries.",
-        "investigate_hydrate" => "Hydrate investigation bodies.",
-        "contract_drift" => "Audit API route/spec drift.",
-        "brain_memory_lint" => "Lint memory-vault health.",
-        "brain_memory_consolidate" => "Propose memory-tier promotions.",
-        "brain_memory_related" => "Walk typed note relationships.",
+        "brain_context" => {
+            "Ranked code+note context from seeds (names, note titles, path::name, Class::method, path::<module>). At most 3 owners; rest in module_owners_omitted. Flags publication_in_progress."
+        }
+        "code_context" => {
+            "Ranked code-only subgraph around seed symbols (name, sym: UID, path::name, path::<module>). Misses get did_you_mean; owners past 3 counted in module_owners_omitted."
+        }
+        "brain_search" => {
+            "BM25 keyword search over notes, headings, sections, tags and symbols; returns UIDs for follow-up. limit is per kind; total_matches counts every match."
+        }
+        "note_get" => {
+            "Read a note's body, sections and frontmatter by uid, path or title. Use sections to fetch parts; continue a cut body with next_body_offset as body_offset."
+        }
+        "backlinks" => {
+            "List notes that wikilink to a target note (uid, path or unique title), with section, confidence and text. Duplicate titles refuse with candidate UIDs."
+        }
+        "brain_status" => {
+            "Indexed vaults and repos with counts, staleness and search/embedding health. null counts are unreadable, not zero; see unavailable and manifest_recovery."
+        }
+        "brain_add_source" => {
+            "Index a local vault, code repo or markdown folder (absolute or ~/ path); type is auto-detected. name sets a vault display name. Re-adding re-indexes."
+        }
+        "brain_remove_source" => {
+            "Permanently remove a repo or vault by name, path, URL or UID. committed: true means it happened even with reconciliation_warnings; ambiguous needs a UID."
+        }
+        "prune_stale" => {
+            "Remove every indexed repo and vault whose directory no longer exists. committed: true means done; reconciliation_warnings are bookkeeping only."
+        }
+        "compact_embeddings" => {
+            "Reclaim vectors of deleted nodes and rewrite the embedding sidecar; never re-embeds. dry_run counts only already tombstoned rows (a floor). Daemon only."
+        }
+        "cross_repo_contracts" => {
+            "Other repos that import, re-export or implement a symbol (uid or name); repo scopes rows. Links are hypotheses; check confidence and contracts_status."
+        }
+        "brain_impact" => {
+            "Dependents of a symbol, impact-scored. symbol may be path::name, Class::method, path::Class::method or path::<module>; misses get did_you_mean. Cuts in output_budget."
+        }
+        "brain_guide" => {
+            "Orientation guide to every indexed repo, vault, cross-repo link and tool, built from the live graph. Expensive on large graphs; brain_status is lighter."
+        }
+        "flow_trace" => {
+            "Callee tree of a symbol (path::name, Class::method, path::<module> ok; misses get did_you_mean). Each child has edge_type; CROSS_REPO_LINK is inferred, not a call."
+        }
+        "detect_changes" => {
+            "Risk of changed repo-relative files: affected symbols, processes and risk. Gate on gate_state, not status; unknown risk is never low. Owners flag top-level changes."
+        }
+        "clusters" => {
+            "Functional clusters of code symbols (Louvain) with cohesion, key files and member previews. cluster_id pages members; resolution sets granularity; repos scopes."
+        }
+        "stale_check" => {
+            "Per-repo index freshness: indexed SHA vs HEAD and resolver generation. Gate on any_needs_reindex; outdated_resolver needs index --force."
+        }
+        "set_extension" => {
+            "Attach a custom JSON property (uid, key, value) to any node, stored in a sidecar outside the graph; overwrites an existing value. Read back with query_extensions."
+        }
+        "unset_extension" => {
+            "Remove one custom property (uid, key) set by set_extension. Removing an absent key reports removed: false; the old value is not kept."
+        }
+        "query_extensions" => {
+            "Read custom properties: all of one node's (uid), or every node whose key exactly equals value (key + value). Sidecar only, not core graph fields."
+        }
+        "brain_diff" => {
+            "Files added, modified and deleted in a local repo since it was indexed (or since_sha), with affected symbols. File level only; local repos only."
+        }
+        "project_context" => {
+            "Strictly scoped, PPR-ranked context for a named project; each row says in_project and why. Concise by default; flags publication_in_progress during a watcher batch."
+        }
+        "dead_code" => {
+            "Review list (never a deletion list) of unreachable symbols. Check coverage, walk_roots, entry_points and module_owner_roots first; refuses on a stale resolver."
+        }
+        "hub_nodes" => {
+            "Most connected callable symbols by degree, with cluster membership. Constants, properties and modules are never scored; rankings_stale means re-index first."
+        }
+        "bridge_nodes" => {
+            "Architectural chokepoints by betweenness (sampled) and the clusters each bridge joins. Non-callable kinds are never scored; check rankings_stale."
+        }
+        "blast_radius" => {
+            "Risk of changed repo-relative files: dependents with impact scores, clusters and risk level. Unknown is never Low; top-level-only files list top_level_callees."
+        }
+        "get_summary" => {
+            "Deterministic summaries at symbol, file or cluster level; target filters. Symbol level lists at most 3 path::<module> owner callers. token_budget caps output."
+        }
+        "read_symbols" => {
+            "Read symbol source by UID, name, path::name, Class::method or path::<module> (top-level code). Misses get did_you_mean; a first symbol over token_budget sets body_truncated."
+        }
+        "regex_search" => {
+            "Run a Rust regex over indexed section text, note titles and symbol signatures. Bounded by a candidate cap and time budget; truncation_reason names the bound."
+        }
+        "count_patterns" => {
+            "Count regex matches per pattern (total, files matched, top files) without returning them; compare several patterns in one call. Same index as regex_search."
+        }
+        "brain_broken_links" => {
+            "Unresolved and ambiguous vault wikilinks with repair suggestions; low_confidence lists fuzzy resolutions apart. Read the population counts, not the page."
+        }
+        "brain_orphan_documents" => {
+            "Notes with no inbound or outbound wikilinks, minus an allowlist of index and MOC notes; filter by vault or path_prefix."
+        }
+        "brain_topic_clusters" => {
+            "Clusters of notes over the wikilink graph, each labelled by its most central note; resolution sets cluster size. Tags and code links are not used."
+        }
+        "brain_tag_graph" => {
+            "Tag co-occurrence: the tags sharing notes with a focus tag, or the whole tag graph when tag is omitted. Useful for spotting taxonomy drift."
+        }
+        "brain_doc_stats" => {
+            "One-shot vault health: note counts, wikilink edges, unresolved and ambiguous link targets, orphans, top tags and notes by year. Each count names its population."
+        }
+        "affected_tests" => {
+            "Prioritized test files for changed_files or base_ref, in tiers. Refuses with remedies and run-full-suite when a relevant repo's edges predate the resolver."
+        }
+        "investigate" => {
+            "One-call map of a topic: hybrid retrieval grouped into domains with inline bodies and a bundle_id for drill-in. scope is project: or repo:; bundle_not_saved explains a missing bundle."
+        }
+        "investigate_expand" => {
+            "Full bodies and neighbours (callers, callees, linking notes) of chosen entries of an investigate bundle, by asset_id or UID; unresolved targets are listed."
+        }
+        "investigate_hydrate" => {
+            "Fill the source bodies of every unhydrated entry of an investigate bundle, up to token_budget (max 16000); body_complete false means use read_symbols."
+        }
+        "contract_drift" => {
+            "Spec routes not implemented and implemented routes not in any spec (OpenAPI, proto, GraphQL), per repo. Empty buckets prove nothing unless contracts_status is complete."
+        }
+        "brain_memory_lint" => {
+            "Audit a memory-bank vault: stale notes, contradictions, orphans, broken wikilinks, supersession chains, schema drift and dangling relations; limit caps each."
+        }
+        "brain_memory_consolidate" => {
+            "Propose promoting notes up memory tiers (daily logs to ideas to project files) with evidence. Dry run by default; apply: true moves the files."
+        }
+        "brain_memory_related" => {
+            "Walk typed note relations (Supersedes, DependsOn, CausedBy, RelatesTo) from a note to depth; generic wikilinks are left out. A missing uid is not_found."
+        }
         _ => panic!("missing compact tool description for {name}"),
     }
 }
@@ -1809,7 +1899,7 @@ mod tool_schema_validation_tests {
             page_names, full_names,
             "clients that ignore nextCursor must discover every visible tool"
         );
-        assert!(crate::output_budget::escaped_size(&page) <= 32_000);
+        assert!(crate::output_budget::escaped_size(&page) <= crate::output_budget::CATALOGUE_BYTES);
         assert!(page.get("nextCursor").is_none_or(Value::is_null));
     }
 
@@ -1862,65 +1952,176 @@ mod tool_schema_validation_tests {
         let expected = [
             (
                 "brain_context",
-                "Ranked code+note context; seeds may be path::name.",
+                "Ranked code+note context from seeds (names, note titles, path::name, Class::method, path::<module>). At most 3 owners; rest in module_owners_omitted. Flags publication_in_progress.",
             ),
             (
                 "code_context",
-                "Ranked code context; owners read path::<module>.",
+                "Ranked code-only subgraph around seed symbols (name, sym: UID, path::name, path::<module>). Misses get did_you_mean; owners past 3 counted in module_owners_omitted.",
             ),
-            ("brain_search", "Search notes and symbols."),
-            ("note_get", "Read note bodies and metadata."),
-            ("backlinks", "Find incoming note links."),
-            ("brain_status", "Show indexed source health."),
-            ("brain_add_source", "Index a vault or code repository."),
-            ("brain_remove_source", "Remove an indexed source."),
-            ("prune_stale", "Prune sources missing on disk."),
-            ("compact_embeddings", "Reclaim deleted-node vectors."),
-            ("cross_repo_contracts", "Find cross-repo symbol references."),
+            (
+                "brain_search",
+                "BM25 keyword search over notes, headings, sections, tags and symbols; returns UIDs for follow-up. limit is per kind; total_matches counts every match.",
+            ),
+            (
+                "note_get",
+                "Read a note's body, sections and frontmatter by uid, path or title. Use sections to fetch parts; continue a cut body with next_body_offset as body_offset.",
+            ),
+            (
+                "backlinks",
+                "List notes that wikilink to a target note (uid, path or unique title), with section, confidence and text. Duplicate titles refuse with candidate UIDs.",
+            ),
+            (
+                "brain_status",
+                "Indexed vaults and repos with counts, staleness and search/embedding health. null counts are unreadable, not zero; see unavailable and manifest_recovery.",
+            ),
+            (
+                "brain_add_source",
+                "Index a local vault, code repo or markdown folder (absolute or ~/ path); type is auto-detected. name sets a vault display name. Re-adding re-indexes.",
+            ),
+            (
+                "brain_remove_source",
+                "Permanently remove a repo or vault by name, path, URL or UID. committed: true means it happened even with reconciliation_warnings; ambiguous needs a UID.",
+            ),
+            (
+                "prune_stale",
+                "Remove every indexed repo and vault whose directory no longer exists. committed: true means done; reconciliation_warnings are bookkeeping only.",
+            ),
+            (
+                "compact_embeddings",
+                "Reclaim vectors of deleted nodes and rewrite the embedding sidecar; never re-embeds. dry_run counts only already tombstoned rows (a floor). Daemon only.",
+            ),
+            (
+                "cross_repo_contracts",
+                "Other repos that import, re-export or implement a symbol (uid or name); repo scopes rows. Links are hypotheses; check confidence and contracts_status.",
+            ),
             (
                 "brain_impact",
-                "Trace dependents of a symbol (path::name ok).",
+                "Dependents of a symbol, impact-scored. symbol may be path::name, Class::method, path::Class::method or path::<module>; misses get did_you_mean. Cuts in output_budget.",
             ),
-            ("brain_guide", "Generate a graph orientation guide."),
-            ("flow_trace", "Trace callees of a symbol (path::name ok)."),
-            ("detect_changes", "Assess changed-file impact."),
-            ("clusters", "Group related code symbols."),
-            ("stale_check", "Check graph freshness."),
-            ("set_extension", "Set custom node metadata."),
-            ("unset_extension", "Remove custom node metadata."),
-            ("query_extensions", "Query custom node metadata."),
-            ("brain_diff", "Show changes since indexing."),
-            ("project_context", "Get ranked project context."),
+            (
+                "brain_guide",
+                "Orientation guide to every indexed repo, vault, cross-repo link and tool, built from the live graph. Expensive on large graphs; brain_status is lighter.",
+            ),
+            (
+                "flow_trace",
+                "Callee tree of a symbol (path::name, Class::method, path::<module> ok; misses get did_you_mean). Each child has edge_type; CROSS_REPO_LINK is inferred, not a call.",
+            ),
+            (
+                "detect_changes",
+                "Risk of changed repo-relative files: affected symbols, processes and risk. Gate on gate_state, not status; unknown risk is never low. Owners flag top-level changes.",
+            ),
+            (
+                "clusters",
+                "Functional clusters of code symbols (Louvain) with cohesion, key files and member previews. cluster_id pages members; resolution sets granularity; repos scopes.",
+            ),
+            (
+                "stale_check",
+                "Per-repo index freshness: indexed SHA vs HEAD and resolver generation. Gate on any_needs_reindex; outdated_resolver needs index --force.",
+            ),
+            (
+                "set_extension",
+                "Attach a custom JSON property (uid, key, value) to any node, stored in a sidecar outside the graph; overwrites an existing value. Read back with query_extensions.",
+            ),
+            (
+                "unset_extension",
+                "Remove one custom property (uid, key) set by set_extension. Removing an absent key reports removed: false; the old value is not kept.",
+            ),
+            (
+                "query_extensions",
+                "Read custom properties: all of one node's (uid), or every node whose key exactly equals value (key + value). Sidecar only, not core graph fields.",
+            ),
+            (
+                "brain_diff",
+                "Files added, modified and deleted in a local repo since it was indexed (or since_sha), with affected symbols. File level only; local repos only.",
+            ),
+            (
+                "project_context",
+                "Strictly scoped, PPR-ranked context for a named project; each row says in_project and why. Concise by default; flags publication_in_progress during a watcher batch.",
+            ),
             (
                 "dead_code",
-                "Review unreachable code; check coverage first.",
+                "Review list (never a deletion list) of unreachable symbols. Check coverage, walk_roots, entry_points and module_owner_roots first; refuses on a stale resolver.",
             ),
-            ("hub_nodes", "Rank highly connected symbols."),
-            ("bridge_nodes", "Find architectural chokepoints."),
-            ("blast_radius", "Assess file-change blast radius."),
-            ("get_summary", "Summarize symbols/files/clusters."),
+            (
+                "hub_nodes",
+                "Most connected callable symbols by degree, with cluster membership. Constants, properties and modules are never scored; rankings_stale means re-index first.",
+            ),
+            (
+                "bridge_nodes",
+                "Architectural chokepoints by betweenness (sampled) and the clusters each bridge joins. Non-callable kinds are never scored; check rankings_stale.",
+            ),
+            (
+                "blast_radius",
+                "Risk of changed repo-relative files: dependents with impact scores, clusters and risk level. Unknown is never Low; top-level-only files list top_level_callees.",
+            ),
+            (
+                "get_summary",
+                "Deterministic summaries at symbol, file or cluster level; target filters. Symbol level lists at most 3 path::<module> owner callers. token_budget caps output.",
+            ),
             (
                 "read_symbols",
-                "Read symbol source; path::name, path::<module>.",
+                "Read symbol source by UID, name, path::name, Class::method or path::<module> (top-level code). Misses get did_you_mean; a first symbol over token_budget sets body_truncated.",
             ),
-            ("regex_search", "Search indexed text with regex."),
-            ("count_patterns", "Count indexed regex matches."),
-            ("brain_broken_links", "Find broken vault wikilinks."),
-            ("brain_orphan_documents", "Find notes without wikilinks."),
-            ("brain_topic_clusters", "Cluster notes by wikilinks."),
-            ("brain_tag_graph", "Show tag co-occurrence links."),
-            ("brain_doc_stats", "Summarize vault document health."),
-            ("affected_tests", "Prioritize affected test files."),
-            ("investigate", "Map a topic for investigation."),
-            ("investigate_expand", "Expand investigation map entries."),
-            ("investigate_hydrate", "Hydrate investigation bodies."),
-            ("contract_drift", "Audit API route/spec drift."),
-            ("brain_memory_lint", "Lint memory-vault health."),
+            (
+                "regex_search",
+                "Run a Rust regex over indexed section text, note titles and symbol signatures. Bounded by a candidate cap and time budget; truncation_reason names the bound.",
+            ),
+            (
+                "count_patterns",
+                "Count regex matches per pattern (total, files matched, top files) without returning them; compare several patterns in one call. Same index as regex_search.",
+            ),
+            (
+                "brain_broken_links",
+                "Unresolved and ambiguous vault wikilinks with repair suggestions; low_confidence lists fuzzy resolutions apart. Read the population counts, not the page.",
+            ),
+            (
+                "brain_orphan_documents",
+                "Notes with no inbound or outbound wikilinks, minus an allowlist of index and MOC notes; filter by vault or path_prefix.",
+            ),
+            (
+                "brain_topic_clusters",
+                "Clusters of notes over the wikilink graph, each labelled by its most central note; resolution sets cluster size. Tags and code links are not used.",
+            ),
+            (
+                "brain_tag_graph",
+                "Tag co-occurrence: the tags sharing notes with a focus tag, or the whole tag graph when tag is omitted. Useful for spotting taxonomy drift.",
+            ),
+            (
+                "brain_doc_stats",
+                "One-shot vault health: note counts, wikilink edges, unresolved and ambiguous link targets, orphans, top tags and notes by year. Each count names its population.",
+            ),
+            (
+                "affected_tests",
+                "Prioritized test files for changed_files or base_ref, in tiers. Refuses with remedies and run-full-suite when a relevant repo's edges predate the resolver.",
+            ),
+            (
+                "investigate",
+                "One-call map of a topic: hybrid retrieval grouped into domains with inline bodies and a bundle_id for drill-in. scope is project: or repo:; bundle_not_saved explains a missing bundle.",
+            ),
+            (
+                "investigate_expand",
+                "Full bodies and neighbours (callers, callees, linking notes) of chosen entries of an investigate bundle, by asset_id or UID; unresolved targets are listed.",
+            ),
+            (
+                "investigate_hydrate",
+                "Fill the source bodies of every unhydrated entry of an investigate bundle, up to token_budget (max 16000); body_complete false means use read_symbols.",
+            ),
+            (
+                "contract_drift",
+                "Spec routes not implemented and implemented routes not in any spec (OpenAPI, proto, GraphQL), per repo. Empty buckets prove nothing unless contracts_status is complete.",
+            ),
+            (
+                "brain_memory_lint",
+                "Audit a memory-bank vault: stale notes, contradictions, orphans, broken wikilinks, supersession chains, schema drift and dangling relations; limit caps each.",
+            ),
             (
                 "brain_memory_consolidate",
-                "Propose memory-tier promotions.",
+                "Propose promoting notes up memory tiers (daily logs to ideas to project files) with evidence. Dry run by default; apply: true moves the files.",
             ),
-            ("brain_memory_related", "Walk typed note relationships."),
+            (
+                "brain_memory_related",
+                "Walk typed note relations (Supersedes, DependsOn, CausedBy, RelatesTo) from a note to depth; generic wikilinks are left out. A missing uid is not_found.",
+            ),
         ];
         set_direct_read_only(false);
         ALLOWED_TOOLS.with(|slot| *slot.borrow_mut() = None);
@@ -1942,9 +2143,14 @@ mod tool_schema_validation_tests {
             let name = tool["name"].as_str().unwrap();
             let summary = tool["description"].as_str().unwrap();
             assert_eq!(summary, expected[name], "authored summary for {name}");
+            // 12.1.1: real descriptions, about 150 bytes each (catalogue
+            // budget 40,000; see `output_budget::CATALOGUE_BYTES`).
             assert!(
-                summary.len() <= 55 && summary.ends_with('.'),
-                "{name}: {summary}"
+                (100..=200).contains(&summary.len())
+                    && summary.is_ascii()
+                    && summary.ends_with('.'),
+                "{name}: {} bytes: {summary}",
+                summary.len()
             );
             assert!(
                 !summary.contains('…') && !summary.contains("\n"),
@@ -1973,7 +2179,69 @@ mod tool_schema_validation_tests {
         assert_eq!(documented_arguments, 233);
         assert!(crate::output_budget::escaped_size(&page) <= crate::output_budget::CATALOGUE_BYTES);
         let envelope = json!({"jsonrpc":"2.0", "id":2, "result":page});
-        assert!(crate::output_budget::escaped_size(&envelope) < 32_768);
+        assert!(crate::output_budget::escaped_size(&envelope) < 40_960);
+        // Agents choose tools from these descriptions, so the lookup, owner,
+        // miss and cut behaviour must be discoverable where it applies.
+        let summary_of = |name: &str| expected[name];
+        for (name, needles) in [
+            (
+                "brain_impact",
+                &[
+                    "path::name",
+                    "Class::method",
+                    "path::<module>",
+                    "did_you_mean",
+                    "output_budget",
+                ][..],
+            ),
+            (
+                "flow_trace",
+                &[
+                    "path::name",
+                    "Class::method",
+                    "path::<module>",
+                    "did_you_mean",
+                ][..],
+            ),
+            (
+                "read_symbols",
+                &[
+                    "path::name",
+                    "Class::method",
+                    "path::<module>",
+                    "did_you_mean",
+                    "body_truncated",
+                ][..],
+            ),
+            (
+                "code_context",
+                &[
+                    "path::name",
+                    "path::<module>",
+                    "did_you_mean",
+                    "module_owners_omitted",
+                ][..],
+            ),
+            (
+                "brain_context",
+                &[
+                    "path::name",
+                    "Class::method",
+                    "module_owners_omitted",
+                    "publication_in_progress",
+                ][..],
+            ),
+            ("project_context", &["publication_in_progress"][..]),
+            ("dead_code", &["module_owner_roots", "walk_roots"][..]),
+            ("get_summary", &["path::<module>"][..]),
+        ] {
+            for needle in needles {
+                assert!(
+                    summary_of(name).contains(needle),
+                    "{name} must name {needle}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2008,7 +2276,10 @@ mod tool_schema_validation_tests {
             let mut cursor = None;
             for _ in 0..100 {
                 let page = tool_list_page(lite, cursor.as_deref()).unwrap();
-                assert!(crate::output_budget::escaped_size(&page) <= 32_000);
+                assert!(
+                    crate::output_budget::escaped_size(&page)
+                        <= crate::output_budget::CATALOGUE_BYTES
+                );
                 assert_eq!(page["tools"].as_array().unwrap().len(), expected.len());
                 actual.extend(page["tools"].as_array().unwrap().iter().cloned());
                 cursor = page
@@ -6417,7 +6688,7 @@ mod output_budget_tests {
             page["tools"].as_array().unwrap().len(),
             tool_list(false)["tools"].as_array().unwrap().len()
         );
-        assert!(crate::output_budget::escaped_size(&page) <= 32_000);
+        assert!(crate::output_budget::escaped_size(&page) <= crate::output_budget::CATALOGUE_BYTES);
         for (name, argument, needle) in [
             ("note_get", "sections", "heading"),
             ("read_symbols", "targets", "UID"),
@@ -19691,7 +19962,7 @@ fn arg_root_opt(args: &Value) -> Option<std::path::PathBuf> {
 fn tool_schema_investigate() -> Value {
     json!({
         "name": "investigate",
-        "description": "Orient on an unfamiliar topic in ONE call: runs hybrid PPR+BM25 retrieval, groups results into architectural domains, inlines high-confidence source bodies, and returns a token-budgeted map with a bundle_id for drill-down.\n\nGuidelines:\n- Use scope 'project:<slug>' or 'repo:<name>' to restrict; omit for unrestricted\n- Entries with is_seed: true are direct query/seed hits and are listed first; the rest are graph-connected neighbors\n- Under 'project:<slug>' scope ONLY: within the is_seed/connected groups, entries with matched_query: \"exact\" (query text or a token is a case-sensitive full match on the symbol's name) are pinned first, up to 5; matched_query: \"partial\" (substring match) is NOT pinned, it only gets a 5x fused-score boost and keeps its ranked position; every other entry follows in plain fused-score order. This exists because 'project:' seeds every member unconditionally, so a query naming one specific member symbol could otherwise lose to a flood of stronger-scoring member notes and never appear. An exact pin survives even on projects with 100+ members (it is rebuilt directly if the internal render cap would have dropped it) and exact names are looked up directly, so a path-deboosted test/mirror file is still pinned. Remaining misses are true name collisions beyond the resolver's cap of 5 exact matches. matched_query is never present under 'vault'/'repo:'/'all' scope, and is absent under 'project:' scope too when neither exact nor partial applies (most entries)\n- Drill into entries with investigate_expand (by asset_id) or fill all bodies with investigate_hydrate\n- Module owners (a file's top-level code) are never entries; investigate_expand labels an owner neighbour `path::<module>`\n- `returned`/`total`/`truncated` describe the map; `dropped_reasons` says WHICH cap cut. `token_budget` is recoverable by raising it; `retrieval_breadth` is an internal bound that is NOT — narrow the query or pass a scope instead. `more_available` counts only the token-budget loop\n\nLimitations:\n- Token budget hard-capped at 16000\n- Bundles expire 24h after creation\n- `scope` naming no project is not_found (with `did_you_mean`); any other scope than `project:<name>`, `repo:<name>`, `vault` or `all` is invalid arguments\n- During a live `brain watcher batch` publication it answers with `publication_in_progress` disclosure, like brain_context; a full index publication, or one that commits mid-investigation, fails closed with a retry message",
+        "description": "Orient on an unfamiliar topic in ONE call: runs hybrid PPR+BM25 retrieval, groups results into architectural domains, inlines high-confidence source bodies, and returns a token-budgeted map with a bundle_id for drill-down. A map answered through a live watcher batch (publication_in_progress) is not saved: it carries bundle_not_saved, and its bundle_id cannot be expanded or hydrated until you re-run investigate.\n\nGuidelines:\n- Use scope 'project:<slug>' or 'repo:<name>' to restrict; omit for unrestricted\n- Entries with is_seed: true are direct query/seed hits and are listed first; the rest are graph-connected neighbors\n- Under 'project:<slug>' scope ONLY: within the is_seed/connected groups, entries with matched_query: \"exact\" (query text or a token is a case-sensitive full match on the symbol's name) are pinned first, up to 5; matched_query: \"partial\" (substring match) is NOT pinned, it only gets a 5x fused-score boost and keeps its ranked position; every other entry follows in plain fused-score order. This exists because 'project:' seeds every member unconditionally, so a query naming one specific member symbol could otherwise lose to a flood of stronger-scoring member notes and never appear. An exact pin survives even on projects with 100+ members (it is rebuilt directly if the internal render cap would have dropped it) and exact names are looked up directly, so a path-deboosted test/mirror file is still pinned. Remaining misses are true name collisions beyond the resolver's cap of 5 exact matches. matched_query is never present under 'vault'/'repo:'/'all' scope, and is absent under 'project:' scope too when neither exact nor partial applies (most entries)\n- Drill into entries with investigate_expand (by asset_id) or fill all bodies with investigate_hydrate\n- Module owners (a file's top-level code) are never entries; investigate_expand labels an owner neighbour `path::<module>`\n- `returned`/`total`/`truncated` describe the map; `dropped_reasons` says WHICH cap cut. `token_budget` is recoverable by raising it; `retrieval_breadth` is an internal bound that is NOT — narrow the query or pass a scope instead. `more_available` counts only the token-budget loop\n\nLimitations:\n- Token budget hard-capped at 16000\n- Bundles expire 24h after creation\n- `scope` naming no project is not_found (with `did_you_mean`); any other scope than `project:<name>`, `repo:<name>`, `vault` or `all` is invalid arguments\n- During a live `brain watcher batch` publication it answers with `publication_in_progress` disclosure, like brain_context; a full index publication, or one that commits mid-investigation, fails closed with a retry message",
         "inputSchema": {
             "type": "object",
             "properties": {

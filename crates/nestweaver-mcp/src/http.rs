@@ -1939,7 +1939,9 @@ mod tests {
             let parsed: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(parsed["id"], id);
             let result = &parsed["result"];
-            assert!(serde_json::to_vec(result).unwrap().len() <= 32_000);
+            assert!(
+                serde_json::to_vec(result).unwrap().len() <= crate::output_budget::CATALOGUE_BYTES
+            );
             let listed = result["tools"].as_array().unwrap();
             assert_eq!(
                 listed.len(),

@@ -1017,7 +1017,7 @@ mod tests {
                         .replace('\u{2028}', "\\u2028")
                         .replace('\u{2029}', "\\u2029");
                     assert!(
-                        wire.len() <= 32_000,
+                        wire.len() <= crate::output_budget::CATALOGUE_BYTES,
                         "catalogue page has {} bytes",
                         wire.len()
                     );

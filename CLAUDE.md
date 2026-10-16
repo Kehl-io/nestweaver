@@ -435,6 +435,17 @@ nestweaver extensions unset <uid> <key>                         # remove one ext
 # hand-written beside it. `unset_extension` is one of the 7 — a count of six
 # predates it. Read the annotations back off tools/list rather than trusting
 # either number here.
+# tools/list WIRE DESCRIPTIONS are authored, about 150 bytes each, in
+# `compact_tool_description` (crates/nestweaver-mcp/src/tools.rs): what the tool
+# does, its key arguments, and the lookup, owner, miss and cut behaviour that
+# applies (`path::name`, `Class::method`, `path::<module>`, `did_you_mean`,
+# `module_owners_omitted`/`module_owner_roots`, `body_truncated`,
+# `output_budget` cuts, `publication_in_progress`). The catalogue budget
+# (`output_budget::CATALOGUE_BYTES`) is 40,000 bytes as of 12.1.1, up from
+# 32,000, reversing the 2026-10-06 nw-token-budget decision to keep 55-byte
+# summaries: agents choose tools from these descriptions alone, so the new
+# lookup and owner behaviour must be discoverable there. The server
+# `instructions` stay under 2 KB, the size clients truncate at.
 nestweaver mcp --db ./nestweaver.lbug
 nestweaver mcp --lite --db ./nestweaver.lbug                          # 6 core tools only
 # --tools takes exact, case-sensitive REGISTRY names, not CLI verb names.
