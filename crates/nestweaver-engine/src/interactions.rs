@@ -143,6 +143,9 @@ pub struct InteractionTracker {
     session_id: String,
     last_query_time: Mutex<f64>,
     last_query_results: Mutex<Vec<String>>,
+    /// B3 review: which of `last_query_results` the agent then used (opened
+    /// by a follow-up access). Only these earn a terminal success.
+    last_query_used: Mutex<Vec<String>>,
     /// Name of the most recent recorded tool call (for the terminal-success
     /// shutdown heuristic).
     last_tool: Mutex<Option<String>>,
@@ -175,6 +178,7 @@ impl InteractionTracker {
             session_id: generate_session_id(),
             last_query_time: Mutex::new(0.0),
             last_query_results: Mutex::new(Vec::new()),
+            last_query_used: Mutex::new(Vec::new()),
             last_tool: Mutex::new(None),
             flush_threshold: 5,
             last_flush: Mutex::new(std::time::Instant::now()),
@@ -191,6 +195,7 @@ impl InteractionTracker {
             session_id: session_id.to_string(),
             last_query_time: Mutex::new(0.0),
             last_query_results: Mutex::new(Vec::new()),
+            last_query_used: Mutex::new(Vec::new()),
             last_tool: Mutex::new(None),
             flush_threshold,
             last_flush: Mutex::new(std::time::Instant::now()),
@@ -235,6 +240,10 @@ impl InteractionTracker {
                 .unwrap_or_else(|e| e.into_inner());
             *lqr = result_uids.to_vec();
         }
+        self.last_query_used
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.set_last_tool(tool);
 
         self.push_event(event);
@@ -260,6 +269,15 @@ impl InteractionTracker {
             (now - *lqt) <= 30.0 && lqr.iter().any(|u| u == target_uid)
         };
 
+        if is_follow_up {
+            let mut used = self
+                .last_query_used
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !used.iter().any(|u| u == target_uid) {
+                used.push(target_uid.to_string());
+            }
+        }
         let event_type = if is_follow_up {
             EventType::FollowUp
         } else {
@@ -329,6 +347,17 @@ impl InteractionTracker {
     /// this session). Used by the terminal-success shutdown heuristic.
     pub fn last_surfaced_uids(&self) -> Vec<String> {
         self.last_query_results
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// B3 review: the results of the last query that the agent then used
+    /// (opened by a follow-up access), in the order it used them. The
+    /// terminal-success heuristic reinforces only these: a result that was
+    /// only shown must not earn the session floor.
+    pub fn last_used_uids(&self) -> Vec<String> {
+        self.last_query_used
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -1154,8 +1183,13 @@ mod tests {
         assert_eq!(tracker.last_tool_name().as_deref(), Some("brain_context"));
         assert_eq!(tracker.last_surfaced_uids(), vec!["res-1".to_string()]);
 
+        assert!(tracker.last_used_uids().is_empty(), "shown, not used");
         tracker.record_access("note_get", "res-1");
         assert_eq!(tracker.last_tool_name().as_deref(), Some("note_get"));
+        assert_eq!(tracker.last_used_uids(), vec!["res-1".to_string()]);
+        // A new query starts a new set of used results.
+        tracker.record_query("brain_context", &[], &["res-2".into()]);
+        assert!(tracker.last_used_uids().is_empty());
     }
 
     #[test]

@@ -793,8 +793,8 @@ const SEARCH_TOOLS: &[&str] = &["brain_search", "brain_context", "project_contex
 /// This is intentionally simple and conservative:
 /// - No last tool recorded → nothing happened, skip.
 /// - Last tool was a search → agent was still looking, skip.
-/// - Otherwise → reinforce the last surfaced UIDs (the retrieval the agent
-///   acted on and then stopped searching).
+/// - Otherwise → reinforce the last surfaced UIDs the agent then used (a
+///   follow-up access); results that were only shown are not reinforced.
 ///
 /// `record_terminal_success` no-ops on an empty UID list, so this is safe
 /// even when nothing was ever surfaced.
@@ -810,8 +810,11 @@ fn maybe_record_terminal_success(tracker: &nestweaver_engine::InteractionTracker
         // not treat the session as a successful terminal retrieval.
         return;
     }
-    let surfaced = tracker.last_surfaced_uids();
-    tracker.record_terminal_success(&surfaced);
+    // B3 review: only the surfaced results the agent then USED (followed
+    // up). Reinforcing everything the last query showed gave shown-only
+    // results the session floor that `record_query` withholds from them.
+    let used = tracker.last_used_uids();
+    tracker.record_terminal_success(&used);
 }
 
 /// Classify the tool call and record an appropriate interaction event.
@@ -1495,6 +1498,53 @@ mod tests {
             before + 1,
             "should record a terminal-success event"
         );
+    }
+
+    /// B3 review: terminal success reinforced every result the last query
+    /// SHOWED, which gave shown-only noise the session floor through the
+    /// back door. It now reinforces only the results the agent then used.
+    #[test]
+    fn terminal_success_reinforces_only_results_the_agent_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let tracker = nestweaver_engine::InteractionTracker::new(&db_path);
+        record_interaction(
+            &tracker,
+            "brain_context",
+            &json!({ "seeds": ["AuthService"] }),
+            &json!({ "connected": [
+                { "uid": "sym:used", "kind": "Symbol" },
+                { "uid": "sym:shown", "kind": "Symbol" }
+            ] }),
+        );
+        record_interaction(
+            &tracker,
+            "read_symbols",
+            &json!({ "uid": "sym:used" }),
+            &json!({}),
+        );
+        maybe_record_terminal_success(&tracker);
+        tracker.flush().unwrap();
+        let score = |uid: &str| nestweaver_engine::interactions::load_node_score(&db_path, uid);
+        assert!(score("sym:used").unwrap().distinct_sessions >= 1);
+        assert_eq!(
+            score("sym:shown").map_or(0, |s| s.distinct_sessions),
+            0,
+            "a shown-only result must not be reinforced"
+        );
+
+        // Nothing used: no terminal success at all.
+        let tracker = nestweaver_engine::InteractionTracker::new(&db_path);
+        record_interaction(
+            &tracker,
+            "brain_context",
+            &json!({ "seeds": ["AuthService"] }),
+            &json!({ "connected": [{ "uid": "sym:shown", "kind": "Symbol" }] }),
+        );
+        record_interaction(&tracker, "hub_nodes", &json!({}), &json!({}));
+        let before = tracker.pending_count();
+        maybe_record_terminal_success(&tracker);
+        assert_eq!(tracker.pending_count(), before);
     }
 
     #[test]
