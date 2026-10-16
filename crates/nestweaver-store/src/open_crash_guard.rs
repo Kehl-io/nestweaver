@@ -157,6 +157,8 @@ mod imp {
     }
 }
 
+pub(crate) use imp::arm;
+
 /// The message the handler writes, built before the open.
 ///
 /// V2: "deterministic, not transient" and "delete this database" are only
@@ -206,5 +208,3 @@ mod crash_message_tests {
         assert!(contended.contains("/tmp/brain.lbug"), "{contended}");
     }
 }
-
-pub(crate) use imp::arm;
