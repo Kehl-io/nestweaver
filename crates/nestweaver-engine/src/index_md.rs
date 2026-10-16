@@ -1071,6 +1071,103 @@ pub(crate) fn record_vault_link_debt(
     });
 }
 
+/// V1: marks the rows [`record_vault_wikilink_debt`] writes, so
+/// [`clear_vault_wikilink_debt`] removes only its own rows and never another
+/// reason's (owed code links, an owed startup replay).
+const WATCHED_WIKILINK_DEBT_MARKER: &str = "brain watcher wikilinks not yet rebuilt";
+
+/// V1: a watched batch commits per-note transactions, so a failure between
+/// them can leave a note with its new sections and without its links. Every
+/// changed note and every link-rebuild source is recorded as owed BEFORE the
+/// first destructive write; startup replays owed paths and `brain status`
+/// discloses them. A path that already has an owed row keeps it.
+pub(crate) fn record_vault_wikilink_debt(
+    db_path: Option<&Path>,
+    vault_root: &Path,
+    paths: &[PathBuf],
+) {
+    let Some(db_path) = db_path else {
+        return;
+    };
+    if paths.is_empty() {
+        return;
+    }
+    let reason = format!(
+        "{WATCH_RECONCILIATION_PENDING_REASON}: {WATCHED_WIKILINK_DEBT_MARKER}; replayed on \
+         the next watcher retry or start"
+    );
+    let key = vault_root.to_string_lossy().into_owned();
+    update_skipped_notes_sidecar(db_path, |mut sidecar| {
+        let mut owed = sidecar
+            .reconciliation_pending
+            .remove(&key)
+            .unwrap_or_default();
+        let before = owed.len();
+        for path in paths {
+            let path = path.to_string_lossy().into_owned();
+            if !owed.iter().any(|row| row.path == path) {
+                owed.push(SkippedFile::new(
+                    path,
+                    SkipReasonCode::Other,
+                    reason.clone(),
+                ));
+            }
+        }
+        let changed = owed.len() != before;
+        owed.sort_by(|a, b| a.path.cmp(&b.path));
+        sidecar.reconciliation_pending.insert(key, owed);
+        changed.then(|| {
+            build_skipped_notes_sidecar(
+                &sidecar.skipped,
+                &sidecar.notes_near_size_limit,
+                sidecar.unindexable_mtimes,
+                sidecar.reconciliation_pending,
+                sidecar.frontmatter_unparsed,
+            )
+        })
+    });
+}
+
+/// V1: settle the rows [`record_vault_wikilink_debt`] wrote for `paths`, once
+/// the batch's link loop has completed. Other reasons' rows stay.
+pub(crate) fn clear_vault_wikilink_debt(
+    db_path: Option<&Path>,
+    vault_root: &Path,
+    paths: &[PathBuf],
+) {
+    let Some(db_path) = db_path else {
+        return;
+    };
+    if paths.is_empty() {
+        return;
+    }
+    let key = vault_root.to_string_lossy().into_owned();
+    let settled: HashSet<String> = paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    update_skipped_notes_sidecar(db_path, |mut sidecar| {
+        let entries = sidecar.reconciliation_pending.get_mut(&key)?;
+        let before = entries.len();
+        entries.retain(|row| {
+            !(settled.contains(&row.path) && row.reason.contains(WATCHED_WIKILINK_DEBT_MARKER))
+        });
+        if entries.len() == before {
+            return None;
+        }
+        if entries.is_empty() {
+            sidecar.reconciliation_pending.remove(&key);
+        }
+        Some(build_skipped_notes_sidecar(
+            &sidecar.skipped,
+            &sidecar.notes_near_size_limit,
+            sidecar.unindexable_mtimes,
+            sidecar.reconciliation_pending,
+            sidecar.frontmatter_unparsed,
+        ))
+    });
+}
+
 /// nw-664: set the CODE watcher's reconciliation debt for `repo_root` to
 /// `owed` (absolute paths, reasons built by the watcher; empty clears it).
 /// Namespaced apart from any vault at the same root.
@@ -2994,7 +3091,7 @@ fn index_markdown_since_with_reader_mode(
     } else {
         let publication =
             crate::manifest::begin_graph_mutation_publication(store, "incremental vault refresh")?;
-        plan.commit(store, true)?;
+        plan.commit(store, true, "atomic incremental vault refresh")?;
         publication.finish(true)?
     };
     // nw-587: the refresh route registers too (as does its no-change early
@@ -3024,6 +3121,27 @@ fn index_markdown_since_with_reader_mode(
     })
 }
 
+/// V1: attempts for one watched-batch transaction that collides with another
+/// writer's transaction (25 ms doubling to 1 s: about 3.6 s in all).
+const WATCHED_COMMIT_ATTEMPTS: u32 = 8;
+
+/// V1: whether `error` is LadybugDB refusing a second concurrent write
+/// transaction, a transient condition that clears when the other one ends.
+pub(crate) fn is_write_transaction_collision(error: &anyhow::Error) -> bool {
+    nestweaver_store::classify_transient_condition(&format!("{error:#}"))
+        == Some(nestweaver_store::TransientCondition::WriteTransactionCollision)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test failpoint (V1): fail a watched batch between its two loops.
+    pub(crate) static FAIL_AFTER_FIRST_WATCHED_LOOP: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Test override (V1) of [`WATCHED_COMMIT_ATTEMPTS`].
+    pub(crate) static WATCHED_COMMIT_ATTEMPTS_OVERRIDE: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Fully prepared before the first destructive write. The ordinary refresh
 /// commits it atomically; watching preserves per-file admission fairness and
 /// reconciles affected source links only after all target identities exist.
@@ -3051,7 +3169,12 @@ struct VaultRefreshPlan {
 }
 
 impl VaultRefreshPlan {
-    fn commit(&self, store: &GraphStore, prune_tags: bool) -> Result<(), anyhow::Error> {
+    fn commit(
+        &self,
+        store: &GraphStore,
+        prune_tags: bool,
+        context: &'static str,
+    ) -> Result<(), anyhow::Error> {
         let note_links: Vec<_> = self
             .wikilink_to_note
             .iter()
@@ -3085,7 +3208,7 @@ impl VaultRefreshPlan {
                 &string_edge_refs(&self.project_note_edges),
                 prune_tags,
             )
-            .context("atomic incremental vault refresh")
+            .context(context)
     }
 
     fn empty(&self) -> Self {
@@ -3117,6 +3240,14 @@ impl VaultRefreshPlan {
         store: &GraphStore,
         lease: &WatchLeaseAcquirer<'_>,
     ) -> Result<(), anyhow::Error> {
+        // V1: the batch is many transactions, not one. Record every path it
+        // will touch as owed before the first destructive write, and settle
+        // them only once the link loop has completed, so a failure between
+        // transactions is replayed (startup and the watcher retry replay owed
+        // paths) and disclosed instead of silently stranding a note.
+        let vault_root = Path::new(&self.vault.root_path);
+        let owed_paths = self.watched_note_paths(store)?;
+        record_vault_wikilink_debt(store.db_path(), vault_root, &owed_paths);
         // Each transaction installs a complete note, and can yield to another
         // admitted writer before the next file. No source reads under the gate.
         let mut changed: Vec<_> = self
@@ -3127,8 +3258,19 @@ impl VaultRefreshPlan {
             .collect();
         changed.sort();
         changed.dedup();
+        // V1: a note's own outbound links go in with it, except links to a
+        // note of this batch that is not installed yet: its own transaction
+        // DETACH-deletes and reinstalls it, which would drop the edge. Those
+        // few wait for the link loop below.
+        let mut uninstalled: HashSet<String> = changed.iter().cloned().collect();
+        let heading_notes: HashMap<&str, &str> = self
+            .headings
+            .iter()
+            .map(|h| (h.uid.as_str(), h.note_uid.as_str()))
+            .collect();
         let mut inserted_tags = HashSet::new();
         for uid in changed {
+            uninstalled.remove(&uid);
             let mut part = self.empty();
             part.delete_note_uids = self
                 .delete_note_uids
@@ -3216,11 +3358,45 @@ impl VaultRefreshPlan {
                 .filter(|(_, n)| *n == uid)
                 .cloned()
                 .collect();
+            let installed = |target: &str| !uninstalled.contains(target);
+            part.wikilink_to_note = self
+                .wikilink_to_note
+                .iter()
+                .filter(|(s, t, ..)| sections.contains(s.as_str()) && installed(t))
+                .cloned()
+                .collect();
+            part.wikilink_to_heading = self
+                .wikilink_to_heading
+                .iter()
+                .filter(|(s, t, ..)| {
+                    sections.contains(s.as_str())
+                        && heading_notes
+                            .get(t.as_str())
+                            .is_none_or(|note| installed(note))
+                })
+                .cloned()
+                .collect();
+            part.unresolved = self
+                .unresolved
+                .iter()
+                .filter(|(_, n, ..)| *n == uid)
+                .cloned()
+                .collect();
+            part.typed_edges = self
+                .typed_edges
+                .iter()
+                .filter(|e| e.source_uid == uid && installed(&e.target_uid))
+                .cloned()
+                .collect();
             let _lease = lease()?;
             // Orphan cleanup is deferred: a later prepared note may reuse a
             // preexisting tag not included in its new-tag insertion list.
-            part.commit(store, false)?;
+            part.commit_watched_part(store)?;
             inserted_tags.extend(part.tags.iter().map(|tag| tag.uid.clone()));
+        }
+        #[cfg(test)]
+        if FAIL_AFTER_FIRST_WATCHED_LOOP.with(|fail| fail.replace(false)) {
+            anyhow::bail!("injected failure after the first watched loop");
         }
         // Unchanged affected sources retain their own nodes and tags. Replace
         // just their outgoing relationship rows, one source transaction at a time.
@@ -3257,9 +3433,74 @@ impl VaultRefreshPlan {
                 .cloned()
                 .collect();
             let _lease = lease()?;
-            part.commit(store, false)?;
+            part.commit_watched_part(store)?;
         }
+        clear_vault_wikilink_debt(store.db_path(), vault_root, &owed_paths);
         Ok(())
+    }
+
+    /// Absolute paths of every note this watched batch writes: changed and
+    /// removed notes, and the unchanged sources whose links it rebuilds.
+    fn watched_note_paths(&self, store: &GraphStore) -> Result<Vec<PathBuf>, anyhow::Error> {
+        let vault_root = Path::new(&self.vault.root_path);
+        let mut relative: HashSet<String> =
+            self.notes.iter().map(|n| n.file_path.clone()).collect();
+        let known: HashSet<&str> = self.notes.iter().map(|n| n.uid.as_str()).collect();
+        let mut lookup: Vec<String> = self
+            .delete_note_uids
+            .iter()
+            .chain(self.rebuild_link_source_uids.iter())
+            .filter(|uid| !known.contains(uid.as_str()))
+            .cloned()
+            .collect();
+        lookup.sort();
+        lookup.dedup();
+        if !lookup.is_empty() {
+            relative.extend(
+                store
+                    .lookup_notes_by_uids(&lookup)
+                    .context("look up the notes a watched batch rewrites")?
+                    .into_iter()
+                    .map(|n| n.file_path),
+            );
+        }
+        let mut paths: Vec<PathBuf> = relative.iter().map(|p| vault_root.join(p)).collect();
+        paths.sort();
+        Ok(paths)
+    }
+
+    /// One watched-batch transaction. V1: LadybugDB allows one write
+    /// transaction at a time, so a writer outside the gate can make `BEGIN`
+    /// fail; that is retried with backoff rather than ending the watcher.
+    fn commit_watched_part(&self, store: &GraphStore) -> Result<(), anyhow::Error> {
+        let mut delay = std::time::Duration::from_millis(25);
+        let mut attempt = 1;
+        #[cfg(test)]
+        let max_attempts = WATCHED_COMMIT_ATTEMPTS_OVERRIDE
+            .with(std::cell::Cell::get)
+            .unwrap_or(WATCHED_COMMIT_ATTEMPTS);
+        #[cfg(not(test))]
+        let max_attempts = WATCHED_COMMIT_ATTEMPTS;
+        loop {
+            match self.commit(
+                store,
+                false,
+                "watched vault refresh (per-note transactions)",
+            ) {
+                Err(error) if attempt < max_attempts && is_write_transaction_collision(&error) => {
+                    tracing::warn!(
+                        attempt,
+                        retry_in_ms = delay.as_millis() as u64,
+                        error = %format_args!("{error:#}"),
+                        "watched vault transaction collided with another writer; retrying"
+                    );
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(std::time::Duration::from_secs(1));
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
     }
 }
 

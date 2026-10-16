@@ -1500,9 +1500,30 @@ fn note_watcher_exit(state: &DaemonState, kind: &str, error: Option<String>) {
         "{kind} watcher exited and is no longer indexing edits: {error}. \
          Restart watching; later edits stay unindexed until it is running again."
     );
+    if let Ok(mut slot) = state.last_watcher_failure.lock() {
+        *slot = Some(serde_json::json!({
+            "kind": kind,
+            "at_unix_seconds": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or_default(),
+            "error": error,
+        }));
+    }
     if let Ok(mut slot) = state.watcher_failure.lock() {
         *slot = Some(message);
     }
+}
+
+/// V1: the last watcher failure, whether or not a watcher has recovered
+/// since. `null` when none failed during this daemon's life.
+fn last_watcher_failure_json(state: &DaemonState) -> serde_json::Value {
+    state
+        .last_watcher_failure
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .unwrap_or(serde_json::Value::Null)
 }
 
 fn clear_watcher_failure(state: &DaemonState) {
@@ -2384,6 +2405,11 @@ pub struct DaemonState {
     /// does not set it, which is why a dead watcher used to vanish with no
     /// warning.
     pub watcher_failure: std::sync::Mutex<Option<String>>,
+    /// V1: the most recent watcher failure, kept after a replacement watcher
+    /// comes up. `watcher_failure` above is cleared on readiness, which is
+    /// right for "is a watcher dead NOW", but it erased the only record of
+    /// the 10-15 failure about a second after it happened.
+    pub last_watcher_failure: std::sync::Mutex<Option<serde_json::Value>>,
     /// Monotonic id source for [`WatcherRegistration`]s.
     pub next_watcher_id: std::sync::atomic::AtomicU64,
     /// Parsed `nestweaver-instance.toml` if `--config` was supplied at
@@ -10113,6 +10139,7 @@ impl NestWeaverDaemon for DaemonService {
             value["watcher"] = watcher_status_json(&self.state);
             disclose_watcher_failure(&mut value, watcher_failure_message(&self.state).as_deref());
             disclose_manifest_recovery(&mut value, &self.state.manifest_recovery.status());
+            value["last_watcher_failure"] = last_watcher_failure_json(&self.state);
             value["watcher_pid"] =
                 serde_json::json!(watcher_status(&self.state).and_then(|w| w.controller_pid));
             value["supervision"] =
@@ -15098,6 +15125,7 @@ pub async fn run_server(
         shutdown_tx: shutdown_tx.clone(),
         watcher_stop: std::sync::Mutex::new(None),
         watcher_failure: std::sync::Mutex::new(None),
+        last_watcher_failure: std::sync::Mutex::new(None),
         next_watcher_id: std::sync::atomic::AtomicU64::new(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -25714,6 +25742,7 @@ repos = ["alpha"]
             shutdown_tx,
             watcher_stop: std::sync::Mutex::new(None),
             watcher_failure: std::sync::Mutex::new(None),
+            last_watcher_failure: std::sync::Mutex::new(None),
             next_watcher_id: std::sync::atomic::AtomicU64::new(0),
             instance_cfg: None,
             effective_config: EffectiveConfigProvenance::CompiledDefaults,
@@ -26077,6 +26106,38 @@ repos = ["alpha"]
         );
     }
 
+    /// V1: the dead-watcher warning is cleared when a replacement becomes
+    /// ready, and that erased the only record of the production failure. The
+    /// last failure stays visible after the restart, with its full chain.
+    #[test]
+    fn the_last_watcher_failure_stays_visible_after_a_restart() {
+        let state = test_state_with_writer();
+        super::note_watcher_exit(
+            &state,
+            "vault",
+            Some(
+                "watched vault refresh (per-note transactions): Cannot start a new write \
+                 transaction"
+                    .to_string(),
+            ),
+        );
+        assert!(super::watcher_failure_message(&state).is_some());
+        super::clear_watcher_failure(&state);
+        assert!(
+            super::watcher_failure_message(&state).is_none(),
+            "no watcher is dead now"
+        );
+        let last = super::last_watcher_failure_json(&state);
+        assert_eq!(last["kind"], "vault");
+        let error = last["error"].as_str().unwrap();
+        assert!(error.contains("watched vault refresh"), "{error}");
+        assert!(
+            error.contains("Cannot start a new write transaction"),
+            "{error}"
+        );
+        assert!(last["at_unix_seconds"].as_u64().unwrap() > 0);
+    }
+
     /// D3: a capture that runs out of its budget defers the whole snapshot as
     /// contention. It refuses no repository and names no `index --repo`
     /// remedy, and `brain status` shows the deferred runtime state.
@@ -26262,6 +26323,7 @@ credential_method = "gh"
             shutdown_tx,
             watcher_stop: std::sync::Mutex::new(None),
             watcher_failure: std::sync::Mutex::new(None),
+            last_watcher_failure: std::sync::Mutex::new(None),
             next_watcher_id: std::sync::atomic::AtomicU64::new(0),
             instance_cfg: None,
             effective_config: EffectiveConfigProvenance::CompiledDefaults,

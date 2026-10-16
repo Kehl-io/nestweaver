@@ -11036,7 +11036,7 @@ pub fn brain_status_json(
         .map(nestweaver_engine::manifest::manifest_failures_json)
         .unwrap_or_else(|| json!([]));
 
-    Ok(json!({
+    let mut status = json!({
         // `db` and `instance_ids` were direct-path-only keys; the daemon
         // path gains them additively so both paths serve one schema.
         "db": db_path.as_ref().map(|p| p.display().to_string()),
@@ -11117,7 +11117,13 @@ pub fn brain_status_json(
         // component was bypassed. The direct fallback sets
         // ["daemon_runtime"] via `mark_brain_status_daemon_bypassed`.
         "degraded_components": Vec::<String>::new(),
-    }))
+    });
+    // D3 / V1: the manifest reconciler's runtime state and the last watcher
+    // failure live only in a serving daemon. Set outside the literal, which
+    // is at `json!`'s recursion limit.
+    status["manifest_recovery"] = Value::Null;
+    status["last_watcher_failure"] = Value::Null;
+    Ok(status)
 }
 
 /// Daemon-runtime fields of the `brain_status` document that only a live
@@ -11137,6 +11143,8 @@ pub const DAEMON_RUNTIME_STATUS_FIELDS: &[&str] = &[
     "search_status",
     "tantivy_available",
     "tantivy_doc_count",
+    "manifest_recovery",
+    "last_watcher_failure",
 ];
 
 /// The `degraded_components` marker for a `brain_status` answer that carries
