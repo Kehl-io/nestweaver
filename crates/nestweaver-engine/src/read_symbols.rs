@@ -475,16 +475,19 @@ pub fn resolve_spec_detailed(store: &GraphStore, spec: &str) -> SpecResolution {
                 qualifier_ignored: None,
             };
         }
+        // I5: a leading qualifier is dropped only when it cannot be a file.
+        // `nothere.ts::Svc::run` names a file that does not exist; answering
+        // it with another file's `Svc::run` reads the wrong code. It is not
+        // found, and `did_you_mean` offers the shorter reading first.
         let segments: Vec<&str> = spec.split("::").collect();
-        for drop in 1..segments.len() - 1 {
-            let reading = segments[drop..].join("::");
-            let symbols = store.lookup_symbols_by_spec(&reading).unwrap_or_default();
-            if !symbols.is_empty() {
-                return SpecResolution {
-                    symbols,
-                    qualifier_ignored: Some((segments[..drop].join("::"), reading)),
-                };
-            }
+        if segments.len() < 3 || qualifier_may_name_a_file(store, None, segments[0]) {
+            return SpecResolution::default();
+        }
+        if let Some((drop, reading, symbols)) = shorter_qualified_reading(store, &segments) {
+            return SpecResolution {
+                symbols,
+                qualifier_ignored: Some((segments[..drop].join("::"), reading)),
+            };
         }
         return SpecResolution::default();
     }
@@ -494,6 +497,44 @@ pub fn resolve_spec_detailed(store: &GraphStore, spec: &str) -> SpecResolution {
             .unwrap_or_default(),
         qualifier_ignored: None,
     }
+}
+
+/// I5: whether a spec's leading qualifier could name a file: it has a path
+/// separator or an extension, or some indexed file has it as its name or
+/// stem. Such a qualifier is never dropped. A bare word that names no file
+/// (a Rust module path such as `net::inner::send`) can be.
+fn qualifier_may_name_a_file(
+    store: &GraphStore,
+    table: Option<&nestweaver_store::SymbolNameTable>,
+    qualifier: &str,
+) -> bool {
+    if qualifier.contains(['/', '\\', '.']) {
+        return true;
+    }
+    let is_file = |_: &str, symbol: &Symbol| {
+        nestweaver_schema::file_qualifier_rank(qualifier, &symbol.file_path).map(|_| ())
+    };
+    match table {
+        Some(table) => !table.scan(is_file).is_empty(),
+        // Best effort: a failed lookup keeps the qualifier, the safe side.
+        None => store
+            .scan_symbol_names(is_file)
+            .map_or(true, |found| !found.is_empty()),
+    }
+}
+
+/// The first shorter reading of `segments` that is still qualified and names
+/// something, outermost qualifier first: `(segments dropped, reading,
+/// symbols)`.
+fn shorter_qualified_reading(
+    store: &GraphStore,
+    segments: &[&str],
+) -> Option<(usize, String, Vec<Symbol>)> {
+    (1..segments.len().saturating_sub(1)).find_map(|drop| {
+        let reading = segments[drop..].join("::");
+        let symbols = store.lookup_symbols_by_spec(&reading).unwrap_or_default();
+        (!symbols.is_empty()).then_some((drop, reading, symbols))
+    })
 }
 
 /// 12.1.1 (B1/M1): `did_you_mean` for the `not_found` specs of a read, merged
@@ -507,7 +548,7 @@ pub fn not_found_suggestions(store: &GraphStore, not_found: &[String]) -> Vec<St
         if spec.starts_with("sym:") {
             continue;
         }
-        let found = crate::did_you_mean::did_you_mean_candidates_with_table(
+        let mut found = crate::did_you_mean::did_you_mean_candidates_with_table(
             store,
             &mut table,
             spec,
@@ -517,6 +558,17 @@ pub fn not_found_suggestions(store: &GraphStore, not_found: &[String]) -> Vec<St
             tracing::warn!("did_you_mean_candidates lookup failed for '{spec}': {error:#}");
             Vec::new()
         });
+        // I5: a file-looking qualifier that names nothing is not dropped, so
+        // the shorter reading that does answer is offered first.
+        if nestweaver_schema::QualifiedSpec::parse(spec).is_some() {
+            let segments: Vec<&str> = spec.split("::").collect();
+            if qualifier_may_name_a_file(store, table.as_ref(), segments[0])
+                && let Some((_, reading, _)) = shorter_qualified_reading(store, &segments)
+            {
+                found.retain(|name| *name != reading);
+                found.insert(0, reading);
+            }
+        }
         for name in found {
             if names.len() == crate::did_you_mean::DID_YOU_MEAN_LIMIT {
                 return names;
@@ -1435,6 +1487,45 @@ app();
         };
         assert!(ignored.note.contains("'zzz'"), "{ignored:?}");
         assert!(ignored.note.contains("'Svc::run'"), "{ignored:?}");
+    }
+
+    /// I5: `nothere.ts::Svc::run` used to answer with another file's
+    /// `Svc::run`. A qualifier that could be a file (a separator, an
+    /// extension, or a real file's stem) is never dropped: the spec is not
+    /// found and the shorter reading is the first suggestion. A bare word
+    /// that names no file is still dropped, so module paths keep working.
+    #[test]
+    fn a_file_looking_qualifier_that_names_nothing_is_not_found() {
+        let (dir, store) = fixture_files(&[
+            ("a/svc.ts", "export class Svc { run() { return 1; } }\n"),
+            ("c.ts", "export function go() { return 2; }\n"),
+        ]);
+        let reader = FilesystemReader::new(dir.path());
+        let read = |spec: &str| read_symbols(&store, &[spec.to_string()], &reader, 0, None);
+
+        for spec in [
+            "nothere.ts::Svc::run",
+            "lib/nothere::Svc::run",
+            "c::Svc::run",
+        ] {
+            let res = read(spec);
+            assert!(res.symbols.is_empty(), "{spec}: {res:?}");
+            assert_eq!(res.not_found, [spec], "{res:?}");
+            assert!(res.qualifier_ignored.is_empty(), "{spec}: {res:?}");
+            assert_eq!(
+                res.did_you_mean.first().map(String::as_str),
+                Some("Svc::run"),
+                "{spec}: {res:?}"
+            );
+        }
+
+        // A bare word that names no file (a module-path segment) is dropped,
+        // as before.
+        for spec in ["zzz::Svc::run", "net::Svc::run"] {
+            let res = read(spec);
+            assert_eq!(res.symbols.len(), 1, "{spec}: {res:?}");
+            assert_eq!(res.qualifier_ignored.len(), 1, "{spec}: {res:?}");
+        }
     }
 
     /// nw-113 review: the owner is never a neighbour window; reading the
