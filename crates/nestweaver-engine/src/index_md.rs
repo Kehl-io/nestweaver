@@ -3122,7 +3122,9 @@ fn index_markdown_since_with_reader_mode(
 }
 
 /// V1: attempts for one watched-batch transaction that collides with another
-/// writer's transaction (25 ms doubling to 1 s: about 3.6 s in all).
+/// writer's transaction. The seven waits between them are 25, 50, 100, 200,
+/// 400, 800 and 1000 ms: 2575 ms in all. The write lease is released for each
+/// wait and taken again for the next attempt.
 const WATCHED_COMMIT_ATTEMPTS: u32 = 8;
 
 /// V1: whether `error` is LadybugDB refusing a second concurrent write
@@ -3388,10 +3390,9 @@ impl VaultRefreshPlan {
                 .filter(|e| e.source_uid == uid && installed(&e.target_uid))
                 .cloned()
                 .collect();
-            let _lease = lease()?;
             // Orphan cleanup is deferred: a later prepared note may reuse a
             // preexisting tag not included in its new-tag insertion list.
-            part.commit_watched_part(store)?;
+            part.commit_watched_part(store, lease)?;
             inserted_tags.extend(part.tags.iter().map(|tag| tag.uid.clone()));
         }
         #[cfg(test)]
@@ -3432,8 +3433,7 @@ impl VaultRefreshPlan {
                 .filter(|e| &e.source_uid == uid)
                 .cloned()
                 .collect();
-            let _lease = lease()?;
-            part.commit_watched_part(store)?;
+            part.commit_watched_part(store, lease)?;
         }
         clear_vault_wikilink_debt(store.db_path(), vault_root, &owed_paths);
         Ok(())
@@ -3469,10 +3469,16 @@ impl VaultRefreshPlan {
         Ok(paths)
     }
 
-    /// One watched-batch transaction. V1: LadybugDB allows one write
-    /// transaction at a time, so a writer outside the gate can make `BEGIN`
-    /// fail; that is retried with backoff rather than ending the watcher.
-    fn commit_watched_part(&self, store: &GraphStore) -> Result<(), anyhow::Error> {
+    /// One watched-batch transaction, under its own write lease. V1:
+    /// LadybugDB allows one write transaction at a time, so a writer outside
+    /// the gate can make `BEGIN` fail; that is retried with backoff rather
+    /// than ending the watcher. The lease is dropped before each backoff
+    /// sleep, so the wait does not block other admitted writers.
+    fn commit_watched_part(
+        &self,
+        store: &GraphStore,
+        lease: &WatchLeaseAcquirer<'_>,
+    ) -> Result<(), anyhow::Error> {
         let mut delay = std::time::Duration::from_millis(25);
         let mut attempt = 1;
         #[cfg(test)]
@@ -3482,11 +3488,15 @@ impl VaultRefreshPlan {
         #[cfg(not(test))]
         let max_attempts = WATCHED_COMMIT_ATTEMPTS;
         loop {
-            match self.commit(
-                store,
-                false,
-                "watched vault refresh (per-note transactions)",
-            ) {
+            let committed = {
+                let _lease = lease()?;
+                self.commit(
+                    store,
+                    false,
+                    "watched vault refresh (per-note transactions)",
+                )
+            };
+            match committed {
                 Err(error) if attempt < max_attempts && is_write_transaction_collision(&error) => {
                     tracing::warn!(
                         attempt,

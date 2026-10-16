@@ -5464,6 +5464,73 @@ mod tests {
         assert!(crate::index_md::vault_owed_note_paths(&fx.db_path, &fx.root).is_empty());
     }
 
+    /// V1 review (Minor 1): the backoff between collision retries used to
+    /// sleep while holding the write gate. Each attempt now takes the lease
+    /// and releases it before sleeping, so other admitted writers run.
+    #[test]
+    fn v1_collision_backoff_does_not_hold_the_write_lease() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct Held(Arc<AtomicBool>);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = serial_watcher_test();
+        let fx = v1_fixture();
+        let paths = v1_edit(&fx);
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        let held = Arc::new(AtomicBool::new(false));
+        let acquired = AtomicUsize::new(0);
+        let lease = || -> Result<Option<Box<dyn WatchMutationLease>>, anyhow::Error> {
+            held.store(true, Ordering::SeqCst);
+            acquired.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(Box::new(Held(Arc::clone(&held)))))
+        };
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let released_while_colliding = std::thread::scope(|scope| {
+            let store = &fx.store;
+            let held = Arc::clone(&held);
+            let holder = scope.spawn(move || {
+                let conn = store.begin_transaction().unwrap();
+                conn.query("MERGE (v:Vault {uid: 'v1-collision-holder'})")
+                    .unwrap();
+                held_tx.send(()).unwrap();
+                // Once the batch has taken the lease, watch for it being
+                // released while this transaction still blocks it.
+                let started = Instant::now();
+                let mut seen_held = false;
+                let mut released = false;
+                while started.elapsed() < Duration::from_millis(400) {
+                    let now = held.load(Ordering::SeqCst);
+                    seen_held |= now;
+                    released |= seen_held && !now;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                conn.query("ROLLBACK").unwrap();
+                released
+            });
+            held_rx.recv().unwrap();
+            let result = crate::index_md::refresh_watched_paths(
+                &fx.store,
+                &fx.root,
+                "default",
+                "test",
+                &paths,
+                &watcher.ignore_set,
+                watcher.note_limits,
+                &lease,
+            );
+            assert!(result.is_ok(), "{result:?}");
+            holder.join().unwrap()
+        });
+        assert!(
+            released_while_colliding,
+            "the lease was held across the backoff sleep"
+        );
+        assert!(acquired.load(Ordering::SeqCst) > paths.len());
+    }
+
     /// V1: when the other writer outlasts every retry, the batch's paths are
     /// owed and retried on the backoff; the watcher does not end.
     #[test]
