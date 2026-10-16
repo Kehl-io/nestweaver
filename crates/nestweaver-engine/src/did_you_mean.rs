@@ -11,7 +11,7 @@
 //! substring lookup that could drift apart on limit, ordering, or scoping.
 
 use nestweaver_schema::Symbol;
-use nestweaver_store::{GraphStore, SeedResolutionConfig};
+use nestweaver_store::{GraphStore, SeedResolutionConfig, SymbolNameTable};
 
 /// Bound on the number of suggested candidate names, per the nw-481 spec
 /// ("≤5 entries") and verdict ("`search_symbols_page(limit 5)`"). A named
@@ -86,6 +86,21 @@ pub fn did_you_mean_candidates(
     query: &str,
     keep: impl Fn(&Symbol) -> bool,
 ) -> Result<Vec<String>, anyhow::Error> {
+    let mut table = None;
+    did_you_mean_candidates_with_table(store, &mut table, query, keep)
+}
+
+/// [`did_you_mean_candidates`] over a symbol table fetched at most once and
+/// shared through `table` (I4): every stage (a named file's members, the
+/// substring search, edit distance) reads the same fetch, and a caller with
+/// several misses passes the same slot to all of them. Nothing is fetched for
+/// a query that is rejected before any lookup.
+pub fn did_you_mean_candidates_with_table(
+    store: &GraphStore,
+    table: &mut Option<SymbolNameTable>,
+    query: &str,
+    keep: impl Fn(&Symbol) -> bool,
+) -> Result<Vec<String>, anyhow::Error> {
     // nw-113: a qualified miss is searched by its last segment and answered
     // with `path::name` specs (`path::Container::name` for a member); any
     // other `:` form (a UID) gets nothing.
@@ -99,17 +114,26 @@ pub fn did_you_mean_candidates(
         return Ok(Vec::new());
     }
 
+    let table = match table {
+        Some(table) => table,
+        None => table.insert(
+            store
+                .symbol_name_table()
+                .map_err(|e| anyhow::anyhow!("symbol_name_table: {e}"))?,
+        ),
+    };
+
     // 12.1.1 (M4): `path::nosuch` is answered from that file's members, as
     // the CLI help promises.
     if let Some(spec) = qualified.as_ref() {
-        let members = file_member_suggestions(store, spec, &keep)?;
+        let members = file_member_suggestions(store, table, spec, &keep)?;
         if !members.is_empty() {
             return Ok(members);
         }
     }
 
-    let page = store
-        .search_symbols_by_name_page(
+    let page = table
+        .search_page(
             search,
             DID_YOU_MEAN_OVER_FETCH,
             &SeedResolutionConfig::default(),
@@ -136,7 +160,7 @@ pub fn did_you_mean_candidates(
         let already: std::collections::HashSet<String> =
             visible.iter().map(|s| s.uid.clone()).collect();
         visible.extend(
-            edit_distance_matches(store, search, &keep)?
+            edit_distance_matches(table, search, &keep)
                 .into_iter()
                 .filter(|s| !already.contains(&s.uid)),
         );
@@ -179,37 +203,35 @@ fn bounded_edit_distance(a: &[char], b: &[char], max: usize) -> Option<usize> {
 /// insensitively, closest first. Module owners never match: they are named
 /// only by `path::<module>`.
 fn edit_distance_matches(
-    store: &GraphStore,
+    table: &SymbolNameTable,
     name: &str,
     keep: &impl Fn(&Symbol) -> bool,
-) -> Result<Vec<Symbol>, anyhow::Error> {
+) -> Vec<Symbol> {
     let needle: Vec<char> = name.to_lowercase().chars().collect();
     let max = max_edit_distance(needle.len());
     if max == 0 {
-        return Ok(Vec::new());
+        return Vec::new();
     }
-    let mut found = store
-        .scan_symbol_names(|lower, symbol| {
-            // Cheap length bound first: most of the table is skipped here.
-            if symbol.is_module_owner()
-                || lower.chars().count().abs_diff(needle.len()) > max
-                || !keep(symbol)
-            {
-                return None;
-            }
-            let candidate: Vec<char> = lower.chars().collect();
-            bounded_edit_distance(&needle, &candidate, max)
-                .filter(|&distance| distance > 0)
-                .map(|distance| (distance, symbol.clone()))
-        })
-        .map_err(|e| anyhow::anyhow!("scan_symbol_names: {e}"))?;
+    let mut found = table.scan(|lower, symbol| {
+        // Cheap length bound first: most of the table is skipped here.
+        if symbol.is_module_owner()
+            || lower.chars().count().abs_diff(needle.len()) > max
+            || !keep(symbol)
+        {
+            return None;
+        }
+        let candidate: Vec<char> = lower.chars().collect();
+        bounded_edit_distance(&needle, &candidate, max)
+            .filter(|&distance| distance > 0)
+            .map(|distance| (distance, symbol.clone()))
+    });
     found.sort_by(|(da, a), (db, b)| {
         da.cmp(db)
             .then_with(|| a.name.cmp(&b.name))
             .then_with(|| a.file_path.cmp(&b.file_path))
     });
     found.truncate(DID_YOU_MEAN_OVER_FETCH);
-    Ok(found.into_iter().map(|(_, symbol)| symbol).collect())
+    found.into_iter().map(|(_, symbol)| symbol).collect()
 }
 
 /// 12.1.1 (M4): when `spec`'s first qualifier names a file, that file's
@@ -220,19 +242,18 @@ fn edit_distance_matches(
 /// when no file matches.
 fn file_member_suggestions(
     store: &GraphStore,
+    table: &SymbolNameTable,
     spec: &nestweaver_schema::QualifiedSpec<'_>,
     keep: &impl Fn(&Symbol) -> bool,
 ) -> Result<Vec<String>, anyhow::Error> {
     let qualifier = spec.qualifiers[0];
-    let mut members = store
-        .scan_symbol_names(|_, symbol| {
-            if symbol.is_module_owner() || !keep(symbol) {
-                return None;
-            }
-            nestweaver_schema::file_qualifier_rank(qualifier, &symbol.file_path)
-                .map(|rank| (rank, symbol.clone()))
-        })
-        .map_err(|e| anyhow::anyhow!("scan_symbol_names: {e}"))?;
+    let mut members = table.scan(|_, symbol| {
+        if symbol.is_module_owner() || !keep(symbol) {
+            return None;
+        }
+        nestweaver_schema::file_qualifier_rank(qualifier, &symbol.file_path)
+            .map(|rank| (rank, symbol.clone()))
+    });
     let Some(best) = members.iter().map(|(rank, _)| *rank).min() else {
         return Ok(Vec::new());
     };
@@ -353,12 +374,13 @@ pub fn qualified_seed_suggestions(
     keep: impl Fn(&Symbol) -> bool,
 ) -> Result<Vec<String>, anyhow::Error> {
     let mut names: Vec<String> = Vec::new();
+    let mut table = None;
     for seed in seeds {
         let seed = seed.trim();
         if seed.starts_with("sym:") || nestweaver_schema::QualifiedSpec::parse(seed).is_none() {
             continue;
         }
-        for name in did_you_mean_candidates(store, seed, &keep)? {
+        for name in did_you_mean_candidates_with_table(store, &mut table, seed, &keep)? {
             if names.len() == DID_YOU_MEAN_LIMIT {
                 return Ok(names);
             }
@@ -472,6 +494,55 @@ mod tests {
             did_you_mean_candidates(&store, "src/a/svc.ts::Svc::run", always_keep).unwrap();
         names.sort();
         assert_eq!(names, ["a/Svc.ts::Svc::run", "b.ts::Svc::run"]);
+    }
+
+    /// I4: a miss used to fetch the symbol table three times (a named
+    /// file's members, the substring search, edit distance), each a full
+    /// table scan during a publication. It now fetches once per call, and a
+    /// read with several misses fetches once for all of them.
+    #[test]
+    fn a_miss_fetches_the_symbol_table_once() {
+        let store = GraphStore::in_memory().unwrap();
+        for (uid, name) in [("s1", "helper"), ("s2", "resolve_trigram_policy")] {
+            store.insert_symbol(&symbol(uid, name, "repo:a")).unwrap();
+        }
+        let fetches = |run: &dyn Fn()| {
+            let before = nestweaver_store::symbol_table_fetches_on_this_thread();
+            run();
+            nestweaver_store::symbol_table_fetches_on_this_thread() - before
+        };
+        // All three stages run: a file qualifier naming nothing, then the
+        // substring search, then edit distance.
+        assert_eq!(
+            fetches(&|| {
+                did_you_mean_candidates(&store, "nope.js::helpr", always_keep).unwrap();
+            }),
+            1
+        );
+        assert_eq!(
+            fetches(&|| {
+                crate::read_symbols::not_found_suggestions(
+                    &store,
+                    &[
+                        "helpr".to_string(),
+                        "nope.js::resolve_trigram_polcy".to_string(),
+                        "other.rs::nothing".to_string(),
+                    ],
+                );
+            }),
+            1
+        );
+        assert_eq!(
+            fetches(&|| {
+                qualified_seed_suggestions(
+                    &store,
+                    &["a.js::helpr".to_string(), "b.js::helpr".to_string()],
+                    always_keep,
+                )
+                .unwrap();
+            }),
+            1
+        );
     }
 
     /// 12.1.1 (M4): a typo the substring search cannot see (a dropped or

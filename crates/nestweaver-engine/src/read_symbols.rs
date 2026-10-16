@@ -501,15 +501,22 @@ pub fn resolve_spec_detailed(store: &GraphStore, spec: &str) -> SpecResolution {
 /// effort: a lookup failure is logged and suggests nothing.
 pub fn not_found_suggestions(store: &GraphStore, not_found: &[String]) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
+    // I4: one symbol-table fetch for every not-found spec of the read.
+    let mut table = None;
     for spec in not_found {
         if spec.starts_with("sym:") {
             continue;
         }
-        let found = crate::did_you_mean::did_you_mean_candidates(store, spec, |_| true)
-            .unwrap_or_else(|error| {
-                tracing::warn!("did_you_mean_candidates lookup failed for '{spec}': {error:#}");
-                Vec::new()
-            });
+        let found = crate::did_you_mean::did_you_mean_candidates_with_table(
+            store,
+            &mut table,
+            spec,
+            |_| true,
+        )
+        .unwrap_or_else(|error| {
+            tracing::warn!("did_you_mean_candidates lookup failed for '{spec}': {error:#}");
+            Vec::new()
+        });
         for name in found {
             if names.len() == crate::did_you_mean::DID_YOU_MEAN_LIMIT {
                 return names;
