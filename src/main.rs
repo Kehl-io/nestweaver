@@ -3237,7 +3237,74 @@ fn print_json_not_found_suggesting(target_key: &str, target: &str, candidates: &
 /// [`render_dead_code_text`]: the daemon branch printed its response verbatim,
 /// so the output format tracked whether a daemon was running instead of the
 /// `--json` flag (nw-108).
+/// 12.1.1 (V4): how `investigate` reports a failure it can classify, on both
+/// routes. The answer is said ONCE (the daemon route used to print the tool's
+/// answer, then the same text again inside "investigate RPC failed: code:
+/// 'Internal error', message: ..."), and a caller's mistake is never labelled
+/// an internal error: an unresolved repo or unknown project is not found
+/// (exit 2), a malformed scope a usage error (exit 64). An index publication
+/// that is still failing closed keeps exit 1 and says to retry. `None` for
+/// anything else, which the caller propagates unchanged.
+fn report_investigate_failure(
+    error: &anyhow::Error,
+    json: bool,
+    scope: Option<&str>,
+) -> Option<i32> {
+    use nestweaver_engine::investigate::{InvestigateScopeError, InvestigateScopeErrorKind};
+    if error_is_unresolved_repo_filter(error) {
+        return Some(report_unresolved_repo_filter(error, json));
+    }
+    let message = daemon_application_error(error).unwrap_or_else(|| format!("{error:#}"));
+    let typed = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<InvestigateScopeError>())
+        .map(|typed| &typed.kind);
+    let scope_value = serde_json::json!(scope.unwrap_or("all"));
+    if let Some(envelope) = nestweaver_mcp::tools::not_found_envelope(error).or_else(|| {
+        matches!(
+            typed,
+            Some(InvestigateScopeErrorKind::UnknownProject { .. })
+        )
+        .then(|| json_not_found_payload("scope", &scope_value, Some(&message)))
+    }) {
+        if json {
+            println!("{envelope}");
+        }
+        eprintln!("{message}");
+        eprint_did_you_mean(&value_did_you_mean(&envelope));
+        return Some(EXIT_NOT_FOUND);
+    }
+    if error_is_invalid_tool_arguments(error)
+        || matches!(typed, Some(InvestigateScopeErrorKind::Malformed))
+    {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "error": "invalid arguments", "scope": scope_value, "message": message })
+            );
+        }
+        eprintln!("Error: {message}");
+        return Some(EXIT_USAGE);
+    }
+    if message.contains("index publication") {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "error": "publication_in_progress", "retryable": true, "message": message })
+            );
+        }
+        eprintln!("{message}");
+        return Some(EXIT_ERROR);
+    }
+    None
+}
+
 fn render_investigate_text(payload: &serde_json::Value) {
+    // 12.1.1 (V4): an answer served through a live watcher batch says so,
+    // like `brain context`.
+    if let Some(note) = publication_text_note(publication_from_wire(payload).as_ref()) {
+        println!("{note}");
+    }
     // nw-670 re-review R1: owed note->code links, stamped by the daemon or
     // (direct route) just before rendering.
     if let Some(pending) = code_links_from_wire(payload) {
@@ -24344,10 +24411,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // route where it was previously ignored.
                 args["no_embed"] = serde_json::json!(no_embed);
                 let answer = match try_hybrid_json_rpc(true, &db_path, None, "investigate", args) {
-                    Err(error) if error_is_unresolved_repo_filter(&error) => {
-                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    Err(error) => {
+                        match report_investigate_failure(&error, json, scope.as_deref()) {
+                            Some(code) => return Ok((code, None)),
+                            None => return Err(error),
+                        }
                     }
-                    other => other?,
+                    Ok(answer) => answer,
                 };
                 if let Some(value) = answer {
                     if json {
@@ -24380,10 +24450,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(token_budget),
                 None,
             ) {
-                Err(error) if error_is_unresolved_repo_filter(&error) => {
-                    return Ok((report_unresolved_repo_filter(&error, json), None));
-                }
-                other => other?,
+                Err(error) => match report_investigate_failure(&error, json, Some(&scope)) {
+                    Some(code) => return Ok((code, None)),
+                    None => return Err(error),
+                },
+                Ok(result) => result,
             };
             // Built unconditionally so text and JSON render from the SAME
             // payload, and so the daemon path can reuse the renderer (nw-108).
@@ -24391,6 +24462,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // nw-670 re-review R1: the direct route stamps what the daemon's
             // MCP seam would have.
             nestweaver_engine::code_links::stamp_code_links_disclosure(&db_path, &mut payload);
+            // 12.1.1 (V4): and the watcher-batch disclosure, like the seam.
+            nestweaver_engine::index_publication::stamp_watcher_batch_disclosure(
+                &db_path,
+                &mut payload,
+            );
             if json {
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {

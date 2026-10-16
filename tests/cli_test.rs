@@ -16291,3 +16291,69 @@ fn pr_impact_files_resolve_against_the_working_repo() {
     assert!(names.iter().any(|n| n == "betaOnly"), "{payload}");
     assert!(!names.iter().any(|n| n == "alphaOnly"), "{payload}");
 }
+
+/// 12.1.1 (V4): an `investigate` scope the caller got wrong is their
+/// mistake, said once: an unknown project is not found (exit 2), a malformed
+/// scope is a usage error (exit 64). Neither is labelled "Internal error".
+#[test]
+fn investigate_scope_mistakes_are_user_errors_said_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "function greetV4(name) { return name; }\ngreetV4('x');\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    let investigate = |scope: &str, json: bool| {
+        let mut cmd = nestweaver_cmd();
+        cmd.args(["investigate", "greetV4", "--scope", scope, "--db"])
+            .arg(&db_path)
+            .arg("--root")
+            .arg(&repo_dir);
+        if json {
+            cmd.arg("--json");
+        }
+        let output = cmd.output().unwrap();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    };
+
+    let (code, _, stderr) = investigate("project:no-such-project", false);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(!stderr.contains("Internal error"), "{stderr}");
+    assert_eq!(
+        stderr.matches("no project named 'no-such-project'").count(),
+        1,
+        "said once: {stderr}"
+    );
+    let (code, stdout, stderr) = investigate("project:no-such-project", true);
+    assert_eq!(code, Some(2), "{stderr}");
+    let payload: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(payload["error"], "not found", "{payload}");
+    assert_eq!(payload["scope"], "project:no-such-project", "{payload}");
+
+    let (code, _, stderr) = investigate("bogus", false);
+    assert_eq!(code, Some(64), "{stderr}");
+    assert!(!stderr.contains("Internal error"), "{stderr}");
+    assert_eq!(
+        stderr.matches("unknown scope 'bogus'").count(),
+        1,
+        "{stderr}"
+    );
+
+    // Counterweight: a valid scope still answers.
+    let (code, _, stderr) = investigate("all", false);
+    assert_eq!(code, Some(0), "{stderr}");
+}

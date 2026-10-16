@@ -732,13 +732,39 @@ pub fn load_bundle(db_path: &Path, bundle_id: &str) -> Option<Bundle> {
 /// `RankingUnavailable` is what makes `investigate` produce the identical
 /// TRANSIENT/WEDGED message `context` produces rather than a near-miss of it.
 /// An in-memory store has no marker and is never dirty, so this is inert there.
+///
+/// 12.1.1 (V4): the gate is the one every other ranked read uses,
+/// [`GraphStore::index_publication_blocks_ranking`]. A live watcher batch (or
+/// code-link reconcile) does not block it, so `investigate` answers through
+/// one with the dispatch seam's `publication_in_progress` disclosure, like
+/// `brain context` and `project-context`, instead of failing closed for the
+/// whole debounced window. A full index publication still fails closed.
 fn ensure_ranking_publication_clean(store: &GraphStore) -> Result<(), anyhow::Error> {
-    if store.is_index_publication_dirty() {
+    if store.index_publication_blocks_ranking() {
         return Err(anyhow::anyhow!(
             nestweaver_store::StoreError::RankingUnavailable
         ));
     }
     Ok(())
+}
+
+/// The generation an investigation is bracketed by, so a bundle never mixes
+/// entries from two graph generations.
+///
+/// 12.1.1 (V4): outside a publication this is the durable published
+/// generation, exactly as before. During a live watcher batch or code-link
+/// reconcile (the windows [`ensure_ranking_publication_clean`] lets through)
+/// the durable sidecar is mid-publication and the writer holds the lease, so
+/// the in-process generation counter is used instead: it moves on every
+/// commit, so an investigation that straddles one is still refused (with a
+/// retry), and one that does not is consistent and answers.
+fn investigation_generation_snapshot(
+    store: &GraphStore,
+) -> Result<u64, nestweaver_store::StoreError> {
+    if store.is_index_publication_dirty() && !store.index_publication_blocks_ranking() {
+        return Ok(store.graph_generation());
+    }
+    store.clean_published_generation_snapshot()
 }
 
 fn completed_publication_during_investigate(error: nestweaver_store::StoreError) -> anyhow::Error {
@@ -803,9 +829,8 @@ pub fn investigate(
     //    about the RESULT can reject both. The only thing they share is the
     //    condition, so the condition is what is tested.
     ensure_ranking_publication_clean(store)?;
-    let initial_publication_generation = store
-        .clean_published_generation_snapshot()
-        .map_err(anyhow::Error::new)?;
+    let initial_publication_generation =
+        investigation_generation_snapshot(store).map_err(anyhow::Error::new)?;
 
     // 1. Resolve scope into the seed inputs and an optional post-filter.
     let (seed_inputs, scope_filter) = resolve_scope(store, query, scope)?;
@@ -1186,8 +1211,7 @@ pub fn investigate(
     // read and immediately before making the mixed result durable. Refuse
     // before `update_bundle_store` so a retry cannot discover a bundle whose
     // entries came from different graph generations.
-    let final_publication_generation = store
-        .clean_published_generation_snapshot()
+    let final_publication_generation = investigation_generation_snapshot(store)
         .map_err(completed_publication_during_investigate)?;
     if final_publication_generation != initial_publication_generation {
         return Err(completed_publication_during_investigate(
@@ -1472,6 +1496,36 @@ enum ScopeFilter {
     },
 }
 
+/// 12.1.1 (V4): a `scope` the caller got wrong. Typed, so every transport
+/// reports it as the caller's mistake (not found, or a usage error) rather
+/// than as an internal failure.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct InvestigateScopeError {
+    pub kind: InvestigateScopeErrorKind,
+    pub message: String,
+}
+
+/// What was wrong with an `investigate` scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvestigateScopeErrorKind {
+    /// `project:<name>` names no project.
+    UnknownProject { name: String },
+    /// Not `project:<name>`, `repo:<name>`, `vault` or `all`, or an empty
+    /// `project:` name.
+    Malformed,
+}
+
+impl InvestigateScopeError {
+    fn malformed(message: String) -> anyhow::Error {
+        Self {
+            kind: InvestigateScopeErrorKind::Malformed,
+            message,
+        }
+        .into()
+    }
+}
+
 /// Strip a `project:`/`repo:` scope prefix case-insensitively (so
 /// `Project:Foo` / `REPO:x` resolve the same as their lowercase spellings,
 /// matching the already case-insensitive `vault`/`all` and project/repo name
@@ -1528,12 +1582,19 @@ fn resolve_scope(
     if let Some(slug) = strip_scope_prefix(scope, "project:") {
         let slug = slug.trim();
         if slug.is_empty() {
-            anyhow::bail!("invalid scope '{scope}': 'project:' requires a project name");
+            return Err(InvestigateScopeError::malformed(format!(
+                "invalid scope '{scope}': 'project:' requires a project name"
+            )));
         }
         let project = store
             .lookup_project_by_name(slug)
             .map_err(|e| anyhow::anyhow!("lookup project '{slug}': {e}"))?
-            .ok_or_else(|| anyhow::anyhow!("unknown scope '{scope}': no project named '{slug}'"))?;
+            .ok_or_else(|| InvestigateScopeError {
+                kind: InvestigateScopeErrorKind::UnknownProject {
+                    name: slug.to_string(),
+                },
+                message: format!("unknown scope '{scope}': no project named '{slug}'"),
+            })?;
         // Recorded as a MEMBER SET, not just seeded: a note UID here is also
         // seeded (below) so it is a first-class retrieval hit, but membership
         // is what `node_in_scope` tests against — a note that reaches
@@ -1572,9 +1633,9 @@ fn resolve_scope(
         return Ok((seeds, Some(ScopeFilter::Repos(matches))));
     }
 
-    anyhow::bail!(
+    Err(InvestigateScopeError::malformed(format!(
         "unknown scope '{scope}': expected 'project:<name>', 'repo:<name>', 'vault', or 'all'"
-    )
+    )))
 }
 
 /// nw-476 (quality review). How many of a multi-word query's UNIQUE
@@ -3276,6 +3337,74 @@ mod tests {
             format!("{error:#}").contains("index publication"),
             "got: {error:#}"
         );
+    }
+
+    /// 12.1.1 (V4): a live watcher batch (young marker, write lease held)
+    /// does not block ranking, so `investigate` answers through it like
+    /// `brain context` and `project-context` do, with the disclosure the
+    /// dispatch seam stamps, instead of failing closed. Counterweight: a full
+    /// index publication still fails closed (the two tests above).
+    #[test]
+    fn a_live_watcher_batch_does_not_fail_an_investigation_closed() {
+        let (dir, db_path, store) = on_disk_store();
+        let _writer = nestweaver_store::acquire_db_write_lease(&db_path).unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        fs::write(
+            nestweaver_store::index_publication::marker_path(&db_path),
+            nestweaver_store::index_publication::format_marker_payload(
+                std::process::id(),
+                nanos,
+                Some(nestweaver_store::index_publication::MARKER_REASON_WATCHER_BATCH),
+            ),
+        )
+        .unwrap();
+        assert!(store.is_index_publication_dirty());
+        assert!(!store.index_publication_blocks_ranking());
+        let result = run(&store, &db_path, dir.path(), "greet")
+            .expect("a watcher batch answers with disclosure, not a closed failure");
+        assert!(!result.entries.is_empty());
+    }
+
+    /// 12.1.1 (V4): a scope naming no project, or a malformed scope, is the
+    /// caller's mistake: a typed error the transports report as not found or
+    /// as a usage error, never as an internal failure.
+    #[test]
+    fn scope_mistakes_are_typed_user_errors() {
+        let (dir, db_path, store) = on_disk_store();
+        let run_scope = |scope: &str| {
+            investigate(
+                &store,
+                None,
+                Some(&db_path),
+                dir.path(),
+                "greet",
+                scope,
+                Some(4000),
+                None,
+            )
+            .expect_err(scope)
+        };
+        let error = run_scope("project:no-such-project");
+        let typed = error
+            .downcast_ref::<InvestigateScopeError>()
+            .unwrap_or_else(|| panic!("{error:#}"));
+        assert!(
+            matches!(typed.kind, InvestigateScopeErrorKind::UnknownProject { ref name } if name == "no-such-project"),
+            "{typed:?}"
+        );
+        for scope in ["bogus", "project:"] {
+            let error = run_scope(scope);
+            let typed = error
+                .downcast_ref::<InvestigateScopeError>()
+                .unwrap_or_else(|| panic!("{scope}: {error:#}"));
+            assert!(
+                matches!(typed.kind, InvestigateScopeErrorKind::Malformed),
+                "{scope}: {typed:?}"
+            );
+        }
     }
 
     /// COUNTERWEIGHT. A clean publication must not trigger the guard on either

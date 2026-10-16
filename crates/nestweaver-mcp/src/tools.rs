@@ -19672,7 +19672,7 @@ fn arg_root_opt(args: &Value) -> Option<std::path::PathBuf> {
 fn tool_schema_investigate() -> Value {
     json!({
         "name": "investigate",
-        "description": "Orient on an unfamiliar topic in ONE call: runs hybrid PPR+BM25 retrieval, groups results into architectural domains, inlines high-confidence source bodies, and returns a token-budgeted map with a bundle_id for drill-down.\n\nGuidelines:\n- Use scope 'project:<slug>' or 'repo:<name>' to restrict; omit for unrestricted\n- Entries with is_seed: true are direct query/seed hits and are listed first; the rest are graph-connected neighbors\n- Under 'project:<slug>' scope ONLY: within the is_seed/connected groups, entries with matched_query: \"exact\" (query text or a token is a case-sensitive full match on the symbol's name) are pinned first, up to 5; matched_query: \"partial\" (substring match) is NOT pinned, it only gets a 5x fused-score boost and keeps its ranked position; every other entry follows in plain fused-score order. This exists because 'project:' seeds every member unconditionally, so a query naming one specific member symbol could otherwise lose to a flood of stronger-scoring member notes and never appear. An exact pin survives even on projects with 100+ members (it is rebuilt directly if the internal render cap would have dropped it) and exact names are looked up directly, so a path-deboosted test/mirror file is still pinned. Remaining misses are true name collisions beyond the resolver's cap of 5 exact matches. matched_query is never present under 'vault'/'repo:'/'all' scope, and is absent under 'project:' scope too when neither exact nor partial applies (most entries)\n- Drill into entries with investigate_expand (by asset_id) or fill all bodies with investigate_hydrate\n- Module owners (a file's top-level code) are never entries; investigate_expand labels an owner neighbour `path::<module>`\n- `returned`/`total`/`truncated` describe the map; `dropped_reasons` says WHICH cap cut. `token_budget` is recoverable by raising it; `retrieval_breadth` is an internal bound that is NOT — narrow the query or pass a scope instead. `more_available` counts only the token-budget loop\n\nLimitations:\n- Token budget hard-capped at 16000\n- Bundles expire 24h after creation",
+        "description": "Orient on an unfamiliar topic in ONE call: runs hybrid PPR+BM25 retrieval, groups results into architectural domains, inlines high-confidence source bodies, and returns a token-budgeted map with a bundle_id for drill-down.\n\nGuidelines:\n- Use scope 'project:<slug>' or 'repo:<name>' to restrict; omit for unrestricted\n- Entries with is_seed: true are direct query/seed hits and are listed first; the rest are graph-connected neighbors\n- Under 'project:<slug>' scope ONLY: within the is_seed/connected groups, entries with matched_query: \"exact\" (query text or a token is a case-sensitive full match on the symbol's name) are pinned first, up to 5; matched_query: \"partial\" (substring match) is NOT pinned, it only gets a 5x fused-score boost and keeps its ranked position; every other entry follows in plain fused-score order. This exists because 'project:' seeds every member unconditionally, so a query naming one specific member symbol could otherwise lose to a flood of stronger-scoring member notes and never appear. An exact pin survives even on projects with 100+ members (it is rebuilt directly if the internal render cap would have dropped it) and exact names are looked up directly, so a path-deboosted test/mirror file is still pinned. Remaining misses are true name collisions beyond the resolver's cap of 5 exact matches. matched_query is never present under 'vault'/'repo:'/'all' scope, and is absent under 'project:' scope too when neither exact nor partial applies (most entries)\n- Drill into entries with investigate_expand (by asset_id) or fill all bodies with investigate_hydrate\n- Module owners (a file's top-level code) are never entries; investigate_expand labels an owner neighbour `path::<module>`\n- `returned`/`total`/`truncated` describe the map; `dropped_reasons` says WHICH cap cut. `token_budget` is recoverable by raising it; `retrieval_breadth` is an internal bound that is NOT — narrow the query or pass a scope instead. `more_available` counts only the token-budget loop\n\nLimitations:\n- Token budget hard-capped at 16000\n- Bundles expire 24h after creation\n- `scope` naming no project is not_found (with `did_you_mean`); any other scope than `project:<name>`, `repo:<name>`, `vault` or `all` is invalid arguments\n- During a live `brain watcher batch` publication it answers with `publication_in_progress` disclosure, like brain_context; a full index publication, or one that commits mid-investigation, fails closed with a retry message",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -19747,8 +19747,38 @@ fn tool_investigate(
         scope,
         token_budget,
         embed_model,
-    )?;
+    )
+    .map_err(|error| investigate_scope_error(store, scope, error))?;
     Ok(serde_json::to_value(result)?)
+}
+
+/// 12.1.1 (V4): a scope the caller got wrong is reported as their mistake:
+/// an unknown project is a lookup miss (the not-found envelope, with project
+/// suggestions) and a malformed scope is invalid arguments (a usage error).
+/// Any other failure passes through unchanged.
+fn investigate_scope_error(store: &GraphStore, scope: &str, error: anyhow::Error) -> anyhow::Error {
+    use nestweaver_engine::investigate::{InvestigateScopeError, InvestigateScopeErrorKind};
+    let Some(typed) = error.downcast_ref::<InvestigateScopeError>() else {
+        return error;
+    };
+    match &typed.kind {
+        InvestigateScopeErrorKind::UnknownProject { name } => {
+            let projects = store.list_projects().unwrap_or_default();
+            target_not_found(
+                typed.message.clone(),
+                "scope",
+                json!(scope),
+                &project_did_you_mean(&projects, name)
+                    .into_iter()
+                    .map(|name| format!("project:{name}"))
+                    .collect::<Vec<_>>(),
+            )
+        }
+        InvestigateScopeErrorKind::Malformed => ToolArgumentsInvalid {
+            message: typed.message.clone(),
+        }
+        .into(),
+    }
 }
 
 fn tool_schema_investigate_expand() -> Value {
@@ -26702,6 +26732,43 @@ mod arg_alias_tests {
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("empty query"), "{err}");
+        }
+    }
+
+    /// 12.1.1 (V4): a scope naming no project is a lookup miss (the
+    /// not-found envelope keyed on `scope`), and a malformed scope is
+    /// invalid arguments. Neither is an internal failure.
+    #[test]
+    fn investigate_scope_mistakes_are_user_errors() {
+        let store = GraphStore::in_memory().unwrap();
+        let err = tool_investigate(
+            &store,
+            None,
+            json!({ "query": "greet", "scope": "project:no-such-project" }),
+            None,
+        )
+        .unwrap_err();
+        let envelope = not_found_envelope(&err).unwrap_or_else(|| panic!("{err:#}"));
+        assert_eq!(envelope["status"], "not_found", "{envelope}");
+        assert_eq!(envelope["scope"], "project:no-such-project", "{envelope}");
+        assert_eq!(
+            format!("{err:#}"),
+            "unknown scope 'project:no-such-project': no project named 'no-such-project'",
+            "said once"
+        );
+
+        for scope in ["bogus", "project:"] {
+            let err = tool_investigate(
+                &store,
+                None,
+                json!({ "query": "greet", "scope": scope }),
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                err.chain().any(|cause| cause.is::<ToolArgumentsInvalid>()),
+                "{scope}: {err:#}"
+            );
         }
     }
 }
