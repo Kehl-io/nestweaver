@@ -3629,6 +3629,18 @@ async fn watch_sigterm(state: Arc<DaemonState>) {
 /// Refuses when a watcher is already registered unless `force` — in
 /// which case the incumbent (possibly orphaned by a kill -9'd `watch` CLI)
 /// is stopped and replaced instead of failing new watch sessions forever.
+/// D4: log a watcher's exit error with its WHOLE chain. `%error` on an
+/// `anyhow::Error` prints only the outermost context, which hid the
+/// write-transaction collision behind "atomic incremental vault refresh".
+fn log_code_watcher_error(error: &anyhow::Error, watcher_id: u64) {
+    tracing::error!(error = %format_args!("{error:#}"), watcher_id, "code watcher exited with error");
+}
+
+/// D4: see [`log_code_watcher_error`].
+fn log_vault_watcher_error(error: &anyhow::Error, watcher_id: u64) {
+    tracing::error!(error = %format_args!("{error:#}"), watcher_id, "watcher exited with error");
+}
+
 fn register_watcher(
     state: &DaemonState,
     handle: nestweaver_engine::ShutdownHandle,
@@ -3957,9 +3969,7 @@ impl DaemonService {
             };
             match &result {
                 Ok(Ok(())) => tracing::info!(watcher_id, "code watcher exited cleanly"),
-                Ok(Err(error)) => {
-                    tracing::error!(%error, watcher_id, "code watcher exited with error")
-                }
+                Ok(Err(error)) => log_code_watcher_error(error, watcher_id),
                 Err(_) => tracing::error!(watcher_id, "code watcher thread panicked"),
             }
             note_watcher_exit(&state, "code", failure);
@@ -7299,7 +7309,7 @@ impl NestWeaverDaemon for DaemonService {
                 };
                 match &result {
                     Ok(Ok(())) => tracing::info!("watcher exited cleanly"),
-                    Ok(Err(error)) => tracing::error!(error = %error, "watcher exited with error"),
+                    Ok(Err(error)) => log_vault_watcher_error(error, watcher_id),
                     Err(_) => tracing::error!("watcher thread panicked"),
                 }
                 note_watcher_exit(&state, "vault", failure);
@@ -13014,6 +13024,55 @@ mod pass_pipeline_check_tests {
             assert!(result.unwrap().is_some());
         }
         assert_eq!(store_checks, 4);
+    }
+}
+
+#[cfg(test)]
+mod watcher_error_log_tests {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture(log: impl FnOnce()) -> String {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, log);
+        String::from_utf8(captured.0.lock().unwrap().clone()).unwrap()
+    }
+
+    fn chained() -> anyhow::Error {
+        anyhow::anyhow!("Cannot start a new write transaction")
+            .context("watched vault refresh (per-note transactions)")
+    }
+
+    #[test]
+    fn both_watcher_exit_lines_log_the_whole_error_chain() {
+        for line in [
+            capture(|| super::log_vault_watcher_error(&chained(), 7)),
+            capture(|| super::log_code_watcher_error(&chained(), 7)),
+        ] {
+            assert!(line.contains("watched vault refresh"), "{line}");
+            assert!(
+                line.contains("Cannot start a new write transaction"),
+                "inner cause missing: {line}"
+            );
+        }
     }
 }
 
