@@ -1472,8 +1472,8 @@ pub(crate) fn assert_wire_tool_contract(wire: &Value, full: &Value) {
 /// Keep a summary for every registered tool instead of clipping prose.
 fn compact_tool_description(name: &str) -> &'static str {
     match name {
-        "brain_context" => "Get ranked graph context.",
-        "code_context" => "Get ranked symbol context.",
+        "brain_context" => "Ranked code+note context; seeds may be path::name.",
+        "code_context" => "Ranked code context; owners read path::<module>.",
         "brain_search" => "Search notes and symbols.",
         "note_get" => "Read note bodies and metadata.",
         "backlinks" => "Find incoming note links.",
@@ -1483,9 +1483,9 @@ fn compact_tool_description(name: &str) -> &'static str {
         "prune_stale" => "Prune sources missing on disk.",
         "compact_embeddings" => "Reclaim deleted-node vectors.",
         "cross_repo_contracts" => "Find cross-repo symbol references.",
-        "brain_impact" => "Trace symbol dependents.",
+        "brain_impact" => "Trace dependents of a symbol (path::name ok).",
         "brain_guide" => "Generate a graph orientation guide.",
-        "flow_trace" => "Trace a symbol's callees.",
+        "flow_trace" => "Trace callees of a symbol (path::name ok).",
         "detect_changes" => "Assess changed-file impact.",
         "clusters" => "Group related code symbols.",
         "stale_check" => "Check graph freshness.",
@@ -1494,12 +1494,12 @@ fn compact_tool_description(name: &str) -> &'static str {
         "query_extensions" => "Query custom node metadata.",
         "brain_diff" => "Show changes since indexing.",
         "project_context" => "Get ranked project context.",
-        "dead_code" => "Review unreachable code.",
+        "dead_code" => "Review unreachable code; check coverage first.",
         "hub_nodes" => "Rank highly connected symbols.",
         "bridge_nodes" => "Find architectural chokepoints.",
         "blast_radius" => "Assess file-change blast radius.",
         "get_summary" => "Summarize symbols/files/clusters.",
-        "read_symbols" => "Read symbol source spans.",
+        "read_symbols" => "Read symbol source; path::name, path::<module>.",
         "regex_search" => "Search indexed text with regex.",
         "count_patterns" => "Count indexed regex matches.",
         "brain_broken_links" => "Find broken vault wikilinks.",
@@ -1860,8 +1860,14 @@ mod tool_schema_validation_tests {
         // This independent expected registry makes clipped prose, generic
         // punctuation fixes, missing tools, and unreviewed additions fail.
         let expected = [
-            ("brain_context", "Get ranked graph context."),
-            ("code_context", "Get ranked symbol context."),
+            (
+                "brain_context",
+                "Ranked code+note context; seeds may be path::name.",
+            ),
+            (
+                "code_context",
+                "Ranked code context; owners read path::<module>.",
+            ),
             ("brain_search", "Search notes and symbols."),
             ("note_get", "Read note bodies and metadata."),
             ("backlinks", "Find incoming note links."),
@@ -1871,9 +1877,12 @@ mod tool_schema_validation_tests {
             ("prune_stale", "Prune sources missing on disk."),
             ("compact_embeddings", "Reclaim deleted-node vectors."),
             ("cross_repo_contracts", "Find cross-repo symbol references."),
-            ("brain_impact", "Trace symbol dependents."),
+            (
+                "brain_impact",
+                "Trace dependents of a symbol (path::name ok).",
+            ),
             ("brain_guide", "Generate a graph orientation guide."),
-            ("flow_trace", "Trace a symbol's callees."),
+            ("flow_trace", "Trace callees of a symbol (path::name ok)."),
             ("detect_changes", "Assess changed-file impact."),
             ("clusters", "Group related code symbols."),
             ("stale_check", "Check graph freshness."),
@@ -1882,12 +1891,18 @@ mod tool_schema_validation_tests {
             ("query_extensions", "Query custom node metadata."),
             ("brain_diff", "Show changes since indexing."),
             ("project_context", "Get ranked project context."),
-            ("dead_code", "Review unreachable code."),
+            (
+                "dead_code",
+                "Review unreachable code; check coverage first.",
+            ),
             ("hub_nodes", "Rank highly connected symbols."),
             ("bridge_nodes", "Find architectural chokepoints."),
             ("blast_radius", "Assess file-change blast radius."),
             ("get_summary", "Summarize symbols/files/clusters."),
-            ("read_symbols", "Read symbol source spans."),
+            (
+                "read_symbols",
+                "Read symbol source; path::name, path::<module>.",
+            ),
             ("regex_search", "Search indexed text with regex."),
             ("count_patterns", "Count indexed regex matches."),
             ("brain_broken_links", "Find broken vault wikilinks."),
@@ -6930,7 +6945,7 @@ pub fn validate_brain_context_kinds(kinds: &[String]) -> Result<(), anyhow::Erro
 fn tool_schema_code_context() -> Value {
     json!({
         "name": "code_context",
-        "description": "Structural subgraph around seed SYMBOLS: personalized PageRank over the code graph alone. Returns the seeds plus the most relevant connected symbols, ranked.\n\nGuidelines:\n- Use when the question is about code structure — what surrounds this function, what is near this class\n- Seeds are symbol names, `sym:` UIDs, or `path::name` (`path::<module>` seeds a file's top-level code)\n- Module owners (`path::<module>`, a file's top-level code) rank after every real symbol; at most 3 are listed and the rest are counted in `module_owners_omitted` (absent when 0), their places refilled with lower-scored real symbols up to the limit\n\nLimitations:\n- CODE ONLY. It does not consider notes, tags, or wikilinks, and it does not resolve taxonomy aliases — use brain_context for the unified code+notes view\n- Relevance is PPR over the symbol graph, so scores are NOT comparable with brain_context's, which ranks over a different graph",
+        "description": "Structural subgraph around seed SYMBOLS: personalized PageRank over the code graph alone. Returns the seeds plus the most relevant connected symbols, ranked.\n\nGuidelines:\n- Use when the question is about code structure — what surrounds this function, what is near this class\n- Seeds are symbol names, `sym:` UIDs, or `path::name` (`path::<module>` seeds a file's top-level code); a qualified seed that names nothing is not_found with `did_you_mean` suggestions\n- Module owners (`path::<module>`, a file's top-level code) rank after every real symbol; at most 3 are listed and the rest are counted in `module_owners_omitted` (absent when 0), their places refilled with lower-scored real symbols up to the limit\n\nLimitations:\n- CODE ONLY. It does not consider notes, tags, or wikilinks, and it does not resolve taxonomy aliases — use brain_context for the unified code+notes view\n- Relevance is PPR over the symbol graph, so scores are NOT comparable with brain_context's, which ranks over a different graph",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -12913,7 +12928,7 @@ fn tool_brain_guide(store: &GraphStore, args: Value) -> Result<Value, anyhow::Er
 fn tool_schema_flow_trace() -> Value {
     json!({
         "name": "flow_trace",
-        "description": "Trace forward execution flow from a symbol: what it calls, what those call, and so on. Returns a tree of callees.\n\nGuidelines:\n- Best for tracing from entry points (main, request handlers) to understand execution paths\n- Every child carries `edge_type`: CALLS and IMPORTS are observed in code, CROSS_REPO_LINK is an INFERRED cross-repo link. A CROSS_REPO_LINK child is NOT an observed call — filter it out when you need a real execution path\n- Cycles are detected and pruned; use max_depth to control tree depth (default 10)\n- Classes are auto-expanded to their methods since classes have no direct CALLS edges\n- `symbol` accepts `path::name`, `Class::method` and `path::Class::method` (narrows by file and container together) and `path::<module>` (a file's top-level code, labelled by its file)\n\nLimitations:\n- For reverse dependencies ('what calls this?') use brain_impact instead\n- For general structural context use brain_context",
+        "description": "Trace forward execution flow from a symbol: what it calls, what those call, and so on. Returns a tree of callees.\n\nGuidelines:\n- Best for tracing from entry points (main, request handlers) to understand execution paths\n- Every child carries `edge_type`: CALLS and IMPORTS are observed in code, CROSS_REPO_LINK is an INFERRED cross-repo link. A CROSS_REPO_LINK child is NOT an observed call — filter it out when you need a real execution path\n- Cycles are detected and pruned; use max_depth to control tree depth (default 10)\n- Classes are auto-expanded to their methods since classes have no direct CALLS edges\n- `symbol` accepts `path::name`, `Class::method` and `path::Class::method` (narrows by file and container together) and `path::<module>` (a file's top-level code, labelled by its file); a miss is not_found with `did_you_mean` suggestions\n\nLimitations:\n- For reverse dependencies ('what calls this?') use brain_impact instead\n- For general structural context use brain_context",
         "inputSchema": {
             "type": "object",
             "properties": {

@@ -38,10 +38,15 @@ NestWeaver is a code intelligence knowledge graph. Use it instead of grep/find f
 - Read a vault note: note_get (by UID or title)
 - Investigate unfamiliar code: investigate → investigate_expand → investigate_hydrate
 
+## Naming symbols
+- Pass a UID, a name, path::name, Class::method or path::Class::method; path::<module> is a file's top-level code
+- A miss is not_found with did_you_mean suggestions; an ambiguous name lists candidates with file_path
+
 ## Query Efficiency
 - Always query the graph before reading source files
 - Filter with repos, tags, path_prefix, kinds for precision
 - Use response_format 'concise' unless you need full bodies
+- Cut answers say so (truncated*, body_truncated, output_budget.cuts); narrow the query rather than raising limit
 - In subagents/scripts: use CLI (nestweaver search --json) instead of MCP for fewer tokens
 
 ## Do NOT
@@ -51,11 +56,9 @@ NestWeaver is a code intelligence knowledge graph. Use it instead of grep/find f
 
 ## Server Mode
 When connected to a NestWeaver server (not a local daemon):
-- brain_status includes indexing_active, indexing_repo, queue_depth, and server_mode fields
-- brain_status also reports write_queue_depth (write RPCs blocked on the daemon write lock; distinct from queue_depth, which counts index jobs), write_holder, write_holder_seconds, and embedding_status.pass_* progress for an in-flight embedding pass
-- read_symbols may return empty bodies with a server_note explaining the bare-clone limitation
-- regex_search runs trigram-accelerated exact regex over the graph store — identical locally and on the server (it does NOT use Tantivy)
-- blast_radius returns two-tier results (local_impact + org_wide_impact) when upstream is available
+- brain_status adds indexing_active, indexing_repo, queue_depth, write_queue_depth, write_holder and server_mode
+- read_symbols may return empty bodies with a server_note (bare clones)
+- blast_radius returns local_impact + org_wide_impact when upstream is available
 - Results include _meta.sources indicating which data sources contributed";
 
 /// Canonical sidecar location for the Tantivy index. Lives next to the
@@ -939,6 +942,29 @@ fn extract_result_uids(result: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 12.1.1 (O1): the server instructions name the lookup forms and the
+    /// cut disclosures an agent cannot discover from the terse wire
+    /// summaries, and stay short enough that a client truncating
+    /// instructions at 2 KB keeps all of them.
+    #[test]
+    fn server_instructions_name_lookups_and_cut_disclosures() {
+        for needle in [
+            "path::name",
+            "Class::method",
+            "path::<module>",
+            "did_you_mean",
+            "body_truncated",
+            "output_budget",
+        ] {
+            assert!(SERVER_INSTRUCTIONS.contains(needle), "{needle}");
+        }
+        assert!(
+            SERVER_INSTRUCTIONS.len() <= 2048,
+            "{} bytes",
+            SERVER_INSTRUCTIONS.len()
+        );
+    }
 
     fn make_request(method: &str, id: u64, params: Value) -> protocol::Request {
         protocol::Request {
