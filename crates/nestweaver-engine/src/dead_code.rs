@@ -131,8 +131,9 @@ pub struct DeadCodeResult {
     /// `entry_points` and `module_owner_roots` count the scoped repos'
     /// roots only, so [`Self::coverage_is_complete`] reads this instead:
     /// whether the walk had any seed is a property of the walk, not of the
-    /// output filter.
-    #[serde(skip)]
+    /// output filter. Serialized (12.1.1 review), so a reader of the JSON
+    /// can tell "this scope owns no roots" from "the walk had no seed".
+    #[serde(default)]
     pub walk_roots: usize,
     /// Repo-scope disclosure — `None` for an unfiltered call, `Some` when the
     /// caller passed a `repos` filter (nw-479). See
@@ -419,6 +420,7 @@ pub fn serialize_dead_code_page(
         "coverage": if result.coverage_is_complete() && manifest_load_error.is_none() {"complete"} else {"degraded"},
         "undecodable_symbols": result.undecodable_symbols, "entry_points": result.entry_points,
         "module_owner_roots": result.module_owner_roots,
+        "walk_roots": result.walk_roots,
         "languages_without_entry_points": result.languages_without_entry_points,
         "min_confidence": request.min_confidence, "requested_min_confidence": request.min_confidence,
         "review_only": true, "high_confidence_available": false,
@@ -762,11 +764,13 @@ pub fn detect_dead_code_with_manifests_cancellable(
 /// scoped when `repos` is `Some` — they describe the repos the caller asked
 /// about, not the whole graph, which is what a caller scoping to one repo
 /// out of a monorepo actually wants to see (`scope.totals_population` on the
-/// result discloses this). `entry_points`/`languages_without_entry_points`
-/// stay whole-graph on purpose: they are coverage/health signals about the
-/// WALK, not the output, and a scoped repo can legitimately own zero of its
-/// own entry points (e.g. a library consumed only by an app in another
-/// repo) without that being a coverage gap for THIS repo's numbers.
+/// result discloses this). `entry_points` and `module_owner_roots` are scoped
+/// the same way (12.1.1, M2): they count the scoped repos' own roots.
+/// `walk_roots` and `languages_without_entry_points` stay whole-graph on
+/// purpose: they are coverage/health signals about the WALK, not the output,
+/// and a scoped repo can legitimately own zero of its own entry points (e.g.
+/// a library consumed only by an app in another repo) without that being a
+/// coverage gap for THIS repo's numbers.
 ///
 /// **The stale-resolver refusal (see `resolver_generation.rs`) stays
 /// whole-store, not scoped to `repos`, and is unaffected by this function**

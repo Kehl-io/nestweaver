@@ -16603,6 +16603,10 @@ mod dead_code_argument_contract_tests {
         assert_eq!(scoped["scope"]["totals_population"], "filtered", "{scoped}");
         assert_eq!(scoped["module_owner_roots"], 1, "{scoped}");
         assert_eq!(scoped["entry_points"], 0, "{scoped}");
+        // 12.1.1 review: the whole-graph walk's roots are in the JSON, scoped
+        // or not.
+        assert_eq!(all["walk_roots"], 4, "{all}");
+        assert_eq!(scoped["walk_roots"], 4, "{scoped}");
     }
 
     #[test]

@@ -5084,6 +5084,19 @@ mod affected_tests_rpc_payload_tests {
     }
 }
 
+/// Whether the dead-code walk had no seed at all, over a non-empty corpus:
+/// every symbol is then unreachable by construction. Reads `walk_roots`, the
+/// whole-graph root count (a `--repo` scope's own `entry_points` and
+/// `module_owner_roots` can both be 0 over a seeded walk). An older daemon
+/// that does not send `walk_roots` falls back to the two scoped counts.
+fn dead_code_walk_unseeded(payload: &serde_json::Value) -> bool {
+    let num = |k: &str| payload.get(k).and_then(|v| v.as_u64());
+    let walk_roots = num("walk_roots").unwrap_or_else(|| {
+        num("entry_points").unwrap_or(0) + num("module_owner_roots").unwrap_or(0)
+    });
+    walk_roots == 0 && num("total_symbols").unwrap_or(0) > 0
+}
+
 fn render_dead_code_text(payload: &serde_json::Value) {
     let num = |k: &str| payload.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
     let total = num("total_symbols");
@@ -5101,7 +5114,6 @@ fn render_dead_code_text(payload: &serde_json::Value) {
     // "N of M unreachable" believing M is the total. Printed on both branches
     // — "No dead code detected" over a short corpus is the worse of the two.
     let undecodable = num("undecodable_symbols");
-    let entry_points = num("entry_points");
     let coverage_note = || {
         // nw-500. FIRST, before any count, and on both branches: a manifest
         // sidecar that exists and cannot be read drops every
@@ -5138,12 +5150,8 @@ fn render_dead_code_text(payload: &serde_json::Value) {
         // `module_owner_roots`, not `entry_points`.
         // 12.1.1 (M2): with `--repo` both counts are the scoped repos' roots,
         // so a scoped repo reached only from another repo's roots reads 0/0
-        // over a seeded walk; `coverage` says whether the walk had a seed.
-        if entry_points == 0
-            && num("module_owner_roots") == 0
-            && total > 0
-            && payload.get("coverage").and_then(|v| v.as_str()) != Some("complete")
-        {
+        // over a seeded walk. Whether the WALK had a seed is `walk_roots`.
+        if dead_code_walk_unseeded(payload) {
             println!(
                 "Coverage DEGRADED: no entry point was found, so the reachability walk had \
                  no seed and every symbol below is unreachable BY CONSTRUCTION. This is not \
@@ -30167,6 +30175,39 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
             );
             assert!(!rendered.contains("delete this database"), "{rendered}");
         }
+    }
+
+    /// 12.1.1 review (M2): the "no entry point ... no seed" warning is about
+    /// the WALK, so it reads `walk_roots`. A `--repo` scope that owns no
+    /// roots over a seeded walk is not warned about; an unseeded walk is; an
+    /// older daemon's payload without `walk_roots` falls back to the counts.
+    #[test]
+    fn the_no_seed_warning_is_gated_on_walk_roots() {
+        let payload = |extra: serde_json::Value| {
+            let mut base = serde_json::json!({
+                "total_symbols": 10,
+                "entry_points": 0,
+                "module_owner_roots": 0,
+                "coverage": "degraded",
+            });
+            base.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            base
+        };
+        assert!(!dead_code_walk_unseeded(&payload(
+            serde_json::json!({ "walk_roots": 4 })
+        )));
+        assert!(dead_code_walk_unseeded(&payload(
+            serde_json::json!({ "walk_roots": 0 })
+        )));
+        assert!(dead_code_walk_unseeded(&payload(serde_json::json!({}))));
+        assert!(!dead_code_walk_unseeded(&payload(
+            serde_json::json!({ "entry_points": 1 })
+        )));
+        assert!(!dead_code_walk_unseeded(&payload(
+            serde_json::json!({ "walk_roots": 0, "total_symbols": 0 })
+        )));
     }
 
     /// V2 review: a transient phrase elsewhere in the chain no longer hides a
