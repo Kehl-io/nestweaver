@@ -671,8 +671,10 @@ impl<'a> StoreConnection<'a> {
         };
         let _admission =
             self.admit_native(mode, !statement.exclusive, statement.checkpoint, "execute")?;
+        // `exclusive` is `!is_read_only()` (or transaction control), already
+        // computed at prepare: no extra native call on the hot path.
         if let Some(gate) = self.native_admission
-            && !statement.inner.is_read_only()
+            && statement.exclusive
         {
             gate.observe_write("write statement");
         }
