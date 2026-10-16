@@ -219,6 +219,9 @@ pub struct ManifestRecoveryRuntime {
     status: std::sync::Mutex<ManifestRecoveryStatus>,
     pub wake: tokio::sync::Notify,
     pub changed: tokio::sync::watch::Sender<u64>,
+    /// D3: per repository, how many consecutive capture passes ran out of
+    /// that repository's own budget. Reset when the repository captures.
+    pub capture_overruns: std::sync::Mutex<HashMap<String, u32>>,
 }
 impl Default for ManifestRecoveryRuntime {
     fn default() -> Self {
@@ -232,6 +235,7 @@ impl Default for ManifestRecoveryRuntime {
             }),
             wake: tokio::sync::Notify::new(),
             changed: tokio::sync::watch::channel(0).0,
+            capture_overruns: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }

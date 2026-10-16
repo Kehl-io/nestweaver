@@ -26200,6 +26200,124 @@ repos = ["alpha"]
         assert!(status.get("warnings").is_none());
     }
 
+    /// D3 review: the per-repo budget had no pass-level cap, so the write
+    /// gate could be held for repos x 60 s x 2 captures. Every capture under
+    /// the gate now shares one pass budget, started once the gate is held.
+    #[tokio::test]
+    async fn the_write_gate_hold_is_bounded_by_the_pass_budget() {
+        use super::manifest_recovery::CaptureBudget;
+        let state = test_state_with_writer();
+        manifest_recovery_fixture(&state);
+        nestweaver_engine::manifest::mark_manifest_reconciliation_pending(
+            &state.db_path,
+            "repository index",
+        )
+        .unwrap();
+        // Each repo is slow but well inside its own budget; four captures
+        // under the gate (two repos, two captures) would take ~1.6 s.
+        // The capture before the gate has no pass budget, so it completes.
+        let mut budget = CaptureBudget::new(Duration::from_secs(60), Duration::from_millis(300));
+        for repo in ["repo:alpha", "repo:beta"] {
+            budget
+                .delays
+                .insert(repo.into(), Duration::from_millis(400));
+        }
+        let before = super::manifest_recovery::capture(&state, budget).unwrap();
+        let guard = ConnectionGuard::write(&state).unwrap();
+        let lease = state.write_gate.lock("manifest_reconciliation").await;
+        let owned = MutationWorkerOwnership {
+            _write_lease: lease,
+            _connection_guard: guard,
+        };
+        let started = Instant::now();
+        let result = super::manifest_recovery::reconcile(&state, before);
+        let held = started.elapsed();
+        drop(owned);
+        let error = match result {
+            Ok(()) => panic!("the pass budget must defer the reconciliation"),
+            Err(error) => error,
+        };
+        assert!(
+            super::manifest_recovery::is_contention_deferral(&error),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("pass budget"), "{error:#}");
+        assert!(held < Duration::from_millis(1000), "gate held for {held:?}");
+        // The pass overrun blames no repository.
+        assert!(
+            state
+                .manifest_recovery
+                .capture_overruns
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// D3 review: one repository that keeps running out of its own budget
+    /// deferred the WHOLE snapshot forever. After three consecutive overruns
+    /// it is refused with a contention reason (no `index --repo` remedy) and
+    /// the other repositories publish.
+    #[tokio::test]
+    async fn a_persistently_slow_repo_is_refused_and_the_others_publish() {
+        use super::manifest_recovery::{CONSECUTIVE_OVERRUNS_BEFORE_REFUSAL, CaptureBudget};
+        use nestweaver_engine::manifest;
+        let state = test_state_with_writer();
+        manifest_recovery_fixture(&state);
+        manifest::mark_manifest_reconciliation_pending(&state.db_path, "repository index").unwrap();
+        let mut budget = CaptureBudget::new(Duration::from_millis(50), Duration::from_secs(10));
+        budget
+            .delays
+            .insert("repo:beta".into(), Duration::from_millis(120));
+        for pass in 1..CONSECUTIVE_OVERRUNS_BEFORE_REFUSAL {
+            let error = match super::manifest_recovery::capture(&state, budget.clone()) {
+                Ok(_) => panic!("pass {pass}: an overrun defers until the streak is long enough"),
+                Err(error) => error,
+            };
+            assert!(super::manifest_recovery::is_contention_deferral(&error));
+        }
+        let before = super::manifest_recovery::capture(&state, budget.clone()).unwrap();
+        let refused: Vec<_> = before
+            .failures
+            .iter()
+            .map(|f| f.repo_uid.as_str())
+            .collect();
+        assert_eq!(refused, ["repo:beta"]);
+        assert!(before.failures[0].reason.starts_with("contention: "));
+        assert!(!before.failures[0].remedy.contains("index --repo"));
+
+        let guard = ConnectionGuard::write(&state).unwrap();
+        let lease = state.write_gate.lock("manifest_reconciliation").await;
+        let owned = MutationWorkerOwnership {
+            _write_lease: lease,
+            _connection_guard: guard,
+        };
+        let result = super::manifest_recovery::reconcile(&state, before);
+        drop(owned);
+        result.expect("the other repository publishes");
+        let manifests = manifest::current_manifest_snapshot(&state.store, &state.db_path).unwrap();
+        assert_eq!(manifests["repo:alpha"].dependencies, ["beta"]);
+        assert!(!manifests.contains_key("repo:beta"));
+        let failures = manifest::load_manifest_failures(&state.db_path);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].reason.starts_with("contention: "));
+        // The off-gate probe captures beta in time (no simulated delay), so
+        // it asks for a rebuild and the streak starts over.
+        assert!(super::manifest_recovery::refused_repos_changed(
+            &state, &failures
+        ));
+        assert_eq!(
+            state
+                .manifest_recovery
+                .capture_overruns
+                .lock()
+                .unwrap()
+                .get("repo:beta"),
+            None,
+            "a probe that captures clears the streak"
+        );
+    }
+
     #[tokio::test]
     async fn release_manifest_recovery_rejects_changed_inputs_and_corrupt_predecessor() {
         use nestweaver_engine::manifest;
