@@ -17,11 +17,19 @@ struct State {
 #[cfg(test)]
 type AdmissionObserver = std::sync::Arc<dyn Fn(Mode, &'static str) + Send + Sync>;
 
+/// Called with a short label whenever a connection starts a write: an
+/// explicit `BEGIN TRANSACTION` or a non-read-only prepared statement.
+pub type WriteObserver = std::sync::Arc<dyn Fn(&'static str) + Send + Sync>;
+
 #[derive(Default)]
 pub(crate) struct NativeAdmission {
     state: Mutex<State>,
     changed: Condvar,
     connections: std::sync::atomic::AtomicUsize,
+    /// D2 regression hook: lets a test prove no write starts outside the
+    /// caller's write gate. The flag keeps the unobserved path to one load.
+    write_observer: Mutex<Option<WriteObserver>>,
+    has_write_observer: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     observer: Mutex<Option<AdmissionObserver>>,
     #[cfg(test)]
@@ -83,6 +91,31 @@ impl NativeAdmission {
         self.connections
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         ConnectionRegistration(self)
+    }
+    pub(crate) fn set_write_observer(&self, observer: Option<WriteObserver>) {
+        let mut slot = self
+            .write_observer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.has_write_observer
+            .store(observer.is_some(), std::sync::atomic::Ordering::Release);
+        *slot = observer;
+    }
+    pub(crate) fn observe_write(&self, what: &'static str) {
+        if !self
+            .has_write_observer
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        let observer = self
+            .write_observer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(observer) = observer {
+            observer(what);
+        }
     }
     pub(crate) fn connection_count(&self) -> usize {
         self.connections.load(std::sync::atomic::Ordering::Acquire)

@@ -482,6 +482,17 @@ fn statement_returns_rows(query: &str) -> bool {
 
 // Conservative control override: the native analyzer reports these as reads.
 // Matches in comments/strings/identifiers only choose stronger exclusion.
+/// `BEGIN TRANSACTION`, but not `BEGIN TRANSACTION READ ONLY`.
+fn statement_begins_write_transaction(query: &str) -> bool {
+    let mut words = query
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|word| !word.is_empty());
+    words
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("BEGIN"))
+        && !words.any(|word| word.eq_ignore_ascii_case("READ"))
+}
+
 fn statement_controls_transaction(query: &str) -> bool {
     query
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
@@ -622,6 +633,11 @@ impl<'a> StoreConnection<'a> {
             statement_has_checkpoint(query),
             "query",
         )?;
+        if let Some(gate) = self.native_admission
+            && statement_begins_write_transaction(query)
+        {
+            gate.observe_write("BEGIN TRANSACTION");
+        }
         let result = self.conn.query(query);
         self.settle(result, statement_returns_rows(query))
     }
@@ -655,6 +671,11 @@ impl<'a> StoreConnection<'a> {
         };
         let _admission =
             self.admit_native(mode, !statement.exclusive, statement.checkpoint, "execute")?;
+        if let Some(gate) = self.native_admission
+            && !statement.inner.is_read_only()
+        {
+            gate.observe_write("write statement");
+        }
         let result = self.conn.execute(&mut statement.inner, params);
         self.settle(result, statement.returns_rows)
     }
@@ -2668,6 +2689,15 @@ impl GraphStore {
     /// Load pre-computed interaction memory scores into the in-memory cache.
     /// When present, PPR's personalization vector blends a small fraction of
     /// these scores to boost nodes the user has frequently accessed.
+    /// Test hook (D2): observe every write a connection on this database
+    /// starts — an explicit `BEGIN TRANSACTION` or a non-read-only prepared
+    /// statement — so a test can prove none happens outside its write gate.
+    /// Raw auto-commit writes sent through `query()` are not classified.
+    #[doc(hidden)]
+    pub fn set_write_observer(&self, observer: Option<crate::WriteObserver>) {
+        self.db.native_admission.set_write_observer(observer);
+    }
+
     pub fn load_interaction_cache(&self, scores: HashMap<String, f64>) {
         *self
             .interaction_cache
@@ -4627,6 +4657,12 @@ impl GraphStore {
             return Err(StoreError::Query(
                 "refusing to record an empty data instance id".to_string(),
             ));
+        }
+        // D2: read first. The id is written once per database, so nearly
+        // every call finds it, and an unconditional write transaction here
+        // collided with whichever gated writer held the single write slot.
+        if let Some(existing) = self.data_instance_id()? {
+            return Ok(existing);
         }
         let conn = self.conn()?;
         conn.query("BEGIN TRANSACTION")
@@ -8223,6 +8259,54 @@ mod data_instance_identity_tests {
         // And a database with no recorded identity cannot object to anything.
         let fresh = GraphStore::open_or_create(&dir.path().join("fresh.lbug")).unwrap();
         fresh.assert_data_instance_id("anything").unwrap();
+    }
+
+    /// D2: `ensure_data_instance_id` opened a write transaction on every
+    /// call, even when the id was already recorded. LadybugDB allows one write
+    /// transaction at a time, so that idle no-op collided with whichever gated
+    /// writer held one (the vault watcher, on 10-15) and killed it.
+    #[test]
+    fn an_already_recorded_instance_opens_no_write_transaction() {
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let writes = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let sink = Arc::clone(&writes);
+        store.set_write_observer(Some(Arc::new(move |what| sink.lock().unwrap().push(what))));
+
+        store.ensure_data_instance_id("2051a9da").unwrap();
+        assert!(
+            !writes.lock().unwrap().is_empty(),
+            "the observer must see the first, real write"
+        );
+        writes.lock().unwrap().clear();
+
+        for proposed in ["2051a9da", "default"] {
+            assert_eq!(store.ensure_data_instance_id(proposed).unwrap(), "2051a9da");
+        }
+        assert_eq!(
+            *writes.lock().unwrap(),
+            Vec::<&str>::new(),
+            "a recorded id must be answered without a write transaction"
+        );
+        store.set_write_observer(None);
+    }
+
+    #[test]
+    fn begin_write_classification_ignores_read_only_transactions() {
+        assert!(super::statement_begins_write_transaction(
+            "BEGIN TRANSACTION"
+        ));
+        assert!(super::statement_begins_write_transaction(
+            " begin transaction;"
+        ));
+        assert!(!super::statement_begins_write_transaction(
+            "BEGIN TRANSACTION READ ONLY"
+        ));
+        assert!(!super::statement_begins_write_transaction("COMMIT"));
+        assert!(!super::statement_begins_write_transaction(
+            "MATCH (n) RETURN n.begin"
+        ));
     }
 
     /// An empty instance is not an identity. Recording one would make every

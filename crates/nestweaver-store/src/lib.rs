@@ -10,6 +10,7 @@ pub mod generation;
 pub mod git_activity_sidecar;
 pub mod index_publication;
 mod native_admission;
+pub use native_admission::WriteObserver;
 mod open_crash_guard;
 pub mod ranking;
 pub mod read;
