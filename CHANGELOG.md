@@ -1,5 +1,58 @@
 # Changelog
 
+## [12.2.1](https://github.com/Kehl-io/nestweaver/compare/v12.1.0...v12.2.1) (2026-10-16)
+
+
+### Features
+
+* **mcp:** give every tool a real wire description and raise the catalogue budget to 40,000 bytes ([1eb9a2b](https://github.com/Kehl-io/nestweaver/commit/1eb9a2b9830df7455d9b420a4b04e6cbe8188465))
+
+
+### Bug Fixes
+
+* **cli:** exit 2 on feature, summary-target and expand misses; 64 on a bad summary level (B9, B6) ([d19380b](https://github.com/Kehl-io/nestweaver/commit/d19380be19c8b6e2267f743f7e98202f5c0cf8da))
+* **cli:** keep pr-impact --repo ambiguous and malformed classes on every route (B4 review) ([87fb578](https://github.com/Kehl-io/nestweaver/commit/87fb578e060a3286b234db20e9935a57fa56495f))
+* **cli:** resolve pr-impact --files against the working repo or --repo (B4) ([759b1bf](https://github.com/Kehl-io/nestweaver/commit/759b1bfc507f87c5cb079bee8fad207c4b3135a7))
+* **cli:** show manifest recovery and the last watcher failure in brain status text (review Minor 10) ([9a8ba29](https://github.com/Kehl-io/nestweaver/commit/9a8ba29338fbcf55954ac1ca05e1766077123921))
+* **daemon:** bound the manifest gate hold and refuse a persistently slow repo (I1) ([4f6f252](https://github.com/Kehl-io/nestweaver/commit/4f6f252e1cff8d23b0cfd6b4c78e8443e79d9b56))
+* **daemon:** check the embedding pipeline once per pass and make is_empty O(1) (D5) ([cfb86ca](https://github.com/Kehl-io/nestweaver/commit/cfb86cabfe54457b21859d3ab2fb58cdf117b89d))
+* **daemon:** give each manifest capture its own budget after the gate (D3) ([9e75053](https://github.com/Kehl-io/nestweaver/commit/9e75053dc5f21ce1f1bf522ee7e5e0f2d8075065))
+* **daemon:** log the full error chain when a watcher exits (D4) ([3a83913](https://github.com/Kehl-io/nestweaver/commit/3a8391311937975e1d8ddbdee9c0097cdd8a2149))
+* **engine:** disclose a replay stopped by a collision as a failed reconciliation (V1 review) ([ee776d8](https://github.com/Kehl-io/nestweaver/commit/ee776d8a7e0c4145eb27154c77641e86b1a3fa97))
+* **engine:** expose dead-code walk_roots and gate the no-seed warning on it (M2 review) ([9accc13](https://github.com/Kehl-io/nestweaver/commit/9accc1328c3a1d53684f856904c0549b32e6ec97))
+* **engine:** label module owners in the web top-symbols list, snapshot and Cypher export (R1, B5) ([57df3d8](https://github.com/Kehl-io/nestweaver/commit/57df3d8425f466b73ad22e1c79dfd443e257a5cf))
+* **engine:** make a failed watcher batch recoverable instead of stranding notes (V1) ([73c38f0](https://github.com/Kehl-io/nestweaver/commit/73c38f0cf7842f35bc335462254f1d772f382ee6))
+* **engine:** name a part-way watched batch correctly and re-queue its search docs (V1 review) ([c22bdcf](https://github.com/Kehl-io/nestweaver/commit/c22bdcf3617b696b7fafa41871f579f5336f40e6))
+* **engine:** never drop a file-looking qualifier in read_symbols (I5) ([cd203a6](https://github.com/Kehl-io/nestweaver/commit/cd203a6805f19f6fcaab6dd9e180926945a69247))
+* **engine:** release the write lease during watched-batch collision backoff (V1 review) ([adced27](https://github.com/Kehl-io/nestweaver/commit/adced27ed1f52f03b0e958aab6c3a2e9228a317f))
+* **engine:** report a qualifier that names nothing as not found with suggestions (B1, M1) ([12c82e1](https://github.com/Kehl-io/nestweaver/commit/12c82e107c92ffeba30abf21cefd9ec88766a9c2))
+* **engine:** scope dead-code entry_points and module_owner_roots to the repos filter (M2) ([56f3ae8](https://github.com/Kehl-io/nestweaver/commit/56f3ae8092b0aeeff5fa1bdcbfc27cbb02c87a75))
+* **engine:** start no write transaction before the index holds its write gate (D2) ([00a75cf](https://github.com/Kehl-io/nestweaver/commit/00a75cf1a8d41a545eaf114ccf89920a32f427a4))
+* **engine:** suggest typo matches and a named file's members in did_you_mean (M4) ([5748214](https://github.com/Kehl-io/nestweaver/commit/5748214c22519c0f04e9046ed809f5c652bd5db0))
+* **investigate:** never save a bundle sampled under a live publication (I3) ([d11d942](https://github.com/Kehl-io/nestweaver/commit/d11d942d84f6504e637beb3287346d101a763fb2))
+* **investigate:** report scope mistakes as user errors once and answer through a live watcher batch (V4) ([a9c9f6e](https://github.com/Kehl-io/nestweaver/commit/a9c9f6e794f5a7bff2fc6df200fbc7c94a3d0fcd))
+* **mcp:** always keep a clusters page's first row so member continuation progresses (B2) ([43a8bbe](https://github.com/Kehl-io/nestweaver/commit/43a8bbeb7150f389c284fd05bab5a56513997803))
+* **mcp:** disclose brain_impact rows cut by the output budget and send them once (M3) ([5ab35b5](https://github.com/Kehl-io/nestweaver/commit/5ab35b58b07518810e92bf7b0deac2999d907f22))
+* **mcp:** reinforce only used results at terminal success (B3 review) ([da89d64](https://github.com/Kehl-io/nestweaver/commit/da89d64483afab7db397f1b8775c9efee50bd84e))
+* post-12.1.0 regression fixes for daemon, vault watcher, ranking and lookups ([7d88735](https://github.com/Kehl-io/nestweaver/commit/7d88735ba7426ad38ed4a703057fde015563a862))
+* **rankings:** apply interaction memory as a re-rank of reached nodes only (B3) ([8041ced](https://github.com/Kehl-io/nestweaver/commit/8041cedd8f6a967d83946ecf6cc62cf43a200943))
+* **rankings:** keep code-only PageRank warm across code-link publications (D1) ([9861436](https://github.com/Kehl-io/nestweaver/commit/9861436ed840c818e6671fcb245b05b958d3d95b))
+* **rankings:** re-save a warm PageRank sidecar after a code-link publication (D1 review) ([b086754](https://github.com/Kehl-io/nestweaver/commit/b0867548db51937a5ccdcf81c3e6d0c73c793e8d))
+* **store:** keep definite corruption verdicts through transient phrases and a live daemon (I2) ([2be3b57](https://github.com/Kehl-io/nestweaver/commit/2be3b57c479fd1662da784043b755ac4659696e3))
+* **store:** never report a transient condition as database corruption (V2) ([0bd46db](https://github.com/Kehl-io/nestweaver/commit/0bd46db568df2a1885287d1e230b975cbbc8c5aa))
+* **web:** label module owners in JSON without renaming the shared Symbol (R1 review) ([175573d](https://github.com/Kehl-io/nestweaver/commit/175573d17a07552a3380d1f6c61cef5c0f224220))
+
+
+### Performance Improvements
+
+* **engine:** fetch the symbol table once per did_you_mean miss and per read (I4) ([be24a3a](https://github.com/Kehl-io/nestweaver/commit/be24a3a4703330f3f09534743e3b8b0edbde000b))
+* **store:** reuse the prepared statement's write flag in the write observer (D2) ([36278bb](https://github.com/Kehl-io/nestweaver/commit/36278bba476654917499e64766c8218e36856a3e))
+
+
+### Miscellaneous Chores
+
+* release 12.2.1 ([f69c387](https://github.com/Kehl-io/nestweaver/commit/f69c3874c271d321a1357d496ecf6dcd6ac2d744))
+
 ## [12.1.0](https://github.com/Kehl-io/nestweaver/compare/v12.0.4...v12.1.0) (2026-10-15)
 
 
