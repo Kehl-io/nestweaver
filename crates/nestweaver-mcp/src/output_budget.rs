@@ -415,6 +415,21 @@ fn disclose(payload: &mut Value, omitted: &BTreeMap<String, Value>, prior_comple
             "retry":"Narrow the query, reduce limit, or request a specific UID/section. Output cuts do not describe unvisited graph work."}));
     }
 }
+/// 12.1.1 (M3): disclose rows a tool dropped itself, before the finalizer
+/// ran, to keep its payload inside [`LOGICAL_BYTES`]. Same shape as a
+/// finalizer cut, so `finalize` merges any later cut into it, and a caller
+/// can tell a budget cut from its own `limit`.
+pub fn disclose_tool_cut(payload: &mut Value, array_key: &str, items_omitted: usize) {
+    if items_omitted == 0 {
+        return;
+    }
+    let mut omitted = BTreeMap::new();
+    omitted.insert(
+        format!("/{array_key}"),
+        json!({"items_omitted":items_omitted,"count_kind":"exact_completed_array","paired_array":null}),
+    );
+    disclose(payload, &omitted, true);
+}
 fn synchronize(result: &mut Value) {
     if let Some(payload) = result.get("structuredContent") {
         let text = serde_json::to_string(payload).expect("JSON Value serializes");

@@ -12531,7 +12531,7 @@ fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_brain_impact() -> Value {
     json!({
         "name": "brain_impact",
-        "description": "Trace reverse dependencies of a symbol to understand what might break if it changes. Returns confidence-weighted impact scores (0.0-1.0) decaying through the call graph.\n\nGuidelines:\n- Use BEFORE modifying a function, class, or interface\n- Results sorted by impact_score (highest risk first); type-aware resolution follows class hierarchies\n- Use response_format 'concise' for names only, 'detailed' for full metadata\n- `symbol` may be `path::name`, `Class::method` or `path::Class::method`: the first qualifier narrows by file (exact repo-relative path, `/`-boundary suffix, or that suffix without its extension) and the rest by container, or every qualifier narrows by container; both readings are kept. One matching neither is not_found with `path::name` suggestions. `path::<module>` names a file's top-level code\n- A caller labelled `path::<module>` is that file's top-level code (the module owner)\n\nLimitations:\n- A bare `symbol` name resolves by EXACT match only, never substring/fuzzy -- a name `brain_search` finds hits for can still be not_found here; the not_found response (`isError: true`, like every lookup tool's miss) carries a bounded `did_you_mean` list of the closest substring matches when any exist\n- For forward call chains use flow_trace; for file-level impact use detect_changes or blast_radius\n- For cross-repo impact use cross_repo_contracts\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
+        "description": "Trace reverse dependencies of a symbol to understand what might break if it changes. Returns confidence-weighted impact scores (0.0-1.0) decaying through the call graph.\n\nGuidelines:\n- Use BEFORE modifying a function, class, or interface\n- Results sorted by impact_score (highest risk first); type-aware resolution follows class hierarchies\n- Use response_format 'concise' for names only, 'detailed' for full metadata\n- `symbol` may be `path::name`, `Class::method` or `path::Class::method`: the first qualifier narrows by file (exact repo-relative path, `/`-boundary suffix, or that suffix without its extension) and the rest by container, or every qualifier narrows by container; both readings are kept. One matching neither is not_found with `path::name` suggestions. `path::<module>` names a file's top-level code\n- A caller labelled `path::<module>` is that file's top-level code (the module owner)\n- Dependents are returned once, as `impact_nodes` (the CLI's JSON also mirrors them as `nodes`). Rows cut to fit the MCP output budget are counted in `output_budget.cuts`; `truncated_by_limit` is set only when `limit` cut them, so raise `limit` only then\n\nLimitations:\n- A bare `symbol` name resolves by EXACT match only, never substring/fuzzy -- a name `brain_search` finds hits for can still be not_found here; the not_found response (`isError: true`, like every lookup tool's miss) carries a bounded `did_you_mean` list of the closest substring matches when any exist\n- For forward call chains use flow_trace; for file-level impact use detect_changes or blast_radius\n- For cross-repo impact use cross_repo_contracts\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -12702,7 +12702,10 @@ fn tool_brain_impact(
     nodes.retain(|node| uid_is_visible(&node.uid));
     let total = nodes.len();
 
-    let rows = bounded_mapped_rows(&nodes[..nodes.len().min(limit)], 8_000, |n, bytes| {
+    // 12.1.1 (M3): MCP sends the list once (`impact_nodes`, below), so it
+    // gets the whole row budget rather than half of it.
+    let limited = nodes.len().min(limit);
+    let rows = bounded_mapped_rows(&nodes[..limited], 16_000, |n, bytes| {
         if concise {
             #[derive(serde::Serialize)]
             struct Row<'a> {
@@ -12747,7 +12750,8 @@ fn tool_brain_impact(
         }
     })?;
 
-    Ok(nestweaver_schema::responses::impact(json!({
+    let budget_cut = limited - rows.len();
+    let mut payload = nestweaver_schema::responses::impact(json!({
         "status": "ok",
         "symbol": symbol,
         "target": uid,
@@ -12768,9 +12772,23 @@ fn tool_brain_impact(
         // Independent boolean, not a `truncated_by` scalar: raising `--depth`,
         // lowering `--min-score` and raising `limit` do not compose in an
         // order, so blaming exactly one would discard two live remedies.
-        "truncated_by_limit": rows.len() < total,
+        // 12.1.1 (M3): only when `limit` was the cause. A cut made to fit the
+        // MCP output budget is disclosed in `output_budget` instead, so a
+        // caller does not retry with a larger `limit` that cannot help.
+        "truncated_by_limit": limited < total,
         "note": note,
-    })))
+    }));
+    if bounded_delivery() {
+        // 12.1.1 (M3): `nodes` is the CLI's spelling of the same list. The
+        // CLI JSON keeps both aliases (documented in `impact --help`); MCP
+        // sends only `impact_nodes`, its own documented key, so one list
+        // is not paid for twice in the output budget.
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("nodes");
+        }
+        crate::output_budget::disclose_tool_cut(&mut payload, "impact_nodes", budget_cut);
+    }
+    Ok(payload)
 }
 
 // ── 9. brain_guide ──────────────────────────────────────────────────────────
@@ -30720,7 +30738,85 @@ mod flow_trace_truncation_tests {
             json!(0.9_f32),
             "streaming a bounded row must preserve the direct Value number representation"
         );
-        assert_eq!(result["nodes"], result["impact_nodes"]);
+        assert!(
+            result.get("nodes").is_none(),
+            "MCP sends the list once, as impact_nodes"
+        );
+    }
+
+    /// 12.1.1 (M3): when the MCP output budget, not `limit`, cuts the
+    /// dependents, `brain_impact` says so in `output_budget` and leaves
+    /// `truncated_by_limit` false; the list is sent once, as `impact_nodes`.
+    #[test]
+    fn brain_impact_discloses_an_output_budget_cut_and_sends_one_list() {
+        let mut symbols = vec![symbol(
+            "sym:root",
+            "budgetDisclosureRoot",
+            SymbolKind::Function,
+            1,
+        )];
+        let mut edges = Vec::new();
+        let callers: Vec<String> = (0..300).map(|i| format!("sym:caller{i:03}")).collect();
+        for (i, uid) in callers.iter().enumerate() {
+            symbols.push(symbol(
+                uid,
+                &format!("aRatherLongCallerNameSoTheRowsFillTheBudget{i:03}"),
+                SymbolKind::Function,
+                10 + i as u32,
+            ));
+            edges.push((uid.as_str(), "sym:root", EdgeType::Calls));
+        }
+        let store = store_with(&symbols, &edges);
+
+        let result = tool_brain_impact(
+            &store,
+            json!({"symbol":"budgetDisclosureRoot","depth":1,"limit":1000}),
+            None,
+            None,
+        )
+        .unwrap();
+        let rows = result["impact_nodes"].as_array().unwrap();
+        assert_eq!(result["total"], 300, "{result}");
+        assert!(rows.len() < 300, "the fixture must overflow the budget");
+        assert!(
+            rows.len() > 40,
+            "one list gets the whole row budget: {}",
+            rows.len()
+        );
+        assert_eq!(result["returned"], rows.len(), "{result}");
+        assert_eq!(result["truncated"], true, "{result}");
+        assert_eq!(
+            result["truncated_by_limit"], false,
+            "limit was not the cause: {result}"
+        );
+        assert_eq!(
+            result["output_budget"]["cuts"]["/impact_nodes"]["items_omitted"],
+            300 - rows.len(),
+            "{result}"
+        );
+        assert!(
+            result.get("nodes").is_none(),
+            "the list is sent once: {result}"
+        );
+        let wrapped = crate::output_budget::finalize(wrap_tool_result(result.clone()));
+        assert_eq!(
+            wrapped["structuredContent"]["output_budget"]["cuts"]["/impact_nodes"]["items_omitted"],
+            300 - rows.len(),
+            "the finalizer keeps the disclosure: {wrapped}"
+        );
+
+        // Counterweight: a cut by `limit` alone is `truncated_by_limit`, with
+        // no budget disclosure.
+        let limited = tool_brain_impact(
+            &store,
+            json!({"symbol":"budgetDisclosureRoot","depth":1,"limit":5}),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(limited["returned"], 5, "{limited}");
+        assert_eq!(limited["truncated_by_limit"], true, "{limited}");
+        assert!(limited.get("output_budget").is_none(), "{limited}");
     }
 
     #[test]
