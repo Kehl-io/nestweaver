@@ -522,6 +522,9 @@ pub(crate) fn run_brain(
                     for line in vault_derivation_status_lines(&value) {
                         println!("  {line}");
                     }
+                    for line in daemon_runtime_status_lines(&value) {
+                        println!("  {line}");
+                    }
                     if let Some(near) = value.get("notes_near_size_limit") {
                         let near_count = near.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
                         if near_count > 0 {
@@ -3551,6 +3554,69 @@ pub(crate) fn finish_vault_refresh(
     ))
 }
 
+/// 12.1.1 review: the daemon's manifest-recovery state (D3) and its last
+/// watcher failure (V1) were in `--json` only. Text shows them too: the
+/// recovery state when it is not `ready`, with its error and when it is
+/// retried, and the last watcher failure with its kind, age and full error.
+/// Both are absent (`null`) off the daemon, and then print nothing.
+pub(crate) fn daemon_runtime_status_lines(status: &serde_json::Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(recovery) = status
+        .get("manifest_recovery")
+        .filter(|recovery| recovery.is_object())
+    {
+        let state = recovery
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        if state != "ready" {
+            let mut line = format!("Manifest recovery: {state}");
+            if let Some(attempts) = recovery
+                .get("attempts")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+            {
+                line.push_str(&format!(", attempt {attempts}"));
+            }
+            if let Some(retry) = recovery.get("retry_after_seconds").and_then(|v| v.as_u64()) {
+                line.push_str(&format!(", retried in {retry}s"));
+            }
+            if let Some(error) = recovery.get("error").and_then(|v| v.as_str()) {
+                line.push_str(&format!(" -- {error}"));
+            }
+            lines.push(line);
+        }
+    }
+    if let Some(failure) = status
+        .get("last_watcher_failure")
+        .filter(|failure| failure.is_object())
+    {
+        let kind = failure
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let error = failure
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("no detail");
+        let age = failure
+            .get("at_unix_seconds")
+            .and_then(|v| v.as_u64())
+            .and_then(|at| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_secs();
+                Some(format!(" {}s ago", now.saturating_sub(at)))
+            })
+            .unwrap_or_default();
+        lines.push(format!(
+            "Last watcher failure ({kind} watcher,{age}): {error}"
+        ));
+    }
+    lines
+}
+
 /// nw-694: `brain status` text says a vault is BLOCKED. The count lived only
 /// in `--json` (`vault_derivation`), so a human saw a healthy status while
 /// every link-graph tool refused that vault.
@@ -3604,7 +3670,40 @@ pub(crate) fn vault_derivation_status_lines(status: &serde_json::Value) -> Vec<S
 
 #[cfg(test)]
 mod vault_derivation_status_tests {
-    use super::vault_derivation_status_lines;
+    use super::{daemon_runtime_status_lines, vault_derivation_status_lines};
+
+    /// 12.1.1 review: manifest recovery and the last watcher failure reach
+    /// the text output, not only `--json`.
+    #[test]
+    fn brain_status_text_shows_manifest_recovery_and_the_last_watcher_failure() {
+        let status = serde_json::json!({
+            "manifest_recovery": {
+                "state": "deferred",
+                "attempts": 2,
+                "retry_after_seconds": 30,
+                "error": "deferred: contention: the manifest capture of repo:a exceeded its 60s budget",
+            },
+            "last_watcher_failure": {
+                "kind": "vault",
+                "at_unix_seconds": 1,
+                "error": "watched vault refresh (per-note transactions): Cannot start a new write transaction",
+            },
+        });
+        let lines = daemon_runtime_status_lines(&status);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("Manifest recovery: deferred, attempt 2, retried in 30s"));
+        assert!(lines[0].contains("contention"), "{}", lines[0]);
+        assert!(lines[1].starts_with("Last watcher failure (vault watcher, "));
+        assert!(lines[1].contains("Cannot start a new write transaction"));
+
+        // Ready and absent (null off the daemon) print nothing.
+        let quiet = serde_json::json!({
+            "manifest_recovery": { "state": "ready", "attempts": 0 },
+            "last_watcher_failure": null,
+        });
+        assert!(daemon_runtime_status_lines(&quiet).is_empty());
+        assert!(daemon_runtime_status_lines(&serde_json::json!({})).is_empty());
+    }
 
     /// nw-694: a Blocked vault is said in the text render.
     #[test]
