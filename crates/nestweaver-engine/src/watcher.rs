@@ -1362,10 +1362,13 @@ impl BrainWatcher {
                 match self.process_batch(store, tantivy, v_uid, paths.clone(), on_change) {
                     // nw-668: the text landed but some notes' code links did
                     // not; only those are still owed.
-                    Ok(Some(debt)) => {
+                    Ok(Some(debt)) if debt.kind == DebtKind::CodeLinks => {
                         link_failure = true;
                         (Some(debt.paths), anyhow::anyhow!(debt.error))
                     }
+                    // V1: a replay stopped part way by a collision is a
+                    // failed reconciliation of those notes, not owed links.
+                    Ok(Some(debt)) => (Some(debt.paths), anyhow::anyhow!(debt.error)),
                     Ok(None) => {
                         crate::index_md::record_vault_reconciliation_debt(
                             store.db_path(),
