@@ -482,9 +482,15 @@ pub fn pr_impact_target_repo(
         .list_repos(None)
         .map_err(|e| anyhow::anyhow!("list_repos: {e}"))?;
     if let Some(selector) = selector.filter(|s| !s.trim().is_empty()) {
-        return Ok(Some(
-            crate::resolve_repo_selector(&repos, selector)?.uid.clone(),
-        ));
+        // Typed like every other `--repo` filter, so each route keeps the
+        // class: not found (2), ambiguous (3), malformed (64).
+        return crate::resolve_repo_selector(&repos, selector)
+            .map(|repo| Some(repo.uid.clone()))
+            .map_err(|error| {
+                anyhow::Error::new(crate::node_scope::RepoFilterUnresolved::new(
+                    selector, &error,
+                ))
+            });
     }
     let Some(root) = working_root.and_then(|root| std::fs::canonicalize(root).ok()) else {
         return Ok(None);

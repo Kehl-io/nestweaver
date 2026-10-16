@@ -11381,7 +11381,9 @@ impl NestWeaverDaemon for DaemonService {
                     repo_selector.as_deref(),
                     working_root.as_deref(),
                 )
-                .map_err(|e| Status::not_found(format!("{e:#}")))?;
+                // Review M7: an ambiguous `--repo` stays ambiguous (exit 3)
+                // and a malformed one a usage error; only a miss is not found.
+                .map_err(|e| dispatch_err_to_status("pr_impact", e))?;
                 let options = nestweaver_engine::BlastRadiusOptions {
                     target_repo,
                     max_depth: depth,

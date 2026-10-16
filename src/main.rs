@@ -21498,7 +21498,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(repo) = repo.as_deref() {
                     args["repo"] = serde_json::json!(repo);
                 }
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "pr_impact", args)? {
+                let routed = match try_hybrid_json_rpc(true, &db_path, None, "pr_impact", args) {
+                    // `--repo` is resolved like every other repo filter.
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
+                    routed => routed?,
+                };
+                if let Some(value) = routed {
                     // The daemon serializes a full BlastRadiusResult; decode it so
                     // both the concise banner and the strict exit code see the real
                     // gate state (missing fields default via serde on old daemons).
@@ -21540,11 +21547,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // 12.1.1 (B4): the repo under review, from `--repo` or the
             // working directory, so repo-relative paths resolve there only.
-            let target_repo = nestweaver_engine::pr_impact_target_repo(
+            let target_repo = match nestweaver_engine::pr_impact_target_repo(
                 &store,
                 repo.as_deref(),
                 Some(&repo_root),
-            )?;
+            ) {
+                Err(error) if error_is_unresolved_repo_filter(&error) => {
+                    return Ok((report_unresolved_repo_filter(&error, json), None));
+                }
+                target => target?,
+            };
             let options = nestweaver_engine::BlastRadiusOptions {
                 target_repo,
                 max_depth: depth,

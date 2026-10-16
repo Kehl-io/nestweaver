@@ -16290,6 +16290,34 @@ fn pr_impact_files_resolve_against_the_working_repo() {
     let (payload, names) = pr_impact(&roots[0], &["--repo", "beta"]);
     assert!(names.iter().any(|n| n == "betaOnly"), "{payload}");
     assert!(!names.iter().any(|n| n == "alphaOnly"), "{payload}");
+
+    // Review M7: a --repo that names nothing is not found (2), and one that
+    // names both repos (a root prefix they share) is ambiguous (3) on the
+    // daemon route, not folded into not found.
+    let exit = |selector: &str| {
+        let output = nestweaver_cmd()
+            .args(["pr-impact", "--files", "index.js", "--json", "--db"])
+            .arg(&db_path)
+            .args(["--repo", selector])
+            .current_dir(&roots[0])
+            .output()
+            .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or(serde_json::Value::Null);
+        (output.status.code(), payload)
+    };
+    let (code, payload) = exit("no-such-repo");
+    assert_eq!(code, Some(2), "{payload}");
+    assert_eq!(payload["status"], "not_found", "{payload}");
+    let shared = dir.path().to_string_lossy().into_owned();
+    let (code, payload) = exit(&shared);
+    assert_eq!(code, Some(3), "{payload}");
+    assert_eq!(payload["status"], "ambiguous", "{payload}");
+    assert_eq!(
+        payload["candidates"].as_array().map(Vec::len),
+        Some(2),
+        "{payload}"
+    );
 }
 
 /// 12.1.1 (V4): an `investigate` scope the caller got wrong is their
