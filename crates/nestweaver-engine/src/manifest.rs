@@ -868,9 +868,14 @@ impl<'a> GraphMutationPublicationGuard<'a> {
                 store.with_index_publication_rank_barrier(remove)
             }
         };
+        let mut retired = false;
         if !outcome.is_degraded()
             && let Some(marker_path) = &self.marker_path
-            && let Err(error) = retire(marker_path)
+            && let Err(error) = {
+                let result = retire(marker_path);
+                retired = result.is_ok();
+                result
+            }
         {
             if changed {
                 outcome.record_warning(
@@ -888,6 +893,26 @@ impl<'a> GraphMutationPublicationGuard<'a> {
                     marker_path.display()
                 );
             }
+        }
+
+        // D1 review: a non-code publication keeps a warm code-only PageRank
+        // cache but removed its generation-bound sidecar, so after a relink
+        // `.pagerank.json` stayed missing until something recomputed. Re-save
+        // it at the new generation once the marker is retired: the save is
+        // refused while the publication is dirty, so it cannot happen inside
+        // `finalize_graph_mutation`. A cold cache saves nothing.
+        if retired
+            && changed
+            && self.non_code
+            && let Some(db_path) = store.db_path()
+            && let Err(error) =
+                store.save_pagerank_cache(&crate::sidecar_path(db_path, ".pagerank.json"))
+        {
+            tracing::warn!(
+                operation = %self.operation,
+                %error,
+                "could not re-save the warm PageRank sidecar; the next compute rewrites it"
+            );
         }
 
         if let Some(lease) = self.lease.take()

@@ -2152,6 +2152,14 @@ repos = [{repos}]
             "a code-link publication forced a lazy PageRank recompute"
         );
         assert_eq!(after, before, "code-only ranks must be unchanged");
+
+        // D1 review: the warm cache is re-saved at the new generation, so the
+        // sidecar is not left missing after the relink, and it loads (it is
+        // bound to the current generation).
+        let sidecar = crate::sidecar_path(&fx.db, ".pagerank.json");
+        assert!(sidecar.exists(), "the relink left no PageRank sidecar");
+        fx.store.load_pagerank_cache(&sidecar).unwrap();
+        assert_eq!(fx.store.pagerank_scores().unwrap(), before);
     }
 
     /// The daemon's boot contract: a pass with nothing to change publishes
