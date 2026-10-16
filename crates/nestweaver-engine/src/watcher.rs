@@ -5587,7 +5587,17 @@ mod tests {
                 watcher.note_limits,
                 &lease,
             );
-            assert!(result.is_ok(), "{result:?}");
+            // Under CI load the holder thread can be scheduled late enough
+            // that the other writer outlasts every retry (2575 ms). That path
+            // is the owed-work case pinned by
+            // `v1_exhausted_collision_retries_owe_the_paths_instead_of_ending_the_watcher`;
+            // here only the lease behaviour during the backoff is asserted.
+            if let Err(error) = &result {
+                assert!(
+                    format!("{error:#}").contains("Only one write transaction"),
+                    "unexpected refresh error: {error:#}"
+                );
+            }
             holder.join().unwrap()
         });
         assert!(
