@@ -16644,9 +16644,11 @@ module.exports = { check, plain };\n";
             error.failures[0].stage,
             DeletionReconciliationStage::PersistedPageRank
         );
-        assert!(!store.pagerank_scores().unwrap().contains_key("stale"));
+        // Checked before the ranked read below: since D1 a lazy compute
+        // persists a FRESH sidecar, which is correct and not the stale one.
         assert!(!pagerank_path.exists());
         assert!(quarantine_path(&pagerank_path).exists());
+        assert!(!store.pagerank_scores().unwrap().contains_key("stale"));
         assert!(store.graph_generation() > generation_before);
         assert_eq!(
             fs::read_to_string(crate::sidecar_path(&db_path, ".generation"))

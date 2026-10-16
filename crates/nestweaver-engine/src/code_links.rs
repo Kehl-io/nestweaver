@@ -896,13 +896,14 @@ pub(crate) fn begin_publication<'s>(
             .transpose()?;
         // nw-670 live eval #2: stamped as a code-link chunk, so ranked reads
         // answer through it with disclosure instead of failing closed.
-        if let Some(publication) =
-            crate::manifest::try_begin_graph_mutation_publication_with_reason(
-                store,
-                "code link reconciliation",
-                Some(nestweaver_store::index_publication::MARKER_REASON_CODE_LINKS),
-            )?
-        {
+        // D1: every publication through here changes note->code links or
+        // project memberships only, never a Symbol node or a code edge, so it
+        // keeps a warm code-only PageRank cache.
+        if let Some(publication) = crate::manifest::try_begin_non_code_graph_mutation_publication(
+            store,
+            "code link reconciliation",
+            Some(nestweaver_store::index_publication::MARKER_REASON_CODE_LINKS),
+        )? {
             return Ok((guard, publication));
         }
         drop(guard);
@@ -2112,6 +2113,45 @@ repos = [{repos}]
                 2
             ]
         );
+    }
+
+    /// D1: every code-link group is its own publication, and each one wiped
+    /// the PageRank cache and deleted its sidecar without recomputing, so on
+    /// production every ranked read recomputed over ~300k symbols every ~25 s
+    /// for the whole relink. Note->code edges are not in code-only PageRank,
+    /// so a code-link publication must leave a warm code-only cache intact.
+    #[test]
+    fn code_link_publications_keep_a_warm_code_only_pagerank() {
+        let fx = two_widgets();
+        full_vault_refresh(&fx);
+        fx.store
+            .compute_pagerank(
+                nestweaver_store::ranking::PAGERANK_DAMPING,
+                nestweaver_store::ranking::PAGERANK_ITERATIONS,
+                &nestweaver_store::GraphScope::code_only(),
+            )
+            .unwrap();
+        let before = fx.store.pagerank_scores().unwrap();
+        assert!(!before.is_empty(), "the fixture must have ranked symbols");
+        let lazy_before = fx.store.lazy_pagerank_computations();
+
+        MAX_EDGES_OVERRIDE.with(|max| max.set(Some(2)));
+        let report = CodeLinkReconciler::new(CrossDomainConfig::default()).reconcile(
+            &fx.store,
+            None,
+            &|| false,
+        );
+        MAX_EDGES_OVERRIDE.with(|max| max.set(None));
+        let report = report.unwrap();
+        assert!(report.rewritten.len() >= 2, "K >= 2 groups: {report:?}");
+
+        let after = fx.store.pagerank_scores().unwrap();
+        assert_eq!(
+            fx.store.lazy_pagerank_computations(),
+            lazy_before,
+            "a code-link publication forced a lazy PageRank recompute"
+        );
+        assert_eq!(after, before, "code-only ranks must be unchanged");
     }
 
     /// The daemon's boot contract: a pass with nothing to change publishes

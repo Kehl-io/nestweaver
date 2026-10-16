@@ -904,6 +904,10 @@ pub struct GraphStore {
     /// PPR's personalization vector blends a small fraction of these scores
     /// to boost nodes the user has frequently accessed.
     pub(crate) interaction_cache: Mutex<Option<HashMap<String, f64>>>,
+    /// D1: how many times a ranked read found the PageRank cache empty and
+    /// recomputed it. Exposed for tests through
+    /// [`GraphStore::lazy_pagerank_computations`].
+    pub(crate) lazy_pagerank_computes: std::sync::atomic::AtomicU64,
     /// Feature F12: optional git-activity recency scores keyed by repo-relative
     /// file path (`path -> score ∈ [0, 1]`). When loaded, `pagerank_score` is
     /// multiplied at *read* time by a clamped recency factor so dormant code is
@@ -2078,6 +2082,7 @@ impl GraphStore {
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
+            lazy_pagerank_computes: std::sync::atomic::AtomicU64::new(0),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
@@ -2174,6 +2179,7 @@ impl GraphStore {
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
+            lazy_pagerank_computes: std::sync::atomic::AtomicU64::new(0),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
@@ -2255,6 +2261,7 @@ impl GraphStore {
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
+            lazy_pagerank_computes: std::sync::atomic::AtomicU64::new(0),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
@@ -2472,6 +2479,7 @@ impl GraphStore {
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
+            lazy_pagerank_computes: std::sync::atomic::AtomicU64::new(0),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
@@ -2553,6 +2561,7 @@ impl GraphStore {
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
+            lazy_pagerank_computes: std::sync::atomic::AtomicU64::new(0),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: None,
@@ -2670,6 +2679,87 @@ impl GraphStore {
             .impact_snapshot_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Whether the live PageRank cache holds CODE-ONLY scores: Symbol nodes
+    /// and code edges, whatever damping and iterations produced them. The
+    /// caller must hold `pagerank_compute_lock`.
+    fn cached_pagerank_is_code_only_locked(&self) -> bool {
+        if self
+            .pagerank_cache
+            .lock()
+            .map(|cache| cache.is_none())
+            .unwrap_or(true)
+        {
+            return false;
+        }
+        let declared = self
+            .pagerank_declared_parameters
+            .lock()
+            .ok()
+            .and_then(|params| params.clone());
+        let Some(declared) = declared else {
+            return false;
+        };
+        let code_only = crate::ranking::pagerank_declared_parameters(
+            crate::ranking::PAGERANK_DAMPING,
+            crate::ranking::PAGERANK_ITERATIONS,
+            &crate::ranking::GraphScope::code_only(),
+        );
+        declared.get("node_queries") == code_only.get("node_queries")
+            && declared.get("edge_queries") == code_only.get("edge_queries")
+    }
+
+    /// [`Self::invalidate_ranking_caches_locked`] for a publication that
+    /// changes no Symbol node and no code edge (D1: note->code links, project
+    /// note memberships). Code-only PageRank cannot see such a change, so a
+    /// code-only cache survives it; every other ranking cache is discarded.
+    /// Returns whether the PageRank cache was kept.
+    fn invalidate_ranking_caches_for_non_code_change_locked(&self) -> bool {
+        if !self.cached_pagerank_is_code_only_locked() {
+            self.invalidate_ranking_caches_locked();
+            return false;
+        }
+        *self
+            .ppr_graph_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        self.ppr_result_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *self
+            .symbol_name_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .impact_snapshot_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        true
+    }
+
+    /// [`Self::invalidate_pagerank`] for a committed change to no Symbol node
+    /// and no code edge. Returns whether a code-only PageRank cache was kept.
+    pub fn invalidate_ranking_for_non_code_change(&self) -> bool {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.invalidate_ranking_caches_for_non_code_change_locked()
+    }
+
+    /// [`Self::with_index_publication_rank_barrier`] for a publication that
+    /// changes no Symbol node and no code edge: a code-only PageRank cache
+    /// survives it (D1).
+    pub fn with_non_code_publication_rank_barrier<T>(&self, operation: impl FnOnce() -> T) -> T {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let result = operation();
+        self.invalidate_ranking_caches_for_non_code_change_locked();
+        result
     }
 
     /// Run a publication marker transition while excluding PageRank readers,

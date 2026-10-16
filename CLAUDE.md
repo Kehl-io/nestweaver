@@ -470,7 +470,7 @@ nestweaver ui --watch                    # live re-indexing via filesystem watch
 Default database: `./nestweaver.lbug`. Override with `--db <path>` or `NESTWEAVER_DB` env var.
 
 Sidecar files written alongside the database:
-- `<db>.pagerank.json` — PageRank score cache (computed and saved at index time on a full re-index and on incremental updates, loaded on open; a single-flight lazy compute is the fallback for DBs indexed before this or with no sidecar yet)
+- `<db>.pagerank.json` — PageRank score cache (computed and saved at index time on a full re-index and on incremental updates, loaded on open; a single-flight lazy compute is the fallback for DBs indexed before this or with no sidecar yet, and it persists what it computes). A publication that changes only note→code links or project memberships (code-link reconciliation) keeps a warm code-only cache in memory, since those edges are not in code-only PageRank; it still removes the generation-bound sidecar
 - `<db>.manifests.json` — parsed manifest data (package.json, go.mod, Cargo.toml, pyproject.toml, requirements.txt, composer.json, Gemfile, pubspec.yaml, Package.swift, *.csproj, build.gradle.kts, CMakeLists.txt)
 - `<db>.filemeta.json` — per-file mtime/size/hash cache for tiered change detection (skips unchanged files on re-index). **v3**: the mtime is NANOSECONDS, not seconds — truncating to seconds made same-second edits permanently invisible. Versioned in lockstep with `resolution_cache::CACHE_VERSION`; a stale version is discarded, costing one full re-index rather than risking a mis-classification
 - `<db>.summaries.json` — hierarchical code summaries cache (symbol/file/cluster levels)
