@@ -1146,10 +1146,9 @@ mod corruption_classification_tests {
                 CorruptionKind::EngineAssertion,
             ),
             (
-                format!(
-                    "refusing to overwrite a dirty publication: database error: \
-                     basic_string::_M_create"
-                ),
+                "refusing to overwrite a dirty publication: database error: \
+                 basic_string::_M_create"
+                    .to_string(),
                 CorruptionKind::EngineAssertion,
             ),
             (
