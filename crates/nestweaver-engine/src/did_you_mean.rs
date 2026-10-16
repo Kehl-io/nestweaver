@@ -99,6 +99,15 @@ pub fn did_you_mean_candidates(
         return Ok(Vec::new());
     }
 
+    // 12.1.1 (M4): `path::nosuch` is answered from that file's members, as
+    // the CLI help promises.
+    if let Some(spec) = qualified.as_ref() {
+        let members = file_member_suggestions(store, spec, &keep)?;
+        if !members.is_empty() {
+            return Ok(members);
+        }
+    }
+
     let page = store
         .search_symbols_by_name_page(
             search,
@@ -116,15 +125,179 @@ pub fn did_you_mean_candidates(
         }
         _ => true,
     };
-    let visible: Vec<&Symbol> = page
+    let mut visible: Vec<Symbol> = page
         .symbols
-        .iter()
+        .into_iter()
         .filter(|s| keep(s) && same_file_name(s))
         .collect();
+    // 12.1.1 (M4): then names a small typo away, which no substring search
+    // finds (`helpr`, `resolve_trigram_polcy`), closest first.
+    if search != nestweaver_schema::MODULE_OWNER_NAME {
+        let already: std::collections::HashSet<String> =
+            visible.iter().map(|s| s.uid.clone()).collect();
+        visible.extend(
+            edit_distance_matches(store, search, &keep)?
+                .into_iter()
+                .filter(|s| !already.contains(&s.uid)),
+        );
+    }
+    format_suggestions(store, qualified.is_some(), &visible)
+}
+
+/// The furthest edit distance a suggestion may be from a name of `len`
+/// characters: none below 3, one for 3 or 4, two from 5.
+fn max_edit_distance(len: usize) -> usize {
+    match len {
+        0..=2 => 0,
+        3 | 4 => 1,
+        _ => 2,
+    }
+}
+
+/// Levenshtein distance between `a` and `b` when it is at most `max`.
+fn bounded_edit_distance(a: &[char], b: &[char], max: usize) -> Option<usize> {
+    if a.len().abs_diff(b.len()) > max {
+        return None;
+    }
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut current = Vec::with_capacity(b.len() + 1);
+        current.push(i + 1);
+        for (j, cb) in b.iter().enumerate() {
+            let substitute = previous[j] + usize::from(ca != cb);
+            current.push(substitute.min(previous[j + 1] + 1).min(current[j] + 1));
+        }
+        if current.iter().min().is_some_and(|&best| best > max) {
+            return None;
+        }
+        previous = current;
+    }
+    previous.last().copied().filter(|&distance| distance <= max)
+}
+
+/// Symbols whose name is within [`max_edit_distance`] of `name`, case
+/// insensitively, closest first. Module owners never match: they are named
+/// only by `path::<module>`.
+fn edit_distance_matches(
+    store: &GraphStore,
+    name: &str,
+    keep: &impl Fn(&Symbol) -> bool,
+) -> Result<Vec<Symbol>, anyhow::Error> {
+    let needle: Vec<char> = name.to_lowercase().chars().collect();
+    let max = max_edit_distance(needle.len());
+    if max == 0 {
+        return Ok(Vec::new());
+    }
+    let mut found = store
+        .scan_symbol_names(|lower, symbol| {
+            // Cheap length bound first: most of the table is skipped here.
+            if symbol.is_module_owner()
+                || lower.chars().count().abs_diff(needle.len()) > max
+                || !keep(symbol)
+            {
+                return None;
+            }
+            let candidate: Vec<char> = lower.chars().collect();
+            bounded_edit_distance(&needle, &candidate, max)
+                .filter(|&distance| distance > 0)
+                .map(|distance| (distance, symbol.clone()))
+        })
+        .map_err(|e| anyhow::anyhow!("scan_symbol_names: {e}"))?;
+    found.sort_by(|(da, a), (db, b)| {
+        da.cmp(db)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.file_path.cmp(&b.file_path))
+    });
+    found.truncate(DID_YOU_MEAN_OVER_FETCH);
+    Ok(found.into_iter().map(|(_, symbol)| symbol).collect())
+}
+
+/// 12.1.1 (M4): when `spec`'s first qualifier names a file, that file's
+/// members as `path::name` suggestions (best file match only, like the
+/// lookup): those whose name is close to the one asked for (a substring
+/// either way, or a small typo), else every member in source order. An inner
+/// class qualifier narrows to that class's members when it has any. Empty
+/// when no file matches.
+fn file_member_suggestions(
+    store: &GraphStore,
+    spec: &nestweaver_schema::QualifiedSpec<'_>,
+    keep: &impl Fn(&Symbol) -> bool,
+) -> Result<Vec<String>, anyhow::Error> {
+    let qualifier = spec.qualifiers[0];
+    let mut members = store
+        .scan_symbol_names(|_, symbol| {
+            if symbol.is_module_owner() || !keep(symbol) {
+                return None;
+            }
+            nestweaver_schema::file_qualifier_rank(qualifier, &symbol.file_path)
+                .map(|rank| (rank, symbol.clone()))
+        })
+        .map_err(|e| anyhow::anyhow!("scan_symbol_names: {e}"))?;
+    let Some(best) = members.iter().map(|(rank, _)| *rank).min() else {
+        return Ok(Vec::new());
+    };
+    members.retain(|(rank, _)| *rank == best);
+    let mut members: Vec<Symbol> = members.into_iter().map(|(_, symbol)| symbol).collect();
+    members.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then_with(|| a.start_line.cmp(&b.start_line))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let uids: Vec<&str> = members.iter().map(|s| s.uid.as_str()).collect();
+    let containers = store
+        .container_chains(&uids, 1)
+        .map_err(|e| anyhow::anyhow!("container_chains: {e}"))?;
+    if let Some(class) = spec.qualifiers.get(1..).and_then(<[&str]>::last) {
+        let in_class: Vec<Symbol> = members
+            .iter()
+            .filter(|s| {
+                containers
+                    .get(&s.uid)
+                    .and_then(|chain| chain.first())
+                    .is_some_and(|container| container == class)
+            })
+            .cloned()
+            .collect();
+        if !in_class.is_empty() {
+            members = in_class;
+        }
+    }
+    let needle = spec.name.to_lowercase();
+    let needle_chars: Vec<char> = needle.chars().collect();
+    let max = max_edit_distance(needle_chars.len());
+    let mut close: Vec<(usize, &Symbol)> = members
+        .iter()
+        .filter_map(|s| {
+            let lower = s.name.to_lowercase();
+            if lower.contains(&needle) || needle.contains(&lower) {
+                return Some((0, s));
+            }
+            let chars: Vec<char> = lower.chars().collect();
+            bounded_edit_distance(&needle_chars, &chars, max).map(|distance| (distance, s))
+        })
+        .collect();
+    close.sort_by_key(|(distance, _)| *distance);
+    let chosen: Vec<Symbol> = if close.is_empty() {
+        members
+    } else {
+        close.into_iter().map(|(_, s)| s.clone()).collect()
+    };
+    format_suggestions(store, true, &chosen)
+}
+
+/// Render `symbols` as up to [`DID_YOU_MEAN_LIMIT`] distinct suggestions:
+/// `path::name` (`path::Container::name` for a member) when the miss was
+/// qualified, the display name otherwise.
+fn format_suggestions(
+    store: &GraphStore,
+    qualified: bool,
+    symbols: &[Symbol],
+) -> Result<Vec<String>, anyhow::Error> {
     // One container level is enough for the suggestion to resolve: the
     // lookup matches a container chain from its innermost end.
-    let containers = if qualified.is_some() {
-        let uids: Vec<&str> = visible.iter().map(|s| s.uid.as_str()).collect();
+    let containers = if qualified {
+        let uids: Vec<&str> = symbols.iter().map(|s| s.uid.as_str()).collect();
         store
             .container_chains(&uids, 1)
             .map_err(|e| anyhow::anyhow!("container_chains: {e}"))?
@@ -134,11 +307,11 @@ pub fn did_you_mean_candidates(
 
     let mut seen_names = std::collections::HashSet::new();
     let mut names = Vec::with_capacity(DID_YOU_MEAN_LIMIT);
-    for candidate in visible {
+    for candidate in symbols {
         if names.len() == DID_YOU_MEAN_LIMIT {
             break;
         }
-        let suggestion = if qualified.is_some() {
+        let suggestion = if qualified {
             match containers
                 .get(&candidate.uid)
                 .and_then(|chain| chain.first())
@@ -299,6 +472,102 @@ mod tests {
             did_you_mean_candidates(&store, "src/a/svc.ts::Svc::run", always_keep).unwrap();
         names.sort();
         assert_eq!(names, ["a/Svc.ts::Svc::run", "b.ts::Svc::run"]);
+    }
+
+    /// 12.1.1 (M4): a typo the substring search cannot see (a dropped or
+    /// swapped letter) is suggested by edit distance (at most 2, at most 1
+    /// for a 3- or 4-letter name), after any substring match.
+    #[test]
+    fn edit_distance_typos_are_suggested() {
+        let store = GraphStore::in_memory().unwrap();
+        for (uid, name) in [
+            ("s1", "resolve_trigram_policy"),
+            ("s2", "helper"),
+            ("s3", "run"),
+            ("s4", "unrelated_thing"),
+        ] {
+            store.insert_symbol(&symbol(uid, name, "repo:a")).unwrap();
+        }
+        let ask = |query: &str| did_you_mean_candidates(&store, query, always_keep).unwrap();
+        assert_eq!(ask("resolve_trigram_polcy"), ["resolve_trigram_policy"]);
+        assert_eq!(ask("helpr"), ["helper"]);
+        assert_eq!(ask("hepler"), ["helper"], "a swap is two edits");
+        assert_eq!(ask("rum"), ["run"]);
+        assert!(ask("xyz").is_empty(), "three edits from `run` is no match");
+        assert_eq!(
+            ask("nope.js::helpr"),
+            ["src/s2.rs::helper"],
+            "a qualified typo suggests path::name"
+        );
+        // A substring match ranks before an edit-distance one. (A fresh
+        // store: the name table is cached per graph generation.)
+        let store = GraphStore::in_memory().unwrap();
+        for (uid, name) in [("s2", "helper"), ("s5", "helpr_cache")] {
+            store.insert_symbol(&symbol(uid, name, "repo:a")).unwrap();
+        }
+        assert_eq!(
+            did_you_mean_candidates(&store, "helpr", always_keep).unwrap(),
+            ["helpr_cache", "helper"]
+        );
+    }
+
+    /// 12.1.1 (M4): `path::nosuch` is answered from that file's members, as
+    /// the CLI help promises, closest name first; with no close name, the
+    /// file's members in source order. Never another file's symbols.
+    #[test]
+    fn a_file_qualified_miss_suggests_that_files_members() {
+        use nestweaver_schema::{EdgeType, ResolvedEdge};
+        let store = GraphStore::in_memory().unwrap();
+        for (uid, name, path, line, parent) in [
+            ("u-repo", "UserRepository", "engine/user.py", 1, None),
+            ("u-save", "save", "engine/user.py", 2, Some("u-repo")),
+            ("u-load", "load", "engine/user.py", 5, Some("u-repo")),
+            ("u-help", "user_helper", "engine/user.py", 9, None),
+            ("o-save", "save", "engine/order.py", 1, None),
+        ] {
+            let mut s = symbol(uid, name, "repo:a");
+            s.file_path = path.to_string();
+            s.start_line = line;
+            store.insert_symbol(&s).unwrap();
+            if let Some(parent) = parent {
+                store
+                    .insert_edge(&ResolvedEdge {
+                        source_uid: uid.to_string(),
+                        target_uid: parent.to_string(),
+                        edge_type: EdgeType::MemberOf,
+                        confidence: 1.0,
+                        link_type: None,
+                        evidence: vec![],
+                    })
+                    .unwrap();
+            }
+        }
+        let ask = |query: &str| did_you_mean_candidates(&store, query, always_keep).unwrap();
+        assert_eq!(
+            ask("engine/user.py::sav"),
+            ["engine/user.py::UserRepository::save"],
+            "the close member only, never order.py's save"
+        );
+        assert_eq!(
+            ask("user.py::UserRepository::lod"),
+            ["engine/user.py::UserRepository::load"]
+        );
+        assert_eq!(
+            ask("user.py::nosuch"),
+            [
+                "engine/user.py::UserRepository",
+                "engine/user.py::UserRepository::save",
+                "engine/user.py::UserRepository::load",
+                "engine/user.py::user_helper",
+            ],
+            "no close name: the file's members in source order"
+        );
+        assert!(
+            ask("user.py::<module>")
+                .iter()
+                .all(|s| s.starts_with("engine/user.py::") && !s.ends_with("::<module>")),
+            "an owner-less file suggests its members"
+        );
     }
 
     /// One text rendering of the suggestions, for every CLI miss.

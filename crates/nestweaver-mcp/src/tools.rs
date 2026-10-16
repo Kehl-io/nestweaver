@@ -12531,14 +12531,14 @@ fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_brain_impact() -> Value {
     json!({
         "name": "brain_impact",
-        "description": "Trace reverse dependencies of a symbol to understand what might break if it changes. Returns confidence-weighted impact scores (0.0-1.0) decaying through the call graph.\n\nGuidelines:\n- Use BEFORE modifying a function, class, or interface\n- Results sorted by impact_score (highest risk first); type-aware resolution follows class hierarchies\n- Use response_format 'concise' for names only, 'detailed' for full metadata\n- `symbol` may be `path::name`, `Class::method` or `path::Class::method`: the first qualifier narrows by file (exact repo-relative path, `/`-boundary suffix, or that suffix without its extension) and the rest by container, or every qualifier narrows by container; both readings are kept. One matching neither is not_found with `path::name` suggestions. `path::<module>` names a file's top-level code\n- A caller labelled `path::<module>` is that file's top-level code (the module owner)\n- Dependents are returned once, as `impact_nodes` (the CLI's JSON also mirrors them as `nodes`). Rows cut to fit the MCP output budget are counted in `output_budget.cuts`; `truncated_by_limit` is set only when `limit` cut them, so raise `limit` only then\n\nLimitations:\n- A bare `symbol` name resolves by EXACT match only, never substring/fuzzy -- a name `brain_search` finds hits for can still be not_found here; the not_found response (`isError: true`, like every lookup tool's miss) carries a bounded `did_you_mean` list of the closest substring matches when any exist\n- For forward call chains use flow_trace; for file-level impact use detect_changes or blast_radius\n- For cross-repo impact use cross_repo_contracts\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
+        "description": "Trace reverse dependencies of a symbol to understand what might break if it changes. Returns confidence-weighted impact scores (0.0-1.0) decaying through the call graph.\n\nGuidelines:\n- Use BEFORE modifying a function, class, or interface\n- Results sorted by impact_score (highest risk first); type-aware resolution follows class hierarchies\n- Use response_format 'concise' for names only, 'detailed' for full metadata\n- `symbol` may be `path::name`, `Class::method` or `path::Class::method`: the first qualifier narrows by file (exact repo-relative path, `/`-boundary suffix, or that suffix without its extension) and the rest by container, or every qualifier narrows by container; both readings are kept. One matching neither is not_found with `path::name` suggestions. `path::<module>` names a file's top-level code\n- A caller labelled `path::<module>` is that file's top-level code (the module owner)\n- Dependents are returned once, as `impact_nodes` (the CLI's JSON also mirrors them as `nodes`). Rows cut to fit the MCP output budget are counted in `output_budget.cuts`; `truncated_by_limit` is set only when `limit` cut them, so raise `limit` only then\n\nLimitations:\n- A bare `symbol` name resolves by EXACT match only, never substring/fuzzy -- a name `brain_search` finds hits for can still be not_found here; the not_found response (`isError: true`, like every lookup tool's miss) carries a bounded `did_you_mean` list (substring matches, then names a small typo away; that file's members for `path::name`) when any exist\n- For forward call chains use flow_trace; for file-level impact use detect_changes or blast_radius\n- For cross-repo impact use cross_repo_contracts\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repo": { "type": "string", "description": "Scope the target symbol to this repository (UID or display name)." },
                 "confidence": { "type": "number", "minimum": 0, "maximum": 1, "default": 0, "description": "Minimum edge confidence." },
                 "min_score": { "type": "number", "minimum": 0, "maximum": 1, "description": "Minimum traversal impact score; 0 disables pruning." },
-                "symbol": { "type": "string", "description": "Symbol name (e.g. \"validateUser\") or full UID (e.g. \"sym:repo:...:hash:42\"). A bare name is resolved by EXACT match only (not substring); ambiguous names require a repo selector or UID. An exact-match miss returns status \"not_found\" with a bounded `did_you_mean` array of the closest substring matches, when any exist." },
+                "symbol": { "type": "string", "description": "Symbol name (e.g. \"validateUser\") or full UID (e.g. \"sym:repo:...:hash:42\"). A bare name is resolved by EXACT match only (not substring); ambiguous names require a repo selector or UID. An exact-match miss returns status \"not_found\" with a bounded `did_you_mean` array: substring matches, then names a small typo away (edit distance up to 2), and for `path::name` that file's members; absent when none exist." },
                 "depth": { "type": "integer", "minimum": 1, "maximum": 15, "description": "Max traversal depth (1-15). Higher values find more transitive dependents but take longer. Default 3.", "default": 3 },
                 "limit": {
                     "type": "integer",
@@ -33318,6 +33318,17 @@ mod ambiguous_name_contract_tests {
         assert_eq!(
             miss["did_you_mean"],
             json!(["src/cache.js::Cache::get"]),
+            "{miss}"
+        );
+
+        // 12.1.1 (M4): a typo is suggested by edit distance, and
+        // `path::nosuch` from that file's members.
+        let miss = read("helpr");
+        assert_eq!(miss["did_you_mean"], json!(["helper"]), "{miss}");
+        let miss = read("src/util.js::nosuch");
+        assert_eq!(
+            miss["did_you_mean"],
+            json!(["src/util.js::helper"]),
             "{miss}"
         );
 

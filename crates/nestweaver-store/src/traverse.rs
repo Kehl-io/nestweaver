@@ -1408,6 +1408,65 @@ impl GraphStore {
         )
     }
 
+    /// The full symbol table with lowercased names, from the per-generation
+    /// `symbol_name_cache` (loaded and published on a miss).
+    fn symbol_name_entry(
+        &self,
+        after_db_scan: impl FnOnce(),
+        inside_publication_barrier: impl FnOnce(),
+    ) -> Result<std::sync::Arc<SymbolNameCached>, StoreError> {
+        // --- Step 1: coherently snapshot publication state + cache ----------
+        // On a clean hit we clone the Arc (cheap ref-count bump). Dirty
+        // publications always bypass hits. The DB query itself remains outside
+        // the publication barrier so an index writer is never blocked by a
+        // full-table scan.
+        let (query_generation, cached_symbols) = self.begin_symbol_name_cache_query();
+
+        // --- Step 2: on cache miss, query the DB then populate the cache ----
+        if let Some(arc) = cached_symbols {
+            return Ok(arc);
+        }
+        // LadybugDB's CONTAINS is case-sensitive and has no toLower().
+        // Load all symbols and filter in Rust for case-insensitive matching.
+        let conn = self.conn()?;
+        let q = format!("MATCH (s:Symbol) RETURN {}", crate::read::SYMBOL_COLUMNS);
+        let result = conn
+            .query(&q)
+            .map_err(|e| StoreError::Query(format!("query: {e}")))?;
+
+        let mut all: Vec<(String, nestweaver_schema::Symbol)> = Vec::new();
+        for row in result {
+            if let Ok(sym) = crate::read::row_to_symbol(&row) {
+                let lower = sym.name.to_lowercase();
+                all.push((lower, sym));
+            }
+        }
+
+        after_db_scan();
+        Ok(self.finalize_symbol_name_cache_query_with_hook(
+            query_generation,
+            all,
+            inside_publication_barrier,
+        ))
+    }
+
+    /// 12.1.1: visit every symbol (with its lowercased name) in the cached
+    /// symbol table the name search uses, keeping what `visit` returns. For
+    /// lookups the substring search cannot express, such as `did_you_mean`'s
+    /// edit-distance and same-file candidates; no extra table scan when the
+    /// name search already warmed the cache this generation.
+    pub fn scan_symbol_names<T>(
+        &self,
+        mut visit: impl FnMut(&str, &nestweaver_schema::Symbol) -> Option<T>,
+    ) -> Result<Vec<T>, StoreError> {
+        let entry = self.symbol_name_entry(|| {}, || {})?;
+        Ok(entry
+            .symbols
+            .iter()
+            .filter_map(|(lower, symbol)| visit(lower, symbol))
+            .collect())
+    }
+
     fn search_symbols_by_name_page_impl(
         &self,
         query: &str,
@@ -1424,40 +1483,7 @@ impl GraphStore {
             });
         }
         let needle = query.to_lowercase();
-        // --- Step 1: coherently snapshot publication state + cache ----------
-        // On a clean hit we clone the Arc (cheap ref-count bump). Dirty
-        // publications always bypass hits. The DB query itself remains outside
-        // the publication barrier so an index writer is never blocked by a
-        // full-table scan.
-        let (query_generation, cached_symbols) = self.begin_symbol_name_cache_query();
-
-        // --- Step 2: on cache miss, query the DB then populate the cache ----
-        let entry: std::sync::Arc<SymbolNameCached> = if let Some(arc) = cached_symbols {
-            arc
-        } else {
-            // LadybugDB's CONTAINS is case-sensitive and has no toLower().
-            // Load all symbols and filter in Rust for case-insensitive matching.
-            let conn = self.conn()?;
-            let q = format!("MATCH (s:Symbol) RETURN {}", crate::read::SYMBOL_COLUMNS);
-            let result = conn
-                .query(&q)
-                .map_err(|e| StoreError::Query(format!("query: {e}")))?;
-
-            let mut all: Vec<(String, nestweaver_schema::Symbol)> = Vec::new();
-            for row in result {
-                if let Ok(sym) = crate::read::row_to_symbol(&row) {
-                    let lower = sym.name.to_lowercase();
-                    all.push((lower, sym));
-                }
-            }
-
-            after_db_scan();
-            self.finalize_symbol_name_cache_query_with_hook(
-                query_generation,
-                all,
-                inside_publication_barrier,
-            )
-        };
+        let entry = self.symbol_name_entry(after_db_scan, inside_publication_barrier)?;
 
         // --- Step 3: filter and rank the in-memory list ----------------------
         // Collect all substring matches, score by name quality × path factor,
