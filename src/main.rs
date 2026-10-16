@@ -4983,7 +4983,14 @@ fn render_dead_code_text(payload: &serde_json::Value) {
         // after them.
         // nw-113: `<module>` owners seed the walk too; they are counted in
         // `module_owner_roots`, not `entry_points`.
-        if entry_points == 0 && num("module_owner_roots") == 0 && total > 0 {
+        // 12.1.1 (M2): with `--repo` both counts are the scoped repos' roots,
+        // so a scoped repo reached only from another repo's roots reads 0/0
+        // over a seeded walk; `coverage` says whether the walk had a seed.
+        if entry_points == 0
+            && num("module_owner_roots") == 0
+            && total > 0
+            && payload.get("coverage").and_then(|v| v.as_str()) != Some("complete")
+        {
             println!(
                 "Coverage DEGRADED: no entry point was found, so the reachability walk had \
                  no seed and every symbol below is unreachable BY CONSTRUCTION. This is not \

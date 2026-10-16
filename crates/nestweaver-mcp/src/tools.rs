@@ -16316,7 +16316,7 @@ fn tool_project_context(
 fn tool_schema_dead_code() -> Value {
     json!({
         "name": "dead_code",
-        "description": "Review statically unreachable symbols. Every tier is review-only, never deletion approval. High input remains accepted but returns an explicitly unavailable, unvalidated population; no High rows are emitted. Low includes all review candidates; Medium excludes explicitly public candidates. Check coverage, entry_points, module_owner_roots, undecodable_symbols, languages_without_entry_points and manifest_load_error before interpreting counts. Module owners (a file's top-level code) seed the walk and are never reported; they count in module_owner_roots, not entry_points, and coverage needs entry_points + module_owner_roots > 0. Missing static references, dynamic dispatch and same-file-only bash trap resolution remain limitations. Resolver-stale graphs refuse with remedies. Optional repos scope uses a global reachability walk then filters results and totals. Pages are local to one database: use next_offset with expected_generation and page_token from the prior response. Changed publication, database, scope, filter or ordered population refuses continuation. Row order is confidence, PageRank, file, name, UID. Pages remain bounded to 1000 rows; traversal still examines the whole graph.",
+        "description": "Review statically unreachable symbols. Every tier is review-only, never deletion approval. High input remains accepted but returns an explicitly unavailable, unvalidated population; no High rows are emitted. Low includes all review candidates; Medium excludes explicitly public candidates. Check coverage, entry_points, module_owner_roots, undecodable_symbols, languages_without_entry_points and manifest_load_error before interpreting counts. Module owners (a file's top-level code) seed the walk and are never reported; they count in module_owner_roots, not entry_points. With a repos scope, entry_points and module_owner_roots count that scope's roots; coverage needs the walk to have had at least one root anywhere. Missing static references, dynamic dispatch and same-file-only bash trap resolution remain limitations. Resolver-stale graphs refuse with remedies. Optional repos scope uses a global reachability walk then filters results and totals. Pages are local to one database: use next_offset with expected_generation and page_token from the prior response. Changed publication, database, scope, filter or ordered population refuses continuation. Row order is confidence, PageRank, file, name, UID. Pages remain bounded to 1000 rows; traversal still examines the whole graph.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -16516,6 +16516,71 @@ mod dead_code_argument_contract_tests {
                 .contains("not-hex"),
             "{payload}"
         );
+    }
+
+    /// 12.1.1 (M2): `module_owner_roots` and `entry_points` count the
+    /// `repos` scope's roots, like the other totals, not the whole graph's.
+    #[test]
+    fn dead_code_root_counts_follow_the_repos_scope() {
+        use nestweaver_schema::{EntryPointKind, Repo, Symbol, SymbolKind, Visibility};
+        let store = GraphStore::in_memory().unwrap();
+        for uid in ["repo:a", "repo:b"] {
+            store
+                .insert_repo(&Repo {
+                    uid: uid.to_string(),
+                    url: format!("https://example.test/{uid}"),
+                    indexed_sha: String::new(),
+                    staleness_commits_behind: 0,
+                    instance_id: "inst".to_string(),
+                    name: None,
+                    root_path: None,
+                })
+                .unwrap();
+        }
+        let symbol = |uid: &str, repo: &str, path: &str, owner: bool, entry: bool| Symbol {
+            uid: uid.to_string(),
+            name: if owner {
+                nestweaver_schema::MODULE_OWNER_NAME.to_string()
+            } else {
+                uid.replace(':', "_")
+            },
+            kind: if owner {
+                SymbolKind::Module
+            } else {
+                SymbolKind::Function
+            },
+            repo_uid: repo.to_string(),
+            file_path: path.to_string(),
+            start_line: 1,
+            end_line: 2,
+            signature: String::new(),
+            summary: None,
+            content_hash: format!("h_{uid}"),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: owner || entry,
+            entry_point_kind: owner.then_some(EntryPointKind::ModuleInit),
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        for s in [
+            symbol("a:owner", "repo:a", "a.js", true, false),
+            symbol("a:fn", "repo:a", "a.js", false, false),
+            symbol("b:owner1", "repo:b", "b1.js", true, false),
+            symbol("b:owner2", "repo:b", "b2.js", true, false),
+            symbol("b:main", "repo:b", "main.rs", false, true),
+        ] {
+            store.insert_symbol(&s).unwrap();
+        }
+        let all = tool_dead_code(&store, json!({}), None, None).unwrap();
+        assert_eq!(all["module_owner_roots"], 3, "{all}");
+        assert_eq!(all["entry_points"], 1, "{all}");
+        let scoped = tool_dead_code(&store, json!({ "repos": ["repo:a"] }), None, None).unwrap();
+        assert_eq!(scoped["scope"]["totals_population"], "filtered", "{scoped}");
+        assert_eq!(scoped["module_owner_roots"], 1, "{scoped}");
+        assert_eq!(scoped["entry_points"], 0, "{scoped}");
     }
 
     #[test]
