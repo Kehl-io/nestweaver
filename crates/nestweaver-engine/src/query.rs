@@ -2269,6 +2269,21 @@ mod context_tests {
             format!("{}::<module>", owner["file_path"].as_str().unwrap())
         );
         assert_eq!(json["symbol"]["display_name"], "fromTemplate");
+        // 12.1.1 (B5): the owner looked up itself reads the same way: raw
+        // `name`, labelled `display_name`.
+        let owner_path = owner["file_path"].as_str().unwrap().to_string();
+        let super::LookupResult::Found(owner_detail) =
+            super::lookup_symbol(&store, &format!("{owner_path}::<module>"), None).unwrap()
+        else {
+            panic!("{owner_path}::<module> resolves")
+        };
+        let owner_json = serde_json::to_value(&*owner_detail).unwrap();
+        assert_eq!(owner_json["symbol"]["name"], "<module>", "{owner_json}");
+        assert_eq!(
+            owner_json["symbol"]["display_name"],
+            format!("{owner_path}::<module>"),
+            "{owner_json}"
+        );
         let back: super::SymbolDetail = serde_json::from_value(json).unwrap();
         assert_eq!(back.callers.len(), detail.callers.len());
     }

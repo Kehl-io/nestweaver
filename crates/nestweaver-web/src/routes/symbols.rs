@@ -30,19 +30,26 @@ pub async fn search(
     Ok(Json(json).into_response())
 }
 
-/// nw-113: a file's symbol list as JSON, its `<module>` owner labelled
-/// `path::<module>` rather than bare.
-fn labelled_symbols_json(
+/// nw-113: a symbol list as JSON, each `<module>` owner labelled
+/// `path::<module>` rather than bare. 12.1.1 (R1): every row also carries
+/// that label as `display_name`, and `name` (what the UI renders) reads the
+/// same, so several owners in one list can be told apart.
+pub(crate) fn labelled_symbols_json(
     symbols: Vec<nestweaver_schema::Symbol>,
 ) -> serde_json::Result<serde_json::Value> {
-    let symbols: Vec<_> = symbols
+    let rows = symbols
         .into_iter()
         .map(|mut symbol| {
-            symbol.name = symbol.display_name().into_owned();
-            symbol
+            let display_name = symbol.display_name().into_owned();
+            symbol.name = display_name.clone();
+            let mut row = serde_json::to_value(&symbol)?;
+            if let Some(object) = row.as_object_mut() {
+                object.insert("display_name".into(), display_name.into());
+            }
+            Ok(row)
         })
-        .collect();
-    serde_json::to_value(&symbols)
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    Ok(serde_json::Value::Array(rows))
 }
 
 #[derive(Deserialize, Default)]
@@ -150,7 +157,7 @@ pub async fn symbols_top(
         } else {
             crate::routes::workspaces::symbols_page(&state2.store, &workspace, None, limit)?.items
         };
-        let json = serde_json::to_value(&symbols)?;
+        let json = labelled_symbols_json(symbols)?;
         Ok(Json(json).into_response())
     })
     .await
@@ -201,6 +208,66 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["a.js::<module>", "f"], "{symbols}");
+    }
+
+    /// 12.1.1 (R1): `/api/v1/symbols/top`, unscoped and repo-scoped (the
+    /// `symbols_page` route), labels a `<module>` owner `path::<module>` in
+    /// `name` (what the UI renders) and in `display_name`.
+    #[tokio::test]
+    async fn symbols_top_labels_module_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.js"), "function f() {}\nf();\n").unwrap();
+        let db_path = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::open_or_create(&db_path).unwrap();
+        nestweaver_engine::index_directory_with_store(
+            &store,
+            &src,
+            &db_path,
+            "test",
+            "https://example.com/r",
+            "sha",
+            false,
+            None,
+        )
+        .unwrap();
+        let repo_uid = store.list_repos(None).unwrap()[0].uid.clone();
+        let state = AppState::new(store, None, db_path);
+        for workspace in [None, Some(repo_uid)] {
+            let response = symbols_top(
+                State(state.clone()),
+                Query(TopParams {
+                    limit: Some(50),
+                    workspace: workspace.clone(),
+                    scope: None,
+                }),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("top symbols for {workspace:?}"));
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let symbols: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let owner = symbols
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["kind"] == "Module")
+                .unwrap_or_else(|| panic!("{workspace:?}: the owner is ranked: {symbols}"));
+            assert_eq!(owner["name"], "a.js::<module>", "{workspace:?}: {symbols}");
+            assert_eq!(
+                owner["display_name"], "a.js::<module>",
+                "{workspace:?}: {symbols}"
+            );
+            let f = symbols
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["kind"] == "Function")
+                .unwrap();
+            assert_eq!(f["display_name"], "f", "{symbols}");
+        }
     }
 
     /// During a dirty index publication the top-symbols route must say

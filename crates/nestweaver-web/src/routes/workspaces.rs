@@ -495,6 +495,15 @@ pub fn symbols_page(
             limit,
         )
         .map_err(|e| ApiError::from_ranking(e.into()))?;
+    // 12.1.1 (R1): an owner reads `path::<module>` on every consumer of this
+    // page (top symbols, overview landmarks, search hits), never bare.
+    let items = items
+        .into_iter()
+        .map(|mut symbol| {
+            symbol.name = symbol.display_name().into_owned();
+            symbol
+        })
+        .collect();
     Ok(BoundedResults { items, total_count })
 }
 
