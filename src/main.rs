@@ -8234,6 +8234,11 @@ enum Commands {
         sarif: bool,
         #[arg(
             long,
+            help = "Repository the changed files belong to (name or UID). Default: the indexed repo checked out at the working directory's git root; repo-relative paths then resolve in that repo only, never in another repo with the same relative path"
+        )]
+        repo: Option<String>,
+        #[arg(
+            long,
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
         )]
         db: Option<PathBuf>,
@@ -21172,6 +21177,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             depth,
             json,
             sarif,
+            repo,
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
@@ -21281,10 +21287,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if use_daemon && !sarif {
                 let file_strs: Vec<&str> =
                     changed_files.iter().filter_map(|p| p.to_str()).collect();
-                let args = serde_json::json!({
+                // 12.1.1 (B4): the daemon resolves these to the repo under
+                // review, so a repo-relative path matches that repo only.
+                let mut args = serde_json::json!({
                     "files": file_strs,
                     "depth": depth,
+                    "working_root": repo_root.to_string_lossy(),
                 });
+                if let Some(repo) = repo.as_deref() {
+                    args["repo"] = serde_json::json!(repo);
+                }
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "pr_impact", args)? {
                     // The daemon serializes a full BlastRadiusResult; decode it so
                     // both the concise banner and the strict exit code see the real
@@ -21325,9 +21337,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 depth
             ));
 
-            // TODO(nw-033): resolve target repo_uid from the working repo
+            // 12.1.1 (B4): the repo under review, from `--repo` or the
+            // working directory, so repo-relative paths resolve there only.
+            let target_repo = nestweaver_engine::pr_impact_target_repo(
+                &store,
+                repo.as_deref(),
+                Some(&repo_root),
+            )?;
             let options = nestweaver_engine::BlastRadiusOptions {
-                target_repo: None,
+                target_repo,
                 max_depth: depth,
                 include_data_edges: false,
                 limit: None,

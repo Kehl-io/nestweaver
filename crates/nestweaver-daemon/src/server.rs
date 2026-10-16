@@ -11354,6 +11354,19 @@ impl NestWeaverDaemon for DaemonService {
                 .map(PathBuf::from)
                 .collect();
 
+        // 12.1.1 (B4): the repo under review. `repo` is the caller's
+        // `--repo`; `working_root` is the CLI's working git root, matched
+        // against each repo's recorded checkout. Neither names one: every
+        // repo is matched, as before.
+        let repo_selector = args
+            .get("repo")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let working_root = args
+            .get("working_root")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from);
+
         let cancel_for_task = cancel.clone();
         let handler = async move {
             tokio::task::spawn_blocking(move || {
@@ -11363,9 +11376,14 @@ impl NestWeaverDaemon for DaemonService {
                 nestweaver_engine::resolver_generation::set_declared_link_config(
                     state.instance_cfg.clone(),
                 );
-                // TODO(nw-033): resolve target repo_uid from the working repo
+                let target_repo = nestweaver_engine::pr_impact_target_repo(
+                    &state.store,
+                    repo_selector.as_deref(),
+                    working_root.as_deref(),
+                )
+                .map_err(|e| Status::not_found(format!("{e:#}")))?;
                 let options = nestweaver_engine::BlastRadiusOptions {
-                    target_repo: None,
+                    target_repo,
                     max_depth: depth,
                     include_data_edges: false,
                     limit: None,

@@ -16200,3 +16200,94 @@ fn read_symbols_qualifier_miss_is_not_found_with_suggestions() {
     assert_eq!(code, Some(0), "{payload}");
     assert_eq!(payload["symbols"][0]["path"], "src/cache.js", "{payload}");
 }
+
+/// 12.1.1 (B4): a repo-relative `pr-impact --files` path resolves against the
+/// repo of the working directory (or an explicit `--repo`), not against every
+/// indexed repo that happens to have a file at the same relative path.
+#[test]
+fn pr_impact_files_resolve_against_the_working_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let mut roots = Vec::new();
+    for (name, function) in [("alpha", "alphaOnly"), ("beta", "betaOnly")] {
+        let root = dir.path().join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("index.js"),
+            format!("function {function}() {{ return 1; }}\n{function}();\n"),
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ]);
+        nestweaver_cmd()
+            .args(["index", "--repo"])
+            .arg(&root)
+            .args(["--name", name, "--db"])
+            .arg(&db_path)
+            .assert()
+            .success();
+        roots.push(root);
+    }
+    let pr_impact = |cwd: &std::path::Path, extra: &[&str]| {
+        let output = nestweaver_cmd()
+            .args(["pr-impact", "--files", "index.js", "--json", "--db"])
+            .arg(&db_path)
+            .args(extra)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or(serde_json::Value::Null);
+        assert!(
+            payload.is_object(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let names: Vec<String> = payload["changed_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["name"].as_str().map(str::to_string))
+            .collect();
+        (payload, names)
+    };
+
+    let (payload, names) = pr_impact(&roots[0], &[]);
+    assert!(names.iter().any(|n| n == "alphaOnly"), "{payload}");
+    assert!(!names.iter().any(|n| n == "betaOnly"), "{payload}");
+    assert_eq!(
+        payload["coverage"]["repos_in_scope"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "{payload}"
+    );
+
+    // A subdirectory of the repo is the same repo.
+    std::fs::create_dir_all(roots[1].join("sub")).unwrap();
+    let (payload, names) = pr_impact(&roots[1].join("sub"), &[]);
+    assert!(names.iter().any(|n| n == "betaOnly"), "{payload}");
+    assert!(!names.iter().any(|n| n == "alphaOnly"), "{payload}");
+
+    // An explicit --repo wins over the working directory.
+    let (payload, names) = pr_impact(&roots[0], &["--repo", "beta"]);
+    assert!(names.iter().any(|n| n == "betaOnly"), "{payload}");
+    assert!(!names.iter().any(|n| n == "alphaOnly"), "{payload}");
+}
