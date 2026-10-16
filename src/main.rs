@@ -3454,6 +3454,10 @@ fn render_investigate_text(payload: &serde_json::Value) {
         text(payload, "bundle_id"),
         text(payload, "query")
     );
+    // I3: a map built during a live publication is answered but not saved.
+    if let Some(reason) = payload.get("bundle_not_saved").and_then(|v| v.as_str()) {
+        println!("  note: bundle not saved: {reason}");
+    }
     println!(
         "{} domain(s), {} entr{}{}",
         domains.len(),

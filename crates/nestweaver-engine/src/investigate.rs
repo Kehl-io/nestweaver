@@ -199,6 +199,11 @@ pub struct Domain {
 #[derive(Debug, Clone, Serialize)]
 pub struct InvestigateResult {
     pub bundle_id: String,
+    /// I3: set when the bundle was NOT persisted (it was built during a live
+    /// publication), so `bundle_id` cannot be expanded or hydrated. Says why
+    /// and what to do. Absent when the bundle was saved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_not_saved: Option<String>,
     pub query: String,
     /// The scope STRING the caller supplied, echoed back verbatim.
     ///
@@ -749,23 +754,34 @@ fn ensure_ranking_publication_clean(store: &GraphStore) -> Result<(), anyhow::Er
 }
 
 /// The generation an investigation is bracketed by, so a bundle never mixes
-/// entries from two graph generations.
+/// entries from two graph generations, and whether it was sampled under a
+/// dirty publication marker.
 ///
 /// 12.1.1 (V4): outside a publication this is the durable published
 /// generation, exactly as before. During a live watcher batch or code-link
 /// reconcile (the windows [`ensure_ranking_publication_clean`] lets through)
 /// the durable sidecar is mid-publication and the writer holds the lease, so
-/// the in-process generation counter is used instead: it moves on every
-/// commit, so an investigation that straddles one is still refused (with a
-/// retry), and one that does not is consistent and answers.
+/// the in-process generation counter is used instead. That counter is bumped
+/// once per BATCH, after the batch's commits, not on each commit: a batch's
+/// own per-note commits land between two samples with the counter unchanged,
+/// so the bracket cannot prove such an answer came from one graph state. The
+/// caller therefore answers it (with the dispatch seam's disclosure) but does
+/// not persist it as a bundle (I3).
 fn investigation_generation_snapshot(
     store: &GraphStore,
-) -> Result<u64, nestweaver_store::StoreError> {
+) -> Result<(u64, bool), nestweaver_store::StoreError> {
     if store.is_index_publication_dirty() && !store.index_publication_blocks_ranking() {
-        return Ok(store.graph_generation());
+        return Ok((store.graph_generation(), true));
     }
-    store.clean_published_generation_snapshot()
+    store
+        .clean_published_generation_snapshot()
+        .map(|generation| (generation, false))
 }
+
+/// I3: why a bundle sampled under a live publication is not saved.
+pub const BUNDLE_NOT_SAVED_DURING_PUBLICATION: &str = "a watcher publication was in progress, \
+     so this map may mix graph states and was not saved for drill-in; re-run investigate once \
+     it finishes to get a bundle that investigate_expand and investigate_hydrate accept";
 
 fn completed_publication_during_investigate(error: nestweaver_store::StoreError) -> anyhow::Error {
     anyhow::Error::new(error).context("index publication completed during investigate; retry")
@@ -829,7 +845,7 @@ pub fn investigate(
     //    about the RESULT can reject both. The only thing they share is the
     //    condition, so the condition is what is tested.
     ensure_ranking_publication_clean(store)?;
-    let initial_publication_generation =
+    let (initial_publication_generation, initial_under_publication) =
         investigation_generation_snapshot(store).map_err(anyhow::Error::new)?;
 
     // 1. Resolve scope into the seed inputs and an optional post-filter.
@@ -1211,15 +1227,20 @@ pub fn investigate(
     // read and immediately before making the mixed result durable. Refuse
     // before `update_bundle_store` so a retry cannot discover a bundle whose
     // entries came from different graph generations.
-    let final_publication_generation = investigation_generation_snapshot(store)
-        .map_err(completed_publication_during_investigate)?;
+    let (final_publication_generation, final_under_publication) =
+        investigation_generation_snapshot(store)
+            .map_err(completed_publication_during_investigate)?;
     if final_publication_generation != initial_publication_generation {
         return Err(completed_publication_during_investigate(
             nestweaver_store::StoreError::RankingUnavailable,
         ));
     }
+    // I3: the generation bracket cannot see a watcher batch's own commits, so
+    // a map sampled under a dirty marker is answered but never made durable.
+    let bundle_not_saved = (initial_under_publication || final_under_publication)
+        .then(|| BUNDLE_NOT_SAVED_DURING_PUBLICATION.to_string());
 
-    if let Some(db) = db_path {
+    if let Some(db) = db_path.filter(|_| bundle_not_saved.is_none()) {
         let id = bundle_id.clone();
         update_bundle_store(db, |bundle_store| {
             bundle_store.bundles.insert(id, bundle);
@@ -1257,6 +1278,7 @@ pub fn investigate(
 
     Ok(InvestigateResult {
         bundle_id,
+        bundle_not_saved,
         query: query.to_string(),
         scope: scope.to_string(),
         scope_filtered: scope_filter.is_some(),
@@ -3366,6 +3388,22 @@ mod tests {
         let result = run(&store, &db_path, dir.path(), "greet")
             .expect("a watcher batch answers with disclosure, not a closed failure");
         assert!(!result.entries.is_empty());
+        // I3: the generation bracket cannot see the batch's own per-note
+        // commits, so the map is answered but never saved: drill-in cannot
+        // be handed a bundle that mixes graph states.
+        assert_eq!(
+            result.bundle_not_saved.as_deref(),
+            Some(BUNDLE_NOT_SAVED_DURING_PUBLICATION)
+        );
+        assert!(load_bundle(&db_path, &result.bundle_id).is_none());
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json["bundle_not_saved"].is_string());
+
+        // Counterweight: with the publication finished the bundle is saved.
+        fs::remove_file(nestweaver_store::index_publication::marker_path(&db_path)).unwrap();
+        let result = run(&store, &db_path, dir.path(), "greet").unwrap();
+        assert!(result.bundle_not_saved.is_none());
+        assert!(load_bundle(&db_path, &result.bundle_id).is_some());
     }
 
     /// 12.1.1 (V4): a scope naming no project, or a malformed scope, is the
