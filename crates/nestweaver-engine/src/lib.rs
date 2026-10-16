@@ -605,7 +605,7 @@ pub use bare_clone::{mint_repo_identity, read_origin_url};
 pub use blast_radius::{
     AffectedCluster, AffectedSymbol as BlastAffectedSymbol, AnalysisStatus, BlastRadiusOptions,
     BlastRadiusResult, ChangedSymbol, GateState, Notification, NotificationLevel,
-    analyze_blast_radius, changed_files_from_git,
+    analyze_blast_radius, changed_files_from_git, pr_impact_target_repo,
 };
 pub use blast_radius_sarif::{append_contract_breaks_to_sarif, blast_radius_to_sarif};
 pub use brain_docgraph::{

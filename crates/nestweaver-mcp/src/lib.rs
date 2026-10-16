@@ -38,10 +38,15 @@ NestWeaver is a code intelligence knowledge graph. Use it instead of grep/find f
 - Read a vault note: note_get (by UID or title)
 - Investigate unfamiliar code: investigate → investigate_expand → investigate_hydrate
 
+## Naming symbols
+- Pass a UID, a name, path::name, Class::method or path::Class::method; path::<module> is a file's top-level code
+- A miss is not_found with did_you_mean suggestions; an ambiguous name lists candidates with file_path
+
 ## Query Efficiency
 - Always query the graph before reading source files
 - Filter with repos, tags, path_prefix, kinds for precision
 - Use response_format 'concise' unless you need full bodies
+- Cut answers say so (truncated*, body_truncated, output_budget.cuts); narrow the query rather than raising limit
 - In subagents/scripts: use CLI (nestweaver search --json) instead of MCP for fewer tokens
 
 ## Do NOT
@@ -51,11 +56,9 @@ NestWeaver is a code intelligence knowledge graph. Use it instead of grep/find f
 
 ## Server Mode
 When connected to a NestWeaver server (not a local daemon):
-- brain_status includes indexing_active, indexing_repo, queue_depth, and server_mode fields
-- brain_status also reports write_queue_depth (write RPCs blocked on the daemon write lock; distinct from queue_depth, which counts index jobs), write_holder, write_holder_seconds, and embedding_status.pass_* progress for an in-flight embedding pass
-- read_symbols may return empty bodies with a server_note explaining the bare-clone limitation
-- regex_search runs trigram-accelerated exact regex over the graph store — identical locally and on the server (it does NOT use Tantivy)
-- blast_radius returns two-tier results (local_impact + org_wide_impact) when upstream is available
+- brain_status adds indexing_active, indexing_repo, queue_depth, write_queue_depth, write_holder and server_mode
+- read_symbols may return empty bodies with a server_note (bare clones)
+- blast_radius returns local_impact + org_wide_impact when upstream is available
 - Results include _meta.sources indicating which data sources contributed";
 
 /// Canonical sidecar location for the Tantivy index. Lives next to the
@@ -790,8 +793,8 @@ const SEARCH_TOOLS: &[&str] = &["brain_search", "brain_context", "project_contex
 /// This is intentionally simple and conservative:
 /// - No last tool recorded → nothing happened, skip.
 /// - Last tool was a search → agent was still looking, skip.
-/// - Otherwise → reinforce the last surfaced UIDs (the retrieval the agent
-///   acted on and then stopped searching).
+/// - Otherwise → reinforce the last surfaced UIDs the agent then used (a
+///   follow-up access); results that were only shown are not reinforced.
 ///
 /// `record_terminal_success` no-ops on an empty UID list, so this is safe
 /// even when nothing was ever surfaced.
@@ -807,8 +810,11 @@ fn maybe_record_terminal_success(tracker: &nestweaver_engine::InteractionTracker
         // not treat the session as a successful terminal retrieval.
         return;
     }
-    let surfaced = tracker.last_surfaced_uids();
-    tracker.record_terminal_success(&surfaced);
+    // B3 review: only the surfaced results the agent then USED (followed
+    // up). Reinforcing everything the last query showed gave shown-only
+    // results the session floor that `record_query` withholds from them.
+    let used = tracker.last_used_uids();
+    tracker.record_terminal_success(&used);
 }
 
 /// Classify the tool call and record an appropriate interaction event.
@@ -940,6 +946,29 @@ fn extract_result_uids(result: &Value) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// 12.1.1 (O1): the server instructions name the lookup forms and the
+    /// cut disclosures an agent cannot discover from the terse wire
+    /// summaries, and stay short enough that a client truncating
+    /// instructions at 2 KB keeps all of them.
+    #[test]
+    fn server_instructions_name_lookups_and_cut_disclosures() {
+        for needle in [
+            "path::name",
+            "Class::method",
+            "path::<module>",
+            "did_you_mean",
+            "body_truncated",
+            "output_budget",
+        ] {
+            assert!(SERVER_INSTRUCTIONS.contains(needle), "{needle}");
+        }
+        assert!(
+            SERVER_INSTRUCTIONS.len() <= 2048,
+            "{} bytes",
+            SERVER_INSTRUCTIONS.len()
+        );
+    }
+
     fn make_request(method: &str, id: u64, params: Value) -> protocol::Request {
         protocol::Request {
             jsonrpc: "2.0".to_string(),
@@ -988,7 +1017,7 @@ mod tests {
                         .replace('\u{2028}', "\\u2028")
                         .replace('\u{2029}', "\\u2029");
                     assert!(
-                        wire.len() <= 32_000,
+                        wire.len() <= crate::output_budget::CATALOGUE_BYTES,
                         "catalogue page has {} bytes",
                         wire.len()
                     );
@@ -1469,6 +1498,53 @@ mod tests {
             before + 1,
             "should record a terminal-success event"
         );
+    }
+
+    /// B3 review: terminal success reinforced every result the last query
+    /// SHOWED, which gave shown-only noise the session floor through the
+    /// back door. It now reinforces only the results the agent then used.
+    #[test]
+    fn terminal_success_reinforces_only_results_the_agent_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let tracker = nestweaver_engine::InteractionTracker::new(&db_path);
+        record_interaction(
+            &tracker,
+            "brain_context",
+            &json!({ "seeds": ["AuthService"] }),
+            &json!({ "connected": [
+                { "uid": "sym:used", "kind": "Symbol" },
+                { "uid": "sym:shown", "kind": "Symbol" }
+            ] }),
+        );
+        record_interaction(
+            &tracker,
+            "read_symbols",
+            &json!({ "uid": "sym:used" }),
+            &json!({}),
+        );
+        maybe_record_terminal_success(&tracker);
+        tracker.flush().unwrap();
+        let score = |uid: &str| nestweaver_engine::interactions::load_node_score(&db_path, uid);
+        assert!(score("sym:used").unwrap().distinct_sessions >= 1);
+        assert_eq!(
+            score("sym:shown").map_or(0, |s| s.distinct_sessions),
+            0,
+            "a shown-only result must not be reinforced"
+        );
+
+        // Nothing used: no terminal success at all.
+        let tracker = nestweaver_engine::InteractionTracker::new(&db_path);
+        record_interaction(
+            &tracker,
+            "brain_context",
+            &json!({ "seeds": ["AuthService"] }),
+            &json!({ "connected": [{ "uid": "sym:shown", "kind": "Symbol" }] }),
+        );
+        record_interaction(&tracker, "hub_nodes", &json!({}), &json!({}));
+        let before = tracker.pending_count();
+        maybe_record_terminal_success(&tracker);
+        assert_eq!(tracker.pending_count(), before);
     }
 
     #[test]

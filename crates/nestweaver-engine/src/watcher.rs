@@ -201,6 +201,19 @@ pub(crate) struct PendingReconciliation {
 pub(crate) struct SidecarDebt {
     pub(crate) paths: Vec<PathBuf>,
     pub(crate) error: String,
+    /// What is owed, which decides the logged and disclosed reason.
+    pub(crate) kind: DebtKind,
+}
+
+/// Why a [`SidecarDebt`] is owed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum DebtKind {
+    /// nw-668: the notes committed and their code links did not land.
+    #[default]
+    CodeLinks,
+    /// V1: another writer held the write transaction past every retry, so
+    /// the batch stopped part way; its notes are replayed whole.
+    BatchCollision,
 }
 
 #[cfg(test)]
@@ -245,6 +258,7 @@ fn owe(debt: &mut Option<SidecarDebt>, paths: &[PathBuf], error: &str) {
     debt.get_or_insert_with(|| SidecarDebt {
         paths: Vec::new(),
         error: error.to_string(),
+        kind: DebtKind::CodeLinks,
     })
     .paths
     .extend(paths.iter().cloned());
@@ -1093,6 +1107,7 @@ impl BrainWatcher {
 
         let mut batch_failures = Vec::new();
         let mut sidecar_debt = None;
+        let mut refresh_debt: Option<SidecarDebt> = None;
         if graph_batch {
             let embedding_candidates_started = Instant::now();
             let mut embedding_candidates = Vec::new();
@@ -1110,7 +1125,7 @@ impl BrainWatcher {
             // any deletion. A failed plan or transaction leaves the publication
             // marker dirty and never emits a successful change callback.
             let refresh_watched_paths_started = Instant::now();
-            let committed_sources = crate::index_md::refresh_watched_paths(
+            let refreshed = crate::index_md::refresh_watched_paths(
                 store,
                 &self.vault_root,
                 &self.instance_id,
@@ -1119,23 +1134,69 @@ impl BrainWatcher {
                 &self.ignore_set,
                 self.note_limits,
                 &|| self.try_acquire_batch_lease(true, "watch_vault_batch"),
-            )?;
+            );
             phase_timings.refresh_watched_paths_ms =
                 refresh_watched_paths_started.elapsed().as_millis() as u64;
+            let committed_sources = match refreshed {
+                Ok(committed_sources) => Some(committed_sources),
+                // V1: another writer held LadybugDB's single write transaction
+                // past every retry. The batch's paths were recorded as owed
+                // before its first write, so it is replayed on the retry
+                // backoff (and at startup); ending the watcher, as this did,
+                // left the publication abandoned and the notes stranded.
+                Err(error) if crate::index_md::is_write_transaction_collision(&error) => {
+                    let mut paths = graph_paths.clone();
+                    if let Some(db_path) = store.db_path() {
+                        paths.extend(crate::index_md::vault_owed_note_paths(
+                            db_path,
+                            &self.vault_root,
+                        ));
+                    }
+                    paths.sort();
+                    paths.dedup();
+                    refresh_debt = Some(SidecarDebt {
+                        paths,
+                        error: format!("{error:#}"),
+                        kind: DebtKind::BatchCollision,
+                    });
+                    // Notes committed before the collision have new
+                    // sections: re-queue their BM25 documents now from what
+                    // the graph holds, so search does not lose them until
+                    // the replay. No sources were read for them, so their
+                    // code links are left to the replay (they are owed).
+                    let note_tags: HashMap<_, _> = store.note_tag_sets()?.into_iter().collect();
+                    let sidecars_started = Instant::now();
+                    sidecar_debt = self.refresh_prepared_sidecars(
+                        store,
+                        tantivy,
+                        v_uid,
+                        &graph_paths,
+                        symbol_index.as_ref(),
+                        &note_tags,
+                        &HashMap::new(),
+                        &mut phase_timings,
+                    )?;
+                    phase_timings.sidecars_ms = sidecars_started.elapsed().as_millis() as u64;
+                    None
+                }
+                Err(error) => return Err(error),
+            };
 
-            let note_tags: HashMap<_, _> = store.note_tag_sets()?.into_iter().collect();
-            let sidecars_started = Instant::now();
-            sidecar_debt = self.refresh_prepared_sidecars(
-                store,
-                tantivy,
-                v_uid,
-                &graph_paths,
-                symbol_index.as_ref(),
-                &note_tags,
-                &committed_sources,
-                &mut phase_timings,
-            )?;
-            phase_timings.sidecars_ms = sidecars_started.elapsed().as_millis() as u64;
+            if let Some(committed_sources) = committed_sources {
+                let note_tags: HashMap<_, _> = store.note_tag_sets()?.into_iter().collect();
+                let sidecars_started = Instant::now();
+                sidecar_debt = self.refresh_prepared_sidecars(
+                    store,
+                    tantivy,
+                    v_uid,
+                    &graph_paths,
+                    symbol_index.as_ref(),
+                    &note_tags,
+                    &committed_sources,
+                    &mut phase_timings,
+                )?;
+                phase_timings.sidecars_ms = sidecars_started.elapsed().as_millis() as u64;
+            }
 
             let tombstones_started = Instant::now();
             let _lease = self.try_acquire_batch_lease(true, "watch_vault_embeddings")?;
@@ -1234,6 +1295,14 @@ impl BrainWatcher {
                 batch_failures.join("; ")
             );
         }
+        if let Some(mut owed) = refresh_debt {
+            if let Some(debt) = sidecar_debt {
+                owed.paths.extend(debt.paths);
+                owed.paths.sort();
+                owed.paths.dedup();
+            }
+            return Ok(Some(owed));
+        }
         Ok(sidecar_debt)
     }
 
@@ -1293,11 +1362,21 @@ impl BrainWatcher {
                 match self.process_batch(store, tantivy, v_uid, paths.clone(), on_change) {
                     // nw-668: the text landed but some notes' code links did
                     // not; only those are still owed.
-                    Ok(Some(debt)) => {
+                    Ok(Some(debt)) if debt.kind == DebtKind::CodeLinks => {
                         link_failure = true;
                         (Some(debt.paths), anyhow::anyhow!(debt.error))
                     }
+                    // V1: a replay stopped part way by a collision is a
+                    // failed reconciliation of those notes, not owed links.
+                    Ok(Some(debt)) => (Some(debt.paths), anyhow::anyhow!(debt.error)),
                     Ok(None) => {
+                        // Clearing the vault's WHOLE debt key, not only
+                        // `paths`, is safe: batches are serial per vault (this
+                        // watcher's one thread runs them one at a time), so no
+                        // other batch can have recorded debt for this vault
+                        // since this replay began. Everything the key held was
+                        // in `paths` (the drift plus `also_replay`, which
+                        // carries the owed rows) and has just landed.
                         crate::index_md::record_vault_reconciliation_debt(
                             store.db_path(),
                             &self.vault_root,
@@ -1410,21 +1489,36 @@ impl BrainWatcher {
                 next_attempt: Instant::now() + reconcile_retry_delay(self.reconcile_retry_base, 1),
             },
         };
-        tracing::error!(
-            vault = %self.vault_root.display(),
-            error = %debt.error,
-            notes = debt.paths.len(),
-            "BrainWatcher could not write code links for committed notes; they have none \
-             until the retry lands (retrying; `nestweaver brain refresh` also heals it)"
-        );
+        match debt.kind {
+            DebtKind::CodeLinks => tracing::error!(
+                vault = %self.vault_root.display(),
+                error = %debt.error,
+                notes = debt.paths.len(),
+                "BrainWatcher could not write code links for committed notes; they have none \
+                 until the retry lands (retrying; `nestweaver brain refresh` also heals it)"
+            ),
+            DebtKind::BatchCollision => tracing::warn!(
+                vault = %self.vault_root.display(),
+                error = %debt.error,
+                notes = debt.paths.len(),
+                "BrainWatcher batch stopped part way: another writer held the write \
+                 transaction past every retry; its notes are replayed on the retry backoff \
+                 (`nestweaver brain refresh` also heals it)"
+            ),
+        }
         // Merged, not replaced: rows an owed startup replay already disclosed
         // keep their own (startup) reason.
-        crate::index_md::record_vault_link_debt(
+        let subject = match debt.kind {
+            DebtKind::CodeLinks => crate::index_md::OWED_CODE_LINKS,
+            DebtKind::BatchCollision => crate::index_md::OWED_BATCH_COLLISION,
+        };
+        crate::index_md::record_vault_owed_paths(
             store.db_path(),
             &self.vault_root,
             &debt.paths,
             &debt.error,
             false,
+            subject,
         );
         next
     }
@@ -5220,6 +5314,7 @@ mod tests {
             SidecarDebt {
                 paths: vec![path.clone()],
                 error: "injected".to_string(),
+                kind: DebtKind::CodeLinks,
             },
         );
         assert!(merged.paths.is_none(), "still recomputes drift");
@@ -5285,6 +5380,305 @@ mod tests {
             edges.iter().all(|(from, _, _, _)| *from != dropped),
             "the dropped note's links go with it: {edges:?}"
         );
+    }
+
+    /// V1 fixture: `a` and `b` link to each other and to `c`; `s` (unchanged
+    /// in every test) links to `a`. Returns the fixture and a helper that
+    /// names the note->note links by file stem.
+    fn v1_fixture() -> Nw668Fixture {
+        nw_668_fixture(
+            &[
+                ("a.md", "# A\n\nsee [[b]] and [[c]]\n"),
+                ("b.md", "# B\n\nsee [[a]] and [[c]]\n"),
+                ("c.md", "# C\n\nplain\n"),
+                ("s.md", "# S\n\nsee [[a]]\n"),
+            ],
+            0,
+            &[],
+        )
+    }
+
+    fn v1_links(store: &GraphStore) -> Vec<(String, String)> {
+        let stems: HashMap<String, String> = store
+            .list_notes(None)
+            .unwrap()
+            .into_iter()
+            .map(|note| (note.uid, note.file_path.trim_end_matches(".md").to_string()))
+            .collect();
+        let mut links: Vec<(String, String)> = store
+            .note_wikilink_edges()
+            .unwrap()
+            .into_iter()
+            .map(|(from, to)| (stems[&from].clone(), stems[&to].clone()))
+            .collect();
+        links.sort();
+        links.dedup();
+        links
+    }
+
+    fn v1_all_links() -> Vec<(String, String)> {
+        [("a", "b"), ("a", "c"), ("b", "a"), ("b", "c"), ("s", "a")]
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    }
+
+    fn v1_edit(fx: &Nw668Fixture) -> Vec<PathBuf> {
+        let a = fx.root.join("a.md");
+        let b = fx.root.join("b.md");
+        fs::write(&a, "# A\n\nsee [[b]] and [[c]] again\n").unwrap();
+        fs::write(&b, "# B\n\nsee [[a]] and [[c]] again\n").unwrap();
+        vec![a, b]
+    }
+
+    /// V1: a failure between the per-note transactions and the link loop
+    /// stranded each changed note with its sections and NO outbound links,
+    /// recorded nowhere. Each note's links to already-installed targets now
+    /// land with it, and every path the batch touches stays owed.
+    #[test]
+    fn v1_a_failure_after_the_first_loop_keeps_links_and_owes_the_paths() {
+        let _guard = serial_watcher_test();
+        let fx = v1_fixture();
+        assert_eq!(v1_links(&fx.store), v1_all_links());
+        let paths = v1_edit(&fx);
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        crate::index_md::FAIL_AFTER_FIRST_WATCHED_LOOP.with(|fail| fail.set(true));
+        let result = watcher.process_batch(&fx.store, None, &fx.v_uid, paths, &None);
+        crate::index_md::FAIL_AFTER_FIRST_WATCHED_LOOP.with(|fail| fail.set(false));
+        assert!(result.is_err(), "the injected failure surfaces");
+
+        let links = v1_links(&fx.store);
+        let has = |from: &str, to: &str| links.contains(&(from.to_string(), to.to_string()));
+        // Links to a note outside the batch land with their source.
+        assert!(has("a", "c") && has("b", "c"), "{links:?}");
+        // Between the two batch notes, the one installed second links to
+        // the first in its own transaction; only the other direction waits
+        // for the link loop. Which is second depends on the uids.
+        assert!(has("a", "b") ^ has("b", "a"), "{links:?}");
+        let owed: Vec<String> = crate::index_md::vault_owed_note_paths(&fx.db_path, &fx.root)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        for name in ["a.md", "b.md", "s.md"] {
+            assert!(owed.contains(&name.to_string()), "{name} owed: {owed:?}");
+        }
+    }
+
+    /// V1: the restart that followed the production failure could not see
+    /// the stranded notes (their mtimes were already recorded). With the
+    /// paths owed, a restart with NO file changes repairs every link.
+    #[test]
+    fn v1_a_restart_with_no_file_changes_repairs_a_stranded_note() {
+        let _guard = serial_watcher_test();
+        let fx = v1_fixture();
+        let paths = v1_edit(&fx);
+        let first = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        crate::index_md::FAIL_AFTER_FIRST_WATCHED_LOOP.with(|fail| fail.set(true));
+        let _ = first.process_batch(&fx.store, None, &fx.v_uid, paths, &None);
+        crate::index_md::FAIL_AFTER_FIRST_WATCHED_LOOP.with(|fail| fail.set(false));
+        drop(first);
+        // The failed batch left its publication marker; restart recovery
+        // clears an abandoned one, as the daemon's read-write boot does.
+        let marker = crate::sidecar_path(&fx.db_path, ".index-dirty");
+        let _ = fs::remove_file(&marker);
+
+        let store = Arc::new(GraphStore::open_or_create(&fx.db_path).unwrap());
+        drop(fx.store);
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        let stop = watcher.shutdown_handle();
+        watcher
+            .with_ready_callback(move || stop.stop())
+            .run_with_store(store.clone(), None)
+            .unwrap();
+        assert_eq!(v1_links(&store), v1_all_links(), "every link repaired");
+        assert!(
+            crate::index_md::vault_owed_note_paths(&fx.db_path, &fx.root).is_empty(),
+            "and nothing is still owed"
+        );
+    }
+
+    /// V1, the production cause: another connection held LadybugDB's single
+    /// write transaction while a watched batch ran. The batch retries with
+    /// backoff and completes with every link.
+    #[test]
+    fn v1_a_write_transaction_held_elsewhere_is_retried_and_the_batch_completes() {
+        let _guard = serial_watcher_test();
+        let fx = v1_fixture();
+        let paths = v1_edit(&fx);
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let result = std::thread::scope(|scope| {
+            let store = &fx.store;
+            scope.spawn(move || {
+                let conn = store.begin_transaction().unwrap();
+                // A transaction holds the write slot once it has written.
+                conn.query("MERGE (v:Vault {uid: 'v1-collision-holder'})")
+                    .unwrap();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(400));
+                conn.query("ROLLBACK").unwrap();
+            });
+            held_rx.recv().unwrap();
+            watcher.process_batch(&fx.store, None, &fx.v_uid, paths, &None)
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(v1_links(&fx.store), v1_all_links());
+        assert!(crate::index_md::vault_owed_note_paths(&fx.db_path, &fx.root).is_empty());
+    }
+
+    /// V1 review (Minor 1): the backoff between collision retries used to
+    /// sleep while holding the write gate. Each attempt now takes the lease
+    /// and releases it before sleeping, so other admitted writers run.
+    #[test]
+    fn v1_collision_backoff_does_not_hold_the_write_lease() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct Held(Arc<AtomicBool>);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = serial_watcher_test();
+        let fx = v1_fixture();
+        let paths = v1_edit(&fx);
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        let held = Arc::new(AtomicBool::new(false));
+        let acquired = AtomicUsize::new(0);
+        let lease = || -> Result<Option<Box<dyn WatchMutationLease>>, anyhow::Error> {
+            held.store(true, Ordering::SeqCst);
+            acquired.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(Box::new(Held(Arc::clone(&held)))))
+        };
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let released_while_colliding = std::thread::scope(|scope| {
+            let store = &fx.store;
+            let held = Arc::clone(&held);
+            let holder = scope.spawn(move || {
+                let conn = store.begin_transaction().unwrap();
+                conn.query("MERGE (v:Vault {uid: 'v1-collision-holder'})")
+                    .unwrap();
+                held_tx.send(()).unwrap();
+                // Wait (under load, planning can be slow) until the batch
+                // first takes the lease, then watch for one second for it to
+                // be released while this transaction still blocks it. The
+                // first backoff wait is 25 ms; holding the lease through the
+                // backoff would keep it until the retries ran out (2575 ms).
+                let waiting = Instant::now();
+                while !held.load(Ordering::SeqCst) && waiting.elapsed() < Duration::from_secs(30) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let started = Instant::now();
+                let mut released = false;
+                while !released && started.elapsed() < Duration::from_secs(1) {
+                    released = !held.load(Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                conn.query("ROLLBACK").unwrap();
+                released
+            });
+            held_rx.recv().unwrap();
+            let result = crate::index_md::refresh_watched_paths(
+                &fx.store,
+                &fx.root,
+                "default",
+                "test",
+                &paths,
+                &watcher.ignore_set,
+                watcher.note_limits,
+                &lease,
+            );
+            assert!(result.is_ok(), "{result:?}");
+            holder.join().unwrap()
+        });
+        assert!(
+            released_while_colliding,
+            "the lease was held across the backoff sleep"
+        );
+        assert!(acquired.load(Ordering::SeqCst) > paths.len());
+    }
+
+    /// V1: when the other writer outlasts every retry, the batch's paths are
+    /// owed and retried on the backoff; the watcher does not end.
+    #[test]
+    fn v1_exhausted_collision_retries_owe_the_paths_instead_of_ending_the_watcher() {
+        let _guard = serial_watcher_test();
+        let fx = v1_fixture();
+        let paths = v1_edit(&fx);
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        crate::index_md::WATCHED_COMMIT_ATTEMPTS_OVERRIDE.with(|n| n.set(Some(1)));
+        let result = std::thread::scope(|scope| {
+            let store = &fx.store;
+            scope.spawn(move || {
+                let conn = store.begin_transaction().unwrap();
+                conn.query("MERGE (v:Vault {uid: 'v1-collision-holder'})")
+                    .unwrap();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(400));
+                conn.query("ROLLBACK").unwrap();
+            });
+            held_rx.recv().unwrap();
+            watcher.process_batch(&fx.store, None, &fx.v_uid, paths, &None)
+        });
+        crate::index_md::WATCHED_COMMIT_ATTEMPTS_OVERRIDE.with(|n| n.set(None));
+        let debt = result
+            .expect("a collision must not end the watcher")
+            .expect("the batch is owed");
+        assert!(
+            debt.error.contains("Cannot start a new write transaction"),
+            "{debt:?}"
+        );
+        let owed: Vec<String> = debt
+            .paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        for name in ["a.md", "b.md", "s.md"] {
+            assert!(owed.contains(&name.to_string()), "{name}: {owed:?}");
+        }
+        assert!(
+            !crate::sidecar_path(&fx.db_path, ".index-dirty").exists(),
+            "the batch publication is finalized, not abandoned"
+        );
+    }
+
+    /// V1 review (Minor 2): a batch stopped part way by a collision was
+    /// disclosed as "could not write code links", and the notes it had
+    /// already committed kept stale BM25 documents until the replay. The
+    /// reason now says what happened, and their documents are re-queued.
+    #[test]
+    fn v1_a_collision_part_way_is_named_and_requeues_committed_notes_for_search() {
+        let _guard = serial_watcher_test();
+        let fx = v1_fixture();
+        let tantivy = TantivyIndex::open_or_create(&fx.db_path.with_extension("tantivy")).unwrap();
+        let a = fx.root.join("a.md");
+        let b = fx.root.join("b.md");
+        fs::write(&a, "# A\n\nquokkaword see [[b]] and [[c]]\n").unwrap();
+        fs::write(&b, "# B\n\nquokkaword see [[a]] and [[c]]\n").unwrap();
+        let watcher = BrainWatcher::new(&fx.db_path, &fx.root, "default", "test");
+        crate::index_md::COLLIDE_AFTER_WATCHED_COMMITS.with(|n| n.set(Some(1)));
+        let result = watcher.process_batch(&fx.store, Some(&tantivy), &fx.v_uid, vec![a, b], &None);
+        crate::index_md::COLLIDE_AFTER_WATCHED_COMMITS.with(|n| n.set(None));
+        let debt = result
+            .expect("a collision must not end the watcher")
+            .expect("the batch is owed");
+        assert_eq!(debt.kind, DebtKind::BatchCollision);
+        assert!(
+            !tantivy.search("quokkaword", 10).unwrap().is_empty(),
+            "the note committed before the collision is searchable"
+        );
+        let _pending = watcher.owe_sidecar_retry(&fx.store, None, debt);
+        let reasons: Vec<String> = crate::index_md::load_skipped_notes_sidecar(&fx.db_path)
+            .skipped
+            .into_iter()
+            .map(|row| row.reason)
+            .filter(|reason| reason.contains("retrying ("))
+            .collect();
+        assert!(!reasons.is_empty());
+        for reason in &reasons {
+            assert!(reason.contains("stopped part way"), "{reason}");
+            assert!(!reason.contains("code links"), "{reason}");
+        }
     }
 
     /// nw-668 re-review (N1): owed link debt lives in the skipped-notes

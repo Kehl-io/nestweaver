@@ -900,6 +900,33 @@ impl EmbedProgress {
     }
 }
 
+/// D5: an embed pass asked the store for a pipeline mismatch once per
+/// vector, under the embedding-index mutex. The answer only changes when the
+/// pipeline does, so a pass remembers the last pipeline that checked clean.
+#[cfg(feature = "embed")]
+#[derive(Default)]
+struct PassPipelineCheck {
+    verified: Option<nestweaver_schema::EmbeddingPipelineV2>,
+}
+
+#[cfg(feature = "embed")]
+impl PassPipelineCheck {
+    fn check<E>(
+        &mut self,
+        pipeline: &nestweaver_schema::EmbeddingPipelineV2,
+        mismatch: impl FnOnce() -> Result<Option<serde_json::Value>, E>,
+    ) -> Result<Option<serde_json::Value>, E> {
+        if self.verified.as_ref() == Some(pipeline) {
+            return Ok(None);
+        }
+        let diagnostic = mismatch()?;
+        if diagnostic.is_none() {
+            self.verified = Some(pipeline.clone());
+        }
+        Ok(diagnostic)
+    }
+}
+
 /// How often a running embed pass logs a progress line. The production
 /// incident had the daemon silent for ~13 hours of continuous work, which is
 /// what made "working" and "wedged" indistinguishable in the log.
@@ -1473,9 +1500,30 @@ fn note_watcher_exit(state: &DaemonState, kind: &str, error: Option<String>) {
         "{kind} watcher exited and is no longer indexing edits: {error}. \
          Restart watching; later edits stay unindexed until it is running again."
     );
+    if let Ok(mut slot) = state.last_watcher_failure.lock() {
+        *slot = Some(serde_json::json!({
+            "kind": kind,
+            "at_unix_seconds": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or_default(),
+            "error": error,
+        }));
+    }
     if let Ok(mut slot) = state.watcher_failure.lock() {
         *slot = Some(message);
     }
+}
+
+/// V1: the last watcher failure, whether or not a watcher has recovered
+/// since. `null` when none failed during this daemon's life.
+fn last_watcher_failure_json(state: &DaemonState) -> serde_json::Value {
+    state
+        .last_watcher_failure
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .unwrap_or(serde_json::Value::Null)
 }
 
 fn clear_watcher_failure(state: &DaemonState) {
@@ -1518,6 +1566,41 @@ mod watcher_failure_disclosure_tests {
         disclose_watcher_failure(&mut value, None);
         disclose_watcher_failure(&mut value, Some(""));
         assert!(value.get("warnings").is_none());
+    }
+}
+
+/// D3: `brain status` read only the manifest sidecar, so a reconcile that
+/// kept failing (or kept deferring) showed `manifest_failures: []`. The
+/// runtime state is reported beside it, and a reconcile that is not
+/// progressing is a warning.
+fn disclose_manifest_recovery(
+    value: &mut serde_json::Value,
+    status: &nestweaver_engine::manifest::ManifestRecoveryStatus,
+) {
+    let message = status.error.as_ref().map(|error| error.message.clone());
+    value["manifest_recovery"] = serde_json::json!({
+        "state": status.state,
+        "attempts": status.attempts,
+        "retry_after_seconds": status.retry_after_seconds,
+        "error": message,
+    });
+    if !matches!(status.state, "deferred" | "blocked" | "retry_scheduled") {
+        return;
+    }
+    let warning = serde_json::json!({
+        "kind": "manifest_recovery",
+        "warning": format!(
+            "manifest reconciliation is {}: {}",
+            status.state,
+            message.as_deref().unwrap_or("no detail")
+        ),
+    });
+    match value
+        .get_mut("warnings")
+        .and_then(|warnings| warnings.as_array_mut())
+    {
+        Some(warnings) => warnings.push(warning),
+        None => value["warnings"] = serde_json::json!([warning]),
     }
 }
 
@@ -2322,6 +2405,11 @@ pub struct DaemonState {
     /// does not set it, which is why a dead watcher used to vanish with no
     /// warning.
     pub watcher_failure: std::sync::Mutex<Option<String>>,
+    /// V1: the most recent watcher failure, kept after a replacement watcher
+    /// comes up. `watcher_failure` above is cleared on readiness, which is
+    /// right for "is a watcher dead NOW", but it erased the only record of
+    /// the 10-15 failure about a second after it happened.
+    pub last_watcher_failure: std::sync::Mutex<Option<serde_json::Value>>,
     /// Monotonic id source for [`WatcherRegistration`]s.
     pub next_watcher_id: std::sync::atomic::AtomicU64,
     /// Parsed `nestweaver-instance.toml` if `--config` was supplied at
@@ -3596,6 +3684,18 @@ async fn watch_sigterm(state: Arc<DaemonState>) {
     }
 }
 
+/// D4: log a watcher's exit error with its WHOLE chain. `%error` on an
+/// `anyhow::Error` prints only the outermost context, which hid the
+/// write-transaction collision behind "atomic incremental vault refresh".
+fn log_code_watcher_error(error: &anyhow::Error, watcher_id: u64) {
+    tracing::error!(error = %format_args!("{error:#}"), watcher_id, "code watcher exited with error");
+}
+
+/// D4: see [`log_code_watcher_error`].
+fn log_vault_watcher_error(error: &anyhow::Error, watcher_id: u64) {
+    tracing::error!(error = %format_args!("{error:#}"), watcher_id, "watcher exited with error");
+}
+
 /// Register a watcher's shutdown handle, returning its registration id (the
 /// watcher thread passes it to [`clear_watcher_registration`] on exit).
 ///
@@ -3930,9 +4030,7 @@ impl DaemonService {
             };
             match &result {
                 Ok(Ok(())) => tracing::info!(watcher_id, "code watcher exited cleanly"),
-                Ok(Err(error)) => {
-                    tracing::error!(%error, watcher_id, "code watcher exited with error")
-                }
+                Ok(Err(error)) => log_code_watcher_error(error, watcher_id),
                 Err(_) => tracing::error!(watcher_id, "code watcher thread panicked"),
             }
             note_watcher_exit(&state, "code", failure);
@@ -7272,7 +7370,7 @@ impl NestWeaverDaemon for DaemonService {
                 };
                 match &result {
                     Ok(Ok(())) => tracing::info!("watcher exited cleanly"),
-                    Ok(Err(error)) => tracing::error!(error = %error, "watcher exited with error"),
+                    Ok(Err(error)) => log_vault_watcher_error(error, watcher_id),
                     Err(_) => tracing::error!("watcher thread panicked"),
                 }
                 note_watcher_exit(&state, "vault", failure);
@@ -10040,6 +10138,8 @@ impl NestWeaverDaemon for DaemonService {
             value["runtime_telemetry"] = serde_json::json!("available");
             value["watcher"] = watcher_status_json(&self.state);
             disclose_watcher_failure(&mut value, watcher_failure_message(&self.state).as_deref());
+            disclose_manifest_recovery(&mut value, &self.state.manifest_recovery.status());
+            value["last_watcher_failure"] = last_watcher_failure_json(&self.state);
             value["watcher_pid"] =
                 serde_json::json!(watcher_status(&self.state).and_then(|w| w.controller_pid));
             value["supervision"] =
@@ -11254,6 +11354,19 @@ impl NestWeaverDaemon for DaemonService {
                 .map(PathBuf::from)
                 .collect();
 
+        // 12.1.1 (B4): the repo under review. `repo` is the caller's
+        // `--repo`; `working_root` is the CLI's working git root, matched
+        // against each repo's recorded checkout. Neither names one: every
+        // repo is matched, as before.
+        let repo_selector = args
+            .get("repo")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let working_root = args
+            .get("working_root")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from);
+
         let cancel_for_task = cancel.clone();
         let handler = async move {
             tokio::task::spawn_blocking(move || {
@@ -11263,9 +11376,16 @@ impl NestWeaverDaemon for DaemonService {
                 nestweaver_engine::resolver_generation::set_declared_link_config(
                     state.instance_cfg.clone(),
                 );
-                // TODO(nw-033): resolve target repo_uid from the working repo
+                let target_repo = nestweaver_engine::pr_impact_target_repo(
+                    &state.store,
+                    repo_selector.as_deref(),
+                    working_root.as_deref(),
+                )
+                // Review M7: an ambiguous `--repo` stays ambiguous (exit 3)
+                // and a malformed one a usage error; only a miss is not found.
+                .map_err(|e| dispatch_err_to_status("pr_impact", e))?;
                 let options = nestweaver_engine::BlastRadiusOptions {
-                    target_repo: None,
+                    target_repo,
                     max_depth: depth,
                     include_data_edges: false,
                     limit: None,
@@ -11681,6 +11801,8 @@ impl NestWeaverDaemon for DaemonService {
                     );
                 };
 
+                // D5: the pipeline is checked once per pass, not per vector.
+                let mut pipeline_check = PassPipelineCheck::default();
                 if do_symbols {
                     let symbols = store
                         .list_embeddable_symbols()
@@ -11705,10 +11827,13 @@ impl NestWeaverDaemon for DaemonService {
                                         .pipeline_for_dimension(emb_dim)
                                         .map_err(|error| Status::internal(error.to_string()))?;
                                     if !force
-                                        && let Some(diagnostic) =
-                                            store.embedding_pipeline_mismatch(&pipeline).map_err(
-                                                |e| Status::failed_precondition(e.to_string()),
-                                            )?
+                                        && let Some(diagnostic) = pipeline_check
+                                            .check(&pipeline, || {
+                                                store.embedding_pipeline_mismatch(&pipeline)
+                                            })
+                                            .map_err(|e| {
+                                                Status::failed_precondition(e.to_string())
+                                            })?
                                     {
                                         return Err(Status::failed_precondition(format!(
                                             "embedding pipeline mismatch: {diagnostic}"
@@ -11765,10 +11890,13 @@ impl NestWeaverDaemon for DaemonService {
                                         .pipeline_for_dimension(emb_dim)
                                         .map_err(|error| Status::internal(error.to_string()))?;
                                     if !force
-                                        && let Some(diagnostic) =
-                                            store.embedding_pipeline_mismatch(&pipeline).map_err(
-                                                |e| Status::failed_precondition(e.to_string()),
-                                            )?
+                                        && let Some(diagnostic) = pipeline_check
+                                            .check(&pipeline, || {
+                                                store.embedding_pipeline_mismatch(&pipeline)
+                                            })
+                                            .map_err(|e| {
+                                                Status::failed_precondition(e.to_string())
+                                            })?
                                     {
                                         return Err(Status::failed_precondition(format!(
                                             "embedding pipeline mismatch: {diagnostic}"
@@ -11825,10 +11953,13 @@ impl NestWeaverDaemon for DaemonService {
                                         .pipeline_for_dimension(emb_dim)
                                         .map_err(|error| Status::internal(error.to_string()))?;
                                     if !force
-                                        && let Some(diagnostic) =
-                                            store.embedding_pipeline_mismatch(&pipeline).map_err(
-                                                |e| Status::failed_precondition(e.to_string()),
-                                            )?
+                                        && let Some(diagnostic) = pipeline_check
+                                            .check(&pipeline, || {
+                                                store.embedding_pipeline_mismatch(&pipeline)
+                                            })
+                                            .map_err(|e| {
+                                                Status::failed_precondition(e.to_string())
+                                            })?
                                     {
                                         return Err(Status::failed_precondition(format!(
                                             "embedding pipeline mismatch: {diagnostic}"
@@ -12944,6 +13075,87 @@ fn compact_embeddings_response(
         bytes_before,
         bytes_after,
         dry_run: false,
+    }
+}
+
+#[cfg(all(test, feature = "embed"))]
+mod pass_pipeline_check_tests {
+    use super::PassPipelineCheck;
+    use nestweaver_schema::EmbeddingPipelineV2;
+
+    #[test]
+    fn a_pass_checks_each_pipeline_once_not_once_per_vector() {
+        let a = EmbeddingPipelineV2::external("p", "model-a", 3);
+        let b = EmbeddingPipelineV2::external("p", "model-b", 3);
+        let mut check = PassPipelineCheck::default();
+        let mut store_checks = 0;
+        for _ in 0..1000 {
+            let result: Result<_, ()> = check.check(&a, || {
+                store_checks += 1;
+                Ok(None)
+            });
+            assert_eq!(result, Ok(None));
+        }
+        assert_eq!(store_checks, 1, "one store check per pass");
+
+        // A different pipeline is checked again; a mismatch is never cached.
+        for _ in 0..3 {
+            let result: Result<_, ()> = check.check(&b, || {
+                store_checks += 1;
+                Ok(Some(serde_json::json!({"mismatch": true})))
+            });
+            assert!(result.unwrap().is_some());
+        }
+        assert_eq!(store_checks, 4);
+    }
+}
+
+#[cfg(test)]
+mod watcher_error_log_tests {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture(log: impl FnOnce()) -> String {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, log);
+        String::from_utf8(captured.0.lock().unwrap().clone()).unwrap()
+    }
+
+    fn chained() -> anyhow::Error {
+        anyhow::anyhow!("Cannot start a new write transaction")
+            .context("watched vault refresh (per-note transactions)")
+    }
+
+    #[test]
+    fn both_watcher_exit_lines_log_the_whole_error_chain() {
+        for line in [
+            capture(|| super::log_vault_watcher_error(&chained(), 7)),
+            capture(|| super::log_code_watcher_error(&chained(), 7)),
+        ] {
+            assert!(line.contains("watched vault refresh"), "{line}");
+            assert!(
+                line.contains("Cannot start a new write transaction"),
+                "inner cause missing: {line}"
+            );
+        }
     }
 }
 
@@ -14933,6 +15145,7 @@ pub async fn run_server(
         shutdown_tx: shutdown_tx.clone(),
         watcher_stop: std::sync::Mutex::new(None),
         watcher_failure: std::sync::Mutex::new(None),
+        last_watcher_failure: std::sync::Mutex::new(None),
         next_watcher_id: std::sync::atomic::AtomicU64::new(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -25549,6 +25762,7 @@ repos = ["alpha"]
             shutdown_tx,
             watcher_stop: std::sync::Mutex::new(None),
             watcher_failure: std::sync::Mutex::new(None),
+            last_watcher_failure: std::sync::Mutex::new(None),
             next_watcher_id: std::sync::atomic::AtomicU64::new(0),
             instance_cfg: None,
             effective_config: EffectiveConfigProvenance::CompiledDefaults,
@@ -25754,9 +25968,11 @@ repos = ["alpha"]
             .store
             .set_repo_index_policy("repo:beta", "a-different-policy")
             .unwrap();
-        let snapshot =
-            super::manifest_recovery::capture(&state, Instant::now() + Duration::from_secs(60))
-                .unwrap();
+        let snapshot = super::manifest_recovery::capture(
+            &state,
+            super::manifest_recovery::REPO_CAPTURE_BUDGET,
+        )
+        .unwrap();
         let refused: Vec<&str> = snapshot
             .failures
             .iter()
@@ -25870,14 +26086,250 @@ repos = ["alpha"]
         }
     }
 
+    /// D3: the capture deadline was shared by every repo and included the
+    /// write-gate wait, so after a 10-44 s gate wait all 45 repos were
+    /// refused in the same second, with an `index --repo` remedy each, on
+    /// four upgrade-day bursts. A long gate wait must not refuse anything.
+    #[tokio::test]
+    async fn a_long_write_gate_wait_refuses_no_repository() {
+        use nestweaver_engine::manifest;
+        let state = test_state_with_writer();
+        manifest_recovery_fixture(&state);
+        manifest::mark_manifest_reconciliation_pending(&state.db_path, "repository index").unwrap();
+        let budget = Duration::from_millis(300);
+        let before = super::manifest_recovery::capture(&state, budget).unwrap();
+        assert!(before.failures.is_empty(), "{:?}", before.failures);
+
+        // Another writer holds the gate for longer than the whole budget.
+        let held = state.write_gate.lock("code_link_reconcile").await;
+        let waiter = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { state.write_gate.lock("manifest_reconciliation").await })
+        };
+        tokio::time::sleep(budget * 2).await;
+        drop(held);
+        let lease = waiter.await.unwrap();
+        let guard = ConnectionGuard::write(&state).unwrap();
+        let owned = MutationWorkerOwnership {
+            _write_lease: lease,
+            _connection_guard: guard,
+        };
+        let result = super::manifest_recovery::reconcile(&state, before);
+        drop(owned);
+        result.expect("the snapshot must save after the gate is released");
+        assert_eq!(manifest::load_manifest_failures(&state.db_path), []);
+        assert!(manifest::current_manifest_snapshot(&state.store, &state.db_path).is_ok());
+        assert!(
+            manifest::manifest_debt_revision(&state.db_path)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// V1: the dead-watcher warning is cleared when a replacement becomes
+    /// ready, and that erased the only record of the production failure. The
+    /// last failure stays visible after the restart, with its full chain.
+    #[test]
+    fn the_last_watcher_failure_stays_visible_after_a_restart() {
+        let state = test_state_with_writer();
+        super::note_watcher_exit(
+            &state,
+            "vault",
+            Some(
+                "watched vault refresh (per-note transactions): Cannot start a new write \
+                 transaction"
+                    .to_string(),
+            ),
+        );
+        assert!(super::watcher_failure_message(&state).is_some());
+        super::clear_watcher_failure(&state);
+        assert!(
+            super::watcher_failure_message(&state).is_none(),
+            "no watcher is dead now"
+        );
+        let last = super::last_watcher_failure_json(&state);
+        assert_eq!(last["kind"], "vault");
+        let error = last["error"].as_str().unwrap();
+        assert!(error.contains("watched vault refresh"), "{error}");
+        assert!(
+            error.contains("Cannot start a new write transaction"),
+            "{error}"
+        );
+        assert!(last["at_unix_seconds"].as_u64().unwrap() > 0);
+    }
+
+    /// D3: a capture that runs out of its budget defers the whole snapshot as
+    /// contention. It refuses no repository and names no `index --repo`
+    /// remedy, and `brain status` shows the deferred runtime state.
+    #[test]
+    fn a_capture_deadline_is_deferred_contention_not_a_refusal() {
+        let state = test_state_with_writer();
+        manifest_recovery_fixture(&state);
+        let error = match super::manifest_recovery::capture(&state, Duration::ZERO) {
+            Ok(_) => panic!("a zero budget must defer the capture"),
+            Err(error) => error,
+        };
+        assert!(super::manifest_recovery::is_contention_deferral(&error));
+        let message = format!("{error:#}");
+        assert!(message.starts_with("deferred: contention"), "{message}");
+        assert!(!message.contains("index --repo"), "{message}");
+        assert_eq!(
+            nestweaver_engine::manifest::load_manifest_failures(&state.db_path),
+            []
+        );
+
+        state.manifest_recovery.publish(
+            "deferred",
+            0,
+            Some(30),
+            Some(nestweaver_engine::manifest::ManifestUnavailable::new(
+                nestweaver_engine::manifest::ManifestUnavailableReason::PendingSourceChange,
+                state.store.graph_generation(),
+                message.clone(),
+            )),
+        );
+        let mut status = serde_json::json!({ "manifest_failures": [] });
+        super::disclose_manifest_recovery(&mut status, &state.manifest_recovery.status());
+        assert_eq!(status["manifest_recovery"]["state"], "deferred");
+        assert_eq!(status["manifest_recovery"]["error"], message);
+        assert_eq!(status["warnings"][0]["kind"], "manifest_recovery");
+
+        // A ready runtime adds the state and no warning.
+        state.manifest_recovery.publish("ready", 0, None, None);
+        let mut status = serde_json::json!({});
+        super::disclose_manifest_recovery(&mut status, &state.manifest_recovery.status());
+        assert_eq!(status["manifest_recovery"]["state"], "ready");
+        assert!(status.get("warnings").is_none());
+    }
+
+    /// D3 review: the per-repo budget had no pass-level cap, so the write
+    /// gate could be held for repos x 60 s x 2 captures. Every capture under
+    /// the gate now shares one pass budget, started once the gate is held.
+    #[tokio::test]
+    async fn the_write_gate_hold_is_bounded_by_the_pass_budget() {
+        use super::manifest_recovery::CaptureBudget;
+        let state = test_state_with_writer();
+        manifest_recovery_fixture(&state);
+        nestweaver_engine::manifest::mark_manifest_reconciliation_pending(
+            &state.db_path,
+            "repository index",
+        )
+        .unwrap();
+        // Each repo is slow but well inside its own budget; four captures
+        // under the gate (two repos, two captures) would take ~1.6 s.
+        // The capture before the gate has no pass budget, so it completes.
+        let mut budget = CaptureBudget::new(Duration::from_secs(60), Duration::from_millis(300));
+        for repo in ["repo:alpha", "repo:beta"] {
+            budget
+                .delays
+                .insert(repo.into(), Duration::from_millis(400));
+        }
+        let before = super::manifest_recovery::capture(&state, budget).unwrap();
+        let guard = ConnectionGuard::write(&state).unwrap();
+        let lease = state.write_gate.lock("manifest_reconciliation").await;
+        let owned = MutationWorkerOwnership {
+            _write_lease: lease,
+            _connection_guard: guard,
+        };
+        let started = Instant::now();
+        let result = super::manifest_recovery::reconcile(&state, before);
+        let held = started.elapsed();
+        drop(owned);
+        let error = match result {
+            Ok(()) => panic!("the pass budget must defer the reconciliation"),
+            Err(error) => error,
+        };
+        assert!(
+            super::manifest_recovery::is_contention_deferral(&error),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("pass budget"), "{error:#}");
+        assert!(held < Duration::from_millis(1000), "gate held for {held:?}");
+        // The pass overrun blames no repository.
+        assert!(
+            state
+                .manifest_recovery
+                .capture_overruns
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// D3 review: one repository that keeps running out of its own budget
+    /// deferred the WHOLE snapshot forever. After three consecutive overruns
+    /// it is refused with a contention reason (no `index --repo` remedy) and
+    /// the other repositories publish.
+    #[tokio::test]
+    async fn a_persistently_slow_repo_is_refused_and_the_others_publish() {
+        use super::manifest_recovery::{CONSECUTIVE_OVERRUNS_BEFORE_REFUSAL, CaptureBudget};
+        use nestweaver_engine::manifest;
+        let state = test_state_with_writer();
+        manifest_recovery_fixture(&state);
+        manifest::mark_manifest_reconciliation_pending(&state.db_path, "repository index").unwrap();
+        let mut budget = CaptureBudget::new(Duration::from_millis(50), Duration::from_secs(10));
+        budget
+            .delays
+            .insert("repo:beta".into(), Duration::from_millis(120));
+        for pass in 1..CONSECUTIVE_OVERRUNS_BEFORE_REFUSAL {
+            let error = match super::manifest_recovery::capture(&state, budget.clone()) {
+                Ok(_) => panic!("pass {pass}: an overrun defers until the streak is long enough"),
+                Err(error) => error,
+            };
+            assert!(super::manifest_recovery::is_contention_deferral(&error));
+        }
+        let before = super::manifest_recovery::capture(&state, budget.clone()).unwrap();
+        let refused: Vec<_> = before
+            .failures
+            .iter()
+            .map(|f| f.repo_uid.as_str())
+            .collect();
+        assert_eq!(refused, ["repo:beta"]);
+        assert!(before.failures[0].reason.starts_with("contention: "));
+        assert!(!before.failures[0].remedy.contains("index --repo"));
+
+        let guard = ConnectionGuard::write(&state).unwrap();
+        let lease = state.write_gate.lock("manifest_reconciliation").await;
+        let owned = MutationWorkerOwnership {
+            _write_lease: lease,
+            _connection_guard: guard,
+        };
+        let result = super::manifest_recovery::reconcile(&state, before);
+        drop(owned);
+        result.expect("the other repository publishes");
+        let manifests = manifest::current_manifest_snapshot(&state.store, &state.db_path).unwrap();
+        assert_eq!(manifests["repo:alpha"].dependencies, ["beta"]);
+        assert!(!manifests.contains_key("repo:beta"));
+        let failures = manifest::load_manifest_failures(&state.db_path);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].reason.starts_with("contention: "));
+        // The off-gate probe captures beta in time (no simulated delay), so
+        // it asks for a rebuild and the streak starts over.
+        assert!(super::manifest_recovery::refused_repos_changed(
+            &state, &failures
+        ));
+        assert_eq!(
+            state
+                .manifest_recovery
+                .capture_overruns
+                .lock()
+                .unwrap()
+                .get("repo:beta"),
+            None,
+            "a probe that captures clears the streak"
+        );
+    }
+
     #[tokio::test]
     async fn release_manifest_recovery_rejects_changed_inputs_and_corrupt_predecessor() {
         use nestweaver_engine::manifest;
         let state = test_state_with_writer();
         manifest_recovery_fixture(&state);
-        let before =
-            super::manifest_recovery::capture(&state, Instant::now() + Duration::from_secs(60))
-                .unwrap();
+        let before = super::manifest_recovery::capture(
+            &state,
+            super::manifest_recovery::REPO_CAPTURE_BUDGET,
+        )
+        .unwrap();
         let alpha = state.db_path.parent().unwrap().join("alpha/package.json");
         std::fs::write(&alpha, r#"{"name":"changed"}"#).unwrap();
         let guard = ConnectionGuard::write(&state).unwrap();
@@ -25888,9 +26340,11 @@ repos = ["alpha"]
         };
         assert!(super::manifest_recovery::reconcile(&state, before).is_err());
         assert!(!manifest::manifest_cache_path(&state.db_path).exists());
-        let before =
-            super::manifest_recovery::capture(&state, Instant::now() + Duration::from_secs(60))
-                .unwrap();
+        let before = super::manifest_recovery::capture(
+            &state,
+            super::manifest_recovery::REPO_CAPTURE_BUDGET,
+        )
+        .unwrap();
         std::fs::write(
             manifest::manifest_cache_path(&state.db_path),
             b"corrupt evidence",
@@ -25912,7 +26366,7 @@ repos = ["alpha"]
         std::fs::write(&path, "{").unwrap();
         // nw-705: a malformed source refuses its own repo, by name.
         let refused = |state: &DaemonState| {
-            super::manifest_recovery::capture(state, Instant::now() + Duration::from_secs(60))
+            super::manifest_recovery::capture(state, super::manifest_recovery::REPO_CAPTURE_BUDGET)
                 .unwrap()
                 .failures
                 .into_iter()
@@ -26007,6 +26461,7 @@ credential_method = "gh"
             shutdown_tx,
             watcher_stop: std::sync::Mutex::new(None),
             watcher_failure: std::sync::Mutex::new(None),
+            last_watcher_failure: std::sync::Mutex::new(None),
             next_watcher_id: std::sync::atomic::AtomicU64::new(0),
             instance_cfg: None,
             effective_config: EffectiveConfigProvenance::CompiledDefaults,

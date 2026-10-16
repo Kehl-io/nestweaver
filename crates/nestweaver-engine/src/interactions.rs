@@ -38,7 +38,9 @@ const DEFAULT_LAMBDA: f64 = 0.05;
 /// changed since the last access.
 const HASH_CHANGE_PENALTY: f64 = 0.5;
 
-/// Minimum number of distinct sessions before the floor applies.
+/// Minimum number of distinct sessions before the floor applies. Only explicit
+/// use counts as a session (seed, access, follow-up, impact, terminal
+/// success); a result that was merely shown does not.
 const SESSION_FLOOR_THRESHOLD: u32 = 3;
 
 /// Minimum score for nodes accessed from enough distinct sessions.
@@ -141,6 +143,9 @@ pub struct InteractionTracker {
     session_id: String,
     last_query_time: Mutex<f64>,
     last_query_results: Mutex<Vec<String>>,
+    /// B3 review: which of `last_query_results` the agent then used (opened
+    /// by a follow-up access). Only these earn a terminal success.
+    last_query_used: Mutex<Vec<String>>,
     /// Name of the most recent recorded tool call (for the terminal-success
     /// shutdown heuristic).
     last_tool: Mutex<Option<String>>,
@@ -173,6 +178,7 @@ impl InteractionTracker {
             session_id: generate_session_id(),
             last_query_time: Mutex::new(0.0),
             last_query_results: Mutex::new(Vec::new()),
+            last_query_used: Mutex::new(Vec::new()),
             last_tool: Mutex::new(None),
             flush_threshold: 5,
             last_flush: Mutex::new(std::time::Instant::now()),
@@ -189,6 +195,7 @@ impl InteractionTracker {
             session_id: session_id.to_string(),
             last_query_time: Mutex::new(0.0),
             last_query_results: Mutex::new(Vec::new()),
+            last_query_used: Mutex::new(Vec::new()),
             last_tool: Mutex::new(None),
             flush_threshold,
             last_flush: Mutex::new(std::time::Instant::now()),
@@ -233,6 +240,10 @@ impl InteractionTracker {
                 .unwrap_or_else(|e| e.into_inner());
             *lqr = result_uids.to_vec();
         }
+        self.last_query_used
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.set_last_tool(tool);
 
         self.push_event(event);
@@ -258,6 +269,15 @@ impl InteractionTracker {
             (now - *lqt) <= 30.0 && lqr.iter().any(|u| u == target_uid)
         };
 
+        if is_follow_up {
+            let mut used = self
+                .last_query_used
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !used.iter().any(|u| u == target_uid) {
+                used.push(target_uid.to_string());
+            }
+        }
         let event_type = if is_follow_up {
             EventType::FollowUp
         } else {
@@ -327,6 +347,17 @@ impl InteractionTracker {
     /// this session). Used by the terminal-success shutdown heuristic.
     pub fn last_surfaced_uids(&self) -> Vec<String> {
         self.last_query_results
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// B3 review: the results of the last query that the agent then used
+    /// (opened by a follow-up access), in the order it used them. The
+    /// terminal-success heuristic reinforces only these: a result that was
+    /// only shown must not earn the session floor.
+    pub fn last_used_uids(&self) -> Vec<String> {
+        self.last_query_used
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -408,17 +439,23 @@ fn consolidate_events(store: &mut InteractionStore, events: &[InteractionEvent])
                 // The first `seed_count` UIDs are seeds (weight 0.5 via
                 // `query_seed_count`); the remainder are shown results
                 // (weight 0.1 via `result_shown_count`).
+                //
+                // Only seeds count toward `distinct_sessions`. A shown result
+                // is not evidence of use: counting it let any row that
+                // surfaced in three sessions (noise included) earn the
+                // permanent `SESSION_FLOOR_SCORE`, which fed it back into
+                // every walk (rc-context-noise B3).
                 let boundary = event.seed_count.min(event.uids.len());
                 for (i, uid) in event.uids.iter().enumerate() {
                     let ns = store.node_scores.entry(uid.clone()).or_default();
                     if i < boundary {
                         ns.query_seed_count += 1;
+                        ns.session_ids.insert(event.session_id.clone());
+                        ns.distinct_sessions = ns.session_ids.len() as u32;
                     } else {
                         ns.result_shown_count += 1;
                     }
                     ns.last_accessed = event.timestamp;
-                    ns.session_ids.insert(event.session_id.clone());
-                    ns.distinct_sessions = ns.session_ids.len() as u32;
                 }
             }
             EventType::Access => {
@@ -794,6 +831,38 @@ mod tests {
         assert_eq!(after.query_seed_count, before.query_seed_count);
     }
 
+    /// rc-context-noise (B3) feedback loop: a node that was only SHOWN in
+    /// three sessions must not earn the permanent session floor. Only
+    /// explicit use (seed, access, follow-up, impact, terminal success)
+    /// counts toward `distinct_sessions`.
+    #[test]
+    fn shown_only_results_do_not_count_toward_the_session_floor() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_path_buf();
+        let _ = tmp.into_temp_path();
+        for session in ["s1", "s2", "s3"] {
+            let tracker = InteractionTracker::new_with_options(&db_path, 50, session);
+            tracker.record_query(
+                "brain_context",
+                &["sym:seed".to_string()],
+                &["sym:noise".to_string()],
+            );
+            tracker.flush().unwrap();
+        }
+        let noise = load_node_score(&db_path, "sym:noise").unwrap();
+        assert_eq!(noise.result_shown_count, 3);
+        assert_eq!(
+            noise.distinct_sessions, 0,
+            "shown-only results must not count toward the session floor"
+        );
+        // Far in the future the decayed score must fall below the floor.
+        let later = noise.last_accessed + 365.0 * 86400.0;
+        assert!(compute_decayed_score(&noise, later, false) < SESSION_FLOOR_SCORE);
+
+        let seed = load_node_score(&db_path, "sym:seed").unwrap();
+        assert_eq!(seed.distinct_sessions, 3, "explicit use still counts");
+    }
+
     #[test]
     fn record_query_stores_event() {
         let (tracker, _db) = temp_tracker();
@@ -1114,8 +1183,13 @@ mod tests {
         assert_eq!(tracker.last_tool_name().as_deref(), Some("brain_context"));
         assert_eq!(tracker.last_surfaced_uids(), vec!["res-1".to_string()]);
 
+        assert!(tracker.last_used_uids().is_empty(), "shown, not used");
         tracker.record_access("note_get", "res-1");
         assert_eq!(tracker.last_tool_name().as_deref(), Some("note_get"));
+        assert_eq!(tracker.last_used_uids(), vec!["res-1".to_string()]);
+        // A new query starts a new set of used results.
+        tracker.record_query("brain_context", &[], &["res-2".into()]);
+        assert!(tracker.last_used_uids().is_empty());
     }
 
     #[test]

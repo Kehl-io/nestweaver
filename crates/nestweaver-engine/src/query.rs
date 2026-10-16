@@ -1811,6 +1811,49 @@ mod context_tests {
         assert!(names.len() <= 30, "{names:?}");
     }
 
+    /// rc-context-noise (B3): interaction memory on an unrelated component
+    /// used to teleport PPR mass onto it, and the nw-113 refill then listed
+    /// those rows from the head of the below-floor tail.
+    #[test]
+    fn context_refill_ignores_interaction_only_nodes() {
+        let (_dir, src) = hub_of_owners_repo(400);
+        fs::write(
+            src.join("alien.js"),
+            (0..12)
+                .map(|i| format!("function alien{i}(k) {{ return alien{}(k); }}\n", i + 1))
+                .chain(std::iter::once(
+                    "function alien12(k) { return k; }\n".to_string(),
+                ))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let (_result, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let seeds = ["fromTemplate".to_string()];
+        let baseline = super::build_context_with_intent(&store, &seeds, None, Some(30)).unwrap();
+
+        let scores: std::collections::HashMap<String, f64> = store
+            .list_embeddable_symbols()
+            .unwrap()
+            .into_iter()
+            .filter(|symbol| symbol.name.starts_with("alien"))
+            .map(|symbol| (symbol.uid, 5.0))
+            .collect();
+        assert_eq!(scores.len(), 13, "fixture must index every alien symbol");
+        store.load_interaction_cache(scores);
+
+        let result = super::build_context_with_intent(&store, &seeds, None, Some(30)).unwrap();
+        let names: Vec<&str> = result.connected.iter().map(|n| n.name.as_str()).collect();
+        assert!(
+            !names.iter().any(|name| name.starts_with("alien")),
+            "interaction-only rows leaked into context: {names:?}"
+        );
+        assert_eq!(
+            result.connected_total, baseline.connected_total,
+            "interaction-only rows must not count toward connected_total"
+        );
+    }
+
     /// nw-113 final review Minor 2: a limit that leaves no room for the
     /// listed owners trims them, and counts them in `module_owners_omitted`
     /// rather than in `connected_total`.
@@ -2226,6 +2269,21 @@ mod context_tests {
             format!("{}::<module>", owner["file_path"].as_str().unwrap())
         );
         assert_eq!(json["symbol"]["display_name"], "fromTemplate");
+        // 12.1.1 (B5): the owner looked up itself reads the same way: raw
+        // `name`, labelled `display_name`.
+        let owner_path = owner["file_path"].as_str().unwrap().to_string();
+        let super::LookupResult::Found(owner_detail) =
+            super::lookup_symbol(&store, &format!("{owner_path}::<module>"), None).unwrap()
+        else {
+            panic!("{owner_path}::<module> resolves")
+        };
+        let owner_json = serde_json::to_value(&*owner_detail).unwrap();
+        assert_eq!(owner_json["symbol"]["name"], "<module>", "{owner_json}");
+        assert_eq!(
+            owner_json["symbol"]["display_name"],
+            format!("{owner_path}::<module>"),
+            "{owner_json}"
+        );
         let back: super::SymbolDetail = serde_json::from_value(json).unwrap();
         assert_eq!(back.callers.len(), detail.callers.len());
     }

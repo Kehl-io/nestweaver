@@ -16103,3 +16103,384 @@ fn cli_operator_config_follows_current_on_each_invocation() {
             .success();
     }
 }
+
+/// 12.1.1 (B1): `read-symbols` with a qualifier that names no file or
+/// container is not found (exit 2) with `path::name` suggestions, the same as
+/// `symbol`. It used to drop the qualifier and answer with another file's
+/// symbol, and an owner-less `path::<module>` listed every owner (exit 3).
+#[test]
+fn read_symbols_qualifier_miss_is_not_found_with_suggestions() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+    for (rel, src) in [
+        (
+            "src/app.js",
+            "const { helper } = require('./util');\nhelper(1);\n",
+        ),
+        (
+            "src/other.js",
+            "const { helper } = require('./util');\nhelper(2);\n",
+        ),
+        (
+            "src/util.js",
+            "function helper(n) { return n; }\nmodule.exports = { helper };\n",
+        ),
+        (
+            "src/cache.js",
+            "class Cache {\n  get(k) { return k; }\n}\nmodule.exports = { Cache };\n",
+        ),
+    ] {
+        std::fs::write(repo_dir.join(rel), src).unwrap();
+    }
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    let read = |target: &str, json: bool| {
+        let mut cmd = nestweaver_cmd();
+        cmd.args(["read-symbols", target, "--db"])
+            .arg(&db_path)
+            .current_dir(dir.path());
+        if json {
+            cmd.arg("--json");
+        }
+        let output = cmd.output().unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or(serde_json::Value::Null);
+        (
+            output.status.code(),
+            payload,
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    };
+
+    // A wrong path.
+    let (code, payload, _) = read("nope.js::helper", true);
+    assert_eq!(code, Some(2), "{payload}");
+    assert_eq!(payload["symbols"], serde_json::json!([]), "{payload}");
+    assert_eq!(payload["not_found"], serde_json::json!(["nope.js::helper"]));
+    assert_eq!(
+        payload["did_you_mean"],
+        serde_json::json!(["src/util.js::helper"]),
+        "{payload}"
+    );
+    let (code, _, stderr) = read("nope.js::helper", false);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("Did you mean: src/util.js::helper?"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("warning:"), "{stderr}");
+
+    // An owner-less `path::<module>`: not found, not every owner.
+    let (code, payload, stderr) = read("src/util.js::<module>", true);
+    assert_eq!(code, Some(2), "{payload} {stderr}");
+    assert_eq!(payload["ambiguous"], serde_json::json!([]), "{payload}");
+    assert!(
+        !payload.to_string().contains("src/app.js::<module>"),
+        "{payload}"
+    );
+
+    // A wrong class.
+    let (code, payload, _) = read("Nope::get", true);
+    assert_eq!(code, Some(2), "{payload}");
+    assert_eq!(
+        payload["did_you_mean"],
+        serde_json::json!(["src/cache.js::Cache::get"]),
+        "{payload}"
+    );
+
+    // Counterweight: a real qualifier still reads.
+    let (code, payload, _) = read("src/cache.js::Cache::get", true);
+    assert_eq!(code, Some(0), "{payload}");
+    assert_eq!(payload["symbols"][0]["path"], "src/cache.js", "{payload}");
+}
+
+/// 12.1.1 (B4): a repo-relative `pr-impact --files` path resolves against the
+/// repo of the working directory (or an explicit `--repo`), not against every
+/// indexed repo that happens to have a file at the same relative path.
+#[test]
+fn pr_impact_files_resolve_against_the_working_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.lbug");
+    let mut roots = Vec::new();
+    for (name, function) in [("alpha", "alphaOnly"), ("beta", "betaOnly")] {
+        let root = dir.path().join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("index.js"),
+            format!("function {function}() {{ return 1; }}\n{function}();\n"),
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ]);
+        nestweaver_cmd()
+            .args(["index", "--repo"])
+            .arg(&root)
+            .args(["--name", name, "--db"])
+            .arg(&db_path)
+            .assert()
+            .success();
+        roots.push(root);
+    }
+    let pr_impact = |cwd: &std::path::Path, extra: &[&str]| {
+        let output = nestweaver_cmd()
+            .args(["pr-impact", "--files", "index.js", "--json", "--db"])
+            .arg(&db_path)
+            .args(extra)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or(serde_json::Value::Null);
+        assert!(
+            payload.is_object(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let names: Vec<String> = payload["changed_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["name"].as_str().map(str::to_string))
+            .collect();
+        (payload, names)
+    };
+
+    let (payload, names) = pr_impact(&roots[0], &[]);
+    assert!(names.iter().any(|n| n == "alphaOnly"), "{payload}");
+    assert!(!names.iter().any(|n| n == "betaOnly"), "{payload}");
+    assert_eq!(
+        payload["coverage"]["repos_in_scope"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "{payload}"
+    );
+
+    // A subdirectory of the repo is the same repo.
+    std::fs::create_dir_all(roots[1].join("sub")).unwrap();
+    let (payload, names) = pr_impact(&roots[1].join("sub"), &[]);
+    assert!(names.iter().any(|n| n == "betaOnly"), "{payload}");
+    assert!(!names.iter().any(|n| n == "alphaOnly"), "{payload}");
+
+    // An explicit --repo wins over the working directory.
+    let (payload, names) = pr_impact(&roots[0], &["--repo", "beta"]);
+    assert!(names.iter().any(|n| n == "betaOnly"), "{payload}");
+    assert!(!names.iter().any(|n| n == "alphaOnly"), "{payload}");
+
+    // Review M7: a --repo that names nothing is not found (2), and one that
+    // names both repos (a root prefix they share) is ambiguous (3) on the
+    // daemon route, not folded into not found.
+    let exit = |selector: &str| {
+        let output = nestweaver_cmd()
+            .args(["pr-impact", "--files", "index.js", "--json", "--db"])
+            .arg(&db_path)
+            .args(["--repo", selector])
+            .current_dir(&roots[0])
+            .output()
+            .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or(serde_json::Value::Null);
+        (output.status.code(), payload)
+    };
+    let (code, payload) = exit("no-such-repo");
+    assert_eq!(code, Some(2), "{payload}");
+    assert_eq!(payload["status"], "not_found", "{payload}");
+    let shared = dir.path().to_string_lossy().into_owned();
+    let (code, payload) = exit(&shared);
+    assert_eq!(code, Some(3), "{payload}");
+    assert_eq!(payload["status"], "ambiguous", "{payload}");
+    assert_eq!(
+        payload["candidates"].as_array().map(Vec::len),
+        Some(2),
+        "{payload}"
+    );
+}
+
+/// 12.1.1 (V4): an `investigate` scope the caller got wrong is their
+/// mistake, said once: an unknown project is not found (exit 2), a malformed
+/// scope is a usage error (exit 64). Neither is labelled "Internal error".
+#[test]
+fn investigate_scope_mistakes_are_user_errors_said_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "function greetV4(name) { return name; }\ngreetV4('x');\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    let investigate = |scope: &str, json: bool| {
+        let mut cmd = nestweaver_cmd();
+        cmd.args(["investigate", "greetV4", "--scope", scope, "--db"])
+            .arg(&db_path)
+            .arg("--root")
+            .arg(&repo_dir);
+        if json {
+            cmd.arg("--json");
+        }
+        let output = cmd.output().unwrap();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    };
+
+    let (code, _, stderr) = investigate("project:no-such-project", false);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(!stderr.contains("Internal error"), "{stderr}");
+    assert_eq!(
+        stderr.matches("no project named 'no-such-project'").count(),
+        1,
+        "said once: {stderr}"
+    );
+    let (code, stdout, stderr) = investigate("project:no-such-project", true);
+    assert_eq!(code, Some(2), "{stderr}");
+    let payload: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(payload["error"], "not found", "{payload}");
+    assert_eq!(payload["scope"], "project:no-such-project", "{payload}");
+
+    let (code, _, stderr) = investigate("bogus", false);
+    assert_eq!(code, Some(64), "{stderr}");
+    assert!(!stderr.contains("Internal error"), "{stderr}");
+    assert_eq!(
+        stderr.matches("unknown scope 'bogus'").count(),
+        1,
+        "{stderr}"
+    );
+
+    // Counterweight: a valid scope still answers.
+    let (code, _, stderr) = investigate("all", false);
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
+/// 12.1.1 (B9, B6): misses exit 2 and usage errors 64 on the commands that
+/// used to exit 0 or 1, and `hubs --repo` names a miss `"error":"not found"`
+/// like every other not-found envelope.
+#[test]
+fn not_found_and_usage_exit_codes_are_consistent() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let db_path = dir.path().join("test.lbug");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("main.js"),
+        "function exitCodeTarget(name) { return name; }\nexitCodeTarget('x');\n",
+    )
+    .unwrap();
+    nestweaver_cmd()
+        .args(["index", "--repo"])
+        .arg(&repo_dir)
+        .arg("--db")
+        .arg(&db_path)
+        .assert()
+        .success();
+    let config = dir.path().join("instance.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "instance_id = \"exit-codes\"\n\n\
+             [snapshot_storage]\nbackend = \"local\"\npath = \"{0}/snapshots\"\n\n\
+             [workspace]\nbackend = \"local\"\npath = \"{0}/workspace\"\n\n\
+             [inference]\nendpoint = \"http://localhost:11434\"\n\
+             embedding_model = \"nomic-embed-text\"\nsummary_model = \"qwen2.5-coder:7b\"\n\n\
+             [git]\ncredential_method = \"gh\"\n\n\
+             [[features]]\nname = \"checkout\"\nrepos = []\nentry_points = [\"exitCodeTarget\"]\n",
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let output = nestweaver_cmd()
+            .args(args)
+            .arg("--db")
+            .arg(&db_path)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    };
+    let config_arg = config.to_string_lossy().to_string();
+
+    let (code, _, stderr) = run(&[
+        "context",
+        "--feature",
+        "nosuchfeature",
+        "--config",
+        &config_arg,
+    ]);
+    assert_eq!(code, Some(2), "context --feature miss: {stderr}");
+    assert!(stderr.contains("nosuchfeature"), "{stderr}");
+    let (code, stdout, stderr) = run(&[
+        "context",
+        "--feature",
+        "nosuchfeature",
+        "--config",
+        &config_arg,
+        "--json",
+    ]);
+    assert_eq!(code, Some(2), "{stderr}");
+    let payload: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(payload["error"], "not found", "{payload}");
+    assert_eq!(payload["feature"], "nosuchfeature", "{payload}");
+
+    let (code, _, stderr) = run(&["summary", "--level", "symbol", "--target", "zzzqqqnot"]);
+    assert_eq!(code, Some(2), "summary --target miss: {stderr}");
+    let (code, _, stderr) = run(&["summary", "--level", "bogus"]);
+    assert_eq!(code, Some(64), "summary --level bogus: {stderr}");
+    // Counterweight: a target that matches still succeeds.
+    let (code, _, stderr) = run(&["summary", "--level", "symbol", "--target", "exitCodeTarget"]);
+    assert_eq!(code, Some(0), "{stderr}");
+
+    let (code, stdout, stderr) = run(&["investigate", "exitCodeTarget", "--json"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let bundle: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let bundle_id = bundle["bundle_id"].as_str().unwrap().to_string();
+    let (code, _, stderr) = run(&["investigate-expand", &bundle_id, "--targets", "zzzz"]);
+    assert_eq!(
+        code,
+        Some(2),
+        "investigate-expand with nothing resolved: {stderr}"
+    );
+
+    let (code, stdout, stderr) = run(&["hubs", "--repo", "zzz-no-such-repo", "--json"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    let payload: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(payload["error"], "not found", "{payload}");
+}

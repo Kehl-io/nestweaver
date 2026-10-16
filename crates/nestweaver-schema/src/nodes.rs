@@ -224,7 +224,9 @@ impl<'a> QualifiedSpec<'a> {
 /// Suffixes only match on a `/` boundary, so `x.js` never matches
 /// `index.js`. A leading `./` or `/` is ignored and `\` reads as `/`, so a
 /// Windows-style or root-anchored path names the same file.
-fn file_qualifier_rank(qualifier: &str, file_path: &str) -> Option<u8> {
+/// `Some(0)`/`Some(1)`/`Some(2)` in that order, `None` for no match; lower
+/// is better.
+pub fn file_qualifier_rank(qualifier: &str, file_path: &str) -> Option<u8> {
     let normalised = qualifier.replace('\\', "/");
     let mut qualifier = normalised.as_str();
     while let Some(rest) = qualifier

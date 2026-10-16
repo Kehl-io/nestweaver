@@ -154,9 +154,12 @@ pub fn export_cypher(store: &GraphStore, writer: &mut dyn Write) -> anyhow::Resu
             .unwrap_or(0.0);
         writeln!(
             writer,
-            "CREATE (:Symbol {{uid: {}, name: {}, kind: {}, file: {}, line: {}, pagerank: {:.6}}});",
+            "CREATE (:Symbol {{uid: {}, name: {}, display_name: {}, kind: {}, file: {}, line: {}, pagerank: {:.6}}});",
             cypher_escape(&sym.uid),
             cypher_escape(&sym.name),
+            // 12.1.1 (B5): the raw name stays; an owner's label is
+            // `path::<module>`, every other symbol's is its name.
+            cypher_escape(&sym.display_name()),
             cypher_escape(&sym.kind.to_string()),
             cypher_escape(&sym.file_path),
             sym.start_line,
@@ -1296,6 +1299,36 @@ mod tests {
         assert!(!code_only.contains(r#"<data key="kind">Note</data>"#));
 
         assert!(render("nonsense", ExportScope::All).is_err());
+    }
+
+    /// 12.1.1 (B5): a `<module>` owner keeps its raw `name` in the Cypher
+    /// export and gains a `display_name` of `path::<module>`, so a consumer
+    /// keying on a label never sees thousands of identical `<module>` nodes.
+    #[test]
+    fn cypher_export_labels_module_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.js"), "function f() {}\nf();\n").unwrap();
+        let (_repo, store) = crate::index::index_directory_in_memory(
+            dir.path(),
+            "test",
+            "https://example.com/r",
+            "sha",
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        export_cypher(&store, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let owner = output
+            .lines()
+            .find(|line| line.starts_with("CREATE (:Symbol") && line.contains("kind: 'Module'"))
+            .unwrap_or_else(|| panic!("{output}"));
+        assert!(owner.contains("name: '<module>'"), "raw name kept: {owner}");
+        assert!(owner.contains("display_name: 'a.js::<module>'"), "{owner}");
+        let f = output
+            .lines()
+            .find(|line| line.starts_with("CREATE (:Symbol") && line.contains("name: 'f'"))
+            .unwrap();
+        assert!(f.contains("display_name: 'f'"), "{f}");
     }
 
     #[test]

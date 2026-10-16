@@ -27,7 +27,9 @@ pub fn export_in_memory_graph(store: &GraphStore) -> anyhow::Result<InMemoryGrap
         uid_to_idx.insert(sym.uid.clone(), idx);
         uids.push(sym.uid.clone());
         nodes.push(NodeMeta {
-            name: sym.name.clone(),
+            // 12.1.1 (R1): the graph view renders this name, so an owner
+            // reads `path::<module>`, never bare.
+            name: sym.display_name().into_owned(),
             kind: sym.kind.to_string(),
             file_path: Some(sym.file_path.clone()),
             pagerank_score: sym.pagerank_score,
@@ -75,5 +77,29 @@ fn parse_edge_kind(s: &str) -> EdgeKind {
         "MEMBER_OF" => EdgeKind::MemberOf,
         "INCLUDES_SYM" => EdgeKind::Includes,
         _ => EdgeKind::Other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 12.1.1 (R1): the snapshot's node name, which the graph view renders,
+    /// labels a `<module>` owner `path::<module>`.
+    #[test]
+    fn snapshot_labels_module_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.js"), "function f() {}\nf();\n").unwrap();
+        let (_repo, store) = crate::index::index_directory_in_memory(
+            dir.path(),
+            "test",
+            "https://example.com/r",
+            "sha",
+        )
+        .unwrap();
+        let graph = export_in_memory_graph(&store).unwrap();
+        let mut names: Vec<&str> = graph.nodes.iter().map(|n| n.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["a.js::<module>", "f"]);
     }
 }

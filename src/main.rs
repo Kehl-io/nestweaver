@@ -1041,6 +1041,30 @@ fn corruption_diagnostic(
             cause: drop_engine_retry_advice(&message),
         }
         .into(),
+        // V2: a read that races a live writer's checkpoint can see a file
+        // shorter than its catalog and succeed on retry, which is what QA
+        // observed on 12.1.0. That race is the ONLY case downgraded: an
+        // engine assertion or an unclassified corruption is not explained by
+        // a live writer, and the daemon is up whenever the CLI runs, so
+        // downgrading those would mean never calling real corruption corrupt.
+        // The step it names makes the next attempt conclusive.
+        CorruptionKind::FileTruncated
+            if nestweaver_store::live_writer_holds_write_lease(Path::new(&path)) =>
+        {
+            CliDiagnostic::DatabaseUnavailable {
+                cause: format!(
+                    "{}\nAnother process was writing this database while it was read \
+                     (a checkpoint can briefly leave the file shorter than its catalog), \
+                     so this is not yet proof the file is damaged. If it repeats, run \
+                     `nestweaver daemon --db {} stop` and re-run the command: a failure \
+                     with nothing writing the database means the file is damaged.",
+                    drop_engine_retry_advice(&message),
+                    shell_quote(&path),
+                ),
+                path,
+            }
+            .into()
+        }
         CorruptionKind::FileTruncated
         | CorruptionKind::EngineAssertion
         | CorruptionKind::Unclassified => CliDiagnostic::DatabaseCorrupt {
@@ -1552,6 +1576,86 @@ fn print_json_not_found_detail(
     message: Option<&str>,
 ) {
     println!("{}", json_not_found_payload(target_key, target, message));
+}
+
+/// 12.1.1 (B9): whether a `get_summary` answer for a `--target` matched
+/// nothing at all (nothing returned, nothing cut).
+fn summary_target_missed(value: &serde_json::Value) -> bool {
+    let count = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+    count("total")
+        .or_else(|| count("returned"))
+        .or_else(|| count("count"))
+        == Some(0)
+}
+
+/// 12.1.1 (B9): `summary --target` that matched nothing. Exit 2.
+fn report_summary_target_not_found(target: &str, json: bool) -> i32 {
+    let message = format!("no summary matches target '{target}'");
+    if json {
+        println!(
+            "{}",
+            json_not_found_payload("target", &serde_json::json!(target), Some(&message))
+        );
+    }
+    eprintln!("{message}");
+    EXIT_NOT_FOUND
+}
+
+/// 12.1.1 (B9): `investigate-expand` resolved none of its targets: exit 2,
+/// like any other lookup that found nothing. A partial resolution succeeds.
+fn investigate_expand_exit(value: &serde_json::Value) -> i32 {
+    let empty = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty)
+    };
+    if empty("expanded") && !empty("unresolved") {
+        EXIT_NOT_FOUND
+    } else {
+        EXIT_SUCCESS
+    }
+}
+
+/// 12.1.1 (B9): `context --feature <name>` naming no `[[features]]` entry:
+/// the not-found message (and `--json` envelope), with the declared feature
+/// names that contain the one asked for (or all of them, up to the
+/// suggestion bound, when none does) as `did_you_mean`. Exit 2.
+fn report_feature_not_found(
+    feature: &str,
+    config_path: &std::path::Path,
+    declared: &[&str],
+    json: bool,
+) -> i32 {
+    let needle = feature.to_lowercase();
+    let mut close: Vec<String> = declared
+        .iter()
+        .filter(|name| {
+            let lower = name.to_lowercase();
+            lower.contains(&needle) || needle.contains(&lower)
+        })
+        .map(|name| name.to_string())
+        .collect();
+    if close.is_empty() {
+        close = declared.iter().map(|name| name.to_string()).collect();
+    }
+    close.truncate(nestweaver_engine::did_you_mean::DID_YOU_MEAN_LIMIT);
+    let message = format!(
+        "feature '{feature}' not found in config {}",
+        config_path.display()
+    );
+    if json {
+        println!(
+            "{}",
+            nestweaver_schema::responses::with_did_you_mean(
+                json_not_found_payload("feature", &serde_json::json!(feature), Some(&message)),
+                &close,
+            )
+        );
+    }
+    eprintln!("{message}");
+    eprint_did_you_mean(&close);
+    EXIT_NOT_FOUND
 }
 
 /// [`print_json_not_found_detail`]'s payload, split out so the envelope can be
@@ -3201,14 +3305,68 @@ fn print_json_not_found_suggesting(target_key: &str, target: &str, candidates: &
     );
 }
 
-/// Render a `dead-code` result as text from its JSON payload.
-///
-/// BOTH the direct and daemon paths render through this, so the two cannot
-/// drift. The daemon branch used to `println!` the RPC response verbatim with
-/// no `if json` guard, which meant the OUTPUT FORMAT depended on whether a
-/// daemon happened to be running rather than on the flag — `dead-code` printed
-/// text standalone and JSON once the daemon was up (nw-108). Driving both from
-/// the same payload makes parity structural rather than something to remember.
+/// 12.1.1 (V4): how `investigate` reports a failure it can classify, on both
+/// routes. The answer is said ONCE (the daemon route used to print the tool's
+/// answer, then the same text again inside "investigate RPC failed: code:
+/// 'Internal error', message: ..."), and a caller's mistake is never labelled
+/// an internal error: an unresolved repo or unknown project is not found
+/// (exit 2), a malformed scope a usage error (exit 64). An index publication
+/// that is still failing closed keeps exit 1 and says to retry. `None` for
+/// anything else, which the caller propagates unchanged.
+fn report_investigate_failure(
+    error: &anyhow::Error,
+    json: bool,
+    scope: Option<&str>,
+) -> Option<i32> {
+    use nestweaver_engine::investigate::{InvestigateScopeError, InvestigateScopeErrorKind};
+    if error_is_unresolved_repo_filter(error) {
+        return Some(report_unresolved_repo_filter(error, json));
+    }
+    let message = daemon_application_error(error).unwrap_or_else(|| format!("{error:#}"));
+    let typed = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<InvestigateScopeError>())
+        .map(|typed| &typed.kind);
+    let scope_value = serde_json::json!(scope.unwrap_or("all"));
+    if let Some(envelope) = nestweaver_mcp::tools::not_found_envelope(error).or_else(|| {
+        matches!(
+            typed,
+            Some(InvestigateScopeErrorKind::UnknownProject { .. })
+        )
+        .then(|| json_not_found_payload("scope", &scope_value, Some(&message)))
+    }) {
+        if json {
+            println!("{envelope}");
+        }
+        eprintln!("{message}");
+        eprint_did_you_mean(&value_did_you_mean(&envelope));
+        return Some(EXIT_NOT_FOUND);
+    }
+    if error_is_invalid_tool_arguments(error)
+        || matches!(typed, Some(InvestigateScopeErrorKind::Malformed))
+    {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "error": "invalid arguments", "scope": scope_value, "message": message })
+            );
+        }
+        eprintln!("Error: {message}");
+        return Some(EXIT_USAGE);
+    }
+    if message.contains("index publication") {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "error": "publication_in_progress", "retryable": true, "message": message })
+            );
+        }
+        eprintln!("{message}");
+        return Some(EXIT_ERROR);
+    }
+    None
+}
+
 /// Render an `investigate` bundle as text from its JSON payload.
 ///
 /// Shared by the direct and daemon paths for the same reason as
@@ -3216,6 +3374,11 @@ fn print_json_not_found_suggesting(target_key: &str, target: &str, candidates: &
 /// so the output format tracked whether a daemon was running instead of the
 /// `--json` flag (nw-108).
 fn render_investigate_text(payload: &serde_json::Value) {
+    // 12.1.1 (V4): an answer served through a live watcher batch says so,
+    // like `brain context`.
+    if let Some(note) = publication_text_note(publication_from_wire(payload).as_ref()) {
+        println!("{note}");
+    }
     // nw-670 re-review R1: owed note->code links, stamped by the daemon or
     // (direct route) just before rendering.
     if let Some(pending) = code_links_from_wire(payload) {
@@ -3283,6 +3446,10 @@ fn render_investigate_text(payload: &serde_json::Value) {
         text(payload, "bundle_id"),
         text(payload, "query")
     );
+    // I3: a map built during a live publication is answered but not saved.
+    if let Some(reason) = payload.get("bundle_not_saved").and_then(|v| v.as_str()) {
+        println!("  note: bundle not saved: {reason}");
+    }
     println!(
         "{} domain(s), {} entr{}{}",
         domains.len(),
@@ -4909,6 +5076,27 @@ mod affected_tests_rpc_payload_tests {
     }
 }
 
+/// Whether the dead-code walk had no seed at all, over a non-empty corpus:
+/// every symbol is then unreachable by construction. Reads `walk_roots`, the
+/// whole-graph root count (a `--repo` scope's own `entry_points` and
+/// `module_owner_roots` can both be 0 over a seeded walk). An older daemon
+/// that does not send `walk_roots` falls back to the two scoped counts.
+fn dead_code_walk_unseeded(payload: &serde_json::Value) -> bool {
+    let num = |k: &str| payload.get(k).and_then(|v| v.as_u64());
+    let walk_roots = num("walk_roots").unwrap_or_else(|| {
+        num("entry_points").unwrap_or(0) + num("module_owner_roots").unwrap_or(0)
+    });
+    walk_roots == 0 && num("total_symbols").unwrap_or(0) > 0
+}
+
+/// Render a `dead-code` result as text from its JSON payload.
+///
+/// BOTH the direct and daemon paths render through this, so the two cannot
+/// drift. The daemon branch used to `println!` the RPC response verbatim with
+/// no `if json` guard, which meant the OUTPUT FORMAT depended on whether a
+/// daemon happened to be running rather than on the flag — `dead-code` printed
+/// text standalone and JSON once the daemon was up (nw-108). Driving both from
+/// the same payload makes parity structural rather than something to remember.
 fn render_dead_code_text(payload: &serde_json::Value) {
     let num = |k: &str| payload.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
     let total = num("total_symbols");
@@ -4926,7 +5114,6 @@ fn render_dead_code_text(payload: &serde_json::Value) {
     // "N of M unreachable" believing M is the total. Printed on both branches
     // — "No dead code detected" over a short corpus is the worse of the two.
     let undecodable = num("undecodable_symbols");
-    let entry_points = num("entry_points");
     let coverage_note = || {
         // nw-500. FIRST, before any count, and on both branches: a manifest
         // sidecar that exists and cannot be read drops every
@@ -4961,7 +5148,10 @@ fn render_dead_code_text(payload: &serde_json::Value) {
         // after them.
         // nw-113: `<module>` owners seed the walk too; they are counted in
         // `module_owner_roots`, not `entry_points`.
-        if entry_points == 0 && num("module_owner_roots") == 0 && total > 0 {
+        // 12.1.1 (M2): with `--repo` both counts are the scoped repos' roots,
+        // so a scoped repo reached only from another repo's roots reads 0/0
+        // over a seeded walk. Whether the WALK had a seed is `walk_roots`.
+        if dead_code_walk_unseeded(payload) {
             println!(
                 "Coverage DEGRADED: no entry point was found, so the reachability walk had \
                  no seed and every symbol below is unreachable BY CONSTRUCTION. This is not \
@@ -6481,7 +6671,10 @@ enum Commands {
         /// Symbol UIDs, names, FQNs, or path::name specs to read. The path is a
         /// repo-relative path or a suffix of one; path::<module> reads the
         /// file's top-level code, with function, class and method bodies
-        /// elided as ⋮.
+        /// elided as ⋮. A qualifier that names no file or container is not
+        /// found (exit 2), with path::name suggestions, like `symbol`; it is
+        /// never dropped to the bare name. A file with no top-level calls has
+        /// no owner, so its path::<module> is not found.
         #[arg(required = true)]
         targets: Vec<String>,
         #[arg(
@@ -8200,6 +8393,11 @@ enum Commands {
             help = "Output as SARIF v2.1.0 (for GitHub code scanning / Azure DevOps / the VS Code SARIF viewer)"
         )]
         sarif: bool,
+        #[arg(
+            long,
+            help = "Repository the changed files belong to (name or UID). Default: the indexed repo checked out at the working directory's git root; repo-relative paths then resolve in that repo only, never in another repo with the same relative path"
+        )]
+        repo: Option<String>,
         #[arg(
             long,
             help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
@@ -18323,6 +18521,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("--config is required when using --feature"))?;
 
+                // 12.1.1 (B9): a feature the config does not declare is a
+                // miss (exit 2), on both routes, before either opens anything.
+                {
+                    let declared = nestweaver_engine::InstanceConfig::from_file(config_path)?;
+                    let names: Vec<&str> = declared
+                        .features
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|feature| feature.name.as_str())
+                        .collect();
+                    if !names.contains(&feature_name.as_str()) {
+                        return Ok((
+                            report_feature_not_found(feature_name, config_path, &names, json),
+                            None,
+                        ));
+                    }
+                }
+
                 // ── daemon guard (routed through HybridClient for upstream merge) ──
                 if use_daemon {
                     let instance_cfg = nestweaver_engine::InstanceConfig::from_file(config_path)?;
@@ -19586,8 +19803,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             target,
             config,
         } => {
-            let parsed_level: SummaryLevel =
-                level.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            // 12.1.1 (B9): a bad `--level` is a usage error (64), like a bad
+            // value clap rejects, not a failed run (1).
+            let parsed_level: SummaryLevel = match level.parse() {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    let error: String = error;
+                    eprintln!("error: invalid value '{level}' for '--level': {error}");
+                    return Ok((EXIT_USAGE, None));
+                }
+            };
             // nw-414: resolved through the same helper `hubs`/`bridges` use, so
             // `--config` alone (no `--db`) selects the instance's database
             // instead of falling back to `./nestweaver.lbug`. `db.unwrap_or_else(
@@ -19646,6 +19871,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         warn_stale_resolver_rankings_no_store(
                             &ResolverStaleness::from_daemon_response(&value, &db_path),
                         );
+                    }
+                    // 12.1.1 (B9): a `--target` that matched nothing is a
+                    // miss (exit 2), not "the graph may be empty".
+                    if let Some(target) = target.as_deref()
+                        && summary_target_missed(&value)
+                    {
+                        return Ok((report_summary_target_not_found(target, false), None));
                     }
                     if text.is_empty() {
                         println!("No summaries generated (graph may be empty).");
@@ -19846,6 +20078,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let truncated_by_budget = display.len() < total;
             let truncated_by_cap = cap_dropped > 0;
             let truncated = truncated_by_budget || truncated_by_cap;
+            // 12.1.1 (B9): a `--target` that matched nothing is a miss.
+            if let Some(target) = target.as_deref()
+                && total + cap_dropped == 0
+            {
+                return Ok((report_summary_target_not_found(target, json), None));
+            }
 
             // nw-370: hub level ONLY. `generate_hub_summaries_bounded` selects
             // and orders by the same degree/PageRank nw-103's import fan-out
@@ -21140,6 +21378,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             depth,
             json,
             sarif,
+            repo,
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
@@ -21249,11 +21488,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if use_daemon && !sarif {
                 let file_strs: Vec<&str> =
                     changed_files.iter().filter_map(|p| p.to_str()).collect();
-                let args = serde_json::json!({
+                // 12.1.1 (B4): the daemon resolves these to the repo under
+                // review, so a repo-relative path matches that repo only.
+                let mut args = serde_json::json!({
                     "files": file_strs,
                     "depth": depth,
+                    "working_root": repo_root.to_string_lossy(),
                 });
-                if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "pr_impact", args)? {
+                if let Some(repo) = repo.as_deref() {
+                    args["repo"] = serde_json::json!(repo);
+                }
+                let routed = match try_hybrid_json_rpc(true, &db_path, None, "pr_impact", args) {
+                    // `--repo` is resolved like every other repo filter.
+                    Err(error) if error_is_unresolved_repo_filter(&error) => {
+                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    }
+                    routed => routed?,
+                };
+                if let Some(value) = routed {
                     // The daemon serializes a full BlastRadiusResult; decode it so
                     // both the concise banner and the strict exit code see the real
                     // gate state (missing fields default via serde on old daemons).
@@ -21293,9 +21545,20 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 depth
             ));
 
-            // TODO(nw-033): resolve target repo_uid from the working repo
+            // 12.1.1 (B4): the repo under review, from `--repo` or the
+            // working directory, so repo-relative paths resolve there only.
+            let target_repo = match nestweaver_engine::pr_impact_target_repo(
+                &store,
+                repo.as_deref(),
+                Some(&repo_root),
+            ) {
+                Err(error) if error_is_unresolved_repo_filter(&error) => {
+                    return Ok((report_unresolved_repo_filter(&error, json), None));
+                }
+                target => target?,
+            };
             let options = nestweaver_engine::BlastRadiusOptions {
-                target_repo: None,
+                target_repo,
                 max_depth: depth,
                 include_data_edges: false,
                 limit: None,
@@ -24294,10 +24557,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // route where it was previously ignored.
                 args["no_embed"] = serde_json::json!(no_embed);
                 let answer = match try_hybrid_json_rpc(true, &db_path, None, "investigate", args) {
-                    Err(error) if error_is_unresolved_repo_filter(&error) => {
-                        return Ok((report_unresolved_repo_filter(&error, json), None));
+                    Err(error) => {
+                        match report_investigate_failure(&error, json, scope.as_deref()) {
+                            Some(code) => return Ok((code, None)),
+                            None => return Err(error),
+                        }
                     }
-                    other => other?,
+                    Ok(answer) => answer,
                 };
                 if let Some(value) = answer {
                     if json {
@@ -24330,10 +24596,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 Some(token_budget),
                 None,
             ) {
-                Err(error) if error_is_unresolved_repo_filter(&error) => {
-                    return Ok((report_unresolved_repo_filter(&error, json), None));
-                }
-                other => other?,
+                Err(error) => match report_investigate_failure(&error, json, Some(&scope)) {
+                    Some(code) => return Ok((code, None)),
+                    None => return Err(error),
+                },
+                Ok(result) => result,
             };
             // Built unconditionally so text and JSON render from the SAME
             // payload, and so the daemon path can reuse the renderer (nw-108).
@@ -24341,6 +24608,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // nw-670 re-review R1: the direct route stamps what the daemon's
             // MCP seam would have.
             nestweaver_engine::code_links::stamp_code_links_disclosure(&db_path, &mut payload);
+            // 12.1.1 (V4): and the watcher-batch disclosure, like the seam.
+            nestweaver_engine::index_publication::stamp_watcher_batch_disclosure(
+                &db_path,
+                &mut payload,
+            );
             if json {
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
@@ -24407,7 +24679,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     } else {
                         print!("{}", render_investigate_expand_text(&value));
                     }
-                    return Ok((EXIT_SUCCESS, None));
+                    return Ok((investigate_expand_exit(&value), None));
                 }
             }
 
@@ -24431,15 +24703,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     None => return Err(error),
                 },
             };
+            let value = serde_json::to_value(&result)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
-                print!(
-                    "{}",
-                    render_investigate_expand_text(&serde_json::to_value(&result)?)
-                );
+                print!("{}", render_investigate_expand_text(&value));
             }
-            Ok((EXIT_SUCCESS, None))
+            Ok((investigate_expand_exit(&value), None))
         }
 
         Commands::InvestigateHydrate {
@@ -27998,8 +28268,10 @@ fn render_read_symbols(
         for nf in &res.not_found {
             eprintln!("not found: {nf}");
         }
-        // nw-113: a dropped qualifier is said out loud, not silently
-        // answered with whatever shares the last segment.
+        // 12.1.1 (B1): a miss suggests `path::name` specs, like `symbol`.
+        eprint_did_you_mean(&res.did_you_mean);
+        // nw-113: a dropped leading qualifier is said out loud, not silently
+        // answered by the shorter qualified reading.
         for ignored in &res.qualifier_ignored {
             eprintln!("warning: {}: {}", ignored.query, ignored.note);
         }
@@ -29889,6 +30161,154 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
             help.contains("outside the database file with 1696 pages"),
             "the engine's FACTS are the load-bearing part and must survive: {help}"
         );
+    }
+
+    /// V2: QA saw "delete this database ... deterministic, not transient" once
+    /// during a watcher batch, and the immediate retry succeeded. A transient
+    /// condition must never reach a corruption remedy.
+    #[test]
+    fn transient_conditions_never_reach_a_corruption_remedy() {
+        for raw in [
+            "backlinks RPC failed: query error: begin transaction: Cannot start a new \
+             write transaction in the system. Only one write transaction at a time is \
+             allowed in the system. The database file may be corrupted.",
+            "index publication TRANSIENT: an index publication is in flight (marker age \
+             3s). The database file may be corrupted.",
+        ] {
+            let report = into_diagnostic(anyhow::anyhow!("{raw}"));
+            let code = report.code().map(|c| c.to_string()).unwrap_or_default();
+            assert!(
+                !code.contains("corrupt"),
+                "transient condition classified as corruption ({code}): {raw}"
+            );
+            let rendered = format!(
+                "{report:?} {}",
+                report.help().map(|h| h.to_string()).unwrap_or_default()
+            );
+            assert!(!rendered.contains("delete this database"), "{rendered}");
+        }
+    }
+
+    /// 12.1.1 review (M2): the "no entry point ... no seed" warning is about
+    /// the WALK, so it reads `walk_roots`. A `--repo` scope that owns no
+    /// roots over a seeded walk is not warned about; an unseeded walk is; an
+    /// older daemon's payload without `walk_roots` falls back to the counts.
+    #[test]
+    fn the_no_seed_warning_is_gated_on_walk_roots() {
+        let payload = |extra: serde_json::Value| {
+            let mut base = serde_json::json!({
+                "total_symbols": 10,
+                "entry_points": 0,
+                "module_owner_roots": 0,
+                "coverage": "degraded",
+            });
+            base.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            base
+        };
+        assert!(!dead_code_walk_unseeded(&payload(
+            serde_json::json!({ "walk_roots": 4 })
+        )));
+        assert!(dead_code_walk_unseeded(&payload(
+            serde_json::json!({ "walk_roots": 0 })
+        )));
+        assert!(dead_code_walk_unseeded(&payload(serde_json::json!({}))));
+        assert!(!dead_code_walk_unseeded(&payload(
+            serde_json::json!({ "entry_points": 1 })
+        )));
+        assert!(!dead_code_walk_unseeded(&payload(
+            serde_json::json!({ "walk_roots": 0, "total_symbols": 0 })
+        )));
+    }
+
+    /// V2 review: a transient phrase elsewhere in the chain no longer hides a
+    /// definite verdict. A timed-out health check that relays a truncation,
+    /// and a refusal to overwrite a dirty publication that wraps one, are
+    /// corruption.
+    #[test]
+    fn a_transient_phrase_does_not_hide_a_truncated_file() {
+        for raw in [
+            "health check timed out — daemon connected but unresponsive: catalog page \
+             range starts at 3567 and spans 5 pages, outside the database file with 1696 \
+             pages",
+            "refusing to overwrite a dirty publication: catalog page range starts at 3567 \
+             and spans 5 pages, outside the database file with 1696 pages",
+            "refusing to overwrite a dirty publication: Assertion failed in file \
+             \"<crate>/column.cpp\" on line 289: x <= y",
+        ] {
+            let report = into_diagnostic(anyhow::anyhow!("{raw}"));
+            let code = report.code().map(|c| c.to_string()).unwrap_or_default();
+            assert_eq!(code, "nestweaver::db_corrupt", "{raw}");
+        }
+    }
+
+    /// V2: an engine read that races a LIVE writer (the daemon) is not proof
+    /// the file is damaged, so it must not say "delete this database". The
+    /// verdict-free counterweight below keeps a quiet database's corruption
+    /// report intact.
+    #[cfg(unix)]
+    #[test]
+    fn corruption_seen_while_another_process_writes_is_not_called_deterministic() {
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"LBUG").unwrap();
+        let messages = [
+            "catalog page range starts at 3567 and spans 5 pages, outside the database \
+             file with 1696 pages",
+            "Assertion failed in file \"<crate>/column.cpp\" on line 289: x <= y",
+            "Runtime exception: The database file may be corrupted.",
+        ];
+        let render = |engine: &str| {
+            let report = into_diagnostic(anyhow::anyhow!(
+                "failed to open database at {}: database error: {engine}",
+                db.display()
+            ));
+            let code = report.code().map(|c| c.to_string()).unwrap_or_default();
+            let help = report.help().map(|h| h.to_string()).unwrap_or_default();
+            (code, help)
+        };
+
+        // Nothing writing: the corruption verdict and its remedy stand.
+        for engine in messages {
+            let (code, help) = render(engine);
+            assert_eq!(code, "nestweaver::db_corrupt", "{engine}");
+            assert!(help.contains("delete this database"), "{help}");
+        }
+
+        // A live writer holds the lease (a raw flock, as another process would).
+        let lease = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.path().join("brain.lbug.write.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        // V2 review: only the checkpoint race (a truncated read) is
+        // downgraded, and it names the step that makes a retry conclusive.
+        let (code, help) = render(messages[0]);
+        assert_ne!(code, "nestweaver::db_corrupt", "{}", messages[0]);
+        assert!(!help.contains("delete this database"), "{help}");
+        assert!(!help.contains("deterministic"), "{help}");
+        assert!(
+            help.contains(&format!(
+                "nestweaver daemon --db {} stop",
+                shell_quote(&db.display().to_string())
+            )) && help.contains("re-run the command"),
+            "it must say what to do: {help}"
+        );
+        // An engine assertion and an unclassified corruption are corruption
+        // whether or not the daemon is up.
+        for engine in &messages[1..] {
+            let (code, help) = render(engine);
+            assert_eq!(code, "nestweaver::db_corrupt", "{engine}");
+            assert!(help.contains("delete this database"), "{help}");
+        }
     }
 
     /// nw-332. The production WAL corruption reached the operator through
@@ -40276,6 +40696,17 @@ mod clusters_forwarding_tests {
     use super::*;
 
     fn cluster_collector_store() -> nestweaver_store::GraphStore {
+        cluster_collector_store_with(150, 80, "")
+    }
+
+    /// `count` symbols in `repo:pages`; `symbol:000` and every symbol below
+    /// `star` call each other, so they form one community. `pad` lengthens
+    /// every name.
+    fn cluster_collector_store_with(
+        count: usize,
+        star: usize,
+        pad: &str,
+    ) -> nestweaver_store::GraphStore {
         use nestweaver_schema::{EdgeType, Repo, ResolvedEdge, Symbol, SymbolKind, Visibility};
         let store = nestweaver_store::GraphStore::in_memory().unwrap();
         store
@@ -40289,12 +40720,12 @@ mod clusters_forwarding_tests {
                 root_path: None,
             })
             .unwrap();
-        for index in 0..150 {
+        for index in 0..count {
             let uid = format!("symbol:{index:03}");
             store
                 .insert_symbol(&Symbol {
                     uid: uid.clone(),
-                    name: uid.clone(),
+                    name: format!("{uid}{pad}"),
                     kind: SymbolKind::Function,
                     repo_uid: "repo:pages".into(),
                     file_path: format!("src/{index}.rs"),
@@ -40313,7 +40744,7 @@ mod clusters_forwarding_tests {
                     canonical_id: None,
                 })
                 .unwrap();
-            if index > 0 && index < 80 {
+            if index > 0 && index < star {
                 for (a, b) in [("symbol:000", uid.as_str()), (uid.as_str(), "symbol:000")] {
                     store
                         .insert_edge(&ResolvedEdge {
@@ -40424,6 +40855,49 @@ mod clusters_forwarding_tests {
                 }
             }
         }
+    }
+
+    /// 12.1.1 (B2): `clusters --repo X --members 0` asks for a big
+    /// community's remaining members up to 200 at a time. On the CLI route
+    /// (full delivery) a page of 200 members could exceed the tool's 16 KB
+    /// listing allowance, the row was dropped, and the collector failed
+    /// with "empty cluster member continuation".
+    #[test]
+    fn cluster_collector_completes_a_large_community_on_the_cli_route() {
+        let store = cluster_collector_store_with(400, 400, &"_padded".repeat(12));
+        let mut args = clusters_tool_args(0, 0, None);
+        args["repos"] = serde_json::json!(["repo:pages"]);
+        let result = collect_cluster_tool_pages(
+            args,
+            |args| {
+                Ok(Some(nestweaver_mcp::tools::dispatch_cli(
+                    &store, None, "clusters", args, None,
+                )?))
+            },
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let rows = result["clusters"].as_array().unwrap();
+        let biggest = rows
+            .iter()
+            .max_by_key(|row| row["size"].as_u64().unwrap())
+            .unwrap();
+        assert!(
+            biggest["size"].as_u64().unwrap() > 220,
+            "fixture must need a member page past 200: {}",
+            biggest["size"]
+        );
+        assert_eq!(
+            biggest["members"].as_array().unwrap().len() as u64,
+            biggest["size"].as_u64().unwrap()
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["members"].as_array().unwrap().len())
+                .sum::<usize>(),
+            400
+        );
     }
 
     #[test]

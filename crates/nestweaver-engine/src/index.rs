@@ -2807,7 +2807,10 @@ fn index_directory_with_store_inner(
     let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
     let r_uid = repo_uid(instance_id, repo_url);
-    record_data_instance(store, instance_id);
+    // D2: the data instance id is recorded INSIDE the write gate (nw-246/
+    // nw-277, `index_into_store_with_write_gate`). A second, ungated call here
+    // opened a write transaction before scan and could take the single write
+    // slot from a gated writer such as the vault watcher.
     // Capture generation-N derived state before graph publication advances to
     // N+2. Loading it after the graph commit would correctly reject it as
     // stale and, historically, `unwrap_or_default` then discarded every other
@@ -8879,6 +8882,58 @@ fn content_hash_hex(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D2: `index_directory_with_store_inner` recorded the data instance id
+    /// at its top, before scan and OUTSIDE the write gate, opening a LadybugDB
+    /// write transaction there. On 10-15 that won the single write slot from
+    /// the gated vault watcher and killed it, stranding notes without links.
+    /// No write may start before this run holds its gate.
+    #[test]
+    fn index_starts_no_write_before_it_holds_the_write_gate() {
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("main.js"),
+            "function a() { b(); }\nfunction b() {}\n",
+        )
+        .unwrap();
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = dir.path().join("t.lbug");
+        let gate = crate::WriteGate::new();
+        let observed_gate = gate.clone();
+        let ungated = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let gated = Arc::new(Mutex::new(0usize));
+        let (ungated_sink, gated_sink) = (Arc::clone(&ungated), Arc::clone(&gated));
+        store.set_write_observer(Some(Arc::new(move |what| {
+            if observed_gate.holder_snapshot().is_some() {
+                *gated_sink.lock().unwrap() += 1;
+            } else {
+                ungated_sink.lock().unwrap().push(what);
+            }
+        })));
+
+        let opts = IndexOptions::new("inst-d2", "https://example.com/d2", "abc123")
+            .write_gate(gate, "index_repo");
+        index_directory_with_store_opts(&store, &src, &db_path, &opts, None).unwrap();
+        store.set_write_observer(None);
+
+        assert_eq!(
+            *ungated.lock().unwrap(),
+            Vec::<&str>::new(),
+            "writes started without the write gate"
+        );
+        assert!(
+            *gated.lock().unwrap() > 0,
+            "the observer must see gated writes"
+        );
+        assert_eq!(
+            store.data_instance_id().unwrap().as_deref(),
+            Some("inst-d2"),
+            "the gated call still records the instance"
+        );
+    }
 
     /// nw-787 (also nw-113 last-round QA): a Python nested class's method is a
     /// member of the nested class, not of a same-named top-level class, and
@@ -16589,9 +16644,11 @@ module.exports = { check, plain };\n";
             error.failures[0].stage,
             DeletionReconciliationStage::PersistedPageRank
         );
-        assert!(!store.pagerank_scores().unwrap().contains_key("stale"));
+        // Checked before the ranked read below: since D1 a lazy compute
+        // persists a FRESH sidecar, which is correct and not the stale one.
         assert!(!pagerank_path.exists());
         assert!(quarantine_path(&pagerank_path).exists());
+        assert!(!store.pagerank_scores().unwrap().contains_key("stale"));
         assert!(store.graph_generation() > generation_before);
         assert_eq!(
             fs::read_to_string(crate::sidecar_path(&db_path, ".generation"))

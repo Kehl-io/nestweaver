@@ -11,10 +11,145 @@ use std::path::Path;
 use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 
+/// D3: how long ONE repository's manifest capture may take. Each repo gets
+/// its own budget, started when its capture starts — after the write gate is
+/// held, for the re-captures under it — so neither a long gate wait nor the
+/// other repos' captures spend it.
+pub(super) const REPO_CAPTURE_BUDGET: Duration = Duration::from_secs(60);
+
+/// D3: how long ALL the captures made under the write gate may take together
+/// (the re-capture and the verification capture of one reconciliation). It
+/// starts once the gate is held, so the gate hold is bounded by this, not by
+/// repos × [`REPO_CAPTURE_BUDGET`] × 2.
+pub(super) const PASS_CAPTURE_BUDGET: Duration = Duration::from_secs(60);
+
+/// D3: after this many consecutive passes in which the same repository ran
+/// out of its OWN budget, that repository is refused with a contention reason
+/// and the others are published, so one persistently slow repository cannot
+/// block every manifest rebuild (nw-705's per-repo isolation).
+pub(super) const CONSECUTIVE_OVERRUNS_BEFORE_REFUSAL: u32 = 3;
+
+/// The time budgets of one capture pass.
+#[derive(Debug, Clone)]
+pub(super) struct CaptureBudget {
+    pub(super) repo: Duration,
+    pub(super) pass: Duration,
+    /// Test seam: simulated slow I/O for a named repository.
+    #[cfg(test)]
+    pub(super) delays: HashMap<String, Duration>,
+}
+
+impl CaptureBudget {
+    pub(super) fn new(repo: Duration, pass: Duration) -> Self {
+        Self {
+            repo,
+            pass,
+            #[cfg(test)]
+            delays: HashMap::new(),
+        }
+    }
+}
+
+impl From<Duration> for CaptureBudget {
+    fn from(repo: Duration) -> Self {
+        Self::new(repo, PASS_CAPTURE_BUDGET)
+    }
+}
+
+/// D3: a capture ran out of its budget. The whole snapshot is deferred and
+/// retried; no repository is refused and no `index --repo` remedy is named,
+/// because a re-index cannot cure contention. A repository that runs out of
+/// its own budget on [`CONSECUTIVE_OVERRUNS_BEFORE_REFUSAL`] passes in a row
+/// is refused instead (see [`contention_refusal_reason`]).
+#[derive(Debug)]
+pub(super) struct CaptureDeferred {
+    repo: String,
+    budget: Duration,
+    pass: bool,
+}
+
+impl std::fmt::Display for CaptureDeferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.pass {
+            write!(
+                f,
+                "deferred: contention: the manifest captures under the write gate exceeded \
+                 their {:?} pass budget at {}; the snapshot is retried and no repository is \
+                 refused",
+                self.budget, self.repo
+            )
+        } else {
+            write!(
+                f,
+                "deferred: contention: the manifest capture of {} exceeded its {:?} budget; \
+                 the snapshot is retried and no repository is refused",
+                self.repo, self.budget
+            )
+        }
+    }
+}
+
+impl std::error::Error for CaptureDeferred {}
+
+pub(super) fn is_contention_deferral(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<CaptureDeferred>())
+}
+
+/// D3: the reason recorded for a repository refused for persistent
+/// contention. Deterministic, so captures before and under the gate agree.
+pub(super) fn contention_refusal_reason(repo_budget: Duration) -> String {
+    format!(
+        "contention: the manifest capture exceeded its {repo_budget:?} budget on \
+         {CONSECUTIVE_OVERRUNS_BEFORE_REFUSAL} consecutive passes"
+    )
+}
+
+fn contention_failure(
+    repo: &nestweaver_schema::Repo,
+    repo_budget: Duration,
+) -> manifest::ManifestRepoFailure {
+    let mut failure =
+        manifest::ManifestRepoFailure::new(repo, contention_refusal_reason(repo_budget));
+    // A re-index cannot cure contention; the repository is probed again.
+    failure.remedy = "none needed: the repository is probed again automatically and \
+                      published once its capture fits the budget"
+        .to_string();
+    failure
+}
+
+fn overrun_streak(state: &DaemonState, repo: &str) -> u32 {
+    let overruns = state
+        .manifest_recovery
+        .capture_overruns
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    overruns.get(repo).copied().unwrap_or(0)
+}
+
+fn record_overrun(state: &DaemonState, repo: &str) -> u32 {
+    let mut overruns = state
+        .manifest_recovery
+        .capture_overruns
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let streak = overruns.entry(repo.to_string()).or_insert(0);
+    *streak = streak.saturating_add(1);
+    *streak
+}
+
+fn clear_overruns(state: &DaemonState, repo: &str) {
+    state
+        .manifest_recovery
+        .capture_overruns
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(repo);
+}
+
 pub(super) struct Snapshot {
     generation: u64,
     identity: nestweaver_store::PublicationIdentity,
-    deadline: Instant,
+    budget: CaptureBudget,
     inventory: String,
     debt: Option<Vec<u8>>,
     inputs: Vec<(String, ManifestInputs)>,
@@ -23,7 +158,20 @@ pub(super) struct Snapshot {
     pub(super) failures: Vec<manifest::ManifestRepoFailure>,
 }
 
-pub(super) fn capture(state: &DaemonState, deadline: Instant) -> anyhow::Result<Snapshot> {
+pub(super) fn capture(
+    state: &DaemonState,
+    budget: impl Into<CaptureBudget>,
+) -> anyhow::Result<Snapshot> {
+    capture_within(state, budget.into(), None)
+}
+
+/// One capture pass. `pass_deadline` bounds the whole pass (the captures
+/// under the write gate); each repository also has its own budget.
+fn capture_within(
+    state: &DaemonState,
+    budget: CaptureBudget,
+    pass_deadline: Option<Instant>,
+) -> anyhow::Result<Snapshot> {
     let generation = state.store.graph_generation();
     let identity = state
         .store
@@ -44,17 +192,60 @@ pub(super) fn capture(state: &DaemonState, deadline: Instant) -> anyhow::Result<
     let mut failures = Vec::new();
     let mut remaining = 32 * 1024 * 1024;
     for repo in &repos {
+        // D3: a repository that ran out of its own budget on enough passes in
+        // a row is refused without spending the gate on it again. The
+        // refused-repo probe re-tries it off the gate and clears the streak.
+        if overrun_streak(state, &repo.uid) >= CONSECUTIVE_OVERRUNS_BEFORE_REFUSAL {
+            failures.push(contention_failure(repo, budget.repo));
+            continue;
+        }
         // nw-705: each repository is captured on its own. One that is refused
         // (a policy recorded under other settings, a missing root, a
-        // malformed manifest, a budget overrun) is recorded by name and the
-        // rest are still rebuilt; it used to fail the capture for EVERY repo.
-        // A refused repo's partial reads do not spend the shared budget.
-        let mut budget = remaining;
-        match capture_repo(state, config.as_ref(), limits, repo, &mut budget, deadline) {
+        // malformed manifest) is recorded by name and the rest are still
+        // rebuilt; it used to fail the capture for EVERY repo. A refused
+        // repo's partial reads do not spend the shared budget.
+        let mut bytes = remaining;
+        let own_deadline = Instant::now() + budget.repo;
+        let deadline = pass_deadline.map_or(own_deadline, |pass| pass.min(own_deadline));
+        #[cfg(test)]
+        if let Some(delay) = budget.delays.get(&repo.uid) {
+            std::thread::sleep(*delay);
+        }
+        match capture_repo(state, config.as_ref(), limits, repo, &mut bytes, deadline) {
             Ok((policy, captured)) => {
-                remaining = budget;
+                clear_overruns(state, &repo.uid);
+                remaining = bytes;
                 inventory.push(serde_json::json!({ "repo": repo, "policy": policy }));
                 inputs.push((repo.uid.clone(), captured));
+            }
+            Err(error) if manifest::is_manifest_capture_deadline(&error) => {
+                // The pass budget ran out: no single repository is to blame.
+                if pass_deadline.is_some_and(|pass| Instant::now() >= pass && pass < own_deadline) {
+                    return Err(CaptureDeferred {
+                        repo: repo.uid.clone(),
+                        budget: budget.pass,
+                        pass: true,
+                    }
+                    .into());
+                }
+                let streak = record_overrun(state, &repo.uid);
+                if streak >= CONSECUTIVE_OVERRUNS_BEFORE_REFUSAL {
+                    let failure = contention_failure(repo, budget.repo);
+                    tracing::warn!(
+                        repo = %repo.uid,
+                        reason = %failure.reason,
+                        "manifest rebuild refused a persistently slow repository; the others \
+                         are published"
+                    );
+                    failures.push(failure);
+                    continue;
+                }
+                return Err(CaptureDeferred {
+                    repo: repo.uid.clone(),
+                    budget: budget.repo,
+                    pass: false,
+                }
+                .into());
             }
             Err(error) => {
                 let failure = manifest::ManifestRepoFailure::new(repo, format!("{error:#}"));
@@ -72,7 +263,7 @@ pub(super) fn capture(state: &DaemonState, deadline: Instant) -> anyhow::Result<
     Ok(Snapshot {
         generation,
         identity,
-        deadline,
+        budget,
         inventory: serde_json::to_string(&inventory)?,
         debt: manifest::manifest_debt_revision(&state.db_path)?,
         inputs,
@@ -161,7 +352,7 @@ fn capture_repo(
         repo.uid
     );
     let captured = manifest::capture_manifest_inputs(reader.as_ref(), remaining, deadline)
-        .map_err(|e| anyhow::anyhow!("{}: {e:#}", repo.uid))?;
+        .map_err(|e| e.context(repo.uid.clone()))?;
     Ok((policy, captured))
 }
 
@@ -179,7 +370,9 @@ pub(super) fn reconcile(state: &DaemonState, before: Snapshot) -> anyhow::Result
             "refusing to replace a non-recoverable artifact: {problem}"
         );
     }
-    let after = capture(state, before.deadline)?;
+    // D3: one budget for every capture made while the gate is held.
+    let pass_deadline = Instant::now() + before.budget.pass;
+    let after = capture_within(state, before.budget.clone(), Some(pass_deadline))?;
     anyhow::ensure!(
         before.generation == after.generation
             && before.identity == after.identity
@@ -215,7 +408,7 @@ pub(super) fn reconcile(state: &DaemonState, before: Snapshot) -> anyhow::Result
     )?;
     // Fail closed if an external editor changed bytes during the atomic save.
     // Leave durable debt; never let the new envelope hide this pending work.
-    let verified = capture(state, after.deadline)?;
+    let verified = capture_within(state, after.budget.clone(), Some(pass_deadline))?;
     if after.identity != verified.identity
         || after.generation != verified.generation
         || after.inventory != verified.inventory
@@ -267,12 +460,45 @@ pub(super) fn refused_repos_changed(
             return true;
         };
         let mut budget = 32 * 1024 * 1024;
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + REPO_CAPTURE_BUDGET;
         match capture_repo(state, config.as_ref(), limits, repo, &mut budget, deadline) {
-            Ok(_) => true,
+            Ok(_) => {
+                // D3: a repository refused for contention is captured again
+                // by the full rebuild this triggers.
+                clear_overruns(state, &repo.uid);
+                true
+            }
+            // D3: still too slow; a contention refusal stands.
+            Err(error)
+                if manifest::is_manifest_capture_deadline(&error)
+                    && failure.reason.starts_with("contention: ") =>
+            {
+                false
+            }
             Err(error) => format!("{error:#}") != failure.reason,
         }
     })
+}
+
+/// D3: report a capture deferred by contention as `deferred`, with the
+/// contention message, rather than as refused repositories.
+fn publish_contention(
+    runtime: &manifest::ManifestRecoveryRuntime,
+    state: &DaemonState,
+    attempts: u32,
+    error: &anyhow::Error,
+) {
+    tracing::info!(error = %format_args!("{error:#}"), "manifest reconciliation deferred");
+    runtime.publish(
+        "deferred",
+        attempts,
+        Some(30),
+        Some(ManifestUnavailable::new(
+            ManifestUnavailableReason::PendingSourceChange,
+            state.store.graph_generation(),
+            format!("{error:#}"),
+        )),
+    );
 }
 
 /// Three immediate attempts, then a cooldown that can recover from repaired
@@ -409,12 +635,15 @@ pub(super) async fn run(state: Arc<DaemonState>) {
             continue;
         }
         let capture_state = Arc::clone(&state);
-        let snapshot = tokio::task::spawn_blocking(move || {
-            capture(&capture_state, Instant::now() + Duration::from_secs(60))
-        })
-        .await;
+        let snapshot =
+            tokio::task::spawn_blocking(move || capture(&capture_state, REPO_CAPTURE_BUDGET)).await;
         let snapshot = match snapshot {
             Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(error)) if is_contention_deferral(&error) => {
+                publish_contention(&runtime, &state, retry.attempts, &error);
+                delay = 30;
+                continue;
+            }
             other => {
                 let message = match other {
                     Ok(Err(e)) => format!("{e:#}"),
@@ -491,6 +720,13 @@ pub(super) async fn run(state: Arc<DaemonState>) {
                 retry = RetryBudget::default();
                 last_key.clear();
                 delay = 2;
+            }
+            Ok(Err(error)) if is_contention_deferral(&error) => {
+                // D3: contention is not a failed attempt. It does not spend
+                // the retry budget or end in "blocked".
+                retry = RetryBudget::default();
+                publish_contention(&runtime, &state, 0, &error);
+                delay = 30;
             }
             other => {
                 let message = match other {

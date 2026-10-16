@@ -464,6 +464,48 @@ impl Default for BlastRadiusOptions {
     }
 }
 
+/// 12.1.1 (B4): the repo a `pr-impact` run reviews, so its repo-relative
+/// changed files resolve in that repo alone and not in every indexed repo
+/// that has a file at the same relative path.
+///
+/// An explicit `selector` (`--repo`: a name or UID) wins and must resolve.
+/// Otherwise `working_root` (the git root of the working directory) names
+/// the indexed repo whose recorded checkout is that directory. `Ok(None)`
+/// when neither names exactly one repo: the run then keeps matching every
+/// repo, as before.
+pub fn pr_impact_target_repo(
+    store: &GraphStore,
+    selector: Option<&str>,
+    working_root: Option<&std::path::Path>,
+) -> anyhow::Result<Option<String>> {
+    let repos = store
+        .list_repos(None)
+        .map_err(|e| anyhow::anyhow!("list_repos: {e}"))?;
+    if let Some(selector) = selector.filter(|s| !s.trim().is_empty()) {
+        // Typed like every other `--repo` filter, so each route keeps the
+        // class: not found (2), ambiguous (3), malformed (64).
+        return crate::resolve_repo_selector(&repos, selector)
+            .map(|repo| Some(repo.uid.clone()))
+            .map_err(|error| {
+                anyhow::Error::new(crate::node_scope::RepoFilterUnresolved::new(
+                    selector, &error,
+                ))
+            });
+    }
+    let Some(root) = working_root.and_then(|root| std::fs::canonicalize(root).ok()) else {
+        return Ok(None);
+    };
+    let mut owners = repos.iter().filter(|repo| {
+        repo.local_root()
+            .and_then(|path| std::fs::canonicalize(path).ok())
+            .is_some_and(|path| path == root)
+    });
+    match (owners.next(), owners.next()) {
+        (Some(repo), None) => Ok(Some(repo.uid.clone())),
+        _ => Ok(None),
+    }
+}
+
 /// Analyze the blast radius of a set of changed files.
 ///
 /// 1. Maps changed files to their symbols in the graph.

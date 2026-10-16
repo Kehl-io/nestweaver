@@ -3549,7 +3549,7 @@ impl GraphStore {
             return match self.rollback_transaction(&conn) {
                 Ok(()) => Err(error),
                 Err(rollback) => Err(StoreError::Query(format!(
-                    "{error}; atomic incremental vault refresh rollback failed: {rollback}"
+                    "{error}; incremental vault refresh rollback failed: {rollback}"
                 ))),
             };
         }

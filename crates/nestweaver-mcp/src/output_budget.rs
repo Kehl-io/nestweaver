@@ -5,7 +5,11 @@ use std::io::{self, Write};
 
 pub const LOGICAL_BYTES: usize = 20_000;
 pub const RESULT_BYTES: usize = 40_000;
-pub const CATALOGUE_BYTES: usize = 32_000;
+/// The whole `tools/list` catalogue, every tool's wire description included.
+/// 12.1.1 raised it from 32,000 so each of the 43 tools can carry a real
+/// description (what it does, its key arguments, and the lookup, owner, miss
+/// and cut behaviour that applies): agents choose tools from these alone.
+pub const CATALOGUE_BYTES: usize = 40_000;
 
 #[derive(Default)]
 struct Size(usize);
@@ -414,6 +418,21 @@ fn disclose(payload: &mut Value, omitted: &BTreeMap<String, Value>, prior_comple
             "cuts":omitted,"cuts_complete":prior_complete && omitted.len() < 16,
             "retry":"Narrow the query, reduce limit, or request a specific UID/section. Output cuts do not describe unvisited graph work."}));
     }
+}
+/// 12.1.1 (M3): disclose rows a tool dropped itself, before the finalizer
+/// ran, to keep its payload inside [`LOGICAL_BYTES`]. Same shape as a
+/// finalizer cut, so `finalize` merges any later cut into it, and a caller
+/// can tell a budget cut from its own `limit`.
+pub fn disclose_tool_cut(payload: &mut Value, array_key: &str, items_omitted: usize) {
+    if items_omitted == 0 {
+        return;
+    }
+    let mut omitted = BTreeMap::new();
+    omitted.insert(
+        format!("/{array_key}"),
+        json!({"items_omitted":items_omitted,"count_kind":"exact_completed_array","paired_array":null}),
+    );
+    disclose(payload, &omitted, true);
 }
 fn synchronize(result: &mut Value) {
     if let Some(payload) = result.get("structuredContent") {

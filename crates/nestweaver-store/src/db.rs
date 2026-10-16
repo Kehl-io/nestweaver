@@ -482,6 +482,17 @@ fn statement_returns_rows(query: &str) -> bool {
 
 // Conservative control override: the native analyzer reports these as reads.
 // Matches in comments/strings/identifiers only choose stronger exclusion.
+/// `BEGIN TRANSACTION`, but not `BEGIN TRANSACTION READ ONLY`.
+fn statement_begins_write_transaction(query: &str) -> bool {
+    let mut words = query
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|word| !word.is_empty());
+    words
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("BEGIN"))
+        && !words.any(|word| word.eq_ignore_ascii_case("READ"))
+}
+
 fn statement_controls_transaction(query: &str) -> bool {
     query
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
@@ -622,6 +633,11 @@ impl<'a> StoreConnection<'a> {
             statement_has_checkpoint(query),
             "query",
         )?;
+        if let Some(gate) = self.native_admission
+            && statement_begins_write_transaction(query)
+        {
+            gate.observe_write("BEGIN TRANSACTION");
+        }
         let result = self.conn.query(query);
         self.settle(result, statement_returns_rows(query))
     }
@@ -655,6 +671,13 @@ impl<'a> StoreConnection<'a> {
         };
         let _admission =
             self.admit_native(mode, !statement.exclusive, statement.checkpoint, "execute")?;
+        // `exclusive` is `!is_read_only()` (or transaction control), already
+        // computed at prepare: no extra native call on the hot path.
+        if let Some(gate) = self.native_admission
+            && statement.exclusive
+        {
+            gate.observe_write("write statement");
+        }
         let result = self.conn.execute(&mut statement.inner, params);
         self.settle(result, statement.returns_rows)
     }
@@ -883,6 +906,10 @@ pub struct GraphStore {
     /// PPR's personalization vector blends a small fraction of these scores
     /// to boost nodes the user has frequently accessed.
     pub(crate) interaction_cache: Mutex<Option<HashMap<String, f64>>>,
+    /// D1: how many times a ranked read found the PageRank cache empty and
+    /// recomputed it. Exposed for tests through
+    /// [`GraphStore::lazy_pagerank_computations`].
+    pub(crate) lazy_pagerank_computes: std::sync::atomic::AtomicU64,
     /// Feature F12: optional git-activity recency scores keyed by repo-relative
     /// file path (`path -> score ∈ [0, 1]`). When loaded, `pagerank_score` is
     /// multiplied at *read* time by a clamped recency factor so dormant code is
@@ -2057,6 +2084,7 @@ impl GraphStore {
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
+            lazy_pagerank_computes: std::sync::atomic::AtomicU64::new(0),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
@@ -2153,6 +2181,7 @@ impl GraphStore {
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
+            lazy_pagerank_computes: std::sync::atomic::AtomicU64::new(0),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
@@ -2234,6 +2263,7 @@ impl GraphStore {
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
+            lazy_pagerank_computes: std::sync::atomic::AtomicU64::new(0),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
@@ -2451,6 +2481,7 @@ impl GraphStore {
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
+            lazy_pagerank_computes: std::sync::atomic::AtomicU64::new(0),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
@@ -2532,6 +2563,7 @@ impl GraphStore {
             index_publication_generation_base: Mutex::new(None),
             index_publication_lease: IndexPublicationLeaseCoordinator::default(),
             interaction_cache: Mutex::new(None),
+            lazy_pagerank_computes: std::sync::atomic::AtomicU64::new(0),
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: None,
@@ -2651,6 +2683,87 @@ impl GraphStore {
             .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
+    /// Whether the live PageRank cache holds CODE-ONLY scores: Symbol nodes
+    /// and code edges, whatever damping and iterations produced them. The
+    /// caller must hold `pagerank_compute_lock`.
+    fn cached_pagerank_is_code_only_locked(&self) -> bool {
+        if self
+            .pagerank_cache
+            .lock()
+            .map(|cache| cache.is_none())
+            .unwrap_or(true)
+        {
+            return false;
+        }
+        let declared = self
+            .pagerank_declared_parameters
+            .lock()
+            .ok()
+            .and_then(|params| params.clone());
+        let Some(declared) = declared else {
+            return false;
+        };
+        let code_only = crate::ranking::pagerank_declared_parameters(
+            crate::ranking::PAGERANK_DAMPING,
+            crate::ranking::PAGERANK_ITERATIONS,
+            &crate::ranking::GraphScope::code_only(),
+        );
+        declared.get("node_queries") == code_only.get("node_queries")
+            && declared.get("edge_queries") == code_only.get("edge_queries")
+    }
+
+    /// [`Self::invalidate_ranking_caches_locked`] for a publication that
+    /// changes no Symbol node and no code edge (D1: note->code links, project
+    /// note memberships). Code-only PageRank cannot see such a change, so a
+    /// code-only cache survives it; every other ranking cache is discarded.
+    /// Returns whether the PageRank cache was kept.
+    fn invalidate_ranking_caches_for_non_code_change_locked(&self) -> bool {
+        if !self.cached_pagerank_is_code_only_locked() {
+            self.invalidate_ranking_caches_locked();
+            return false;
+        }
+        *self
+            .ppr_graph_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        self.ppr_result_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *self
+            .symbol_name_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .impact_snapshot_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        true
+    }
+
+    /// [`Self::invalidate_pagerank`] for a committed change to no Symbol node
+    /// and no code edge. Returns whether a code-only PageRank cache was kept.
+    pub fn invalidate_ranking_for_non_code_change(&self) -> bool {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.invalidate_ranking_caches_for_non_code_change_locked()
+    }
+
+    /// [`Self::with_index_publication_rank_barrier`] for a publication that
+    /// changes no Symbol node and no code edge: a code-only PageRank cache
+    /// survives it (D1).
+    pub fn with_non_code_publication_rank_barrier<T>(&self, operation: impl FnOnce() -> T) -> T {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let result = operation();
+        self.invalidate_ranking_caches_for_non_code_change_locked();
+        result
+    }
+
     /// Run a publication marker transition while excluding PageRank readers,
     /// computations, and generation-keyed cache publication, then discard
     /// caches before releasing them. Establishment and retirement both use
@@ -2665,9 +2778,18 @@ impl GraphStore {
         result
     }
 
+    /// Test hook (D2): observe every write a connection on this database
+    /// starts — an explicit `BEGIN TRANSACTION` or a non-read-only prepared
+    /// statement — so a test can prove none happens outside its write gate.
+    /// Raw auto-commit writes sent through `query()` are not classified.
+    #[doc(hidden)]
+    pub fn set_write_observer(&self, observer: Option<crate::WriteObserver>) {
+        self.db.native_admission.set_write_observer(observer);
+    }
+
     /// Load pre-computed interaction memory scores into the in-memory cache.
-    /// When present, PPR's personalization vector blends a small fraction of
-    /// these scores to boost nodes the user has frequently accessed.
+    /// When present, PPR slightly boosts nodes the walk already reached in
+    /// proportion to these scores (never nodes it did not reach).
     pub fn load_interaction_cache(&self, scores: HashMap<String, f64>) {
         *self
             .interaction_cache
@@ -4627,6 +4749,12 @@ impl GraphStore {
             return Err(StoreError::Query(
                 "refusing to record an empty data instance id".to_string(),
             ));
+        }
+        // D2: read first. The id is written once per database, so nearly
+        // every call finds it, and an unconditional write transaction here
+        // collided with whichever gated writer held the single write slot.
+        if let Some(existing) = self.data_instance_id()? {
+            return Ok(existing);
         }
         let conn = self.conn()?;
         conn.query("BEGIN TRANSACTION")
@@ -8223,6 +8351,54 @@ mod data_instance_identity_tests {
         // And a database with no recorded identity cannot object to anything.
         let fresh = GraphStore::open_or_create(&dir.path().join("fresh.lbug")).unwrap();
         fresh.assert_data_instance_id("anything").unwrap();
+    }
+
+    /// D2: `ensure_data_instance_id` opened a write transaction on every
+    /// call, even when the id was already recorded. LadybugDB allows one write
+    /// transaction at a time, so that idle no-op collided with whichever gated
+    /// writer held one (the vault watcher, on 10-15) and killed it.
+    #[test]
+    fn an_already_recorded_instance_opens_no_write_transaction() {
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let writes = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let sink = Arc::clone(&writes);
+        store.set_write_observer(Some(Arc::new(move |what| sink.lock().unwrap().push(what))));
+
+        store.ensure_data_instance_id("2051a9da").unwrap();
+        assert!(
+            !writes.lock().unwrap().is_empty(),
+            "the observer must see the first, real write"
+        );
+        writes.lock().unwrap().clear();
+
+        for proposed in ["2051a9da", "default"] {
+            assert_eq!(store.ensure_data_instance_id(proposed).unwrap(), "2051a9da");
+        }
+        assert_eq!(
+            *writes.lock().unwrap(),
+            Vec::<&str>::new(),
+            "a recorded id must be answered without a write transaction"
+        );
+        store.set_write_observer(None);
+    }
+
+    #[test]
+    fn begin_write_classification_ignores_read_only_transactions() {
+        assert!(super::statement_begins_write_transaction(
+            "BEGIN TRANSACTION"
+        ));
+        assert!(super::statement_begins_write_transaction(
+            " begin transaction;"
+        ));
+        assert!(!super::statement_begins_write_transaction(
+            "BEGIN TRANSACTION READ ONLY"
+        ));
+        assert!(!super::statement_begins_write_transaction("COMMIT"));
+        assert!(!super::statement_begins_write_transaction(
+            "MATCH (n) RETURN n.begin"
+        ));
     }
 
     /// An empty instance is not an identity. Recording one would make every

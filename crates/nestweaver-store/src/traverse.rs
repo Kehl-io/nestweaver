@@ -116,6 +116,58 @@ pub(crate) struct SymbolNameCached {
     pub symbols: Vec<(String, nestweaver_schema::Symbol)>,
 }
 
+thread_local! {
+    /// How many times this thread fetched the symbol name table (cache hit or
+    /// full scan). Test instrumentation for I4: a caller that must touch the
+    /// table once per call can assert it.
+    static SYMBOL_TABLE_FETCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// I4: how many symbol-table fetches this thread has made. During a dirty
+/// publication every fetch is a full table scan (the cache is bypassed), so a
+/// caller that fans one lookup out into several stages must fetch once.
+#[doc(hidden)]
+pub fn symbol_table_fetches_on_this_thread() -> u64 {
+    SYMBOL_TABLE_FETCHES.with(std::cell::Cell::get)
+}
+
+/// I4: one fetched symbol name table, shared by every stage of a lookup
+/// (substring search, a file's members, edit distance) so a miss costs one
+/// fetch, and one full scan during a publication, not three.
+#[derive(Clone)]
+pub struct SymbolNameTable(std::sync::Arc<SymbolNameCached>);
+
+impl SymbolNameTable {
+    /// Visit every symbol with its lowercased name, keeping what `visit`
+    /// returns.
+    pub fn scan<T>(
+        &self,
+        mut visit: impl FnMut(&str, &nestweaver_schema::Symbol) -> Option<T>,
+    ) -> Vec<T> {
+        self.0
+            .symbols
+            .iter()
+            .filter_map(|(lower, symbol)| visit(lower, symbol))
+            .collect()
+    }
+
+    /// [`GraphStore::search_symbols_by_name_page`] over this table.
+    pub fn search_page(
+        &self,
+        query: &str,
+        limit: usize,
+        seed_resolution: &SeedResolutionConfig,
+    ) -> Result<SymbolSearchPage, StoreError> {
+        rank_symbol_name_page(
+            &self.0,
+            query,
+            limit,
+            seed_resolution,
+            SYMBOL_SEARCH_COUNT_CAP,
+        )
+    }
+}
+
 /// Minimum impact score for a node to be included in traversal results.
 /// Edges below this threshold are pruned during BFS.
 ///
@@ -1408,6 +1460,67 @@ impl GraphStore {
         )
     }
 
+    /// The full symbol table with lowercased names, from the per-generation
+    /// `symbol_name_cache` (loaded and published on a miss).
+    fn symbol_name_entry(
+        &self,
+        after_db_scan: impl FnOnce(),
+        inside_publication_barrier: impl FnOnce(),
+    ) -> Result<std::sync::Arc<SymbolNameCached>, StoreError> {
+        // --- Step 1: coherently snapshot publication state + cache ----------
+        // On a clean hit we clone the Arc (cheap ref-count bump). Dirty
+        // publications always bypass hits. The DB query itself remains outside
+        // the publication barrier so an index writer is never blocked by a
+        // full-table scan.
+        SYMBOL_TABLE_FETCHES.with(|fetches| fetches.set(fetches.get() + 1));
+        let (query_generation, cached_symbols) = self.begin_symbol_name_cache_query();
+
+        // --- Step 2: on cache miss, query the DB then populate the cache ----
+        if let Some(arc) = cached_symbols {
+            return Ok(arc);
+        }
+        // LadybugDB's CONTAINS is case-sensitive and has no toLower().
+        // Load all symbols and filter in Rust for case-insensitive matching.
+        let conn = self.conn()?;
+        let q = format!("MATCH (s:Symbol) RETURN {}", crate::read::SYMBOL_COLUMNS);
+        let result = conn
+            .query(&q)
+            .map_err(|e| StoreError::Query(format!("query: {e}")))?;
+
+        let mut all: Vec<(String, nestweaver_schema::Symbol)> = Vec::new();
+        for row in result {
+            if let Ok(sym) = crate::read::row_to_symbol(&row) {
+                let lower = sym.name.to_lowercase();
+                all.push((lower, sym));
+            }
+        }
+
+        after_db_scan();
+        Ok(self.finalize_symbol_name_cache_query_with_hook(
+            query_generation,
+            all,
+            inside_publication_barrier,
+        ))
+    }
+
+    /// 12.1.1: visit every symbol (with its lowercased name) in the cached
+    /// symbol table the name search uses, keeping what `visit` returns. For
+    /// lookups the substring search cannot express, such as `did_you_mean`'s
+    /// edit-distance and same-file candidates; no extra table scan when the
+    /// name search already warmed the cache this generation.
+    pub fn scan_symbol_names<T>(
+        &self,
+        visit: impl FnMut(&str, &nestweaver_schema::Symbol) -> Option<T>,
+    ) -> Result<Vec<T>, StoreError> {
+        Ok(self.symbol_name_table()?.scan(visit))
+    }
+
+    /// I4: fetch the symbol name table once, for a caller with several
+    /// lookups to make over it.
+    pub fn symbol_name_table(&self) -> Result<SymbolNameTable, StoreError> {
+        Ok(SymbolNameTable(self.symbol_name_entry(|| {}, || {})?))
+    }
+
     fn search_symbols_by_name_page_impl(
         &self,
         query: &str,
@@ -1423,107 +1536,91 @@ impl GraphStore {
                 max: crate::tantivy_index::SEARCH_PRESENTATION_LIMIT_MAX,
             });
         }
-        let needle = query.to_lowercase();
-        // --- Step 1: coherently snapshot publication state + cache ----------
-        // On a clean hit we clone the Arc (cheap ref-count bump). Dirty
-        // publications always bypass hits. The DB query itself remains outside
-        // the publication barrier so an index writer is never blocked by a
-        // full-table scan.
-        let (query_generation, cached_symbols) = self.begin_symbol_name_cache_query();
+        let entry = self.symbol_name_entry(after_db_scan, inside_publication_barrier)?;
+        rank_symbol_name_page(&entry, query, limit, seed_resolution, count_cap)
+    }
+}
 
-        // --- Step 2: on cache miss, query the DB then populate the cache ----
-        let entry: std::sync::Arc<SymbolNameCached> = if let Some(arc) = cached_symbols {
-            arc
-        } else {
-            // LadybugDB's CONTAINS is case-sensitive and has no toLower().
-            // Load all symbols and filter in Rust for case-insensitive matching.
-            let conn = self.conn()?;
-            let q = format!("MATCH (s:Symbol) RETURN {}", crate::read::SYMBOL_COLUMNS);
-            let result = conn
-                .query(&q)
-                .map_err(|e| StoreError::Query(format!("query: {e}")))?;
+/// Rank one page of substring matches for `query` over a fetched table.
+fn rank_symbol_name_page(
+    entry: &SymbolNameCached,
+    query: &str,
+    limit: usize,
+    seed_resolution: &SeedResolutionConfig,
+    count_cap: usize,
+) -> Result<SymbolSearchPage, StoreError> {
+    if limit > crate::tantivy_index::SEARCH_PRESENTATION_LIMIT_MAX {
+        return Err(StoreError::PresentationLimitExceeded {
+            limit,
+            max: crate::tantivy_index::SEARCH_PRESENTATION_LIMIT_MAX,
+        });
+    }
+    let needle = query.to_lowercase();
 
-            let mut all: Vec<(String, nestweaver_schema::Symbol)> = Vec::new();
-            for row in result {
-                if let Ok(sym) = crate::read::row_to_symbol(&row) {
-                    let lower = sym.name.to_lowercase();
-                    all.push((lower, sym));
-                }
-            }
-
-            after_db_scan();
-            self.finalize_symbol_name_cache_query_with_hook(
-                query_generation,
-                all,
-                inside_publication_barrier,
-            )
-        };
-
-        // --- Step 3: filter and rank the in-memory list ----------------------
-        // Collect all substring matches, score by name quality × path factor,
-        // then take the top `limit` by descending adjusted score with
-        // kind-priority + file-path tiebreaks. This prevents test/playwright
-        // files from dominating when a PascalCase name also appears in
-        // production code, and gives a deterministic order across calls.
-        let mut candidates = BinaryHeap::new();
-        let mut counted = 0usize;
-        let mut count_saturated = false;
-        for (ordinal, (lower, sym)) in entry.symbols.iter().enumerate() {
-            if !lower.contains(&needle) {
-                continue;
-            }
-            // nw-113: one `<module>` per file would flood substring searches
-            // for "module"; it is listed only when asked for by its exact name.
-            if sym.is_module_owner() && *lower != needle {
-                continue;
-            }
-            if counted < count_cap {
-                counted += 1;
-                if counted == count_cap {
-                    count_saturated = true;
-                }
-            } else {
+    // --- Step 3: filter and rank the in-memory list ----------------------
+    // Collect all substring matches, score by name quality × path factor,
+    // then take the top `limit` by descending adjusted score with
+    // kind-priority + file-path tiebreaks. This prevents test/playwright
+    // files from dominating when a PascalCase name also appears in
+    // production code, and gives a deterministic order across calls.
+    let mut candidates = BinaryHeap::new();
+    let mut counted = 0usize;
+    let mut count_saturated = false;
+    for (ordinal, (lower, sym)) in entry.symbols.iter().enumerate() {
+        if !lower.contains(&needle) {
+            continue;
+        }
+        // nw-113: one `<module>` per file would flood substring searches
+        // for "module"; it is listed only when asked for by its exact name.
+        if sym.is_module_owner() && *lower != needle {
+            continue;
+        }
+        if counted < count_cap {
+            counted += 1;
+            if counted == count_cap {
                 count_saturated = true;
             }
-            let base_score = if *lower == needle {
-                4.0_f64 // exact
-            } else if lower.starts_with(&needle) {
-                2.0_f64 // prefix
-            } else {
-                1.0_f64 // contains
-            };
-            let path_factor = compute_path_factor(&sym.file_path, &seed_resolution.path_deboost);
-            let adjusted = base_score * path_factor;
-            if limit == 0 {
-                continue;
-            }
-            let ranked = RankedSymbol {
-                adjusted_score: adjusted,
-                kind_rank: kind_rank(sym.kind, &seed_resolution.kind_priority),
-                file_path: &sym.file_path,
-                ordinal,
-                symbol: sym,
-            };
-            if candidates.len() < limit {
-                candidates.push(ranked);
-            } else if candidates.peek().is_some_and(|worst| ranked < *worst) {
-                candidates.pop();
-                candidates.push(ranked);
-            }
-        }
-        let mut candidates = candidates.into_vec();
-        candidates.sort();
-        let symbols = candidates
-            .into_iter()
-            .map(|candidate| candidate.symbol.clone())
-            .collect();
-        let total = if count_saturated {
-            SearchTotal::lower_bound(counted)
         } else {
-            SearchTotal::exact(counted)
+            count_saturated = true;
+        }
+        let base_score = if *lower == needle {
+            4.0_f64 // exact
+        } else if lower.starts_with(&needle) {
+            2.0_f64 // prefix
+        } else {
+            1.0_f64 // contains
         };
-        Ok(SymbolSearchPage { symbols, total })
+        let path_factor = compute_path_factor(&sym.file_path, &seed_resolution.path_deboost);
+        let adjusted = base_score * path_factor;
+        if limit == 0 {
+            continue;
+        }
+        let ranked = RankedSymbol {
+            adjusted_score: adjusted,
+            kind_rank: kind_rank(sym.kind, &seed_resolution.kind_priority),
+            file_path: &sym.file_path,
+            ordinal,
+            symbol: sym,
+        };
+        if candidates.len() < limit {
+            candidates.push(ranked);
+        } else if candidates.peek().is_some_and(|worst| ranked < *worst) {
+            candidates.pop();
+            candidates.push(ranked);
+        }
     }
+    let mut candidates = candidates.into_vec();
+    candidates.sort();
+    let symbols = candidates
+        .into_iter()
+        .map(|candidate| candidate.symbol.clone())
+        .collect();
+    let total = if count_saturated {
+        SearchTotal::lower_bound(counted)
+    } else {
+        SearchTotal::exact(counted)
+    };
+    Ok(SymbolSearchPage { symbols, total })
 }
 
 #[cfg(test)]

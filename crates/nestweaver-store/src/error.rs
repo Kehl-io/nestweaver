@@ -501,6 +501,49 @@ pub fn live_writer_holds_write_lease(db_path: &Path) -> bool {
     candidates.iter().any(|path| write_lease_is_held(path))
 }
 
+/// A condition that clears on its own and must never be reported as storage
+/// corruption (V2).
+///
+/// QA on 12.1.0 saw `backlinks Home` fail once, during a watcher batch, with
+/// "delete this database ... deterministic, not transient", and the immediate
+/// retry succeed. Every condition below is a moment in another writer's life,
+/// not a property of the file, so none of them may reach a remedy that tells
+/// the operator to destroy data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransientCondition {
+    /// LadybugDB allows one write transaction; another connection held it.
+    WriteTransactionCollision,
+    /// An index or watcher publication was in flight, or was left dirty for
+    /// the next publisher to recover.
+    PublicationInProgress,
+    /// The daemon was busy, saturated or slow to answer.
+    DaemonBusy,
+}
+
+/// Recognise a [`TransientCondition`] in an error message, whatever wraps it.
+pub fn classify_transient_condition(message: &str) -> Option<TransientCondition> {
+    let lower = message.to_lowercase();
+    if lower.contains("cannot start a new write transaction")
+        || lower.contains("only one write transaction at a time")
+    {
+        return Some(TransientCondition::WriteTransactionCollision);
+    }
+    if lower.contains("index publication transient")
+        || lower.contains("index publication is in flight")
+        || lower.contains("dirty index publication")
+        || lower.contains("overwrite a dirty publication")
+    {
+        return Some(TransientCondition::PublicationInProgress);
+    }
+    if lower.contains("daemon connected but unresponsive")
+        || lower.contains("health check timed out")
+        || lower.contains("may be wedged or saturated")
+    {
+        return Some(TransientCondition::DaemonBusy);
+    }
+    None
+}
+
 /// Classify an engine message into a [`CorruptionKind`], or `None` when it
 /// describes an ordinary failure.
 ///
@@ -544,6 +587,17 @@ pub fn classify_engine_corruption(message: &str) -> Option<CorruptionKind> {
     // this arm is reached from both directions.
     if lower.starts_with("basic_string") || lower.contains("database error: basic_string") {
         return Some(CorruptionKind::EngineAssertion);
+    }
+    // V2: a write-transaction collision, a publication in flight or a busy
+    // daemon is a moment in another writer's life, never a property of the
+    // file. It suppresses only the HEURISTIC arms below (the WAL and
+    // "may be corrupted" sentences), which such a moment can produce. It never
+    // suppresses the definite verdicts above: a file shorter than its own
+    // catalog or an engine assertion is not made healthy by a transient
+    // phrase elsewhere in the chain (a timed-out health check, a refusal to
+    // overwrite a dirty publication that wraps the real cause).
+    if classify_transient_condition(message).is_some() {
+        return None;
     }
     // The engine has at least TWO phrasings for an unreadable log and they do
     // not share a word order:
@@ -1014,6 +1068,106 @@ impl From<lbug::Error> for StoreError {
 
 #[cfg(test)]
 mod corruption_classification_tests {
+
+    /// V2: each transient class, including when the same chain also carries
+    /// an engine sentence the corruption classifier would otherwise act on.
+    #[test]
+    fn transient_conditions_are_never_classified_as_corruption() {
+        for (message, expected) in [
+            (
+                "atomic incremental vault refresh: query error: begin transaction: Query \
+                 execution failed: Cannot start a new write transaction in the system. \
+                 Only one write transaction at a time is allowed in the system.",
+                TransientCondition::WriteTransactionCollision,
+            ),
+            (
+                "index publication TRANSIENT: an index publication is in flight (marker \
+                 age 3s) and did not finish within the 3000ms wait",
+                TransientCondition::PublicationInProgress,
+            ),
+            (
+                "refusing to overwrite a dirty publication (code link reconciliation)",
+                TransientCondition::PublicationInProgress,
+            ),
+            (
+                "health check timed out — daemon connected but unresponsive",
+                TransientCondition::DaemonBusy,
+            ),
+            (
+                "daemon did not answer backlinks within 300s; it may be wedged or saturated",
+                TransientCondition::DaemonBusy,
+            ),
+        ] {
+            assert_eq!(
+                classify_transient_condition(message),
+                Some(expected),
+                "{message}"
+            );
+            assert_eq!(classify_engine_corruption(message), None, "{message}");
+            let mixed = format!("{message}: The database file may be corrupted.");
+            assert_eq!(
+                classify_engine_corruption(&mixed),
+                None,
+                "a transient condition must win over a corruption phrase: {mixed}"
+            );
+        }
+        // The counterweight: a bare engine corruption sentence is not transient.
+        assert_eq!(
+            classify_transient_condition("The database file may be corrupted."),
+            None
+        );
+        assert_eq!(
+            classify_engine_corruption("The database file may be corrupted."),
+            Some(CorruptionKind::Unclassified)
+        );
+    }
+
+    /// V2 review: a transient phrase ANYWHERE in the chain used to return
+    /// "not corruption", so a timed-out health check that relayed a
+    /// truncation, or a refusal to overwrite a dirty publication that wrapped
+    /// an engine assertion, was never called corrupt. The transient check
+    /// suppresses only the heuristic arms; the definite verdicts stand.
+    #[test]
+    fn a_transient_phrase_never_hides_a_definite_corruption_verdict() {
+        const TRUNCATED: &str = "Cannot read checkpoint: catalog page range starts at 3567 \
+                                 and spans 5 pages, outside the database file with 1696 pages";
+        const ASSERTION: &str = "Assertion failed in file \"<crate>/column.cpp\" on line 289";
+        for (message, expected) in [
+            (
+                format!("health check timed out — daemon connected but unresponsive: {TRUNCATED}"),
+                CorruptionKind::FileTruncated,
+            ),
+            (
+                format!("refusing to overwrite a dirty publication: {TRUNCATED}"),
+                CorruptionKind::FileTruncated,
+            ),
+            (
+                format!("refusing to overwrite a dirty publication: {ASSERTION}"),
+                CorruptionKind::EngineAssertion,
+            ),
+            (
+                "refusing to overwrite a dirty publication: database error: \
+                 basic_string::_M_create"
+                    .to_string(),
+                CorruptionKind::EngineAssertion,
+            ),
+            (
+                format!("Cannot start a new write transaction in the system: {ASSERTION}"),
+                CorruptionKind::EngineAssertion,
+            ),
+        ] {
+            assert!(
+                classify_transient_condition(&message).is_some(),
+                "{message}"
+            );
+            assert_eq!(
+                classify_engine_corruption(&message),
+                Some(expected),
+                "{message}"
+            );
+        }
+    }
+
     use super::*;
 
     /// nw-346. The engine's five known corruption phrasings must each classify

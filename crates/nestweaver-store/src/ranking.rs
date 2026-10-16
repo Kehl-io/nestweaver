@@ -1884,11 +1884,42 @@ impl GraphStore {
             return Ok(());
         }
         tracing::info!("PageRank cache empty — computing lazily (single-flight)");
-        if let Err(e) = self.compute_pagerank_warm_locked(0.85, 20, &GraphScope::code_only(), None)
+        self.lazy_pagerank_computes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // D1: a failure is the caller's to see. Swallowing it returned `Ok`
+        // over an empty cache, so every ranked read silently ranked nothing.
+        self.compute_pagerank_warm_locked(
+            PAGERANK_DAMPING,
+            PAGERANK_ITERATIONS,
+            &GraphScope::code_only(),
+            None,
+        )
+        .inspect_err(|error| tracing::warn!("lazy PageRank computation failed: {error}"))?;
+        // D1: persist what was computed, so a restart (or the next publisher
+        // that deletes a generation-stale sidecar) does not pay it again. A
+        // dirty publication skips the save: the sidecar must not claim a
+        // generation the publication has not finished. Persistence failure
+        // costs only a future recompute, so it is logged, not returned.
+        if let Some(db_path) = self.db_path()
+            && !self.is_index_publication_dirty()
         {
-            tracing::warn!("lazy PageRank computation failed: {e}");
+            let mut sidecar = db_path.as_os_str().to_owned();
+            sidecar.push(".pagerank.json");
+            if let Err(error) = self
+                .save_pagerank_cache_inner(std::path::Path::new(&sidecar), self.graph_generation())
+            {
+                tracing::warn!("could not persist the lazily computed PageRank: {error}");
+            }
         }
         Ok(())
+    }
+
+    /// How many times a ranked read found the PageRank cache empty and had to
+    /// recompute it (D1). Diagnostic and test use only.
+    #[doc(hidden)]
+    pub fn lazy_pagerank_computations(&self) -> u64 {
+        self.lazy_pagerank_computes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Pre-build the PPR adjacency cache for the unified graph scope.
@@ -2067,6 +2098,38 @@ mod tests {
             }
         }
         store
+    }
+
+    /// D1: the lazy compute kept its result only in memory, so a daemon that
+    /// restarted (or a graph-mutation finalize that deleted the sidecar)
+    /// paid the full recompute again. It now persists what it computed.
+    #[test]
+    fn a_lazy_pagerank_compute_persists_its_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let sidecar = dir.path().join("graph.lbug.pagerank.json");
+        let store = GraphStore::create(&db).unwrap();
+        store.insert_symbol(&make_symbol("A", "alpha")).unwrap();
+        store.insert_symbol(&make_symbol("B", "beta")).unwrap();
+        store.insert_edge(&make_calls_edge("A", "B")).unwrap();
+        assert!(!sidecar.exists());
+
+        let scores = store.pagerank_scores().unwrap();
+        assert_eq!(store.lazy_pagerank_computations(), 1);
+        assert!(!scores.is_empty());
+        assert!(
+            sidecar.exists(),
+            "the lazy compute must persist its sidecar"
+        );
+
+        let reopened = GraphStore::open(&db).unwrap();
+        reopened.load_pagerank_cache(&sidecar).unwrap();
+        assert_eq!(reopened.pagerank_scores().unwrap(), scores);
+        assert_eq!(
+            reopened.lazy_pagerank_computations(),
+            0,
+            "a reopened store must not recompute"
+        );
     }
 
     #[test]
@@ -3911,6 +3974,42 @@ mod tests {
                 "scores should be identical with empty cache: {uid1}: {s1} vs {s2}"
             );
         }
+    }
+
+    /// rc-context-noise (B3): interaction memory must never pull rows from a
+    /// component the seed cannot reach.
+    #[test]
+    fn code_only_ppr_with_interactions_on_other_component_is_unchanged() {
+        use std::collections::HashMap;
+
+        let store = test_store();
+        for uid in ["A", "B", "C", "X", "Y", "Z"] {
+            store
+                .insert_symbol(&make_symbol(uid, &format!("fn_{uid}")))
+                .unwrap();
+        }
+        store.insert_edge(&make_calls_edge("A", "B")).unwrap();
+        store.insert_edge(&make_calls_edge("B", "C")).unwrap();
+        store.insert_edge(&make_calls_edge("X", "Y")).unwrap();
+        store.insert_edge(&make_calls_edge("Y", "Z")).unwrap();
+
+        let baseline = store
+            .personalized_pagerank(&["A".to_string()], 0.85, 40, &GraphScope::code_only())
+            .unwrap();
+
+        let mut scores = HashMap::new();
+        for uid in ["X", "Y", "Z"] {
+            scores.insert(uid.to_string(), 50.0);
+        }
+        store.load_interaction_cache(scores);
+        let with_interactions = store
+            .personalized_pagerank(&["A".to_string()], 0.85, 40, &GraphScope::code_only())
+            .unwrap();
+
+        assert_eq!(
+            baseline, with_interactions,
+            "interactions on an unreachable component changed the rows"
+        );
     }
 
     #[test]

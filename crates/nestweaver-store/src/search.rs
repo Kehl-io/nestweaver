@@ -289,6 +289,23 @@ struct EmbeddingSnapshotEntry<'a> {
     vector: EmbeddingVectorRef<'a>,
 }
 
+/// Test-only count of full base scans (`len()`), so a test can prove a hot
+/// path does not iterate every row.
+#[cfg(test)]
+pub(crate) mod len_scans {
+    use std::cell::Cell;
+    thread_local!(static SCANS: Cell<usize> = const { Cell::new(0) });
+    pub(crate) fn bump() {
+        SCANS.with(|c| c.set(c.get() + 1));
+    }
+    pub(crate) fn reset() {
+        SCANS.with(|c| c.set(0));
+    }
+    pub(crate) fn get() -> usize {
+        SCANS.with(Cell::get)
+    }
+}
+
 pub struct EmbeddingIndex {
     /// Vectors created or replaced since the mapped base generation.
     embeddings: HashMap<String, Vec<f32>>,
@@ -1391,6 +1408,8 @@ impl EmbeddingIndex {
     }
 
     pub fn len(&self) -> usize {
+        #[cfg(test)]
+        len_scans::bump();
         let base_count = self.base.as_ref().map_or(0, |base| {
             base.rows
                 .iter()
@@ -1430,8 +1449,25 @@ impl EmbeddingIndex {
         dropped
     }
 
+    /// O(1) in every case but a base that is at least as tombstoned as it is
+    /// long (D5). `len()` costs a hash lookup per base row, and this is asked
+    /// on the embed hot path, under the index mutex.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        if !self.embeddings.is_empty() {
+            return false;
+        }
+        let Some(base) = self.base.as_ref() else {
+            return true;
+        };
+        // `deleted_base_uids` only ever holds base UIDs, so a base with more
+        // rows than tombstones has a live row.
+        if base.rows.len() > self.deleted_base_uids.len() {
+            return false;
+        }
+        !base
+            .rows
+            .iter()
+            .any(|row| !self.deleted_base_uids.contains(&row.uid))
     }
 
     pub(crate) fn has_pending_deltas(&self) -> bool {
@@ -2828,6 +2864,39 @@ mod tests {
             2,
             "the never-embedded UID must not produce a journal delta"
         );
+    }
+
+    /// D5: `embedding_pipeline_mismatch` asked `is_empty()` once per
+    /// embedded symbol, and `is_empty()` was `len() == 0` — a hash lookup per
+    /// base row (~300k) every time. `is_empty()` must not scan the base.
+    #[test]
+    fn is_empty_does_not_scan_the_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("base.bin");
+        let identity = test_identity();
+        let pipeline = test_pipeline("model-a", 2);
+        let mut original = EmbeddingIndex::new();
+        for (uid, vector) in [("a", vec![1.0, 0.0]), ("b", vec![0.0, 1.0])] {
+            assert!(original.add_with_pipeline(uid, vector, &pipeline, false));
+        }
+        original
+            .save_binary_v2(&base_path, &identity, 1, &pipeline)
+            .unwrap();
+        let mut index = EmbeddingIndex::load_binary_v2(&base_path).unwrap();
+
+        len_scans::reset();
+        for _ in 0..1000 {
+            assert!(!index.is_empty());
+        }
+        assert_eq!(len_scans::get(), 0, "is_empty scanned the base");
+
+        // Still correct at the edges: a fully tombstoned base is empty, an
+        // overlay row is not.
+        index.tombstone_uids(&["a".to_string(), "b".to_string()]);
+        assert!(index.is_empty());
+        assert_eq!(index.len(), 0);
+        assert!(index.add_with_pipeline("c", vec![0.5, 0.5], &pipeline, false));
+        assert!(!index.is_empty());
     }
 
     #[test]

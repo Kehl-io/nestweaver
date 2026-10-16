@@ -126,6 +126,15 @@ pub struct DeadCodeResult {
     /// This is the same defect shape nw-351 closed for C++ specifically,
     /// generalised to every language rather than re-discovered one at a time.
     pub languages_without_entry_points: Vec<String>,
+    /// 12.1.1 (M2): every root that seeded the whole-graph walk (entry
+    /// points and owners alike, in every repo). With a `repos` scope,
+    /// `entry_points` and `module_owner_roots` count the scoped repos'
+    /// roots only, so [`Self::coverage_is_complete`] reads this instead:
+    /// whether the walk had any seed is a property of the walk, not of the
+    /// output filter. Serialized (12.1.1 review), so a reader of the JSON
+    /// can tell "this scope owns no roots" from "the walk had no seed".
+    #[serde(default)]
+    pub walk_roots: usize,
     /// Repo-scope disclosure — `None` for an unfiltered call, `Some` when the
     /// caller passed a `repos` filter (nw-479). See
     /// [`detect_dead_code_in_repos_cancellable`] for the full semantics.
@@ -147,9 +156,11 @@ pub struct DeadCodeScope {
     /// comment, that `total_symbols`/`reachable_symbols`/`dead_percentage`
     /// describe the SCOPED population — the repos in `repos` — and not the
     /// whole graph, even though the reachability walk that produced them was
-    /// whole-graph. `entry_points`/`languages_without_entry_points` are the
-    /// deliberate exception: they stay whole-graph regardless of this field,
-    /// because they describe the walk's own coverage, not the output.
+    /// whole-graph. `entry_points` and `module_owner_roots` are scoped too
+    /// (12.1.1, M2): they count the scoped repos' roots.
+    /// `languages_without_entry_points` is the deliberate exception: it stays
+    /// whole-graph regardless of this field, because it describes the walk's
+    /// own coverage, not the output.
     pub totals_population: &'static str,
 }
 
@@ -168,7 +179,11 @@ impl DeadCodeResult {
         // nothing to walk to, so nothing was concluded and nothing is offered
         // for deletion. Every other zero-seed run reports 100% dead.
         self.undecodable_symbols == 0
-            && (self.entry_points + self.module_owner_roots > 0 || self.total_symbols == 0)
+            && (self
+                .walk_roots
+                .max(self.entry_points + self.module_owner_roots)
+                > 0
+                || self.total_symbols == 0)
             && self.languages_without_entry_points.is_empty()
     }
 }
@@ -405,6 +420,7 @@ pub fn serialize_dead_code_page(
         "coverage": if result.coverage_is_complete() && manifest_load_error.is_none() {"complete"} else {"degraded"},
         "undecodable_symbols": result.undecodable_symbols, "entry_points": result.entry_points,
         "module_owner_roots": result.module_owner_roots,
+        "walk_roots": result.walk_roots,
         "languages_without_entry_points": result.languages_without_entry_points,
         "min_confidence": request.min_confidence, "requested_min_confidence": request.min_confidence,
         "review_only": true, "high_confidence_available": false,
@@ -748,11 +764,13 @@ pub fn detect_dead_code_with_manifests_cancellable(
 /// scoped when `repos` is `Some` — they describe the repos the caller asked
 /// about, not the whole graph, which is what a caller scoping to one repo
 /// out of a monorepo actually wants to see (`scope.totals_population` on the
-/// result discloses this). `entry_points`/`languages_without_entry_points`
-/// stay whole-graph on purpose: they are coverage/health signals about the
-/// WALK, not the output, and a scoped repo can legitimately own zero of its
-/// own entry points (e.g. a library consumed only by an app in another
-/// repo) without that being a coverage gap for THIS repo's numbers.
+/// result discloses this). `entry_points` and `module_owner_roots` are scoped
+/// the same way (12.1.1, M2): they count the scoped repos' own roots.
+/// `walk_roots` and `languages_without_entry_points` stay whole-graph on
+/// purpose: they are coverage/health signals about the WALK, not the output,
+/// and a scoped repo can legitimately own zero of its own entry points (e.g.
+/// a library consumed only by an app in another repo) without that being a
+/// coverage gap for THIS repo's numbers.
 ///
 /// **The stale-resolver refusal (see `resolver_generation.rs`) stays
 /// whole-store, not scoped to `repos`, and is unaffected by this function**
@@ -821,11 +839,13 @@ fn detect_dead_code_inner(
     // entry point: it owns the calls the file makes at load time. Seed it
     // here, before the exclusion drops it, or a function called only at
     // module load reads as dead.
-    let module_owners: Vec<(String, String)> = raw_symbols
+    let module_owners: Vec<(String, String, String)> = raw_symbols
         .iter()
         .filter(|s| s.is_module_owner() && s.is_entry_point)
-        .map(|s| (s.uid.clone(), s.file_path.clone()))
+        .map(|s| (s.uid.clone(), s.file_path.clone(), s.repo_uid.clone()))
         .collect();
+    // 12.1.1 (M2): root counts follow the output scope.
+    let in_scope = |repo_uid: &str| repos.is_none_or(|repos| repos.contains(repo_uid));
     let all_symbols: Vec<_> = raw_symbols
         .into_iter()
         .filter(|s| !is_excluded_from_dead_code(s) && !function_local.contains(&s.uid))
@@ -858,6 +878,7 @@ fn detect_dead_code_inner(
             entry_points: 0,
             module_owner_roots: 0,
             languages_without_entry_points: vec![],
+            walk_roots: 0,
             scope,
         });
     }
@@ -951,6 +972,7 @@ fn detect_dead_code_inner(
     // enrolled, a file the parser could not see a component in would have
     // degraded a corpus that previously read clean.
     let mut entry_point_uids: Vec<String> = Vec::new();
+    let mut scoped_entry_points = 0usize;
     let mut lang_totals: HashMap<String, usize> = HashMap::new();
     let mut lang_entries: HashMap<String, usize> = HashMap::new();
     for sym in &all_symbols {
@@ -966,6 +988,9 @@ fn detect_dead_code_inner(
                 });
         if is_entry {
             entry_point_uids.push(sym.uid.clone());
+            if in_scope(&sym.repo_uid) {
+                scoped_entry_points += 1;
+            }
         }
         if let Some(lang) = detect_language(std::path::Path::new(&sym.file_path))
             && language_has_entry_point_model(lang)
@@ -977,8 +1002,11 @@ fn detect_dead_code_inner(
             }
         }
     }
-    let module_owner_roots = module_owners.len();
-    for (uid, file_path) in module_owners {
+    let module_owner_roots = module_owners
+        .iter()
+        .filter(|(_, _, repo_uid)| in_scope(repo_uid))
+        .count();
+    for (uid, file_path, _) in module_owners {
         entry_point_uids.push(uid);
         if let Some(lang) = detect_language(std::path::Path::new(&file_path))
             && language_has_entry_point_model(lang)
@@ -1304,9 +1332,10 @@ fn detect_dead_code_inner(
         excluded_count,
         undecodable_symbols,
         // nw-113: owners seed the walk but are reported on their own.
-        entry_points: entry_point_uids.len() - module_owner_roots,
+        entry_points: scoped_entry_points,
         module_owner_roots,
         languages_without_entry_points,
+        walk_roots: entry_point_uids.len(),
         scope,
     })
 }
@@ -1346,6 +1375,7 @@ mod page_contract_tests {
             entry_points: 1,
             module_owner_roots: 0,
             languages_without_entry_points: vec![],
+            walk_roots: 1,
             scope: Some(DeadCodeScope {
                 repos: vec!["repo:a".into()],
                 totals_population: "filtered",
@@ -3993,6 +4023,107 @@ mod tests {
         );
     }
 
+    /// 12.1.1 (M2): with a `repos` scope, `entry_points` and
+    /// `module_owner_roots` count the scoped repos' roots, like the other
+    /// totals, rather than the whole graph's. The walk stays whole-graph, so
+    /// a scoped repo with no roots of its own still reads as covered when
+    /// another repo's roots reach it.
+    #[test]
+    fn dead_code_root_counts_respect_the_repo_scope() {
+        let store = GraphStore::in_memory().unwrap();
+        let owner = |uid: &str, path: &str, repo: &str| {
+            let mut s = make_symbol_in_repo(
+                uid,
+                nestweaver_schema::MODULE_OWNER_NAME,
+                SymbolKind::Module,
+                path,
+                repo,
+                true,
+            );
+            s.entry_point_kind = Some(nestweaver_schema::EntryPointKind::ModuleInit);
+            s
+        };
+        for symbol in [
+            make_symbol_in_repo(
+                "b:main",
+                "main_b",
+                SymbolKind::Function,
+                "b/main.rs",
+                "repo-b",
+                true,
+            ),
+            make_symbol_in_repo(
+                "b:cli",
+                "cli_b",
+                SymbolKind::Function,
+                "b/cli.rs",
+                "repo-b",
+                true,
+            ),
+            owner("b:owner1", "b/one.js", "repo-b"),
+            owner("b:owner2", "b/two.js", "repo-b"),
+            owner("a:owner", "a/one.js", "repo-a"),
+            make_symbol_in_repo(
+                "a:helper",
+                "helper_a",
+                SymbolKind::Function,
+                "a/one.js",
+                "repo-a",
+                false,
+            ),
+            make_symbol_in_repo(
+                "c:lib",
+                "lib_c",
+                SymbolKind::Function,
+                "c/lib.rs",
+                "repo-c",
+                false,
+            ),
+        ] {
+            store.insert_symbol(&symbol).unwrap();
+        }
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: "b:main".to_string(),
+                target_uid: "c:lib".to_string(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.9,
+                link_type: None,
+                evidence: vec![],
+            })
+            .unwrap();
+        let run = |repos: Option<&[&str]>| {
+            let repos: Option<HashSet<String>> =
+                repos.map(|r| r.iter().map(|s| s.to_string()).collect());
+            detect_dead_code_in_repos_cancellable(
+                &store,
+                DEFAULT_MIN_EDGE_CONFIDENCE,
+                &HashMap::new(),
+                repos.as_ref(),
+                None,
+            )
+            .unwrap()
+        };
+
+        let all = run(None);
+        assert_eq!(
+            (all.entry_points, all.module_owner_roots),
+            (2, 3),
+            "{all:?}"
+        );
+
+        let a = run(Some(&["repo-a"]));
+        assert_eq!((a.entry_points, a.module_owner_roots), (0, 1), "{a:?}");
+        let b = run(Some(&["repo-b"]));
+        assert_eq!((b.entry_points, b.module_owner_roots), (2, 2), "{b:?}");
+
+        // repo-c has no roots of its own, but repo-b's main reaches it.
+        let c = run(Some(&["repo-c"]));
+        assert_eq!((c.entry_points, c.module_owner_roots), (0, 0), "{c:?}");
+        assert!(c.unreachable_symbols.is_empty(), "{c:?}");
+        assert!(c.coverage_is_complete(), "the walk was seeded: {c:?}");
+    }
+
     /// COUNTERWEIGHT (nw-479): calling the new repo-scoped entry point with
     /// `repos: None` must be byte-for-byte identical to the pre-nw-479
     /// path -- same `unreachable_symbols`, same totals, and no `scope` key
@@ -4055,13 +4186,13 @@ mod tests {
     }
 
     /// `total_symbols`/`reachable_symbols`/`dead_percentage` describe the
-    /// SCOPED population when `repos` is given, but `entry_points` (a
-    /// coverage/health signal about the WALK, not the output) stays
-    /// whole-graph -- a scoped repo that owns zero entry points of its own
-    /// (a library called only from elsewhere) must not read as a coverage
-    /// gap just because it was scoped.
+    /// SCOPED population when `repos` is given, and so (12.1.1, M2) does
+    /// `entry_points`. Coverage is still a property of the WALK, not the
+    /// output: a scoped repo that owns zero entry points of its own (a
+    /// library called only from elsewhere) must not read as a coverage gap
+    /// just because it was scoped.
     #[test]
-    fn dead_code_repo_filter_scopes_totals_but_not_entry_points() {
+    fn dead_code_repo_filter_scopes_totals_and_entry_points_but_not_coverage() {
         let store = GraphStore::in_memory().unwrap();
         store
             .insert_symbol(&make_symbol_in_repo(
@@ -4114,9 +4245,8 @@ mod tests {
         assert_eq!(result.reachable_symbols, 0);
         assert!((result.dead_percentage - 100.0).abs() < f64::EPSILON);
         assert_eq!(
-            result.entry_points, 1,
-            "entry_points must stay WHOLE-GRAPH -- repo-b's real entry \
-             point, even though repo-a itself owns none"
+            result.entry_points, 0,
+            "entry_points counts the scoped repo's own roots: repo-a owns none"
         );
         assert!(
             result.coverage_is_complete(),

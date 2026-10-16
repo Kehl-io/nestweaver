@@ -219,6 +219,9 @@ pub struct ManifestRecoveryRuntime {
     status: std::sync::Mutex<ManifestRecoveryStatus>,
     pub wake: tokio::sync::Notify,
     pub changed: tokio::sync::watch::Sender<u64>,
+    /// D3: per repository, how many consecutive capture passes ran out of
+    /// that repository's own budget. Reset when the repository captures.
+    pub capture_overruns: std::sync::Mutex<HashMap<String, u32>>,
 }
 impl Default for ManifestRecoveryRuntime {
     fn default() -> Self {
@@ -232,6 +235,7 @@ impl Default for ManifestRecoveryRuntime {
             }),
             wake: tokio::sync::Notify::new(),
             changed: tokio::sync::watch::channel(0).0,
+            capture_overruns: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -660,6 +664,21 @@ pub fn is_manifest_input(path: &Path) -> bool {
             .contains(&name))
 }
 
+/// D3: a manifest capture ran out of its time budget. That is CONTENTION (a
+/// loaded machine, a slow disk), never evidence that the repository is
+/// wrong, so the daemon defers the whole snapshot rather than refusing the
+/// repository with an `index --repo` remedy that cannot help.
+#[derive(Debug, thiserror::Error)]
+#[error("manifest derivation exceeded its cooperative deadline")]
+pub struct ManifestCaptureDeadline;
+
+/// Whether `error` is a [`ManifestCaptureDeadline`] anywhere in its chain.
+pub fn is_manifest_capture_deadline(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<ManifestCaptureDeadline>())
+}
+
 pub fn capture_manifest_inputs(
     reader: &dyn ContentReader,
     remaining_bytes: &mut usize,
@@ -668,10 +687,9 @@ pub fn capture_manifest_inputs(
     let mut files = std::collections::BTreeMap::new();
     let inventory = reader.list_files()?;
     for path in inventory.into_iter().filter(|p| is_manifest_input(p)) {
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "manifest derivation exceeded its 60-second cooperative deadline"
-        );
+        if std::time::Instant::now() >= deadline {
+            return Err(ManifestCaptureDeadline.into());
+        }
         let content = reader.read_file(&path)?;
         anyhow::ensure!(
             content.len() <= *remaining_bytes,
@@ -682,10 +700,9 @@ pub fn capture_manifest_inputs(
             .map_err(|error| anyhow::anyhow!("{}: {error:#}", path.display()))?;
         files.insert(path, content);
     }
-    anyhow::ensure!(
-        std::time::Instant::now() < deadline,
-        "manifest derivation exceeded its 60-second cooperative deadline"
-    );
+    if std::time::Instant::now() >= deadline {
+        return Err(ManifestCaptureDeadline.into());
+    }
     Ok(ManifestInputs {
         root: reader.root().to_path_buf(),
         files,
@@ -823,6 +840,9 @@ pub struct GraphMutationPublicationGuard<'a> {
     lease: Option<nestweaver_store::IndexPublicationLease<'a>>,
     marker_path: Option<PathBuf>,
     operation: String,
+    /// D1: the mutation touches no Symbol node and no code edge (note->code
+    /// links, project memberships), so a code-only PageRank cache survives it.
+    non_code: bool,
 }
 
 impl<'a> GraphMutationPublicationGuard<'a> {
@@ -837,13 +857,25 @@ impl<'a> GraphMutationPublicationGuard<'a> {
             .as_ref()
             .expect("publication guard always owns its lease until finish")
             .store();
-        let mut outcome = finalize_committed_graph_mutation(store, changed);
+        let mut outcome = finalize_graph_mutation(store, changed, self.non_code);
 
+        let retire = |marker_path: &Path| {
+            let remove =
+                || nestweaver_store::durable_sidecar::remove_file_durable_if_exists(marker_path);
+            if self.non_code {
+                store.with_non_code_publication_rank_barrier(remove)
+            } else {
+                store.with_index_publication_rank_barrier(remove)
+            }
+        };
+        let mut retired = false;
         if !outcome.is_degraded()
             && let Some(marker_path) = &self.marker_path
-            && let Err(error) = store.with_index_publication_rank_barrier(|| {
-                nestweaver_store::durable_sidecar::remove_file_durable_if_exists(marker_path)
-            })
+            && let Err(error) = {
+                let result = retire(marker_path);
+                retired = result.is_ok();
+                result
+            }
         {
             if changed {
                 outcome.record_warning(
@@ -861,6 +893,26 @@ impl<'a> GraphMutationPublicationGuard<'a> {
                     marker_path.display()
                 );
             }
+        }
+
+        // D1 review: a non-code publication keeps a warm code-only PageRank
+        // cache but removed its generation-bound sidecar, so after a relink
+        // `.pagerank.json` stayed missing until something recomputed. Re-save
+        // it at the new generation once the marker is retired: the save is
+        // refused while the publication is dirty, so it cannot happen inside
+        // `finalize_graph_mutation`. A cold cache saves nothing.
+        if retired
+            && changed
+            && self.non_code
+            && let Some(db_path) = store.db_path()
+            && let Err(error) =
+                store.save_pagerank_cache(&crate::sidecar_path(db_path, ".pagerank.json"))
+        {
+            tracing::warn!(
+                operation = %self.operation,
+                %error,
+                "could not re-save the warm PageRank sidecar; the next compute rewrites it"
+            );
         }
 
         if let Some(lease) = self.lease.take()
@@ -899,7 +951,7 @@ pub fn begin_graph_mutation_publication<'a>(
     let lease = store
         .acquire_index_publication_lease()
         .map_err(|error| anyhow::anyhow!("{operation}: acquire publication lease: {error}"))?;
-    begin_graph_mutation_publication_on_lease(store, lease, operation, None)
+    begin_graph_mutation_publication_on_lease(store, lease, operation, None, false)
 }
 
 /// [`begin_graph_mutation_publication`] without blocking: `Ok(None)` while
@@ -934,7 +986,28 @@ pub fn try_begin_graph_mutation_publication_with_reason<'a>(
     else {
         return Ok(None);
     };
-    begin_graph_mutation_publication_on_lease(store, lease, operation, reason).map(Some)
+    begin_graph_mutation_publication_on_lease(store, lease, operation, reason, false).map(Some)
+}
+
+/// [`try_begin_graph_mutation_publication_with_reason`] for a mutation that
+/// touches no Symbol node and no code edge — note->code links, project
+/// memberships (D1). Such a publication keeps a warm code-only PageRank cache
+/// instead of wiping it: code-link reconciliation publishes once per edge
+/// budget group, and wiping per group left every ranked read recomputing
+/// PageRank over the whole code graph every ~25 s for the length of a relink.
+pub fn try_begin_non_code_graph_mutation_publication<'a>(
+    store: &'a nestweaver_store::GraphStore,
+    operation: impl Into<String>,
+    reason: Option<&'static str>,
+) -> Result<Option<GraphMutationPublicationGuard<'a>>, anyhow::Error> {
+    let operation = operation.into();
+    let Some(lease) = store
+        .try_acquire_index_publication_lease()
+        .map_err(|error| anyhow::anyhow!("{operation}: acquire publication lease: {error}"))?
+    else {
+        return Ok(None);
+    };
+    begin_graph_mutation_publication_on_lease(store, lease, operation, reason, true).map(Some)
 }
 
 fn begin_graph_mutation_publication_on_lease<'a>(
@@ -942,6 +1015,7 @@ fn begin_graph_mutation_publication_on_lease<'a>(
     lease: nestweaver_store::IndexPublicationLease<'a>,
     operation: String,
     reason: Option<&'static str>,
+    non_code: bool,
 ) -> Result<GraphMutationPublicationGuard<'a>, anyhow::Error> {
     lease.ensure_clean_for_snapshot().map_err(|error| {
         anyhow::anyhow!("{operation}: refusing to overwrite a dirty publication: {error}")
@@ -960,18 +1034,22 @@ fn begin_graph_mutation_publication_on_lease<'a>(
                 .as_nanos(),
             reason,
         );
-        store
-            .with_index_publication_rank_barrier(|| {
-                nestweaver_store::durable_sidecar::atomic_replace_file(&marker_path, |file| {
-                    file.write_all(payload.as_bytes())
-                })
+        let write = || {
+            nestweaver_store::durable_sidecar::atomic_replace_file(&marker_path, |file| {
+                file.write_all(payload.as_bytes())
             })
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "{operation}: publish graph mutation marker {}: {error}",
-                    marker_path.display()
-                )
-            })?;
+        };
+        if non_code {
+            store.with_non_code_publication_rank_barrier(write)
+        } else {
+            store.with_index_publication_rank_barrier(write)
+        }
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "{operation}: publish graph mutation marker {}: {error}",
+                marker_path.display()
+            )
+        })?;
         Some(marker_path)
     } else {
         lease.preflight_transient_generation().map_err(|error| {
@@ -984,6 +1062,7 @@ fn begin_graph_mutation_publication_on_lease<'a>(
         lease: Some(lease),
         marker_path,
         operation,
+        non_code,
     })
 }
 
@@ -1018,6 +1097,16 @@ impl GraphMutationPublicationOutcome {
 pub fn finalize_committed_graph_mutation(
     store: &nestweaver_store::GraphStore,
     changed: bool,
+) -> GraphMutationPublicationOutcome {
+    finalize_graph_mutation(store, changed, false)
+}
+
+/// [`finalize_committed_graph_mutation`]; `non_code` keeps a warm code-only
+/// PageRank cache for a mutation that touched no Symbol node and no code edge.
+fn finalize_graph_mutation(
+    store: &nestweaver_store::GraphStore,
+    changed: bool,
+    non_code: bool,
 ) -> GraphMutationPublicationOutcome {
     let generation_before = store.graph_generation();
     if !changed {
@@ -1086,7 +1175,16 @@ pub fn finalize_committed_graph_mutation(
     // Clear live scores before exposing the new generation. The durable copy
     // is removed as well, so a process restart cannot reload pre-mutation
     // ranking even if a later publication step is degraded.
-    store.invalidate_pagerank();
+    //
+    // D1: a non-code mutation cannot change code-only PageRank, so a code-only
+    // live cache is kept. The durable copy still goes: it is bound to the
+    // generation this publication is about to advance past, and the next
+    // lazy compute or index finalize rewrites it.
+    if non_code {
+        store.invalidate_ranking_for_non_code_change();
+    } else {
+        store.invalidate_pagerank();
+    }
     if let Some(db_path) = &db_path {
         let pagerank_path = crate::sidecar_path(db_path, ".pagerank.json");
         if let Err(error) =

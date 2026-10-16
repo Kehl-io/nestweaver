@@ -10,6 +10,7 @@ pub mod generation;
 pub mod git_activity_sidecar;
 pub mod index_publication;
 mod native_admission;
+pub use native_admission::WriteObserver;
 mod open_crash_guard;
 pub mod ranking;
 pub mod read;
@@ -30,9 +31,10 @@ pub use db::{
 };
 pub use error::{
     CancelReason, CheckpointFailure, CorruptionKind, DB_REBUILD_REQUIRED_CODE, EngineCorruption,
-    FrozenCheckpointApplied, SelfHeldWriteLease, StoreError, classify_checkpoint_failure,
-    classify_engine_corruption, live_writer_holds_write_lease, note_self_held_write_lease,
-    redact_build_paths, self_holds_write_lease,
+    FrozenCheckpointApplied, SelfHeldWriteLease, StoreError, TransientCondition,
+    classify_checkpoint_failure, classify_engine_corruption, classify_transient_condition,
+    live_writer_holds_write_lease, note_self_held_write_lease, redact_build_paths,
+    self_holds_write_lease,
 };
 
 pub use db::StoreConnection as DbConnection;
@@ -68,7 +70,7 @@ pub use tantivy_index::{
 };
 pub use traverse::{
     DEFAULT_IMPACT_THRESHOLD, IMPACT_EDGE_TYPES, ImpactEdge, ImpactNode, ImpactResult,
-    ImpactSnapshot,
+    ImpactSnapshot, SymbolNameTable, symbol_table_fetches_on_this_thread,
 };
 pub use write::{
     CONTRACT_DERIVATION_FAILED_PREFIX, DeleteProjectCascadeError, DeleteProjectCascadeOutcome,
