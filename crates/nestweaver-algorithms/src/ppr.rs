@@ -11,12 +11,13 @@ pub struct PprConfig {
     /// Minimum score threshold — non-seed nodes below this are excluded from
     /// results.
     pub min_score: f64,
-    /// Optional interaction memory scores for personalization bias. When
-    /// present, a small fraction of the personalization vector is blended
-    /// from these scores so that frequently-accessed nodes receive a slight
-    /// ranking boost.
+    /// Optional interaction memory scores. When present, every node the walk
+    /// reached (score > 0) is scaled by `1 + w * s / max_s` after
+    /// convergence, so frequently-accessed nodes receive a slight ranking
+    /// boost. They are never a teleport target: a node the seed cannot reach
+    /// stays at zero.
     pub interaction_scores: Option<HashMap<String, f64>>,
-    /// Weight of the interaction bias blend (default 0.05 = 5%).
+    /// Weight `w` of the interaction re-rank (default 0.05 = at most +5%).
     pub interaction_bias_weight: f64,
 }
 
@@ -64,7 +65,10 @@ pub fn personalized_pagerank(
     let personalization_val = 1.0 / seed_count as f64;
 
     // Build personalization vector: 1/|seeds| for seeds, 0 otherwise.
-    let mut personalization: Vec<f64> = (0..n)
+    // Interaction memory is deliberately NOT blended in here (see
+    // `apply_interaction_rerank`): teleport mass on an interacted node is mass
+    // the seed never sent, so it reached nodes in unrelated components.
+    let personalization: Vec<f64> = (0..n)
         .map(|i| {
             if seed_set.contains(&i) {
                 personalization_val
@@ -74,47 +78,14 @@ pub fn personalized_pagerank(
         })
         .collect();
 
-    // Apply interaction memory bias (conservative: 5% weight by default).
-    // Blends a small fraction of interaction history scores into the
-    // personalization vector so frequently-accessed nodes receive a slight
-    // ranking boost without overwhelming seed-based relevance.
-    if let Some(ref scores) = config.interaction_scores {
-        let mut interaction_mass = 0.0;
-        let mut contributions: Vec<(usize, f64)> = Vec::new();
-        for (i, uid) in uids.iter().enumerate() {
-            if let Some(&score) = scores.get(uid)
-                && score > 0.0
-            {
-                contributions.push((i, score));
-                interaction_mass += score;
-            }
-        }
-        if interaction_mass > 0.0 {
-            // Anti-feedback-loop / exploration floor: we scale every seed's
-            // personalization weight by `(1 - w)` and only redistribute the
-            // remaining `w` (default 5%) according to interaction history.
-            // Because `w < 1`, a seed with NO interaction history still
-            // retains `(1 - w)` of its original personalization mass — it can
-            // never be driven to zero by the interaction blend. This keeps
-            // newly-seeded, never-before-accessed nodes discoverable and
-            // prevents the feedback loop from collapsing onto historically
-            // popular nodes.
-            for p in personalization.iter_mut() {
-                *p *= 1.0 - config.interaction_bias_weight;
-            }
-            for (i, score) in &contributions {
-                personalization[*i] += config.interaction_bias_weight * score / interaction_mass;
-            }
-        }
-    }
-
     // PPR power iteration.
     let mut scores = personalization.clone();
     for _ in 0..config.max_iterations {
         let mut new_scores = vec![0.0f64; n];
 
         // Dangling-node handling: redistribute mass from nodes with no
-        // outgoing edges through the personalization vector.
+        // outgoing edges through the personalization vector, which holds the
+        // seeds only, so dangling mass can never reach an unrelated node.
         let dangling_sum: f64 = scores
             .iter()
             .enumerate()
@@ -146,6 +117,8 @@ pub fn personalized_pagerank(
         }
     }
 
+    apply_interaction_rerank(uids, &mut scores, config);
+
     // Collect results: always include seeds, filter others by min_score.
     let mut results: Vec<(String, f64)> = uids
         .iter()
@@ -157,6 +130,38 @@ pub fn personalized_pagerank(
     // Sort descending by score.
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     results
+}
+
+/// Apply interaction memory as a re-rank of nodes the walk already reached.
+///
+/// rc-context-noise (B3): through 12.1.0 the interaction scores were blended
+/// into the personalization (teleport) vector, and dangling mass was returned
+/// through it as well. That put `alpha * w * s_i / sum(s)` of score on EVERY
+/// interacted node in scope whatever the seed, so `context` listed ~83
+/// symbols from unrelated repos on every walk. Here a node with no walk mass
+/// stays at exactly zero; a reached node is scaled by `1 + w * s_i / max_s`,
+/// keeping F1's "frequently-accessed nodes get a slight boost" intent.
+fn apply_interaction_rerank(uids: &[String], estimate: &mut [f64], config: &PprConfig) {
+    let Some(scores) = config.interaction_scores.as_ref() else {
+        return;
+    };
+    let max_s = scores
+        .values()
+        .copied()
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .fold(0.0_f64, f64::max);
+    if max_s <= 0.0 {
+        return;
+    }
+    for (i, uid) in uids.iter().enumerate() {
+        if estimate[i] > 0.0
+            && let Some(&s) = scores.get(uid)
+            && s.is_finite()
+            && s > 0.0
+        {
+            estimate[i] *= 1.0 + config.interaction_bias_weight * s / max_s;
+        }
+    }
 }
 
 /// Run Personalized PageRank using the Forward Push (LocalPush) algorithm.
@@ -236,8 +241,9 @@ pub fn forward_push_ppr_cancellable(
     }
 
     // -- Build personalization vector (identical to power iteration) --
+    // Seeds only; interaction memory is a post-convergence re-rank.
     let personalization_val = 1.0 / seed_count as f64;
-    let mut personalization: Vec<f64> = (0..n)
+    let personalization: Vec<f64> = (0..n)
         .map(|i| {
             if seed_set.contains(&i) {
                 personalization_val
@@ -246,28 +252,6 @@ pub fn forward_push_ppr_cancellable(
             }
         })
         .collect();
-
-    // -- Apply interaction memory bias (same exploration floor pattern) --
-    if let Some(ref scores) = config.interaction_scores {
-        let mut interaction_mass = 0.0;
-        let mut contributions: Vec<(usize, f64)> = Vec::new();
-        for (i, uid) in uids.iter().enumerate() {
-            if let Some(&score) = scores.get(uid)
-                && score > 0.0
-            {
-                contributions.push((i, score));
-                interaction_mass += score;
-            }
-        }
-        if interaction_mass > 0.0 {
-            for p in personalization.iter_mut() {
-                *p *= 1.0 - config.interaction_bias_weight;
-            }
-            for (i, score) in &contributions {
-                personalization[*i] += config.interaction_bias_weight * score / interaction_mass;
-            }
-        }
-    }
 
     // -- Forward Push --
     let alpha = 1.0 - config.damping; // teleport probability
@@ -327,8 +311,9 @@ pub fn forward_push_ppr_cancellable(
                 }
             }
         } else {
-            // Dangling node: redistribute through the personalization vector
-            // (same semantics as power iteration's dangling-sum handling).
+            // Dangling node: redistribute through the (seed-only)
+            // personalization vector, same semantics as power iteration's
+            // dangling-sum handling.
             let push_mass = (1.0 - alpha) * r_v;
             for (i, &p) in personalization.iter().enumerate() {
                 if p > 0.0 {
@@ -343,6 +328,8 @@ pub fn forward_push_ppr_cancellable(
 
         residual[v] = 0.0;
     }
+
+    apply_interaction_rerank(uids, &mut estimate, config);
 
     // -- Collect results (same filtering as power iteration) --
     let mut results: Vec<(String, f64)> = uids
@@ -977,5 +964,142 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "a");
         assert!(result[0].1 > 0.0);
+    }
+
+    fn interaction_graph(names: &[&str], edges: &[(u32, u32)]) -> InMemoryGraph {
+        InMemoryGraph {
+            uids: names.iter().map(|n| n.to_string()).collect(),
+            nodes: names
+                .iter()
+                .map(|n| NodeMeta {
+                    name: (*n).into(),
+                    kind: "Function".into(),
+                    file_path: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                })
+                .collect(),
+            edges: edges
+                .iter()
+                .map(|&(a, b)| (a, b, 1.0, EdgeKind::Calls))
+                .collect(),
+            generation: 0,
+        }
+    }
+
+    /// Every node reachable from `seeds` along directed edges.
+    fn reachable_from(graph: &InMemoryGraph, seeds: &[&str]) -> HashSet<String> {
+        let mut seen: HashSet<String> = seeds.iter().map(|s| s.to_string()).collect();
+        let mut stack: Vec<String> = seen.iter().cloned().collect();
+        while let Some(uid) = stack.pop() {
+            let i = graph.uids.iter().position(|u| *u == uid).unwrap();
+            for &(a, b, _, _) in &graph.edges {
+                if a as usize == i && seen.insert(graph.uids[b as usize].clone()) {
+                    stack.push(graph.uids[b as usize].clone());
+                }
+            }
+        }
+        seen
+    }
+
+    /// rc-context-noise (B3): interaction memory was blended into the
+    /// teleport vector, so an interacted node the seed cannot reach still
+    /// received `alpha * w * s_i / sum(s)` of mass on every walk.
+    #[test]
+    fn interaction_bias_never_reaches_unreachable_node() {
+        let graph = interaction_graph(&["a", "b", "c"], &[(0, 1)]);
+        let adj = graph.build_adjacency(&EdgeWeightConfig::default_config());
+        let mut interaction_scores = HashMap::new();
+        interaction_scores.insert("c".to_string(), 10.0);
+        let config = PprConfig {
+            interaction_scores: Some(interaction_scores),
+            min_score: 0.0,
+            ..PprConfig::default()
+        };
+        let seeds = ["a".to_string()];
+        for (name, result) in [
+            (
+                "power",
+                personalized_pagerank(&graph.uids, &adj, &seeds, &config),
+            ),
+            ("push", forward_push_ppr(&graph.uids, &adj, &seeds, &config)),
+        ] {
+            assert!(
+                result.iter().all(|(uid, _)| uid != "c"),
+                "{name}: unreachable interacted node leaked into results: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dangling_mass_returns_to_seeds_only_with_interactions() {
+        // a -> b (b dangling), c -> d isolated from a; interactions on c and d.
+        let graph = interaction_graph(&["a", "b", "c", "d"], &[(0, 1), (2, 3)]);
+        let adj = graph.build_adjacency(&EdgeWeightConfig::default_config());
+        let mut interaction_scores = HashMap::new();
+        interaction_scores.insert("c".to_string(), 5.0);
+        interaction_scores.insert("d".to_string(), 5.0);
+        let config = PprConfig {
+            interaction_scores: Some(interaction_scores),
+            min_score: 0.0,
+            ..PprConfig::default()
+        };
+        let reachable = reachable_from(&graph, &["a"]);
+        let seeds = ["a".to_string()];
+        for (name, result) in [
+            (
+                "power",
+                personalized_pagerank(&graph.uids, &adj, &seeds, &config),
+            ),
+            ("push", forward_push_ppr(&graph.uids, &adj, &seeds, &config)),
+        ] {
+            for (uid, score) in &result {
+                if *score > 0.0 {
+                    assert!(
+                        reachable.contains(uid),
+                        "{name}: {uid} scored {score} but is unreachable from the seed"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forward_push_and_power_iteration_agree_with_interactions() {
+        let graph = interaction_graph(
+            &["n0", "n1", "n2", "n3", "n4", "n5", "x0", "x1"],
+            &[(0, 1), (0, 2), (1, 3), (2, 4), (4, 5), (6, 7)],
+        );
+        let adj = graph.build_adjacency(&EdgeWeightConfig::default_config());
+        let mut interaction_scores = HashMap::new();
+        interaction_scores.insert("n4".to_string(), 3.0);
+        interaction_scores.insert("n3".to_string(), 0.5);
+        interaction_scores.insert("x0".to_string(), 9.0);
+        let config = PprConfig {
+            interaction_scores: Some(interaction_scores),
+            ..PprConfig::default()
+        };
+        let seeds = ["n0".to_string()];
+        let pi = personalized_pagerank(&graph.uids, &adj, &seeds, &config);
+        let fp = forward_push_ppr(&graph.uids, &adj, &seeds, &config);
+        // Same row set and per-row scores within tolerance, compared by uid.
+        let pi_map: HashMap<&str, f64> = pi.iter().map(|(u, s)| (u.as_str(), *s)).collect();
+        let fp_map: HashMap<&str, f64> = fp.iter().map(|(u, s)| (u.as_str(), *s)).collect();
+        assert_eq!(
+            pi_map.keys().collect::<HashSet<_>>(),
+            fp_map.keys().collect::<HashSet<_>>(),
+            "row sets differ: {pi:?} vs {fp:?}"
+        );
+        for (uid, a) in &pi_map {
+            // The two algorithms differ by ~1e-3 on this graph without
+            // interactions too (20-step cap vs push threshold).
+            assert!(
+                (a - fp_map[uid]).abs() < 5e-3,
+                "scores diverge: {pi:?} vs {fp:?}"
+            );
+        }
+        // The interacted reached node outranks its uninteracted peer at equal depth.
+        assert!(pi_map["n4"] > pi_map["n3"] && fp_map["n4"] > fp_map["n3"]);
+        assert!(!pi_map.contains_key("x0") && !pi_map.contains_key("x1"));
     }
 }

@@ -38,7 +38,9 @@ const DEFAULT_LAMBDA: f64 = 0.05;
 /// changed since the last access.
 const HASH_CHANGE_PENALTY: f64 = 0.5;
 
-/// Minimum number of distinct sessions before the floor applies.
+/// Minimum number of distinct sessions before the floor applies. Only explicit
+/// use counts as a session (seed, access, follow-up, impact, terminal
+/// success); a result that was merely shown does not.
 const SESSION_FLOOR_THRESHOLD: u32 = 3;
 
 /// Minimum score for nodes accessed from enough distinct sessions.
@@ -408,17 +410,23 @@ fn consolidate_events(store: &mut InteractionStore, events: &[InteractionEvent])
                 // The first `seed_count` UIDs are seeds (weight 0.5 via
                 // `query_seed_count`); the remainder are shown results
                 // (weight 0.1 via `result_shown_count`).
+                //
+                // Only seeds count toward `distinct_sessions`. A shown result
+                // is not evidence of use: counting it let any row that
+                // surfaced in three sessions (noise included) earn the
+                // permanent `SESSION_FLOOR_SCORE`, which fed it back into
+                // every walk (rc-context-noise B3).
                 let boundary = event.seed_count.min(event.uids.len());
                 for (i, uid) in event.uids.iter().enumerate() {
                     let ns = store.node_scores.entry(uid.clone()).or_default();
                     if i < boundary {
                         ns.query_seed_count += 1;
+                        ns.session_ids.insert(event.session_id.clone());
+                        ns.distinct_sessions = ns.session_ids.len() as u32;
                     } else {
                         ns.result_shown_count += 1;
                     }
                     ns.last_accessed = event.timestamp;
-                    ns.session_ids.insert(event.session_id.clone());
-                    ns.distinct_sessions = ns.session_ids.len() as u32;
                 }
             }
             EventType::Access => {
@@ -792,6 +800,38 @@ mod tests {
         assert!(store.node_scores.contains_key("sym:c"));
         let after = load_node_score(&db_path, "sym:a").unwrap();
         assert_eq!(after.query_seed_count, before.query_seed_count);
+    }
+
+    /// rc-context-noise (B3) feedback loop: a node that was only SHOWN in
+    /// three sessions must not earn the permanent session floor. Only
+    /// explicit use (seed, access, follow-up, impact, terminal success)
+    /// counts toward `distinct_sessions`.
+    #[test]
+    fn shown_only_results_do_not_count_toward_the_session_floor() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_path_buf();
+        let _ = tmp.into_temp_path();
+        for session in ["s1", "s2", "s3"] {
+            let tracker = InteractionTracker::new_with_options(&db_path, 50, session);
+            tracker.record_query(
+                "brain_context",
+                &["sym:seed".to_string()],
+                &["sym:noise".to_string()],
+            );
+            tracker.flush().unwrap();
+        }
+        let noise = load_node_score(&db_path, "sym:noise").unwrap();
+        assert_eq!(noise.result_shown_count, 3);
+        assert_eq!(
+            noise.distinct_sessions, 0,
+            "shown-only results must not count toward the session floor"
+        );
+        // Far in the future the decayed score must fall below the floor.
+        let later = noise.last_accessed + 365.0 * 86400.0;
+        assert!(compute_decayed_score(&noise, later, false) < SESSION_FLOOR_SCORE);
+
+        let seed = load_node_score(&db_path, "sym:seed").unwrap();
+        assert_eq!(seed.distinct_sessions, 3, "explicit use still counts");
     }
 
     #[test]

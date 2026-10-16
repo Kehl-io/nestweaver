@@ -3913,6 +3913,42 @@ mod tests {
         }
     }
 
+    /// rc-context-noise (B3): interaction memory must never pull rows from a
+    /// component the seed cannot reach.
+    #[test]
+    fn code_only_ppr_with_interactions_on_other_component_is_unchanged() {
+        use std::collections::HashMap;
+
+        let store = test_store();
+        for uid in ["A", "B", "C", "X", "Y", "Z"] {
+            store
+                .insert_symbol(&make_symbol(uid, &format!("fn_{uid}")))
+                .unwrap();
+        }
+        store.insert_edge(&make_calls_edge("A", "B")).unwrap();
+        store.insert_edge(&make_calls_edge("B", "C")).unwrap();
+        store.insert_edge(&make_calls_edge("X", "Y")).unwrap();
+        store.insert_edge(&make_calls_edge("Y", "Z")).unwrap();
+
+        let baseline = store
+            .personalized_pagerank(&["A".to_string()], 0.85, 40, &GraphScope::code_only())
+            .unwrap();
+
+        let mut scores = HashMap::new();
+        for uid in ["X", "Y", "Z"] {
+            scores.insert(uid.to_string(), 50.0);
+        }
+        store.load_interaction_cache(scores);
+        let with_interactions = store
+            .personalized_pagerank(&["A".to_string()], 0.85, 40, &GraphScope::code_only())
+            .unwrap();
+
+        assert_eq!(
+            baseline, with_interactions,
+            "interactions on an unreachable component changed the rows"
+        );
+    }
+
     #[test]
     fn interaction_cache_load_and_clear() {
         use std::collections::HashMap;

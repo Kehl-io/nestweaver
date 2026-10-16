@@ -64,9 +64,10 @@ pub struct RankingConfig {
     ///
     /// Note this is not merely label collection for a future reranker: the
     /// scores feed `PprConfig::interaction_scores`, so enabling it changes live
-    /// ranking. The blend is deliberately capped (see the exploration floor in
-    /// `nestweaver-algorithms::ppr`), but it is a retrieval-behaviour change,
-    /// not just telemetry.
+    /// ranking. The effect is deliberately capped: it re-ranks only nodes the
+    /// walk already reached, by at most `1 + w` (see `apply_interaction_rerank`
+    /// in `nestweaver-algorithms::ppr`), but it is a retrieval-behaviour
+    /// change, not just telemetry.
     #[serde(default)]
     pub track_interactions: bool,
     /// Substring patterns matched case-insensitively against a symbol's file
