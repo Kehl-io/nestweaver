@@ -1578,8 +1578,6 @@ fn print_json_not_found_detail(
     println!("{}", json_not_found_payload(target_key, target, message));
 }
 
-/// [`print_json_not_found_detail`]'s payload, split out so the envelope can be
-/// asserted without capturing stdout.
 /// 12.1.1 (B9): whether a `get_summary` answer for a `--target` matched
 /// nothing at all (nothing returned, nothing cut).
 fn summary_target_missed(value: &serde_json::Value) -> bool {
@@ -1660,6 +1658,8 @@ fn report_feature_not_found(
     EXIT_NOT_FOUND
 }
 
+/// [`print_json_not_found_detail`]'s payload, split out so the envelope can be
+/// asserted without capturing stdout.
 fn json_not_found_payload(
     target_key: &str,
     target: &serde_json::Value,
@@ -3305,20 +3305,6 @@ fn print_json_not_found_suggesting(target_key: &str, target: &str, candidates: &
     );
 }
 
-/// Render a `dead-code` result as text from its JSON payload.
-///
-/// BOTH the direct and daemon paths render through this, so the two cannot
-/// drift. The daemon branch used to `println!` the RPC response verbatim with
-/// no `if json` guard, which meant the OUTPUT FORMAT depended on whether a
-/// daemon happened to be running rather than on the flag — `dead-code` printed
-/// text standalone and JSON once the daemon was up (nw-108). Driving both from
-/// the same payload makes parity structural rather than something to remember.
-/// Render an `investigate` bundle as text from its JSON payload.
-///
-/// Shared by the direct and daemon paths for the same reason as
-/// [`render_dead_code_text`]: the daemon branch printed its response verbatim,
-/// so the output format tracked whether a daemon was running instead of the
-/// `--json` flag (nw-108).
 /// 12.1.1 (V4): how `investigate` reports a failure it can classify, on both
 /// routes. The answer is said ONCE (the daemon route used to print the tool's
 /// answer, then the same text again inside "investigate RPC failed: code:
@@ -3381,6 +3367,12 @@ fn report_investigate_failure(
     None
 }
 
+/// Render an `investigate` bundle as text from its JSON payload.
+///
+/// Shared by the direct and daemon paths for the same reason as
+/// [`render_dead_code_text`]: the daemon branch printed its response verbatim,
+/// so the output format tracked whether a daemon was running instead of the
+/// `--json` flag (nw-108).
 fn render_investigate_text(payload: &serde_json::Value) {
     // 12.1.1 (V4): an answer served through a live watcher batch says so,
     // like `brain context`.
@@ -5097,6 +5089,14 @@ fn dead_code_walk_unseeded(payload: &serde_json::Value) -> bool {
     walk_roots == 0 && num("total_symbols").unwrap_or(0) > 0
 }
 
+/// Render a `dead-code` result as text from its JSON payload.
+///
+/// BOTH the direct and daemon paths render through this, so the two cannot
+/// drift. The daemon branch used to `println!` the RPC response verbatim with
+/// no `if json` guard, which meant the OUTPUT FORMAT depended on whether a
+/// daemon happened to be running rather than on the flag — `dead-code` printed
+/// text standalone and JSON once the daemon was up (nw-108). Driving both from
+/// the same payload makes parity structural rather than something to remember.
 fn render_dead_code_text(payload: &serde_json::Value) {
     let num = |k: &str| payload.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
     let total = num("total_symbols");

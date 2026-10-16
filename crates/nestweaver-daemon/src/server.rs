@@ -3684,12 +3684,6 @@ async fn watch_sigterm(state: Arc<DaemonState>) {
     }
 }
 
-/// Register a watcher's shutdown handle, returning its registration id (the
-/// watcher thread passes it to [`clear_watcher_registration`] on exit).
-///
-/// Refuses when a watcher is already registered unless `force` — in
-/// which case the incumbent (possibly orphaned by a kill -9'd `watch` CLI)
-/// is stopped and replaced instead of failing new watch sessions forever.
 /// D4: log a watcher's exit error with its WHOLE chain. `%error` on an
 /// `anyhow::Error` prints only the outermost context, which hid the
 /// write-transaction collision behind "atomic incremental vault refresh".
@@ -3702,6 +3696,12 @@ fn log_vault_watcher_error(error: &anyhow::Error, watcher_id: u64) {
     tracing::error!(error = %format_args!("{error:#}"), watcher_id, "watcher exited with error");
 }
 
+/// Register a watcher's shutdown handle, returning its registration id (the
+/// watcher thread passes it to [`clear_watcher_registration`] on exit).
+///
+/// Refuses when a watcher is already registered unless `force` — in
+/// which case the incumbent (possibly orphaned by a kill -9'd `watch` CLI)
+/// is stopped and replaced instead of failing new watch sessions forever.
 fn register_watcher(
     state: &DaemonState,
     handle: nestweaver_engine::ShutdownHandle,
