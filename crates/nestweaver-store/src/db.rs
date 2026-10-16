@@ -2686,9 +2686,6 @@ impl GraphStore {
         result
     }
 
-    /// Load pre-computed interaction memory scores into the in-memory cache.
-    /// When present, PPR's personalization vector blends a small fraction of
-    /// these scores to boost nodes the user has frequently accessed.
     /// Test hook (D2): observe every write a connection on this database
     /// starts — an explicit `BEGIN TRANSACTION` or a non-read-only prepared
     /// statement — so a test can prove none happens outside its write gate.
@@ -2698,6 +2695,9 @@ impl GraphStore {
         self.db.native_admission.set_write_observer(observer);
     }
 
+    /// Load pre-computed interaction memory scores into the in-memory cache.
+    /// When present, PPR slightly boosts nodes the walk already reached in
+    /// proportion to these scores (never nodes it did not reach).
     pub fn load_interaction_cache(&self, scores: HashMap<String, f64>) {
         *self
             .interaction_cache
