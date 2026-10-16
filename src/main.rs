@@ -40394,6 +40394,17 @@ mod clusters_forwarding_tests {
     use super::*;
 
     fn cluster_collector_store() -> nestweaver_store::GraphStore {
+        cluster_collector_store_with(150, 80, "")
+    }
+
+    /// `count` symbols in `repo:pages`; `symbol:000` and every symbol below
+    /// `star` call each other, so they form one community. `pad` lengthens
+    /// every name.
+    fn cluster_collector_store_with(
+        count: usize,
+        star: usize,
+        pad: &str,
+    ) -> nestweaver_store::GraphStore {
         use nestweaver_schema::{EdgeType, Repo, ResolvedEdge, Symbol, SymbolKind, Visibility};
         let store = nestweaver_store::GraphStore::in_memory().unwrap();
         store
@@ -40407,12 +40418,12 @@ mod clusters_forwarding_tests {
                 root_path: None,
             })
             .unwrap();
-        for index in 0..150 {
+        for index in 0..count {
             let uid = format!("symbol:{index:03}");
             store
                 .insert_symbol(&Symbol {
                     uid: uid.clone(),
-                    name: uid.clone(),
+                    name: format!("{uid}{pad}"),
                     kind: SymbolKind::Function,
                     repo_uid: "repo:pages".into(),
                     file_path: format!("src/{index}.rs"),
@@ -40431,7 +40442,7 @@ mod clusters_forwarding_tests {
                     canonical_id: None,
                 })
                 .unwrap();
-            if index > 0 && index < 80 {
+            if index > 0 && index < star {
                 for (a, b) in [("symbol:000", uid.as_str()), (uid.as_str(), "symbol:000")] {
                     store
                         .insert_edge(&ResolvedEdge {
@@ -40542,6 +40553,49 @@ mod clusters_forwarding_tests {
                 }
             }
         }
+    }
+
+    /// 12.1.1 (B2): `clusters --repo X --members 0` asks for a big
+    /// community's remaining members up to 200 at a time. On the CLI route
+    /// (full delivery) a page of 200 members could exceed the tool's 16 KB
+    /// listing allowance, the row was dropped, and the collector failed
+    /// with "empty cluster member continuation".
+    #[test]
+    fn cluster_collector_completes_a_large_community_on_the_cli_route() {
+        let store = cluster_collector_store_with(400, 400, &"_padded".repeat(12));
+        let mut args = clusters_tool_args(0, 0, None);
+        args["repos"] = serde_json::json!(["repo:pages"]);
+        let result = collect_cluster_tool_pages(
+            args,
+            |args| {
+                Ok(Some(nestweaver_mcp::tools::dispatch_cli(
+                    &store, None, "clusters", args, None,
+                )?))
+            },
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let rows = result["clusters"].as_array().unwrap();
+        let biggest = rows
+            .iter()
+            .max_by_key(|row| row["size"].as_u64().unwrap())
+            .unwrap();
+        assert!(
+            biggest["size"].as_u64().unwrap() > 220,
+            "fixture must need a member page past 200: {}",
+            biggest["size"]
+        );
+        assert_eq!(
+            biggest["members"].as_array().unwrap().len() as u64,
+            biggest["size"].as_u64().unwrap()
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["members"].as_array().unwrap().len())
+                .sum::<usize>(),
+            400
+        );
     }
 
     #[test]

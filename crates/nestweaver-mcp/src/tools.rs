@@ -14301,6 +14301,13 @@ fn mcp_clusters_rows(
         .filter(|c| id.is_none_or(|id| c.id as i64 == id))
         .count();
     let mut rows = Vec::new();
+    // 12.1.1 (B2): the first row is always kept, so a page always
+    // progresses. The CLI route (full delivery) pages a community's members
+    // 200 at a time, and one such row could exceed this allowance on its
+    // own: it was dropped, and `clusters --repo X --members 0` failed with
+    // "empty cluster member continuation". A bounded MCP row is capped well
+    // below the allowance (3 KB of members, 1 KB of key files), so this
+    // changes nothing there.
     let mut remaining = 16_000usize;
     for c in communities
         .iter_mut()
@@ -14313,10 +14320,10 @@ fn mcp_clusters_rows(
         c.members.sort_by(|a, b| a.uid.cmp(&b.uid));
         let row = mcp_cluster_page(c, members, offset)?;
         let cost = crate::output_budget::escaped_size(&row) + 1;
-        if cost > remaining {
+        if cost > remaining && !rows.is_empty() {
             break;
         }
-        remaining -= cost;
+        remaining = remaining.saturating_sub(cost);
         rows.push(row);
     }
     Ok((rows, total))
