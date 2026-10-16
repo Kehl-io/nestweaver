@@ -1041,23 +1041,25 @@ fn corruption_diagnostic(
             cause: drop_engine_retry_advice(&message),
         }
         .into(),
-        // V2: these say "delete this database ... deterministic". That is
-        // only provable when nothing else is writing the file: a read that
-        // races a live writer (the daemon mid-checkpoint, an index) can see
-        // a file shorter than its catalog or a half-written header and
-        // succeed on retry, which is what QA observed on 12.1.0.
+        // V2: a read that races a live writer's checkpoint can see a file
+        // shorter than its catalog and succeed on retry, which is what QA
+        // observed on 12.1.0. That race is the ONLY case downgraded: an
+        // engine assertion or an unclassified corruption is not explained by
+        // a live writer, and the daemon is up whenever the CLI runs, so
+        // downgrading those would mean never calling real corruption corrupt.
+        // The step it names makes the next attempt conclusive.
         CorruptionKind::FileTruncated
-        | CorruptionKind::EngineAssertion
-        | CorruptionKind::Unclassified
             if nestweaver_store::live_writer_holds_write_lease(Path::new(&path)) =>
         {
             CliDiagnostic::DatabaseUnavailable {
                 cause: format!(
-                    "{}\nAnother process was writing this database while it was read, \
-                     so this is not proof the file is damaged: retry once the write \
-                     finishes. Only if it repeats while nothing is writing the \
-                     database is the file itself damaged.",
-                    drop_engine_retry_advice(&message)
+                    "{}\nAnother process was writing this database while it was read \
+                     (a checkpoint can briefly leave the file shorter than its catalog), \
+                     so this is not yet proof the file is damaged. If it repeats, run \
+                     `nestweaver daemon --db {} stop` and re-run the command: a failure \
+                     with nothing writing the database means the file is damaged.",
+                    drop_engine_retry_advice(&message),
+                    shell_quote(&path),
                 ),
                 path,
             }
@@ -30148,9 +30150,6 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
              allowed in the system. The database file may be corrupted.",
             "index publication TRANSIENT: an index publication is in flight (marker age \
              3s). The database file may be corrupted.",
-            "health check timed out — daemon connected but unresponsive: catalog page \
-             range starts at 3567 and spans 5 pages, outside the database file with 1696 \
-             pages",
         ] {
             let report = into_diagnostic(anyhow::anyhow!("{raw}"));
             let code = report.code().map(|c| c.to_string()).unwrap_or_default();
@@ -30163,6 +30162,27 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
                 report.help().map(|h| h.to_string()).unwrap_or_default()
             );
             assert!(!rendered.contains("delete this database"), "{rendered}");
+        }
+    }
+
+    /// V2 review: a transient phrase elsewhere in the chain no longer hides a
+    /// definite verdict. A timed-out health check that relays a truncation,
+    /// and a refusal to overwrite a dirty publication that wraps one, are
+    /// corruption.
+    #[test]
+    fn a_transient_phrase_does_not_hide_a_truncated_file() {
+        for raw in [
+            "health check timed out — daemon connected but unresponsive: catalog page \
+             range starts at 3567 and spans 5 pages, outside the database file with 1696 \
+             pages",
+            "refusing to overwrite a dirty publication: catalog page range starts at 3567 \
+             and spans 5 pages, outside the database file with 1696 pages",
+            "refusing to overwrite a dirty publication: Assertion failed in file \
+             \"<crate>/column.cpp\" on line 289: x <= y",
+        ] {
+            let report = into_diagnostic(anyhow::anyhow!("{raw}"));
+            let code = report.code().map(|c| c.to_string()).unwrap_or_default();
+            assert_eq!(code, "nestweaver::db_corrupt", "{raw}");
         }
     }
 
@@ -30212,12 +30232,25 @@ lbug-0.19.1/lbug-src/src/storage/table/column.cpp\" on line 289: \
             unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
         );
-        for engine in messages {
+        // V2 review: only the checkpoint race (a truncated read) is
+        // downgraded, and it names the step that makes a retry conclusive.
+        let (code, help) = render(messages[0]);
+        assert_ne!(code, "nestweaver::db_corrupt", "{}", messages[0]);
+        assert!(!help.contains("delete this database"), "{help}");
+        assert!(!help.contains("deterministic"), "{help}");
+        assert!(
+            help.contains(&format!(
+                "nestweaver daemon --db {} stop",
+                shell_quote(&db.display().to_string())
+            )) && help.contains("re-run the command"),
+            "it must say what to do: {help}"
+        );
+        // An engine assertion and an unclassified corruption are corruption
+        // whether or not the daemon is up.
+        for engine in &messages[1..] {
             let (code, help) = render(engine);
-            assert_ne!(code, "nestweaver::db_corrupt", "{engine}");
-            assert!(!help.contains("delete this database"), "{help}");
-            assert!(!help.contains("deterministic"), "{help}");
-            assert!(help.contains("retry"), "it must say what to do: {help}");
+            assert_eq!(code, "nestweaver::db_corrupt", "{engine}");
+            assert!(help.contains("delete this database"), "{help}");
         }
     }
 

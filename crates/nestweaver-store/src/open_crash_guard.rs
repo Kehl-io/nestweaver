@@ -172,10 +172,12 @@ fn crash_message(path: &std::path::Path, contended: bool) -> String {
             "\nerror: the database at {} could not be opened: the storage engine \
              crashed while reading it.\n\
              Another process was writing this database at the time, so this is not \
-             proof the file is damaged: retry once the write finishes.\n\
-             Only if it repeats while nothing is writing the database is the file \
-             corrupt; then restore the most recent backup with `nestweaver backup \
+             yet proof the file is damaged.\n\
+             If it repeats, run `nestweaver daemon --db {} stop` and re-run the \
+             command. If it still crashes with nothing writing the database, the \
+             file is corrupt: restore the most recent backup with `nestweaver backup \
              restore <archive>`.\n",
+            path.display(),
             path.display()
         );
     }
@@ -204,7 +206,11 @@ mod crash_message_tests {
         let contended = super::crash_message(path, true);
         assert!(!contended.contains("delete this database"), "{contended}");
         assert!(!contended.contains("deterministic"), "{contended}");
-        assert!(contended.contains("retry"), "{contended}");
+        assert!(
+            contended.contains("nestweaver daemon --db /tmp/brain.lbug stop")
+                && contended.contains("re-run the command"),
+            "{contended}"
+        );
         assert!(contended.contains("/tmp/brain.lbug"), "{contended}");
     }
 }

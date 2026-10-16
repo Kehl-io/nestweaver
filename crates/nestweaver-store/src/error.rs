@@ -569,12 +569,6 @@ pub fn classify_engine_corruption(message: &str) -> Option<CorruptionKind> {
     if classify_checkpoint_failure(message).is_some() {
         return None;
     }
-    // V2: a write-transaction collision, a publication in flight or a busy
-    // daemon is a moment in another writer's life, never a property of the
-    // file, whatever engine sentence happens to share its error chain.
-    if classify_transient_condition(message).is_some() {
-        return None;
-    }
     let lower = message.to_lowercase();
     // These signatures are unambiguous and must win before the deliberately
     // broad WAL heuristic below. A daemon-refusal path such as `/walnut/...`
@@ -593,6 +587,17 @@ pub fn classify_engine_corruption(message: &str) -> Option<CorruptionKind> {
     // this arm is reached from both directions.
     if lower.starts_with("basic_string") || lower.contains("database error: basic_string") {
         return Some(CorruptionKind::EngineAssertion);
+    }
+    // V2: a write-transaction collision, a publication in flight or a busy
+    // daemon is a moment in another writer's life, never a property of the
+    // file. It suppresses only the HEURISTIC arms below (the WAL and
+    // "may be corrupted" sentences), which such a moment can produce. It never
+    // suppresses the definite verdicts above: a file shorter than its own
+    // catalog or an engine assertion is not made healthy by a transient
+    // phrase elsewhere in the chain (a timed-out health check, a refusal to
+    // overwrite a dirty publication that wraps the real cause).
+    if classify_transient_condition(message).is_some() {
+        return None;
     }
     // The engine has at least TWO phrasings for an unreadable log and they do
     // not share a word order:
@@ -1115,6 +1120,53 @@ mod corruption_classification_tests {
             classify_engine_corruption("The database file may be corrupted."),
             Some(CorruptionKind::Unclassified)
         );
+    }
+
+    /// V2 review: a transient phrase ANYWHERE in the chain used to return
+    /// "not corruption", so a timed-out health check that relayed a
+    /// truncation, or a refusal to overwrite a dirty publication that wrapped
+    /// an engine assertion, was never called corrupt. The transient check
+    /// suppresses only the heuristic arms; the definite verdicts stand.
+    #[test]
+    fn a_transient_phrase_never_hides_a_definite_corruption_verdict() {
+        const TRUNCATED: &str = "Cannot read checkpoint: catalog page range starts at 3567 \
+                                 and spans 5 pages, outside the database file with 1696 pages";
+        const ASSERTION: &str = "Assertion failed in file \"<crate>/column.cpp\" on line 289";
+        for (message, expected) in [
+            (
+                format!("health check timed out — daemon connected but unresponsive: {TRUNCATED}"),
+                CorruptionKind::FileTruncated,
+            ),
+            (
+                format!("refusing to overwrite a dirty publication: {TRUNCATED}"),
+                CorruptionKind::FileTruncated,
+            ),
+            (
+                format!("refusing to overwrite a dirty publication: {ASSERTION}"),
+                CorruptionKind::EngineAssertion,
+            ),
+            (
+                format!(
+                    "refusing to overwrite a dirty publication: database error: \
+                     basic_string::_M_create"
+                ),
+                CorruptionKind::EngineAssertion,
+            ),
+            (
+                format!("Cannot start a new write transaction in the system: {ASSERTION}"),
+                CorruptionKind::EngineAssertion,
+            ),
+        ] {
+            assert!(
+                classify_transient_condition(&message).is_some(),
+                "{message}"
+            );
+            assert_eq!(
+                classify_engine_corruption(&message),
+                Some(expected),
+                "{message}"
+            );
+        }
     }
 
     use super::*;
