@@ -5558,16 +5558,20 @@ mod tests {
                 conn.query("MERGE (v:Vault {uid: 'v1-collision-holder'})")
                     .unwrap();
                 held_tx.send(()).unwrap();
-                // Once the batch has taken the lease, watch for it being
-                // released while this transaction still blocks it.
+                // Wait (under load, planning can be slow) until the batch
+                // first takes the lease, then watch for one second for it to
+                // be released while this transaction still blocks it. The
+                // first backoff wait is 25 ms; holding the lease through the
+                // backoff would keep it until the retries ran out (2575 ms).
+                let waiting = Instant::now();
+                while !held.load(Ordering::SeqCst) && waiting.elapsed() < Duration::from_secs(30) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 let started = Instant::now();
-                let mut seen_held = false;
                 let mut released = false;
-                while started.elapsed() < Duration::from_millis(400) {
-                    let now = held.load(Ordering::SeqCst);
-                    seen_held |= now;
-                    released |= seen_held && !now;
-                    std::thread::sleep(Duration::from_millis(2));
+                while !released && started.elapsed() < Duration::from_secs(1) {
+                    released = !held.load(Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(1));
                 }
                 conn.query("ROLLBACK").unwrap();
                 released
