@@ -2607,9 +2607,12 @@ mod tests {
         );
         let disclosed = crate::index_md::load_skipped_notes_sidecar(&db_path);
         assert!(
-            disclosed.skipped.iter().any(|file| file.path == "Later.md"),
+            disclosed
+                .merged_skipped()
+                .iter()
+                .any(|file| file.path == "Later.md"),
             "the failed ingest stays disclosed: {:?}",
-            disclosed.skipped
+            disclosed.merged_skipped()
         );
 
         // Counterweight: fixed while no watcher ran, it is replayed and lands.
@@ -2649,7 +2652,7 @@ mod tests {
         });
         let pending = |db: &Path| {
             crate::index_md::load_skipped_notes_sidecar(db)
-                .skipped
+                .merged_skipped()
                 .into_iter()
                 .filter(|file| {
                     file.reason
@@ -2803,7 +2806,7 @@ mod tests {
                     thread::sleep(Duration::from_millis(50));
                 }
                 thread::sleep(Duration::from_millis(300));
-                let rows = crate::index_md::load_skipped_notes_sidecar(&db_path).skipped;
+                let rows = crate::index_md::load_skipped_notes_sidecar(&db_path).merged_skipped();
                 assert!(
                     rows.iter().any(|row| row.path == "locked"
                         && row.reason_code == nestweaver_parser::SkipReasonCode::ReadError),
@@ -2852,7 +2855,7 @@ mod tests {
                     .unwrap();
                 let deadline = Instant::now() + Duration::from_secs(30);
                 while !crate::index_md::load_skipped_notes_sidecar(&db_path)
-                    .skipped
+                    .merged_skipped()
                     .iter()
                     .any(|row| row.path == "fresh_locked")
                 {
@@ -3481,7 +3484,7 @@ mod tests {
         for path in ["escape.md", "alias.md"] {
             assert!(
                 sidecar
-                    .skipped
+                    .merged_skipped()
                     .iter()
                     .any(|row| row.path == path && row.reason.contains("symlink")),
                 "{path}: {sidecar:?}"
@@ -3508,7 +3511,7 @@ mod tests {
         let v_uid = vault_uid("default", &root.to_string_lossy());
         let rows = || -> Vec<String> {
             let mut rows: Vec<String> = crate::index_md::load_skipped_notes_sidecar(&db_path)
-                .skipped
+                .merged_skipped()
                 .into_iter()
                 .filter(|row| row.reason.contains("symlink"))
                 .map(|row| row.path)
@@ -3556,7 +3559,10 @@ mod tests {
             .unwrap();
         let sidecar = crate::index_md::load_skipped_notes_sidecar(&db_path);
         assert!(
-            sidecar.skipped.iter().any(|file| file.path == "huge.md"),
+            sidecar
+                .merged_skipped()
+                .iter()
+                .any(|file| file.path == "huge.md"),
             "new oversized note must land in the sidecar: {sidecar:?}"
         );
         let notes = store.list_notes(Some(&v_uid)).unwrap();
@@ -3639,8 +3645,8 @@ mod tests {
         );
         let sidecar = crate::index_md::load_skipped_notes_sidecar(&db_path);
         let rows: Vec<_> = sidecar
-            .skipped
-            .iter()
+            .merged_skipped()
+            .into_iter()
             .filter(|file| file.path == "Beta.md")
             .collect();
         assert_eq!(rows.len(), 1, "disclosed once: {sidecar:?}");
@@ -5023,7 +5029,7 @@ mod tests {
 
     fn nw_668_owed_debt(db_path: &Path) -> Vec<String> {
         crate::index_md::load_skipped_notes_sidecar(db_path)
-            .skipped
+            .merged_skipped()
             .into_iter()
             .filter(|file| {
                 file.reason
@@ -5193,7 +5199,7 @@ mod tests {
             "the owed notes are disclosed"
         );
         let reasons: Vec<String> = crate::index_md::load_skipped_notes_sidecar(&fx.db_path)
-            .skipped
+            .merged_skipped()
             .into_iter()
             .map(|file| file.reason)
             .collect();
@@ -5261,7 +5267,7 @@ mod tests {
         );
         assert!(
             crate::index_md::load_skipped_notes_sidecar(&fx.db_path)
-                .skipped
+                .merged_skipped()
                 .iter()
                 .all(|file| file
                     .reason
@@ -5322,7 +5328,7 @@ mod tests {
         assert_eq!(merged.failures, 3, "an owed retry keeps its schedule");
         let rows: HashMap<String, String> =
             crate::index_md::load_skipped_notes_sidecar(&fx.db_path)
-                .skipped
+                .merged_skipped()
                 .into_iter()
                 .map(|file| (file.path, file.reason))
                 .collect();
@@ -5679,7 +5685,7 @@ mod tests {
         );
         let _pending = watcher.owe_sidecar_retry(&fx.store, None, debt);
         let reasons: Vec<String> = crate::index_md::load_skipped_notes_sidecar(&fx.db_path)
-            .skipped
+            .merged_skipped()
             .into_iter()
             .map(|row| row.reason)
             .filter(|reason| reason.contains("retrying ("))
