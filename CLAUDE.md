@@ -462,7 +462,7 @@ nestweaver mcp --tools brain_context,brain_search,read_symbols --db ./nestweaver
 # Web UI
 nestweaver ui --db ./nestweaver.lbug --port 8080
 nestweaver ui --watch                    # live re-indexing via filesystem watcher
-# Append ?engine=wasm to run graph algorithms client-side via WASM.
+# Append ?engine=wasm to load a WASM graph snapshot. Queries, including PPR, run on the server.
 # Build with --remap-path-prefix so the build machine's home path (and the
 # username in .cargo/registry panic-location strings) is NOT baked into the
 # committed .wasm artifact:

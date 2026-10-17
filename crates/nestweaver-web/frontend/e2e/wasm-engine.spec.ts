@@ -61,7 +61,7 @@ test.describe("WASM engine (nw-570)", () => {
 
     const badge = page.getByRole("status", { name: "Graph engine" });
     await expect(badge).toContainText(/WASM/);
-    await expect(badge).toContainText(/ready/i, { timeout: 30_000 });
+    await expect(badge).toContainText(/Engine: server · WASM snapshot/i, { timeout: 30_000 });
     await expect.poll(() => engineSyncs(page)).toBe(1);
     expect(snapshots.count).toBe(1);
 
@@ -75,7 +75,7 @@ test.describe("WASM engine (nw-570)", () => {
     events.pending = true;
     await expect.poll(() => engineSyncs(page)).toBe(2);
     expect(snapshots.count).toBe(1);
-    await expect(badge).toContainText(/ready/i);
+    await expect(badge).toContainText(/Engine: server · WASM snapshot/i);
   });
 
   test("an unreadable /version never re-downloads a loaded snapshot on graph updates", async ({ page }) => {
@@ -85,7 +85,7 @@ test.describe("WASM engine (nw-570)", () => {
     const events = await controllableEvents(page);
     const snapshots = countSnapshotRequests(page);
     await openPanels(page, "/?engine=wasm");
-    await expect(page.getByRole("status", { name: "Graph engine" })).toContainText(/ready/i, {
+    await expect(page.getByRole("status", { name: "Graph engine" })).toContainText(/Engine: server · WASM snapshot/i, {
       timeout: 30_000,
     });
     await expect.poll(() => engineSyncs(page)).toBe(1);

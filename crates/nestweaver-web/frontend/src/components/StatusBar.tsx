@@ -79,9 +79,9 @@ export function StatusBar() {
         }
         title={
           wasm.mode === "server"
-            ? "Graph algorithms run on the server. Add ?engine=wasm to run them in the browser."
+            ? "Graph algorithms run on the server."
             : wasm.status === "ready"
-              ? `WASM: ${wasm.nodeCount} nodes, ${wasm.edgeCount} edges`
+              ? `WASM snapshot loaded: ${wasm.nodeCount} nodes, ${wasm.edgeCount} edges. Queries run on the server.`
               : wasm.status === "error"
                 ? `WASM failed: ${wasm.error ?? "unknown error"}`
                 : "WASM: downloading the graph snapshot"
@@ -90,7 +90,8 @@ export function StatusBar() {
         {wasm.mode === "server"
           ? "Engine: server"
           : wasm.status === "ready"
-            ? `Engine: WASM · ready (${wasm.nodeCount}n)`
+            // nw-752: the module has a snapshot; nothing calls wasmPpr.
+            ? `Engine: server · WASM snapshot (${wasm.nodeCount}n)`
             : wasm.status === "error"
               ? "Engine: WASM · failed"
               : "Engine: WASM · loading…"}
