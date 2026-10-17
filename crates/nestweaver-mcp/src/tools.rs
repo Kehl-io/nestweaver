@@ -20243,13 +20243,26 @@ mod investigate_body_complete_schema_tests {
 /// be invisible to precisely the reader that needs it. It is a
 /// natural-language sentence because the model reads text.
 fn ranking_staleness_note(store: &GraphStore) -> Option<String> {
-    let db_path = current_db_path(store).ok()?;
+    let db_path = generation_evidence_path(store).ok()?;
     let repos = store.list_repos(None).ok()?;
     let uids: Vec<String> = repos.into_iter().map(|repo| repo.uid).collect();
     if uids.is_empty() {
         return None;
     }
     nestweaver_engine::resolver_generation::staleness_note(&db_path, &uids)
+}
+
+/// The database whose resolver-generation sidecar is authoritative for `store`.
+///
+/// Prefer the file the store was opened from. `CURRENT_DB_PATH` is only the
+/// fallback for an in-memory store, which has no file. A logical publication
+/// anchor is not evidence: it has no generation record, so every repository
+/// would read as generation 0.
+fn generation_evidence_path(store: &GraphStore) -> Result<std::path::PathBuf, anyhow::Error> {
+    if let Some(path) = store.db_path() {
+        return Ok(path.to_path_buf());
+    }
+    current_db_path(store)
 }
 
 /// WHICH repos are stale, not merely that some are.
@@ -20266,7 +20279,7 @@ fn ranking_staleness_note(store: &GraphStore) -> Option<String> {
 ///  * "N of M repos were indexed by an older resolver" tells a caller to go
 ///    find out which. The human gets the list; the agent got a count.
 fn ranking_stale_repos(store: &GraphStore) -> Vec<String> {
-    let Ok(db_path) = current_db_path(store) else {
+    let Ok(db_path) = generation_evidence_path(store) else {
         return Vec::new();
     };
     let Ok(repos) = store.list_repos(None) else {
@@ -20303,7 +20316,7 @@ pub fn attach_ranking_staleness(resp: &mut Value, store: &GraphStore) {
     // thread-local was unset, so `repo-map` via daemon replied "not stale" on a
     // generation-3 database while `hubs` on the same daemon replied "stale".
     // The call site is fixed; this makes the next one loud instead of silent.
-    let unavailable = match (current_db_path(store), store.list_repos(None)) {
+    let unavailable = match (generation_evidence_path(store), store.list_repos(None)) {
         (Err(error), _) => Some(format!(
             "the database path is not set on this server ({error})"
         )),
@@ -20351,7 +20364,7 @@ pub fn attach_ranking_staleness(resp: &mut Value, store: &GraphStore) {
 /// daemon's `repo_map_json` answered `rankings_stale: false` on a
 /// generation-3 database: the value is unset on a `spawn_blocking` worker
 /// unless the call site remembers to set it. `GraphStore::db_path` cannot be
-/// unset by a worker thread, so reading it second REMOVES that hazard rather
+/// unset by a worker thread, so reading it first REMOVES that hazard rather
 /// than merely refusing on it. `None` from both means the store has no
 /// database file at all — an in-memory store, which has no sidecar because it
 /// has no disk, and whose graph was necessarily built in-process by THIS
@@ -20389,10 +20402,10 @@ fn resolver_generation_refusal(
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
     changed_files: Option<&[String]>,
 ) -> Result<Option<nestweaver_engine::resolver_generation::DeadCodeRefusal>, anyhow::Error> {
-    let db_path = match (current_db_path(store), store.db_path()) {
-        (Ok(path), _) => path,
-        (Err(_), Some(path)) => path.to_path_buf(),
-        (Err(_), None) => return Ok(None),
+    let db_path = match (store.db_path(), current_db_path(store)) {
+        (Some(path), _) => path.to_path_buf(),
+        (None, Ok(path)) => path,
+        (None, Err(_)) => return Ok(None),
     };
     // A store that cannot list repos cannot serve a reachability walk either,
     // so this PROPAGATES instead of refusing: the caller gets the store's own

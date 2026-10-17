@@ -321,8 +321,8 @@ pub(crate) fn run_ranking(
             // There is no daemon route to mirror: `ranking rank` opens the
             // store directly and has no `try_hybrid_json_rpc` guard, so the
             // direct constructor is the only one reachable.
-            warn_stale_resolver_rankings(&store, &db_path);
-            let staleness = ResolverStaleness::from_store(&store, &db_path);
+            warn_stale_resolver_rankings(&store);
+            let staleness = ResolverStaleness::from_store(&store);
 
             if json {
                 println!(

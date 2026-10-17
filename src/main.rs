@@ -2719,15 +2719,26 @@ fn nodes_len(nodes: &serde_json::Value) -> u64 {
 /// `bridges` and PageRank confidently wrong for every repo not yet re-indexed,
 /// and previously nothing disclosed it. Emitted on stderr so `--json` consumers
 /// are told without the payload changing shape.
-fn warn_stale_resolver_rankings(store: &nestweaver_store::GraphStore, db_path: &std::path::Path) {
-    let Ok(repos) = store.list_repos(None) else {
-        return;
-    };
+/// The resolver-generation caveat for the database `store` was opened from.
+///
+/// The sidecar is beside that file. A caller that still holds the logical
+/// anchor — the path before publication `CURRENT` is followed — must not
+/// supply it: an anchor with no generation record reads as generation 0, so
+/// every repository looks incompatible and the remedy says to force-reindex
+/// them all. Git SHA drift is not this verdict; `stale-check` reports that
+/// separately.
+fn resolver_ranking_note(store: &nestweaver_store::GraphStore) -> Option<String> {
+    let db_path = store.db_path()?;
+    let repos = store.list_repos(None).ok()?;
     let uids: Vec<String> = repos.into_iter().map(|r| r.uid).collect();
     if uids.is_empty() {
-        return;
+        return None;
     }
-    if let Some(note) = nestweaver_engine::resolver_generation::staleness_note(db_path, &uids) {
+    nestweaver_engine::resolver_generation::staleness_note(db_path, &uids)
+}
+
+fn warn_stale_resolver_rankings(store: &nestweaver_store::GraphStore) {
+    if let Some(note) = resolver_ranking_note(store) {
         eprintln!("warning: {note}");
     }
 }
@@ -2827,17 +2838,18 @@ struct ResolverStaleness {
 }
 
 impl ResolverStaleness {
-    /// Exact answer: enumerate the repos and compare each recorded generation.
-    /// Available only where we hold the store, i.e. the direct path.
-    fn from_store(store: &nestweaver_store::GraphStore, db_path: &std::path::Path) -> Self {
-        let uids: Vec<String> = store
-            .list_repos(None)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| r.uid)
-            .collect();
-        let stale_repos = nestweaver_engine::resolver_generation::load(db_path)
-            .stale_repos(uids.iter().map(String::as_str));
+    /// Exact answer: enumerate the repos and compare each recorded generation
+    /// on the database this store was opened from.
+    ///
+    /// That path is the same evidence `incompatible_repos_for_store` uses.
+    /// Passing a separate path let `repo-map` read the logical anchor after
+    /// `open_store` had already followed publication `CURRENT`, so a Git SHA
+    /// mismatch on an otherwise current graph was reported as every repository
+    /// being resolver-incompatible.
+    fn from_store(store: &nestweaver_store::GraphStore) -> Self {
+        let stale_repos =
+            nestweaver_engine::resolver_generation::incompatible_repos_for_store(store)
+                .unwrap_or_default();
         Self {
             rankings_stale: !stale_repos.is_empty(),
             stale_repos,
@@ -14885,6 +14897,223 @@ fn no_bytes_refusal(db_path: &std::path::Path) -> anyhow::Error {
 }
 
 #[cfg(test)]
+mod repo_map_resolver_generation_tests {
+    use super::*;
+    use nestweaver_engine::publication::{
+        self, ArtifactKind, CurrentPublicationPointer, PublicationBundleV3,
+    };
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "nw740")
+            .env("GIT_AUTHOR_EMAIL", "nw740@example.com")
+            .env("GIT_COMMITTER_NAME", "nw740")
+            .env("GIT_COMMITTER_EMAIL", "nw740@example.com")
+            .output()
+            .unwrap_or_else(|error| panic!("git {args:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "git {args:?}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// A published graph whose logical anchor has no generation sidecar.
+    /// Reading the anchor reports every repo as generation 0.
+    fn publish_repo(base: &Path, uid: &str, root: &Path, indexed_sha: &str) -> PathBuf {
+        let identity = nestweaver_store::PublicationIdentity::new_brain();
+        let root_dir = publication::default_publication_root(base);
+        let slot = publication::slot_path(&root_dir, &identity.publication_uuid).unwrap();
+        std::fs::create_dir_all(&slot).unwrap();
+        let graph_path = slot.join(publication::PUBLICATION_GRAPH_FILE);
+        let store = GraphStore::create_with_publication_identity(&graph_path, &identity).unwrap();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: uid.to_string(),
+                url: format!("file://{}", root.display()),
+                indexed_sha: indexed_sha.to_string(),
+                staleness_commits_behind: 1,
+                instance_id: "nw740".into(),
+                name: Some("ahead".into()),
+                root_path: Some(root.display().to_string()),
+            })
+            .unwrap();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: format!("{uid}-old"),
+                url: format!("file://{}/old", root.display()),
+                indexed_sha: indexed_sha.to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "nw740".into(),
+                name: Some("old-generation".into()),
+                root_path: Some(root.display().to_string()),
+            })
+            .unwrap();
+        let generation = store.graph_generation();
+        drop(store);
+        let ahead = uid.to_string();
+        let old = format!("{uid}-old");
+        nestweaver_engine::resolver_generation::record(&graph_path, &ahead).unwrap();
+        nestweaver_engine::resolver_generation::record(&graph_path, &old).unwrap();
+        let stamp_name = format!(
+            "{}{}",
+            publication::PUBLICATION_GRAPH_FILE,
+            nestweaver_store::engine_format::ENGINE_FORMAT_SIDECAR_SUFFIX
+        );
+        let descriptor = |path: &str, kind, fingerprint: &str| {
+            let bytes = std::fs::read(slot.join(path)).unwrap();
+            publication::ArtifactDescriptor {
+                path: path.to_string(),
+                kind,
+                artifact_schema_version: 1,
+                byte_size: bytes.len() as u64,
+                blake3: nestweaver_engine::hash::blake3_hex_bytes(&bytes),
+                brain_uuid: identity.brain_uuid.clone(),
+                publication_uuid: identity.publication_uuid.clone(),
+                producer_version: env!("CARGO_PKG_VERSION").to_string(),
+                source_graph_generation: generation,
+                algorithm_fingerprint: fingerprint.to_string(),
+            }
+        };
+        let bundle = PublicationBundleV3 {
+            format_version: nestweaver_engine::snapshot::SNAPSHOT_FORMAT_VERSION,
+            brain_uuid: identity.brain_uuid.clone(),
+            publication_uuid: identity.publication_uuid.clone(),
+            producer_version: env!("CARGO_PKG_VERSION").to_string(),
+            source_graph_generation: generation,
+            artifacts: vec![
+                descriptor(
+                    publication::PUBLICATION_GRAPH_FILE,
+                    ArtifactKind::Graph,
+                    "ladybugdb-graph-v1",
+                ),
+                descriptor(
+                    &stamp_name,
+                    ArtifactKind::CompatibilityStamp,
+                    "nestweaver-engine-format-v1",
+                ),
+            ],
+        };
+        let manifest = serde_json::to_vec_pretty(&bundle).unwrap();
+        std::fs::write(slot.join(publication::PUBLICATION_MANIFEST_FILE), &manifest).unwrap();
+        let pointer = CurrentPublicationPointer::new(
+            &identity,
+            None,
+            nestweaver_engine::hash::blake3_hex_bytes(&manifest),
+        )
+        .unwrap();
+        std::fs::write(
+            publication::current_pointer_path(&root_dir),
+            serde_json::to_vec_pretty(&pointer).unwrap(),
+        )
+        .unwrap();
+        graph_path
+    }
+
+    #[test]
+    fn a_repo_ahead_of_its_indexed_sha_is_not_resolver_incompatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        std::fs::write(repo.join("a.js"), "export function a() { return 1; }\n").unwrap();
+        git(&repo, &["add", "a.js"]);
+        git(&repo, &["commit", "-m", "indexed"]);
+        let indexed = git(&repo, &["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("a.js"), "export function a() { return 2; }\n").unwrap();
+        git(&repo, &["add", "a.js"]);
+        git(&repo, &["commit", "-m", "ahead"]);
+        let head = git(&repo, &["rev-parse", "HEAD"]);
+        assert_ne!(head, indexed, "HEAD must be ahead of the indexed SHA");
+        assert_ne!(
+            git(
+                &repo,
+                &["rev-list", "--count", &format!("{indexed}..{head}")]
+            ),
+            "0"
+        );
+
+        let base = dir.path().join("brain.lbug");
+        let uid = "repo:nw740:ahead";
+        let old = format!("{uid}-old");
+        let graph = publish_repo(&base, uid, &repo, &indexed);
+        assert!(
+            !nestweaver_engine::sidecar_path(
+                &base,
+                nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+            )
+            .exists(),
+            "the logical anchor must not carry the generation record"
+        );
+        let anchor_stale =
+            nestweaver_engine::resolver_generation::load(&base).stale_repos([uid, old.as_str()]);
+        assert_eq!(
+            anchor_stale,
+            vec![uid.to_string(), old.clone()],
+            "reading the anchor reports both repos incompatible; that is the false warning"
+        );
+
+        let store = open_store(Some(&base)).unwrap();
+        assert_eq!(store.db_path(), Some(graph.as_path()));
+        let current = ResolverStaleness::from_store(&store);
+        assert!(
+            !current.rankings_stale,
+            "HEAD ahead of the indexed SHA is not a resolver mismatch: {:?}",
+            current.stale_repos
+        );
+        assert!(
+            current.stale_repos.is_empty(),
+            "the SHA-ahead repo must not be listed for a force reindex: {:?}",
+            current.stale_repos
+        );
+        assert!(
+            resolver_ranking_note(&store).is_none(),
+            "repo-map must not advise `index --force` for a Git SHA mismatch: {:?}",
+            resolver_ranking_note(&store)
+        );
+        drop(store);
+
+        let sidecar = nestweaver_engine::sidecar_path(
+            &graph,
+            nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+        );
+        std::fs::write(
+            &sidecar,
+            serde_json::json!({
+                "repos": {
+                    uid: nestweaver_engine::resolver_generation::RESOLVER_GENERATION,
+                    old.as_str(): 1,
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = open_store(Some(&base)).unwrap();
+        let stale = ResolverStaleness::from_store(&store);
+        assert!(stale.rankings_stale);
+        assert_eq!(stale.stale_repos, vec![old.clone()]);
+        let note = resolver_ranking_note(&store).expect("an incompatible generation still warns");
+        assert!(
+            note.contains("1 of 2 repo(s) were incompatible with this resolver"),
+            "{note}"
+        );
+        assert!(
+            note.contains("nestweaver index --repo <path> --force"),
+            "{note}"
+        );
+        assert!(
+            !note.contains("2 of 2"),
+            "a Git SHA mismatch must not be counted as resolver-incompatible: {note}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod logical_publication_admission_tests {
     use super::*;
     use nestweaver_engine::publication;
@@ -17911,8 +18140,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "repo_map", args)? {
                     let map = value["map"].as_str().unwrap_or("");
                     // nw-370: read the daemon's own verdict, the same way
-                    // `hubs`/`bridges` do.
-                    let staleness = ResolverStaleness::from_daemon_response(&value, &db_path);
+                    // `hubs`/`bridges` do. The sidecar fallback has to follow
+                    // publication CURRENT too: the anchor this RPC dials has
+                    // no generation record of its own.
+                    let generation_db = selected_db_path(&db_path)?;
+                    let staleness = ResolverStaleness::from_daemon_response(&value, &generation_db);
                     print!("{map}");
                     warn_stale_resolver_rankings_no_store(&staleness);
                     return Ok((EXIT_SUCCESS, None));
@@ -17920,7 +18152,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             let store = open_store(db.as_deref())?;
-            let db_path = db.clone().unwrap_or_else(default_db_path);
             // nw-439: `repo-map --json` has no MCP/daemon twin that can
             // answer the full shape (the daemon's `repo_map_json` RPC exists
             // but cannot supply `truncated`/`files_returned`/`files_total` —
@@ -17950,12 +18181,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // this command — is computed over the edges an older resolver
             // wrote. Same disclosure as `hubs`, for a stronger reason: `hubs`
             // prints scores a reader can discount, this prints only an order.
-            warn_stale_resolver_rankings(&store, &db_path);
+            warn_stale_resolver_rankings(&store);
 
             if json {
                 print_repo_map_json(
                     &found.map,
-                    &ResolverStaleness::from_store(&store, &db_path),
+                    &ResolverStaleness::from_store(&store),
                     None,
                     Some(found.truncated()),
                     Some(found.files_returned),
@@ -19608,13 +19839,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // reaches the user in --json mode too. nw-308: stderr alone was
             // not enough — the bare-array payload had nowhere to put this, so
             // the `--json` consumer never saw it. The payload now carries it.
-            warn_stale_resolver_rankings(&store, &db_path);
+            warn_stale_resolver_rankings(&store);
 
             if json {
                 print_ranking_json(
                     "hubs",
                     &hubs,
-                    &ResolverStaleness::from_store(&store, &db_path),
+                    &ResolverStaleness::from_store(&store),
                     None,
                     &bounds,
                     None,
@@ -19813,7 +20044,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             .map_err(|e| nestweaver_mcp::tools::classify_index_publication_error(&store, e))?;
             let bounds = RankingBounds::from_bridges(&found);
             let mut bridges = found.bridges;
-            warn_stale_resolver_rankings(&store, &db_path);
+            warn_stale_resolver_rankings(&store);
 
             // Attach community connection info if clustering sidecar exists.
             if let Ok(Some(clustering)) = load_clusters(&db_path) {
@@ -19824,7 +20055,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 print_ranking_json(
                     "bridges",
                     &bridges,
-                    &ResolverStaleness::from_store(&store, &db_path),
+                    &ResolverStaleness::from_store(&store),
                     None,
                     &bounds,
                     None,
@@ -20170,12 +20401,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // thirty symbols. The other three levels are deliberately excluded:
             // File is not ranking-derived at all, and a flag present on every
             // level distinguishes nothing.
-            let hub_staleness = (parsed_level == SummaryLevel::Hub)
-                .then(|| ResolverStaleness::from_store(&store, &db_path));
+            let hub_staleness =
+                (parsed_level == SummaryLevel::Hub).then(|| ResolverStaleness::from_store(&store));
             if hub_staleness.is_some() {
                 // The store-holding variant, so this route prints the exact
                 // `N of M` denominator rather than the daemon route's floor.
-                warn_stale_resolver_rankings(&store, &db_path);
+                warn_stale_resolver_rankings(&store);
             }
 
             if json {

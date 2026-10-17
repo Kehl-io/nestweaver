@@ -1043,7 +1043,7 @@ pub(crate) fn run_brain(
             // (nw-358). No fourth decider is added here; this reads the same
             // verdict and joins it to the rows by uid.
             let resolver_stale: std::collections::HashSet<String> =
-                ResolverStaleness::from_store(&store, &db_path)
+                ResolverStaleness::from_store(&store)
                     .stale_repos
                     .into_iter()
                     .collect();
