@@ -707,11 +707,14 @@ fn socket_path_in(instance_id: &str, runtime: &Path) -> PathBuf {
     let uid = unsafe { libc::getuid() };
     let fallback_dir = socket_fallback_root();
     if let Err(e) = secure_fallback_sock_dir(&fallback_dir, uid) {
-        tracing::error!(
-            error = %e,
-            dir = %fallback_dir.display(),
-            "refusing squatted /tmp socket fallback dir"
-        );
+        let dir = fallback_dir.display().to_string();
+        emit_lifecycle_diagnostic(|| {
+            tracing::error!(
+                error = %e,
+                dir = %dir,
+                "refusing squatted /tmp socket fallback dir"
+            );
+        });
         return default;
     }
     let fallback = fallback_dir.join(instance_id);
@@ -719,12 +722,41 @@ fn socket_path_in(instance_id: &str, runtime: &Path) -> PathBuf {
     // `runtime_dir` (which callers create) is NOT the fallback's parent.
     let _ = std::fs::create_dir_all(&fallback);
     let fallback = fallback.join("daemon.sock");
-    tracing::warn!(
-        intended = %default.display(),
-        fallback = %fallback.display(),
-        "socket path exceeds the {SUN_PATH_LIMIT}-byte sun_path limit — using /tmp fallback"
-    );
+    let intended = default.display().to_string();
+    let fallback_display = fallback.display().to_string();
+    emit_lifecycle_diagnostic(|| {
+        tracing::warn!(
+            intended = %intended,
+            fallback = %fallback_display,
+            "socket path exceeds the {SUN_PATH_LIMIT}-byte sun_path limit — using /tmp fallback"
+        );
+    });
     fallback
+}
+
+/// Emit a lifecycle diagnostic without letting a closed stderr abort the caller.
+///
+/// The CLI's stderr subscriber turns a failed write into `eprintln!`, which
+/// panics with `failed printing to stderr: Broken pipe`. The process boundary
+/// treats that panic as a successful stdout close and exits 0, so a socket
+/// fallback warning was discarding the command's real status. A closed pipe
+/// means the reader is gone; every other panic still propagates.
+fn emit_lifecycle_diagnostic(emit: impl FnOnce()) {
+    let emit = std::panic::AssertUnwindSafe(emit);
+    if let Err(payload) = std::panic::catch_unwind(emit) {
+        if !lifecycle_panic_is_closed_stderr(payload.as_ref()) {
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+fn lifecycle_panic_is_closed_stderr(payload: &(dyn std::any::Any + Send)) -> bool {
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied())
+        .unwrap_or("");
+    message.contains("failed printing to stderr: Broken pipe")
 }
 
 /// Path to the PID file for the given instance.
@@ -4465,6 +4497,72 @@ mod tests {
         assert!(sock.starts_with("/tmp"), "got {}", sock.display());
         assert!(sock.ends_with("daemon.sock"));
         assert!(sock.parent().is_some_and(|p| p.exists()));
+    }
+
+    /// A closed stderr during the sun_path fallback warning must not unwind
+    /// out of `socket_path`. That panic is what the CLI boundary reports as a
+    /// successful stdout close, which turns a later exit 2/3 into exit 0.
+    #[test]
+    fn closed_stderr_during_socket_fallback_warning_still_returns_the_fallback() {
+        let unrelated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            emit_lifecycle_diagnostic(|| panic!("socket directory vanished"));
+        }));
+        assert!(
+            unrelated.is_err(),
+            "a lifecycle diagnostic must still propagate panics that are not a closed stderr"
+        );
+
+        struct ClosedStderr;
+        impl std::io::Write for ClosedStderr {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                // tracing-subscriber's own fallback for a failed event write
+                // is eprintln!, and that second write panics with this
+                // message once stderr is already closed.
+                panic!("failed printing to stderr: Broken pipe (os error 32)");
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let fallback_root = tempfile::tempdir().unwrap();
+        let long = format!("/run/user/{}", "x".repeat(120));
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let previous_runtime = std::env::var_os("XDG_RUNTIME_DIR");
+        let previous_fallback = std::env::var_os("NESTWEAVER_SOCK_FALLBACK_DIR");
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", &long);
+            std::env::set_var("NESTWEAVER_SOCK_FALLBACK_DIR", fallback_root.path());
+        }
+        let sock = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(|| ClosedStderr)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || socket_path("test1234"))
+        }));
+        unsafe {
+            match previous_runtime {
+                Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+            match previous_fallback {
+                Some(value) => std::env::set_var("NESTWEAVER_SOCK_FALLBACK_DIR", value),
+                None => std::env::remove_var("NESTWEAVER_SOCK_FALLBACK_DIR"),
+            }
+        }
+        let sock = sock.expect("closed stderr during the fallback warning must not abort");
+        assert!(sock.ends_with("daemon.sock"), "{}", sock.display());
+        assert!(
+            sock.starts_with(fallback_root.path()),
+            "fallback path must still be returned: {}",
+            sock.display()
+        );
+        assert!(
+            sock.as_os_str().len() < super::SUN_PATH_LIMIT,
+            "fallback socket path must fit sun_path: {}",
+            sock.display()
+        );
     }
 
     /// The /tmp fallback dir is created mode 0700 so no other user can

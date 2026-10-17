@@ -3262,8 +3262,22 @@ fn impact_json_not_found(symbol: &str) -> serde_json::Value {
 /// so every symbol-lookup command answers a miss with the same sentence and
 /// the same `path::name` suggestions.
 fn eprint_symbol_not_found(name_or_uid: &str, candidates: &[String]) {
-    eprintln!("Symbol '{name_or_uid}' not found.");
-    eprint_did_you_mean(candidates);
+    // `eprintln!` panics on EPIPE. The process boundary treats that panic as
+    // a closed stdout and exits 0, so a missing symbol with a closed stderr
+    // was succeeding with empty stdout instead of exiting 2.
+    let _ = eprint_symbol_not_found_to(&mut std::io::stderr().lock(), name_or_uid, candidates);
+}
+
+fn eprint_symbol_not_found_to(
+    writer: &mut impl std::io::Write,
+    name_or_uid: &str,
+    candidates: &[String],
+) -> std::io::Result<()> {
+    eprint_best_effort_to(writer, format_args!("Symbol '{name_or_uid}' not found."))?;
+    if let Some(line) = nestweaver_engine::did_you_mean::did_you_mean_line(candidates) {
+        eprint_best_effort_to(writer, line)?;
+    }
+    Ok(())
 }
 
 /// nw-113: the shared "Did you mean" line, printed only when there are
@@ -3271,7 +3285,7 @@ fn eprint_symbol_not_found(name_or_uid: &str, candidates: &[String]) {
 /// not-found message.
 fn eprint_did_you_mean(candidates: &[String]) {
     if let Some(line) = nestweaver_engine::did_you_mean::did_you_mean_line(candidates) {
-        eprintln!("{line}");
+        let _ = eprint_best_effort(line);
     }
 }
 
@@ -16170,6 +16184,55 @@ fn eprint_best_effort(message: impl std::fmt::Display) -> anyhow::Result<()> {
     eprint_best_effort_to(&mut std::io::stderr().lock(), message).map_err(Into::into)
 }
 
+/// Stderr writer for lifecycle diagnostics. A closed pipe is not a command
+/// failure: tracing-subscriber would otherwise `eprintln!` the write error,
+/// panic, and the process boundary would exit 0.
+struct BrokenPipeStderr<W> {
+    inner: W,
+}
+
+impl BrokenPipeStderr<std::io::Stderr> {
+    fn process() -> Self {
+        Self {
+            inner: std::io::stderr(),
+        }
+    }
+}
+
+impl<W> BrokenPipeStderr<W> {
+    fn new(inner: W) -> Self {
+        Self { inner }
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for BrokenPipeStderr<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.inner.write(buf) {
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(buf.len()),
+            other => other,
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.inner.flush() {
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            other => other,
+        }
+    }
+}
+
+macro_rules! cli_stderr_tracing {
+    () => {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive(tracing::Level::WARN.into()),
+            )
+            .with_writer(BrokenPipeStderr::process)
+            .log_internal_errors(false)
+    };
+}
+
 fn write_stderr_to(
     writer: &mut impl std::io::Write,
     message: impl std::fmt::Display,
@@ -16248,6 +16311,32 @@ mod broken_pipe_policy_tests {
                 .expect("closed stderr should not fail an ambiguous report");
         assert_eq!(result, (EXIT_AMBIGUOUS, None));
     }
+
+    #[test]
+    fn closed_stderr_lifecycle_warning_does_not_mask_not_found() {
+        use std::io::Write;
+
+        struct ClosedPipe;
+        impl std::io::Write for ClosedPipe {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+        }
+
+        let mut stderr = BrokenPipeStderr::new(ClosedPipe);
+        writeln!(
+            stderr,
+            "socket path exceeds the 104-byte sun_path limit — using /tmp fallback"
+        )
+        .expect("socket-path fallback warning must tolerate a closed stderr");
+        let exit = eprint_symbol_not_found_to(&mut stderr, "missing-symbol", &[])
+            .map(|()| EXIT_NOT_FOUND)
+            .expect("not-found message must tolerate a closed stderr");
+        assert_eq!(exit, EXIT_NOT_FOUND);
+    }
 }
 
 /// Give the `daemon start` parent its stderr subscriber back after the fork.
@@ -16258,13 +16347,7 @@ mod broken_pipe_policy_tests {
 /// because on the child's path a subscriber is already global.
 #[cfg(not(target_os = "macos"))]
 fn restore_parent_stderr_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::WARN.into()),
-        )
-        .with_writer(std::io::stderr)
-        .try_init();
+    let _ = cli_stderr_tracing!().try_init();
 }
 
 /// Convert a daemon `tonic::Status` into an error that renders its message
@@ -16394,13 +16477,7 @@ fn main() {
     #[cfg(target_os = "macos")]
     let forks_into_daemon = false;
     if !is_daemon_run && !forks_into_daemon {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive(tracing::Level::WARN.into()),
-            )
-            .with_writer(std::io::stderr)
-            .init();
+        cli_stderr_tracing!().init();
     }
     let out = OutputConfig::from_cli(&cli);
     let show_stats = cli.stats;
@@ -16464,8 +16541,10 @@ fn main() {
             };
             let report = into_diagnostic(e);
             if let Err(error) = write_stderr(format_args!("{report:?}")) {
+                // The failure message is what hit the closed pipe. Dropping
+                // it must not replace the command's exit code with success.
                 process::exit(if error.kind() == std::io::ErrorKind::BrokenPipe {
-                    EXIT_SUCCESS
+                    code
                 } else {
                     EXIT_ERROR
                 });
