@@ -153,6 +153,26 @@ where
         for line in reader.lines() {
             let line = match line {
                 Ok(line) => line,
+                // nw-745: `BufRead::lines` consumes a frame that is not valid
+                // UTF-8 and returns InvalidData ("stream did not contain valid
+                // UTF-8"). That frame is a JSON-RPC parse error, the same
+                // -32700 a malformed JSON line already gets. Reply and keep
+                // reading so the next request is still served.
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    if write(
+                        &reader_output,
+                        &failure(
+                            Value::Null,
+                            error_code::PARSE_ERROR,
+                            format!("invalid JSON: {error}"),
+                        ),
+                    )
+                    .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
                 Err(error) => {
                     let _ = sender.send(Err(error));
                     return;
@@ -396,6 +416,40 @@ mod tests {
         assert!(batch[0].get("result").is_none(), "{batch}");
         assert_eq!(batch[1]["error"]["code"], -32602, "{batch}");
         assert_eq!(batch[2]["result"]["isError"], false, "{batch}");
+    }
+
+    /// nw-745 clause 3. Bytes `\xff\xfe\n` are not valid UTF-8, so
+    /// `BufRead::lines` yields InvalidData. The server answers JSON-RPC
+    /// -32700 and still serves the following request.
+    #[test]
+    fn invalid_utf8_frame_is_a_parse_error_and_the_next_request_is_served() {
+        let (writer, output) = writer();
+        let mut input = Vec::new();
+        input.extend_from_slice(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+        input.push(b'\n');
+        input.extend_from_slice(&[0xff, 0xfe, b'\n']);
+        input.extend_from_slice(br#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#);
+        input.push(b'\n');
+        run_with_io(std::io::Cursor::new(input), writer, |req, _| {
+            panic!("control frame reached dispatch: {req:?}");
+        })
+        .unwrap();
+        let first = output.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(first["id"], 1, "{first}");
+        assert!(first.get("error").is_none(), "{first}");
+        let parse = output.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(parse["jsonrpc"], "2.0", "{parse}");
+        assert_eq!(parse["id"], Value::Null, "{parse}");
+        assert_eq!(parse["error"]["code"], error_code::PARSE_ERROR, "{parse}");
+        let message = parse["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("UTF-8"),
+            "parse-error message should name the UTF-8 failure: {parse}"
+        );
+        let third = output.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(third["id"], 3, "{third}");
+        assert_eq!(third["result"], json!({}), "{third}");
+        assert!(output.try_recv().is_err(), "unexpected extra frame");
     }
 
     #[test]
