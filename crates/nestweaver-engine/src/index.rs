@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -3837,6 +3837,9 @@ struct IndexResolution {
     insertable_edges: Vec<nestweaver_schema::ResolvedEdge>,
     inferred_cross_repo_edges: Vec<nestweaver_schema::ResolvedEdge>,
     member_of_edges: Vec<nestweaver_schema::ResolvedEdge>,
+    /// Importer rel-path → unresolved import specifiers, for files this pass
+    /// actually resolved. Empty when resolution was skipped. nw-806.
+    unresolved_imports: HashMap<String, HashSet<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -4107,12 +4110,27 @@ fn prepare_index_resolution(
         .collect();
 
     resolve_pb.finish_and_clear();
+    // nw-806: remember specifiers that did not resolve so a later added file
+    // can find the importers. Only files this pass resolved are recorded;
+    // everyone else keeps the sidecar entry they already have.
+    let unresolved_imports = if skip_resolution {
+        HashMap::new()
+    } else {
+        let only = resolve_filter.clone().unwrap_or_else(|| {
+            resolver_view
+                .iter()
+                .map(|(path, _, _)| path.clone())
+                .collect()
+        });
+        unresolved_imports_for_resolved_files(&resolver_view, file_languages, &workspace_ctx, &only)
+    };
     let resolution = IndexResolution {
         skip_resolution,
         resolve_filter,
         insertable_edges,
         inferred_cross_repo_edges,
         member_of_edges,
+        unresolved_imports,
     };
     tracing::info!(
         edges_resolved = resolution.edges_count(),
@@ -5299,6 +5317,9 @@ where
                             if resolved.contains(file) {
                                 let deps = file_deps.remove(file).unwrap_or_default();
                                 rd.set_deps_for_repo(&r_uid, file.clone(), deps);
+                                if let Some(specs) = resolution.unresolved_imports.get(file) {
+                                    rd.set_unresolved_for_repo(&r_uid, file.clone(), specs.clone());
+                                }
                             }
                         }
                     }
@@ -5306,6 +5327,9 @@ where
                         for (path, _, _, _) in &parsed_files_for_resolver {
                             let deps = file_deps.remove(path).unwrap_or_default();
                             rd.set_deps_for_repo(&r_uid, path.clone(), deps);
+                            if let Some(specs) = resolution.unresolved_imports.get(path) {
+                                rd.set_unresolved_for_repo(&r_uid, path.clone(), specs.clone());
+                            }
                         }
                     }
                 }
@@ -7117,7 +7141,16 @@ fn incremental_index_with_name_and_io_and_authority(
     // nw-008 Phase 0 — transitive reverse-dependents from the LIVE graph, BEFORE
     // any mutation (the per-file `DETACH DELETE` destroys the edges we walk).
     let (changed_files, removed_files) = partition_changed_removed(&changes, skip_reader);
-    let rdeps = collect_reverse_dep_files(&store, &r_uid, &changed_files, &removed_files);
+    let mut rdeps = collect_reverse_dep_files(&store, &r_uid, &changed_files, &removed_files);
+    extend_rdeps_for_added_files(
+        skip_reader,
+        &store,
+        Some(db_path),
+        &r_uid,
+        &changed_files,
+        &removed_files,
+        &mut rdeps,
+    );
     let contract_plan = match prepare_incremental_contract_derivation(&reader, &r_uid, repo_url) {
         Ok(plan) => plan,
         Err(error) => {
@@ -7374,6 +7407,15 @@ fn incremental_index_with_name_and_io_and_authority(
     if let Err(error) = store.clear_contract_derivation_failed(&r_uid) {
         tracing::warn!("clearing contract derivation marker failed: {error}");
     }
+    persist_unresolved_imports(
+        &reader,
+        &store,
+        db_path,
+        &r_uid,
+        &changed_files,
+        &removed_files,
+        &rdeps,
+    );
 
     // AFTER the commit, never before: a modified file has its symbols deleted
     // and re-inserted under the same UIDs, so the pre-commit graph would report
@@ -7508,7 +7550,16 @@ where
     // graph BEFORE any mutation. The per-file `DETACH DELETE` below destroys the
     // edges we walk here, so this ordering is correctness-critical.
     let (changed_files, removed_files) = partition_changed_removed(&changes, skip_reader);
-    let rdeps = collect_reverse_dep_files(store, &r_uid, &changed_files, &removed_files);
+    let mut rdeps = collect_reverse_dep_files(store, &r_uid, &changed_files, &removed_files);
+    extend_rdeps_for_added_files(
+        skip_reader,
+        store,
+        store.db_path(),
+        &r_uid,
+        &changed_files,
+        &removed_files,
+        &mut rdeps,
+    );
     let contract_plan_result = prepare_incremental_contract_derivation(reader, &r_uid, repo_url);
     let prepared_files = prepare_incremental_files(reader, &changes)
         .context("prepare server incremental source files")?;
@@ -7762,6 +7813,17 @@ where
     drop(txn);
     if let Err(error) = store.clear_contract_derivation_failed(&r_uid) {
         tracing::warn!("clearing contract derivation marker failed: {error}");
+    }
+    if let Some(db_path) = store.db_path() {
+        persist_unresolved_imports(
+            reader,
+            store,
+            db_path,
+            &r_uid,
+            &changed_files,
+            &removed_files,
+            &rdeps,
+        );
     }
 
     // See the note at the sibling call site: this must follow the commit.
@@ -8123,6 +8185,330 @@ fn partition_changed_removed(
 /// per-file `DETACH DELETE` in the mutation loop destroys the very edges this
 /// query reads.
 ///
+/// nw-806. An added file has no reverse edges: they left with the previous
+/// copy, and an import that never resolved never had one. Seed importers
+/// whose persisted unresolved specifiers name the new path so the re-resolve
+/// pass rebuilds those edges.
+pub(crate) fn extend_rdeps_for_added_files(
+    reader: &dyn crate::content_reader::ContentReader,
+    store: &GraphStore,
+    db_path: Option<&Path>,
+    r_uid: &str,
+    changed: &HashSet<String>,
+    removed: &HashSet<String>,
+    rdeps: &mut HashSet<String>,
+) {
+    let Some(db_path) = db_path else {
+        return;
+    };
+    let deps = crate::resolution_cache::ResolutionDeps::load(&crate::sidecar_path(
+        db_path,
+        ".resolution_deps.bin",
+    ));
+    let Some(unresolved) = deps.unresolved_for_repo(r_uid) else {
+        return;
+    };
+    if unresolved.is_empty() {
+        return;
+    }
+    let Ok(listed) = store.list_files_by_repo(r_uid) else {
+        tracing::warn!("listing files for unresolved-import re-resolution failed");
+        return;
+    };
+    let existing: HashSet<String> = listed.into_iter().map(|(_, path)| path).collect();
+    let added: HashSet<String> = changed
+        .iter()
+        .filter(|path| !existing.contains(*path))
+        .cloned()
+        .collect();
+    if added.is_empty() {
+        return;
+    }
+    let mut known = existing;
+    for path in removed {
+        known.remove(path);
+    }
+    known.extend(changed.iter().cloned());
+    let seeded = importers_of_added_paths(reader, unresolved, &added, &known);
+    if seeded.is_empty() {
+        return;
+    }
+    tracing::info!(
+        count = seeded.len(),
+        "re-resolving files whose unresolved imports name an added file"
+    );
+    rdeps.extend(seeded);
+}
+
+/// After a committed incremental or watcher batch, refresh unresolved import
+/// specifiers for the files this batch re-resolved (and drop entries for
+/// files that are gone). A delete-only batch does not re-resolve — the
+/// target's edges die with its symbols — so this parse is what records the
+/// specifier the next create has to find.
+pub(crate) fn persist_unresolved_imports(
+    reader: &dyn crate::content_reader::ContentReader,
+    store: &GraphStore,
+    db_path: &Path,
+    r_uid: &str,
+    changed: &HashSet<String>,
+    removed: &HashSet<String>,
+    rdeps: &HashSet<String>,
+) {
+    let mut refresh = rdeps.clone();
+    refresh.extend(changed.iter().cloned());
+    for path in removed {
+        refresh.remove(path);
+    }
+    if refresh.is_empty() && removed.is_empty() {
+        return;
+    }
+    let path = crate::sidecar_path(db_path, ".resolution_deps.bin");
+    let mut deps = crate::resolution_cache::ResolutionDeps::load(&path);
+    if !removed.is_empty() {
+        deps.drop_files_for_repo(r_uid, removed);
+    }
+    if !refresh.is_empty() {
+        match store.list_files_by_repo(r_uid) {
+            Ok(listed) => {
+                let known: HashSet<String> = listed.into_iter().map(|(_, file)| file).collect();
+                for (file, specifiers) in unresolved_imports_on_disk(reader, &known, &refresh) {
+                    deps.set_unresolved_for_repo(r_uid, file, specifiers);
+                }
+            }
+            Err(error) => {
+                tracing::warn!("listing files to persist unresolved imports failed: {error}");
+            }
+        }
+    }
+    if let Err(error) = deps.save(&path) {
+        tracing::warn!("failed to save unresolved import specifiers: {error:#}");
+    }
+}
+
+fn import_specifier_ref(specifier: &str) -> RawReference {
+    RawReference {
+        scope: None,
+        name: specifier.to_string(),
+        kind: nestweaver_parser::ReferenceKind::Import,
+        start_line: 1,
+        context: String::new(),
+        receiver: None,
+    }
+}
+
+fn language_uses_workspace_context(language: Language) -> bool {
+    matches!(
+        language,
+        Language::JavaScript
+            | Language::TypeScript
+            | Language::Vue
+            | Language::Svelte
+            | Language::Astro
+    )
+}
+
+/// Workspace packages and tsconfig aliases for import resolution. This is the
+/// discovery `build_reresolve_edges_unlogged` uses, so a stored alias or
+/// workspace specifier maps onto the same path the re-resolve pass sees.
+fn workspace_context_for_languages(
+    reader: &dyn crate::content_reader::ContentReader,
+    languages: impl IntoIterator<Item = Language>,
+) -> nestweaver_resolver::WorkspaceContext {
+    if languages.into_iter().any(language_uses_workspace_context) {
+        discover_workspace_context_with(|path| {
+            reader
+                .read_file(path)
+                .map_err(|error| std::io::Error::other(error.to_string()))
+        })
+    } else {
+        nestweaver_resolver::WorkspaceContext::default()
+    }
+}
+
+/// Files in `unresolved` whose stored specifiers resolve to a path in `added`
+/// once `known_files` (including the added paths) is the resolution set.
+fn importers_of_added_paths(
+    reader: &dyn crate::content_reader::ContentReader,
+    unresolved: &HashMap<String, HashSet<String>>,
+    added: &HashSet<String>,
+    known_files: &HashSet<String>,
+) -> HashSet<String> {
+    let mut by_lang: HashMap<Language, Vec<String>> = HashMap::new();
+    for file in unresolved.keys() {
+        let Some(language) = detect_language(Path::new(file)) else {
+            continue;
+        };
+        by_lang.entry(language).or_default().push(file.clone());
+    }
+    let workspace = workspace_context_for_languages(reader, by_lang.keys().copied());
+    let mut seeded = HashSet::new();
+    for (language, importers) in by_lang {
+        let mut slice: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> = known_files
+            .iter()
+            .map(|path| (path.clone(), Vec::new(), Vec::new()))
+            .collect();
+        let index: HashMap<String, usize> = slice
+            .iter()
+            .enumerate()
+            .map(|(index, (path, _, _))| (path.clone(), index))
+            .collect();
+        for importer in &importers {
+            let Some(specs) = unresolved.get(importer) else {
+                continue;
+            };
+            let refs: Vec<RawReference> = specs
+                .iter()
+                .map(|spec| import_specifier_ref(spec))
+                .collect();
+            if let Some(&position) = index.get(importer) {
+                slice[position].2 = refs;
+            } else {
+                slice.push((importer.clone(), Vec::new(), refs));
+            }
+        }
+        let graph = nestweaver_resolver::imports::build_import_graph(&slice, language, &workspace);
+        for (source, _specifier, target) in graph.all_resolved_imports() {
+            if source != target && added.contains(target) {
+                seeded.insert(source.to_string());
+            }
+        }
+    }
+    seeded
+}
+
+fn unresolved_imports_on_disk(
+    reader: &dyn crate::content_reader::ContentReader,
+    known_files: &HashSet<String>,
+    refresh: &HashSet<String>,
+) -> HashMap<String, HashSet<String>> {
+    let mut languages = HashMap::new();
+    let mut file_data: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for path in known_files {
+        let Some(language) = detect_language(Path::new(path)) else {
+            continue;
+        };
+        languages.insert(path.clone(), language);
+        index.insert(path.clone(), file_data.len());
+        file_data.push((path.clone(), Vec::new(), Vec::new()));
+    }
+    // A file this pass could not re-read keeps its previous specifiers.
+    let mut parsed = HashSet::new();
+    for rel in refresh {
+        let Some(language) = detect_language(Path::new(rel)) else {
+            continue;
+        };
+        let Ok(source) = reader.read_file(Path::new(rel)) else {
+            continue;
+        };
+        let Ok(parsed_file) = parse_source(&reader.root().join(rel), &source) else {
+            continue;
+        };
+        languages.insert(rel.clone(), language);
+        parsed.insert(rel.clone());
+        if let Some(&position) = index.get(rel) {
+            file_data[position].1 = parsed_file.symbols;
+            file_data[position].2 = parsed_file.references;
+        } else {
+            index.insert(rel.clone(), file_data.len());
+            file_data.push((rel.clone(), parsed_file.symbols, parsed_file.references));
+        }
+    }
+    let workspace = workspace_context_for_languages(reader, languages.values().copied());
+    unresolved_import_specifiers(&file_data, &languages, &workspace, &parsed)
+}
+
+/// Unresolved import specifiers for `only`, resolved against every path in
+/// `file_data`. An empty set means the file was resolved and every import
+/// specifier hit a known file — callers use that to clear a stale entry.
+fn unresolved_import_specifiers(
+    file_data: &[(String, Vec<RawSymbol>, Vec<RawReference>)],
+    languages: &HashMap<String, Language>,
+    workspace: &nestweaver_resolver::WorkspaceContext,
+    only: &HashSet<String>,
+) -> HashMap<String, HashSet<String>> {
+    let references: HashMap<&str, &Vec<RawReference>> = file_data
+        .iter()
+        .map(|(path, _, references)| (path.as_str(), references))
+        .collect();
+    let mut by_lang: HashMap<Language, Vec<&str>> = HashMap::new();
+    for path in only {
+        let Some(language) = languages.get(path) else {
+            continue;
+        };
+        if references.contains_key(path.as_str()) {
+            by_lang.entry(*language).or_default().push(path.as_str());
+        }
+    }
+    let mut out = HashMap::new();
+    for (language, files) in by_lang {
+        let graph =
+            nestweaver_resolver::imports::build_import_graph(file_data, language, workspace);
+        for path in files {
+            let imports = graph.imports_of(path);
+            let resolved: HashSet<&str> = imports
+                .iter()
+                .map(|(specifier, _)| specifier.as_str())
+                .collect();
+            let mut specs = HashSet::new();
+            let Some(file_refs) = references.get(path) else {
+                continue;
+            };
+            for reference in *file_refs {
+                let specifier = match reference.kind {
+                    nestweaver_parser::ReferenceKind::Import
+                    | nestweaver_parser::ReferenceKind::Includes
+                    | nestweaver_parser::ReferenceKind::Uses => Some(reference.name.as_str()),
+                    nestweaver_parser::ReferenceKind::ImportAlias
+                        if !reference.context.is_empty() =>
+                    {
+                        Some(reference.context.as_str())
+                    }
+                    _ => None,
+                };
+                if let Some(specifier) = specifier.filter(|specifier| !specifier.is_empty())
+                    && !resolved.contains(specifier)
+                {
+                    specs.insert(specifier.to_string());
+                }
+            }
+            out.insert(path.to_string(), specs);
+        }
+    }
+    out
+}
+
+/// Specifiers that failed to resolve for files in `only` that this pass
+/// actually parsed. Known paths include every scanned file, not only the
+/// parsed subset, so an unchanged target is not recorded as unresolved.
+fn unresolved_imports_for_resolved_files(
+    resolver_view: &[(String, Vec<RawSymbol>, Vec<RawReference>)],
+    file_languages: &HashMap<String, Language>,
+    workspace: &nestweaver_resolver::WorkspaceContext,
+    only: &HashSet<String>,
+) -> HashMap<String, HashSet<String>> {
+    let mut file_data: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> = file_languages
+        .keys()
+        .map(|path| (path.clone(), Vec::new(), Vec::new()))
+        .collect();
+    let index: HashMap<String, usize> = file_data
+        .iter()
+        .enumerate()
+        .map(|(position, (path, _, _))| (path.clone(), position))
+        .collect();
+    for (path, _symbols, references) in resolver_view {
+        if !only.contains(path) {
+            continue;
+        }
+        if let Some(&position) = index.get(path) {
+            file_data[position].2.clone_from(references);
+        } else {
+            file_data.push((path.clone(), Vec::new(), references.clone()));
+        }
+    }
+    unresolved_import_specifiers(&file_data, file_languages, workspace, only)
+}
+
 /// `pub(crate)` so the live code watcher (`watch_code.rs`) can run the same
 /// nw-008 Phase 0 — without it a watcher reindex loses every cross-file edge
 /// incident to the re-indexed file.
@@ -8508,24 +8894,7 @@ fn build_reresolve_edges_unlogged(
         }
     }
 
-    let workspace_ctx = if file_languages.values().any(|language| {
-        matches!(
-            language,
-            Language::JavaScript
-                | Language::TypeScript
-                | Language::Vue
-                | Language::Svelte
-                | Language::Astro
-        )
-    }) {
-        discover_workspace_context_with(|p| {
-            reader
-                .read_file(p)
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        })
-    } else {
-        Default::default()
-    };
+    let workspace_ctx = workspace_context_for_languages(reader, file_languages.values().copied());
 
     // Unchanged JS/TS targets need their exact public keys, not just stored
     // symbol visibility. Hydrate direct targets of scoped files, then only
@@ -15106,6 +15475,219 @@ module.exports = { check, plain };\n";
         assert!(
             !clusters_path.exists(),
             "node-UID-keyed cluster output must be invalidated after deletion"
+        );
+    }
+
+    /// nw-806. Delete an imported file, then create it again. The delete takes
+    /// the reverse edges with it, so the recreate must re-resolve importers
+    /// from the unresolved specifier recorded for that path.
+    #[test]
+    fn incremental_added_file_reresolves_unresolved_importers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("lib.js"),
+            "export function helper() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("app.js"),
+            "import { helper } from \"./lib.js\";\nexport function run() { return helper(); }\n",
+        )
+        .unwrap();
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        let repo_url = "https://example.com/nw-806";
+        index_directory(
+            &repo,
+            &db_path,
+            "test",
+            repo_url,
+            &git(&["rev-parse", "HEAD"]),
+        )
+        .unwrap();
+        let r_uid = repo_uid("test", repo_url);
+        let imports_lib = || {
+            GraphStore::open_or_create(&db_path)
+                .unwrap()
+                .files_referencing_file(&r_uid, "lib.js")
+                .unwrap()
+                .contains("app.js")
+        };
+        assert!(
+            imports_lib(),
+            "precondition: full index links app.js to lib.js"
+        );
+
+        fs::remove_file(repo.join("lib.js")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "delete lib.js"]);
+        let deleted = incremental_index(&repo, &db_path, "test", repo_url).unwrap();
+        assert!(
+            !deleted.fell_back_to_full,
+            "delete must stay on the incremental path"
+        );
+        assert!(
+            !imports_lib(),
+            "deleting lib.js must drop the importer edge"
+        );
+        let specs = crate::resolution_cache::ResolutionDeps::load(&crate::sidecar_path(
+            &db_path,
+            ".resolution_deps.bin",
+        ));
+        assert!(
+            specs
+                .unresolved_for_repo(&r_uid)
+                .and_then(|slice| slice.get("app.js"))
+                .is_some_and(|specifiers| specifiers.contains("./lib.js")),
+            "the deleted target's import specifier must be persisted"
+        );
+
+        fs::write(
+            repo.join("lib.js"),
+            "export function helper() { return 2; }\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "recreate lib.js"]);
+        let created = incremental_index(&repo, &db_path, "test", repo_url).unwrap();
+        assert!(
+            !created.fell_back_to_full,
+            "recreate must stay on the incremental path"
+        );
+        assert!(
+            imports_lib(),
+            "creating lib.js must re-resolve app.js, whose unresolved import names it"
+        );
+    }
+
+    /// nw-806. A tsconfig alias is not a relative specifier. Recreating the
+    /// target must still find the importer, and the stored specifier must
+    /// clear once that alias resolves.
+    #[test]
+    fn incremental_added_file_reresolves_aliased_unresolved_importer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(
+            repo.join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"@/*":["src/*"]}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/lib.ts"),
+            "export function helper() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/app.ts"),
+            "import { helper } from \"@/lib\";\nexport function run() { return helper(); }\n",
+        )
+        .unwrap();
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        let repo_url = "https://example.com/nw-806-alias";
+        index_directory(
+            &repo,
+            &db_path,
+            "test",
+            repo_url,
+            &git(&["rev-parse", "HEAD"]),
+        )
+        .unwrap();
+        let r_uid = repo_uid("test", repo_url);
+        let imports_lib = || {
+            GraphStore::open_or_create(&db_path)
+                .unwrap()
+                .files_referencing_file(&r_uid, "src/lib.ts")
+                .unwrap()
+                .contains("src/app.ts")
+        };
+        assert!(
+            imports_lib(),
+            "precondition: full index links the tsconfig alias to src/lib.ts"
+        );
+
+        fs::remove_file(repo.join("src/lib.ts")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "delete src/lib.ts"]);
+        let deleted = incremental_index(&repo, &db_path, "test", repo_url).unwrap();
+        assert!(
+            !deleted.fell_back_to_full,
+            "delete must stay on the incremental path"
+        );
+        assert!(
+            !imports_lib(),
+            "deleting src/lib.ts must drop the importer edge"
+        );
+        let unresolved_alias = || {
+            crate::resolution_cache::ResolutionDeps::load(&crate::sidecar_path(
+                &db_path,
+                ".resolution_deps.bin",
+            ))
+            .unresolved_for_repo(&r_uid)
+            .and_then(|slice| slice.get("src/app.ts").cloned())
+            .is_some_and(|specifiers| specifiers.contains("@/lib"))
+        };
+        assert!(
+            unresolved_alias(),
+            "the deleted target's alias specifier must be persisted"
+        );
+
+        fs::write(
+            repo.join("src/lib.ts"),
+            "export function helper() { return 2; }\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "recreate src/lib.ts"]);
+        let created = incremental_index(&repo, &db_path, "test", repo_url).unwrap();
+        assert!(
+            !created.fell_back_to_full,
+            "recreate must stay on the incremental path"
+        );
+        assert!(
+            imports_lib(),
+            "creating src/lib.ts must re-resolve src/app.ts through the @/ alias"
+        );
+        assert!(
+            !unresolved_alias(),
+            "the alias must leave the unresolved set once it maps onto src/lib.ts"
         );
     }
 

@@ -1144,7 +1144,16 @@ impl CodeWatcher {
         // nw-008 Phase 0 — transitive reverse-dependents from the LIVE graph,
         // BEFORE any mutation (the per-file `DETACH DELETE` destroys the
         // edges this query walks).
-        let rdeps = crate::index::collect_reverse_dep_files(store, r_uid, &changed, &removed);
+        let mut rdeps = crate::index::collect_reverse_dep_files(store, r_uid, &changed, &removed);
+        crate::index::extend_rdeps_for_added_files(
+            &reader,
+            store,
+            Some(self.db_path.as_path()),
+            r_uid,
+            &changed,
+            &removed,
+            &mut rdeps,
+        );
         let replacement_symbols: Vec<_> = prepared_paths
             .iter()
             .filter_map(|path| match path {
@@ -1284,6 +1293,15 @@ impl CodeWatcher {
             .commit_transaction(&txn)
             .context("commit code watcher batch transaction")?;
         drop(txn);
+        crate::index::persist_unresolved_imports(
+            &reader,
+            store,
+            &self.db_path,
+            r_uid,
+            &changed,
+            &removed,
+            &rdeps,
+        );
         // A committed replacement cascades away both note mentions and other
         // repositories' inferred links. Record their owed repairs before any
         // fallible publication or evidence stage can return early.
