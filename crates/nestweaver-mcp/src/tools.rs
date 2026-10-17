@@ -14930,7 +14930,6 @@ fn tool_stale_check(
             nestweaver_engine::repo_head::current_head(local_missing, repo.local_root(), &repo.url);
 
         // Compute commits behind for local repos when HEAD differs from indexed SHA.
-        let is_valid_sha = nestweaver_engine::repo_head::is_full_sha(&repo.indexed_sha);
         //
         // `unwrap_or(0)` here produced a CONTRADICTION rather than a missed
         // staleness: this branch is only reached when HEAD differs from the
@@ -14940,12 +14939,14 @@ fn tool_stale_check(
         //
         // `None` means "we could not count", which is what a failed `git
         // rev-list` actually tells us, and is distinguishable from a real zero.
-        let commits_behind: Option<u64> = match (&current_head, repo.local_root()) {
-            (Some(head), Some(path)) if is_valid_sha && *head != repo.indexed_sha => {
-                nestweaver_engine::repo_head::commits_between(path, &repo.indexed_sha, head)
-            }
-            _ => Some(repo.staleness_commits_behind as u64),
-        };
+        // Shared with the CLI route and with `list-repos` so a stored `0` cannot
+        // outlive the live distance on only one of them.
+        let commits_behind = nestweaver_engine::repo_head::commits_behind(
+            current_head.as_deref(),
+            repo.local_root(),
+            &repo.indexed_sha,
+            repo.staleness_commits_behind,
+        );
 
         // nw-163: `is_stale` means BEHIND HEAD, and nothing else.
         //

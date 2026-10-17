@@ -291,6 +291,18 @@ pub fn repos_json_with_display_name(repos: &[nestweaver_schema::Repo]) -> serde_
                         "display_name".to_string(),
                         serde_json::Value::String(repo_display_name(repo)),
                     );
+                    // The column is the distance recorded at index time. After
+                    // HEAD moves it stays 0 until the next index, while
+                    // `stale-check` reports the live `rev-list` count. Publish
+                    // that same count. `None` (rev-list failed) leaves the
+                    // stored number: this payload is also decoded as `Repo`,
+                    // whose field is a `u32`, so it cannot carry null.
+                    if let Some(behind) = crate::repo_head::listing_commits_behind(repo) {
+                        map.insert(
+                            "staleness_commits_behind".to_string(),
+                            serde_json::Value::from(behind),
+                        );
+                    }
                 }
                 value
             })

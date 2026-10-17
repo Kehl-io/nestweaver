@@ -119,6 +119,46 @@ pub fn is_full_sha(value: &str) -> bool {
     value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// The commit distance `stale-check` publishes for one repo.
+///
+/// `current_head` is already resolved. Counting runs only when that HEAD
+/// differs from a full indexed SHA inside a local working tree. `None` is a
+/// failed `git rev-list` (uncountable). Every other case keeps the stored
+/// counter, including a real zero when HEAD and the indexed SHA match.
+pub fn commits_behind(
+    current_head: Option<&str>,
+    local_root: Option<&str>,
+    indexed_sha: &str,
+    stored: u32,
+) -> Option<u64> {
+    match (current_head, local_root) {
+        (Some(head), Some(path)) if is_full_sha(indexed_sha) && head != indexed_sha => {
+            commits_between(path, indexed_sha, head)
+        }
+        _ => Some(u64::from(stored)),
+    }
+}
+
+/// The commit distance `list-repos` publishes for one repo.
+///
+/// Same decision as [`commits_behind`], using the local HEAD `stale-check`
+/// reads for a working tree. A remote-only row is not probed: without a
+/// working tree `rev-list` cannot run, and `stale-check` keeps the stored
+/// counter there too.
+pub fn listing_commits_behind(repo: &nestweaver_schema::Repo) -> Option<u64> {
+    let root = repo.local_root();
+    let head = root.and_then(|path| {
+        let missing = !std::path::Path::new(path).exists();
+        current_head(missing, Some(path), &repo.url)
+    });
+    commits_behind(
+        head.as_deref(),
+        root,
+        &repo.indexed_sha,
+        repo.staleness_commits_behind,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +264,69 @@ mod tests {
             commits_between(repo.to_str().unwrap(), &"0".repeat(40), &head),
             None,
             "an unreachable range cannot be counted, and must not be reported as 0"
+        );
+    }
+
+    /// `list-repos` used to emit the stored `staleness_commits_behind` column.
+    /// That column stays 0 after HEAD moves, while `stale-check` counts
+    /// `indexed..HEAD`. Both surfaces must report that live distance, and a
+    /// repo whose indexed SHA is still HEAD must stay 0.
+    #[test]
+    fn list_repos_commits_behind_matches_stale_check_when_head_is_ahead() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir(&repo_dir).unwrap();
+        git(&repo_dir, &["init"]);
+        git(&repo_dir, &["config", "user.email", "t@t.com"]);
+        git(&repo_dir, &["config", "user.name", "T"]);
+        git(&repo_dir, &["commit", "--allow-empty", "-m", "indexed"]);
+        let path = repo_dir.to_str().unwrap();
+        let indexed = local_head(path).expect("indexed HEAD");
+
+        for message in ["two", "three", "four", "five"] {
+            git(&repo_dir, &["commit", "--allow-empty", "-m", message]);
+        }
+        let head = local_head(path).expect("moved HEAD");
+        assert_ne!(
+            indexed, head,
+            "the fixture must move HEAD past the indexed SHA"
+        );
+
+        let ahead = nestweaver_schema::Repo {
+            uid: "repo:ahead".to_string(),
+            url: format!("file://{path}"),
+            indexed_sha: indexed.clone(),
+            staleness_commits_behind: 0,
+            instance_id: "test".to_string(),
+            name: None,
+            root_path: Some(path.to_string()),
+        };
+        let current = nestweaver_schema::Repo {
+            uid: "repo:current".to_string(),
+            url: format!("file://{path}"),
+            indexed_sha: head.clone(),
+            staleness_commits_behind: 0,
+            instance_id: "test".to_string(),
+            name: None,
+            root_path: Some(path.to_string()),
+        };
+
+        let stale_check_ahead = commits_behind(Some(&head), Some(path), &indexed, 0);
+        let stale_check_current = commits_behind(Some(&head), Some(path), &head, 0);
+        assert_eq!(stale_check_ahead, Some(4));
+        assert_eq!(stale_check_current, Some(0));
+
+        let listed = crate::repos_json_with_display_name(&[ahead, current]);
+        let rows = listed.as_array().expect("list-repos rows");
+        assert_eq!(
+            rows[0]["staleness_commits_behind"].as_u64(),
+            stale_check_ahead,
+            "list-repos must publish the live distance, not the stored 0"
+        );
+        assert_eq!(
+            rows[1]["staleness_commits_behind"].as_u64(),
+            stale_check_current,
+            "a repo indexed at HEAD stays 0 in both commands"
         );
     }
 }
