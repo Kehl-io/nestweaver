@@ -9114,10 +9114,16 @@ impl NestWeaverDaemon for DaemonService {
         let base_mutation_factory = daemon_mutation_lease_factory(self.state.clone());
         let writing_tx = tx.clone();
         let project_total = instance_config.projects.len() as u64;
+        // The engine calls this factory on every publication collision, while
+        // the returned lease still holds the write gate. `blocking_send` on a
+        // full 16-slot channel would wait in that critical section, so the
+        // collision path could never drop the gate for the watcher that owns
+        // publication. `try_send` reports the writing phase when the client is
+        // reading and otherwise continues into the yield.
         let mutation_factory: nestweaver_engine::WatchMutationLeaseFactory =
             Arc::new(move |label| {
                 let lease = base_mutation_factory(label)?;
-                let _ = writing_tx.blocking_send(Ok(IndexProgress {
+                let _ = writing_tx.try_send(Ok(IndexProgress {
                     phase: Phase::Writing as i32,
                     message: "Applying the planned project graph in one transaction".to_string(),
                     files_processed: 0,
@@ -11217,17 +11223,32 @@ impl NestWeaverDaemon for DaemonService {
             ));
         }
 
+        // Preserve immediate shutdown refusal even when detection finds no
+        // projects. The worker re-admits at its actual mutation boundary.
+        if !dry_run {
+            drop(ConnectionGuard::write(&state)?);
+        }
+        let mutation_factory = (!dry_run).then(|| daemon_mutation_lease_factory(state.clone()));
         let detect = move || {
-            let detected = nestweaver_engine::project::detect_implicit_projects_with_publication(
-                &state.store,
-                &vault,
-                &vault_uid,
-                &instance_id,
-                dry_run,
-            )
-            .map_err(|error| {
-                Status::internal(format!("detect_implicit_projects failed: {error:#}"))
-            })?;
+            let detected =
+                nestweaver_engine::project::detect_implicit_projects_with_publication_and_lease(
+                    &state.store,
+                    &vault,
+                    &vault_uid,
+                    &instance_id,
+                    dry_run,
+                    mutation_factory,
+                )
+                .map_err(|error| {
+                    if error
+                        .downcast_ref::<nestweaver_engine::WatchMutationRefused>()
+                        .is_some()
+                    {
+                        Status::unavailable(format!("detect_implicit_projects refused: {error:#}"))
+                    } else {
+                        Status::internal(format!("detect_implicit_projects failed: {error:#}"))
+                    }
+                })?;
             // nw-670 re-review R3: new implicit-project membership rescopes
             // the notes it covers.
             if !dry_run && detected.publication.changed() {
@@ -11264,16 +11285,11 @@ impl NestWeaverDaemon for DaemonService {
             serde_json::to_string(&payload)
                 .map_err(|error| Status::internal(format!("serialization failed: {error:#}")))
         };
-        let result = if dry_run {
-            tokio::task::spawn_blocking(detect)
-                .await
-                .map_err(|error| {
-                    Status::internal(format!("detect_implicit_projects task panicked: {error}"))
-                })??
-        } else {
-            self.run_unary_mutation("detect_implicit_projects", detect)
-                .await?
-        };
+        let result = tokio::task::spawn_blocking(detect)
+            .await
+            .map_err(|error| {
+                Status::internal(format!("detect_implicit_projects task panicked: {error}"))
+            })??;
         Ok(Response::new(JsonResponse {
             result_json: result,
         }))

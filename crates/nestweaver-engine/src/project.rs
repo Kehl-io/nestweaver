@@ -15,7 +15,7 @@ use crate::extensions::{load_extensions, save_extensions, set_property};
 use crate::html_to_md::maybe_convert_html_to_markdown;
 use crate::manifest::{
     GraphMutationPublicationGuard, GraphMutationPublicationOutcome,
-    begin_graph_mutation_publication, finalize_committed_graph_mutation,
+    finalize_committed_graph_mutation,
 };
 use crate::mcp_client::McpClient;
 use crate::repo_display_name;
@@ -585,6 +585,64 @@ pub fn rebuild_project_repo_membership(
     Ok(changed)
 }
 
+/// Write-gate then publication, with inventory planning between them.
+///
+/// The publication lease is taken only after `plan` returns and must be
+/// reserved immediately by the caller. Holding it across `list_notes` leaves
+/// the lease owned with no dirty marker, so ranked reads fail closed instead
+/// of disclosing an in-flight publication. If publication is already owned,
+/// the write gate is dropped before waiting and `plan` runs again: the
+/// publisher may have committed while it held the gate.
+fn reserve_project_publication_after_plan<'a, T>(
+    store: &'a GraphStore,
+    factory: Option<&crate::watcher::WatchMutationLeaseFactory>,
+    label: &'static str,
+    mut plan: impl FnMut() -> Result<T, anyhow::Error>,
+) -> Result<
+    (
+        Option<Box<dyn crate::watcher::WatchMutationLease>>,
+        nestweaver_store::IndexPublicationLease<'a>,
+        T,
+    ),
+    anyhow::Error,
+> {
+    loop {
+        let mutation = factory.map(|factory| factory(label)).transpose()?;
+        // Yield before planning when a watcher already owns publication.
+        // Planning under the gate in that state would keep the watcher from
+        // the write lock it needs to finish and release the lease.
+        if !store.index_publication_lease_is_unowned() {
+            drop(mutation);
+            store.wait_until_index_publication_unowned();
+            continue;
+        }
+        let planned = plan()?;
+        if let Some(publication) = store.try_acquire_index_publication_lease()? {
+            return Ok((mutation, publication, planned));
+        }
+        // Publication was taken during planning. Drop the gate, wait, and
+        // read the inventories again on the next pass.
+        drop(mutation);
+        store.wait_until_index_publication_unowned();
+    }
+}
+
+struct PlannedExplicitProjects {
+    projects: Vec<Project>,
+    note_edges: Vec<(String, String)>,
+    symbol_edges: Vec<(String, String)>,
+    repo_edges: Vec<(String, String)>,
+    component_edges: Vec<(String, String)>,
+    parent_edges: Vec<(String, String)>,
+    wiki_project_uids: HashMap<String, Vec<String>>,
+    repo_issues: Vec<ProjectRepoIssue>,
+}
+
+struct PlannedImplicitProjects {
+    projects: Vec<Project>,
+    note_edges: Vec<(String, String)>,
+}
+
 /// Materialize explicit `[[projects]]` declared in an `InstanceConfig`.
 ///
 /// For each project entry the function:
@@ -717,99 +775,134 @@ pub fn materialize_projects_with_lease(
         prepared_wiki_contents.insert(key, maybe_convert_html_to_markdown(&content));
     }
 
-    let _mutation_lease = mutation_lease_factory
-        .as_ref()
-        .map(|factory| factory("materialize_projects"))
-        .transpose()?;
+    // Plan note and repo inventories under the write gate, then take the
+    // publication lease. A watcher that already owns publication needs that
+    // gate to finish, so the acquire loop drops the gate before waiting and
+    // the next pass re-reads inventories. The lease is not held across this
+    // planning read.
+    let plan_explicit = || -> Result<PlannedExplicitProjects, anyhow::Error> {
+        // Repository and note inventories are loaded once per pass rather
+        // than once per project/repo. A yielded pass loads them again.
+        let all_notes = store.list_notes(None)?;
+        let all_repos = store.list_repos(None)?;
+        let mut projects = Vec::with_capacity(config.projects.len());
+        let mut note_edges: Vec<(String, String)> = Vec::new();
+        // nw-678: no per-symbol PROJECT_INCLUDES_SYMBOL fan-out any more — it
+        // was dropped by every re-index and never re-materialized. Replacing
+        // with an empty set also clears the legacy edges of these projects.
+        let symbol_edges: Vec<(String, String)> = Vec::new();
+        // nw-678: the shared planner, so this and the daemon's startup rebuild
+        // cannot disagree about a project's member repos.
+        let repo_edges = declared_repo_edges(config, instance_id, &all_repos);
+        let mut component_edges: Vec<(String, String)> = Vec::new();
+        let mut parent_edges: Vec<(String, String)> = Vec::new();
+        let mut wiki_project_uids: HashMap<String, Vec<String>> = HashMap::new();
+        let mut repo_issues: Vec<ProjectRepoIssue> = Vec::new();
 
-    // Plan every local graph relationship before deleting anything. Repository
-    // and note inventories are stable for this materialization pass and are
-    // intentionally loaded once rather than once per project/repo.
-    let all_notes = store.list_notes(None)?;
-    let all_repos = store.list_repos(None)?;
-    let mut projects = Vec::with_capacity(config.projects.len());
-    let mut note_edges: Vec<(String, String)> = Vec::new();
-    // nw-678: no per-symbol PROJECT_INCLUDES_SYMBOL fan-out any more — it
-    // was dropped by every re-index and never re-materialized. Replacing
-    // with an empty set also clears the legacy edges of these projects.
-    let symbol_edges: Vec<(String, String)> = Vec::new();
-    // nw-678: the shared planner, so this and the daemon's startup rebuild
-    // cannot disagree about a project's member repos.
-    let repo_edges = declared_repo_edges(config, instance_id, &all_repos);
-    let mut component_edges: Vec<(String, String)> = Vec::new();
-    let mut parent_edges: Vec<(String, String)> = Vec::new();
-    let mut wiki_project_uids: HashMap<String, Vec<String>> = HashMap::new();
-    let mut repo_issues: Vec<ProjectRepoIssue> = Vec::new();
+        for project_cfg in &config.projects {
+            let uid = project_uid(instance_id, &project_cfg.name);
+            projects.push(Project {
+                uid: uid.clone(),
+                name: project_cfg.name.clone(),
+                summary: project_cfg.description.clone(),
+                instance_id: instance_id.to_string(),
+            });
 
-    for project_cfg in &config.projects {
-        let uid = project_uid(instance_id, &project_cfg.name);
-        projects.push(Project {
-            uid: uid.clone(),
-            name: project_cfg.name.clone(),
-            summary: project_cfg.description.clone(),
-            instance_id: instance_id.to_string(),
-        });
+            if let Some(folder) = &project_cfg.vault_folder {
+                let folder = folder.trim_end_matches('/');
+                note_edges.extend(
+                    all_notes
+                        .iter()
+                        .filter(|note| note_in_folder(&note.file_path, folder))
+                        .map(|note| (uid.clone(), note.uid.clone())),
+                );
+            }
 
-        if let Some(folder) = &project_cfg.vault_folder {
-            let folder = folder.trim_end_matches('/');
-            note_edges.extend(
-                all_notes
-                    .iter()
-                    .filter(|note| note_in_folder(&note.file_path, folder))
-                    .map(|note| (uid.clone(), note.uid.clone())),
-            );
-        }
+            // A transient wiki fetch failure must not erase the last successfully
+            // materialized membership. Existing successful sources belong in the
+            // desired replacement too: omitting them here deleted and re-created
+            // the same edge on every run, so an identical wiki response could
+            // never be a true graph no-op.
+            for ws in &project_cfg.wiki_sources {
+                let wiki_note_uid = note_uid(
+                    &format!("wiki:{}", ws.mcp_server),
+                    &format!("{}/{}", ws.tool, ws.label),
+                );
+                wiki_project_uids
+                    .entry(wiki_note_uid.clone())
+                    .or_default()
+                    .push(uid.clone());
+                if all_notes.iter().any(|note| note.uid == wiki_note_uid) {
+                    note_edges.push((uid.clone(), wiki_note_uid));
+                }
+            }
 
-        // A transient wiki fetch failure must not erase the last successfully
-        // materialized membership. Existing successful sources belong in the
-        // desired replacement too: omitting them here deleted and re-created
-        // the same edge on every run, so an identical wiki response could
-        // never be a true graph no-op.
-        for ws in &project_cfg.wiki_sources {
-            let wiki_note_uid = note_uid(
-                &format!("wiki:{}", ws.mcp_server),
-                &format!("{}/{}", ws.tool, ws.label),
-            );
-            wiki_project_uids
-                .entry(wiki_note_uid.clone())
-                .or_default()
-                .push(uid.clone());
-            if all_notes.iter().any(|note| note.uid == wiki_note_uid) {
-                note_edges.push((uid.clone(), wiki_note_uid));
+            for repo_name in &project_cfg.repos {
+                let found = resolve_declared_repo(repo_name, &config.repos, &all_repos);
+                repo_issues.extend(ProjectRepoIssue::from_match(
+                    &project_cfg.name,
+                    repo_name,
+                    &found,
+                ));
+            }
+
+            for component_name in &project_cfg.components {
+                let child_uid = project_uid(instance_id, component_name);
+                component_edges.push((uid.clone(), child_uid.clone()));
+                parent_edges.push((child_uid, uid.clone()));
+            }
+            if let Some(parent_name) = &project_cfg.parent {
+                let parent_uid = project_uid(instance_id, parent_name);
+                component_edges.push((parent_uid.clone(), uid.clone()));
+                parent_edges.push((uid.clone(), parent_uid));
             }
         }
-
-        for repo_name in &project_cfg.repos {
-            let found = resolve_declared_repo(repo_name, &config.repos, &all_repos);
-            repo_issues.extend(ProjectRepoIssue::from_match(
-                &project_cfg.name,
-                repo_name,
-                &found,
-            ));
+        for project_uids in wiki_project_uids.values_mut() {
+            project_uids.sort();
+            project_uids.dedup();
         }
-
-        for component_name in &project_cfg.components {
-            let child_uid = project_uid(instance_id, component_name);
-            component_edges.push((uid.clone(), child_uid.clone()));
-            parent_edges.push((child_uid, uid.clone()));
-        }
-        if let Some(parent_name) = &project_cfg.parent {
-            let parent_uid = project_uid(instance_id, parent_name);
-            component_edges.push((parent_uid.clone(), uid.clone()));
-            parent_edges.push((uid.clone(), parent_uid));
-        }
-    }
-    for project_uids in wiki_project_uids.values_mut() {
-        project_uids.sort();
-        project_uids.dedup();
-    }
+        Ok(PlannedExplicitProjects {
+            projects,
+            note_edges,
+            symbol_edges,
+            repo_edges,
+            component_edges,
+            parent_edges,
+            wiki_project_uids,
+            repo_issues,
+        })
+    };
+    let (
+        _mutation_lease,
+        publication_lease,
+        PlannedExplicitProjects {
+            projects,
+            note_edges,
+            symbol_edges,
+            repo_edges,
+            component_edges,
+            parent_edges,
+            wiki_project_uids,
+            repo_issues,
+        },
+    ) = reserve_project_publication_after_plan(
+        store,
+        mutation_lease_factory.as_ref(),
+        "materialize_projects",
+        plan_explicit,
+    )?;
 
     // One transaction replaces the complete configured Project subgraph.
     // Relationship COPY turns the 139k-edge hot path from one execute per edge
     // into four bounded bulk loads, and rollback preserves the old graph if
     // any replacement step fails.
-    let graph_publication =
-        begin_graph_mutation_publication(store, "explicit Project materialization")?;
+    let graph_publication = crate::manifest::begin_graph_mutation_publication_on_lease(
+        store,
+        publication_lease,
+        "explicit Project materialization".to_string(),
+        None,
+        false,
+    )?;
     let (graph_publication, replacement) = resolve_project_replacement(
         graph_publication,
         store.replace_materialized_projects(
@@ -1156,6 +1249,30 @@ pub fn detect_implicit_projects_with_publication(
     instance_id: &str,
     dry_run: bool,
 ) -> Result<ImplicitProjectDetectionResult, anyhow::Error> {
+    detect_implicit_projects_with_publication_and_lease(
+        store,
+        vault_root,
+        vault_uid,
+        instance_id,
+        dry_run,
+        None,
+    )
+}
+
+/// Detect projects with writer admission at the mutation boundary.
+///
+/// Filesystem discovery and dry runs stay outside mutation authority. Note
+/// inventories are read under the write gate immediately before publication
+/// is reserved, and read again if that gate is yielded to a watcher that
+/// already owns publication.
+pub fn detect_implicit_projects_with_publication_and_lease(
+    store: &GraphStore,
+    vault_root: &Path,
+    vault_uid: &str,
+    instance_id: &str,
+    dry_run: bool,
+    mutation_lease_factory: Option<crate::watcher::WatchMutationLeaseFactory>,
+) -> Result<ImplicitProjectDetectionResult, anyhow::Error> {
     let mut detected: Vec<(String, String)> = Vec::new();
     for container in PROJECT_CONTAINER_DIRS {
         let projects_dir = vault_root.join(container);
@@ -1180,34 +1297,59 @@ pub fn detect_implicit_projects_with_publication(
         });
     }
 
-    // Plan every node and relationship before the single atomic store write.
-    // This prevents a later filesystem/read failure from leaving earlier
-    // Projects committed without a generation publication.
-    let all_notes = store.list_notes(Some(vault_uid))?;
-    let projects = project_names
-        .iter()
-        .map(|slug| Project {
-            uid: project_uid(instance_id, slug),
-            name: slug.clone(),
-            summary: None,
-            instance_id: instance_id.to_string(),
+    // Plan note membership under the write gate, immediately before the
+    // publication lease. A collision drops the gate and this closure runs
+    // again so the replacement does not keep the pre-yield inventory.
+    let plan_implicit = || -> Result<PlannedImplicitProjects, anyhow::Error> {
+        let all_notes = store.list_notes(Some(vault_uid))?;
+        let projects = project_names
+            .iter()
+            .map(|slug| Project {
+                uid: project_uid(instance_id, slug),
+                name: slug.clone(),
+                summary: None,
+                instance_id: instance_id.to_string(),
+            })
+            .collect::<Vec<_>>();
+        let mut note_edges = Vec::new();
+        for (slug, container) in &detected {
+            let uid = project_uid(instance_id, slug);
+            let prefix = format!("{container}/{slug}/");
+            note_edges.extend(
+                all_notes
+                    .iter()
+                    .filter(|note| note.file_path.starts_with(&prefix))
+                    .map(|note| (uid.clone(), note.uid.clone())),
+            );
+        }
+        note_edges.sort();
+        note_edges.dedup();
+        Ok(PlannedImplicitProjects {
+            projects,
+            note_edges,
         })
-        .collect::<Vec<_>>();
-    let mut note_edges = Vec::new();
-    for (slug, container) in &detected {
-        let uid = project_uid(instance_id, slug);
-        let prefix = format!("{container}/{slug}/");
-        note_edges.extend(
-            all_notes
-                .iter()
-                .filter(|note| note.file_path.starts_with(&prefix))
-                .map(|note| (uid.clone(), note.uid.clone())),
-        );
-    }
-    note_edges.sort();
-    note_edges.dedup();
+    };
+    let (
+        _mutation_lease,
+        publication_lease,
+        PlannedImplicitProjects {
+            projects,
+            note_edges,
+        },
+    ) = reserve_project_publication_after_plan(
+        store,
+        mutation_lease_factory.as_ref(),
+        "detect_implicit_projects",
+        plan_implicit,
+    )?;
 
-    let graph_publication = begin_graph_mutation_publication(store, "implicit Project detection")?;
+    let graph_publication = crate::manifest::begin_graph_mutation_publication_on_lease(
+        store,
+        publication_lease,
+        "implicit Project detection".to_string(),
+        None,
+        false,
+    )?;
     let (graph_publication, replacement) = resolve_project_replacement(
         graph_publication,
         store.replace_implicit_project_note_memberships(&projects, &note_edges),
@@ -2059,6 +2201,63 @@ timeout_secs = 5
             crate::manifest::GraphMutationPublicationDisposition::ConfirmedNoChange
         );
         assert_eq!(store.graph_generation(), 1);
+    }
+
+    struct Release(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A watcher that already owns publication needs the write gate to finish.
+    /// Detection must drop that gate before waiting, and a dry run must not take it.
+    #[test]
+    fn implicit_detection_yields_the_write_lease_before_waiting_on_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(vault_root.join("Workspaces/alpha")).unwrap();
+        std::fs::write(vault_root.join("Workspaces/alpha/_Overview.md"), "# Alpha").unwrap();
+        let store = std::sync::Arc::new(nestweaver_store::GraphStore::in_memory().unwrap());
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (flag, counted) = (std::sync::Arc::clone(&released), std::sync::Arc::clone(&calls));
+        let factory: crate::watcher::WatchMutationLeaseFactory = std::sync::Arc::new(move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(Release(std::sync::Arc::clone(&flag)))
+                as Box<dyn crate::watcher::WatchMutationLease>)
+        });
+        let dry = super::detect_implicit_projects_with_publication_and_lease(
+            &store, &vault_root, "vault:test", "test-instance", true, Some(factory.clone()),
+        )
+        .unwrap();
+        assert_eq!(dry.projects, vec!["alpha"]);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(store.graph_generation(), 0);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (owner, seen) = (std::sync::Arc::clone(&store), std::sync::Arc::clone(&released));
+        let watcher = std::thread::spawn(move || {
+            let publication = owner.acquire_index_publication_lease().unwrap();
+            held_tx.send(()).unwrap();
+            let start = std::time::Instant::now();
+            while !seen.load(std::sync::atomic::Ordering::SeqCst)
+                && start.elapsed() < std::time::Duration::from_secs(2)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let yielded = seen.load(std::sync::atomic::Ordering::SeqCst)
+                && !owner.index_publication_lease_is_unowned();
+            drop(publication);
+            yielded
+        });
+        held_rx.recv().unwrap();
+        let applied = super::detect_implicit_projects_with_publication_and_lease(
+            &store, &vault_root, "vault:test", "test-instance", false, Some(factory),
+        )
+        .unwrap();
+        assert!(watcher.join().unwrap(), "write lease must drop while publication is owned");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(applied.publication.changed());
     }
 
     #[test]
