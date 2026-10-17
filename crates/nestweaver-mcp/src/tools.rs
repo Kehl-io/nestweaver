@@ -7022,7 +7022,12 @@ pub fn seeds_not_found(
                     tracing::warn!("qualified_seed_suggestions lookup failed: {error:#}");
                     Vec::new()
                 });
-            target_not_found(message, "seeds", json!(seeds), &did_you_mean)
+            // nw-822: the envelope rides in gRPC status details, which share
+            // the 16KiB header-list limit with the status message. The engine
+            // already bounds the message's unresolved list; bound the seeds
+            // copied here with the same total budget. A short list is unchanged.
+            let echoed_seeds = nestweaver_engine::query::bound_unresolved_seed_echoes(seeds);
+            target_not_found(message, "seeds", json!(echoed_seeds), &did_you_mean)
         }
         None => error,
     }

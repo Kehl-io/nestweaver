@@ -470,6 +470,124 @@ mod dispatch_err_to_status_tests {
             Some(nestweaver_mcp::tools::TOOL_TARGET_NOT_FOUND_CODE)
         );
     }
+
+    /// Uncompressed header-list size, per RFC 7540: name + value + 32 per field.
+    /// hyper rejects a list at or above its 16KiB default with PROTOCOL_ERROR.
+    fn grpc_status_header_list_size(status: &tonic::Status) -> usize {
+        let mut headers = http::HeaderMap::new();
+        status
+            .add_header(&mut headers)
+            .expect("a bounded status encodes into header values");
+        headers
+            .iter()
+            .map(|(name, value)| name.as_str().len() + value.as_bytes().len() + 32)
+            .sum()
+    }
+
+    fn brain_context_seed_miss(seeds: &[&str]) -> anyhow::Error {
+        let seeds: Vec<String> = seeds.iter().map(|seed| (*seed).to_string()).collect();
+        let store = GraphStore::in_memory().expect("in-memory store");
+        let error = nestweaver_engine::build_brain_context_hybrid_with_aliases(
+            &store,
+            &seeds,
+            None,
+            &nestweaver_engine::HybridSearchConfig::default(),
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("an unknown seed resolves nothing");
+        nestweaver_mcp::tools::seeds_not_found(&store, error, &seeds, &["No seeds resolved."], None)
+    }
+
+    fn assert_seed_miss_fits(seeds: &[&str]) -> tonic::Status {
+        let status = dispatch_err_to_status("brain_context", brain_context_seed_miss(seeds));
+        assert!(
+            status.message().contains("No seeds resolved."),
+            "the CLI classifies exit 2 from this sentence: {}",
+            status.message()
+        );
+        for seed in seeds {
+            assert!(
+                !status.message().contains(*seed),
+                "the status message must not echo a raw over-long seed"
+            );
+            assert!(
+                !status
+                    .details()
+                    .windows(seed.len())
+                    .any(|window| window == seed.as_bytes()),
+                "the status details must not echo a raw over-long seed"
+            );
+        }
+        let envelope = nestweaver_mcp::tools::envelope_from_status_details(status.details())
+            .expect("the miss is still a not-found envelope");
+        assert_eq!(envelope["status"], "not_found");
+        let header_list = grpc_status_header_list_size(&status);
+        assert!(
+            header_list <= 16 * 1024,
+            "gRPC status header list is {header_list} bytes, above hyper's 16KiB default"
+        );
+        status
+    }
+
+    /// nw-822: a 6000-character unknown seed used to overflow the gRPC status
+    /// (message plus details) and surface as `h2 protocol error` instead of
+    /// not-found. The same echo is percent-encoded in the status and copied
+    /// again into the base64 details, so one 10_000-character seed of 4-byte
+    /// characters, and several over-long ASCII seeds together, must share one
+    /// budget. A short seed is still echoed whole.
+    #[test]
+    fn an_overlong_unresolved_seed_stays_inside_the_grpc_header_limit() {
+        let long = "q".repeat(10_000);
+        let status = assert_seed_miss_fits(&[&long]);
+        assert!(
+            status.message().contains("(10000 chars)"),
+            "the echo must carry a length marker: {}",
+            status.message()
+        );
+
+        // U+10000 is a 4-byte UTF-8 character. Percent-encoding expands each
+        // of those bytes, and the details repeat the echo.
+        let four_byte_char = "\u{10000}";
+        assert_eq!(
+            four_byte_char.len(),
+            4,
+            "the fixture must be a 4-byte character"
+        );
+        let four_byte = four_byte_char.repeat(10_000);
+        let four_byte_status = assert_seed_miss_fits(&[&four_byte]);
+        assert!(
+            four_byte_status.message().contains("(10000 chars)"),
+            "the 4-byte echo must carry a length marker: {}",
+            four_byte_status.message()
+        );
+
+        let many = vec![long.as_str(); 8];
+        let many_status = assert_seed_miss_fits(&many);
+        assert_eq!(
+            many_status.message().matches("(10000 chars)").count(),
+            8,
+            "every over-long seed keeps a length marker: {}",
+            many_status.message()
+        );
+
+        let short = "how does auth work";
+        let short_status =
+            dispatch_err_to_status("brain_context", brain_context_seed_miss(&[short]));
+        assert!(
+            short_status.message().contains(short),
+            "a short seed stays in the not-found message: {}",
+            short_status.message()
+        );
+        assert!(
+            !short_status.message().contains(" chars)"),
+            "a short seed is not truncated: {}",
+            short_status.message()
+        );
+    }
 }
 
 #[cfg(test)]
