@@ -7659,6 +7659,20 @@ mod tests {
     }
 
     #[test]
+    fn h1_mixed_with_inline_code_is_stored_as_heading_text() {
+        let src = "# Overview `_meta.continuation` has `has_more: true` with `cursor: null`\n\nBody.\n";
+        let (_dir, root) = make_vault(&[("overview.md", src)]);
+        let (_result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let notes = store.list_notes(None).unwrap();
+        assert_eq!(notes.len(), 1);
+        let headings = store.headings_in_note(&notes[0].uid).unwrap();
+        let expected = "Overview _meta.continuation has has_more: true with cursor: null";
+        assert_eq!(headings[0].text, expected);
+        assert_eq!(notes[0].title, headings[0].text);
+    }
+
+    #[test]
     fn indexes_nested_headings_and_parent_edges() {
         let src = "\
 # Top
