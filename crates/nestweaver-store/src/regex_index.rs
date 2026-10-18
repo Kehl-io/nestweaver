@@ -17,7 +17,11 @@ use tantivy::{DocAddress, DocSet, Index, ReloadPolicy, TERMINATED, TantivyDocume
 
 use crate::error::StoreError;
 
-pub const REGEX_INDEX_SCHEMA_VERSION: u32 = 4;
+/// Version 5 indexes the heading line with each section. Version 4 shards
+/// stored only `Section.text_content`, which starts after the heading, so a
+/// ready index missed `## Blockers` (nw-738). Search distrusts those shards
+/// and scans them until `index --with-trigrams` rebuilds them.
+pub const REGEX_INDEX_SCHEMA_VERSION: u32 = 5;
 pub const REGEX_TOKENIZER_FINGERPRINT: &str =
     "nestweaver-unicode-scalar-lowercase-distinct-trigram-v1";
 const METADATA_KIND: &str = "__nestweaver_regex_metadata__";

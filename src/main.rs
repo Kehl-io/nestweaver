@@ -2445,7 +2445,10 @@ fn scan_crash_reports_in(directories: &[PathBuf], supported: bool) -> CrashRecur
 }
 
 /// The closed set of node kinds accepted by `--kinds`.
-const NODE_KINDS: [&str; 3] = ["Section", "Note", "Symbol"];
+///
+/// `Frontmatter` is included because regex results already use that kind
+/// (nw-298, nw-738). Filtering on it used to be rejected as unknown.
+const NODE_KINDS: [&str; 4] = ["Section", "Note", "Symbol", "Frontmatter"];
 
 /// Parse and validate a `--kinds` token against [`NODE_KINDS`].
 ///
@@ -6729,11 +6732,12 @@ enum Commands {
         #[arg(long, help = "Path to nestweaver-instance.toml")]
         config: Option<PathBuf>,
     },
-    /// Regex search over indexed text (section bodies, note titles, symbol signatures)
+    /// Regex search over indexed text (section bodies and their heading lines, note titles, frontmatter, symbol signatures)
     ///
     /// First-party replacement for shelling out to rg/grep. Uses a trigram
     /// pre-filter when built (`index --with-trigrams`), else falls back to
     /// scanning all candidate text — always correct, just slower.
+    /// `^` and `$` are line anchors; `(?-m)` anchors the whole candidate.
     #[command(
         after_help = "Examples:\n  nestweaver regex-search 'fn\\s+authenticate'\n  nestweaver regex-search '(?i)todo' --path-prefix src/ --limit 20"
     )]
@@ -6754,7 +6758,7 @@ enum Commands {
             long,
             value_delimiter = ',',
             value_parser = parse_node_kind,
-            help = "Restrict to node kinds (comma-separated): Section,Note,Symbol"
+            help = "Restrict to node kinds (comma-separated): Section,Note,Symbol,Frontmatter"
         )]
         kinds: Option<Vec<String>>,
         #[arg(
@@ -6783,6 +6787,7 @@ enum Commands {
     ///
     /// Companion to regex-search. Reports total matches, files matched, and the
     /// busiest files for each pattern. Reuses the same trigram pre-filter.
+    /// `^` and `$` are line anchors; `(?-m)` anchors the whole candidate.
     #[command(
         after_help = "Examples:\n  nestweaver count-patterns 'TODO' 'FIXME'\n  nestweaver count-patterns '(?i)deprecated' --path-prefix src/"
     )]
@@ -6799,7 +6804,7 @@ enum Commands {
             long,
             value_delimiter = ',',
             value_parser = parse_node_kind,
-            help = "Restrict to node kinds (comma-separated): Section,Note,Symbol"
+            help = "Restrict to node kinds (comma-separated): Section,Note,Symbol,Frontmatter"
         )]
         kinds: Option<Vec<String>>,
         #[arg(long, help = "Output as JSON")]
@@ -39638,7 +39643,7 @@ mod cli_bounds_tests {
                             "{argv:?} must be rejected — a typo must not read as an empty result"
                         );
                     }
-                    for good in ["Section", "note", "SYMBOL", "Note,Symbol"] {
+                    for good in ["Section", "note", "SYMBOL", "Note,Symbol", "Frontmatter"] {
                         let mut argv = prefix.to_vec();
                         argv.push(good);
                         assert!(

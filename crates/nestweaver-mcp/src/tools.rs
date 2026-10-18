@@ -5804,13 +5804,15 @@ fn tool_schema_read_symbols() -> Value {
 }
 
 /// F3: trigram-accelerated regex search over indexed text. Lets agents run a
-/// real regex against Section bodies, Note titles, and Symbol signatures
-/// without shelling out to rg/grep.
+/// real regex against section bodies (including heading lines), note titles,
+/// frontmatter, and symbol signatures without shelling out to rg/grep.
+/// `^` and `$` are line anchors; `(?-m)` anchors the whole candidate.
 ///
 /// The node kinds `regex_search`/`count_patterns` can filter on, as advertised
 /// in their schemas. Anything else used to silently match no candidates and
-/// return empty results — fail loudly instead.
-const REGEX_SEARCH_KINDS: &[&str] = &["Section", "Note", "Symbol"];
+/// return empty results — fail loudly instead. `Frontmatter` is included
+/// because results already carry that kind (nw-738).
+const REGEX_SEARCH_KINDS: &[&str] = &["Section", "Note", "Symbol", "Frontmatter"];
 
 fn validate_regex_kinds(kinds: Option<&[String]>) -> Result<(), anyhow::Error> {
     if let Some(kinds) = kinds {
@@ -6079,17 +6081,17 @@ fn tool_regex_search(
 fn tool_schema_regex_search() -> Value {
     json!({
         "name": "regex_search",
-        "description": "Run a Rust regex against indexed text (section bodies, note titles, symbol signatures) with database-bound, per-scope acceleration and final Rust-regex verification.\n\nGuidelines:\n- Use for exact pattern matching; for fuzzy/semantic lookup use brain_search instead\n- Output names ready/dirty/error scopes, posting hits, hydrated and verified candidate counts, exact truncation reason, and planning/hydration/verification timings\n- scanned_fallback means one or more scopes were safely scanned; stale_index means an existing shard was unavailable or stale, never that matches were dropped\n\nLimitations:\n- MCP candidate cap of 2000 or time budget (default 2000ms) may truncate results; truncation_reason distinguishes the bound\n- Does not search binary files or unindexed content",
+        "description": "Run a Rust regex against indexed text (section bodies and their heading lines, note titles, frontmatter, symbol signatures) with database-bound, per-scope acceleration and final Rust-regex verification. ^ and $ are line anchors; (?-m) anchors the whole candidate.\n\nGuidelines:\n- Use for exact pattern matching; for fuzzy/semantic lookup use brain_search instead\n- Output names ready/dirty/error scopes, posting hits, hydrated and verified candidate counts, exact truncation reason, and planning/hydration/verification timings\n- scanned_fallback means one or more scopes were safely scanned; stale_index means an existing shard was unavailable or stale, never that matches were dropped\n\nLimitations:\n- MCP candidate cap of 2000 or time budget (default 2000ms) may truncate results; truncation_reason distinguishes the bound\n- Does not search binary files or unindexed content",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "pattern": { "type": "string", "description": "Rust regex pattern. Example: \"fn\\\\s+authenticate\" or \"(?i)todo\". One of 'pattern' or 'query' is required." },
+                "pattern": { "type": "string", "description": "Rust regex pattern. ^ and $ are line anchors; (?-m) anchors the whole candidate. Example: \"fn\\\\s+authenticate\" or \"(?i)todo\". One of 'pattern' or 'query' is required." },
                 "query": { "type": "string", "description": "Backward-compatible alias for pattern." },
                 "path_prefix": { "type": "string", "description": "Restrict to nodes whose file path starts with this prefix." },
                 "kinds": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Restrict to these node kinds: Section, Note, Symbol (case-insensitive)."
+                    "description": "Restrict to these node kinds: Section, Note, Symbol, Frontmatter (case-insensitive)."
                 },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Maximum results to return (1-10000; MCP presentation remains bounded by 50 rows and output bytes). Default: 50; MCP candidate work is capped at 2000." },
                 "max_millis": { "type": "integer", "minimum": 1, "maximum": 600000, "description": "Wall-clock time budget in milliseconds (1-600000). Default 2000." },
@@ -6141,7 +6143,7 @@ fn tool_count_patterns(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_count_patterns() -> Value {
     json!({
         "name": "count_patterns",
-        "description": "Count regex matches across indexed text without returning the matches themselves — useful for frequency analysis.\n\nGuidelines:\n- Pass multiple patterns to compare counts in one call\n- Returns per-pattern {pattern, total_matches, files_matched, top_files:[{path,count}], stale_index}\n- For actual match text, use regex_search instead\n\nLimitations:\n- Counts occurrences (non-overlapping, leftmost-first), the same thing `grep -o | wc -l` counts\n- Frontmatter is not in the exact-match corpus\n- Same trigram/fallback behavior as regex_search (stale_index flags a bypassed stale posting table)",
+        "description": "Count regex matches across indexed text without returning the matches themselves — useful for frequency analysis. ^ and $ are line anchors; (?-m) anchors the whole candidate.\n\nGuidelines:\n- Pass multiple patterns to compare counts in one call\n- Returns per-pattern {pattern, total_matches, files_matched, top_files:[{path,count}], stale_index}\n- For actual match text, use regex_search instead\n\nLimitations:\n- Counts occurrences (non-overlapping, leftmost-first), the same thing `grep -o | wc -l` counts\n- Kinds are Section, Note, Symbol, and Frontmatter\n- Same trigram/fallback behavior as regex_search (stale_index flags a bypassed stale posting table)",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -6155,7 +6157,7 @@ fn tool_schema_count_patterns() -> Value {
                 "kinds": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Restrict to these node kinds: Section, Note, Symbol (case-insensitive)."
+                    "description": "Restrict to these node kinds: Section, Note, Symbol, Frontmatter (case-insensitive)."
                 }
             },
             "required": ["patterns"]
@@ -26936,7 +26938,7 @@ mod arg_alias_tests {
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("unknown kind 'Function'") && err.contains("Section, Note, Symbol"),
+            err.contains("unknown kind 'Function'") && err.contains("Section, Note, Symbol, Frontmatter"),
             "{err}"
         );
         let err = tool_count_patterns(&store, json!({ "patterns": ["x"], "kinds": ["Heading"] }))
