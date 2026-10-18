@@ -849,9 +849,8 @@ mod tests {
             .spawn()
             .expect("spawn a process that is not this daemon");
         let pid = child.id();
-        // Declared after `child` so this runs first and reaps it, including
-        // when an assertion below fails.
-        let _reap = KillOnDrop(pid);
+        // Owns the child so Drop reaps it, including when an assertion fails.
+        let _reap = KillOnDrop(child);
         assert_ne!(pid, std::process::id());
         if process_start_unix(pid).is_some_and(|start| start >= now_unix()) {
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -881,16 +880,13 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    struct KillOnDrop(u32);
+    struct KillOnDrop(std::process::Child);
 
     #[cfg(target_os = "linux")]
     impl Drop for KillOnDrop {
         fn drop(&mut self) {
-            unsafe {
-                libc::kill(self.0 as i32, libc::SIGKILL);
-                let mut status = 0;
-                libc::waitpid(self.0 as i32, &mut status, 0);
-            }
+            let _ = self.0.kill();
+            let _ = self.0.wait();
         }
     }
 
