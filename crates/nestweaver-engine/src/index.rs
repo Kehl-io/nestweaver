@@ -955,17 +955,26 @@ pub(crate) fn establish_index_publication_marker_with_io<'a>(
 /// left a leftover watcher-batch marker in front of a multi-hour `index_repo`
 /// parse. If the lease is owned, drop the write gate, wait until it is free,
 /// re-acquire write, then retry.
-fn acquire_index_publication_after_write_gate<'a, G, F>(
+///
+/// A snapshot collected before that wait is stale once the other publisher
+/// finalizes: it can delete files they added and overwrite files they edited.
+/// `rebuild_after_yield` runs only after a wait, once this run holds both the
+/// write gate and the publication lease, and before the dirty marker. Callers
+/// rebuild the write set from disk there, before any delete or replace.
+fn acquire_index_publication_after_write_gate<'a, G, F, R>(
     store: &'a GraphStore,
     db_path: Option<&Path>,
     operation: &str,
     io: &dyn IndexEpilogueIo,
     write_guard: &mut Option<G>,
     mut reacquire_write: F,
+    mut rebuild_after_yield: R,
 ) -> Result<nestweaver_store::IndexPublicationLease<'a>, anyhow::Error>
 where
     F: FnMut() -> Result<G, anyhow::Error>,
+    R: FnMut() -> Result<(), anyhow::Error>,
 {
+    let mut yielded = false;
     let lease = loop {
         match store.try_acquire_index_publication_lease() {
             Ok(Some(lease)) => break lease,
@@ -979,6 +988,7 @@ where
                 *write_guard = Some(reacquire_write().with_context(|| {
                     format!("{operation}: re-acquire write gate after publication yield")
                 })?);
+                yielded = true;
             }
             Err(error) => {
                 return Err(anyhow::anyhow!(
@@ -987,8 +997,591 @@ where
             }
         }
     };
+    if yielded {
+        rebuild_after_yield().with_context(|| {
+            format!("{operation}: rebuild write set from disk after publication yield")
+        })?;
+    }
     establish_index_publication_marker_on_lease(lease, db_path, operation, io)
         .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+struct ParsedPublicationFile {
+    rel_path: String,
+    lang: Language,
+    file_meta: CachedFileMeta,
+    content_hash: String,
+    symbols: Vec<RawSymbol>,
+    references: Vec<RawReference>,
+    type_bindings: Vec<AstTypeBinding>,
+    source: Option<String>,
+}
+
+struct PublicationWriteSet<'a> {
+    r_uid: &'a str,
+    repo_url: &'a str,
+    all_files: &'a mut Vec<File>,
+    all_symbols: &'a mut Vec<Symbol>,
+    repo_file_edge_pairs: &'a mut Vec<(String, String)>,
+    file_symbol_edge_pairs: &'a mut Vec<(String, String)>,
+    parsed_files_for_resolver: &'a mut Vec<ParsedFileEntry>,
+    ast_bindings_by_file: &'a mut HashMap<String, Vec<AstTypeBinding>>,
+    handler_files: &'a mut Vec<HandlerFileData>,
+    actually_changed_files: &'a mut HashSet<String>,
+    present_files: &'a mut HashSet<String>,
+    files_count: &'a mut usize,
+    files_unchanged: &'a mut usize,
+    symbols_count: &'a mut usize,
+    new_filemeta: Option<&'a mut FileMetaCache>,
+}
+
+impl PublicationWriteSet<'_> {
+    /// Drop one path from the pre-wait snapshot so a disk refresh can insert
+    /// the current parse, or so a path that left the tree is not rewritten.
+    fn forget(&mut self, rel_path: &str) {
+        let was_present = self.present_files.contains(rel_path);
+        let was_changed = self.actually_changed_files.contains(rel_path);
+        if was_present && !was_changed {
+            *self.files_unchanged = self.files_unchanged.saturating_sub(1);
+        }
+        self.present_files.remove(rel_path);
+        self.actually_changed_files.remove(rel_path);
+
+        let counted = self
+            .parsed_files_for_resolver
+            .iter()
+            .find(|(path, ..)| path == rel_path)
+            .map(|(_, symbols, ..)| symbols.len())
+            .unwrap_or_else(|| {
+                self.all_symbols
+                    .iter()
+                    .filter(|symbol| symbol.file_path == rel_path)
+                    .count()
+            });
+        *self.symbols_count = self.symbols_count.saturating_sub(counted);
+
+        let file_uid = file_uid(self.r_uid, rel_path);
+        let removed_file = self.all_files.iter().any(|file| file.path == rel_path);
+        self.all_files.retain(|file| file.path != rel_path);
+        if removed_file {
+            *self.files_count = self.files_count.saturating_sub(1);
+        }
+        self.all_symbols
+            .retain(|symbol| symbol.file_path != rel_path);
+        self.repo_file_edge_pairs
+            .retain(|(_, file)| file != &file_uid);
+        self.file_symbol_edge_pairs
+            .retain(|(file, _)| file != &file_uid);
+        self.parsed_files_for_resolver
+            .retain(|(path, ..)| path != rel_path);
+        self.ast_bindings_by_file.remove(rel_path);
+        self.handler_files
+            .retain(|handler| handler.rel_path != rel_path);
+        if let Some(cache) = self.new_filemeta.as_mut() {
+            cache.remove(rel_path);
+        }
+    }
+
+    fn record_parsed(&mut self, parsed: ParsedPublicationFile) {
+        let ParsedPublicationFile {
+            rel_path,
+            lang,
+            file_meta,
+            content_hash,
+            symbols: raw_symbols,
+            references: raw_references,
+            type_bindings: raw_type_bindings,
+            source,
+        } = parsed;
+
+        self.present_files.insert(rel_path.clone());
+        self.actually_changed_files.insert(rel_path.clone());
+
+        if let Some(cache) = self.new_filemeta.as_mut() {
+            cache.insert(rel_path.clone(), file_meta);
+        }
+
+        let f_uid = file_uid(self.r_uid, &rel_path);
+
+        self.all_files.push(File {
+            uid: f_uid.clone(),
+            path: rel_path.clone(),
+            repo_uid: self.r_uid.to_string(),
+            content_hash,
+        });
+
+        self.repo_file_edge_pairs
+            .push((self.r_uid.to_string(), f_uid.clone()));
+        *self.files_count += 1;
+
+        // F2.0: run the (previously dormant) framework detector and
+        // attach hints to the symbols it identifies. The detector keys
+        // off the lowercase language string + per-symbol signatures.
+        let mut hint_by_index: HashMap<usize, nestweaver_schema::FrameworkHint> = HashMap::new();
+        if let Some(lang_str) = crate::contracts::framework_language_str(lang) {
+            for (sym_idx, hint) in
+                nestweaver_parser::detect_frameworks(&raw_symbols, &rel_path, lang_str)
+            {
+                hint_by_index.insert(sym_idx, hint);
+            }
+        }
+
+        // F2.2: NestJS controllers carry `@Controller(...)` as a
+        // decorator on the line *above* the class, which the TS parser
+        // does not fold into the class signature, so `detect_frameworks`
+        // misses it. Recover the controller from the retained source.
+        let class_starts: Vec<(usize, u32)> = raw_symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.kind == nestweaver_schema::SymbolKind::Class)
+            .map(|(i, s)| (i, s.start_line))
+            .collect();
+        if let Some(src) = source.as_deref()
+            && let Some(ctrl_idx) =
+                crate::contracts::detect_nestjs_controller_index(src, &class_starts)
+        {
+            hint_by_index
+                .entry(ctrl_idx)
+                .or_insert_with(|| nestweaver_schema::FrameworkHint {
+                    framework: "nestjs".into(),
+                    role: "controller".into(),
+                });
+        }
+
+        // F2.2: if this file has a Spring/NestJS controller, capture the
+        // data needed to derive IMPLEMENTS_CONTRACT edges later.
+        let controller_framework = hint_by_index
+            .values()
+            .find(|h| h.role == "controller")
+            .map(|h| h.framework.clone())
+            .or_else(|| {
+                // nw-160: Express and Fastify have no controller CLASS —
+                // routes are registered inside function bodies, so their
+                // hints carry role "handler". Requiring "controller"
+                // meant those files never became handler files and no
+                // HTTP contract was ever minted from them.
+                hint_by_index
+                    .values()
+                    .find(|h| {
+                        h.role == "handler" && matches!(h.framework.as_str(), "express" | "fastify")
+                    })
+                    .map(|h| h.framework.clone())
+                    .or_else(|| {
+                        // The signature-based hint cannot see a route
+                        // registered inside a function BODY, so recover
+                        // it from the retained source.
+                        //
+                        // nw-292 (F-CT-4): this recovery is LANGUAGE
+                        // GATED. The `framework_language_str(lang)`
+                        // check above guards `detect_frameworks` only,
+                        // so this `or_else` used to run on every file of
+                        // every language — which is why NestWeaver
+                        // minted `GET /a` out of a Rust `assert_eq!`
+                        // and `POST /oauth/token` out of its own test
+                        // fixture in `contracts.rs`.
+                        source.as_deref().and_then(|src| {
+                            crate::contracts::detect_node_route_framework_for_language(
+                                src,
+                                crate::contracts::framework_language_str(lang).unwrap_or(""),
+                            )
+                            .map(str::to_string)
+                        })
+                    })
+            });
+        let mut handler_file = controller_framework.map(|framework| {
+            let class_signature = raw_symbols
+                .iter()
+                .zip(0..)
+                .find(|(_, i)| hint_by_index.get(i).is_some_and(|h| h.role == "controller"))
+                .map(|(s, _)| s.signature.clone())
+                .unwrap_or_default();
+            HandlerFileData {
+                framework,
+                class_signature,
+                rel_path: rel_path.clone(),
+                symbols: Vec::new(),
+            }
+        });
+
+        for (sym_idx, raw_sym) in raw_symbols.iter().enumerate() {
+            let s_uid = symbol_uid(self.r_uid, &rel_path, &raw_sym.name, raw_sym.start_line);
+
+            if let Some(hf) = handler_file.as_mut() {
+                hf.symbols.push((
+                    s_uid.clone(),
+                    crate::contracts::HandlerSymbol {
+                        name: raw_sym.name.clone(),
+                        signature: raw_sym.signature.clone(),
+                        start_line: raw_sym.start_line,
+                        kind: raw_sym.kind,
+                    },
+                ));
+            }
+
+            let scope_str = raw_sym.scope_chain.as_deref().unwrap_or("");
+            let canonical = canonical_symbol_id(self.repo_url, &rel_path, &raw_sym.name, scope_str);
+
+            self.all_symbols.push(Symbol {
+                uid: s_uid.clone(),
+                name: raw_sym.name.clone(),
+                kind: raw_sym.kind,
+                repo_uid: self.r_uid.to_string(),
+                file_path: rel_path.clone(),
+                start_line: raw_sym.start_line,
+                end_line: raw_sym.end_line,
+                signature: raw_sym.signature.clone(),
+                summary: None,
+                content_hash: raw_sym.content_hash.clone(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: raw_sym.is_entry_point,
+                entry_point_kind: raw_sym.entry_point_kind,
+                visibility: raw_sym.visibility,
+                type_info: raw_sym.type_info.clone(),
+                framework_hint: hint_by_index.remove(&sym_idx),
+                canonical_id: Some(canonical),
+            });
+
+            self.file_symbol_edge_pairs
+                .push((f_uid.clone(), s_uid.clone()));
+            *self.symbols_count += 1;
+        }
+
+        if let Some(hf) = handler_file.take() {
+            self.handler_files.push(hf);
+        }
+
+        if !raw_type_bindings.is_empty() {
+            self.ast_bindings_by_file
+                .insert(rel_path.clone(), raw_type_bindings);
+        }
+        self.parsed_files_for_resolver
+            .push((rel_path, raw_symbols, raw_references, source));
+    }
+}
+
+/// True when a spec path still in the tree does not have the bytes this plan
+/// hashed. OpenAPI, protobuf, and GraphQL files are not source parses, so an
+/// in-place edit leaves the path list alone and never re-parses as a source
+/// file. Callers still have to prepare the contract plan again.
+fn spec_declaration_bytes_differ(
+    reader: &dyn crate::content_reader::ContentReader,
+    spec_files: &[PathBuf],
+    input_hashes: &std::collections::BTreeMap<String, String>,
+) -> Result<bool, anyhow::Error> {
+    let repo_path = reader.root();
+    for spec_path in spec_files {
+        let rel = spec_path
+            .strip_prefix(repo_path)
+            .unwrap_or(spec_path)
+            .to_string_lossy()
+            .into_owned();
+        let current = current_spec_declaration_hash(reader, &rel)?;
+        if input_hashes.get(&rel) != current.as_ref() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Hash of a spec the contract plan would read, or `None` when that read is
+/// skipped (oversized or binary). A real IO error is returned so the caller
+/// does not publish the pre-wait plan over a spec it can no longer read.
+fn current_spec_declaration_hash(
+    reader: &dyn crate::content_reader::ContentReader,
+    rel: &str,
+) -> Result<Option<String>, anyhow::Error> {
+    match reader.read_file(Path::new(rel)) {
+        Ok(source) if (source.len() as u64) <= reader.max_source_file_bytes() => {
+            Ok(Some(crate::hash::blake3_hex(&source)))
+        }
+        Ok(_) => Ok(None),
+        Err(error)
+            if error
+                .downcast_ref::<crate::content_reader::SourceTooLarge>()
+                .is_some()
+                || error
+                    .downcast_ref::<crate::content_reader::BinarySource>()
+                    .is_some() =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error).with_context(|| format!("read watched contract spec {rel}")),
+    }
+}
+
+/// Replace the pre-wait snapshot with the working tree as it exists once this
+/// run holds the publication lease. Paths the other publisher created are
+/// parsed in; paths they edited are re-parsed; paths that left the tree are
+/// dropped before the delete/replace that follows. Spec bytes are compared
+/// even when no spec path was added or removed, and a difference prepares the
+/// contract plan again from the reader.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_full_index_write_set_from_disk(
+    reader: &dyn crate::content_reader::ContentReader,
+    store: &GraphStore,
+    set: &mut PublicationWriteSet<'_>,
+    file_languages: &mut HashMap<String, Language>,
+    spec_files: &mut Vec<PathBuf>,
+    unreadable_dirs: &mut Vec<PathBuf>,
+    skipped_files: &mut Vec<SkippedFile>,
+    parsed_cache: Option<&mut crate::parsed_cache::ParsedCache>,
+    type_envs: &mut HashMap<String, nestweaver_resolver::types::TypeEnvironment>,
+    contract_plan: &mut ContractDerivationPlan,
+    cpu_throttle: &crate::cpu_throttle::CpuThrottle,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<(), anyhow::Error> {
+    let discovered = reader
+        .list_files()
+        .context("ContentReader::list_files failed")?;
+    *unreadable_dirs = reader
+        .skipped_dirs()
+        .iter()
+        .filter(|row| row.reason == crate::content_reader::UNREADABLE_DIR_REASON)
+        .map(|row| PathBuf::from(&row.path))
+        .collect();
+
+    let mut snapshot_hashes: HashMap<String, String> = set
+        .all_files
+        .iter()
+        .map(|file| (file.path.clone(), file.content_hash.clone()))
+        .collect();
+    if let Some(cache) = set.new_filemeta.as_deref() {
+        for (path, meta) in cache {
+            snapshot_hashes
+                .entry(path.clone())
+                .or_insert_with(|| meta.content_hash.clone());
+        }
+    }
+    let cached_meta = set.new_filemeta.as_deref().cloned().unwrap_or_default();
+
+    let repo_path = reader.root();
+    let mut next_specs = Vec::new();
+    let mut kept: HashSet<String> = HashSet::new();
+    enum Refresh {
+        TouchMeta {
+            rel: String,
+            file_meta: CachedFileMeta,
+        },
+        Skip(SkippedFile),
+        Replace(ParsedPublicationFile),
+    }
+    let mut actions: Vec<Refresh> = Vec::new();
+
+    for rel_listed in &discovered {
+        let abs = repo_path.join(rel_listed);
+        if crate::contracts::is_spec_file(&abs.to_string_lossy()) {
+            next_specs.push(abs.clone());
+        }
+        if is_minified_or_bundled(&abs) {
+            continue;
+        }
+        let Some(lang) = detect_language(&abs) else {
+            continue;
+        };
+        let rel = abs
+            .strip_prefix(repo_path)
+            .unwrap_or(&abs)
+            .to_string_lossy()
+            .into_owned();
+        let snapshot_hash = snapshot_hashes.get(&rel).cloned();
+        if let (Some(hash), Some(meta)) = (snapshot_hash.clone(), cached_meta.get(&rel))
+            && let Some((mtime, size)) = reader.file_meta_nanos(Path::new(&rel))?
+            && mtime == meta.mtime_nanos
+            && size == meta.size_bytes
+            && meta.content_hash == hash
+        {
+            kept.insert(rel);
+            continue;
+        }
+
+        let source = match reader.read_file(Path::new(&rel)) {
+            Ok(source) => source,
+            Err(error) => {
+                if let Some(oversized) =
+                    error.downcast_ref::<crate::content_reader::SourceTooLarge>()
+                {
+                    actions.push(Refresh::Skip(SkippedFile::oversized(
+                        rel,
+                        oversized.observed_bytes,
+                        oversized.limit_bytes,
+                    )));
+                    continue;
+                }
+                if error
+                    .downcast_ref::<crate::content_reader::BinarySource>()
+                    .is_some()
+                {
+                    actions.push(Refresh::Skip(SkippedFile::binary(rel)));
+                    continue;
+                }
+                return Err(error).with_context(|| format!("stat/read {}", abs.display()));
+            }
+        };
+        let limit_bytes = reader.max_source_file_bytes();
+        let observed_bytes = source.len() as u64;
+        if observed_bytes > limit_bytes {
+            actions.push(Refresh::Skip(SkippedFile::oversized(
+                rel,
+                observed_bytes,
+                limit_bytes,
+            )));
+            continue;
+        }
+        let content_hash = content_hash_hex(&source);
+        let (mtime_nanos, size_bytes) = reader
+            .file_meta_nanos(Path::new(&rel))?
+            .unwrap_or((0, observed_bytes));
+        let file_meta = CachedFileMeta {
+            mtime_nanos,
+            size_bytes,
+            content_hash: content_hash.clone(),
+        };
+        if snapshot_hash.as_deref() == Some(content_hash.as_str()) {
+            kept.insert(rel.clone());
+            actions.push(Refresh::TouchMeta { rel, file_meta });
+            continue;
+        }
+
+        let parsed = match parse_source(&abs, &source) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return Err(error).with_context(|| format!("parse {}", abs.display()));
+            }
+        };
+        if let Some(skipped) = parsed.unparsable_skip(rel.clone()) {
+            actions.push(Refresh::Skip(skipped));
+            continue;
+        }
+        const SOURCE_RETENTION_CAP: usize = 2 * 1024 * 1024;
+        let source = if matches!(lang, Language::TypeScript | Language::JavaScript) {
+            Some(source.clone())
+        } else if source.len() <= SOURCE_RETENTION_CAP {
+            Some(source)
+        } else {
+            None
+        };
+        kept.insert(rel.clone());
+        actions.push(Refresh::Replace(ParsedPublicationFile {
+            rel_path: rel,
+            lang,
+            file_meta,
+            content_hash,
+            symbols: parsed.symbols,
+            references: parsed.references,
+            type_bindings: parsed.type_bindings,
+            source,
+        }));
+    }
+
+    let mut parsed_cache = parsed_cache;
+    let mut changed = false;
+    for action in actions {
+        match action {
+            Refresh::TouchMeta { rel, file_meta } => {
+                if let Some(cache) = set.new_filemeta.as_mut() {
+                    cache.insert(rel, file_meta);
+                }
+            }
+            Refresh::Skip(skipped) => {
+                let was_present = set.present_files.contains(&skipped.path);
+                file_languages.remove(&skipped.path);
+                set.forget(&skipped.path);
+                changed |= was_present;
+                if !skipped_files.iter().any(|existing| {
+                    existing.path == skipped.path && existing.reason_code == skipped.reason_code
+                }) {
+                    skipped_files.push(skipped);
+                }
+            }
+            Refresh::Replace(parsed) => {
+                file_languages.insert(parsed.rel_path.clone(), parsed.lang);
+                if let Some(cache) = parsed_cache.as_deref_mut() {
+                    cache.insert(
+                        parsed.content_hash.clone(),
+                        crate::parsed_cache::CachedParseResult {
+                            symbols: parsed.symbols.clone(),
+                            references: parsed.references.clone(),
+                            type_bindings: parsed.type_bindings.clone(),
+                        },
+                    );
+                }
+                set.forget(&parsed.rel_path);
+                set.record_parsed(parsed);
+                changed = true;
+            }
+        }
+    }
+
+    let stale: Vec<String> = set
+        .present_files
+        .iter()
+        .filter(|path| !kept.contains(*path) && !path_under_unreadable_dir(path, unreadable_dirs))
+        .cloned()
+        .collect();
+    for path in stale {
+        file_languages.remove(&path);
+        set.forget(&path);
+        changed = true;
+    }
+
+    next_specs.sort();
+    let spec_paths_changed = next_specs != *spec_files;
+    if spec_paths_changed {
+        *spec_files = next_specs;
+        changed = true;
+    }
+    // Source create/edit/delete already set `changed` and will re-prepare
+    // below. This is the remaining case: the spec path list is stable, but
+    // an in-place edit changed the bytes the pre-wait plan hashed.
+    let spec_bytes_changed =
+        !changed && spec_declaration_bytes_differ(reader, spec_files, &contract_plan.input_hashes)?;
+    tracing::info!(
+        changed,
+        spec_bytes_changed,
+        files = set.present_files.len(),
+        "rebuilt index write set from disk after publication yield"
+    );
+    if !changed && !spec_bytes_changed {
+        return Ok(());
+    }
+
+    if changed {
+        set.handler_files
+            .sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+        *type_envs = build_type_environments(
+            reader,
+            set.parsed_files_for_resolver,
+            file_languages,
+            set.ast_bindings_by_file,
+            cpu_throttle,
+            cancel,
+        )?;
+    }
+    let contract_plan_result = if *set.files_unchanged == 0 {
+        prepare_contract_derivation(
+            reader,
+            set.r_uid,
+            spec_files,
+            set.handler_files,
+            set.all_symbols,
+            true,
+        )
+    } else {
+        prepare_incremental_contract_derivation(reader, set.r_uid, set.repo_url)
+    };
+    *contract_plan = match contract_plan_result {
+        Ok(plan) => plan,
+        Err(error) => {
+            if let Err(marker_error) =
+                store.set_contract_derivation_failed(set.r_uid, &error.to_string())
+            {
+                tracing::warn!("recording contract derivation failure failed: {marker_error}");
+            }
+            return Err(error).context("prepare strict contract derivation");
+        }
+    };
+    Ok(())
 }
 
 /// The marker-establishment half of [`establish_index_publication_marker_with_io`],
@@ -4352,7 +4945,7 @@ where
     // nodes under them must be RETAINED (while the row below discloses them),
     // so both the whole-repo replacement and the vanished-file prune consult
     // this. Captured here because the recorder is cleared on every walk.
-    let unreadable_dirs: Vec<PathBuf> = reader
+    let mut unreadable_dirs: Vec<PathBuf> = reader
         .skipped_dirs()
         .iter()
         .filter(|row| row.reason == crate::content_reader::UNREADABLE_DIR_REASON)
@@ -4396,7 +4989,7 @@ where
     // Keep each scanned file's language through cached parses too. Resolving
     // an entire mixed repository with its most common language loses imports
     // from the other languages, and ties depend on HashMap iteration order.
-    let file_languages: HashMap<String, Language> = file_entries
+    let mut file_languages: HashMap<String, Language> = file_entries
         .iter()
         .map(|(path, language)| {
             (
@@ -4729,170 +5322,33 @@ where
                 type_bindings: raw_type_bindings,
                 source,
             } => {
-                present_files.insert(rel_path.clone());
-                actually_changed_files.insert(rel_path.clone());
-
-                // Record in the new filemeta cache.
-                if let Some(ref mut new_cache) = new_filemeta.as_deref_mut() {
-                    new_cache.insert(rel_path.clone(), file_meta);
+                PublicationWriteSet {
+                    r_uid: &r_uid,
+                    repo_url,
+                    all_files: &mut all_files,
+                    all_symbols: &mut all_symbols,
+                    repo_file_edge_pairs: &mut repo_file_edge_pairs,
+                    file_symbol_edge_pairs: &mut file_symbol_edge_pairs,
+                    parsed_files_for_resolver: &mut parsed_files_for_resolver,
+                    ast_bindings_by_file: &mut ast_bindings_by_file,
+                    handler_files: &mut handler_files,
+                    actually_changed_files: &mut actually_changed_files,
+                    present_files: &mut present_files,
+                    files_count: &mut files_count,
+                    files_unchanged: &mut files_unchanged,
+                    symbols_count: &mut symbols_count,
+                    new_filemeta: new_filemeta.as_deref_mut(),
                 }
-
-                let f_uid = file_uid(&r_uid, &rel_path);
-
-                all_files.push(File {
-                    uid: f_uid.clone(),
-                    path: rel_path.clone(),
-                    repo_uid: r_uid.clone(),
+                .record_parsed(ParsedPublicationFile {
+                    rel_path,
+                    lang,
+                    file_meta,
                     content_hash,
+                    symbols: raw_symbols,
+                    references: raw_references,
+                    type_bindings: raw_type_bindings,
+                    source,
                 });
-
-                repo_file_edge_pairs.push((r_uid.clone(), f_uid.clone()));
-                files_count += 1;
-
-                // F2.0: run the (previously dormant) framework detector and
-                // attach hints to the symbols it identifies. The detector keys
-                // off the lowercase language string + per-symbol signatures.
-                let mut hint_by_index: HashMap<usize, nestweaver_schema::FrameworkHint> =
-                    HashMap::new();
-                if let Some(lang_str) = crate::contracts::framework_language_str(lang) {
-                    for (sym_idx, hint) in
-                        nestweaver_parser::detect_frameworks(&raw_symbols, &rel_path, lang_str)
-                    {
-                        hint_by_index.insert(sym_idx, hint);
-                    }
-                }
-
-                // F2.2: NestJS controllers carry `@Controller(...)` as a
-                // decorator on the line *above* the class, which the TS parser
-                // does not fold into the class signature, so `detect_frameworks`
-                // misses it. Recover the controller from the retained source.
-                let class_starts: Vec<(usize, u32)> = raw_symbols
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| s.kind == nestweaver_schema::SymbolKind::Class)
-                    .map(|(i, s)| (i, s.start_line))
-                    .collect();
-                if let Some(src) = source.as_deref()
-                    && let Some(ctrl_idx) =
-                        crate::contracts::detect_nestjs_controller_index(src, &class_starts)
-                {
-                    hint_by_index.entry(ctrl_idx).or_insert_with(|| {
-                        nestweaver_schema::FrameworkHint {
-                            framework: "nestjs".into(),
-                            role: "controller".into(),
-                        }
-                    });
-                }
-
-                // F2.2: if this file has a Spring/NestJS controller, capture the
-                // data needed to derive IMPLEMENTS_CONTRACT edges later.
-                let controller_framework = hint_by_index
-                    .values()
-                    .find(|h| h.role == "controller")
-                    .map(|h| h.framework.clone())
-                    .or_else(|| {
-                        // nw-160: Express and Fastify have no controller CLASS —
-                        // routes are registered inside function bodies, so their
-                        // hints carry role "handler". Requiring "controller"
-                        // meant those files never became handler files and no
-                        // HTTP contract was ever minted from them.
-                        hint_by_index
-                            .values()
-                            .find(|h| {
-                                h.role == "handler"
-                                    && matches!(h.framework.as_str(), "express" | "fastify")
-                            })
-                            .map(|h| h.framework.clone())
-                            .or_else(|| {
-                                // The signature-based hint cannot see a route
-                                // registered inside a function BODY, so recover
-                                // it from the retained source.
-                                //
-                                // nw-292 (F-CT-4): this recovery is LANGUAGE
-                                // GATED. The `framework_language_str(lang)`
-                                // check above guards `detect_frameworks` only,
-                                // so this `or_else` used to run on every file of
-                                // every language — which is why NestWeaver
-                                // minted `GET /a` out of a Rust `assert_eq!`
-                                // and `POST /oauth/token` out of its own test
-                                // fixture in `contracts.rs`.
-                                source.as_deref().and_then(|src| {
-                                    crate::contracts::detect_node_route_framework_for_language(
-                                        src,
-                                        crate::contracts::framework_language_str(lang)
-                                            .unwrap_or(""),
-                                    )
-                                    .map(str::to_string)
-                                })
-                            })
-                    });
-                let mut handler_file = controller_framework.map(|framework| {
-                    let class_signature = raw_symbols
-                        .iter()
-                        .zip(0..)
-                        .find(|(_, i)| hint_by_index.get(i).is_some_and(|h| h.role == "controller"))
-                        .map(|(s, _)| s.signature.clone())
-                        .unwrap_or_default();
-                    HandlerFileData {
-                        framework,
-                        class_signature,
-                        rel_path: rel_path.clone(),
-                        symbols: Vec::new(),
-                    }
-                });
-
-                for (sym_idx, raw_sym) in raw_symbols.iter().enumerate() {
-                    let s_uid = symbol_uid(&r_uid, &rel_path, &raw_sym.name, raw_sym.start_line);
-
-                    if let Some(hf) = handler_file.as_mut() {
-                        hf.symbols.push((
-                            s_uid.clone(),
-                            crate::contracts::HandlerSymbol {
-                                name: raw_sym.name.clone(),
-                                signature: raw_sym.signature.clone(),
-                                start_line: raw_sym.start_line,
-                                kind: raw_sym.kind,
-                            },
-                        ));
-                    }
-
-                    let scope_str = raw_sym.scope_chain.as_deref().unwrap_or("");
-                    let canonical =
-                        canonical_symbol_id(repo_url, &rel_path, &raw_sym.name, scope_str);
-
-                    all_symbols.push(Symbol {
-                        uid: s_uid.clone(),
-                        name: raw_sym.name.clone(),
-                        kind: raw_sym.kind,
-                        repo_uid: r_uid.clone(),
-                        file_path: rel_path.clone(),
-                        start_line: raw_sym.start_line,
-                        end_line: raw_sym.end_line,
-                        signature: raw_sym.signature.clone(),
-                        summary: None,
-                        content_hash: raw_sym.content_hash.clone(),
-                        embedding: None,
-                        pagerank_score: None,
-                        is_entry_point: raw_sym.is_entry_point,
-                        entry_point_kind: raw_sym.entry_point_kind,
-                        visibility: raw_sym.visibility,
-                        type_info: raw_sym.type_info.clone(),
-                        framework_hint: hint_by_index.remove(&sym_idx),
-                        canonical_id: Some(canonical),
-                    });
-
-                    file_symbol_edge_pairs.push((f_uid.clone(), s_uid.clone()));
-                    symbols_count += 1;
-                }
-
-                if let Some(hf) = handler_file.take() {
-                    handler_files.push(hf);
-                }
-
-                if !raw_type_bindings.is_empty() {
-                    ast_bindings_by_file.insert(rel_path.clone(), raw_type_bindings);
-                }
-                parsed_files_for_resolver.push((rel_path, raw_symbols, raw_references, source));
             }
         }
     }
@@ -4961,7 +5417,7 @@ where
 
     // nw-812: type environments are CPU-throttled parse-pool work. Build
     // them before taking the write gate so a throttle wait can never hold it.
-    let type_envs = build_type_environments(
+    let mut type_envs = build_type_environments(
         reader,
         &parsed_files_for_resolver,
         &file_languages,
@@ -4989,7 +5445,7 @@ where
     // This is also the funnel the CLI index actually reaches (nw-246).
     record_data_instance(store, instance_id);
 
-    let contract_plan = match contract_plan_result {
+    let mut contract_plan = match contract_plan_result {
         Ok(plan) => plan,
         Err(error) => {
             if let Err(marker_error) =
@@ -5000,14 +5456,6 @@ where
             return Err(error).context("prepare strict contract derivation");
         }
     };
-    skipped_files.extend(contract_plan.skipped_files.iter().cloned());
-    skipped_files.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| left.reason_code.cmp(&right.reason_code))
-    });
-    skipped_files
-        .dedup_by(|left, right| left.path == right.path && left.reason_code == right.reason_code);
 
     // Last cancellation observation point. Bailing in this window needs no
     // teardown: the marker call below is what creates `.index-dirty` and
@@ -5029,7 +5477,48 @@ where
         epilogue_io,
         &mut write_guard,
         acquire_write_guard,
+        || {
+            let mut write_set = PublicationWriteSet {
+                r_uid: &r_uid,
+                repo_url,
+                all_files: &mut all_files,
+                all_symbols: &mut all_symbols,
+                repo_file_edge_pairs: &mut repo_file_edge_pairs,
+                file_symbol_edge_pairs: &mut file_symbol_edge_pairs,
+                parsed_files_for_resolver: &mut parsed_files_for_resolver,
+                ast_bindings_by_file: &mut ast_bindings_by_file,
+                handler_files: &mut handler_files,
+                actually_changed_files: &mut actually_changed_files,
+                present_files: &mut present_files,
+                files_count: &mut files_count,
+                files_unchanged: &mut files_unchanged,
+                symbols_count: &mut symbols_count,
+                new_filemeta: new_filemeta.as_deref_mut(),
+            };
+            rebuild_full_index_write_set_from_disk(
+                reader,
+                store,
+                &mut write_set,
+                &mut file_languages,
+                &mut spec_files,
+                &mut unreadable_dirs,
+                &mut skipped_files,
+                parsed_cache.as_deref_mut(),
+                &mut type_envs,
+                &mut contract_plan,
+                cpu_throttle,
+                cancel.map(|flag| flag.as_ref()),
+            )
+        },
     )?;
+    skipped_files.extend(contract_plan.skipped_files.iter().cloned());
+    skipped_files.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.reason_code.cmp(&right.reason_code))
+    });
+    skipped_files
+        .dedup_by(|left, right| left.path == right.path && left.reason_code == right.reason_code);
     let _write_guard = write_guard;
     let graph_mutation_attempted = std::cell::Cell::new(false);
     let graph_result = (|| -> Result<IndexResult, anyhow::Error> {
@@ -7649,11 +8138,11 @@ where
         &mut rdeps,
     );
     let contract_plan_result = prepare_incremental_contract_derivation(reader, &r_uid, repo_url);
-    let prepared_files = prepare_incremental_files(reader, &changes)
+    let mut prepared_files = prepare_incremental_files(reader, &changes)
         .context("prepare server incremental source files")?;
 
     let mut write_guard = Some(acquire_write_guard()?);
-    let contract_plan = match contract_plan_result {
+    let mut contract_plan = match contract_plan_result {
         Ok(plan) => plan,
         Err(error) => {
             if let Err(marker_error) =
@@ -7671,6 +8160,27 @@ where
         &FileSystemIndexEpilogueIo,
         &mut write_guard,
         acquire_write_guard,
+        || {
+            prepared_files = prepare_incremental_files(reader, &changes)
+                .context("rebuild server incremental source files after publication yield")?;
+            contract_plan = match prepare_incremental_contract_derivation(reader, &r_uid, repo_url)
+            {
+                Ok(plan) => plan,
+                Err(error) => {
+                    if let Err(marker_error) =
+                        store.set_contract_derivation_failed(&r_uid, &error.to_string())
+                    {
+                        tracing::warn!(
+                            "recording contract derivation failure failed: {marker_error}"
+                        );
+                    }
+                    return Err(error).context(
+                        "rebuild server incremental contract plan after publication yield",
+                    );
+                }
+            };
+            Ok(())
+        },
     )?;
     let _write_guard = write_guard;
     let txn = store
@@ -11446,6 +11956,7 @@ mod tests {
             &FileSystemIndexEpilogueIo,
             &mut write_guard,
             reacquire,
+            || Ok(()),
         )
         .expect("yield must break the deadlock");
         assert!(
@@ -11454,6 +11965,247 @@ mod tests {
         );
         drop(lease);
         watcher.join().expect("watcher finalize");
+    }
+
+    /// A publisher that holds the publication lease can create or edit files
+    /// while this index waits. The publish has to follow the disk after the
+    /// write gate is reacquired, not the snapshot collected before the wait.
+    #[test]
+    fn index_publish_keeps_files_created_or_edited_while_publication_lease_is_held() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let main_path = repo.join("src/main.js");
+        let during_path = repo.join("src/during_yield.js");
+        fs::write(&main_path, "function snapshot_only() {}\n").unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+        let gate = crate::WriteGate::new();
+        let saw_gated_write = Arc::new(AtomicBool::new(false));
+        let observed_gate = gate.clone();
+        let flag = Arc::clone(&saw_gated_write);
+        store.set_write_observer(Some(Arc::new(move |_| {
+            if observed_gate.holder_snapshot().is_some() {
+                flag.store(true, Ordering::Release);
+            }
+        })));
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let watcher_gate = gate.clone();
+        let (saw_yield, indexed) = std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                let publication = store.acquire_index_publication_lease().unwrap();
+                held_tx.send(()).unwrap();
+                let start = std::time::Instant::now();
+                let deadline = std::time::Duration::from_secs(10);
+                while !saw_gated_write.load(Ordering::Acquire) && start.elapsed() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                while watcher_gate.holder_snapshot().is_some() && start.elapsed() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let saw = saw_gated_write.load(Ordering::Acquire)
+                    && watcher_gate.holder_snapshot().is_none();
+                if saw {
+                    fs::write(&main_path, "function watcher_live() {}\n").unwrap();
+                    fs::write(&during_path, "function created_during_yield() {}\n").unwrap();
+                }
+                drop(publication);
+                saw
+            });
+            held_rx
+                .recv()
+                .expect("other publisher holds the publication lease");
+            let opts = IndexOptions::new("yield-inst", "https://example.test/yield", "sha-yield")
+                .write_gate(gate, "index_repo");
+            let indexed = index_directory_with_store_opts(
+                &store,
+                &repo,
+                &dir.path().join("yield.lbug"),
+                &opts,
+                None,
+            );
+            (watcher.join().unwrap(), indexed)
+        });
+        store.set_write_observer(None);
+        assert!(
+            saw_yield,
+            "index must yield the write gate while the publication lease is held"
+        );
+        indexed.expect("index publishes");
+
+        let main_disk = fs::read_to_string(repo.join("src/main.js")).unwrap();
+        let during_disk = fs::read_to_string(repo.join("src/during_yield.js")).unwrap();
+        assert!(
+            main_disk.contains("function watcher_live"),
+            "disk edit must stick: {main_disk}"
+        );
+        assert!(
+            during_disk.contains("function created_during_yield"),
+            "created file must stick: {during_disk}"
+        );
+
+        let r_uid = repo_uid("yield-inst", "https://example.test/yield");
+        let symbol_names = |path: &str| {
+            let mut names: Vec<String> = store
+                .symbols_in_file_in_repo(path, &r_uid)
+                .unwrap()
+                .into_iter()
+                .map(|symbol| symbol.name)
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            symbol_names("src/main.js"),
+            vec!["watcher_live".to_string()],
+            "edited file must publish the disk text, not the pre-wait snapshot"
+        );
+        assert_eq!(
+            symbol_names("src/during_yield.js"),
+            vec!["created_during_yield".to_string()],
+            "file created while the lease was held must be in the graph"
+        );
+        assert!(
+            store
+                .list_all_symbols()
+                .unwrap()
+                .iter()
+                .all(|symbol| symbol.name != "snapshot_only"),
+            "pre-wait symbol must not survive publication"
+        );
+    }
+
+    /// An in-place OpenAPI edit does not add or remove a spec path, so the
+    /// post-yield source refresh has nothing to re-parse. The plan still has
+    /// to be prepared from the bytes on disk: the operation that edit added
+    /// must publish, and an operation the other publisher committed while
+    /// holding the lease must survive that publish.
+    #[test]
+    fn index_publish_keeps_openapi_edited_in_place_while_publication_lease_is_held() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let spec_path = repo.join("openapi.yaml");
+        let spec = |paths: &str| {
+            format!("openapi: 3.0.0\ninfo: {{ title: t, version: \"1\" }}\npaths:\n{paths}")
+        };
+        let health = "  /health:\n    get:\n      operationId: listHealth\n      responses: { \"200\": { description: ok } }\n";
+        let edited = "  /health:\n    get:\n      operationId: listHealth\n      responses: { \"200\": { description: ok } }\n  /orders:\n    post:\n      operationId: createOrder\n      responses: { \"200\": { description: ok } }\n  /audit:\n    get:\n      operationId: publisherAdded\n      responses: { \"200\": { description: ok } }\n";
+        fs::write(&spec_path, spec(health)).unwrap();
+        fs::write(repo.join("src/main.js"), "function snapshot_stable() {}\n").unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+        let gate = crate::WriteGate::new();
+        let saw_gated_write = Arc::new(AtomicBool::new(false));
+        let observed_gate = gate.clone();
+        let flag = Arc::clone(&saw_gated_write);
+        store.set_write_observer(Some(Arc::new(move |_| {
+            if observed_gate.holder_snapshot().is_some() {
+                flag.store(true, Ordering::Release);
+            }
+        })));
+
+        let instance_id = "yield-openapi";
+        let repo_url = "https://example.test/yield-openapi";
+        let r_uid = repo_uid(instance_id, repo_url);
+        let publisher_uid = nestweaver_schema::scoped_contract_uid(
+            &r_uid,
+            "http",
+            Some("GET"),
+            Some("/audit"),
+            Some("publisherAdded"),
+        );
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let watcher_gate = gate.clone();
+        let (saw_yield, indexed) = std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                let publication = store.acquire_index_publication_lease().unwrap();
+                held_tx.send(()).unwrap();
+                let start = std::time::Instant::now();
+                let deadline = std::time::Duration::from_secs(10);
+                while !saw_gated_write.load(Ordering::Acquire) && start.elapsed() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                while watcher_gate.holder_snapshot().is_some() && start.elapsed() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let saw = saw_gated_write.load(Ordering::Acquire)
+                    && watcher_gate.holder_snapshot().is_none();
+                if saw {
+                    fs::write(&spec_path, spec(edited)).unwrap();
+                    store
+                        .insert_contract(&nestweaver_schema::Contract {
+                            uid: publisher_uid.clone(),
+                            kind: "http".into(),
+                            verb: Some("GET".into()),
+                            path: Some("/audit".into()),
+                            operation_id: Some("publisherAdded".into()),
+                            repo_uid: r_uid.clone(),
+                            source_path: "openapi.yaml".into(),
+                            confidence: 1.0,
+                        })
+                        .expect("other publisher commits its operation while holding the lease");
+                }
+                drop(publication);
+                saw
+            });
+            held_rx
+                .recv()
+                .expect("other publisher holds the publication lease");
+            let opts = IndexOptions::new(instance_id, repo_url, "sha-yield")
+                .write_gate(gate, "index_repo");
+            let indexed = index_directory_with_store_opts(
+                &store,
+                &repo,
+                &dir.path().join("yield.lbug"),
+                &opts,
+                None,
+            );
+            (watcher.join().unwrap(), indexed)
+        });
+        store.set_write_observer(None);
+        assert!(
+            saw_yield,
+            "index must yield the write gate while the publication lease is held"
+        );
+        indexed.expect("index publishes");
+
+        let disk = fs::read_to_string(&spec_path).unwrap();
+        assert!(
+            disk.contains("operationId: createOrder"),
+            "in-place spec edit must stick: {disk}"
+        );
+        assert!(
+            disk.contains("operationId: publisherAdded"),
+            "other publisher's spec edit must stick: {disk}"
+        );
+
+        let mut operation_ids: Vec<String> = store
+            .list_contracts(Some(&r_uid))
+            .unwrap()
+            .into_iter()
+            .filter_map(|contract| contract.operation_id)
+            .collect();
+        operation_ids.sort();
+        assert!(
+            operation_ids.iter().any(|id| id == "createOrder"),
+            "operation added by the in-place edit must be published; got {operation_ids:?}"
+        );
+        assert!(
+            operation_ids.iter().any(|id| id == "publisherAdded"),
+            "operation added by the other publisher must not be removed; got {operation_ids:?}"
+        );
+        assert!(
+            operation_ids.iter().any(|id| id == "listHealth"),
+            "pre-wait operation must still be published; got {operation_ids:?}"
+        );
     }
 
     /// Insert a small NOTE-side graph alongside the code graph, so a recovery
