@@ -2221,21 +2221,32 @@ timeout_secs = 5
         let store = std::sync::Arc::new(nestweaver_store::GraphStore::in_memory().unwrap());
         let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (flag, counted) = (std::sync::Arc::clone(&released), std::sync::Arc::clone(&calls));
+        let (flag, counted) = (
+            std::sync::Arc::clone(&released),
+            std::sync::Arc::clone(&calls),
+        );
         let factory: crate::watcher::WatchMutationLeaseFactory = std::sync::Arc::new(move |_| {
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(Box::new(Release(std::sync::Arc::clone(&flag)))
                 as Box<dyn crate::watcher::WatchMutationLease>)
         });
         let dry = super::detect_implicit_projects_with_publication_and_lease(
-            &store, &vault_root, "vault:test", "test-instance", true, Some(factory.clone()),
+            &store,
+            &vault_root,
+            "vault:test",
+            "test-instance",
+            true,
+            Some(factory.clone()),
         )
         .unwrap();
         assert_eq!(dry.projects, vec!["alpha"]);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(store.graph_generation(), 0);
         let (held_tx, held_rx) = std::sync::mpsc::channel();
-        let (owner, seen) = (std::sync::Arc::clone(&store), std::sync::Arc::clone(&released));
+        let (owner, seen) = (
+            std::sync::Arc::clone(&store),
+            std::sync::Arc::clone(&released),
+        );
         let watcher = std::thread::spawn(move || {
             let publication = owner.acquire_index_publication_lease().unwrap();
             held_tx.send(()).unwrap();
@@ -2252,10 +2263,18 @@ timeout_secs = 5
         });
         held_rx.recv().unwrap();
         let applied = super::detect_implicit_projects_with_publication_and_lease(
-            &store, &vault_root, "vault:test", "test-instance", false, Some(factory),
+            &store,
+            &vault_root,
+            "vault:test",
+            "test-instance",
+            false,
+            Some(factory),
         )
         .unwrap();
-        assert!(watcher.join().unwrap(), "write lease must drop while publication is owned");
+        assert!(
+            watcher.join().unwrap(),
+            "write lease must drop while publication is owned"
+        );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert!(applied.publication.changed());
     }

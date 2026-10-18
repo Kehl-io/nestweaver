@@ -7660,7 +7660,8 @@ mod tests {
 
     #[test]
     fn h1_mixed_with_inline_code_is_stored_as_heading_text() {
-        let src = "# Overview `_meta.continuation` has `has_more: true` with `cursor: null`\n\nBody.\n";
+        let src =
+            "# Overview `_meta.continuation` has `has_more: true` with `cursor: null`\n\nBody.\n";
         let (_dir, root) = make_vault(&[("overview.md", src)]);
         let (_result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
 

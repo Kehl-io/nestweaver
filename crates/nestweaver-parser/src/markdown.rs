@@ -1760,7 +1760,8 @@ mod tests {
 
     #[test]
     fn h1_mixed_with_inline_code_keeps_code_text_in_the_title() {
-        let src = "# Overview `_meta.continuation` has `has_more: true` with `cursor: null`\n\nBody.\n";
+        let src =
+            "# Overview `_meta.continuation` has `has_more: true` with `cursor: null`\n\nBody.\n";
         let note = parse_markdown("notes/overview.md", src).unwrap();
         let expected = "Overview _meta.continuation has has_more: true with cursor: null";
         assert_eq!(note.headings[0].text, expected);

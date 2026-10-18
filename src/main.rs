@@ -2504,10 +2504,7 @@ fn parse_project_context_response_format(value: &str) -> Result<String, String> 
     } else if value.eq_ignore_ascii_case("concise") {
         Ok("concise".to_string())
     } else {
-        Err(
-            "expected 'concise' or 'detailed'; use --detailed for the detailed record"
-                .to_string(),
-        )
+        Err("expected 'concise' or 'detailed'; use --detailed for the detailed record".to_string())
     }
 }
 
@@ -16488,9 +16485,7 @@ struct BrokenPipeStderr<W> {
 
 impl BrokenPipeStderr<std::io::Stderr> {
     fn process() -> Self {
-        Self {
-            inner: std::io::stderr(),
-        }
+        Self::new(std::io::stderr())
     }
 }
 
@@ -17516,9 +17511,9 @@ fn project_context_tool_args(
 ) -> anyhow::Result<(serde_json::Value, usize)> {
     let detailed = match response_format {
         Some("detailed") => true,
-        Some("concise") if detailed => anyhow::bail!(
-            "--response-format concise conflicts with --detailed; pass one of them"
-        ),
+        Some("concise") if detailed => {
+            anyhow::bail!("--response-format concise conflicts with --detailed; pass one of them")
+        }
         Some("concise") | None => detailed,
         Some(other) => anyhow::bail!(
             "invalid --response-format '{other}'; expected 'concise' or 'detailed' (use --detailed for the detailed record)"
