@@ -2609,9 +2609,13 @@ impl CodeWatcher {
     /// skipped. `stale-check` then compared that stale SHA to HEAD.
     ///
     /// Update only when git status shows no modified or untracked indexable
-    /// source and no resolution or reconciliation debt is pending. A dirty
-    /// worktree's graph holds content HEAD does not, so it must stay behind.
-    /// Debt means the graph has not caught the tree yet.
+    /// source, the graph matches the worktree, and no resolution or
+    /// reconciliation debt is pending. A dirty worktree's graph holds
+    /// content HEAD does not, so it must stay behind. Debt means the graph
+    /// has not caught the tree yet. A clean status can still hide a committed
+    /// source the graph lacks; advancing then makes a later incremental index
+    /// treat `indexed_sha == HEAD` as an empty range and leave that file out.
+    /// Leave the SHA behind until the graph-versus-worktree check passes.
     ///
     /// Filemeta is not rewritten. Incremental indexing treats
     /// `indexed_sha == HEAD` as an empty commit range and skips the diff.
@@ -2658,6 +2662,23 @@ impl CodeWatcher {
                 return Ok(());
             }
         }
+        match self.graph_matches_worktree(store, r_uid, &repo.url) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(
+                    repo = %r_uid,
+                    "code watcher left indexed_sha behind; graph does not match the worktree"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "code watcher did not record HEAD; graph-versus-worktree check failed"
+                );
+                return Ok(());
+            }
+        }
         store
             .update_repo_sha(r_uid, &head)
             .context("update_repo_sha")?;
@@ -2681,6 +2702,20 @@ impl CodeWatcher {
             .reconciliation_pending
             .remove(&crate::index_md::code_watch_key(&self.repo_root));
         owed.is_some_and(|rows| !rows.is_empty())
+    }
+
+    /// `Ok(true)` when the graph already holds the worktree the watcher would
+    /// apply: startup drift has nothing to replay, no source it could not
+    /// read, and no spec change. A committed source missing from the graph
+    /// is replay, so HEAD stays behind until that file is present.
+    fn graph_matches_worktree(
+        &self,
+        store: &GraphStore,
+        r_uid: &str,
+        repo_url: &str,
+    ) -> anyhow::Result<bool> {
+        let drift = self.startup_drift(store, r_uid, repo_url)?;
+        Ok(drift.replay.is_empty() && drift.unreadable.is_empty() && !drift.spec_changed)
     }
 
     /// `Ok(true)` when git status reports a modified or untracked source the
@@ -3308,9 +3343,10 @@ mod tests {
     /// nw-808: a commit that changes no source file only writes `.git`, which
     /// indexing skips, so the live loop used to leave `indexed_sha` behind
     /// HEAD. Record that HEAD when status shows no modified or untracked
-    /// indexable source and no resolution debt. A dirty source stays behind.
-    /// A dirty non-source file does not. Filemeta stays untouched so the
-    /// incremental SHA short-circuit is not paired with a fake stat refresh.
+    /// indexable source, the graph already holds those sources, and no
+    /// resolution debt. A dirty source stays behind. A dirty non-source file
+    /// does not. Filemeta stays untouched so the incremental SHA short-circuit
+    /// is not paired with a fake stat refresh.
     #[test]
     fn watcher_records_head_after_a_source_free_commit_but_not_a_dirty_tree() {
         let dir = tempfile::tempdir().unwrap();
@@ -3395,6 +3431,16 @@ mod tests {
         let filemeta = crate::sidecar_path(&db, ".filemeta.json");
         let filemeta_bytes = br#"{"sentinel":"nw-808-filemeta"}"#;
         std::fs::write(&filemeta, filemeta_bytes).unwrap();
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: nestweaver_schema::file_uid(&uid, "src/a.js"),
+                path: "src/a.js".to_string(),
+                repo_uid: uid.clone(),
+                content_hash: crate::hash::blake3_hex(
+                    &std::fs::read_to_string(root.join("src/a.js")).unwrap(),
+                ),
+            })
+            .unwrap();
         let indexed = || store.lookup_repo(&uid).unwrap().unwrap().indexed_sha;
 
         git(&["commit", "--allow-empty", "-m", "no source change"]);
@@ -3448,6 +3494,269 @@ mod tests {
             std::fs::read(&filemeta).unwrap(),
             filemeta_bytes,
             "recording HEAD must not refresh filemeta"
+        );
+    }
+
+    /// A clean `git status` is not a graph match. `src/missed.js` stays
+    /// committed and is removed from the graph only; an empty commit moves
+    /// HEAD. Recording that HEAD would make a later incremental index see
+    /// `indexed_sha == HEAD`, add nothing, and leave `missed.js` absent.
+    /// The SHA stays on the previous commit until the graph holds the file.
+    /// A dirty source still does not advance.
+    #[test]
+    fn missed_committed_source_keeps_indexed_sha_behind_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let missed_body = "export function missed() { return 1; }\n";
+        std::fs::write(
+            root.join("src/kept.js"),
+            "export function kept() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/missed.js"), missed_body).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["add", "src/kept.js", "src/missed.js"]);
+        git(&["commit", "-m", "base"]);
+        let head = || -> String {
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git rev-parse HEAD failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        let base = head();
+        let db = dir.path().join("graph.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let url = format!("file://{}", root.display());
+        let uid = nestweaver_schema::repo_uid("test", &url);
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: uid.clone(),
+                url: url.clone(),
+                indexed_sha: base.clone(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: Some(root.display().to_string()),
+            })
+            .unwrap();
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: nestweaver_schema::file_uid(&uid, "src/kept.js"),
+                path: "src/kept.js".to_string(),
+                repo_uid: uid.clone(),
+                content_hash: crate::hash::blake3_hex(
+                    &std::fs::read_to_string(root.join("src/kept.js")).unwrap(),
+                ),
+            })
+            .unwrap();
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        let indexed = || store.lookup_repo(&uid).unwrap().unwrap().indexed_sha;
+        let graph_paths = || -> Vec<String> {
+            let mut paths = store
+                .list_file_hashes_by_repo(&uid)
+                .unwrap()
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths
+        };
+        assert_eq!(graph_paths(), vec!["src/kept.js".to_string()]);
+
+        git(&["commit", "--allow-empty", "-m", "no source change"]);
+        let clean = head();
+        assert_ne!(clean, base);
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(
+            status.stdout.is_empty(),
+            "the missed file is committed, so status is clean: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            indexed(),
+            base,
+            "a committed source missing from the graph keeps indexed_sha behind {clean}"
+        );
+        assert_eq!(graph_paths(), vec!["src/kept.js".to_string()]);
+
+        std::fs::write(
+            root.join("src/extra.js"),
+            "export function extra() { return 2; }\n",
+        )
+        .unwrap();
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            indexed(),
+            base,
+            "a dirty source tree must not advance indexed_sha to {clean}"
+        );
+        std::fs::remove_file(root.join("src/extra.js")).unwrap();
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            indexed(),
+            base,
+            "clearing the dirty file leaves the missing graph source behind {clean}"
+        );
+
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: nestweaver_schema::file_uid(&uid, "src/missed.js"),
+                path: "src/missed.js".to_string(),
+                repo_uid: uid.clone(),
+                content_hash: crate::hash::blake3_hex(missed_body),
+            })
+            .unwrap();
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            indexed(),
+            clean,
+            "once every committed source is in the graph, the clean HEAD is recorded"
+        );
+        assert_eq!(
+            graph_paths(),
+            vec!["src/kept.js".to_string(), "src/missed.js".to_string()]
+        );
+    }
+
+    /// `record_applied_head` leaves `indexed_sha` behind when `src/missed.js`
+    /// is committed and absent from the graph. The following incremental index
+    /// sees an empty `indexed_sha..HEAD` diff, so it must put that file back
+    /// in the same transaction that records HEAD.
+    #[test]
+    fn incremental_index_restores_missed_committed_source_before_recording_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let missed_body = "export function missed() { return 1; }\n";
+        std::fs::write(
+            root.join("src/kept.js"),
+            "export function kept() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/missed.js"), missed_body).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["add", "src/kept.js", "src/missed.js"]);
+        git(&["commit", "-m", "base"]);
+        let head = || -> String {
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git rev-parse HEAD failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        let base = head();
+        let db = dir.path().join("graph.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let url = format!("file://{}", root.display());
+        let uid = nestweaver_schema::repo_uid("test", &url);
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: uid.clone(),
+                url: url.clone(),
+                indexed_sha: base.clone(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: Some(root.display().to_string()),
+            })
+            .unwrap();
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: nestweaver_schema::file_uid(&uid, "src/kept.js"),
+                path: "src/kept.js".to_string(),
+                repo_uid: uid.clone(),
+                content_hash: crate::hash::blake3_hex(
+                    &std::fs::read_to_string(root.join("src/kept.js")).unwrap(),
+                ),
+            })
+            .unwrap();
+        let reader = crate::content_reader::FilesystemReader::with_limits(
+            &root,
+            crate::index_limits::IndexLimits::default(),
+        );
+        store
+            .set_repo_index_policy(&uid, &reader.eligibility_fingerprint())
+            .unwrap();
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        git(&["commit", "--allow-empty", "-m", "no source change"]);
+        let clean = head();
+        assert_ne!(clean, base);
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            store.lookup_repo(&uid).unwrap().unwrap().indexed_sha,
+            base,
+            "precondition: indexed_sha stays behind {clean} while missed.js is absent"
+        );
+        drop(store);
+
+        let result = crate::index::incremental_index(&root, &db, "test", &url).unwrap();
+        assert!(
+            !result.fell_back_to_full,
+            "the empty commit range must stay on the incremental path"
+        );
+        assert_eq!(
+            result.files_added, 1,
+            "only the missing committed source is added"
+        );
+
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert_eq!(
+            store.lookup_repo(&uid).unwrap().unwrap().indexed_sha,
+            clean,
+            "HEAD is recorded once the missing file is back in the graph"
+        );
+        let mut paths = store
+            .list_file_hashes_by_repo(&uid)
+            .unwrap()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["src/kept.js".to_string(), "src/missed.js".to_string()]
+        );
+        let names = store
+            .symbols_in_file_in_repo("src/missed.js", &uid)
+            .unwrap()
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect::<Vec<_>>();
+        assert!(
+            names.iter().any(|name| name == "missed"),
+            "restored file must be parsed, got {names:?}"
         );
     }
 

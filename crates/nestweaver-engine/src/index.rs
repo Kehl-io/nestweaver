@@ -7192,7 +7192,18 @@ fn incremental_index_with_name_and_io_and_authority(
 
     // nw-008 Phase 0 — transitive reverse-dependents from the LIVE graph, BEFORE
     // any mutation (the per-file `DETACH DELETE` destroys the edges we walk).
-    let (changed_files, removed_files) = partition_changed_removed(&changes, skip_reader);
+    let (mut changed_files, removed_files) = partition_changed_removed(&changes, skip_reader);
+    let mut occupied: HashSet<String> = store
+        .list_files_by_repo(&r_uid)
+        .with_context(|| "list files before restoring committed sources")?
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect();
+    occupied.extend(paths_covered_by_changes(&changes));
+    let missing_committed =
+        prepare_missing_committed_sources(skip_reader, repo_path, &new_sha, &occupied)
+            .context("prepare committed sources missing from the graph")?;
+    extend_changed_with_missing_sources(&mut changed_files, &missing_committed);
     let mut rdeps = collect_reverse_dep_files(&store, &r_uid, &changed_files, &removed_files);
     extend_rdeps_for_added_files(
         skip_reader,
@@ -7420,6 +7431,19 @@ fn incremental_index_with_name_and_io_and_authority(
         }
     }
 
+    // A source already in this tree is absent from `indexed_sha..HEAD`. Put it
+    // back before the SHA write in this same transaction, then re-resolve.
+    write_missing_committed_sources_on(
+        skip_reader,
+        &missing_committed,
+        &r_uid,
+        repo_url,
+        &store,
+        &txn,
+        &mut result,
+    )
+    .context("restore committed sources missing from the graph")?;
+
     // nw-008 Phase 2 — re-resolve reverse-dependents and surgically restore the
     // cross-file edges the per-file `DETACH DELETE` removed (same transaction).
     let reresolved = reresolve_affected_dependents(&reader, &txn, &r_uid, &changed_files, &rdeps)?;
@@ -7488,6 +7512,7 @@ fn incremental_index_with_name_and_io_and_authority(
         true,
     )?;
     append_incremental_parses(Some(db_path), &prepared_files);
+    append_incremental_parses(Some(db_path), &missing_committed);
 
     Ok(result)
 }
@@ -7601,7 +7626,18 @@ where
     // nw-008 Phase 0 — compute transitive reverse-dependents from the LIVE
     // graph BEFORE any mutation. The per-file `DETACH DELETE` below destroys the
     // edges we walk here, so this ordering is correctness-critical.
-    let (changed_files, removed_files) = partition_changed_removed(&changes, skip_reader);
+    let (mut changed_files, removed_files) = partition_changed_removed(&changes, skip_reader);
+    let mut occupied: HashSet<String> = store
+        .list_files_by_repo(&r_uid)
+        .with_context(|| "list files before restoring committed sources")?
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect();
+    occupied.extend(paths_covered_by_changes(&changes));
+    let missing_committed =
+        prepare_missing_committed_sources(skip_reader, git_repo_path, new_sha, &occupied)
+            .context("prepare committed sources missing from the graph")?;
+    extend_changed_with_missing_sources(&mut changed_files, &missing_committed);
     let mut rdeps = collect_reverse_dep_files(store, &r_uid, &changed_files, &removed_files);
     extend_rdeps_for_added_files(
         skip_reader,
@@ -7829,6 +7865,19 @@ where
         }
     }
 
+    // A source already in this tree is absent from `indexed_sha..HEAD`. Put it
+    // back before the SHA write in this same transaction, then re-resolve.
+    write_missing_committed_sources_on(
+        skip_reader,
+        &missing_committed,
+        &r_uid,
+        repo_url,
+        store,
+        &txn,
+        &mut result,
+    )
+    .context("restore committed sources missing from the graph")?;
+
     // nw-008 Phase 2 — re-resolve the reverse-dependents computed in Phase 0
     // and surgically restore the cross-file edges that the per-file
     // `DETACH DELETE` removed (same transaction).
@@ -7895,6 +7944,7 @@ where
         true,
     )?;
     append_incremental_parses(store.db_path(), &prepared_files);
+    append_incremental_parses(store.db_path(), &missing_committed);
 
     Ok(result)
 }
@@ -8014,6 +8064,108 @@ fn prepare_incremental_file(
         source,
         parsed,
     }))
+}
+
+fn paths_covered_by_changes(changes: &[crate::git_diff::FileChange]) -> HashSet<String> {
+    let mut paths = HashSet::new();
+    for change in changes {
+        match change {
+            crate::git_diff::FileChange::Added(path)
+            | crate::git_diff::FileChange::Modified(path)
+            | crate::git_diff::FileChange::Deleted(path) => {
+                paths.insert(path.to_string_lossy().into_owned());
+            }
+            crate::git_diff::FileChange::Renamed { from, to } => {
+                paths.insert(from.to_string_lossy().into_owned());
+                paths.insert(to.to_string_lossy().into_owned());
+            }
+        }
+    }
+    paths
+}
+
+/// Indexable paths in `sha`'s tree that the graph does not hold and that this
+/// run's diff does not already cover.
+///
+/// `git diff indexed_sha..HEAD` is empty for a source that was committed at or
+/// before `indexed_sha` and then dropped from the graph. Advancing the SHA
+/// without putting that path back leaves it missing forever.
+fn prepare_missing_committed_sources(
+    reader: &dyn crate::content_reader::ContentReader,
+    git_repo_path: &Path,
+    sha: &str,
+    already_present: &HashSet<String>,
+) -> Result<HashMap<String, PreparedIncrementalOutcome>, anyhow::Error> {
+    let mut prepared = HashMap::new();
+    for path in crate::git_diff::list_commit_paths(git_repo_path, sha)
+        .context("list committed paths before recording HEAD")?
+    {
+        let rel = path.to_string_lossy();
+        if already_present.contains(rel.as_ref())
+            || !reader.accepts_path(&path)
+            || reader.skips_path(&path)
+            || !is_parseable(&path)
+        {
+            continue;
+        }
+        prepared.insert(
+            rel.into_owned(),
+            prepare_incremental_file(reader, &path)
+                .with_context(|| format!("prepare committed source {}", path.display()))?,
+        );
+    }
+    Ok(prepared)
+}
+
+fn extend_changed_with_missing_sources(
+    changed: &mut HashSet<String>,
+    missing: &HashMap<String, PreparedIncrementalOutcome>,
+) {
+    for (path, outcome) in missing {
+        if matches!(outcome, PreparedIncrementalOutcome::Ready(_)) {
+            changed.insert(path.clone());
+        }
+    }
+}
+
+/// Insert prepared committed sources that this transaction has not already
+/// written. Call before `update_repo_sha_on` so a crash rolls the SHA and the
+/// restored file back together.
+fn write_missing_committed_sources_on(
+    reader: &dyn crate::content_reader::ContentReader,
+    missing: &HashMap<String, PreparedIncrementalOutcome>,
+    r_uid: &str,
+    repo_url: &str,
+    store: &nestweaver_store::GraphStore,
+    txn: &nestweaver_store::DbConnection<'_>,
+    result: &mut IncrementalResult,
+) -> Result<(), anyhow::Error> {
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let present: HashSet<String> = nestweaver_store::GraphStore::list_files_by_repo_on(txn, r_uid)
+        .with_context(|| "list files before restoring committed sources")?
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect();
+    for (path, outcome) in missing {
+        if present.contains(path) {
+            continue;
+        }
+        match outcome {
+            PreparedIncrementalOutcome::Excluded | PreparedIncrementalOutcome::PolicySkipped(_) => {
+            }
+            PreparedIncrementalOutcome::Ready(prepared) => {
+                let outcome = write_prepared_incremental_file_txn(
+                    reader, prepared, r_uid, repo_url, store, txn,
+                )?;
+                if record_incremental_file_outcome(result, outcome) {
+                    result.files_added += 1;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn prepare_incremental_files(
