@@ -374,7 +374,7 @@ impl CodeWatcher {
         // race the initial snapshot are queued by the debouncer and replayed
         // below, closing the former scan-then-watch lost-event window.
         let (tx, rx) = std::sync::mpsc::channel::<RawWatchResult>();
-        let watcher =
+        let mut watcher =
             notify::recommended_watcher(move |result: Result<Event, notify::Error>| match result {
                 Ok(event) if event_should_be_queued(&event) => {
                     let _ = tx.send(Ok(event.paths));
@@ -385,6 +385,11 @@ impl CodeWatcher {
                 }
             })
             .context("init code filesystem watcher")?;
+        // A linked worktree's `.git` is a file. Commits write HEAD and refs in
+        // the git dir and common dir, which sit outside the checkout, so the
+        // root watch never sees a source-free commit.
+        let external_git_dirs = external_git_metadata_dirs(&self.repo_root);
+        watch_external_git_metadata(&mut watcher, &external_git_dirs);
         // nw-651 on Linux: an unreadable subdirectory must not stop the whole
         // subscription; it is skipped and disclosed instead (`watch_tree`).
         #[cfg(test)]
@@ -519,6 +524,26 @@ impl CodeWatcher {
                 }
             };
         }
+        // A commit that landed while nothing was watching never produces a
+        // live event. Once startup has applied the tree, record that HEAD
+        // under the same clean-tree rule as a live ref update.
+        if pending.is_none() {
+            match self.acquire_mutation_lease("watch_code_sha") {
+                Ok(_lease) => {
+                    if let Err(error) = self.record_applied_head(&store, &r_uid, false) {
+                        tracing::warn!(
+                            %error,
+                            "code watcher left indexed_sha unchanged at startup"
+                        );
+                    }
+                }
+                Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
+                    tracing::info!("CodeWatcher HEAD record refused during shutdown; exiting");
+                    return Ok(());
+                }
+                Err(error) => return Err(error.context("acquire code watcher HEAD lease")),
+            }
+        }
         if let Some(ready) = self.ready_callback.take() {
             ready();
         }
@@ -546,7 +571,32 @@ impl CodeWatcher {
                     on_change.as_deref().map(|callback| callback as &dyn Fn()),
                     owed.failures,
                 ) {
-                    Ok(next) => pending = next,
+                    Ok(next) => {
+                        let landed = next.is_none();
+                        pending = next;
+                        if landed {
+                            match self.acquire_mutation_lease("watch_code_sha") {
+                                Ok(_lease) => {
+                                    if let Err(error) =
+                                        self.record_applied_head(&store, &r_uid, false)
+                                    {
+                                        tracing::warn!(
+                                            %error,
+                                            "code watcher left indexed_sha unchanged after reconciliation"
+                                        );
+                                    }
+                                }
+                                Err(error)
+                                    if error.downcast_ref::<WatchMutationRefused>().is_some() =>
+                                {
+                                    return Ok(());
+                                }
+                                Err(error) => {
+                                    return Err(error.context("acquire code watcher HEAD lease"));
+                                }
+                            }
+                        }
+                    }
                     Err(_) => return Ok(()),
                 }
             }
@@ -602,6 +652,41 @@ impl CodeWatcher {
                 subscribed_unwatchable = tree.unwatchable().to_vec();
                 self.sync_unwatched_dirs(&repo_url, &subscribed_unwatchable, false);
             }
+            // nw-808: `.git` is not source. A commit that changes no indexable
+            // file only updates HEAD and refs, so it must still be able to
+            // record `indexed_sha` without a source batch.
+            let head_moved = batch
+                .iter()
+                .any(|path| git_head_or_refs_event(&self.repo_root, &external_git_dirs, path));
+            let source_events: Vec<PathBuf> = batch
+                .iter()
+                .filter(|path| !is_dot_git_metadata(&self.repo_root, &external_git_dirs, path))
+                .cloned()
+                .collect();
+            if source_events.is_empty() {
+                if head_moved {
+                    let _mutation_lease = match self.acquire_mutation_lease("watch_code_sha") {
+                        Ok(lease) => lease,
+                        Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
+                            tracing::info!(
+                                "CodeWatcher HEAD record refused during shutdown; exiting"
+                            );
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            return Err(error.context("acquire code watcher HEAD lease"));
+                        }
+                    };
+                    if let Err(error) = self.record_applied_head(&store, &r_uid, pending.is_some())
+                    {
+                        tracing::warn!(
+                            %error,
+                            "code watcher left indexed_sha unchanged after HEAD moved"
+                        );
+                    }
+                }
+                continue;
+            }
             let _mutation_lease = match self.acquire_mutation_lease("watch_code_batch") {
                 Ok(lease) => lease,
                 Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
@@ -615,7 +700,7 @@ impl CodeWatcher {
                 &store,
                 &r_uid,
                 &repo_url,
-                &batch,
+                &source_events,
                 &crate::index::FileSystemIndexEpilogueIo,
                 on_change.as_deref().map(|callback| callback as &dyn Fn()),
             )?;
@@ -625,7 +710,7 @@ impl CodeWatcher {
                     // so any disclosure about them is stale.
                     // An unwatched directory's row stays: a batch touching
                     // it (or an ancestor) says nothing about its watch.
-                    let settled: Vec<PathBuf> = batch
+                    let settled: Vec<PathBuf> = source_events
                         .iter()
                         .filter(|path| {
                             !self
@@ -642,13 +727,24 @@ impl CodeWatcher {
                     );
                     files_processed
                 }
-                WatchBatchOutcome::Unchanged | WatchBatchOutcome::ManifestPending => continue,
+                WatchBatchOutcome::Unchanged | WatchBatchOutcome::ManifestPending => {
+                    if head_moved
+                        && let Err(error) =
+                            self.record_applied_head(&store, &r_uid, pending.is_some())
+                    {
+                        tracing::warn!(
+                            %error,
+                            "code watcher left indexed_sha unchanged after HEAD moved"
+                        );
+                    }
+                    continue;
+                }
                 WatchBatchOutcome::PublishedPending {
                     files_processed,
                     reason,
                 } => {
                     tracing::warn!(error = %reason, files_processed, "code watcher committed; evidence repair remains owed");
-                    self.record_debt(&batch, &[], Some(&format!("{reason:#}")));
+                    self.record_debt(&source_events, &[], Some(&format!("{reason:#}")));
                     if pending.is_none() {
                         pending = Some(crate::watcher::PendingReconciliation {
                             paths: None,
@@ -687,9 +783,24 @@ impl CodeWatcher {
                             next_attempt: Instant::now(),
                         });
                     }
+                    if head_moved && let Err(error) = self.record_applied_head(&store, &r_uid, true)
+                    {
+                        tracing::warn!(
+                            %error,
+                            "code watcher left indexed_sha unchanged after HEAD moved"
+                        );
+                    }
                     continue;
                 }
             };
+            if head_moved
+                && let Err(error) = self.record_applied_head(&store, &r_uid, pending.is_some())
+            {
+                tracing::warn!(
+                    %error,
+                    "code watcher left indexed_sha unchanged after HEAD moved"
+                );
+            }
             let duration = start.elapsed();
             tracing::info!(
                 files_processed,
@@ -2372,6 +2483,272 @@ fn is_watcher_input(path: &Path) -> bool {
     is_supported_source(path) || crate::contracts::is_spec_file(&path.to_string_lossy())
 }
 
+/// True when `path` is git metadata rather than source.
+///
+/// That is the checkout's `.git` directory, or — for a linked worktree — a
+/// file under the git dir or common dir from `git rev-parse`. A commit that
+/// changes no source file still writes those paths, and that is the only
+/// signal the watcher gets. Every other file there stays out of the source
+/// batch.
+fn is_dot_git_metadata(repo_root: &Path, external_git_dirs: &[PathBuf], path: &Path) -> bool {
+    repo_dot_git_suffix(repo_root, path).is_some()
+        || external_git_dirs.iter().any(|dir| path.starts_with(dir))
+}
+
+/// True when `path` is `HEAD` or a ref update that can move HEAD.
+/// Object and index writes are ignored: they do not by themselves mean the
+/// commit the graph should record has changed.
+///
+/// `external_git_dirs` are absolute git dirs and common dirs that sit outside
+/// the checkout. The same HEAD, refs, packed-refs, and reflog names count
+/// there as they do under an in-root `.git`.
+fn git_head_or_refs_event(repo_root: &Path, external_git_dirs: &[PathBuf], path: &Path) -> bool {
+    if let Some(relative) = repo_dot_git_suffix(repo_root, path)
+        && is_head_or_refs_inside_git_dir(relative)
+    {
+        return true;
+    }
+    external_git_dirs.iter().any(|dir| {
+        path.strip_prefix(dir)
+            .is_ok_and(is_head_or_refs_inside_git_dir)
+    })
+}
+
+/// Path inside the checkout's `.git`, or `Some` of an empty path when `path`
+/// is `.git` itself. `None` when `path` is not that directory.
+fn repo_dot_git_suffix<'a>(repo_root: &Path, path: &'a Path) -> Option<&'a Path> {
+    let relative = path.strip_prefix(repo_root).ok()?;
+    let mut parts = relative.components();
+    match parts.next() {
+        Some(std::path::Component::Normal(name)) if name == ".git" => Some(parts.as_path()),
+        _ => None,
+    }
+}
+
+fn is_head_or_refs_inside_git_dir(relative: &Path) -> bool {
+    let mut parts = relative.components();
+    match parts.next() {
+        Some(std::path::Component::Normal(name)) if name == "HEAD" => parts.next().is_none(),
+        Some(std::path::Component::Normal(name)) if name == "packed-refs" => parts.next().is_none(),
+        Some(std::path::Component::Normal(name)) if name == "refs" => true,
+        Some(std::path::Component::Normal(name)) if name == "logs" => match parts.next() {
+            Some(std::path::Component::Normal(inner)) if inner == "HEAD" || inner == "refs" => true,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Absolute `--git-dir` and `--git-common-dir` paths that sit outside `repo_root`.
+///
+/// An in-root `.git` directory is already covered by the checkout watch.
+/// A linked worktree's git dir and common dir are not.
+fn external_git_metadata_dirs(repo_root: &Path) -> Vec<PathBuf> {
+    let canonical_root =
+        std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut dirs = Vec::new();
+    for flag in ["--git-dir", "--git-common-dir"] {
+        let Some(dir) = rev_parse_absolute_dir(repo_root, flag) else {
+            continue;
+        };
+        if dir.starts_with(&canonical_root) || dirs.iter().any(|seen| seen == &dir) {
+            continue;
+        }
+        dirs.push(dir);
+    }
+    dirs
+}
+
+fn rev_parse_absolute_dir(repo_root: &Path, flag: &str) -> Option<PathBuf> {
+    let mut command = std::process::Command::new("git");
+    command.current_dir(repo_root).args(["rev-parse", flag]);
+    let output = crate::git_cmd::run_git_with_timeout(command, Duration::from_secs(15)).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let line = text.lines().next()?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let raw = PathBuf::from(line);
+    let absolute = if raw.is_absolute() {
+        raw
+    } else {
+        repo_root.join(raw)
+    };
+    Some(std::fs::canonicalize(&absolute).unwrap_or(absolute))
+}
+
+/// Subscribe to git metadata directories the checkout watch does not cover.
+/// A directory nested under one already watched is skipped: the recursive
+/// parent watch delivers its events, and classification still names it.
+fn watch_external_git_metadata(watcher: &mut impl notify::Watcher, dirs: &[PathBuf]) {
+    for dir in dirs {
+        if dirs
+            .iter()
+            .any(|other| other != dir && dir.starts_with(other))
+        {
+            continue;
+        }
+        if let Err(error) = watcher.watch(dir, notify::RecursiveMode::Recursive) {
+            tracing::warn!(
+                %error,
+                dir = %dir.display(),
+                "code watcher could not watch the git directory outside the worktree"
+            );
+        }
+    }
+}
+
+impl CodeWatcher {
+    /// Record HEAD in `indexed_sha` when the watcher has applied that tree.
+    ///
+    /// nw-808. Watcher batches never used to advance `indexed_sha`, and a
+    /// commit with no source change never started a batch, because `.git` is
+    /// skipped. `stale-check` then compared that stale SHA to HEAD.
+    ///
+    /// Update only when git status shows no modified or untracked indexable
+    /// source and no resolution or reconciliation debt is pending. A dirty
+    /// worktree's graph holds content HEAD does not, so it must stay behind.
+    /// Debt means the graph has not caught the tree yet.
+    ///
+    /// Filemeta is not rewritten. Incremental indexing treats
+    /// `indexed_sha == HEAD` as an empty commit range and skips the diff.
+    /// That is the right short-circuit once the clean tree and a settled
+    /// watcher already match HEAD. Writing filemeta here would pretend a
+    /// full index had refreshed the stat cache. Startup drift still hashes
+    /// the graph when that cache is stale, so a later full index re-reads a
+    /// file whose stat moved.
+    fn record_applied_head(
+        &self,
+        store: &GraphStore,
+        r_uid: &str,
+        retry_pending: bool,
+    ) -> anyhow::Result<()> {
+        if self.applied_head_blocked(r_uid, retry_pending) {
+            return Ok(());
+        }
+        if !self.repo_root.join(".git").exists() {
+            return Ok(());
+        }
+        let Some(repo) = store.lookup_repo(r_uid)? else {
+            return Ok(());
+        };
+        let head = match crate::git_diff::current_head_sha(&self.repo_root) {
+            Ok(head) if crate::repo_head::is_full_sha(&head) => head,
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                tracing::debug!(%error, "code watcher has no HEAD sha to record");
+                return Ok(());
+            }
+        };
+        if head == repo.indexed_sha {
+            return Ok(());
+        }
+        let reader = self.reader_for(&repo.url)?;
+        match self.indexable_worktree_drift(&reader) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "code watcher did not record HEAD; git status failed"
+                );
+                return Ok(());
+            }
+        }
+        store
+            .update_repo_sha(r_uid, &head)
+            .context("update_repo_sha")?;
+        tracing::info!(repo = %r_uid, sha = %head, "recorded indexed_sha at applied HEAD");
+        Ok(())
+    }
+
+    fn applied_head_blocked(&self, r_uid: &str, retry_pending: bool) -> bool {
+        if retry_pending || self.resolution_debt_path(r_uid).exists() {
+            return true;
+        }
+        if !self
+            .committed_replay_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+        {
+            return true;
+        }
+        let owed = crate::index_md::load_skipped_notes_sidecar(&self.db_path)
+            .reconciliation_pending
+            .remove(&crate::index_md::code_watch_key(&self.repo_root));
+        owed.is_some_and(|rows| !rows.is_empty())
+    }
+
+    /// `Ok(true)` when git status reports a modified or untracked source the
+    /// indexer would admit. Non-source dirt (a dirty README) does not count.
+    fn indexable_worktree_drift(
+        &self,
+        reader: &crate::content_reader::FilesystemReader,
+    ) -> anyhow::Result<bool> {
+        let mut command = std::process::Command::new("git");
+        command.current_dir(&self.repo_root).args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ]);
+        let output = crate::git_cmd::run_git_with_timeout(command, Duration::from_secs(15))
+            .context("git status for watcher HEAD record")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "git status failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        porcelain_has_indexable_source(&output.stdout, reader)
+    }
+}
+
+fn porcelain_has_indexable_source(
+    bytes: &[u8],
+    reader: &crate::content_reader::FilesystemReader,
+) -> anyhow::Result<bool> {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        if rest.len() < 4 || rest[2] != b' ' {
+            anyhow::bail!("git status porcelain entry is truncated");
+        }
+        let renamed = matches!(rest[0], b'R' | b'C') || matches!(rest[1], b'R' | b'C');
+        let (path, next) = split_nul(&rest[3..])?;
+        rest = next;
+        if status_path_is_indexable(reader, path) {
+            return Ok(true);
+        }
+        if renamed {
+            let (prior, next) = split_nul(rest)?;
+            rest = next;
+            if status_path_is_indexable(reader, prior) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn split_nul(bytes: &[u8]) -> anyhow::Result<(&str, &[u8])> {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .context("git status entry is missing its NUL terminator")?;
+    let path = std::str::from_utf8(&bytes[..end]).context("git status path is not utf-8")?;
+    Ok((path, &bytes[end + 1..]))
+}
+
+fn status_path_is_indexable(reader: &crate::content_reader::FilesystemReader, path: &str) -> bool {
+    let relative = Path::new(path);
+    reader.accepts_path(relative)
+        && (is_supported_source(relative) || crate::contracts::is_spec_file(path))
+}
+
 fn manifest_path_not_gitignored(root: &Path, relative: &Path) -> anyhow::Result<bool> {
     if !root.join(".git").exists() {
         return Ok(true);
@@ -2926,6 +3303,252 @@ mod tests {
         assert!(skipped("/repo/node_modules/foo/bar.js"));
         assert!(skipped("/repo/.git/HEAD"));
         assert!(!skipped("/repo/src/main.rs"));
+    }
+
+    /// nw-808: a commit that changes no source file only writes `.git`, which
+    /// indexing skips, so the live loop used to leave `indexed_sha` behind
+    /// HEAD. Record that HEAD when status shows no modified or untracked
+    /// indexable source and no resolution debt. A dirty source stays behind.
+    /// A dirty non-source file does not. Filemeta stays untouched so the
+    /// incremental SHA short-circuit is not paired with a fake stat refresh.
+    #[test]
+    fn watcher_records_head_after_a_source_free_commit_but_not_a_dirty_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.js"), "export function a() { return 1; }\n").unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["add", "src/a.js"]);
+        git(&["commit", "-m", "base"]);
+        let head = || -> String {
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git rev-parse HEAD failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        let base = head();
+        assert!(super::git_head_or_refs_event(
+            &root,
+            &[],
+            &root.join(".git/HEAD")
+        ));
+        assert!(super::git_head_or_refs_event(
+            &root,
+            &[],
+            &root.join(".git/refs/heads/main")
+        ));
+        assert!(super::git_head_or_refs_event(
+            &root,
+            &[],
+            &root.join(".git/packed-refs")
+        ));
+        assert!(!super::git_head_or_refs_event(
+            &root,
+            &[],
+            &root.join(".git/objects/pack/pack")
+        ));
+        assert!(!super::git_head_or_refs_event(
+            &root,
+            &[],
+            &root.join(".git/index")
+        ));
+        assert!(!super::git_head_or_refs_event(
+            &root,
+            &[],
+            &root.join("src/a.js")
+        ));
+        assert!(super::is_dot_git_metadata(
+            &root,
+            &[],
+            &root.join(".git/objects/pack/pack")
+        ));
+
+        let db = dir.path().join("graph.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let url = format!("file://{}", root.display());
+        let uid = nestweaver_schema::repo_uid("test", &url);
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: uid.clone(),
+                url: url.clone(),
+                indexed_sha: base.clone(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: Some(root.display().to_string()),
+            })
+            .unwrap();
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        let filemeta = crate::sidecar_path(&db, ".filemeta.json");
+        let filemeta_bytes = br#"{"sentinel":"nw-808-filemeta"}"#;
+        std::fs::write(&filemeta, filemeta_bytes).unwrap();
+        let indexed = || store.lookup_repo(&uid).unwrap().unwrap().indexed_sha;
+
+        git(&["commit", "--allow-empty", "-m", "no source change"]);
+        let clean = head();
+        assert_ne!(clean, base);
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(indexed(), clean, "a clean source-free commit records HEAD");
+
+        std::fs::write(root.join("README.md"), "notes\n").unwrap();
+        git(&["commit", "--allow-empty", "-m", "still no source change"]);
+        let with_readme = head();
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            indexed(),
+            with_readme,
+            "a dirty non-source file does not keep indexed_sha behind HEAD"
+        );
+
+        watcher
+            .save_resolution_debt(&uid, &[root.join("src/a.js")])
+            .unwrap();
+        git(&["commit", "--allow-empty", "-m", "while resolution is owed"]);
+        let while_debt = head();
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            indexed(),
+            with_readme,
+            "resolution debt keeps the recorded SHA behind {while_debt}"
+        );
+        std::fs::remove_file(watcher.resolution_debt_path(&uid)).unwrap();
+
+        std::fs::write(
+            root.join("src/extra.js"),
+            "export function extra() { return 2; }\n",
+        )
+        .unwrap();
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            indexed(),
+            with_readme,
+            "an untracked indexable source must not be marked fresh at {while_debt}"
+        );
+        std::fs::remove_file(root.join("src/extra.js")).unwrap();
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            indexed(),
+            while_debt,
+            "once the indexable drift is gone, the applied HEAD is recorded"
+        );
+        assert_eq!(
+            std::fs::read(&filemeta).unwrap(),
+            filemeta_bytes,
+            "recording HEAD must not refresh filemeta"
+        );
+    }
+
+    /// A linked worktree's `.git` is a file. A source-free commit updates the
+    /// git dir and common dir outside the checkout, so a watcher subscribed
+    /// only to the worktree root never calls `record_applied_head`.
+    #[cfg(unix)]
+    #[test]
+    fn linked_worktree_source_free_commit_advances_indexed_sha_while_the_watcher_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.js"), "export function a() { return 1; }\n").unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed in {}", cwd.display());
+        };
+        git(&root, &["init"]);
+        git(&root, &["config", "user.email", "test@example.com"]);
+        git(&root, &["config", "user.name", "Test"]);
+        git(&root, &["add", "src/a.js"]);
+        git(&root, &["commit", "-m", "base"]);
+        let wt_path = std::fs::canonicalize(dir.path()).unwrap().join("wt");
+        let wt_arg = wt_path.display().to_string();
+        git(&root, &["worktree", "add", "-b", "wt", &wt_arg]);
+        let wt = std::fs::canonicalize(&wt_path).unwrap();
+        assert!(
+            wt.join(".git").is_file(),
+            "a linked worktree .git is a file"
+        );
+        let external = super::external_git_metadata_dirs(&wt);
+        assert!(
+            !external.is_empty(),
+            "git dir and common dir sit outside {}",
+            wt.display()
+        );
+        assert!(
+            external.iter().all(|dir| !dir.starts_with(&wt)),
+            "external git dirs must stay outside the checkout: {external:?}"
+        );
+        let common = external
+            .iter()
+            .find(|dir| dir.join("refs").is_dir())
+            .cloned()
+            .expect("common git dir has refs");
+        assert!(super::git_head_or_refs_event(
+            &wt,
+            &external,
+            &common.join("refs/heads/wt")
+        ));
+        assert!(super::git_head_or_refs_event(
+            &wt,
+            &external,
+            &common.join("logs/refs/heads/wt")
+        ));
+        assert!(!super::git_head_or_refs_event(
+            &wt,
+            &external,
+            &common.join("objects/pack/pack")
+        ));
+        assert!(super::is_dot_git_metadata(
+            &wt,
+            &external,
+            &common.join("objects/pack/pack")
+        ));
+        assert!(!super::is_dot_git_metadata(
+            &wt,
+            &external,
+            &wt.join("src/a.js")
+        ));
+
+        let head = |cwd: &Path| -> String {
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git rev-parse HEAD failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        let base = head(&wt);
+        let db = dir.path().join("graph.lbug");
+        let url = format!("file://{}", wt.display());
+        crate::index::index_directory(&wt, &db, "test", &url, &base).unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db).unwrap());
+        let uid = nestweaver_schema::repo_uid("test", &url);
+        let (stop, handle) =
+            spawn_live_code_watcher(CodeWatcher::new(&db, &wt, "test"), store.clone());
+
+        git(&wt, &["commit", "--allow-empty", "-m", "no source change"]);
+        let clean = head(&wt);
+        assert_ne!(clean, base);
+        wait_until("indexed_sha to follow the linked worktree commit", || {
+            store.lookup_repo(&uid).unwrap().unwrap().indexed_sha == clean
+        });
+        stop.stop();
+        handle.join().unwrap().unwrap();
     }
 
     #[test]
