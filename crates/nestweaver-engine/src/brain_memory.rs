@@ -951,7 +951,21 @@ fn apply_proposals(
             )
         })?;
         let source_relative = validate_vault_relative_path(Path::new(&proposal.source_path))?;
-        let destination_relative = destination_relative_path(proposal)?;
+        // One proposal with an unusable target (an idea referenced from
+        // vault-root sync.md and status.md, whose project path is empty)
+        // must not abort preflight. The remaining proposals are still
+        // prepared and applied; this row stays in the result with the
+        // validation error.
+        let destination_relative = match destination_relative_path(proposal) {
+            Ok(path) => path,
+            Err(error) => {
+                obsolete.push(format!(
+                    "REJECTED: consolidation of '{}' to '{}' was not applied: {error}",
+                    proposal.source_path, proposal.promote_to
+                ));
+                continue;
+            }
+        };
         let id = consolidation_journal_id(
             &note.vault_uid,
             &proposal.source_uid,

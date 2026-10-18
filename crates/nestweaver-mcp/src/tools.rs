@@ -6554,6 +6554,132 @@ mod memory_consolidation_ownership_tests {
             .to_string();
         assert!(error.contains("authoritative writer ownership"), "{error}");
     }
+
+    /// nw-745 clause 1. An idea linked from vault-root `sync.md` and
+    /// `status.md` proposes `project-file ()`. That empty project path used
+    /// to abort preflight, so a valid log promotion in the same batch was
+    /// dropped, and the MCP result was `isError: false` with `applied: false`.
+    #[test]
+    fn consolidate_apply_skips_empty_project_and_errors_when_nothing_applied() {
+        use nestweaver_engine::index_markdown_directory_in_memory;
+        use std::fs;
+
+        fn write_vault(files: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("vault");
+            fs::create_dir_all(&root).unwrap();
+            for (rel, content) in files {
+                let path = root.join(rel);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).unwrap();
+                }
+                fs::write(&path, content).unwrap();
+            }
+            (dir, root)
+        }
+
+        fn apply(store: &GraphStore) -> Value {
+            with_authoritative_writer_ownership(|| {
+                dispatch(
+                    store,
+                    None,
+                    "brain_memory_consolidate",
+                    json!({ "apply": true }),
+                    None,
+                )
+            })
+            .expect("host-owned apply reaches the engine")
+        }
+
+        fn warning_mentions_empty_project(payload: &Value) -> bool {
+            payload["warnings"]
+                .as_array()
+                .is_some_and(|warnings| {
+                    warnings.iter().any(|warning| {
+                        warning.as_str().is_some_and(|text| {
+                            text.contains("vault path must be non-empty and relative")
+                        })
+                    })
+                })
+        }
+
+        let empty = apply(&GraphStore::in_memory().unwrap());
+        let empty_wrapped = wrap_tool_result(empty);
+        assert_eq!(
+            empty_wrapped["isError"], json!(false),
+            "an empty apply is a noop: {empty_wrapped}"
+        );
+        assert_eq!(empty_wrapped["structuredContent"]["applied"], json!(false));
+
+        let (_bad_dir, bad_root) = write_vault(&[
+            ("sync.md", "See [[_ideas/loose]].\n"),
+            ("status.md", "See [[_ideas/loose]].\n"),
+            ("_ideas/loose.md", "# Loose\n\nAn idea with no project directory.\n"),
+        ]);
+        let (_bad_res, bad_store) =
+            index_markdown_directory_in_memory(&bad_root, "default", "v").unwrap();
+        let bad = apply(&bad_store);
+        assert!(
+            warning_mentions_empty_project(&bad),
+            "warnings: {}",
+            bad["warnings"]
+        );
+        assert_eq!(bad["applied"], json!(false), "{bad}");
+        assert!(
+            bad["proposals"].as_array().is_some_and(|proposals| {
+                proposals
+                    .iter()
+                    .any(|proposal| proposal["promote_to"] == "project-file ()")
+            }),
+            "the empty-project proposal must stay visible: {bad}"
+        );
+        let bad_wrapped = wrap_tool_result(bad);
+        assert_eq!(
+            bad_wrapped["isError"], json!(true),
+            "apply that moved nothing must be an MCP error: {bad_wrapped}"
+        );
+        assert!(bad_root.join("_ideas/loose.md").is_file());
+        assert!(!bad_root.join("loose.md").exists());
+
+        let (_mixed_dir, mixed_root) = write_vault(&[
+            ("sync.md", "See [[_ideas/loose]].\n"),
+            ("status.md", "See [[_ideas/loose]].\n"),
+            ("_ideas/loose.md", "# Loose\n\nAn idea with no project directory.\n"),
+            ("_logs/2025-01-01.md", "# Log Jan 1\n\nA recurring idea worth promoting.\n"),
+            ("_ideas/idea-a.md", "# Idea A\n\nSee [[_logs/2025-01-01]].\n"),
+            ("_ideas/idea-b.md", "# Idea B\n\nRefs [[_logs/2025-01-01]].\n"),
+            ("_ideas/idea-c.md", "# Idea C\n\nAlso [[_logs/2025-01-01]].\n"),
+        ]);
+        let log = mixed_root.join("_logs/2025-01-01.md");
+        let aged = std::fs::File::options().write(true).open(&log).unwrap();
+        aged.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000)),
+        )
+        .unwrap();
+        drop(aged);
+        let (_mixed_res, mixed_store) =
+            index_markdown_directory_in_memory(&mixed_root, "default", "v").unwrap();
+        let mixed = apply(&mixed_store);
+        assert!(
+            warning_mentions_empty_project(&mixed),
+            "the bad proposal must be reported, not dropped silently: {}",
+            mixed["warnings"]
+        );
+        assert_eq!(
+            mixed["applied"], json!(true),
+            "the valid log promotion must apply: {mixed}"
+        );
+        assert!(mixed_root.join("_ideas/2025-01-01.md").is_file());
+        assert!(!mixed_root.join("_logs/2025-01-01.md").exists());
+        assert!(mixed_root.join("_ideas/loose.md").is_file());
+        assert!(!mixed_root.join("loose.md").exists());
+        let mixed_wrapped = wrap_tool_result(mixed);
+        assert_eq!(
+            mixed_wrapped["isError"], json!(false),
+            "a batch that applied its valid proposals is not an error: {mixed_wrapped}"
+        );
+    }
 }
 
 fn tool_brain_memory_related(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
@@ -6673,11 +6799,41 @@ pub fn wrap_tool_result(value: Value) -> Value {
     // `brain_memory_related`, `read_symbols` with every target missing) is
     // the same failed lookup as one that raises `ToolTargetNotFound`.
     let not_found = value.get("status").and_then(Value::as_str) == Some("not_found");
+    // nw-745: `memory_consolidate` returns `Ok` with `applied: false` when
+    // apply moved nothing. A clean noop (no proposals, no failure warning)
+    // stays a success. A rejection or an apply failure is `isError: true`.
+    let apply_failed = consolidate_apply_failed(&value);
     crate::output_budget::finalize(json!({
         "content": [],
         "structuredContent": value,
-        "isError": not_found,
+        "isError": not_found || apply_failed,
     }))
+}
+
+/// True when consolidate apply reported a failure and moved nothing.
+///
+/// Stale-graph `SKIPPED` rows and an empty vault stay successes: `applied`
+/// is false there too, and they are not failures.
+fn consolidate_apply_failed(value: &Value) -> bool {
+    if value.get("dry_run").and_then(Value::as_bool) != Some(false)
+        || value.get("applied").and_then(Value::as_bool) != Some(false)
+    {
+        return false;
+    }
+    value
+        .get("warnings")
+        .and_then(Value::as_array)
+        .is_some_and(|warnings| {
+            warnings.iter().any(|warning| {
+                warning.as_str().is_some_and(|text| {
+                    let lower = text.to_ascii_lowercase();
+                    lower.contains("apply failed")
+                        || lower.contains("failed:")
+                        || lower.contains("rejected:")
+                        || lower.contains("vault path must be non-empty and relative")
+                })
+            })
+        })
 }
 
 #[cfg(test)]
