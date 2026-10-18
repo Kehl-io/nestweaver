@@ -3842,14 +3842,20 @@ struct IndexResolution {
     unresolved_imports: HashMap<String, HashSet<String>>,
 }
 
-#[derive(Clone, Copy)]
 struct PrepareIndexResolution<'a> {
     store: &'a GraphStore,
     reader: &'a dyn crate::content_reader::ContentReader,
     r_uid: &'a str,
-    parsed_files_for_resolver: &'a [ParsedFileEntry],
+    /// Mutable so a seeded importer that filemeta left out of this view can be
+    /// parsed into it before resolution. The publication deletes outgoing
+    /// edges for every resolve-filter member; that parse has to land first.
+    parsed_files_for_resolver: &'a mut Vec<ParsedFileEntry>,
     file_languages: &'a HashMap<String, Language>,
     actually_changed_files: &'a std::collections::HashSet<String>,
+    /// Changed files that were not in the store before this pass deleted
+    /// stale file nodes. A recreated import target is in here; a modification
+    /// of a file that already had a node is not.
+    added_files: &'a std::collections::HashSet<String>,
     files_unchanged: usize,
     resolution_deps: Option<&'a crate::resolution_cache::ResolutionDeps>,
 }
@@ -3960,6 +3966,7 @@ fn prepare_index_resolution(
         parsed_files_for_resolver,
         file_languages,
         actually_changed_files,
+        added_files,
         files_unchanged,
         resolution_deps,
     } = prep;
@@ -3992,6 +3999,54 @@ fn prepare_index_resolution(
         Default::default()
     };
 
+    let skip_resolution = actually_changed_files.is_empty()
+        && resolution_deps.is_some_and(|rd| !rd.is_empty_for_repo(r_uid));
+
+    let resolve_filter = if !skip_resolution
+        && !actually_changed_files.is_empty()
+        && files_unchanged > 0
+        && resolution_deps.is_some_and(|rd| !rd.is_empty_for_repo(r_uid))
+    {
+        let deps = resolution_deps.as_ref().unwrap();
+        let mut affected = deps.affected_files_for_repo(r_uid, actually_changed_files);
+        // nw-806. Dependency rows only name files that already resolved.
+        // After a delete, the importer's row no longer names the deleted
+        // file; the specifier lives on the unresolved sidecar. Seed the same
+        // importers the incremental path would, or this filter never
+        // re-resolves them when the file is created again.
+        //
+        // An untouched importer whose filemeta hits and whose parsed cache
+        // misses stays Unchanged and never enters the resolver view. Parse it
+        // into that view before resolution. The filter names it only after
+        // that parse is included: publication deletes outgoing edges for every
+        // filter member, and naming the importer earlier drops edges this
+        // pass cannot rebuild.
+        let seeded =
+            unresolved_importers_of_added_files(reader, deps, r_uid, added_files, file_languages);
+        let included = include_missing_seeded_importer_parses(
+            reader,
+            parsed_files_for_resolver,
+            &mut type_envs,
+            file_languages,
+            &seeded,
+        );
+        for path in &seeded {
+            if !included.contains(path) {
+                affected.remove(path);
+            }
+        }
+        affected.extend(included);
+        tracing::info!(
+            changed = actually_changed_files.len(),
+            affected = affected.len(),
+            total = parsed_files_for_resolver.len(),
+            "incremental resolution"
+        );
+        Some(affected)
+    } else {
+        None
+    };
+
     {
         let all_symbols_with_returns: std::collections::HashMap<
             &str,
@@ -4010,7 +4065,7 @@ fn prepare_index_resolution(
 
         if !all_symbols_with_returns.is_empty() {
             let mut seeded = 0usize;
-            for (file_path, _symbols, _refs, source_opt) in parsed_files_for_resolver {
+            for (file_path, _symbols, _refs, source_opt) in parsed_files_for_resolver.iter() {
                 if let Some(env) = type_envs.get_mut(file_path) {
                     let source_str = match source_opt {
                         Some(s) => s.clone(),
@@ -4034,29 +4089,6 @@ fn prepare_index_resolution(
         .iter()
         .map(|(path, syms, refs, _)| (path.clone(), syms.clone(), refs.clone()))
         .collect();
-
-    let skip_resolution = actually_changed_files.is_empty()
-        && resolution_deps.is_some_and(|rd| !rd.is_empty_for_repo(r_uid));
-
-    let resolve_filter = if !skip_resolution
-        && !actually_changed_files.is_empty()
-        && files_unchanged > 0
-        && resolution_deps.is_some_and(|rd| !rd.is_empty_for_repo(r_uid))
-    {
-        let affected = resolution_deps
-            .as_ref()
-            .unwrap()
-            .affected_files_for_repo(r_uid, actually_changed_files);
-        tracing::info!(
-            changed = actually_changed_files.len(),
-            affected = affected.len(),
-            total = resolver_view.len(),
-            "incremental resolution"
-        );
-        Some(affected)
-    } else {
-        None
-    };
 
     if skip_resolution {
         tracing::info!("no files changed, skipping resolution");
@@ -5069,6 +5101,25 @@ where
         //     parsed file just the same and its prune skips those paths.
         let force_reindex =
             existing_repo.is_some() && files_unchanged == 0 && unreadable_dirs.is_empty();
+        // Snapshot before the per-file deletes below. Those deletes remove
+        // the nodes of files we are about to re-insert, so a later listing
+        // cannot tell a recreated file from a modification.
+        let added_files: std::collections::HashSet<String> = match store.list_files_by_repo(&r_uid)
+        {
+            Ok(stored) => {
+                let stored: std::collections::HashSet<String> =
+                    stored.into_iter().map(|(_, path)| path).collect();
+                actually_changed_files
+                    .iter()
+                    .filter(|path| !stored.contains(*path))
+                    .cloned()
+                    .collect()
+            }
+            Err(error) => {
+                tracing::warn!("listing files for unresolved-import re-resolution failed: {error}");
+                std::collections::HashSet::new()
+            }
+        };
         // nw-204: this whole-store re-index path deletes symbols too, and used
         // to discard the fact entirely. Accumulate what it removed so the
         // epilogue can tombstone the embeddings of symbols that do not come
@@ -5166,9 +5217,10 @@ where
                 store,
                 reader,
                 r_uid: &r_uid,
-                parsed_files_for_resolver: &parsed_files_for_resolver,
+                parsed_files_for_resolver: &mut parsed_files_for_resolver,
                 file_languages: &file_languages,
                 actually_changed_files: &actually_changed_files,
+                added_files: &added_files,
                 files_unchanged,
                 resolution_deps: resolution_deps.as_deref(),
             },
@@ -8323,6 +8375,123 @@ fn workspace_context_for_languages(
     } else {
         nestweaver_resolver::WorkspaceContext::default()
     }
+}
+
+/// Importers whose unresolved specifiers resolve to a path in `added`.
+///
+/// nw-806. The full-index resolve filter starts from dependency rows, which
+/// no longer name a file once its delete has been indexed. This is the same
+/// importer set [`importers_of_added_paths`] feeds the incremental path.
+fn unresolved_importers_of_added_files(
+    reader: &dyn crate::content_reader::ContentReader,
+    deps: &crate::resolution_cache::ResolutionDeps,
+    r_uid: &str,
+    added: &HashSet<String>,
+    file_languages: &HashMap<String, Language>,
+) -> HashSet<String> {
+    if added.is_empty() {
+        return HashSet::new();
+    }
+    let Some(unresolved) = deps
+        .unresolved_for_repo(r_uid)
+        .filter(|slice| !slice.is_empty())
+    else {
+        return HashSet::new();
+    };
+    let known: HashSet<String> = file_languages.keys().cloned().collect();
+    importers_of_added_paths(reader, unresolved, added, &known)
+}
+
+/// Parse seeded importers that are missing from `parsed_files` into that view.
+///
+/// nw-806. Filemeta can classify an untouched importer as Unchanged when the
+/// parsed cache misses or is stale. Resolution only sees
+/// `parsed_files_for_resolver`, so the importer's edges are rebuilt only when
+/// this parse is included. Callers must add a seeded path to the resolve
+/// filter — the set whose outgoing edges are deleted — only when this returns
+/// it.
+///
+/// Returns the seeded paths present in `parsed_files` after the attempt,
+/// including importers that were already in the view.
+fn include_missing_seeded_importer_parses(
+    reader: &dyn crate::content_reader::ContentReader,
+    parsed_files: &mut Vec<ParsedFileEntry>,
+    type_envs: &mut HashMap<String, nestweaver_resolver::types::TypeEnvironment>,
+    file_languages: &HashMap<String, Language>,
+    seeded: &HashSet<String>,
+) -> HashSet<String> {
+    let mut present: HashSet<String> = parsed_files
+        .iter()
+        .map(|(path, _, _, _)| path.clone())
+        .collect();
+    for rel_path in seeded {
+        if present.contains(rel_path) {
+            continue;
+        }
+        let Some(language) = file_languages
+            .get(rel_path)
+            .copied()
+            .or_else(|| detect_language(Path::new(rel_path)))
+        else {
+            tracing::warn!(
+                file = %rel_path,
+                "seeded importer has no detected language; leaving its edges in place"
+            );
+            continue;
+        };
+        let Ok(source) = reader.read_file(Path::new(rel_path)) else {
+            tracing::warn!(
+                file = %rel_path,
+                "seeded importer could not be read; leaving its edges in place"
+            );
+            continue;
+        };
+        let Ok(parsed) = parse_source(&reader.root().join(rel_path), &source) else {
+            tracing::warn!(
+                file = %rel_path,
+                "seeded importer could not be parsed; leaving its edges in place"
+            );
+            continue;
+        };
+        if parsed.unparsable_skip(rel_path.clone()).is_some() {
+            tracing::warn!(
+                file = %rel_path,
+                "seeded importer was unparsable; leaving its edges in place"
+            );
+            continue;
+        }
+        let env = nestweaver_resolver::types::TypeEnvironment::build(
+            &source,
+            language,
+            &parsed.symbols,
+            &parsed.type_bindings,
+        );
+        if env.binding_count() > 0 || env.has_scoped_call_assignments() {
+            type_envs.insert(rel_path.clone(), env);
+        }
+        // Same retention rule as a normal parse: JS/TS keep source for
+        // decorator recovery; other languages keep it under 2 MB.
+        const SOURCE_RETENTION_CAP: usize = 2 * 1024 * 1024;
+        let retained = if matches!(language, Language::TypeScript | Language::JavaScript)
+            || source.len() <= SOURCE_RETENTION_CAP
+        {
+            Some(source)
+        } else {
+            None
+        };
+        parsed_files.push((
+            rel_path.clone(),
+            parsed.symbols,
+            parsed.references,
+            retained,
+        ));
+        present.insert(rel_path.clone());
+    }
+    seeded
+        .iter()
+        .filter(|path| present.contains(path.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// Files in `unresolved` whose stored specifiers resolve to a path in `added`
@@ -15688,6 +15857,191 @@ module.exports = { check, plain };\n";
         assert!(
             !unresolved_alias(),
             "the alias must leave the unresolved set once it maps onto src/lib.ts"
+        );
+    }
+
+    /// nw-806. A non-force full index builds its resolve filter from
+    /// dependency rows. Re-resolving the importer while the target is gone
+    /// drops that row; the specifier stays on the unresolved sidecar.
+    /// Recreating the file must seed the importer into the filter without
+    /// another edit to the importer.
+    #[test]
+    fn full_index_recreated_file_reresolves_unresolved_importers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let app = |extra: &str| {
+            format!(
+                "import {{ helper }} from \"./lib.js\";\nexport function run() {{ return helper(){extra}; }}\n"
+            )
+        };
+        fs::write(
+            repo.join("lib.js"),
+            "export function helper() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(repo.join("app.js"), app("")).unwrap();
+        fs::write(
+            repo.join("other.js"),
+            "export function other() { return 0; }\n",
+        )
+        .unwrap();
+        let repo_url = "https://example.com/nw-806-full";
+        index_directory(&repo, &db_path, "test", repo_url, "sha-1").unwrap();
+        let r_uid = repo_uid("test", repo_url);
+        let imports_lib = || {
+            GraphStore::open_or_create(&db_path)
+                .unwrap()
+                .files_referencing_file(&r_uid, "lib.js")
+                .unwrap()
+                .contains("app.js")
+        };
+        assert!(
+            imports_lib(),
+            "precondition: full index links app.js to lib.js"
+        );
+
+        fs::remove_file(repo.join("lib.js")).unwrap();
+        fs::write(repo.join("app.js"), app(" + 1")).unwrap();
+        let deleted = index_directory(&repo, &db_path, "test", repo_url, "sha-2").unwrap();
+        assert!(
+            deleted.files_unchanged > 0,
+            "delete index must stay on the non-force path"
+        );
+        assert!(
+            !imports_lib(),
+            "deleting lib.js must drop the importer edge"
+        );
+        #[derive(Deserialize)]
+        struct DepsProbe {
+            version: u32,
+            repos: HashMap<String, HashMap<String, HashSet<String>>>,
+            #[serde(default)]
+            unresolved: HashMap<String, HashMap<String, HashSet<String>>>,
+        }
+        let sidecar = crate::sidecar_path(&db_path, ".resolution_deps.bin");
+        let probe: DepsProbe = rmp_serde::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+        let _ = probe.version;
+        let names_lib = probe
+            .repos
+            .get(&r_uid)
+            .and_then(|slice| slice.get("app.js"))
+            .is_some_and(|deps| deps.contains("lib.js"));
+        assert!(
+            !names_lib,
+            "the importer's dependency row must no longer name the deleted file"
+        );
+        assert!(
+            probe
+                .unresolved
+                .get(&r_uid)
+                .and_then(|slice| slice.get("app.js"))
+                .is_some_and(|specifiers| specifiers.contains("./lib.js")),
+            "the specifier must live on the unresolved sidecar, got {:?}",
+            probe.unresolved.get(&r_uid)
+        );
+
+        fs::write(
+            repo.join("lib.js"),
+            "export function helper() { return 2; }\n",
+        )
+        .unwrap();
+        let created = index_directory(&repo, &db_path, "test", repo_url, "sha-3").unwrap();
+        assert!(
+            created.files_unchanged > 0,
+            "recreate must stay on the non-force full index"
+        );
+        assert!(
+            imports_lib(),
+            "a full index of the recreated file must re-resolve app.js from the unresolved specifier"
+        );
+    }
+
+    /// nw-806. Same recreate as
+    /// [`full_index_recreated_file_reresolves_unresolved_importers`], but the
+    /// importer's parsed cache is gone while its filemeta entry is still
+    /// valid. The importer stays Unchanged, so it never enters the resolver
+    /// view unless the seeded-importer parse adds it before edges are deleted.
+    #[test]
+    fn full_index_recreated_file_reresolves_importer_with_missing_parsed_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let app = |extra: &str| {
+            format!(
+                "import {{ helper }} from \"./lib.js\";\nexport function run() {{ return helper(){extra}; }}\n"
+            )
+        };
+        fs::write(
+            repo.join("lib.js"),
+            "export function helper() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(repo.join("app.js"), app("")).unwrap();
+        fs::write(
+            repo.join("other.js"),
+            "export function other() { return 0; }\n",
+        )
+        .unwrap();
+        let repo_url = "https://example.com/nw-806-full-stale-parse";
+        index_directory(&repo, &db_path, "test", repo_url, "sha-1").unwrap();
+        let r_uid = repo_uid("test", repo_url);
+        let imports_lib = || {
+            GraphStore::open_or_create(&db_path)
+                .unwrap()
+                .files_referencing_file(&r_uid, "lib.js")
+                .unwrap()
+                .contains("app.js")
+        };
+        assert!(
+            imports_lib(),
+            "precondition: full index links app.js to lib.js"
+        );
+
+        fs::remove_file(repo.join("lib.js")).unwrap();
+        fs::write(repo.join("app.js"), app(" + 1")).unwrap();
+        let deleted = index_directory(&repo, &db_path, "test", repo_url, "sha-2").unwrap();
+        assert!(
+            deleted.files_unchanged > 0,
+            "delete index must stay on the non-force path"
+        );
+        assert!(
+            !imports_lib(),
+            "deleting lib.js must drop the importer edge"
+        );
+
+        let filemeta = load_filemeta_sidecar(&crate::sidecar_path(&db_path, ".filemeta.json"));
+        let app_hash = filemeta
+            .repos
+            .get(&r_uid)
+            .and_then(|files| files.get("app.js"))
+            .map(|meta| meta.content_hash.clone())
+            .expect("filemeta for the untouched importer must stay valid");
+        let cache_path = crate::sidecar_path(&db_path, ".parsed_cache.bin");
+        fs::remove_file(&cache_path).unwrap();
+        let _ = fs::remove_file(crate::parsed_cache::log_path(&cache_path));
+        assert!(
+            crate::parsed_cache::ParsedCache::load(&cache_path)
+                .get(&app_hash)
+                .is_none(),
+            "the importer's parsed cache must miss while filemeta is still valid"
+        );
+
+        fs::write(
+            repo.join("lib.js"),
+            "export function helper() { return 2; }\n",
+        )
+        .unwrap();
+        let created = index_directory(&repo, &db_path, "test", repo_url, "sha-3").unwrap();
+        assert!(
+            created.files_unchanged > 0,
+            "recreate must stay on the non-force full index"
+        );
+        assert!(
+            imports_lib(),
+            "a full index must re-resolve app.js even when its parsed cache missed and filemeta was valid"
         );
     }
 
