@@ -2495,6 +2495,22 @@ fn parse_brain_context_kind(value: &str) -> Result<String, String> {
         .map_err(|error| error.to_string())
 }
 
+/// MCP `project_context.response_format`: only `concise` or `detailed`,
+/// case-insensitive, the same two values the tool accepts. Anything else is a
+/// usage error that names `--detailed`, the CLI flag agents already have.
+fn parse_project_context_response_format(value: &str) -> Result<String, String> {
+    if value.eq_ignore_ascii_case("detailed") {
+        Ok("detailed".to_string())
+    } else if value.eq_ignore_ascii_case("concise") {
+        Ok("concise".to_string())
+    } else {
+        Err(
+            "expected 'concise' or 'detailed'; use --detailed for the detailed record"
+                .to_string(),
+        )
+    }
+}
+
 /// A `--intent` value, checked at parse time so a bad one is a usage error
 /// (exit 64) naming the valid intents rather than an internal error.
 fn parse_query_intent(value: &str) -> Result<String, String> {
@@ -7836,7 +7852,7 @@ enum Commands {
 
     /// Get context for a project: all notes and symbols, ranked by PPR
     #[command(
-        after_help = "Examples:\n  nestweaver project-context my-project\n  nestweaver project-context my-project --token-budget 4000 --json"
+        after_help = "Examples:\n  nestweaver project-context my-project\n  nestweaver project-context my-project --repos nestweaver --path-prefix src/ --kinds Symbol --tags api\n  nestweaver project-context my-project --response-format detailed --token-budget 4000 --json"
     )]
     ProjectContext {
         /// Project name, alias, or UID
@@ -7852,6 +7868,51 @@ enum Commands {
             help = "Return full detail (uid + relevance, larger default budget) instead of the concise orientation"
         )]
         detailed: bool,
+        /// MCP `response_format`. `detailed` is `--detailed`; `concise` is the
+        /// default orientation. Unknown values are refused at parse time with
+        /// a hint that names `--detailed`.
+        #[arg(
+            long = "response-format",
+            value_parser = parse_project_context_response_format,
+            help = "MCP response_format: 'concise' (default) or 'detailed' (same as --detailed)"
+        )]
+        response_format: Option<String>,
+        /// Scope results to these repositories. Each entry is forwarded as
+        /// MCP `repos`: exact repo UID, display name, clone URL, or local
+        /// root. An unresolvable or ambiguous entry is the tool's error.
+        /// Accepts comma-separated values or repeated `--repos` flags.
+        /// Omitted when unset — an empty array matches nothing.
+        #[arg(
+            long = "repos",
+            value_delimiter = ',',
+            help = "Scope results to these repo UIDs or names (comma-separated or repeated; MCP project_context repos)"
+        )]
+        repos: Vec<String>,
+        /// Keep only nodes whose location starts with this path prefix.
+        /// Forwarded as MCP `path_prefix`.
+        #[arg(
+            long = "path-prefix",
+            help = "Keep only nodes whose location starts with this path prefix (MCP project_context path_prefix)"
+        )]
+        path_prefix: Option<String>,
+        /// Filter result kinds. Case-insensitive prefix match, forwarded as
+        /// MCP `kinds` (the tool lowercases). Accepts comma-separated values
+        /// or repeated `--kinds` flags.
+        #[arg(
+            long = "kinds",
+            value_delimiter = ',',
+            help = "Filter result kinds by case-insensitive prefix, e.g. Symbol,Note (MCP project_context kinds)"
+        )]
+        kinds: Vec<String>,
+        /// Keep only note/section nodes tagged with any of these tags.
+        /// Forwarded as MCP `tags`. Accepts comma-separated values or
+        /// repeated `--tags` flags.
+        #[arg(
+            long = "tags",
+            value_delimiter = ',',
+            help = "Keep only note/section nodes tagged with any of these tags (MCP project_context tags)"
+        )]
+        tags: Vec<String>,
         // nw-316: `Option<bool>`, because a bare clap `bool` cannot express
         // "unset" and the tool's documented default is TRUE. Sending clap's
         // `false` unconditionally made that default UNREACHABLE on this route,
@@ -17431,6 +17492,86 @@ fn resolve_use_daemon(no_daemon_flag: bool, warn: bool) -> bool {
     true
 }
 
+/// JSON `project_context` arguments shared by the daemon and direct routes.
+///
+/// Empty scope filters are omitted. MCP `repos: []` means "no repo matches",
+/// which is a different request from leaving the filter off. `response_format`
+/// maps onto `--detailed`: `detailed` selects the detailed record and its
+/// 3000-token default; `concise` keeps the concise default unless `--detailed`
+/// is also set, which is a conflict.
+fn project_context_tool_args(
+    name: &str,
+    token_budget: Option<usize>,
+    detailed: bool,
+    response_format: Option<&str>,
+    include_components: Option<bool>,
+    since: Option<&str>,
+    recency_weight: f64,
+    recency_half_life_days: f64,
+    no_embed: bool,
+    repos: &[String],
+    path_prefix: Option<&str>,
+    kinds: &[String],
+    tags: &[String],
+) -> anyhow::Result<(serde_json::Value, usize)> {
+    let detailed = match response_format {
+        Some("detailed") => true,
+        Some("concise") if detailed => anyhow::bail!(
+            "--response-format concise conflicts with --detailed; pass one of them"
+        ),
+        Some("concise") | None => detailed,
+        Some(other) => anyhow::bail!(
+            "invalid --response-format '{other}'; expected 'concise' or 'detailed' (use --detailed for the detailed record)"
+        ),
+    };
+    let response_format = if detailed { "detailed" } else { "concise" };
+    let token_budget = token_budget.unwrap_or(if detailed { 3000 } else { 1000 });
+    let mut project_args = serde_json::json!({
+        "project": name,
+        "token_budget": token_budget,
+        "response_format": response_format,
+        // nw-316: omitted when unset, so the TOOL's documented
+        // default of `true` governs. Sending clap's `false` here
+        // was what pinned this route to the opposite of the
+        // documented behaviour.
+        // nw-295: absent `since` sends `""`, not the key omitted.
+        // The daemon strips empty strings at `server.rs`, so this is
+        // benign THERE — but it is benign by the receiver's grace,
+        // and any caller reaching `tools::dispatch` directly with
+        // `since: ""` gets a spurious filter. Omit the key instead,
+        // so the request does not depend on who reads it.
+        "recency_weight": recency_weight,
+        "recency_half_life_days": recency_half_life_days,
+        // nw-430: `project-context` has a genuine semantic leg
+        // (the daemon's loaded embed model), unlike `search` and
+        // `context` above, which are rejected outright rather than
+        // silently ignoring this flag. Sent on both routes from
+        // the same `project_args`/`direct_args` clone, so the
+        // direct path is future-proofed for whenever it gains its
+        // own embed model.
+        "no_embed": no_embed,
+    });
+    if let Some(since) = since.filter(|value| !value.is_empty()) {
+        project_args["since"] = serde_json::json!(since);
+    }
+    if let Some(include_components) = include_components {
+        project_args["include_components"] = serde_json::json!(include_components);
+    }
+    if !repos.is_empty() {
+        project_args["repos"] = serde_json::json!(repos);
+    }
+    if let Some(prefix) = path_prefix.filter(|value| !value.is_empty()) {
+        project_args["path_prefix"] = serde_json::json!(prefix);
+    }
+    if !kinds.is_empty() {
+        project_args["kinds"] = serde_json::json!(kinds);
+    }
+    if !tags.is_empty() {
+        project_args["tags"] = serde_json::json!(tags);
+    }
+    Ok((project_args, token_budget))
+}
+
 fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
     let t0 = std::time::Instant::now();
     let _ = &t0; // suppress unused warning for arms that don't use it
@@ -24664,6 +24805,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             name,
             token_budget,
             detailed,
+            response_format,
+            repos,
+            path_prefix,
+            kinds,
+            tags,
             include_components,
             json,
             db,
@@ -24679,42 +24825,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 anyhow::bail!("project name must be non-empty");
             }
             // Concise orientation by default (research-backed — see ADR
-            // server-mode-remainder-decisions); --detailed opts into the full record.
-            let response_format = if detailed { "detailed" } else { "concise" };
-            let token_budget = token_budget.unwrap_or(if detailed { 3000 } else { 1000 });
+            // server-mode-remainder-decisions); --detailed, or
+            // --response-format detailed, opts into the full record.
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-
-            let mut project_args = serde_json::json!({
-                    "project": name,
-                    "token_budget": token_budget,
-                    "response_format": response_format,
-                    // nw-316: omitted when unset, so the TOOL's documented
-                    // default of `true` governs. Sending clap's `false` here
-                    // was what pinned this route to the opposite of the
-                    // documented behaviour.
-                    // nw-295: absent `since` sends `""`, not the key omitted.
-                    // The daemon strips empty strings at `server.rs`, so this is
-                    // benign THERE — but it is benign by the receiver's grace,
-                    // and any caller reaching `tools::dispatch` directly with
-                    // `since: ""` gets a spurious filter. Omit the key instead,
-                    // so the request does not depend on who reads it.
-                    "recency_weight": recency_weight,
-                    "recency_half_life_days": recency_half_life_days,
-                    // nw-430: `project-context` has a genuine semantic leg
-                    // (the daemon's loaded embed model), unlike `search` and
-                    // `context` above, which are rejected outright rather than
-                    // silently ignoring this flag. Sent on both routes from
-                    // the same `project_args`/`direct_args` clone, so the
-                    // direct path is future-proofed for whenever it gains its
-                    // own embed model.
-                    "no_embed": no_embed,
-            });
-            if let Some(since) = since.as_deref().filter(|s| !s.is_empty()) {
-                project_args["since"] = serde_json::json!(since);
-            }
-            if let Some(include_components) = include_components {
-                project_args["include_components"] = serde_json::json!(include_components);
-            }
+            let (project_args, token_budget) = project_context_tool_args(
+                &name,
+                token_budget,
+                detailed,
+                response_format.as_deref(),
+                include_components,
+                since.as_deref(),
+                recency_weight,
+                recency_half_life_days,
+                no_embed,
+                &repos,
+                path_prefix.as_deref(),
+                &kinds,
+                &tags,
+            )?;
             // Both routes send the SAME arguments. The direct leg used to
             // build its own set from the same clap fields, which is how
             // `include_components` came to differ between them (nw-316 leg 2).
@@ -41368,6 +41496,115 @@ mod include_components_tri_state_tests {
             flag_state(&[]).unwrap_or(true),
             "an absent flag must resolve to the documented default"
         );
+    }
+}
+
+/// nw-482: `project-context` must accept the MCP scope filters and
+/// `--response-format`, which used to exit 64 as an unexpected argument.
+#[cfg(test)]
+mod project_context_scope_filter_tests {
+    use super::*;
+
+    fn parse(extra: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv: Vec<String> = ["nestweaver", "project-context", "nestweaver"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        argv.extend(extra.iter().copied().map(str::to_string));
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(argv))
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    fn forwarded(extra: &[&str]) -> (serde_json::Value, usize) {
+        let cli = parse(extra).expect("project-context must accept these arguments");
+        match cli.command {
+            Commands::ProjectContext {
+                name,
+                token_budget,
+                detailed,
+                response_format,
+                include_components,
+                since,
+                recency_weight,
+                recency_half_life_days,
+                no_embed,
+                repos,
+                path_prefix,
+                kinds,
+                tags,
+                ..
+            } => project_context_tool_args(
+                &name,
+                token_budget,
+                detailed,
+                response_format.as_deref(),
+                include_components,
+                since.as_deref(),
+                recency_weight,
+                recency_half_life_days,
+                no_embed,
+                &repos,
+                path_prefix.as_deref(),
+                &kinds,
+                &tags,
+            )
+            .expect("forwarded project_context arguments"),
+            _ => panic!("expected `project-context`"),
+        }
+    }
+
+    #[test]
+    fn scoped_call_forwards_mcp_filters_and_response_format_maps_or_hints() {
+        let (args, budget) = forwarded(&[
+            "--repos",
+            "nestweaver",
+            "--path-prefix",
+            "src/",
+            "--kinds",
+            "Symbol",
+            "--tags",
+            "workspace/nestweaver",
+            "--response-format",
+            "concise",
+        ]);
+        assert_eq!(args["project"], "nestweaver");
+        assert_eq!(args["repos"], serde_json::json!(["nestweaver"]));
+        assert_eq!(args["path_prefix"], "src/");
+        assert_eq!(args["kinds"], serde_json::json!(["Symbol"]));
+        assert_eq!(args["tags"], serde_json::json!(["workspace/nestweaver"]));
+        assert_eq!(args["response_format"], "concise");
+        assert_eq!(budget, 1000);
+        assert!(args.get("include_components").is_none());
+
+        let (unscoped, _) = forwarded(&[]);
+        for key in ["repos", "path_prefix", "kinds", "tags"] {
+            assert!(
+                unscoped.get(key).is_none(),
+                "an absent {key} must be omitted; an empty array is a different MCP filter"
+            );
+        }
+
+        let (detailed, detailed_budget) = forwarded(&["--response-format", "DETAILED"]);
+        assert_eq!(detailed["response_format"], "detailed");
+        assert_eq!(detailed_budget, 3000);
+        let (flag, flag_budget) = forwarded(&["--detailed"]);
+        assert_eq!(flag["response_format"], "detailed");
+        assert_eq!(flag_budget, 3000);
+
+        let error = match parse(&["--response-format", "full"]) {
+            Ok(_) => panic!("unknown --response-format must be rejected"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("--detailed"),
+            "a rejected --response-format must name --detailed: {message}"
+        );
+        assert_ne!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 }
 
