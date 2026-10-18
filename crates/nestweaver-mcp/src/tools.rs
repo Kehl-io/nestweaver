@@ -14667,19 +14667,22 @@ fn resolve_affected_tests_base_ref_repository(
 /// failure as `git diff for base_ref` hid "not a git repository" and the
 /// repository that failed.
 ///
-/// `changed_files_from_git` runs git in the indexed path without pinning the
-/// work tree. A directory nested in a parent work tree still diffs, and would
-/// be named as the repository. Require the indexed path to be the work tree
-/// before that call.
+/// The indexed path is a work tree when its `.git` is a normal directory
+/// whose absolute git dir and common dir are that directory, or a linked
+/// worktree whose gitfile target points back at this `.git`. `GIT_DIR` and
+/// `GIT_WORK_TREE` are cleared for that check and for the diff. The diff
+/// uses `--git-dir` of the directory that check resolved, so a symlink
+/// `.git`, a foreign gitfile, or a common dir that names another repository
+/// cannot contribute files.
 fn diff_affected_tests_base_ref(
     repository: &AffectedTestsBaseRefRepository,
     base_ref: &str,
 ) -> Result<Vec<std::path::PathBuf>, anyhow::Error> {
     let path = Path::new(&repository.path);
-    if !indexed_path_is_git_work_tree(path) {
+    let Some(git_dir) = indexed_work_tree_git_dir(path) else {
         return Err(affected_tests_not_a_git_repository(repository));
-    }
-    match nestweaver_engine::changed_files_from_git(path, Some(base_ref)) {
+    };
+    match diff_indexed_work_tree(path, &git_dir, base_ref) {
         Ok(files) => Ok(files),
         Err(error) => {
             let detail = format!("{error:#}");
@@ -14707,30 +14710,214 @@ fn affected_tests_not_a_git_repository(
     )
 }
 
-/// The indexed path is the work tree when `path/.git` exists, or when
-/// `git rev-parse --show-toplevel` names that same path. A nested directory
-/// has neither: git walks up to the parent and would diff it anyway.
-fn indexed_path_is_git_work_tree(path: &Path) -> bool {
-    if path.join(".git").exists() {
-        return true;
+/// `git -C <path>` with inherited repository routing removed.
+///
+/// `GIT_DIR` alone makes `rev-parse --show-toplevel` and `git diff` answer
+/// for another repository even when `<path>/.git` is empty.
+fn git_command_for_indexed_path(path: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command.env_remove("GIT_DIR");
+    command.env_remove("GIT_WORK_TREE");
+    command.arg("-C").arg(path);
+    command
+}
+
+/// Discovery command plus `--git-dir` of the directory this path resolved to.
+fn git_command_for_resolved_git_dir(path: &Path, git_dir: &Path) -> std::process::Command {
+    let mut command = git_command_for_indexed_path(path);
+    command.arg("--git-dir").arg(git_dir);
+    command
+}
+
+/// Git directory to pass as `--git-dir` when `path` is an acceptable work tree.
+///
+/// A normal repository is a non-symlink `.git` directory for which
+/// `rev-parse --absolute-git-dir` and `rev-parse --git-common-dir` both
+/// resolve to that directory. A directory whose `commondir` names another
+/// repository fails that comparison. A symlink `.git` is not a directory
+/// entry of this path, so it is not accepted.
+///
+/// A linked worktree is a gitfile. It is accepted when the target directory's
+/// `gitdir` file points back at this path's `.git`. The returned directory is
+/// that target, which is the per-worktree git dir.
+fn indexed_work_tree_git_dir(path: &Path) -> Option<std::path::PathBuf> {
+    let dot_git = path.join(".git");
+    let meta = std::fs::symlink_metadata(&dot_git).ok()?;
+    if meta.file_type().is_symlink() {
+        return None;
     }
-    let output = match std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(path)
-        .output()
-    {
-        Ok(output) => output,
-        Err(_) => return false,
+    if meta.is_dir() {
+        return self_contained_git_dir(path, &dot_git);
+    }
+    if meta.is_file() {
+        return linked_worktree_git_dir(path, &dot_git);
+    }
+    None
+}
+
+/// `path/.git` when both git-dir queries name that directory and nothing else.
+fn self_contained_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::PathBuf> {
+    let canonical = std::fs::canonicalize(dot_git).ok()?;
+    let absolute = rev_parse_git_path(path, "--absolute-git-dir")?;
+    let common = rev_parse_git_path(path, "--git-common-dir")?;
+    if absolute == canonical && common == canonical {
+        Some(canonical)
+    } else {
+        None
+    }
+}
+
+/// Per-worktree git dir when its `gitdir` file points back at `dot_git`.
+fn linked_worktree_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::PathBuf> {
+    let target = gitfile_target(path, dot_git)?;
+    let canonical = std::fs::canonicalize(&target).ok()?;
+    if !canonical.is_dir() {
+        return None;
+    }
+    let back_text = std::fs::read_to_string(canonical.join("gitdir")).ok()?;
+    let back_line = back_text.lines().next()?.trim();
+    if back_line.is_empty() {
+        return None;
+    }
+    let back_raw = Path::new(back_line);
+    let back = if back_raw.is_absolute() {
+        back_raw.to_path_buf()
+    } else {
+        canonical.join(back_raw)
     };
+    if !same_directory(&back, dot_git) {
+        return None;
+    }
+    Some(canonical)
+}
+
+/// Path named by a `gitdir: <path>` gitfile. Relative paths are relative to
+/// the work tree, which is the directory that contains the gitfile.
+fn gitfile_target(work_tree: &Path, dot_git: &Path) -> Option<std::path::PathBuf> {
+    let text = std::fs::read_to_string(dot_git).ok()?;
+    let line = text.lines().next()?.trim();
+    let rest = line.strip_prefix("gitdir:")?.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let raw = Path::new(rest);
+    if raw.is_absolute() {
+        Some(raw.to_path_buf())
+    } else {
+        Some(work_tree.join(raw))
+    }
+}
+
+/// Absolute path printed by `git -C <path> rev-parse <flag>`.
+///
+/// `--git-common-dir` is often the relative path `.git`. Resolve that against
+/// the work tree, then canonicalize so it can be compared to `path/.git`.
+fn rev_parse_git_path(path: &Path, flag: &str) -> Option<std::path::PathBuf> {
+    let output = git_command_for_indexed_path(path)
+        .args(["rev-parse", flag])
+        .output()
+        .ok()?;
     if !output.status.success() {
-        return false;
+        return None;
     }
-    let toplevel = String::from_utf8_lossy(&output.stdout);
-    let toplevel = toplevel.trim();
-    if toplevel.is_empty() {
-        return false;
+    let text = String::from_utf8(output.stdout).ok()?;
+    let line = text.lines().next()?.trim();
+    if line.is_empty() {
+        return None;
     }
-    same_directory(path, Path::new(toplevel))
+    let raw = Path::new(line);
+    let absolute = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        path.join(raw)
+    };
+    std::fs::canonicalize(absolute).ok()
+}
+
+/// Diff `base_ref` with `--git-dir` set to the directory
+/// [`indexed_work_tree_git_dir`] resolved. The caller's `GIT_DIR` and
+/// `GIT_WORK_TREE` stay removed. The revision is resolved to a commit id
+/// before `git diff` sees it.
+fn diff_indexed_work_tree(
+    path: &Path,
+    git_dir: &Path,
+    base_ref: &str,
+) -> Result<Vec<std::path::PathBuf>, anyhow::Error> {
+    let oid = resolve_indexed_commit(path, git_dir, base_ref)?;
+    let mut command = git_command_for_resolved_git_dir(path, git_dir);
+    command
+        .arg("diff")
+        .arg("--name-only")
+        .arg("-z")
+        .arg(&oid)
+        .arg("--");
+    let output = nestweaver_engine::git_cmd::run_git_with_timeout(
+        command,
+        nestweaver_engine::git_cmd::git_net_timeout(),
+    )
+    .context("failed to run git diff --name-only")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git diff failed: {}", stderr.trim());
+    }
+    parse_affected_tests_diff_names(&output.stdout)
+}
+
+fn resolve_indexed_commit(
+    path: &Path,
+    git_dir: &Path,
+    revision: &str,
+) -> Result<String, anyhow::Error> {
+    let commit_revision = format!("{revision}^{{commit}}");
+    let mut command = git_command_for_resolved_git_dir(path, git_dir);
+    command
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg("--quiet")
+        .arg("--end-of-options")
+        .arg(&commit_revision);
+    let output = nestweaver_engine::git_cmd::run_git_with_timeout(
+        command,
+        nestweaver_engine::git_cmd::git_net_timeout(),
+    )
+    .with_context(|| format!("failed to resolve git commit ref in {}", path.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "invalid git commit ref in {}: {}",
+            path.display(),
+            stderr.trim()
+        );
+    }
+    let stdout = std::str::from_utf8(&output.stdout)
+        .context("git rev-parse returned a non-UTF-8 object ID")?;
+    let oid = stdout.strip_suffix('\n').unwrap_or(stdout);
+    if oid.is_empty() || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("git rev-parse returned an invalid commit object ID");
+    }
+    Ok(oid.to_owned())
+}
+
+fn parse_affected_tests_diff_names(
+    output: &[u8],
+) -> Result<Vec<std::path::PathBuf>, anyhow::Error> {
+    if output.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !output.ends_with(&[0]) {
+        anyhow::bail!("git diff returned malformed non-NUL-terminated output");
+    }
+    output[..output.len() - 1]
+        .split(|byte| *byte == 0)
+        .map(|path| {
+            if path.is_empty() {
+                anyhow::bail!("git diff returned an empty path record");
+            }
+            let path = std::str::from_utf8(path)
+                .context("git diff returned a path that is not valid UTF-8")?;
+            Ok(std::path::PathBuf::from(path))
+        })
+        .collect()
 }
 
 fn same_directory(left: &Path, right: &Path) -> bool {
@@ -14900,6 +15087,182 @@ mod affected_tests_base_ref_tests {
         assert!(
             !nested_diff.contains("git diff for base_ref"),
             "the nested failure must not stay wrapped as 'git diff for base_ref': {nested_diff}"
+        );
+    }
+
+    /// An empty `.git` directory is not a repository. With `GIT_DIR` pointed
+    /// at another repository, `base_ref` must fail and must not report that
+    /// repository's changed files.
+    #[test]
+    fn affected_tests_base_ref_rejects_empty_git_dir_when_git_dir_points_at_another_repo() {
+        const CHILD: &str = "NW_AFFECTED_TESTS_EMPTY_GIT_DIR_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            reject_empty_git_dir_under_inherited_git_dir();
+            return;
+        }
+
+        let real = tempfile::tempdir().unwrap();
+        git(real.path(), &["init", "-q"]);
+        git(real.path(), &["config", "user.email", "test@example.com"]);
+        git(real.path(), &["config", "user.name", "Test"]);
+        git(real.path(), &["config", "commit.gpgsign", "false"]);
+        std::fs::write(real.path().join("only-real.txt"), "before\n").unwrap();
+        git(real.path(), &["add", "only-real.txt"]);
+        git(real.path(), &["commit", "-q", "-m", "init"]);
+        std::fs::write(real.path().join("only-real.txt"), "after\n").unwrap();
+
+        let fake = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fake.path().join(".git")).unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tools::affected_tests_base_ref_tests::affected_tests_base_ref_rejects_empty_git_dir_when_git_dir_points_at_another_repo",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("NW_AFFECTED_TESTS_FAKE_ROOT", fake.path())
+            .env("GIT_DIR", real.path().join(".git"))
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .expect("re-exec the test with GIT_DIR set");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{stdout}{stderr}");
+        assert!(
+            output.status.success() && combined.contains("1 passed"),
+            "empty .git with GIT_DIR pointing at another repository must fail in the child\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    fn reject_empty_git_dir_under_inherited_git_dir() {
+        let fake = std::path::PathBuf::from(
+            std::env::var("NW_AFFECTED_TESTS_FAKE_ROOT").expect("fake root"),
+        );
+        let uid = "repo:test:fake";
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&indexed_repo(uid, "fake-repo", &fake))
+            .unwrap();
+        match tool_affected_tests(
+            &store,
+            json!({ "base_ref": "HEAD", "repo": "fake-repo" }),
+            None,
+        ) {
+            Err(error) => {
+                let error = error.to_string();
+                assert!(
+                    error.contains("fake-repo") && error.contains("it is not a git repository"),
+                    "the outermost error must say the indexed path is not a git repository: {error}"
+                );
+                assert!(
+                    error.contains(uid) && error.contains(&fake.display().to_string()),
+                    "the error must name the indexed path: {error}"
+                );
+                assert!(
+                    !error.contains("only-real.txt"),
+                    "the other repository's files must not be reported: {error}"
+                );
+            }
+            Ok(value) => panic!(
+                "an empty .git directory must not return the other repository's files: {value}"
+            ),
+        }
+    }
+
+    fn init_repo_with_tracked_file(dir: &std::path::Path, file_name: &str) {
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "user.name", "Test"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join(file_name), "before\n").unwrap();
+        git(dir, &["add", file_name]);
+        git(dir, &["commit", "-q", "-m", "init"]);
+    }
+
+    fn assert_other_repository_files_are_not_returned(path: &std::path::Path, name: &str) {
+        let uid = format!("repo:test:{name}");
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_repo(&indexed_repo(&uid, name, path)).unwrap();
+        match tool_affected_tests(&store, json!({ "base_ref": "HEAD", "repo": name }), None) {
+            Err(error) => {
+                let error = error.to_string();
+                assert!(
+                    error.contains(name) && error.contains("it is not a git repository"),
+                    "the outermost error must say the indexed path is not a git repository: {error}"
+                );
+                assert!(
+                    error.contains(&uid) && error.contains(&path.display().to_string()),
+                    "the error must name the indexed path: {error}"
+                );
+                assert!(
+                    !error.contains("only-real.txt"),
+                    "the other repository's files must not be reported: {error}"
+                );
+            }
+            Ok(value) => panic!("{name} must not return the other repository's files: {value}"),
+        }
+    }
+
+    /// A `.git` symlink and a real `.git` directory whose commondir names
+    /// another repository both make `rev-parse --show-toplevel` print this
+    /// path. `base_ref` must fail and must not report that repository's files.
+    #[test]
+    fn affected_tests_base_ref_rejects_symlink_git_or_commondir_of_another_repo() {
+        let real = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(real.path(), "only-real.txt");
+        std::fs::write(real.path().join("only-real.txt"), "after\n").unwrap();
+
+        let via_symlink = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(real.path().join(".git"), via_symlink.path().join(".git"))
+            .unwrap();
+        assert_other_repository_files_are_not_returned(via_symlink.path(), "symlink-repo");
+
+        let via_commondir = tempfile::tempdir().unwrap();
+        let fake_git = via_commondir.path().join(".git");
+        std::fs::create_dir(&fake_git).unwrap();
+        std::fs::write(
+            fake_git.join("commondir"),
+            format!("{}\n", real.path().join(".git").display()),
+        )
+        .unwrap();
+        std::fs::copy(real.path().join(".git").join("HEAD"), fake_git.join("HEAD")).unwrap();
+        assert_other_repository_files_are_not_returned(via_commondir.path(), "commondir-repo");
+    }
+
+    /// A linked worktree's `.git` is a gitfile. Its private git dir's `gitdir`
+    /// file points back at that gitfile, so `base_ref` diffs the worktree.
+    #[test]
+    fn affected_tests_base_ref_diffs_a_linked_worktree() {
+        let main = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(main.path(), "tracked.txt");
+        let linked = tempfile::tempdir().unwrap();
+        let linked_path = linked.path().display().to_string();
+        git(
+            main.path(),
+            &["worktree", "add", "-q", &linked_path, "HEAD"],
+        );
+        std::fs::write(linked.path().join("tracked.txt"), "after\n").unwrap();
+
+        let uid = "repo:test:linked";
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&indexed_repo(uid, "linked-repo", linked.path()))
+            .unwrap();
+        let diffed = tool_affected_tests(
+            &store,
+            json!({ "base_ref": "HEAD", "repo": "linked-repo" }),
+            None,
+        )
+        .expect("a linked worktree must diff");
+        assert_eq!(diffed["repo"], json!("linked-repo"), "{diffed}");
+        assert_eq!(diffed["repo_uid"], json!(uid), "{diffed}");
+        let files = diffed["changed_files"].as_array().expect("changed_files");
+        assert!(
+            files
+                .iter()
+                .any(|file| file.as_str() == Some("tracked.txt")),
+            "the linked worktree diff must name its own tracked file: {diffed}"
         );
     }
 }
