@@ -4045,11 +4045,14 @@ export function hiddenfederationcaller() { return hiddenfederationcanary(); }
         })
     );
 
-    let base_ref_arguments = json!({ "base_ref": "HEAD" });
+    let admin_base_ref_arguments = json!({
+        "base_ref": "HEAD",
+        "repo": "hidden_local_repo"
+    });
     let admin_base_ref_response = client
         .post(&endpoint)
         .bearer_auth(admin_token)
-        .json(&request(67, "affected_tests", base_ref_arguments.clone()))
+        .json(&request(67, "affected_tests", admin_base_ref_arguments))
         .send()
         .await
         .expect("admin affected_tests base_ref request");
@@ -4070,14 +4073,19 @@ export function hiddenfederationcaller() { return hiddenfederationcanary(); }
     };
     assert!(
         admin_base_ref_changed.contains("secret-local-path.test.js"),
-        "fixture must prove unrestricted base_ref selected the first, hidden local repo: \
+        "fixture must prove an explicit base_ref repo selects the hidden local repo: \
          {admin_base_ref_body}"
     );
 
+    let restricted_base_ref_arguments = json!({ "base_ref": "HEAD" });
     let restricted_base_ref_response = client
         .post(&endpoint)
         .bearer_auth(query_token)
-        .json(&request(68, "affected_tests", base_ref_arguments))
+        .json(&request(
+            68,
+            "affected_tests",
+            restricted_base_ref_arguments,
+        ))
         .send()
         .await
         .expect("restricted affected_tests base_ref request");

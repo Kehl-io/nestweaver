@@ -1656,6 +1656,7 @@ pub fn tool_list_page(lite: bool, cursor: Option<&str>) -> Result<Value, String>
                         ("brain_remove_source", "target") => "Source name/path/UID",
                         ("cross_repo_contracts", "repo") => "Other endpoint repo",
                         ("brain_diff", "repo") => "Repo name/URL part",
+                        ("affected_tests", "repo") => "base_ref repository",
                         ("contract_drift", "repo") => "Repo UID",
                         ("brain_search", "limit") => "Max results per kind",
                         ("contract_drift", "limit") => "Max rows per bucket",
@@ -14310,7 +14311,7 @@ fn tool_detect_changes_scoped(
 fn tool_schema_affected_tests() -> Value {
     json!({
         "name": "affected_tests",
-        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (at least one must be provided).\n\nREFUSAL: when a repo that owns a changed file (or shares a recorded cross-repo edge or a declared `[[links]]` entry with one) has edges that predate the running resolver, this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos`, a `remedies` array, `recommendation: \"run-full-suite\"`, and NO tier keys at all — a missing edge can only make the selection SMALLER, so an under-resolved graph silently drops a regression test while the gate still reports success. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required, a generation-stale repo is already at HEAD so a plain incremental index writes nothing) and call again. A stale repo unrelated to the change does not refuse; it is named in a `resolver-generation-stale-unrelated` warning notification.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive. Each test file is listed once, in its best tier\n- A test file whose own top level calls a changed function is selected; its module owner (`path::<module>`) is never a changed symbol or a test name. When none of that file's tests was reached, its `tests` is empty and `selected_by: \"top_level_code\"` says why; it counts as one test in the summary\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n- `recommendation` is a machine-readable CI directive: 'selection-usable' requires a complete run with nonempty test files, or an explicitly documented docs-only/proven-empty exception; otherwise 'run-full-suite'. Documentation-only changes are disclosed as docs; unassessed source/config changes are disclosed and widen to the full suite\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n- `resolver_stale_repos` (repo UIDs, generation-mismatch) is NOT the same population as `_meta.stale_repos` (federation lag, present only via the hybrid client) or `stale_check`'s/`hub_nodes`'s own `stale_repos` (different tools, different populations under the same key name — nw-371)\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
+        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (at least one must be provided).\n\nREFUSAL: when a repo that owns a changed file (or shares a recorded cross-repo edge or a declared `[[links]]` entry with one) has edges that predate the running resolver, this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos`, a `remedies` array, `recommendation: \"run-full-suite\"`, and NO tier keys at all — a missing edge can only make the selection SMALLER, so an under-resolved graph silently drops a regression test while the gate still reports success. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required, a generation-stale repo is already at HEAD so a plain incremental index writes nothing) and call again. A stale repo unrelated to the change does not refuse; it is named in a `resolver-generation-stale-unrelated` warning notification.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against. base_ref diffs the repository named by `repo`; several visible local repositories and no `repo` is an error, not a silent pick of one unnamed repository. The result names the repository it diffed. A path that is not a git work tree fails naming that repository\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive. Each test file is listed once, in its best tier\n- A test file whose own top level calls a changed function is selected; its module owner (`path::<module>`) is never a changed symbol or a test name. When none of that file's tests was reached, its `tests` is empty and `selected_by: \"top_level_code\"` says why; it counts as one test in the summary\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n- `recommendation` is a machine-readable CI directive: 'selection-usable' requires a complete run with nonempty test files, or an explicitly documented docs-only/proven-empty exception; otherwise 'run-full-suite'. Documentation-only changes are disclosed as docs; unassessed source/config changes are disclosed and widen to the full suite\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n- `resolver_stale_repos` (repo UIDs, generation-mismatch) is NOT the same population as `_meta.stale_repos` (federation lag, present only via the hybrid client) or `stale_check`'s/`hub_nodes`'s own `stale_repos` (different tools, different populations under the same key name — nw-371)\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -14338,7 +14339,12 @@ fn tool_schema_affected_tests() -> Value {
                 },
                 "base_ref": {
                     "type": "string",
-                    "description": "Git ref to diff against (e.g. \"main\"). Used when changed_files is omitted; diffs the locally-indexed repo via git."
+                    "description": "Git ref to diff against (e.g. \"main\"). Used when changed_files is omitted. Diffs the repository named by `repo`, or the only visible local repository when `repo` is omitted. The result names that repository."
+                },
+                "repo": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Repository to diff for base_ref (repo uid, exact display name, or local root). Required when more than one local repository is visible; an omitted value then errors instead of diffing one unnamed repository. The result names the repository that was diffed."
                 }
             },
             // nw-410: the either/or requirement, declared where the
@@ -14388,17 +14394,24 @@ fn tool_affected_tests(
     let mut changed_files: Vec<String> = explicit_changed_files.unwrap_or_default();
 
     let base_ref = args.get("base_ref").and_then(|v| v.as_str());
+    // nw-745 clause 2. A base_ref diff must name the repository it read.
+    // Several visible local repositories and no `repo` is an error: picking
+    // the first row returned changed files for one unnamed repository.
+    let mut selected_repo = None;
     if !explicit_input && let Some(base_ref) = base_ref {
-        let repo_path = scoped_local_repo_path(store, visible)?.unwrap_or_else(|| ".".to_string());
-        let files =
-            nestweaver_engine::changed_files_from_git(Path::new(&repo_path), Some(base_ref))
-                .context("git diff for base_ref")?;
+        let selected = resolve_affected_tests_base_ref_repository(
+            store,
+            visible,
+            args.get("repo").and_then(|value| value.as_str()),
+        )?;
+        let files = diff_affected_tests_base_ref(&selected, base_ref)?;
         changed_files = files
             .iter()
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|path| path.to_string_lossy().into_owned())
             .collect();
         changed_files =
             nestweaver_engine::changed_files::validate_changed_file_entries(&changed_files)?;
+        selected_repo = Some(selected);
     }
 
     // Only a genuine "no input" (neither changed_files nor base_ref) is an error.
@@ -14535,41 +14548,359 @@ fn tool_affected_tests(
         )
         .to_string();
     }
-    Ok(serde_json::to_value(&result)?)
+    let mut value = serde_json::to_value(&result)?;
+    if let Some(selected) = selected_repo
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("repo".to_string(), json!(selected.name));
+        object.insert("repo_uid".to_string(), json!(selected.uid));
+    }
+    Ok(value)
 }
 
-/// Resolve the local working tree used for a `base_ref` diff.
-///
-/// Restricted callers must have exactly one visible local repository; choosing
-/// an arbitrary first repository would let graph ordering cross caller scope.
-fn scoped_local_repo_path(
+/// The local repository a `base_ref` diff reads, named in the result.
+struct AffectedTestsBaseRefRepository {
+    uid: String,
+    name: String,
+    path: String,
+}
+
+fn list_affected_tests_base_ref_repositories(
     store: &GraphStore,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
-) -> Result<Option<String>, anyhow::Error> {
-    let repos = store.list_repos(None).map_err(|error| {
-        anyhow!("listing repositories for affected-tests base_ref failed: {error}")
-    })?;
-    let roots: Vec<String> = repos
-        .iter()
-        .filter(|repo| repo_is_visible(&repo.uid, visible))
-        .filter_map(|repo| repo.local_root().map(String::from))
-        .collect();
-    if matches!(
-        visible,
-        Some(nestweaver_engine::authz::VisibleRepos::Only(_))
-    ) {
-        match roots.as_slice() {
-            [root] => Ok(Some(root.clone())),
-            [] => Err(anyhow!(
-                "affected_tests base_ref requires one visible local repository"
-            )),
-            _ => Err(anyhow!(
-                "affected_tests base_ref is ambiguous across visible repositories; \
-                 provide changed_files explicitly"
-            )),
+) -> Result<Vec<nestweaver_schema::Repo>, anyhow::Error> {
+    store
+        .list_repos(None)
+        .map_err(|error| {
+            anyhow!("listing repositories for affected-tests base_ref failed: {error}")
+        })
+        .map(|repos| {
+            repos
+                .into_iter()
+                .filter(|repo| repo_is_visible(&repo.uid, visible))
+                .collect()
+        })
+}
+
+fn affected_tests_base_ref_repository(
+    repo: nestweaver_schema::Repo,
+) -> Result<AffectedTestsBaseRefRepository, anyhow::Error> {
+    let name = nestweaver_engine::repo_display_name(&repo);
+    let path = repo
+        .local_root()
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned);
+    let Some(path) = path else {
+        anyhow::bail!(
+            "affected_tests base_ref cannot diff repository '{name}' ({}): it has no local working tree",
+            repo.uid
+        );
+    };
+    Ok(AffectedTestsBaseRefRepository {
+        uid: repo.uid,
+        name,
+        path,
+    })
+}
+
+/// Resolve which local repository `base_ref` diffs.
+///
+/// An explicit `repo` selects that visible repository. With no selector, the
+/// only visible local working tree is used and named. More than one is an
+/// error that names the candidates: the previous path returned `list_repos`'
+/// first local root and left it unnamed.
+fn resolve_affected_tests_base_ref_repository(
+    store: &GraphStore,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+    repo_selector: Option<&str>,
+) -> Result<AffectedTestsBaseRefRepository, anyhow::Error> {
+    if let Some(selector) = repo_selector {
+        let uid = nestweaver_engine::node_scope::resolve_repo_filter(
+            store,
+            std::slice::from_ref(&selector.to_string()),
+            visible,
+        )?
+        .into_iter()
+        .next()
+        .context("resolve_repo_filter returned no uid for a single selector")?;
+        let repo = list_affected_tests_base_ref_repositories(store, visible)?
+            .into_iter()
+            .find(|repo| repo.uid == uid)
+            .context("resolved repo uid is missing from the visible repo list")?;
+        return affected_tests_base_ref_repository(repo);
+    }
+
+    let locals: Vec<AffectedTestsBaseRefRepository> =
+        list_affected_tests_base_ref_repositories(store, visible)?
+            .into_iter()
+            .filter(|repo| repo.local_root().is_some_and(|path| !path.is_empty()))
+            .map(affected_tests_base_ref_repository)
+            .collect::<Result<_, _>>()?;
+    match locals.len() {
+        1 => Ok(locals.into_iter().next().expect("len checked")),
+        0 => Err(anyhow!(
+            "affected_tests base_ref requires one local git repository; none of the visible repositories has a local working tree"
+        )),
+        count => {
+            const MAX_LISTED: usize = 15;
+            let listed = locals
+                .iter()
+                .take(MAX_LISTED)
+                .map(|repo| format!("{} ({})", repo.name, repo.uid))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let suffix = if count > MAX_LISTED {
+                format!(", and {} more", count - MAX_LISTED)
+            } else {
+                String::new()
+            };
+            Err(anyhow!(
+                "affected_tests base_ref is ambiguous across {count} repositories ({listed}{suffix}); pass repo to name one, or pass changed_files"
+            ))
         }
-    } else {
-        Ok(roots.into_iter().next())
+    }
+}
+
+/// Diff `base_ref` in `repository`.
+///
+/// The outermost error is what an MCP client displays. Wrapping the git
+/// failure as `git diff for base_ref` hid "not a git repository" and the
+/// repository that failed.
+///
+/// `changed_files_from_git` runs git in the indexed path without pinning the
+/// work tree. A directory nested in a parent work tree still diffs, and would
+/// be named as the repository. Require the indexed path to be the work tree
+/// before that call.
+fn diff_affected_tests_base_ref(
+    repository: &AffectedTestsBaseRefRepository,
+    base_ref: &str,
+) -> Result<Vec<std::path::PathBuf>, anyhow::Error> {
+    let path = Path::new(&repository.path);
+    if !indexed_path_is_git_work_tree(path) {
+        return Err(affected_tests_not_a_git_repository(repository));
+    }
+    match nestweaver_engine::changed_files_from_git(path, Some(base_ref)) {
+        Ok(files) => Ok(files),
+        Err(error) => {
+            let detail = format!("{error:#}");
+            if detail.to_ascii_lowercase().contains("not a git repository") {
+                return Err(affected_tests_not_a_git_repository(repository));
+            }
+            anyhow::bail!(
+                "affected_tests base_ref failed for repository '{}' ({}) at {}: {detail}",
+                repository.name,
+                repository.uid,
+                repository.path
+            );
+        }
+    }
+}
+
+fn affected_tests_not_a_git_repository(
+    repository: &AffectedTestsBaseRefRepository,
+) -> anyhow::Error {
+    anyhow!(
+        "affected_tests base_ref cannot diff repository '{}' ({}) at {}: it is not a git repository",
+        repository.name,
+        repository.uid,
+        repository.path
+    )
+}
+
+/// The indexed path is the work tree when `path/.git` exists, or when
+/// `git rev-parse --show-toplevel` names that same path. A nested directory
+/// has neither: git walks up to the parent and would diff it anyway.
+fn indexed_path_is_git_work_tree(path: &Path) -> bool {
+    if path.join(".git").exists() {
+        return true;
+    }
+    let output = match std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(path)
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let toplevel = String::from_utf8_lossy(&output.stdout);
+    let toplevel = toplevel.trim();
+    if toplevel.is_empty() {
+        return false;
+    }
+    same_directory(path, Path::new(toplevel))
+}
+
+fn same_directory(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod affected_tests_base_ref_tests {
+    use super::*;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn indexed_repo(uid: &str, name: &str, root: &std::path::Path) -> nestweaver_schema::Repo {
+        nestweaver_schema::Repo {
+            uid: uid.to_string(),
+            url: format!("file://{}", root.display()),
+            indexed_sha: "abc".to_string(),
+            staleness_commits_behind: 0,
+            instance_id: "test".to_string(),
+            name: Some(name.to_string()),
+            root_path: Some(root.display().to_string()),
+        }
+    }
+
+    /// nw-745 clause 2. `base_ref` must name the repository it diffs (or take
+    /// `repo`), and a non-git repository must fail in the outermost message.
+    #[test]
+    fn affected_tests_base_ref_names_its_repository_and_rejects_a_non_git_repo() {
+        let schema = tool_schema_affected_tests();
+        assert!(
+            schema["inputSchema"]["properties"]["repo"]
+                .as_object()
+                .is_some(),
+            "affected_tests must accept a repo parameter: {schema}"
+        );
+
+        let git_dir = tempfile::tempdir().unwrap();
+        git(git_dir.path(), &["init", "-q"]);
+        git(
+            git_dir.path(),
+            &["config", "user.email", "test@example.com"],
+        );
+        git(git_dir.path(), &["config", "user.name", "Test"]);
+        git(git_dir.path(), &["config", "commit.gpgsign", "false"]);
+        std::fs::write(git_dir.path().join("lib.rs"), "fn kept() {}\n").unwrap();
+        git(git_dir.path(), &["add", "lib.rs"]);
+        git(git_dir.path(), &["commit", "-q", "-m", "init"]);
+        let plain_dir = tempfile::tempdir().unwrap();
+
+        let git_uid = "repo:test:git";
+        let plain_uid = "repo:test:plain";
+        let both = GraphStore::in_memory().unwrap();
+        both.insert_repo(&indexed_repo(git_uid, "git-repo", git_dir.path()))
+            .unwrap();
+        both.insert_repo(&indexed_repo(plain_uid, "plain-repo", plain_dir.path()))
+            .unwrap();
+
+        let ambiguous = tool_affected_tests(&both, json!({ "base_ref": "HEAD" }), None)
+            .expect_err("two local repositories must not diff an unnamed one");
+        let ambiguous = ambiguous.to_string();
+        assert!(
+            ambiguous.contains("git-repo") && ambiguous.contains("plain-repo"),
+            "the ambiguity error must name each repository: {ambiguous}"
+        );
+        assert!(
+            ambiguous.contains("pass repo"),
+            "the ambiguity error must ask for the repo parameter: {ambiguous}"
+        );
+        assert!(
+            !ambiguous.contains("git diff for base_ref"),
+            "ambiguity must not collapse to the opaque git wrapper: {ambiguous}"
+        );
+
+        let named = tool_affected_tests(
+            &both,
+            json!({ "base_ref": "HEAD", "repo": "git-repo" }),
+            None,
+        )
+        .expect("an explicit git repository must diff");
+        assert_eq!(named["repo"], json!("git-repo"), "{named}");
+        assert_eq!(named["repo_uid"], json!(git_uid), "{named}");
+
+        let non_git = tool_affected_tests(
+            &both,
+            json!({ "base_ref": "HEAD", "repo": "plain-repo" }),
+            None,
+        )
+        .expect_err("a non-git repository must fail");
+        let non_git = non_git.to_string();
+        assert!(
+            non_git.contains("plain-repo") && non_git.contains("not a git repository"),
+            "the outermost error must name the repository and say it is not git: {non_git}"
+        );
+        assert!(
+            !non_git.contains("git diff for base_ref"),
+            "the non-git failure must not stay wrapped as 'git diff for base_ref': {non_git}"
+        );
+
+        let only = GraphStore::in_memory().unwrap();
+        only.insert_repo(&indexed_repo(git_uid, "git-repo", git_dir.path()))
+            .unwrap();
+        let implied = tool_affected_tests(&only, json!({ "base_ref": "HEAD" }), None)
+            .expect("the only local repository must diff and be named");
+        assert_eq!(implied["repo"], json!("git-repo"), "{implied}");
+        assert_eq!(implied["repo_uid"], json!(git_uid), "{implied}");
+    }
+
+    /// A directory nested inside a work tree is not that work tree. Git run
+    /// there walks up and diffs the parent, so the indexed path must fail
+    /// before `changed_files_from_git` names it as the repository.
+    #[test]
+    fn affected_tests_base_ref_rejects_a_directory_nested_in_a_work_tree() {
+        let git_dir = tempfile::tempdir().unwrap();
+        git(git_dir.path(), &["init", "-q"]);
+        git(
+            git_dir.path(),
+            &["config", "user.email", "test@example.com"],
+        );
+        git(git_dir.path(), &["config", "user.name", "Test"]);
+        git(git_dir.path(), &["config", "commit.gpgsign", "false"]);
+        let nested = git_dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("inner.rs"), "fn inner() {}\n").unwrap();
+        git(git_dir.path(), &["add", "nested/inner.rs"]);
+        git(git_dir.path(), &["commit", "-q", "-m", "init"]);
+        std::fs::write(nested.join("inner.rs"), "fn inner() { 1 }\n").unwrap();
+
+        let nested_uid = "repo:test:nested";
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&indexed_repo(nested_uid, "nested-repo", &nested))
+            .unwrap();
+
+        let nested_diff = tool_affected_tests(
+            &store,
+            json!({ "base_ref": "HEAD", "repo": "nested-repo" }),
+            None,
+        )
+        .expect_err("a directory nested in a work tree must not diff as the repository");
+        let nested_diff = nested_diff.to_string();
+        assert!(
+            nested_diff.contains("affected_tests base_ref cannot diff repository 'nested-repo'")
+                && nested_diff.contains("it is not a git repository"),
+            "the outermost error must name the nested path as not a git repository: {nested_diff}"
+        );
+        assert!(
+            nested_diff.contains(nested_uid) && nested_diff.contains(&nested.display().to_string()),
+            "the error must name the indexed path: {nested_diff}"
+        );
+        assert!(
+            !nested_diff.contains("git diff for base_ref"),
+            "the nested failure must not stay wrapped as 'git diff for base_ref': {nested_diff}"
+        );
     }
 }
 
