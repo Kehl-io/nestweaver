@@ -2531,10 +2531,10 @@ fn is_head_or_refs_inside_git_dir(relative: &Path) -> bool {
         Some(std::path::Component::Normal(name)) if name == "HEAD" => parts.next().is_none(),
         Some(std::path::Component::Normal(name)) if name == "packed-refs" => parts.next().is_none(),
         Some(std::path::Component::Normal(name)) if name == "refs" => true,
-        Some(std::path::Component::Normal(name)) if name == "logs" => match parts.next() {
-            Some(std::path::Component::Normal(inner)) if inner == "HEAD" || inner == "refs" => true,
-            _ => false,
-        },
+        Some(std::path::Component::Normal(name)) if name == "logs" => matches!(
+            parts.next(),
+            Some(std::path::Component::Normal(inner)) if inner == "HEAD" || inner == "refs"
+        ),
         _ => false,
     }
 }

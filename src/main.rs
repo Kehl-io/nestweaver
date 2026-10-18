@@ -17494,6 +17494,7 @@ fn resolve_use_daemon(no_daemon_flag: bool, warn: bool) -> bool {
 /// maps onto `--detailed`: `detailed` selects the detailed record and its
 /// 3000-token default; `concise` keeps the concise default unless `--detailed`
 /// is also set, which is a conflict.
+#[allow(clippy::too_many_arguments)]
 fn project_context_tool_args(
     name: &str,
     token_budget: Option<usize>,

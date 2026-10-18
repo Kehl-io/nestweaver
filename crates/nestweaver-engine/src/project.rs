@@ -593,19 +593,18 @@ pub fn rebuild_project_repo_membership(
 /// of disclosing an in-flight publication. If publication is already owned,
 /// the write gate is dropped before waiting and `plan` runs again: the
 /// publisher may have committed while it held the gate.
+type ReservedProjectPublication<'a, T> = (
+    Option<Box<dyn crate::watcher::WatchMutationLease>>,
+    nestweaver_store::IndexPublicationLease<'a>,
+    T,
+);
+
 fn reserve_project_publication_after_plan<'a, T>(
     store: &'a GraphStore,
     factory: Option<&crate::watcher::WatchMutationLeaseFactory>,
     label: &'static str,
     mut plan: impl FnMut() -> Result<T, anyhow::Error>,
-) -> Result<
-    (
-        Option<Box<dyn crate::watcher::WatchMutationLease>>,
-        nestweaver_store::IndexPublicationLease<'a>,
-        T,
-    ),
-    anyhow::Error,
-> {
+) -> Result<ReservedProjectPublication<'a, T>, anyhow::Error> {
     loop {
         let mutation = factory.map(|factory| factory(label)).transpose()?;
         // Yield before planning when a watcher already owns publication.

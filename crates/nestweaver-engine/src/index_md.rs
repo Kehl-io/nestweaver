@@ -1043,9 +1043,7 @@ fn forget_symlink_rows(db_path: Option<&Path>, vault_root: &Path, paths: &[Strin
     let key = vault_sidecar_key(vault_root);
     update_skipped_notes_sidecar(db_path, |mut sidecar| {
         let remove_key = {
-            let Some(rows) = sidecar.skipped.get_mut(&key) else {
-                return None;
-            };
+            let rows = sidecar.skipped.get_mut(&key)?;
             let before = rows.len();
             rows.retain(|file| !(is_symlink_row(file) && paths.contains(&file.path)));
             if rows.len() == before {

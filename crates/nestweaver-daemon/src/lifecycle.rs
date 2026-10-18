@@ -743,10 +743,10 @@ fn socket_path_in(instance_id: &str, runtime: &Path) -> PathBuf {
 /// means the reader is gone; every other panic still propagates.
 fn emit_lifecycle_diagnostic(emit: impl FnOnce()) {
     let emit = std::panic::AssertUnwindSafe(emit);
-    if let Err(payload) = std::panic::catch_unwind(emit) {
-        if !lifecycle_panic_is_closed_stderr(payload.as_ref()) {
-            std::panic::resume_unwind(payload);
-        }
+    if let Err(payload) = std::panic::catch_unwind(emit)
+        && !lifecycle_panic_is_closed_stderr(payload.as_ref())
+    {
+        std::panic::resume_unwind(payload);
     }
 }
 
