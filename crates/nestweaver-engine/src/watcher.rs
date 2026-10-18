@@ -619,8 +619,25 @@ impl BrainWatcher {
         if !needed {
             return Ok(None);
         }
+        // nw-744 (3): `brain remove` signals this flag while it still holds
+        // the write gate. A batch that already left the debounce queue is
+        // blocked on the gate; once it acquires the lease the vault is gone,
+        // and writing would recreate it. Refuse under the lease, after stop
+        // is visible, and exit instead.
+        if self.stop_flag.load(Ordering::Acquire) {
+            tracing::info!("BrainWatcher batch refused because the watcher is stopping; exiting");
+            return Err(WatchMutationRefused.into());
+        }
         match self.acquire_mutation_lease(label) {
-            Ok(lease) => Ok(lease),
+            Ok(lease) => {
+                if self.stop_flag.load(Ordering::Acquire) {
+                    tracing::info!(
+                        "BrainWatcher batch refused because the watcher is stopping; exiting"
+                    );
+                    return Err(WatchMutationRefused.into());
+                }
+                Ok(lease)
+            }
             Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
                 tracing::info!("BrainWatcher batch refused during shutdown; exiting");
                 Err(error)
@@ -827,7 +844,22 @@ impl BrainWatcher {
             &self.instance_id,
         )?;
         let _initial_mutation_lease = match self.acquire_mutation_lease("watch_vault_initial") {
-            Ok(lease) => lease,
+            Ok(lease) => {
+                // nw-744 (3): `brain remove` sets the stop flag while it still
+                // holds the write gate. Startup can already be blocked on this
+                // lease; once the gate is released the vault is gone, and
+                // publishing or upserting would recreate it. The batch path
+                // checks this inside `try_acquire_batch_lease`. This lease is
+                // acquired directly, so the same check has to happen here,
+                // before publication or `ensure_vault`.
+                if self.stop_flag.load(Ordering::Acquire) {
+                    tracing::info!(
+                        "BrainWatcher startup refused because the watcher is stopping; exiting"
+                    );
+                    return Ok(());
+                }
+                lease
+            }
             Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
                 tracing::info!("BrainWatcher startup refused during shutdown; exiting");
                 return Ok(());

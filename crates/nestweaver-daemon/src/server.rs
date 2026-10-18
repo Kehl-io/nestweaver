@@ -4005,6 +4005,23 @@ async fn stop_and_drain_watcher(state: &DaemonState, id: u64) -> bool {
     stopped
 }
 
+/// nw-744 (3): after a vault is removed, stop the vault watcher registered
+/// on its root. `brain remove` deletes the graph row and leaves the directory
+/// in place, so a still-running watcher treats the next save as a first index
+/// and recreates the vault with that one note. Roots compare canonically.
+fn forget_removed_vault_watch(state: &DaemonState, root: &Path) {
+    use nestweaver_engine::vault_registration::canonical;
+    let watcher_id = state.watcher_stop.lock().ok().and_then(|guard| {
+        guard
+            .as_ref()
+            .filter(|w| w.kind == "vault" && canonical(Path::new(&w.target)) == canonical(root))
+            .map(|w| w.id)
+    });
+    if let Some(id) = watcher_id {
+        stop_watcher_registration(state, id);
+    }
+}
+
 /// nw-664 review: after a repo is removed or pruned, stop the code watcher
 /// registered on its root (if the canonical slot holds one) and forget its
 /// code-watcher state. Left running, an owed startup-reconciliation retry or
@@ -6729,6 +6746,15 @@ fn run_remove_vault_with_projection(
     // graph proves the uid absent either way.
     if mutation.is_ok() {
         forget_vault_registration(state, vault_uid, root_path.as_deref());
+    }
+    // nw-744 (3): only a removal that actually dropped the vault. A confirmed
+    // no-op never had a row for this watcher to resurrect, and a failed delete
+    // must leave the live watcher in place.
+    if mutation.is_ok()
+        && !confirmed_noop
+        && let Some(root) = root_path.as_deref()
+    {
+        forget_removed_vault_watch(state, Path::new(root));
     }
     let mut failures = Vec::new();
     if !confirmed_noop {
@@ -31748,6 +31774,205 @@ external_model = "unavailable-test-model"
             indexed.is_ok(),
             "first post-acknowledgement edit was missed"
         );
+        assert!(state.watcher_tasks.lock().unwrap().is_empty());
+    }
+
+    /// nw-744 (3): `brain remove` must stop the vault watcher. Leaving it
+    /// running makes the next save recreate the vault with that one note.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_vault_stops_its_watcher_so_a_later_save_does_not_recreate_it() {
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("Seed.md"), "# Seed\n\nkept\n").unwrap();
+        let service = DaemonService::new(state.clone());
+        let response = service
+            .watch_vault(Request::new(WatchVaultRequest {
+                vault_path: vault.path().to_string_lossy().into_owned(),
+                vault_name: "notes".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.ok, "{}", response.message);
+
+        let vault_uid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(found) = state
+                    .store
+                    .list_vaults(None)
+                    .unwrap()
+                    .into_iter()
+                    .find(|candidate| candidate.name == "notes")
+                {
+                    break found.uid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("watcher must publish the vault before removal");
+
+        let mut request = Request::new(RemoveVaultRequest {
+            vault_uid: vault_uid.clone(),
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let removed = service.remove_vault(request).await.unwrap().into_inner();
+        assert!(removed.committed, "vault removal must commit");
+        assert!(
+            watcher_status(&state).is_none(),
+            "brain remove must stop the vault watcher"
+        );
+        assert!(
+            state.store.list_vaults(None).unwrap().is_empty(),
+            "the vault row must be gone before the later save"
+        );
+
+        std::fs::write(
+            vault.path().join("Later.md"),
+            "# Later\n\nshould stay out\n",
+        )
+        .unwrap();
+
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let vaults = state.store.list_vaults(None).unwrap();
+                assert!(
+                    vaults.is_empty(),
+                    "removed vault was recreated by its watcher: {vaults:?}"
+                );
+                let finished = state
+                    .watcher_tasks
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|task| task.handle.is_finished());
+                if finished {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "vault watcher kept running after brain remove"
+        );
+        let notes = state.store.list_notes(None).unwrap();
+        assert!(
+            notes.is_empty(),
+            "a save after brain remove was indexed: {notes:?}"
+        );
+    }
+
+    /// nw-744 (3): a watcher already blocked on `watch_vault_initial` must
+    /// return once `brain remove` sets the stop flag and releases the write
+    /// gate. Acquiring that lease and then upserting recreates the vault.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn remove_vault_stops_a_watcher_blocked_on_the_initial_lease() {
+        use nestweaver_schema::Vault;
+        use nestweaver_schema::uid::vault_uid;
+
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("Seed.md"), "# Seed\n\nkept\n").unwrap();
+        let root = std::fs::canonicalize(vault.path()).unwrap();
+        let uid = vault_uid("default", &root.to_string_lossy());
+        state
+            .store
+            .insert_vault(&Vault {
+                uid: uid.clone(),
+                name: "notes".into(),
+                root_path: root.to_string_lossy().into_owned(),
+                instance_id: "default".into(),
+            })
+            .unwrap();
+
+        // Hold the gate so removal queues first and the watcher parks on its
+        // startup lease behind that removal. `waiting` flips just before the
+        // mutex wait; the watcher is not started until removal is already
+        // counted, and its own startup reaches the lease only after that.
+        let holder = state.write_gate.lock("test_initial_lease_barrier").await;
+        let remove_state = state.clone();
+        let remove_uid = uid.clone();
+        let removing = tokio::spawn(async move {
+            let service = DaemonService::new(remove_state);
+            let mut request = Request::new(RemoveVaultRequest {
+                vault_uid: remove_uid,
+            });
+            request.extensions_mut().insert(crate::auth::IsAdmin(true));
+            service.remove_vault(request).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.write_gate.waiting() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("vault removal must wait behind the startup barrier");
+
+        let service = DaemonService::new(state.clone());
+        let path = root.to_string_lossy().into_owned();
+        let starting = tokio::spawn(async move {
+            service
+                .watch_vault(Request::new(WatchVaultRequest {
+                    vault_path: path,
+                    vault_name: "notes".into(),
+                    instance_id: "default".into(),
+                    ..Default::default()
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.write_gate.waiting() < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("watcher must block on its initial lease behind removal");
+        assert_eq!(
+            state.write_gate.holder_snapshot().unwrap().0,
+            "test_initial_lease_barrier"
+        );
+        assert_eq!(
+            watcher_status(&state).map(|status| status.kind),
+            Some("vault".into()),
+            "the blocked watcher must be registered before removal runs"
+        );
+        drop(holder);
+
+        let removed = tokio::time::timeout(std::time::Duration::from_secs(10), removing)
+            .await
+            .expect("vault removal must finish after the barrier drops")
+            .unwrap()
+            .unwrap()
+            .into_inner();
+        assert!(removed.committed, "vault removal must commit");
+
+        std::fs::write(root.join("Later.md"), "# Later\n\nshould stay out\n").unwrap();
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), starting)
+            .await
+            .expect("blocked watcher must leave startup after removal")
+            .unwrap()
+            .unwrap()
+            .into_inner();
+        assert!(
+            !response.ok,
+            "a watcher that lost its vault during startup must not become ready: {}",
+            response.message
+        );
+        assert!(
+            state.store.list_vaults(None).unwrap().is_empty(),
+            "the initial lease must not recreate the removed vault: {:?}",
+            state.store.list_vaults(None).unwrap()
+        );
+        assert!(
+            state.store.list_notes(None).unwrap().is_empty(),
+            "a save after brain remove was indexed: {:?}",
+            state.store.list_notes(None).unwrap()
+        );
+        assert!(watcher_status(&state).is_none());
         assert!(state.watcher_tasks.lock().unwrap().is_empty());
     }
 
