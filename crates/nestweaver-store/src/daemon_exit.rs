@@ -19,7 +19,11 @@
 //!   the signal number. A daemon that finds a stale sentinel with no line for
 //!   that pid appends one with signal `0`, which means "exited unexpectedly":
 //!   SIGKILL and the OOM killer cannot be caught, so nothing is claimed about
-//!   the storage engine.
+//!   the storage engine. A sentinel whose pid is still held by the process
+//!   that was alive when the sentinel was written — it started before the
+//!   notice and at or before the sentinel's mtime — is not an exit. A later
+//!   process that reused the pid started after the sentinel and still gets a
+//!   line, once; a second kill of that reused pid is not recorded again.
 //!
 //! ## The clearing rule
 //!
@@ -193,6 +197,82 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Unix seconds at which `pid` was created, from `/proc`. `None` when the
+/// process is gone or this is not Linux: a missing start time must not be
+/// treated as proof the process is still the one a notice names.
+fn process_start_unix(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // Field 22 is starttime (clock ticks since boot). The command name is
+        // field 2 and may contain spaces, so count from after the last ") ".
+        let ticks: u64 = stat
+            .rsplit_once(") ")?
+            .1
+            .split_whitespace()
+            .nth(19)?
+            .parse()
+            .ok()?;
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if hz <= 0 {
+            return None;
+        }
+        let proc_stat = std::fs::read_to_string("/proc/stat").ok()?;
+        let btime = proc_stat.lines().find_map(|line| {
+            line.strip_prefix("btime ")
+                .and_then(|rest| rest.trim().parse::<u64>().ok())
+        })?;
+        Some(btime.saturating_add(ticks / hz as u64))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// `kill(pid, 0)` with `EPERM` still means the process exists. Pid 0 is the
+/// process group, never a daemon.
+fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn sentinel_mtime_unix(running: &Path) -> Option<u64> {
+    std::fs::metadata(running)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_secs())
+}
+
+/// True when appending an unexpected-exit line for `pid` at `noticed_at` would
+/// name a process that has not exited.
+///
+/// The pid is alive and started before the notice. It is the process the
+/// sentinel names only when it also started at or before the sentinel was
+/// written. That comparison is against whoever holds the pid now: after
+/// `kill -9`, arm's notice is "now", and a recycled pid can already have been
+/// alive longer than that. A sentinel older than that process is the dead
+/// daemon's, and the signal-0 line is appended. What is deliberately unchanged
+/// is the caller's existing dedup: a pid that already has a crash line does
+/// not get a second one, so a later `kill -9` of a reused pid stays omitted.
+fn sentinel_names_live_daemon(running: &Path, pid: u32, noticed_at: u64) -> bool {
+    let Some(start) = process_start_unix(pid) else {
+        return false;
+    };
+    if start >= noticed_at || !pid_is_alive(pid) {
+        return false;
+    }
+    if sentinel_mtime_unix(running).is_some_and(|mtime| mtime < start) {
+        return false;
+    }
+    true
+}
+
 /// Parse one `<signal> <unix seconds> <pid>` line. A torn or foreign line is
 /// skipped rather than guessed at.
 fn parse_line(line: &str) -> Option<(i32, u64, u32)> {
@@ -331,11 +411,50 @@ pub fn note_deliberate_kill(dir: &Path) {
 /// served by the daemon can report what it found at startup.
 static ARMED_DIR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
+/// Set when this process itself appends an unexpected-exit line for its own
+/// pid. That line is a previous holder of a reused pid, noticed at arm time,
+/// and must still be reported. A line that was already there, naming this
+/// pid, while this process started before the notice, is the live daemon.
+#[cfg(unix)]
+static RECORDED_OWN_PID_DEATH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The unclean exit the running daemon should warn about, if any. `None` in
-/// any process that is not an armed daemon.
+/// any process that is not an armed daemon. An unexplained line for this
+/// process is left out when this process started before that notice: it is
+/// still the live daemon. Earlier deaths in the same file stay. A line this
+/// process just recorded for a reused pid stays too. A recorded fatal signal
+/// is never dropped: the handler wrote it because the process was dying.
 pub fn armed_report() -> Option<UncleanExit> {
     let dir = ARMED_DIR.lock().ok()?.clone()?;
-    read(&dir)
+    let mut deaths = Vec::new();
+    for line in read_lines(&dir) {
+        if deaths.iter().any(|&(_, _, pid)| pid == line.2) || unexplained_live_daemon(line) {
+            continue;
+        }
+        deaths.push(line);
+    }
+    let &(signal, at, pid) = deaths.last()?;
+    Some(UncleanExit {
+        signal: (signal != 0).then_some(signal),
+        at,
+        pid,
+        count: deaths.len(),
+    })
+}
+
+/// An unexplained exit line that names this process, which started before the
+/// notice and so cannot be the process that exited.
+fn unexplained_live_daemon(line: (i32, u64, u32)) -> bool {
+    let (signal, at, pid) = line;
+    if signal != 0 || pid != std::process::id() {
+        return false;
+    }
+    #[cfg(unix)]
+    if RECORDED_OWN_PID_DEATH.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    process_start_unix(pid).is_some_and(|start| start < at)
 }
 
 #[cfg(unix)]
@@ -500,13 +619,23 @@ mod imp {
 
         // A sentinel the previous daemon never removed: it did not return. If
         // its handler recorded a signal the line is already there; otherwise
-        // say only what is known, that it exited unexpectedly.
+        // say only what is known, that it exited unexpectedly. A pid that
+        // already has a line is not recorded again (a later kill of a reused
+        // pid stays omitted). A pid is not recorded when the process holding
+        // it started before this notice and at or before the sentinel was
+        // written.
+        super::RECORDED_OWN_PID_DEATH.store(false, Ordering::SeqCst);
+        let noticed_at = now_unix();
         if let Some(previous) = std::fs::read_to_string(&running)
             .ok()
             .and_then(|text| text.trim().parse::<u32>().ok())
             && !read_lines(dir).iter().any(|&(_, _, pid)| pid == previous)
+            && !sentinel_names_live_daemon(&running, previous, noticed_at)
         {
-            writeln!(crash_log, "0 {} {previous}", now_unix())?;
+            writeln!(crash_log, "0 {noticed_at} {previous}")?;
+            if previous == std::process::id() {
+                super::RECORDED_OWN_PID_DEATH.store(true, Ordering::SeqCst);
+            }
         }
         std::fs::write(&running, format!("{}\n", std::process::id()))?;
 
@@ -621,6 +750,161 @@ mod tests {
             "a client must not attribute its broken pipe to an engine crash"
         );
         armed.clean_shutdown();
+    }
+
+    /// The running daemon's pid is the pid in the crash line, and that process
+    /// started before the notice. Status must not say it has exited. A notice
+    /// from before this process started is a reused pid and stays reported; a
+    /// second line for that pid is still not written.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_daemon_predating_notice_is_not_an_unexpected_exit() {
+        let _serial = serial();
+        let pid = std::process::id();
+        if process_start_unix(pid).is_some_and(|start| start >= now_unix()) {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        let start = process_start_unix(pid).expect("this process has a /proc start time");
+        assert!(start < now_unix(), "start {start} must precede the notice");
+
+        let dir = tempfile::tempdir().unwrap();
+        let notice = start + 60;
+        std::fs::write(dir.path().join(CRASH_FILE), format!("0 {notice} {pid}\n")).unwrap();
+        std::fs::write(dir.path().join(RUNNING_FILE), format!("{pid}\n")).unwrap();
+        let armed = arm(dir.path()).unwrap();
+        assert_eq!(
+            armed_report(),
+            None,
+            "the live daemon started before the notice and has not exited"
+        );
+        armed.clean_shutdown();
+
+        // A real earlier death stays. Only the line for the live pid is dropped.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CRASH_FILE),
+            format!("11 {start} 77\n0 {notice} {pid}\n"),
+        )
+        .unwrap();
+        let armed = arm(dir.path()).unwrap();
+        let exit = armed_report().expect("the earlier death is still reported");
+        assert_eq!((exit.signal, exit.pid, exit.count), (Some(11), 77, 1));
+        assert_ne!(exit.pid, pid);
+        armed.clean_shutdown();
+
+        // Attaching a new line to that same live pid is the same mistake.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(RUNNING_FILE), format!("{pid}\n")).unwrap();
+        let armed = arm(dir.path()).unwrap();
+        assert_eq!(armed_report(), None);
+        let crash = std::fs::read_to_string(dir.path().join(CRASH_FILE)).unwrap_or_default();
+        assert!(
+            crash
+                .lines()
+                .all(|line| parse_line(line).is_none_or(|(_, _, recorded)| recorded != pid)),
+            "must not attach an unexpected exit to the live daemon: {crash}"
+        );
+        armed.clean_shutdown();
+
+        // Opposite of the live-daemon notice: this process reused the pid, and
+        // the sentinel was written by the previous holder. That kill is recorded.
+        let dir = tempfile::tempdir().unwrap();
+        let running = dir.path().join(RUNNING_FILE);
+        std::fs::write(&running, format!("{pid}\n")).unwrap();
+        set_mtime(&running, start.saturating_sub(60));
+        let armed = arm(dir.path()).unwrap();
+        let exit = armed_report().expect("a reused pid's earlier death is still recorded");
+        assert_eq!((exit.signal, exit.pid), (None, pid));
+        assert!(exit.summary().contains("exited unexpectedly"));
+        armed.clean_shutdown();
+
+        // And a kill after that line exists is still omitted (nw-721).
+        let dir = tempfile::tempdir().unwrap();
+        let earlier = start.saturating_sub(60);
+        std::fs::write(dir.path().join(CRASH_FILE), format!("0 {earlier} {pid}\n")).unwrap();
+        std::fs::write(dir.path().join(RUNNING_FILE), format!("{pid}\n")).unwrap();
+        let armed = arm(dir.path()).unwrap();
+        let exit = armed_report().expect("a death noticed before this process started stays");
+        assert_eq!(exit.pid, pid);
+        assert!(exit.at < start);
+        let lines = std::fs::read_to_string(dir.path().join(CRASH_FILE)).unwrap();
+        assert_eq!(
+            lines.lines().count(),
+            1,
+            "a reused pid is not recorded twice: {lines}"
+        );
+        armed.clean_shutdown();
+    }
+
+    /// A live pid that is not this process, and that started after the
+    /// sentinel was written, reused the dead daemon's pid. The notice inside
+    /// `arm` is "now", which is after that process started, so only the
+    /// sentinel mtime distinguishes it from the daemon that is still serving.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_pid_started_after_sentinel_is_an_unexpected_exit() {
+        let _serial = serial();
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a process that is not this daemon");
+        let pid = child.id();
+        // Declared after `child` so this runs first and reaps it, including
+        // when an assertion below fails.
+        let _reap = KillOnDrop(pid);
+        assert_ne!(pid, std::process::id());
+        if process_start_unix(pid).is_some_and(|start| start >= now_unix()) {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        let start = process_start_unix(pid).expect("the other process has a /proc start time");
+        assert!(
+            start < now_unix(),
+            "start {start} must precede the notice, or the mtime check is not what records the exit"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let running = dir.path().join(RUNNING_FILE);
+        std::fs::write(&running, format!("{pid}\n")).unwrap();
+        set_mtime(&running, start.saturating_sub(60));
+        assert!(
+            sentinel_mtime_unix(&running).is_some_and(|mtime| mtime < start),
+            "the sentinel must be older than the process that now holds the pid"
+        );
+
+        let armed = arm(dir.path()).unwrap();
+        let exit = armed_report().expect("a recycled pid still gets a signal-0 line");
+        assert_eq!((exit.signal, exit.pid), (None, pid));
+        assert!(exit.summary().contains("exited unexpectedly"));
+        let lines = std::fs::read_to_string(dir.path().join(CRASH_FILE)).unwrap();
+        assert_eq!(lines.lines().count(), 1, "{lines}");
+        armed.clean_shutdown();
+    }
+
+    #[cfg(target_os = "linux")]
+    struct KillOnDrop(u32);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(self.0 as i32, libc::SIGKILL);
+                let mut status = 0;
+                libc::waitpid(self.0 as i32, &mut status, 0);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_mtime(path: &Path, unix_seconds: u64) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let spec = libc::timespec {
+            tv_sec: unix_seconds as libc::time_t,
+            tv_nsec: 0,
+        };
+        let times = [spec, spec];
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(rc, 0, "utimensat: {}", std::io::Error::last_os_error());
     }
 
     #[test]
