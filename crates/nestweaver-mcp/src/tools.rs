@@ -14657,12 +14657,13 @@ fn resolve_affected_tests_base_ref_repository(
             .filter(|repo| repo.local_root().is_some_and(|path| !path.is_empty()))
             .map(affected_tests_base_ref_repository)
             .collect::<Result<_, _>>()?;
-    match locals.len() {
-        1 => Ok(locals.into_iter().next().expect("len checked")),
-        0 => Err(anyhow!(
+    match <[AffectedTestsBaseRefRepository; 1]>::try_from(locals) {
+        Ok([only]) => Ok(only),
+        Err(locals) if locals.is_empty() => Err(anyhow!(
             "affected_tests base_ref requires one local git repository; none of the visible repositories has a local working tree"
         )),
-        count => {
+        Err(locals) => {
+            let count = locals.len();
             const MAX_LISTED: usize = 15;
             let listed = locals
                 .iter()
@@ -14739,6 +14740,9 @@ fn git_command_for_indexed_path(path: &Path) -> std::process::Command {
     let mut command = std::process::Command::new("git");
     command.env_remove("GIT_DIR");
     command.env_remove("GIT_WORK_TREE");
+    // The caller classifies failures by git's message text, so pin the locale.
+    command.env("LC_ALL", "C");
+    command.env_remove("LANGUAGE");
     command.arg("-C").arg(path);
     command
 }
@@ -14758,9 +14762,10 @@ fn git_command_for_resolved_git_dir(path: &Path, git_dir: &Path) -> std::process
 /// repository fails that comparison. A symlink `.git` is not a directory
 /// entry of this path, so it is not accepted.
 ///
-/// A linked worktree is a gitfile. It is accepted when the target directory's
-/// `gitdir` file points back at this path's `.git`. The returned directory is
-/// that target, which is the per-worktree git dir.
+/// A gitfile (linked worktree, submodule, `--separate-git-dir`) is accepted
+/// when the target directory points back at this work tree: through its
+/// `gitdir` file (linked worktree) or its `core.worktree` setting (submodule,
+/// separate git dir). The returned directory is that target.
 fn indexed_work_tree_git_dir(path: &Path) -> Option<std::path::PathBuf> {
     let dot_git = path.join(".git");
     let meta = std::fs::symlink_metadata(&dot_git).ok()?;
@@ -14795,21 +14800,63 @@ fn linked_worktree_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::Pat
     if !canonical.is_dir() {
         return None;
     }
-    let back_text = std::fs::read_to_string(canonical.join("gitdir")).ok()?;
-    let back_line = back_text.lines().next()?.trim();
+    if gitdir_file_points_at(&canonical, dot_git) || core_worktree_points_at(&canonical, path) {
+        Some(canonical)
+    } else {
+        None
+    }
+}
+
+/// A linked worktree's `<git dir>/gitdir` names the `.git` gitfile it serves.
+fn gitdir_file_points_at(git_dir: &Path, dot_git: &Path) -> bool {
+    let Ok(back_text) = std::fs::read_to_string(git_dir.join("gitdir")) else {
+        return false;
+    };
+    let Some(back_line) = back_text.lines().next().map(str::trim) else {
+        return false;
+    };
     if back_line.is_empty() {
-        return None;
+        return false;
     }
     let back_raw = Path::new(back_line);
     let back = if back_raw.is_absolute() {
         back_raw.to_path_buf()
     } else {
-        canonical.join(back_raw)
+        git_dir.join(back_raw)
     };
-    if !same_directory(&back, dot_git) {
-        return None;
+    same_directory(&back, dot_git)
+}
+
+/// A submodule or `--separate-git-dir` repository records its work tree as
+/// `core.worktree` in `<git dir>/config`, relative to the git dir.
+fn core_worktree_points_at(git_dir: &Path, work_tree: &Path) -> bool {
+    let Ok(output) = git_command_for_indexed_path(work_tree)
+        .arg("config")
+        .arg("--file")
+        .arg(git_dir.join("config"))
+        .arg("--get")
+        .arg("core.worktree")
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
     }
-    Some(canonical)
+    let Ok(text) = String::from_utf8(output.stdout) else {
+        return false;
+    };
+    let line = text.trim();
+    if line.is_empty() {
+        return false;
+    }
+    let raw = Path::new(line);
+    let target = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        git_dir.join(raw)
+    };
+    same_directory(&target, work_tree)
 }
 
 /// Path named by a `gitdir: <path>` gitfile. Relative paths are relative to
