@@ -8600,6 +8600,9 @@ fn paths_covered_by_changes(changes: &[crate::git_diff::FileChange]) -> HashSet<
 /// `git diff indexed_sha..HEAD` is empty for a source that was committed at or
 /// before `indexed_sha` and then dropped from the graph. Advancing the SHA
 /// without putting that path back leaves it missing forever.
+/// Individually logged committed sources that could not be prepared per run.
+const MAX_LOGGED_UNPREPARED: usize = 10;
+
 fn prepare_missing_committed_sources(
     reader: &dyn crate::content_reader::ContentReader,
     git_repo_path: &Path,
@@ -8607,6 +8610,7 @@ fn prepare_missing_committed_sources(
     already_present: &HashSet<String>,
 ) -> Result<HashMap<String, PreparedIncrementalOutcome>, anyhow::Error> {
     let mut prepared = HashMap::new();
+    let mut unprepared = 0usize;
     for path in crate::git_diff::list_commit_paths(git_repo_path, sha)
         .context("list committed paths before recording HEAD")?
     {
@@ -8627,17 +8631,41 @@ fn prepare_missing_committed_sources(
             // ReadError, a mode-000 file), absent from a dirty working tree
             // (deleted or renamed without a commit), or unparsable. Failing
             // the index here would block every later commit until the tree
-            // is repaired; the next commit retries the path because it is
-            // still absent from the graph. Warn rather than debug so the
-            // skip is visible.
+            // is repaired. The path stays out of the graph, is disclosed as a
+            // `ReadError` skip so coverage does not read complete, and is
+            // retried on the next index that has a new commit to process.
             Err(error) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %format!("{error:#}"),
-                    "leaving a committed source that could not be prepared for a later index"
+                unprepared += 1;
+                if unprepared <= MAX_LOGGED_UNPREPARED {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %format!("{error:#}"),
+                        "committed source could not be prepared; leaving it out of the graph"
+                    );
+                } else {
+                    tracing::debug!(path = %path.display(), "committed source could not be prepared");
+                }
+                prepared.insert(
+                    rel.into_owned(),
+                    PreparedIncrementalOutcome::PolicySkipped(SkippedFile::new(
+                        path.to_string_lossy().into_owned(),
+                        SkipReasonCode::ReadError,
+                        format!(
+                            "committed source could not be read or parsed ({error:#}), so it \
+                             is not in the graph; restore it or re-run the index after the \
+                             next commit"
+                        ),
+                    )),
                 );
             }
         }
+    }
+    if unprepared > MAX_LOGGED_UNPREPARED {
+        tracing::warn!(
+            unprepared,
+            logged = MAX_LOGGED_UNPREPARED,
+            "more committed sources could not be prepared than were logged individually"
+        );
     }
     Ok(prepared)
 }
@@ -8678,7 +8706,16 @@ fn write_missing_committed_sources_on(
             continue;
         }
         match outcome {
-            PreparedIncrementalOutcome::Excluded | PreparedIncrementalOutcome::PolicySkipped(_) => {
+            // Binary, oversized and unparsable files are deliberate policy
+            // and are never stored; only a read failure is a coverage gap.
+            PreparedIncrementalOutcome::Excluded => {}
+            PreparedIncrementalOutcome::PolicySkipped(skipped) => {
+                if skipped.reason_code == SkipReasonCode::ReadError {
+                    record_incremental_file_outcome(
+                        result,
+                        IncrementalFileOutcome::PolicySkipped(skipped.clone()),
+                    );
+                }
             }
             PreparedIncrementalOutcome::Ready(prepared) => {
                 let outcome = write_prepared_incremental_file_txn(

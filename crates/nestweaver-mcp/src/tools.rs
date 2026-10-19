@@ -14802,16 +14802,54 @@ fn linked_worktree_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::Pat
     if !canonical.is_dir() {
         return None;
     }
-    // A submodule owns its object store, so a `commondir`
-    // file there means it borrows another repository's and is refused, as
-    // `self_contained_git_dir` refuses it for a `.git` directory.
-    if gitdir_file_points_at(&canonical, dot_git)
-        || (!canonical.join("commondir").exists() && core_worktree_points_at(&canonical, path))
-    {
+    // The indexed tree authors its own `.git` gitfile, so a target inside it is
+    // a git dir the tree forged (a real one lives in the superproject's
+    // `.git/modules` or the main repository's `.git/worktrees`, both outside).
+    if canonical.starts_with(std::fs::canonicalize(path).ok()?) {
+        return None;
+    }
+    // A `commondir` must be the main repository this worktree is registered
+    // under, as `self_contained_git_dir` insists for a `.git` directory.
+    if !commondir_is_own_registration(&canonical) {
+        return None;
+    }
+    if gitdir_file_points_at(&canonical, dot_git) || core_worktree_points_at(&canonical, path) {
         Some(canonical)
     } else {
         None
     }
+}
+
+/// True when `git_dir` has no `commondir`, or when it is
+/// `<common>/worktrees/<name>` and its `commondir` resolves to `<common>`.
+fn commondir_is_own_registration(git_dir: &Path) -> bool {
+    let commondir = git_dir.join("commondir");
+    if !commondir.exists() {
+        return true;
+    }
+    let Ok(text) = std::fs::read_to_string(&commondir) else {
+        return false;
+    };
+    let line = text.lines().next().map(str::trim).unwrap_or_default();
+    if line.is_empty() {
+        return false;
+    }
+    let raw = Path::new(line);
+    let resolved = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        git_dir.join(raw)
+    };
+    let Ok(common) = std::fs::canonicalize(resolved) else {
+        return false;
+    };
+    let Some(worktrees) = git_dir.parent() else {
+        return false;
+    };
+    worktrees
+        .file_name()
+        .is_some_and(|name| name == "worktrees")
+        && worktrees.parent().is_some_and(|parent| parent == common)
 }
 
 /// A linked worktree's `<git dir>/gitdir` names the `.git` gitfile it serves.
@@ -15375,6 +15413,42 @@ mod affected_tests_base_ref_tests {
         .unwrap();
         std::fs::copy(real.path().join(".git").join("HEAD"), evil.join("HEAD")).unwrap();
         assert_other_repository_files_are_not_returned(forged.path(), "forged-core-worktree");
+    }
+
+    /// The tree authors its own gitfile, so a git dir it plants inside itself
+    /// must never be trusted, whatever `gitdir`, `core.worktree`, `commondir`
+    /// or alternates it carries.
+    #[test]
+    fn affected_tests_base_ref_rejects_git_dirs_planted_in_the_indexed_tree() {
+        let real = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(real.path(), "only-real.txt");
+        std::fs::write(real.path().join("only-real.txt"), "after\n").unwrap();
+        let real_git = real.path().join(".git");
+
+        let forged_gitdir = tempfile::tempdir().unwrap();
+        let evil = forged_gitdir.path().join(".evil");
+        std::fs::create_dir(&evil).unwrap();
+        std::fs::write(forged_gitdir.path().join(".git"), "gitdir: .evil\n").unwrap();
+        std::fs::write(evil.join("gitdir"), "../.git\n").unwrap();
+        std::fs::write(evil.join("commondir"), format!("{}\n", real_git.display())).unwrap();
+        std::fs::copy(real_git.join("HEAD"), evil.join("HEAD")).unwrap();
+        assert_other_repository_files_are_not_returned(
+            forged_gitdir.path(),
+            "forged-gitdir-commondir",
+        );
+
+        let alternates = tempfile::tempdir().unwrap();
+        let evil = alternates.path().join(".evil");
+        std::fs::create_dir_all(evil.join("objects").join("info")).unwrap();
+        std::fs::write(alternates.path().join(".git"), "gitdir: .evil\n").unwrap();
+        std::fs::write(evil.join("config"), "[core]\n\tworktree = ..\n").unwrap();
+        std::fs::write(
+            evil.join("objects").join("info").join("alternates"),
+            format!("{}\n", real_git.join("objects").display()),
+        )
+        .unwrap();
+        std::fs::copy(real_git.join("HEAD"), evil.join("HEAD")).unwrap();
+        assert_other_repository_files_are_not_returned(alternates.path(), "forged-alternates");
     }
 
     /// A linked worktree's `.git` is a gitfile. Its private git dir's `gitdir`

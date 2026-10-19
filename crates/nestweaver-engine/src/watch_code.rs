@@ -3638,6 +3638,109 @@ mod tests {
         );
     }
 
+    /// A committed source that is gone from the working tree (deleted, not
+    /// committed) must not fail the incremental index or leave coverage
+    /// reading complete.
+    #[test]
+    fn incremental_index_discloses_an_unreadable_missed_source_and_still_records_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let missed_body = "export function missed() { return 1; }\n";
+        std::fs::write(
+            root.join("src/kept.js"),
+            "export function kept() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/missed.js"), missed_body).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["add", "src/kept.js", "src/missed.js"]);
+        git(&["commit", "-m", "base"]);
+        let head = || -> String {
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git rev-parse HEAD failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        let base = head();
+        let db = dir.path().join("graph.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let url = format!("file://{}", root.display());
+        let uid = nestweaver_schema::repo_uid("test", &url);
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: uid.clone(),
+                url: url.clone(),
+                indexed_sha: base.clone(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: Some(root.display().to_string()),
+            })
+            .unwrap();
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: nestweaver_schema::file_uid(&uid, "src/kept.js"),
+                path: "src/kept.js".to_string(),
+                repo_uid: uid.clone(),
+                content_hash: crate::hash::blake3_hex(
+                    &std::fs::read_to_string(root.join("src/kept.js")).unwrap(),
+                ),
+            })
+            .unwrap();
+        let reader = crate::content_reader::FilesystemReader::with_limits(
+            &root,
+            crate::index_limits::IndexLimits::default(),
+        );
+        store
+            .set_repo_index_policy(&uid, &reader.eligibility_fingerprint())
+            .unwrap();
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        git(&["commit", "--allow-empty", "-m", "no source change"]);
+        let clean = head();
+        assert_ne!(clean, base);
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            store.lookup_repo(&uid).unwrap().unwrap().indexed_sha,
+            base,
+            "precondition: indexed_sha stays behind {clean} while missed.js is absent"
+        );
+        drop(store);
+
+        // Deleted from the working tree but still committed: it cannot be
+        // prepared. That must not block the index, and must not read complete.
+        std::fs::remove_file(root.join("src/missed.js")).unwrap();
+        let result = crate::index::incremental_index(&root, &db, "test", &url).unwrap();
+        assert_eq!(result.files_added, 0, "{result:?}");
+        assert!(
+            result.skipped_files.iter().any(|skipped| {
+                skipped.path == "src/missed.js"
+                    && skipped.reason_code == nestweaver_parser::SkipReasonCode::ReadError
+            }),
+            "the unreadable committed source must be disclosed: {:?}",
+            result.skipped_files
+        );
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert_eq!(
+            store.lookup_repo(&uid).unwrap().unwrap().indexed_sha,
+            clean,
+            "HEAD is recorded even though the committed source could not be restored"
+        );
+    }
+
     /// `record_applied_head` leaves `indexed_sha` behind when `src/missed.js`
     /// is committed and absent from the graph. The following incremental index
     /// sees an empty `indexed_sha..HEAD` diff, so it must put that file back
