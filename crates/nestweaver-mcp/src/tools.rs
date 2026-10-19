@@ -6837,25 +6837,9 @@ pub fn wrap_tool_result(value: Value) -> Value {
 /// Stale-graph `SKIPPED` rows and an empty vault stay successes: `applied`
 /// is false there too, and they are not failures.
 fn consolidate_apply_failed(value: &Value) -> bool {
-    if value.get("dry_run").and_then(Value::as_bool) != Some(false)
-        || value.get("applied").and_then(Value::as_bool) != Some(false)
-    {
-        return false;
-    }
-    value
-        .get("warnings")
-        .and_then(Value::as_array)
-        .is_some_and(|warnings| {
-            warnings.iter().any(|warning| {
-                warning.as_str().is_some_and(|text| {
-                    let lower = text.to_ascii_lowercase();
-                    lower.contains("apply failed")
-                        || lower.contains("failed:")
-                        || lower.contains("rejected:")
-                        || lower.contains("vault path must be non-empty and relative")
-                })
-            })
-        })
+    value.get("dry_run").and_then(Value::as_bool) == Some(false)
+        && value.get("applied").and_then(Value::as_bool) == Some(false)
+        && value.get("apply_errors").and_then(Value::as_bool) == Some(true)
 }
 
 #[cfg(test)]
@@ -14651,14 +14635,14 @@ fn resolve_affected_tests_base_ref_repository(
         return affected_tests_base_ref_repository(repo);
     }
 
-    let locals: Vec<AffectedTestsBaseRefRepository> =
+    let mut locals: Vec<AffectedTestsBaseRefRepository> =
         list_affected_tests_base_ref_repositories(store, visible)?
             .into_iter()
             .filter(|repo| repo.local_root().is_some_and(|path| !path.is_empty()))
             .map(affected_tests_base_ref_repository)
             .collect::<Result<_, _>>()?;
     match locals.len() {
-        1 => Ok(locals.into_iter().next().expect("len checked")),
+        1 => Ok(locals.remove(0)),
         0 => Err(anyhow!(
             "affected_tests base_ref requires one local git repository; none of the visible repositories has a local working tree"
         )),

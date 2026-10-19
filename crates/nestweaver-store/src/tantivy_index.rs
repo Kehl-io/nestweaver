@@ -1000,9 +1000,12 @@ impl TantivyIndex {
         if query.trim().is_empty() {
             return None;
         }
-        let mut parser =
-            QueryParser::for_index(&self.index, vec![self.fields.title, self.fields.body]);
-        parser.set_field_boost(self.fields.title, 3.0);
+        let parser = |query: &str| {
+            let mut parser =
+                QueryParser::for_index(&self.index, vec![self.fields.title, self.fields.body]);
+            parser.set_field_boost(self.fields.title, 3.0);
+            parser.parse_query(query)
+        };
         // Tantivy's strict grammar panics, instead of returning Err, when a
         // bare `*` is classified as an exist-query with no field (`*[]`,
         // `*()`, `*{}`, and the same `*` plus other exist metacharacters).
@@ -1013,16 +1016,21 @@ impl TantivyIndex {
         let parsed = if bare_exist_query_panics(query) {
             None
         } else {
-            parser.parse_query(query).ok()
+            // The scanner above is not Tantivy's grammar. A shape it misses
+            // panics inside `parse_query` instead of returning Err.
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser(query)))
+                .ok()
+                .and_then(Result::ok)
         };
         let parsed = if let Some(parsed) = parsed {
             parsed
         } else {
             // Fall back to a "lenient" parse that escapes special
             // chars by quoting — handles common user input like
-            // `auth/v2` or `path:foo` that breaks the parser.
+            // `auth/v2` or `path:foo` that breaks the parser. A fresh
+            // parser: the raw attempt may have panicked.
             let escaped = escape_query(query);
-            match parser.parse_query(&escaped) {
+            match parser(&escaped) {
                 Ok(q) => q,
                 // Last resort: a bare boolean keyword (`a AND`), an unbalanced
                 // quote, or other residual syntax that escape_query doesn't
@@ -1032,7 +1040,7 @@ impl TantivyIndex {
                 // hits rather than an error.
                 Err(_) => {
                     let phrase = format!("\"{}\"", query.replace('"', " "));
-                    match parser.parse_query(&phrase) {
+                    match parser(&phrase) {
                         Ok(q) => q,
                         Err(_) => return None,
                     }
@@ -2023,7 +2031,16 @@ fn bare_exist_query_panics(query: &str) -> bool {
             continue;
         }
         if !in_double && c == '\'' {
-            in_single = !in_single;
+            // `what's *[]` is a word plus a bare exist leaf. A mid-word
+            // apostrophe is not a phrase quote; treating it as one hides
+            // the `*` from this scan and `parse_query` panics.
+            let mid_word = query[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|prev| prev.is_ascii_alphanumeric() || prev == '_');
+            if !mid_word || in_single {
+                in_single = !in_single;
+            }
             continue;
         }
         if in_single || in_double {
@@ -2597,6 +2614,7 @@ mod tests {
             r"foo\: *^2",
             r#"\" *[]"#,
             r"\' *[]",
+            "what's *[]",
         ] {
             assert!(
                 bare_exist_query_panics(query),

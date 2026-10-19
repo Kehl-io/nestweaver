@@ -527,22 +527,10 @@ impl CodeWatcher {
         // A commit that landed while nothing was watching never produces a
         // live event. Once startup has applied the tree, record that HEAD
         // under the same clean-tree rule as a live ref update.
-        if pending.is_none() {
-            match self.acquire_mutation_lease("watch_code_sha") {
-                Ok(_lease) => {
-                    if let Err(error) = self.record_applied_head(&store, &r_uid, false) {
-                        tracing::warn!(
-                            %error,
-                            "code watcher left indexed_sha unchanged at startup"
-                        );
-                    }
-                }
-                Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
-                    tracing::info!("CodeWatcher HEAD record refused during shutdown; exiting");
-                    return Ok(());
-                }
-                Err(error) => return Err(error.context("acquire code watcher HEAD lease")),
-            }
+        if pending.is_none()
+            && self.record_applied_head_quietly(&store, &r_uid, false, "at startup")?
+        {
+            return Ok(());
         }
         if let Some(ready) = self.ready_callback.take() {
             ready();
@@ -574,27 +562,15 @@ impl CodeWatcher {
                     Ok(next) => {
                         let landed = next.is_none();
                         pending = next;
-                        if landed {
-                            match self.acquire_mutation_lease("watch_code_sha") {
-                                Ok(_lease) => {
-                                    if let Err(error) =
-                                        self.record_applied_head(&store, &r_uid, false)
-                                    {
-                                        tracing::warn!(
-                                            %error,
-                                            "code watcher left indexed_sha unchanged after reconciliation"
-                                        );
-                                    }
-                                }
-                                Err(error)
-                                    if error.downcast_ref::<WatchMutationRefused>().is_some() =>
-                                {
-                                    return Ok(());
-                                }
-                                Err(error) => {
-                                    return Err(error.context("acquire code watcher HEAD lease"));
-                                }
-                            }
+                        if landed
+                            && self.record_applied_head_quietly(
+                                &store,
+                                &r_uid,
+                                false,
+                                "after reconciliation",
+                            )?
+                        {
+                            return Ok(());
                         }
                     }
                     Err(_) => return Ok(()),
@@ -664,31 +640,20 @@ impl CodeWatcher {
                 .cloned()
                 .collect();
             if source_events.is_empty() {
-                if head_moved {
-                    let _mutation_lease = match self.acquire_mutation_lease("watch_code_sha") {
-                        Ok(lease) => lease,
-                        Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
-                            tracing::info!(
-                                "CodeWatcher HEAD record refused during shutdown; exiting"
-                            );
-                            return Ok(());
-                        }
-                        Err(error) => {
-                            return Err(error.context("acquire code watcher HEAD lease"));
-                        }
-                    };
-                    if let Err(error) = self.record_applied_head(&store, &r_uid, pending.is_some())
-                    {
-                        tracing::warn!(
-                            %error,
-                            "code watcher left indexed_sha unchanged after HEAD moved"
-                        );
-                    }
+                if head_moved
+                    && self.record_applied_head_quietly(
+                        &store,
+                        &r_uid,
+                        pending.is_some(),
+                        "after HEAD moved",
+                    )?
+                {
+                    return Ok(());
                 }
                 continue;
             }
-            let _mutation_lease = match self.acquire_mutation_lease("watch_code_batch") {
-                Ok(lease) => lease,
+            let mut mutation_lease = match self.acquire_mutation_lease("watch_code_batch") {
+                Ok(lease) => Some(lease),
                 Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
                     tracing::info!("CodeWatcher batch refused during shutdown; exiting");
                     return Ok(());
@@ -728,14 +693,16 @@ impl CodeWatcher {
                     files_processed
                 }
                 WatchBatchOutcome::Unchanged | WatchBatchOutcome::ManifestPending => {
+                    drop(mutation_lease.take());
                     if head_moved
-                        && let Err(error) =
-                            self.record_applied_head(&store, &r_uid, pending.is_some())
+                        && self.record_applied_head_quietly(
+                            &store,
+                            &r_uid,
+                            pending.is_some(),
+                            "after HEAD moved",
+                        )?
                     {
-                        tracing::warn!(
-                            %error,
-                            "code watcher left indexed_sha unchanged after HEAD moved"
-                        );
+                        return Ok(());
                     }
                     continue;
                 }
@@ -783,23 +750,30 @@ impl CodeWatcher {
                             next_attempt: Instant::now(),
                         });
                     }
-                    if head_moved && let Err(error) = self.record_applied_head(&store, &r_uid, true)
+                    drop(mutation_lease.take());
+                    if head_moved
+                        && self.record_applied_head_quietly(
+                            &store,
+                            &r_uid,
+                            true,
+                            "after HEAD moved",
+                        )?
                     {
-                        tracing::warn!(
-                            %error,
-                            "code watcher left indexed_sha unchanged after HEAD moved"
-                        );
+                        return Ok(());
                     }
                     continue;
                 }
             };
+            drop(mutation_lease.take());
             if head_moved
-                && let Err(error) = self.record_applied_head(&store, &r_uid, pending.is_some())
+                && self.record_applied_head_quietly(
+                    &store,
+                    &r_uid,
+                    pending.is_some(),
+                    "after HEAD moved",
+                )?
             {
-                tracing::warn!(
-                    %error,
-                    "code watcher left indexed_sha unchanged after HEAD moved"
-                );
+                return Ok(());
             }
             let duration = start.elapsed();
             tracing::info!(
@@ -2530,11 +2504,20 @@ fn is_head_or_refs_inside_git_dir(relative: &Path) -> bool {
     match parts.next() {
         Some(std::path::Component::Normal(name)) if name == "HEAD" => parts.next().is_none(),
         Some(std::path::Component::Normal(name)) if name == "packed-refs" => parts.next().is_none(),
-        Some(std::path::Component::Normal(name)) if name == "refs" => true,
-        Some(std::path::Component::Normal(name)) if name == "logs" => matches!(
-            parts.next(),
-            Some(std::path::Component::Normal(inner)) if inner == "HEAD" || inner == "refs"
-        ),
+        // Remote-tracking refs move on fetch without moving this worktree's
+        // HEAD. A shared common dir would otherwise wake every linked
+        // worktree's watcher.
+        Some(std::path::Component::Normal(name)) if name == "refs" => {
+            matches!(parts.next(), Some(std::path::Component::Normal(kind)) if kind == "heads")
+        }
+        Some(std::path::Component::Normal(name)) if name == "logs" => match parts.next() {
+            Some(std::path::Component::Normal(inner)) if inner == "HEAD" => parts.next().is_none(),
+            Some(std::path::Component::Normal(inner)) if inner == "refs" => matches!(
+                parts.next(),
+                Some(std::path::Component::Normal(kind)) if kind == "heads"
+            ),
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -2624,6 +2607,34 @@ impl CodeWatcher {
     /// full index had refreshed the stat cache. Startup drift still hashes
     /// the graph when that cache is stale, so a later full index re-reads a
     /// file whose stat moved.
+    /// Record HEAD, and report whether shutdown refused the write.
+    ///
+    /// `Ok(true)` means the watcher should exit. Other failures are logged
+    /// and the previous SHA is left in place.
+    fn record_applied_head_quietly(
+        &self,
+        store: &GraphStore,
+        r_uid: &str,
+        retry_pending: bool,
+        when: &'static str,
+    ) -> anyhow::Result<bool> {
+        match self.record_applied_head(store, r_uid, retry_pending) {
+            Ok(()) => Ok(false),
+            Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
+                tracing::info!("CodeWatcher HEAD record refused during shutdown; exiting");
+                Ok(true)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    when,
+                    "code watcher left indexed_sha unchanged"
+                );
+                Ok(false)
+            }
+        }
+    }
+
     fn record_applied_head(
         &self,
         store: &GraphStore,
@@ -2650,6 +2661,15 @@ impl CodeWatcher {
         if head == repo.indexed_sha {
             return Ok(());
         }
+        // Status and the drift walk stay outside the write lease. They can
+        // take the full git-status budget on a large tree; holding the lease
+        // across that stalls every other writer.
+        let observed_generation = store.graph_generation();
+        let hashes_before: std::collections::BTreeMap<_, _> = store
+            .list_file_hashes_by_repo(r_uid)
+            .context("list indexed files before recording HEAD")?
+            .into_iter()
+            .collect();
         let reader = self.reader_for(&repo.url)?;
         match self.indexable_worktree_drift(&reader) {
             Ok(true) => return Ok(()),
@@ -2678,6 +2698,25 @@ impl CodeWatcher {
                 );
                 return Ok(());
             }
+        }
+        let _lease = self.acquire_mutation_lease("watch_code_sha")?;
+        let Some(repo) = store.lookup_repo(r_uid)? else {
+            return Ok(());
+        };
+        if repo.indexed_sha == head {
+            return Ok(());
+        }
+        let hashes_after: std::collections::BTreeMap<_, _> = store
+            .list_file_hashes_by_repo(r_uid)
+            .context("list indexed files before recording HEAD")?
+            .into_iter()
+            .collect();
+        if store.graph_generation() != observed_generation || hashes_after != hashes_before {
+            tracing::info!(
+                repo = %r_uid,
+                "code watcher left indexed_sha unchanged; the graph changed during the HEAD check"
+            );
+            return Ok(());
         }
         store
             .update_repo_sha(r_uid, &head)
@@ -3394,6 +3433,11 @@ mod tests {
         assert!(!super::git_head_or_refs_event(
             &root,
             &[],
+            &root.join(".git/refs/remotes/origin/main")
+        ));
+        assert!(!super::git_head_or_refs_event(
+            &root,
+            &[],
             &root.join(".git/objects/pack/pack")
         ));
         assert!(!super::git_head_or_refs_event(
@@ -3815,6 +3859,11 @@ mod tests {
             &wt,
             &external,
             &common.join("logs/refs/heads/wt")
+        ));
+        assert!(!super::git_head_or_refs_event(
+            &wt,
+            &external,
+            &common.join("refs/remotes/origin/main")
         ));
         assert!(!super::git_head_or_refs_event(
             &wt,

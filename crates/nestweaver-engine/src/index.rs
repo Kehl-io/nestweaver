@@ -109,7 +109,9 @@ pub struct CachedFileMeta {
 /// Map from repo-relative path to cached file metadata.
 pub type FileMetaCache = HashMap<String, CachedFileMeta>;
 
-/// Sidecar format version. v3 = nanosecond mtimes (nw-200). v2 = per-repo
+/// Sidecar format version. v4 moves with the resolution-deps sidecar so an
+/// upgrade that must re-resolve unresolved imports also rebuilds filemeta.
+/// v3 = nanosecond mtimes (nw-200). v2 = per-repo
 /// keying (nw-022). v1 (implicit, unversioned flat map) fails deserialization
 /// and loads as empty — a deliberate fail-open that costs one full re-index and
 /// can never mis-classify a file.
@@ -123,7 +125,7 @@ pub type FileMetaCache = HashMap<String, CachedFileMeta>;
 /// Paired with `resolution_cache::CACHE_VERSION`: bumping one requires
 /// bumping the other (both sidecars must be invalidated together), enforced
 /// by `resolution_cache::tests::cache_version_moves_with_filemeta_version`.
-pub const FILEMETA_VERSION: u32 = 3;
+pub const FILEMETA_VERSION: u32 = 4;
 
 /// On-disk shape of `<db>.filemeta.json`: change-detection metadata keyed by
 /// repo uid, then repo-relative path. Two repos sharing one DB can never
@@ -8615,6 +8617,7 @@ fn prepare_missing_committed_sources(
             || !reader.accepts_path(&path)
             || reader.skips_path(&path)
             || !is_parseable(&path)
+            || committed_source_needs_no_restore(reader, &path)
         {
             continue;
         }
@@ -8622,16 +8625,15 @@ fn prepare_missing_committed_sources(
             Ok(outcome) => {
                 prepared.insert(rel.into_owned(), outcome);
             }
-            // A committed path inside a directory the walk cannot read is
-            // already disclosed as a directory ReadError. Failing the index
-            // here would block every later commit until that directory is
-            // readable, and the next commit retries this path because it is
-            // still absent from the graph.
-            Err(error) if io_error_is_permission_denied(&error) => {
+            // A missing worktree file (deleted without a commit) or a
+            // directory the walk cannot read must not abort the rest of the
+            // incremental index. The path stays absent, so a later commit
+            // retries it once the bytes can be read.
+            Err(error) if io_error_blocks_restore(&error) => {
                 tracing::debug!(
                     path = %path.display(),
                     %error,
-                    "leaving an unreadable committed source for a later index"
+                    "leaving a committed source that cannot be read for a later index"
                 );
             }
             Err(error) => {
@@ -8643,11 +8645,32 @@ fn prepare_missing_committed_sources(
     Ok(prepared)
 }
 
-fn io_error_is_permission_denied(error: &anyhow::Error) -> bool {
+/// Oversized and minified sources are policy skips. Stat them instead of
+/// reading and parsing a file the restore will discard.
+fn committed_source_needs_no_restore(
+    reader: &dyn crate::content_reader::ContentReader,
+    path: &Path,
+) -> bool {
+    if is_minified_or_bundled(&reader.root().join(path)) {
+        return true;
+    }
+    match reader.file_meta_nanos(path) {
+        Ok(Some((_, bytes))) => bytes > reader.max_source_file_bytes(),
+        // `None` means this reader has no filesystem metadata (a bare git
+        // repo), not that the path is missing.
+        Ok(None) => false,
+        Err(error) => io_error_blocks_restore(&error),
+    }
+}
+
+fn io_error_blocks_restore(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+            )
+        })
     })
 }
 
@@ -10681,6 +10704,50 @@ mod tests {
         git(&["add", "-A"]);
         git(&["commit", "-q", "-m", message]);
         git
+    }
+
+    /// A committed file missing from the graph and deleted in the worktree
+    /// is not in `git diff`. Restoring it used to stat a missing path and
+    /// fail the whole incremental index, so `indexed_sha` never moved.
+    #[test]
+    fn uncommitted_deletion_of_a_graph_hole_does_not_fail_incremental_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/kept.py"), "def kept():\n    return 1\n").unwrap();
+        fs::write(repo.join("src/gone.py"), "def gone():\n    return 2\n").unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let db = dir.path().join("graph.lbug");
+        let url = "https://example.test/uncommitted-delete";
+        let head = git(&["rev-parse", "HEAD"]);
+        index_directory_with_options_and_limits(
+            &repo,
+            &db,
+            "test",
+            url,
+            &head,
+            true,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+        {
+            let store = nestweaver_store::GraphStore::open(&db).unwrap();
+            let repo_uid = nestweaver_schema::repo_uid("test", url);
+            let files = store.list_files_by_repo(&repo_uid).unwrap();
+            let (uid, _) = files
+                .iter()
+                .find(|(_, path)| path == "src/gone.py")
+                .expect("gone.py was indexed");
+            store.delete_file_node(uid).unwrap();
+        }
+        fs::remove_file(repo.join("src/gone.py")).unwrap();
+        fs::write(repo.join("src/later.py"), "def later():\n    return 3\n").unwrap();
+        git(&["add", "src/later.py"]);
+        git(&["commit", "-q", "-m", "later"]);
+        let indexed = incremental_index(&repo, &db, "test", url)
+            .expect("a missing worktree file must not abort the incremental index");
+        assert_eq!(indexed.files_added, 1, "{indexed:?}");
     }
 
     /// nw-664 review: a binary file with a contract-language extension (an

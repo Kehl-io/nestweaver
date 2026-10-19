@@ -4,7 +4,12 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// Sidecar format version. v2 = per-repo keying (nw-045). v1 (a flat,
+/// Sidecar format version. v4 records unresolved import specifiers beside
+/// resolved deps. A v3 file has no such slice; loading it with an empty
+/// default would look like "nothing failed to resolve" and a later create of
+/// the target would not re-resolve the importer. v3 therefore fails the
+/// version check and loads empty, which forces the paired filemeta bypass
+/// and one full replacement. v2 = per-repo keying (nw-045). v1 (a flat,
 /// bare-rel-path `deps` map shared across all repos) fails deserialization
 /// and/or the version check and loads as empty — a deliberate fail-open.
 ///
@@ -21,7 +26,7 @@ use serde::{Deserialize, Serialize};
 /// Paired with `index::FILEMETA_VERSION`: bumping one requires bumping the
 /// other (both sidecars must be invalidated together), enforced by
 /// `tests::cache_version_moves_with_filemeta_version`.
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 
 /// Maximum number of transitive reverse-dependency hops expanded when deciding
 /// which files to re-resolve after a change. Shared by the local cache-based
