@@ -19,10 +19,10 @@
 
 /// The HEAD sha of a local working tree, or `None` if it cannot be read.
 pub fn local_head(repo_path: &str) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["-C", repo_path, "rev-parse", "HEAD"])
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new("git");
+    command.args(["-C", repo_path, "rev-parse", "HEAD"]);
+    let output =
+        crate::git_cmd::run_git_with_timeout(command, std::time::Duration::from_secs(15)).ok()?;
     output
         .status
         .success()
@@ -100,11 +100,12 @@ pub fn current_head(local_missing: bool, local_root: Option<&str>, url: &str) ->
 /// because the caller only asks when HEAD already differs from the indexed
 /// SHA: a zero there is a contradiction, not an answer (nw-256).
 pub fn commits_between(repo_path: &str, from_sha: &str, to_sha: &str) -> Option<u64> {
-    let output = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
         .args(["-C", repo_path, "rev-list", "--count"])
-        .arg(format!("{from_sha}..{to_sha}"))
-        .output()
-        .ok()?;
+        .arg(format!("{from_sha}..{to_sha}"));
+    let output =
+        crate::git_cmd::run_git_with_timeout(command, std::time::Duration::from_secs(15)).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -146,14 +147,19 @@ pub fn commits_behind(
 /// working tree `rev-list` cannot run, and `stale-check` keeps the stored
 /// counter there too.
 pub fn listing_commits_behind(repo: &nestweaver_schema::Repo) -> Option<u64> {
-    let root = repo.local_root();
-    let head = root.and_then(|path| {
-        let missing = !std::path::Path::new(path).exists();
-        current_head(missing, Some(path), &repo.url)
-    });
+    let Some(path) = repo.local_root() else {
+        return Some(u64::from(repo.staleness_commits_behind));
+    };
+    // A missing tree is the stored leftover, same as `commits_behind`. An
+    // existing tree whose HEAD cannot be read is uncountable: returning the
+    // stored 0 would say "current" while `stale-check` says unknown.
+    if !std::path::Path::new(path).exists() {
+        return Some(u64::from(repo.staleness_commits_behind));
+    }
+    let head = local_head(path)?;
     commits_behind(
-        head.as_deref(),
-        root,
+        Some(&head),
+        Some(path),
         &repo.indexed_sha,
         repo.staleness_commits_behind,
     )
@@ -327,6 +333,48 @@ mod tests {
             rows[1]["staleness_commits_behind"].as_u64(),
             stale_check_current,
             "a repo indexed at HEAD stays 0 in both commands"
+        );
+        assert_eq!(
+            rows[0]["staleness_commits_behind_uncountable"],
+            serde_json::json!(false)
+        );
+    }
+
+    /// A failed `rev-list` used to leave the stored 0 in place, so list-repos
+    /// read as current while stale-check read as unknown.
+    #[test]
+    fn list_repos_names_an_uncountable_distance_instead_of_a_stored_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir(&repo_dir).unwrap();
+        git(&repo_dir, &["init"]);
+        git(&repo_dir, &["config", "user.email", "t@t.com"]);
+        git(&repo_dir, &["config", "user.name", "T"]);
+        git(&repo_dir, &["commit", "--allow-empty", "-m", "indexed"]);
+        let path = repo_dir.to_str().unwrap();
+        let head = local_head(path).expect("HEAD");
+        let repo = nestweaver_schema::Repo {
+            uid: "repo:uncountable".to_string(),
+            url: format!("file://{path}"),
+            indexed_sha: "0".repeat(40),
+            staleness_commits_behind: 0,
+            instance_id: "test".to_string(),
+            name: None,
+            root_path: Some(path.to_string()),
+        };
+        assert_ne!(repo.indexed_sha, head);
+        assert_eq!(
+            listing_commits_behind(&repo),
+            None,
+            "an unreachable indexed sha cannot be counted"
+        );
+        let listed = crate::repos_json_with_display_name(&[repo]);
+        let row = &listed.as_array().expect("rows")[0];
+        assert_eq!(row["staleness_commits_behind"], 0);
+        assert_eq!(
+            row["staleness_commits_behind_uncountable"],
+            serde_json::json!(true),
+            "a stored 0 must be marked uncountable: {row}"
         );
     }
 }

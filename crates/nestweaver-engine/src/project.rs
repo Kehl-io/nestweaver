@@ -1354,6 +1354,13 @@ pub fn detect_implicit_projects_with_publication_and_lease(
         store.replace_implicit_project_note_memberships(&projects, &note_edges),
     )?;
     let publication = graph_publication.finish(replacement.changed())?;
+    // Still inside the mutation lease. A sidecar write after this function
+    // returns is invisible to the shutdown drain.
+    if publication.changed()
+        && let Some(db_path) = store.db_path()
+    {
+        crate::code_links::mark_code_links_pending(db_path, "implicit project membership changed");
+    }
     Ok(ImplicitProjectDetectionResult {
         projects: project_names,
         publication,

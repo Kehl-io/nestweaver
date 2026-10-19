@@ -668,6 +668,21 @@ pub fn run_recorded_derived_diff(
     attach_recording(store, result, db_path)
 }
 
+/// [`run_recorded_derived_diff`] limited to the repository the diff was read from.
+pub fn run_recorded_derived_diff_in_repo(
+    store: &nestweaver_store::GraphStore,
+    repo_uid: &str,
+    changed_files: &[String],
+    db_path: Option<&Path>,
+) -> Result<AffectedTestsResult> {
+    let result = crate::affected_tests::affected_tests_for_derived_diff_in_repo(
+        store,
+        repo_uid,
+        changed_files,
+    )?;
+    attach_recording(store, result, db_path)
+}
+
 fn attach_recording(
     store: &nestweaver_store::GraphStore,
     mut result: AffectedTestsResult,

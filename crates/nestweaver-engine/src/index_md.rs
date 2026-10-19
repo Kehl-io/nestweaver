@@ -482,8 +482,9 @@ pub struct SkippedNotesSidecar {
     /// a row stay vault-relative, except mirrored reconciliation debt, which
     /// is already absolute. One vault's full refresh replaces only its key;
     /// [`skipped_notes_status_json`] merges every vault. A v1 sidecar stored
-    /// one flat list for the whole database — those rows name no vault, so
-    /// load drops them instead of letting the next vault's refresh own them.
+    /// one flat list for the whole database. Those rows name no vault, so
+    /// load keeps them under [`LEGACY_UNATTRIBUTED_VAULT_KEY`] until a full
+    /// vault index rewrites the file.
     #[serde(default, deserialize_with = "deserialize_vault_keyed_rows")]
     pub skipped: BTreeMap<String, Vec<SkippedFile>>,
     /// Per vault root, notes still indexed but larger than half the configured
@@ -494,8 +495,8 @@ pub struct SkippedNotesSidecar {
     /// [`SKIPPED_NOTES_LIST_CAP`] on the write that replaced them. An
     /// incremental merge only reloads the capped survivors, so it keeps the
     /// stored bit. [`skipped_notes_status_json`] ORs every vault. A
-    /// database-wide bool names no vault; load drops it, the same way a v1
-    /// flat skipped list is dropped.
+    /// database-wide `true` is kept on [`LEGACY_UNATTRIBUTED_VAULT_KEY`] so
+    /// status still reports truncation. `false` names no truncated vault.
     #[serde(default, deserialize_with = "deserialize_truncation_bits")]
     pub skipped_truncated: BTreeMap<String, bool>,
     /// Per vault root, the near-size twin of [`Self::skipped_truncated`].
@@ -564,8 +565,12 @@ impl SkippedNotesSidecar {
     }
 }
 
-/// Accept a per-vault object or a v1 flat list. The flat list is not
-/// attributable to a vault; dropping it keeps the rest of the sidecar.
+/// Rows from a v1 sidecar that named no vault. Not a filesystem path, so it
+/// cannot collide with a vault root. A full index of any vault drops it.
+const LEGACY_UNATTRIBUTED_VAULT_KEY: &str = "\u{0}legacy-unattributed";
+
+/// Accept a per-vault object or a v1 flat list. The flat list is kept under
+/// [`LEGACY_UNATTRIBUTED_VAULT_KEY`] so status still discloses it.
 fn deserialize_vault_keyed_rows<'de, D, T>(
     deserializer: D,
 ) -> Result<BTreeMap<String, Vec<T>>, D::Error>
@@ -583,15 +588,17 @@ where
     match <VaultKeyedOrFlat<T> as serde::Deserialize>::deserialize(deserializer)? {
         VaultKeyedOrFlat::Keyed(rows) => Ok(rows),
         VaultKeyedOrFlat::Flat(rows) => {
-            let _ = rows;
-            Ok(BTreeMap::new())
+            let mut keyed = BTreeMap::new();
+            if !rows.is_empty() {
+                keyed.insert(LEGACY_UNATTRIBUTED_VAULT_KEY.to_string(), rows);
+            }
+            Ok(keyed)
         }
     }
 }
 
-/// A per-vault map, or the previous database-wide bool. The bool cannot be
-/// attributed to a vault, so it is dropped instead of sticking to whichever
-/// vault writes next.
+/// A per-vault map, or the previous database-wide bool. `true` stays visible
+/// as truncation until a full index replaces the sidecar.
 fn deserialize_truncation_bits<'de, D>(deserializer: D) -> Result<BTreeMap<String, bool>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -606,8 +613,11 @@ where
     match <StoredBits as serde::Deserialize>::deserialize(deserializer)? {
         StoredBits::PerVault(bits) => Ok(bits),
         StoredBits::DatabaseWide(database_wide) => {
-            let _ = database_wide;
-            Ok(BTreeMap::new())
+            let mut bits = BTreeMap::new();
+            if database_wide {
+                bits.insert(LEGACY_UNATTRIBUTED_VAULT_KEY.to_string(), true);
+            }
+            Ok(bits)
         }
     }
 }
@@ -895,6 +905,16 @@ fn persist_skipped_notes_replace(
     // to clear.
     let key = vault_sidecar_key(vault_root);
     update_skipped_notes_sidecar(db_path, |mut existing| {
+        existing.skipped.remove(LEGACY_UNATTRIBUTED_VAULT_KEY);
+        existing
+            .notes_near_size_limit
+            .remove(LEGACY_UNATTRIBUTED_VAULT_KEY);
+        existing
+            .skipped_truncated
+            .remove(LEGACY_UNATTRIBUTED_VAULT_KEY);
+        existing
+            .near_limit_truncated
+            .remove(LEGACY_UNATTRIBUTED_VAULT_KEY);
         existing
             .unindexable_mtimes
             .retain(|path, _| !Path::new(path).starts_with(vault_root));
@@ -6088,6 +6108,37 @@ fn skip_frontmatter(source: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_flat_skipped_notes_stay_visible_until_a_full_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let path = crate::sidecar_path(&db, super::SKIPPED_NOTES_SIDECAR_SUFFIX);
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "skipped": [{"path": "lost.md", "reason": "unreadable"}],
+                "notes_near_size_limit": [{"path": "big.md", "bytes": 9}],
+                "skipped_truncated": true,
+                "near_limit_truncated": false
+            }"#,
+        )
+        .unwrap();
+        let (skipped, near) = super::skipped_notes_status_json(Some(&db));
+        assert_eq!(skipped["count"], 1);
+        assert_eq!(skipped["paths"][0], "lost.md");
+        assert_eq!(skipped["truncated"], true);
+        assert_eq!(near["count"], 1);
+        assert_eq!(near["truncated"], false);
+
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        super::persist_skipped_notes_replace(Some(&db), &vault, &[], &[], &[]);
+        let (skipped, _) = super::skipped_notes_status_json(Some(&db));
+        assert_eq!(skipped["count"], 0);
+        assert_eq!(skipped["truncated"], false);
+    }
+
     /// nw-196: one predicate, on either side of the daemon wire. Only a
     /// `.brainignore` match is "requested"; an unreadable or oversized note
     /// is not, even when its code is `ignored` with another reason.

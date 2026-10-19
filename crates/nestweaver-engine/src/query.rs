@@ -1086,43 +1086,58 @@ const INVESTIGATE_HINT_MAX_CHARS: usize = 200;
 /// every seed and by both copies, keeps that header list under hyper's 16KiB
 /// default: one 10_000-character seed of 4-byte characters, and several
 /// over-long ASCII seeds together. Seeds whose combined text fits are echoed
-/// unchanged. A seed that does not fit keeps a prefix and a length marker
-/// (`… (N chars)`); later seeds keep only the marker, so the list is not
-/// dropped.
+/// unchanged. Seeds that do not fit collapse into one `… (N more)` summary
+/// that stays inside the same budget.
 pub const UNRESOLVED_SEED_ECHO_BUDGET_BYTES: usize = 1024;
 
 /// Bound unresolved seeds before they are echoed into an error or a
 /// not-found envelope.
 ///
-/// The whole list shares [`UNRESOLVED_SEED_ECHO_BUDGET_BYTES`]. A seed that
-/// fits in what remains is copied whole; the first that does not keeps a
-/// prefix plus `… (N chars)`; each seed after that keeps only the marker.
+/// The whole list shares [`UNRESOLVED_SEED_ECHO_BUDGET_BYTES`]. Seeds that
+/// fit are copied whole. The first that does not fit, and every seed after
+/// it, become one `… (N more)` summary. That summary is omitted when it
+/// would itself exceed the budget.
 pub fn bound_unresolved_seed_echoes(seeds: &[String]) -> Vec<String> {
     let mut remaining = UNRESOLVED_SEED_ECHO_BUDGET_BYTES;
-    let mut echoed = Vec::with_capacity(seeds.len());
-    for seed in seeds {
+    let mut echoed = Vec::new();
+    for (index, seed) in seeds.iter().enumerate() {
         if seed.len() <= remaining {
             echoed.push(seed.clone());
             remaining -= seed.len();
             continue;
         }
-        let count = seed.chars().count();
-        let marker = format!("… ({count} chars)");
-        let room = remaining.saturating_sub(marker.len());
-        let mut prefix = String::new();
-        let mut prefix_bytes = 0usize;
-        for ch in seed.chars() {
-            let ch_bytes = ch.len_utf8();
-            if prefix_bytes + ch_bytes > room {
-                break;
-            }
-            prefix.push(ch);
-            prefix_bytes += ch_bytes;
+        let summary = format!("… ({} more)", seeds.len() - index);
+        if summary.len() <= remaining {
+            echoed.push(summary);
         }
-        echoed.push(format!("{prefix}{marker}"));
-        remaining = 0;
+        break;
     }
     echoed
+}
+
+#[cfg(test)]
+mod unresolved_seed_echo_tests {
+    use super::*;
+
+    #[test]
+    fn many_short_unresolved_seeds_stay_inside_the_byte_budget() {
+        let seeds = vec!["unknown-seed-name".repeat(8); 500];
+        let echoed = bound_unresolved_seed_echoes(&seeds);
+        let bytes: usize = echoed.iter().map(String::len).sum();
+        assert!(
+            bytes <= UNRESOLVED_SEED_ECHO_BUDGET_BYTES,
+            "{bytes} bytes, {} entries",
+            echoed.len()
+        );
+        assert!(
+            echoed.len() < seeds.len(),
+            "the tail must collapse instead of one marker per seed"
+        );
+        assert!(
+            echoed.last().is_some_and(|last| last.contains("more")),
+            "{echoed:?}"
+        );
+    }
 }
 
 /// Build a copy-pasteable `nestweaver investigate` argument from the raw

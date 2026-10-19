@@ -2262,6 +2262,46 @@ impl GraphStore {
         Ok(sections)
     }
 
+    /// Heading rows for `uids`, skipping corrupt rows the same way a full scan does.
+    pub fn lookup_headings_by_uids_with_integrity(
+        &self,
+        uids: &[String],
+    ) -> Result<(Vec<Heading>, ScanIntegrity), StoreError> {
+        const CHUNK: usize = 256;
+        let conn = self.conn()?;
+        let mut headings = Vec::with_capacity(uids.len());
+        let mut integrity = ScanIntegrity::default();
+        for chunk in uids.chunks(CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let in_list: String = chunk
+                .iter()
+                .map(|uid| format!("'{}'", uid.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "UNWIND [{}] AS want_uid \
+                 MATCH (h:Heading {{uid: want_uid}}) RETURN {}",
+                in_list, HEADING_COLUMNS
+            );
+            let rows = conn
+                .query(&query)
+                .map_err(|error| StoreError::Query(format!("heading UID batch: {error}")))?;
+            let (found, chunk_integrity) = collect_tolerating_corrupt(
+                rows.map(|row| row_to_heading(&row)),
+                "lookup_headings",
+            )?;
+            integrity.returned += chunk_integrity.returned;
+            integrity.skipped_corrupt += chunk_integrity.skipped_corrupt;
+            if integrity.first_reason.is_none() {
+                integrity.first_reason = chunk_integrity.first_reason;
+            }
+            headings.extend(found);
+        }
+        Ok((headings, integrity))
+    }
+
     /// List all Heading nodes across all vaults/notes.
     /// Used by the brain_search substring fallback to extend title-only search
     /// to heading text.

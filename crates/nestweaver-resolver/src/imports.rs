@@ -653,6 +653,21 @@ pub(crate) fn build_import_graph_with_languages(
     }
 }
 
+/// Path a single import specifier resolves to, when it names a known file.
+///
+/// Same decision [`build_import_graph`] records for `Import` / `Includes` /
+/// `Uses`. Callers that only need that answer for a few files should use this
+/// instead of building export maps for every path in the repo.
+pub fn resolved_import_path(
+    from_file: &str,
+    specifier: &str,
+    known_files: &HashSet<&str>,
+    language: Language,
+    workspace_ctx: &WorkspaceContext,
+) -> Option<String> {
+    resolve_specifier(from_file, specifier, known_files, language, workspace_ctx)
+}
+
 fn resolve_specifier(
     from_file: &str,
     specifier: &str,

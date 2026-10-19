@@ -11393,14 +11393,6 @@ impl NestWeaverDaemon for DaemonService {
                         Status::internal(format!("detect_implicit_projects failed: {error:#}"))
                     }
                 })?;
-            // nw-670 re-review R3: new implicit-project membership rescopes
-            // the notes it covers.
-            if !dry_run && detected.publication.changed() {
-                nestweaver_engine::code_links::mark_code_links_pending(
-                    &state.db_path,
-                    "implicit project membership changed",
-                );
-            }
             let disposition = match detected.publication.disposition {
                 nestweaver_engine::manifest::GraphMutationPublicationDisposition::ConfirmedNoChange => {
                     "confirmed_no_change"

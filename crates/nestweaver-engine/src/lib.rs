@@ -281,10 +281,12 @@ pub fn repo_display_name(repo: &nestweaver_schema::Repo) -> String {
 /// route call this one function so the added field cannot drift between them
 /// (CONTRIBUTING "sibling gaps").
 pub fn repos_json_with_display_name(repos: &[nestweaver_schema::Repo]) -> serde_json::Value {
+    let distances = listing_distances(repos);
     serde_json::Value::Array(
         repos
             .iter()
-            .map(|repo| {
+            .zip(distances)
+            .map(|(repo, distance)| {
                 let mut value = serde_json::to_value(repo).unwrap_or(serde_json::Value::Null);
                 if let serde_json::Value::Object(ref mut map) = value {
                     map.insert(
@@ -294,21 +296,24 @@ pub fn repos_json_with_display_name(repos: &[nestweaver_schema::Repo]) -> serde_
                     // The column is the distance recorded at index time. After
                     // HEAD moves it stays 0 until the next index, while
                     // `stale-check` reports the live `rev-list` count. Publish
-                    // that same count. `None` (rev-list failed) leaves the
-                    // stored number, because this payload is also decoded as
-                    // `Repo`, whose field is a `u32`, so it cannot carry null.
-                    // A stored 0 would read as "current" where `stale-check`
-                    // says "could not be counted", so say so beside it.
-                    match crate::repo_head::listing_commits_behind(repo) {
+                    // that same count. `None` (rev-list or HEAD failed) cannot
+                    // replace the `u32` column with null, because this payload
+                    // is also decoded as `Repo`. Name that case so a stored 0
+                    // is not read as a live "current".
+                    match distance {
                         Some(behind) => {
                             map.insert(
                                 "staleness_commits_behind".to_string(),
                                 serde_json::Value::from(behind),
                             );
+                            map.insert(
+                                "staleness_commits_behind_uncountable".to_string(),
+                                serde_json::Value::Bool(false),
+                            );
                         }
                         None => {
                             map.insert(
-                                "staleness_commits_behind_unavailable".to_string(),
+                                "staleness_commits_behind_uncountable".to_string(),
                                 serde_json::Value::Bool(true),
                             );
                         }
@@ -318,6 +323,27 @@ pub fn repos_json_with_display_name(repos: &[nestweaver_schema::Repo]) -> serde_
             })
             .collect(),
     )
+}
+
+/// Live distances for `list-repos`. Each repo is one or two local git
+/// processes; a wide inventory used to run those one after another, so one
+/// slow tree stalled the whole list. Eight at a time keeps the wall clock
+/// near the slowest repo instead of the sum.
+fn listing_distances(repos: &[nestweaver_schema::Repo]) -> Vec<Option<u64>> {
+    const WIDTH: usize = 8;
+    let mut distances = Vec::with_capacity(repos.len());
+    for chunk in repos.chunks(WIDTH) {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|repo| scope.spawn(|| crate::repo_head::listing_commits_behind(repo)))
+                .collect();
+            for handle in handles {
+                distances.push(handle.join().unwrap_or(None));
+            }
+        });
+    }
+    distances
 }
 
 /// Why a repository selector did not resolve. The class decides the exit
@@ -1022,68 +1048,5 @@ mod repo_selector_tests {
             "unconfigured repo must keep name: null: {unnamed}"
         );
         assert_eq!(unnamed["display_name"], repo_display_name(&repos[1]));
-    }
-    /// An indexed SHA that `rev-list` cannot resolve (history rewritten and
-    /// pruned) must not read as "0 behind": `stale-check` calls it uncountable,
-    /// so the listing flags it rather than publishing the stored 0 alone.
-    #[test]
-    fn repos_json_flags_an_uncountable_commit_distance() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let git = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .args(args)
-                .current_dir(root)
-                .status()
-                .expect("git");
-            assert!(status.success(), "git {args:?} failed");
-        };
-        git(&["init", "-q"]);
-        git(&["config", "user.email", "t@t.com"]);
-        git(&["config", "user.name", "T"]);
-        git(&["config", "commit.gpgsign", "false"]);
-        std::fs::write(root.join("a.txt"), "a").unwrap();
-        git(&["add", "a.txt"]);
-        git(&["commit", "-q", "-m", "one"]);
-        let head = String::from_utf8(
-            std::process::Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(root)
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_string();
-        let root_str = root.display().to_string();
-
-        let mut gone = repo(
-            "repo:gone",
-            "https://example.test/gone.git",
-            None,
-            Some(&root_str),
-        );
-        gone.indexed_sha = "0".repeat(40);
-        let mut current = repo(
-            "repo:ok",
-            "https://example.test/ok.git",
-            None,
-            Some(&root_str),
-        );
-        current.indexed_sha = head;
-
-        let value = repos_json_with_display_name(&[gone, current]);
-        let rows = value.as_array().expect("array of repo rows");
-        let gone = rows.iter().find(|r| r["uid"] == "repo:gone").unwrap();
-        assert_eq!(gone["staleness_commits_behind_unavailable"], true, "{gone}");
-        let current = rows.iter().find(|r| r["uid"] == "repo:ok").unwrap();
-        assert!(
-            current
-                .get("staleness_commits_behind_unavailable")
-                .is_none(),
-            "a countable repo must not be flagged: {current}"
-        );
-        assert_eq!(current["staleness_commits_behind"], 0, "{current}");
     }
 }

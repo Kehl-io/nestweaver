@@ -6837,25 +6837,9 @@ pub fn wrap_tool_result(value: Value) -> Value {
 /// Stale-graph `SKIPPED` rows and an empty vault stay successes: `applied`
 /// is false there too, and they are not failures.
 fn consolidate_apply_failed(value: &Value) -> bool {
-    if value.get("dry_run").and_then(Value::as_bool) != Some(false)
-        || value.get("applied").and_then(Value::as_bool) != Some(false)
-    {
-        return false;
-    }
-    value
-        .get("warnings")
-        .and_then(Value::as_array)
-        .is_some_and(|warnings| {
-            warnings.iter().any(|warning| {
-                warning.as_str().is_some_and(|text| {
-                    let lower = text.to_ascii_lowercase();
-                    lower.contains("apply failed")
-                        || lower.contains("failed:")
-                        || lower.contains("rejected:")
-                        || lower.contains("vault path must be non-empty and relative")
-                })
-            })
-        })
+    value.get("dry_run").and_then(Value::as_bool) == Some(false)
+        && value.get("applied").and_then(Value::as_bool) == Some(false)
+        && value.get("apply_errors").and_then(Value::as_bool) == Some(true)
 }
 
 #[cfg(test)]
@@ -14453,7 +14437,12 @@ fn tool_affected_tests(
     // dropped while the gate reports success. Only a stale repository
     // that owns or is linked to a changed file refuses; an unrelated one is
     // disclosed in the selection's notifications instead.
-    if let Some(refusal) = resolver_generation_refusal(store, visible, Some(&changed_files))? {
+    if let Some(refusal) = resolver_generation_refusal_in(
+        store,
+        visible,
+        Some(&changed_files),
+        selected_repo.as_ref().map(|repo| repo.uid.as_str()),
+    )? {
         return Ok(affected_tests_refusal_payload(&refusal));
     }
 
@@ -14473,8 +14462,13 @@ fn tool_affected_tests(
             )
             .context("affected_tests")?
         } else {
-            nestweaver_engine::affected_tests::affected_tests_scoped_for_derived_diff(
+            let repo_uid = selected_repo
+                .as_ref()
+                .map(|repo| repo.uid.as_str())
+                .context("a derived diff names the repository it was read from")?;
+            nestweaver_engine::affected_tests::affected_tests_scoped_for_derived_diff_in_repo(
                 store,
+                repo_uid,
                 &changed_files,
                 &allowed,
             )
@@ -14486,8 +14480,13 @@ fn tool_affected_tests(
             nestweaver_engine::rts_eval::run_recorded(store, &changed_files, db_path.as_deref())
                 .context("affected_tests")?
         } else {
-            nestweaver_engine::rts_eval::run_recorded_derived_diff(
+            let repo_uid = selected_repo
+                .as_ref()
+                .map(|repo| repo.uid.as_str())
+                .context("a derived diff names the repository it was read from")?;
+            nestweaver_engine::rts_eval::run_recorded_derived_diff_in_repo(
                 store,
+                repo_uid,
                 &changed_files,
                 db_path.as_deref(),
             )
@@ -14799,7 +14798,8 @@ fn self_contained_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::Path
     }
 }
 
-/// Per-worktree git dir when its `gitdir` file points back at `dot_git`.
+/// Per-worktree or submodule git dir that a gitfile names, when it provably
+/// belongs to this work tree.
 fn linked_worktree_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::PathBuf> {
     let target = gitfile_target(path, dot_git)?;
     let canonical = std::fs::canonicalize(&target).ok()?;
@@ -14817,7 +14817,28 @@ fn linked_worktree_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::Pat
     if !commondir_is_own_registration(&canonical) {
         return None;
     }
-    if gitdir_file_points_at(&canonical, dot_git) || core_worktree_points_at(&canonical, path) {
+    match gitdir_back_pointer(&canonical, dot_git) {
+        GitdirBackPointer::Matches => return Some(canonical),
+        // A pointer that names another worktree is not this checkout, even
+        // when `--absolute-git-dir` follows the copied gitfile.
+        GitdirBackPointer::Mismatch => return None,
+        GitdirBackPointer::Absent => {}
+    }
+    // A submodule records its work tree as `core.worktree`: proof it is ours.
+    if core_worktree_points_at(&canonical, path) {
+        return Some(canonical);
+    }
+    // `git init --separate-git-dir` leaves no back-pointer at all, so nothing
+    // proves the target is ours. Accept it when it is this work tree's own git
+    // dir, but never a normal repository's embedded `.git`: that directory
+    // belongs to the work tree beside it, and a gitfile naming one is how a
+    // tree would borrow another repository's refs and objects. A bare
+    // repository named by a gitfile cannot be told from a separate git dir.
+    if canonical.file_name().is_some_and(|name| name == ".git") {
+        return None;
+    }
+    let absolute = rev_parse_git_path(path, "--absolute-git-dir")?;
+    if absolute == canonical {
         Some(canonical)
     } else {
         None
@@ -14856,16 +14877,26 @@ fn commondir_is_own_registration(git_dir: &Path) -> bool {
         && worktrees.parent().is_some_and(|parent| parent == common)
 }
 
+enum GitdirBackPointer {
+    Absent,
+    Matches,
+    Mismatch,
+}
+
 /// A linked worktree's `<git dir>/gitdir` names the `.git` gitfile it serves.
-fn gitdir_file_points_at(git_dir: &Path, dot_git: &Path) -> bool {
-    let Ok(back_text) = std::fs::read_to_string(git_dir.join("gitdir")) else {
-        return false;
+fn gitdir_back_pointer(git_dir: &Path, dot_git: &Path) -> GitdirBackPointer {
+    let back_text = match std::fs::read_to_string(git_dir.join("gitdir")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return GitdirBackPointer::Absent;
+        }
+        Err(_) => return GitdirBackPointer::Mismatch,
     };
     let Some(back_line) = back_text.lines().next().map(str::trim) else {
-        return false;
+        return GitdirBackPointer::Mismatch;
     };
     if back_line.is_empty() {
-        return false;
+        return GitdirBackPointer::Mismatch;
     }
     let back_raw = Path::new(back_line);
     let back = if back_raw.is_absolute() {
@@ -14873,7 +14904,11 @@ fn gitdir_file_points_at(git_dir: &Path, dot_git: &Path) -> bool {
     } else {
         git_dir.join(back_raw)
     };
-    same_directory(&back, dot_git)
+    if same_directory(&back, dot_git) {
+        GitdirBackPointer::Matches
+    } else {
+        GitdirBackPointer::Mismatch
+    }
 }
 
 /// A submodule records its work tree as `core.worktree` in
@@ -15205,6 +15240,93 @@ mod affected_tests_base_ref_tests {
             !nested_diff.contains("git diff for base_ref"),
             "the nested failure must not stay wrapped as 'git diff for base_ref': {nested_diff}"
         );
+    }
+
+    /// `git init --separate-git-dir` writes a gitfile with no worktree
+    /// `gitdir` back-pointer. That layout is still this repository.
+    #[test]
+    fn affected_tests_base_ref_accepts_separate_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join("separate.git");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git(
+            dir.path(),
+            &[
+                "init",
+                "-q",
+                "--separate-git-dir",
+                git_dir.to_str().unwrap(),
+                "work",
+            ],
+        );
+        git(&work, &["config", "user.email", "test@example.com"]);
+        git(&work, &["config", "user.name", "Test"]);
+        git(&work, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(work.join("kept.rs"), "fn kept() {}\n").unwrap();
+        git(&work, &["add", "kept.rs"]);
+        git(&work, &["commit", "-q", "-m", "init"]);
+        assert!(
+            work.join(".git").is_file(),
+            "separate-git-dir leaves a gitfile"
+        );
+        assert!(
+            !git_dir.join("gitdir").exists(),
+            "a separate git dir has no worktree back-pointer"
+        );
+
+        let uid = "repo:test:separate";
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&indexed_repo(uid, "separate-repo", &work))
+            .unwrap();
+        let result = tool_affected_tests(
+            &store,
+            json!({ "base_ref": "HEAD", "repo": "separate-repo" }),
+            None,
+        )
+        .expect("separate-git-dir is a git repository");
+        assert_eq!(result["repo"], json!("separate-repo"), "{result}");
+        assert_eq!(result["repo_uid"], json!(uid), "{result}");
+    }
+
+    /// Copying another linked worktree's gitfile must not be accepted. The
+    /// target's `gitdir` pointer names the original worktree.
+    #[test]
+    fn affected_tests_base_ref_rejects_a_copied_worktree_gitfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "test@example.com"]);
+        git(&main, &["config", "user.name", "Test"]);
+        git(&main, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(main.join("only-real.txt"), "before\n").unwrap();
+        git(&main, &["add", "only-real.txt"]);
+        git(&main, &["commit", "-q", "-m", "init"]);
+        let wt = dir.path().join("wt");
+        git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let fake = dir.path().join("fake");
+        std::fs::create_dir_all(&fake).unwrap();
+        std::fs::copy(wt.join(".git"), fake.join(".git")).unwrap();
+
+        let uid = "repo:test:copied";
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&indexed_repo(uid, "copied-repo", &fake))
+            .unwrap();
+        let error = tool_affected_tests(
+            &store,
+            json!({ "base_ref": "HEAD", "repo": "copied-repo" }),
+            None,
+        )
+        .expect_err("a copied worktree gitfile must not diff");
+        let error = error.to_string();
+        assert!(
+            error.contains("copied-repo") && error.contains("not a git repository"),
+            "{error}"
+        );
+        assert!(!error.contains("only-real.txt"), "{error}");
     }
 
     /// An empty `.git` directory is not a repository. With `GIT_DIR` pointed
@@ -21506,6 +21628,15 @@ fn resolver_generation_refusal(
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
     changed_files: Option<&[String]>,
 ) -> Result<Option<nestweaver_engine::resolver_generation::DeadCodeRefusal>, anyhow::Error> {
+    resolver_generation_refusal_in(store, visible, changed_files, None)
+}
+
+fn resolver_generation_refusal_in(
+    store: &GraphStore,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+    changed_files: Option<&[String]>,
+    repo_uid: Option<&str>,
+) -> Result<Option<nestweaver_engine::resolver_generation::DeadCodeRefusal>, anyhow::Error> {
     let db_path = match (store.db_path(), current_db_path(store)) {
         (Some(path), _) => path.to_path_buf(),
         (None, Ok(path)) => path,
@@ -21522,12 +21653,21 @@ fn resolver_generation_refusal(
         .filter(|repo| repo_is_visible(&repo.uid, visible))
         .collect();
     if let Some(changed_files) = changed_files {
-        nestweaver_engine::resolver_generation::incompatibility_for_changed_files_at(
-            store,
-            Some(&db_path),
-            changed_files,
-        )?
-        .retain_degrading(&mut repos);
+        let incompatibility = match repo_uid {
+            Some(repo) => {
+                nestweaver_engine::resolver_generation::incompatibility_for_changed_files_in_repo(
+                    store,
+                    repo,
+                    changed_files,
+                )?
+            }
+            None => nestweaver_engine::resolver_generation::incompatibility_for_changed_files_at(
+                store,
+                Some(&db_path),
+                changed_files,
+            )?,
+        };
+        incompatibility.retain_degrading(&mut repos);
     }
     Ok(nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(&db_path, &repos))
 }
