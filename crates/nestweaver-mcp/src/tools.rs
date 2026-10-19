@@ -14742,6 +14742,10 @@ fn git_command_for_indexed_path(path: &Path) -> std::process::Command {
     command.env_remove("GIT_WORK_TREE");
     // The caller classifies failures by git's message text, so pin the locale.
     command.env("LC_ALL", "C");
+    // The indexed tree can author the git config the diff reads, and
+    // `core.fsmonitor` names a program git would run. `-c` outranks any
+    // repository config.
+    command.args(["-c", "core.fsmonitor=false"]);
     command.env_remove("LANGUAGE");
     command.arg("-C").arg(path);
     command
@@ -15449,6 +15453,33 @@ mod affected_tests_base_ref_tests {
         .unwrap();
         std::fs::copy(real_git.join("HEAD"), evil.join("HEAD")).unwrap();
         assert_other_repository_files_are_not_returned(alternates.path(), "forged-alternates");
+    }
+
+    /// The repository's own config can name a `core.fsmonitor` program; the
+    /// diff must not run it.
+    #[test]
+    fn affected_tests_base_ref_does_not_run_a_configured_fsmonitor() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(repo.path(), "tracked.txt");
+        std::fs::write(repo.path().join("tracked.txt"), "after\n").unwrap();
+        let marker = repo.path().join("fsmonitor-ran");
+        let hook = repo.path().join("..").join(format!(
+            "fsmonitor-{}.sh",
+            repo.path().file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(
+            repo.path(),
+            &["config", "core.fsmonitor", &hook.display().to_string()],
+        );
+        assert_diffs_tracked_file(repo.path(), "fsmonitor-repo");
+        let _ = std::fs::remove_file(&hook);
+        assert!(
+            !marker.exists(),
+            "the configured fsmonitor program must not run during the diff"
+        );
     }
 
     /// A linked worktree's `.git` is a gitfile. Its private git dir's `gitdir`

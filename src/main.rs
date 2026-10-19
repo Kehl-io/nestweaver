@@ -2863,12 +2863,20 @@ impl ResolverStaleness {
     /// mismatch on an otherwise current graph was reported as every repository
     /// being resolver-incompatible.
     fn from_store(store: &nestweaver_store::GraphStore) -> Self {
-        let stale_repos =
-            nestweaver_engine::resolver_generation::incompatible_repos_for_store(store)
-                .unwrap_or_default();
-        Self {
-            rankings_stale: !stale_repos.is_empty(),
-            stale_repos,
+        match nestweaver_engine::resolver_generation::incompatible_repos_for_store(store) {
+            Ok(stale_repos) => Self {
+                rankings_stale: !stale_repos.is_empty(),
+                stale_repos,
+            },
+            // Unreadable generation metadata fails closed, like a missing
+            // record: "cannot tell" is not "current". No repo can be named.
+            Err(error) => {
+                tracing::warn!(%error, "could not read resolver generations; rankings reported stale");
+                Self {
+                    rankings_stale: true,
+                    stale_repos: Vec::new(),
+                }
+            }
         }
     }
 
