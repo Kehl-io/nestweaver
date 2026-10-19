@@ -8618,13 +8618,37 @@ fn prepare_missing_committed_sources(
         {
             continue;
         }
-        prepared.insert(
-            rel.into_owned(),
-            prepare_incremental_file(reader, &path)
-                .with_context(|| format!("prepare committed source {}", path.display()))?,
-        );
+        match prepare_incremental_file(reader, &path) {
+            Ok(outcome) => {
+                prepared.insert(rel.into_owned(), outcome);
+            }
+            // A committed path inside a directory the walk cannot read is
+            // already disclosed as a directory ReadError. Failing the index
+            // here would block every later commit until that directory is
+            // readable, and the next commit retries this path because it is
+            // still absent from the graph.
+            Err(error) if io_error_is_permission_denied(&error) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    %error,
+                    "leaving an unreadable committed source for a later index"
+                );
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("prepare committed source {}", path.display()));
+            }
+        }
     }
     Ok(prepared)
+}
+
+fn io_error_is_permission_denied(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
 }
 
 fn extend_changed_with_missing_sources(
