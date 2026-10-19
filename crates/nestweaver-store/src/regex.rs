@@ -1400,8 +1400,14 @@ impl GraphStore {
     /// Heading text keyed by uid. A short heading scan is joined onto sections
     /// because `Section.text_content` does not include the heading line.
     /// `degraded` is true when a corrupt heading row was skipped (nw-335).
-    fn heading_index(&self) -> Result<(HashMap<String, Heading>, bool), StoreError> {
-        let (rows, integrity) = self.list_all_headings_with_integrity()?;
+    fn heading_index(
+        &self,
+        uids: &[String],
+    ) -> Result<(HashMap<String, Heading>, bool), StoreError> {
+        if uids.is_empty() {
+            return Ok((HashMap::new(), false));
+        }
+        let (rows, integrity) = self.lookup_headings_by_uids_with_integrity(uids)?;
         Ok((
             rows.into_iter()
                 .map(|heading| (heading.uid.clone(), heading))
@@ -1467,7 +1473,18 @@ impl GraphStore {
                 .collect();
             let (sections, integrity) = self.list_all_sections_with_integrity()?;
             degraded |= integrity.is_degraded();
-            let (headings, headings_degraded) = self.heading_index()?;
+            let heading_uids: Vec<String> = sections
+                .iter()
+                .filter(|section| {
+                    path_prefix.is_none_or(|prefix| {
+                        note_path
+                            .get(&section.note_uid)
+                            .is_some_and(|(path, _)| path.starts_with(prefix))
+                    })
+                })
+                .filter_map(|section| section.heading_uid.clone())
+                .collect();
+            let (headings, headings_degraded) = self.heading_index(&heading_uids)?;
             degraded |= headings_degraded;
             for s in sections {
                 if interrupted()? {
@@ -1637,13 +1654,6 @@ impl GraphStore {
         // See `collect_candidates`: a scan that came back short must not leave
         // the result claiming it was complete.
         let mut degraded = false;
-        let headings = if want_kind("Section") {
-            let (headings, headings_degraded) = self.heading_index()?;
-            degraded |= headings_degraded;
-            headings
-        } else {
-            HashMap::new()
-        };
         for scope_uid in ordered {
             if interrupted()? {
                 return Ok((candidates, Some(RegexTruncationReason::Deadline)));
@@ -1760,6 +1770,13 @@ impl GraphStore {
                 // this scope's notes in memory.
                 let (sections, integrity) = self.list_all_sections_with_integrity()?;
                 degraded |= integrity.is_degraded();
+                let heading_uids: Vec<String> = sections
+                    .iter()
+                    .filter(|section| note_paths.contains_key(&section.note_uid))
+                    .filter_map(|section| section.heading_uid.clone())
+                    .collect();
+                let (headings, headings_degraded) = self.heading_index(&heading_uids)?;
+                degraded |= headings_degraded;
                 for section in sections {
                     if interrupted()? {
                         return Ok((candidates, Some(RegexTruncationReason::Deadline)));
@@ -1916,13 +1933,19 @@ impl GraphStore {
                         .map(|note| (note.uid, (note.file_path, note.vault_uid))),
                 );
             }
-            let headings = if sections.iter().any(|section| section.heading_uid.is_some()) {
-                let (headings, headings_degraded) = self.heading_index()?;
-                degraded |= headings_degraded;
-                headings
-            } else {
-                HashMap::new()
-            };
+            let heading_uids: Vec<String> = sections
+                .iter()
+                .filter(|section| {
+                    path_prefix.is_none_or(|prefix| {
+                        note_paths
+                            .get(&section.note_uid)
+                            .is_some_and(|(path, _)| path.starts_with(prefix))
+                    })
+                })
+                .filter_map(|section| section.heading_uid.clone())
+                .collect();
+            let (headings, headings_degraded) = self.heading_index(&heading_uids)?;
+            degraded |= headings_degraded;
             for section in sections {
                 if interrupted()? {
                     return Ok((candidates, Some(RegexTruncationReason::Deadline)));

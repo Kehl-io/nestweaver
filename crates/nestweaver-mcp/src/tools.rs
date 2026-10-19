@@ -14794,8 +14794,12 @@ fn linked_worktree_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::Pat
     if !canonical.is_dir() {
         return None;
     }
-    if gitdir_points_at(&canonical, dot_git) {
-        return Some(canonical);
+    match gitdir_back_pointer(&canonical, dot_git) {
+        GitdirBackPointer::Matches => return Some(canonical),
+        // A pointer that names another worktree is not this checkout, even
+        // when `--absolute-git-dir` follows the copied gitfile.
+        GitdirBackPointer::Mismatch => return None,
+        GitdirBackPointer::Absent => {}
     }
     // `git init --separate-git-dir` and submodules use a gitfile whose target
     // is a normal git directory. That directory has no worktree `gitdir`
@@ -14808,16 +14812,26 @@ fn linked_worktree_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::Pat
     }
 }
 
-fn gitdir_points_at(git_dir: &Path, dot_git: &Path) -> bool {
-    let Ok(back_text) = std::fs::read_to_string(git_dir.join("gitdir")) else {
-        return false;
+enum GitdirBackPointer {
+    Absent,
+    Matches,
+    Mismatch,
+}
+
+fn gitdir_back_pointer(git_dir: &Path, dot_git: &Path) -> GitdirBackPointer {
+    let back_text = match std::fs::read_to_string(git_dir.join("gitdir")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return GitdirBackPointer::Absent;
+        }
+        Err(_) => return GitdirBackPointer::Mismatch,
     };
     let Some(back_line) = back_text.lines().next() else {
-        return false;
+        return GitdirBackPointer::Mismatch;
     };
     let back_line = back_line.trim();
     if back_line.is_empty() {
-        return false;
+        return GitdirBackPointer::Mismatch;
     }
     let back_raw = Path::new(back_line);
     let back = if back_raw.is_absolute() {
@@ -14825,7 +14839,11 @@ fn gitdir_points_at(git_dir: &Path, dot_git: &Path) -> bool {
     } else {
         git_dir.join(back_raw)
     };
-    same_directory(&back, dot_git)
+    if same_directory(&back, dot_git) {
+        GitdirBackPointer::Matches
+    } else {
+        GitdirBackPointer::Mismatch
+    }
 }
 
 /// Path named by a `gitdir: <path>` gitfile. Relative paths are relative to
@@ -15173,6 +15191,45 @@ mod affected_tests_base_ref_tests {
         .expect("separate-git-dir is a git repository");
         assert_eq!(result["repo"], json!("separate-repo"), "{result}");
         assert_eq!(result["repo_uid"], json!(uid), "{result}");
+    }
+
+    /// Copying another linked worktree's gitfile must not be accepted. The
+    /// target's `gitdir` pointer names the original worktree.
+    #[test]
+    fn affected_tests_base_ref_rejects_a_copied_worktree_gitfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "test@example.com"]);
+        git(&main, &["config", "user.name", "Test"]);
+        git(&main, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(main.join("only-real.txt"), "before\n").unwrap();
+        git(&main, &["add", "only-real.txt"]);
+        git(&main, &["commit", "-q", "-m", "init"]);
+        let wt = dir.path().join("wt");
+        git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let fake = dir.path().join("fake");
+        std::fs::create_dir_all(&fake).unwrap();
+        std::fs::copy(wt.join(".git"), fake.join(".git")).unwrap();
+
+        let uid = "repo:test:copied";
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&indexed_repo(uid, "copied-repo", &fake))
+            .unwrap();
+        let error = tool_affected_tests(
+            &store,
+            json!({ "base_ref": "HEAD", "repo": "copied-repo" }),
+            None,
+        )
+        .expect_err("a copied worktree gitfile must not diff");
+        let error = error.to_string();
+        assert!(
+            error.contains("copied-repo") && error.contains("not a git repository"),
+            "{error}"
+        );
+        assert!(!error.contains("only-real.txt"), "{error}");
     }
 
     /// An empty `.git` directory is not a repository. With `GIT_DIR` pointed

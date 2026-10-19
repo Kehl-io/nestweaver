@@ -1343,14 +1343,14 @@ fn rebuild_full_index_write_set_from_disk(
         .map(|row| PathBuf::from(&row.path))
         .collect();
 
-    // The pre-wait snapshot can still name a file a watcher deleted while
-    // this run waited. Identical bytes must not count as "already indexed"
-    // unless the live graph still holds the path.
-    let live_paths: HashSet<String> = store
-        .list_files_by_repo(set.r_uid)
-        .context("list indexed files after publication yield")?
+    // The pre-wait snapshot can still name a file a watcher deleted or
+    // edited while this run waited. Existence is not enough: the graph hash
+    // has to match the bytes on disk, or the refresh would keep the
+    // watcher's content after the user undid that edit.
+    let live_hashes: HashMap<String, String> = store
+        .list_file_hashes_by_repo(set.r_uid)
+        .context("list indexed file hashes after publication yield")?
         .into_iter()
-        .map(|(_, path)| path)
         .collect();
 
     let mut snapshot_hashes: HashMap<String, String> = set
@@ -1397,13 +1397,14 @@ fn rebuild_full_index_write_set_from_disk(
             .to_string_lossy()
             .into_owned();
         let snapshot_hash = snapshot_hashes.get(&rel).cloned();
-        let in_graph = live_paths.contains(&rel);
-        if in_graph
+        let graph_hash = live_hashes.get(&rel);
+        if graph_hash.is_some()
             && let (Some(hash), Some(meta)) = (snapshot_hash.clone(), cached_meta.get(&rel))
             && let Some((mtime, size)) = reader.file_meta_nanos(Path::new(&rel))?
             && mtime == meta.mtime_nanos
             && size == meta.size_bytes
             && meta.content_hash == hash
+            && graph_hash == Some(&hash)
         {
             kept.insert(rel);
             continue;
@@ -1451,7 +1452,7 @@ fn rebuild_full_index_write_set_from_disk(
             size_bytes,
             content_hash: content_hash.clone(),
         };
-        if in_graph && snapshot_hash.as_deref() == Some(content_hash.as_str()) {
+        if graph_hash == Some(&content_hash) {
             kept.insert(rel.clone());
             actions.push(Refresh::TouchMeta { rel, file_meta });
             continue;
@@ -7706,7 +7707,7 @@ fn incremental_index_with_name_and_io_and_authority(
 
     // nw-008 Phase 0 — transitive reverse-dependents from the LIVE graph, BEFORE
     // any mutation (the per-file `DETACH DELETE` destroys the edges we walk).
-    let (mut changed_files, removed_files) = partition_changed_removed(&changes, skip_reader);
+    let (mut changed_files, mut removed_files) = partition_changed_removed(&changes, skip_reader);
     let mut occupied: HashSet<String> = store
         .list_files_by_repo(&r_uid)
         .with_context(|| "list files before restoring committed sources")?
@@ -7714,7 +7715,7 @@ fn incremental_index_with_name_and_io_and_authority(
         .map(|(_, path)| path)
         .collect();
     occupied.extend(paths_covered_by_changes(&changes));
-    let missing_committed =
+    let mut missing_committed =
         prepare_missing_committed_sources(skip_reader, repo_path, &new_sha, &occupied)
             .context("prepare committed sources missing from the graph")?;
     extend_changed_with_missing_sources(&mut changed_files, &missing_committed);
@@ -7728,6 +7729,38 @@ fn incremental_index_with_name_and_io_and_authority(
         &removed_files,
         &mut rdeps,
     );
+    let publication = establish_index_publication_marker_with_io(
+        &store,
+        Some(db_path),
+        "incremental index",
+        epilogue_io,
+    )?;
+    // The publication lease may have waited on another writer. Re-read the
+    // tree before this transaction stores source prepared before that wait.
+    (changed_files, removed_files) = partition_changed_removed(&changes, skip_reader);
+    occupied = store
+        .list_files_by_repo(&r_uid)
+        .with_context(|| "list files after incremental publication lease")?
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect();
+    occupied.extend(paths_covered_by_changes(&changes));
+    missing_committed =
+        prepare_missing_committed_sources(skip_reader, repo_path, &new_sha, &occupied)
+            .context("rebuild committed sources missing from the graph")?;
+    extend_changed_with_missing_sources(&mut changed_files, &missing_committed);
+    rdeps = collect_reverse_dep_files(&store, &r_uid, &changed_files, &removed_files);
+    extend_rdeps_for_added_files(
+        skip_reader,
+        &store,
+        Some(db_path),
+        &r_uid,
+        &changed_files,
+        &removed_files,
+        &mut rdeps,
+    );
+    let prepared_files = prepare_incremental_files(&reader, &changes)
+        .context("rebuild incremental source files after publication lease")?;
     let contract_plan = match prepare_incremental_contract_derivation(&reader, &r_uid, repo_url) {
         Ok(plan) => plan,
         Err(error) => {
@@ -7736,38 +7769,22 @@ fn incremental_index_with_name_and_io_and_authority(
             {
                 tracing::warn!("recording contract derivation failure failed: {marker_error}");
             }
-            return Err(error).context("prepare incremental contract derivation");
+            return Err(error).context("rebuild incremental contract plan after publication lease");
         }
     };
-    // nw-664 review: through the one dedupe the per-file rows use, so a file
-    // both the contract plan and the change loop skip (a binary `.ts`) is one
-    // row and one `files_skipped`, whatever order the two report in.
+    // Recorded from the post-lease plan: the publication wait can change which
+    // files the walk skips. A file both this plan and the change loop skip is
+    // one row, because `record_incremental_file_outcome` dedupes by path.
     for skipped in &contract_plan.skipped_files {
         record_incremental_file_outcome(
             &mut result,
             IncrementalFileOutcome::PolicySkipped(skipped.clone()),
         );
     }
-    // nw-387 RESIDUAL: the changed-file half of the same durability problem.
-    // Free here — `prepare_incremental_contract_derivation` has just walked the
-    // tree via `list_files`, so the recorder is populated and current.
-    //
-    // This is also what covers the per-file `skips_path(rel_path)`
-    // `continue`s in the change loop below, which are silent by construction: a
-    // file added under `vendor/` is dropped there with no row, and the pruned
-    // DIRECTORY reported here is the same artefact the full scan reports for
-    // the same repo. Disclosing at directory granularity keeps the two commands
-    // saying the same thing.
+    // `prepare_incremental_contract_derivation` has just walked the tree, so
+    // the prune recorder is current. A directory added under `vendor/` is
+    // dropped by the change loop with no row; this discloses that directory.
     drain_pruned_dirs_into_incremental(&reader, &mut result);
-    let prepared_files =
-        prepare_incremental_files(&reader, &changes).context("prepare incremental source files")?;
-
-    let publication = establish_index_publication_marker_with_io(
-        &store,
-        Some(db_path),
-        "incremental index",
-        epilogue_io,
-    )?;
 
     // Wrap the entire incremental update in a single transaction so that a
     // crash mid-index doesn't leave partial data in the store. The indexed
@@ -8140,7 +8157,7 @@ where
     // nw-008 Phase 0 — compute transitive reverse-dependents from the LIVE
     // graph BEFORE any mutation. The per-file `DETACH DELETE` below destroys the
     // edges we walk here, so this ordering is correctness-critical.
-    let (mut changed_files, removed_files) = partition_changed_removed(&changes, skip_reader);
+    let (mut changed_files, mut removed_files) = partition_changed_removed(&changes, skip_reader);
     let mut occupied: HashSet<String> = store
         .list_files_by_repo(&r_uid)
         .with_context(|| "list files before restoring committed sources")?
@@ -8148,7 +8165,7 @@ where
         .map(|(_, path)| path)
         .collect();
     occupied.extend(paths_covered_by_changes(&changes));
-    let missing_committed =
+    let mut missing_committed =
         prepare_missing_committed_sources(skip_reader, git_repo_path, new_sha, &occupied)
             .context("prepare committed sources missing from the graph")?;
     extend_changed_with_missing_sources(&mut changed_files, &missing_committed);
@@ -8186,6 +8203,30 @@ where
         &mut write_guard,
         acquire_write_guard,
         || {
+            // The other publisher may have added or deleted files while this
+            // run waited. Rebuild the restore set, not only the diff files.
+            (changed_files, removed_files) = partition_changed_removed(&changes, skip_reader);
+            occupied = store
+                .list_files_by_repo(&r_uid)
+                .with_context(|| "list files after publication yield")?
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect();
+            occupied.extend(paths_covered_by_changes(&changes));
+            missing_committed =
+                prepare_missing_committed_sources(skip_reader, git_repo_path, new_sha, &occupied)
+                    .context("rebuild committed sources missing from the graph")?;
+            extend_changed_with_missing_sources(&mut changed_files, &missing_committed);
+            rdeps = collect_reverse_dep_files(store, &r_uid, &changed_files, &removed_files);
+            extend_rdeps_for_added_files(
+                skip_reader,
+                store,
+                store.db_path(),
+                &r_uid,
+                &changed_files,
+                &removed_files,
+                &mut rdeps,
+            );
             prepared_files = prepare_incremental_files(reader, &changes)
                 .context("rebuild server incremental source files after publication yield")?;
             contract_plan = match prepare_incremental_contract_derivation(reader, &r_uid, repo_url)
@@ -8652,16 +8693,15 @@ fn prepare_missing_committed_sources(
             // directory the walk cannot read must not abort the rest of the
             // incremental index. The path stays absent, so a later commit
             // retries it once the bytes can be read.
-            Err(error) if io_error_blocks_restore(&error) => {
-                tracing::debug!(
+            Err(error) => {
+                // NotFound, a closed directory, or a file the parser cannot
+                // read must not stall every later commit. The path stays out
+                // of the graph, so the next commit retries it.
+                tracing::warn!(
                     path = %path.display(),
                     %error,
-                    "leaving a committed source that cannot be read for a later index"
+                    "leaving a committed source that could not be prepared"
                 );
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("prepare committed source {}", path.display()));
             }
         }
     }
@@ -8985,6 +9025,11 @@ pub(crate) fn extend_rdeps_for_added_files(
     let Some(db_path) = db_path else {
         return;
     };
+    // Added paths are a subset of `changed`. A delete-only batch has nothing
+    // for an unresolved specifier to start naming.
+    if changed.is_empty() {
+        return;
+    }
     let deps = crate::resolution_cache::ResolutionDeps::load(&crate::sidecar_path(
         db_path,
         ".resolution_deps.bin",
@@ -9066,17 +9111,6 @@ pub(crate) fn persist_unresolved_imports(
     }
     if let Err(error) = deps.save(&path) {
         tracing::warn!("failed to save unresolved import specifiers: {error:#}");
-    }
-}
-
-fn import_specifier_ref(specifier: &str) -> RawReference {
-    RawReference {
-        scope: None,
-        name: specifier.to_string(),
-        kind: nestweaver_parser::ReferenceKind::Import,
-        start_line: 1,
-        context: String::new(),
-        receiver: None,
     }
 }
 
@@ -9242,35 +9276,21 @@ fn importers_of_added_paths(
         by_lang.entry(language).or_default().push(file.clone());
     }
     let workspace = workspace_context_for_languages(reader, by_lang.keys().copied());
+    let known: HashSet<&str> = known_files.iter().map(String::as_str).collect();
     let mut seeded = HashSet::new();
     for (language, importers) in by_lang {
-        let mut slice: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> = known_files
-            .iter()
-            .map(|path| (path.clone(), Vec::new(), Vec::new()))
-            .collect();
-        let index: HashMap<String, usize> = slice
-            .iter()
-            .enumerate()
-            .map(|(index, (path, _, _))| (path.clone(), index))
-            .collect();
-        for importer in &importers {
-            let Some(specs) = unresolved.get(importer) else {
+        for importer in importers {
+            let Some(specs) = unresolved.get(&importer) else {
                 continue;
             };
-            let refs: Vec<RawReference> = specs
-                .iter()
-                .map(|spec| import_specifier_ref(spec))
-                .collect();
-            if let Some(&position) = index.get(importer) {
-                slice[position].2 = refs;
-            } else {
-                slice.push((importer.clone(), Vec::new(), refs));
-            }
-        }
-        let graph = nestweaver_resolver::imports::build_import_graph(&slice, language, &workspace);
-        for (source, _specifier, target) in graph.all_resolved_imports() {
-            if source != target && added.contains(target) {
-                seeded.insert(source.to_string());
+            let names_added = specs.iter().any(|specifier| {
+                nestweaver_resolver::imports::resolved_import_path(
+                    &importer, specifier, &known, language, &workspace,
+                )
+                .is_some_and(|target| target != importer && added.contains(&target))
+            });
+            if names_added {
+                seeded.insert(importer);
             }
         }
     }
@@ -9283,17 +9303,7 @@ fn unresolved_imports_on_disk(
     refresh: &HashSet<String>,
 ) -> HashMap<String, HashSet<String>> {
     let mut languages = HashMap::new();
-    let mut file_data: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> = Vec::new();
-    let mut index: HashMap<String, usize> = HashMap::new();
-    for path in known_files {
-        let Some(language) = detect_language(Path::new(path)) else {
-            continue;
-        };
-        languages.insert(path.clone(), language);
-        index.insert(path.clone(), file_data.len());
-        file_data.push((path.clone(), Vec::new(), Vec::new()));
-    }
-    // A file this pass could not re-read keeps its previous specifiers.
+    let mut references = HashMap::new();
     let mut parsed = HashSet::new();
     for rel in refresh {
         let Some(language) = detect_language(Path::new(rel)) else {
@@ -9307,74 +9317,55 @@ fn unresolved_imports_on_disk(
         };
         languages.insert(rel.clone(), language);
         parsed.insert(rel.clone());
-        if let Some(&position) = index.get(rel) {
-            file_data[position].1 = parsed_file.symbols;
-            file_data[position].2 = parsed_file.references;
-        } else {
-            index.insert(rel.clone(), file_data.len());
-            file_data.push((rel.clone(), parsed_file.symbols, parsed_file.references));
-        }
+        references.insert(rel.clone(), parsed_file.references);
     }
     let workspace = workspace_context_for_languages(reader, languages.values().copied());
-    unresolved_import_specifiers(&file_data, &languages, &workspace, &parsed)
+    unresolved_import_specifiers(&references, known_files, &languages, &workspace, &parsed)
 }
 
-/// Unresolved import specifiers for `only`, resolved against every path in
-/// `file_data`. An empty set means the file was resolved and every import
-/// specifier hit a known file — callers use that to clear a stale entry.
+/// Unresolved import specifiers for `only`, resolved against `known_files`.
+/// An empty set means the file was resolved and every import specifier hit a
+/// known file — callers use that to clear a stale entry.
+///
+/// Resolves each specifier directly. Building an import graph would walk an
+/// export map for every known path, including files this batch did not parse.
 fn unresolved_import_specifiers(
-    file_data: &[(String, Vec<RawSymbol>, Vec<RawReference>)],
+    references: &HashMap<String, Vec<RawReference>>,
+    known_files: &HashSet<String>,
     languages: &HashMap<String, Language>,
     workspace: &nestweaver_resolver::WorkspaceContext,
     only: &HashSet<String>,
 ) -> HashMap<String, HashSet<String>> {
-    let references: HashMap<&str, &Vec<RawReference>> = file_data
-        .iter()
-        .map(|(path, _, references)| (path.as_str(), references))
-        .collect();
-    let mut by_lang: HashMap<Language, Vec<&str>> = HashMap::new();
+    let known: HashSet<&str> = known_files.iter().map(String::as_str).collect();
+    let mut out = HashMap::new();
     for path in only {
         let Some(language) = languages.get(path) else {
             continue;
         };
-        if references.contains_key(path.as_str()) {
-            by_lang.entry(*language).or_default().push(path.as_str());
-        }
-    }
-    let mut out = HashMap::new();
-    for (language, files) in by_lang {
-        let graph =
-            nestweaver_resolver::imports::build_import_graph(file_data, language, workspace);
-        for path in files {
-            let imports = graph.imports_of(path);
-            let resolved: HashSet<&str> = imports
-                .iter()
-                .map(|(specifier, _)| specifier.as_str())
-                .collect();
-            let mut specs = HashSet::new();
-            let Some(file_refs) = references.get(path) else {
-                continue;
-            };
-            for reference in *file_refs {
-                let specifier = match reference.kind {
-                    nestweaver_parser::ReferenceKind::Import
-                    | nestweaver_parser::ReferenceKind::Includes
-                    | nestweaver_parser::ReferenceKind::Uses => Some(reference.name.as_str()),
-                    nestweaver_parser::ReferenceKind::ImportAlias
-                        if !reference.context.is_empty() =>
-                    {
-                        Some(reference.context.as_str())
-                    }
-                    _ => None,
-                };
-                if let Some(specifier) = specifier.filter(|specifier| !specifier.is_empty())
-                    && !resolved.contains(specifier)
-                {
-                    specs.insert(specifier.to_string());
+        let Some(file_refs) = references.get(path) else {
+            continue;
+        };
+        let mut specs = HashSet::new();
+        for reference in file_refs {
+            let specifier = match reference.kind {
+                nestweaver_parser::ReferenceKind::Import
+                | nestweaver_parser::ReferenceKind::Includes
+                | nestweaver_parser::ReferenceKind::Uses => Some(reference.name.as_str()),
+                nestweaver_parser::ReferenceKind::ImportAlias if !reference.context.is_empty() => {
+                    Some(reference.context.as_str())
                 }
+                _ => None,
+            };
+            if let Some(specifier) = specifier.filter(|specifier| !specifier.is_empty())
+                && nestweaver_resolver::imports::resolved_import_path(
+                    path, specifier, &known, *language, workspace,
+                )
+                .is_none()
+            {
+                specs.insert(specifier.to_string());
             }
-            out.insert(path.to_string(), specs);
         }
+        out.insert(path.clone(), specs);
     }
     out
 }
@@ -9388,26 +9379,14 @@ fn unresolved_imports_for_resolved_files(
     workspace: &nestweaver_resolver::WorkspaceContext,
     only: &HashSet<String>,
 ) -> HashMap<String, HashSet<String>> {
-    let mut file_data: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> = file_languages
-        .keys()
-        .map(|path| (path.clone(), Vec::new(), Vec::new()))
-        .collect();
-    let index: HashMap<String, usize> = file_data
-        .iter()
-        .enumerate()
-        .map(|(position, (path, _, _))| (path.clone(), position))
-        .collect();
-    for (path, _symbols, references) in resolver_view {
-        if !only.contains(path) {
-            continue;
-        }
-        if let Some(&position) = index.get(path) {
-            file_data[position].2.clone_from(references);
-        } else {
-            file_data.push((path.clone(), Vec::new(), references.clone()));
+    let known_files: HashSet<String> = file_languages.keys().cloned().collect();
+    let mut references = HashMap::new();
+    for (path, _symbols, file_refs) in resolver_view {
+        if only.contains(path) {
+            references.insert(path.clone(), file_refs.clone());
         }
     }
-    unresolved_import_specifiers(&file_data, file_languages, workspace, only)
+    unresolved_import_specifiers(&references, &known_files, file_languages, workspace, only)
 }
 
 /// `pub(crate)` so the live code watcher (`watch_code.rs`) can run the same
@@ -10892,6 +10871,137 @@ mod tests {
             "identical bytes must be rewritten when the graph lost the file; changed={actually_changed_files:?}"
         );
         assert!(all_files.iter().any(|file| file.path == rel));
+    }
+
+    /// A watcher can index an edit and the user can undo it before this run
+    /// publishes. The snapshot hash then matches the bytes on disk, and the
+    /// graph still holds the watcher's hash. Existence is not enough: the
+    /// refresh has to rewrite the path.
+    #[test]
+    fn yield_refresh_rewrites_a_file_whose_graph_hash_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let rel = "src/kept.py";
+        let source = "def kept():\n    return 1\n";
+        fs::write(repo.join(rel), source).unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let db = dir.path().join("graph.lbug");
+        let url = "https://example.test/yield-hash";
+        let head = git(&["rev-parse", "HEAD"]);
+        index_directory_with_options_and_limits(
+            &repo,
+            &db,
+            "test",
+            url,
+            &head,
+            true,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+
+        let store = nestweaver_store::GraphStore::open(&db).unwrap();
+        let r_uid = nestweaver_schema::repo_uid("test", url);
+        let files = store.list_files_by_repo(&r_uid).unwrap();
+        let (uid, _) = files
+            .iter()
+            .find(|(_, path)| path == rel)
+            .expect("kept.py was indexed");
+        let content_hash = content_hash_hex(source);
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: uid.clone(),
+                path: rel.to_string(),
+                repo_uid: r_uid.clone(),
+                content_hash: "watcher-edit-then-undo".to_string(),
+            })
+            .unwrap();
+        let live = store
+            .list_file_hashes_by_repo(&r_uid)
+            .unwrap()
+            .into_iter()
+            .find(|(path, _)| path == rel)
+            .map(|(_, hash)| hash);
+        assert_ne!(live.as_deref(), Some(content_hash.as_str()));
+
+        let reader = crate::content_reader::FilesystemReader::with_limits(
+            &repo,
+            crate::index_limits::IndexLimits::default(),
+        );
+        let (mtime_nanos, size_bytes) = crate::content_reader::ContentReader::file_meta_nanos(
+            &reader,
+            std::path::Path::new(rel),
+        )
+        .unwrap()
+        .unwrap();
+        let mut all_files = vec![nestweaver_schema::File {
+            uid: uid.clone(),
+            path: rel.to_string(),
+            repo_uid: r_uid.clone(),
+            content_hash: content_hash.clone(),
+        }];
+        let mut all_symbols = Vec::new();
+        let mut repo_file_edge_pairs = Vec::new();
+        let mut file_symbol_edge_pairs = Vec::new();
+        let mut parsed_files_for_resolver = Vec::new();
+        let mut ast_bindings_by_file = HashMap::new();
+        let mut handler_files = Vec::new();
+        let mut actually_changed_files = HashSet::new();
+        let mut present_files = HashSet::from([rel.to_string()]);
+        let mut files_count = 1usize;
+        let mut files_unchanged = 1usize;
+        let mut symbols_count = 0usize;
+        let mut filemeta = HashMap::from([(
+            rel.to_string(),
+            CachedFileMeta {
+                mtime_nanos,
+                size_bytes,
+                content_hash,
+            },
+        )]);
+        let mut file_languages = HashMap::new();
+        let mut spec_files = Vec::new();
+        let mut unreadable_dirs = Vec::new();
+        let mut skipped_files = Vec::new();
+        let mut type_envs = HashMap::new();
+        let mut contract_plan = empty_contract_plan();
+        let mut write_set = PublicationWriteSet {
+            r_uid: &r_uid,
+            repo_url: url,
+            all_files: &mut all_files,
+            all_symbols: &mut all_symbols,
+            repo_file_edge_pairs: &mut repo_file_edge_pairs,
+            file_symbol_edge_pairs: &mut file_symbol_edge_pairs,
+            parsed_files_for_resolver: &mut parsed_files_for_resolver,
+            ast_bindings_by_file: &mut ast_bindings_by_file,
+            handler_files: &mut handler_files,
+            actually_changed_files: &mut actually_changed_files,
+            present_files: &mut present_files,
+            files_count: &mut files_count,
+            files_unchanged: &mut files_unchanged,
+            symbols_count: &mut symbols_count,
+            new_filemeta: Some(&mut filemeta),
+        };
+        rebuild_full_index_write_set_from_disk(
+            &reader,
+            &store,
+            &mut write_set,
+            &mut file_languages,
+            &mut spec_files,
+            &mut unreadable_dirs,
+            &mut skipped_files,
+            None,
+            &mut type_envs,
+            &mut contract_plan,
+            crate::cpu_throttle::CpuThrottle::global(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            actually_changed_files.contains(rel),
+            "disk bytes that disagree with the graph hash must be rewritten; changed={actually_changed_files:?}"
+        );
     }
 
     /// nw-664 review: a binary file with a contract-language extension (an

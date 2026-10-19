@@ -93,8 +93,16 @@ pub async fn query(
     .into_response())
 }
 
+/// Function words that are not identifier seeds. Short names such as `id`
+/// and `api` stay. A question like "how does the auth work" must not turn
+/// "how" or "the" into an ambiguous-seed 400.
+const QUERY_STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "by", "does", "for", "from", "how", "in", "is",
+    "it", "of", "on", "or", "the", "to", "what", "when", "where", "which", "who", "why", "with",
+];
+
 /// Keep every token that can be an identifier, including short ones (`id`,
-/// `api`). Single-character tokens are not seeds; the response says so.
+/// `api`). Single-character tokens and function words are not seeds.
 fn extract_query_seeds(query: &str) -> (Vec<String>, Vec<DroppedToken>) {
     let mut seeds = Vec::new();
     let mut dropped = Vec::new();
@@ -113,6 +121,14 @@ fn extract_query_seeds(query: &str) -> (Vec<String>, Vec<DroppedToken>) {
             dropped.push(DroppedToken {
                 token,
                 reason: "single_character",
+            });
+            continue;
+        }
+        let lower = token.to_ascii_lowercase();
+        if QUERY_STOPWORDS.contains(&lower.as_str()) {
+            dropped.push(DroppedToken {
+                token,
+                reason: "stopword",
             });
             continue;
         }
@@ -415,6 +431,8 @@ mod tests {
             .map(|seed| seed.as_str().unwrap())
             .collect();
         assert_eq!(seeds, ["api", "id", "greet"], "{wide}");
+        let (question, _) = extract_query_seeds("How does the auth work");
+        assert_eq!(question, ["auth", "work"]);
         assert_eq!(wide["dropped_tokens"][0]["token"], "a");
         assert_eq!(wide["dropped_tokens"][0]["reason"], "single_character");
         assert!(
