@@ -14800,7 +14800,12 @@ fn linked_worktree_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::Pat
     if !canonical.is_dir() {
         return None;
     }
-    if gitdir_file_points_at(&canonical, dot_git) || core_worktree_points_at(&canonical, path) {
+    // A submodule or separate git dir owns its object store, so a `commondir`
+    // file there means it borrows another repository's and is refused, as
+    // `self_contained_git_dir` refuses it for a `.git` directory.
+    if gitdir_file_points_at(&canonical, dot_git)
+        || (!canonical.join("commondir").exists() && core_worktree_points_at(&canonical, path))
+    {
         Some(canonical)
     } else {
         None
@@ -15296,6 +15301,102 @@ mod affected_tests_base_ref_tests {
         .unwrap();
         std::fs::copy(real.path().join(".git").join("HEAD"), fake_git.join("HEAD")).unwrap();
         assert_other_repository_files_are_not_returned(via_commondir.path(), "commondir-repo");
+    }
+
+    /// A `--separate-git-dir` repository and a submodule both have a gitfile
+    /// whose target has no `gitdir` back-pointer; `core.worktree` names the
+    /// work tree instead. Both must diff.
+    #[test]
+    fn affected_tests_base_ref_diffs_separate_git_dir_and_submodule() {
+        let sep_git = tempfile::tempdir().unwrap();
+        let sep_tree = tempfile::tempdir().unwrap();
+        git(
+            sep_tree.path(),
+            &[
+                "init",
+                "-q",
+                "--separate-git-dir",
+                &sep_git.path().join("repo.git").display().to_string(),
+            ],
+        );
+        git(
+            sep_tree.path(),
+            &["config", "user.email", "test@example.com"],
+        );
+        git(sep_tree.path(), &["config", "user.name", "Test"]);
+        git(sep_tree.path(), &["config", "commit.gpgsign", "false"]);
+        std::fs::write(sep_tree.path().join("tracked.txt"), "before\n").unwrap();
+        git(sep_tree.path(), &["add", "tracked.txt"]);
+        git(sep_tree.path(), &["commit", "-q", "-m", "init"]);
+        std::fs::write(sep_tree.path().join("tracked.txt"), "after\n").unwrap();
+        assert_diffs_tracked_file(sep_tree.path(), "separate-repo");
+
+        let inner = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(inner.path(), "tracked.txt");
+        let outer = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(outer.path(), "outer.txt");
+        git(
+            outer.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &inner.path().display().to_string(),
+                "sub",
+            ],
+        );
+        let sub = outer.path().join("sub");
+        std::fs::write(sub.join("tracked.txt"), "after\n").unwrap();
+        assert_diffs_tracked_file(&sub, "submodule-repo");
+    }
+
+    fn assert_diffs_tracked_file(path: &std::path::Path, name: &str) {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&indexed_repo(&format!("repo:test:{name}"), name, path))
+            .unwrap();
+        let diffed = tool_affected_tests(&store, json!({ "base_ref": "HEAD", "repo": name }), None)
+            .unwrap_or_else(|error| panic!("{name} must diff: {error:#}"));
+        let files = diffed["changed_files"].as_array().expect("changed_files");
+        assert!(
+            files
+                .iter()
+                .any(|file| file.as_str() == Some("tracked.txt")),
+            "{name} diff must name its own tracked file: {diffed}"
+        );
+    }
+
+    /// A gitfile that names another repository's git dir, and a forged git dir
+    /// that pairs `core.worktree` with another repository's `commondir`, must
+    /// not let that repository's files through.
+    #[test]
+    fn affected_tests_base_ref_rejects_foreign_gitfile_and_forged_core_worktree() {
+        let real = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(real.path(), "only-real.txt");
+        std::fs::write(real.path().join("only-real.txt"), "after\n").unwrap();
+
+        let foreign = tempfile::tempdir().unwrap();
+        std::fs::write(
+            foreign.path().join(".git"),
+            format!("gitdir: {}\n", real.path().join(".git").display()),
+        )
+        .unwrap();
+        assert_other_repository_files_are_not_returned(foreign.path(), "foreign-gitfile");
+
+        let forged = tempfile::tempdir().unwrap();
+        let evil = forged.path().join(".evil");
+        std::fs::create_dir(&evil).unwrap();
+        std::fs::write(forged.path().join(".git"), "gitdir: .evil\n").unwrap();
+        std::fs::write(evil.join("config"), "[core]\n\tworktree = ..\n").unwrap();
+        std::fs::write(
+            evil.join("commondir"),
+            format!("{}\n", real.path().join(".git").display()),
+        )
+        .unwrap();
+        std::fs::copy(real.path().join(".git").join("HEAD"), evil.join("HEAD")).unwrap();
+        assert_other_repository_files_are_not_returned(forged.path(), "forged-core-worktree");
     }
 
     /// A linked worktree's `.git` is a gitfile. Its private git dir's `gitdir`
