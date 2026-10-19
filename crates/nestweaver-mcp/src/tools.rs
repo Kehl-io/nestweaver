@@ -14762,10 +14762,12 @@ fn git_command_for_resolved_git_dir(path: &Path, git_dir: &Path) -> std::process
 /// repository fails that comparison. A symlink `.git` is not a directory
 /// entry of this path, so it is not accepted.
 ///
-/// A gitfile (linked worktree, submodule, `--separate-git-dir`) is accepted
-/// when the target directory points back at this work tree: through its
-/// `gitdir` file (linked worktree) or its `core.worktree` setting (submodule,
-/// separate git dir). The returned directory is that target.
+/// A gitfile (linked worktree or submodule) is accepted when the target
+/// directory points back at this work tree: through its `gitdir` file (linked
+/// worktree) or its `core.worktree` setting (submodule). The returned
+/// directory is that target. A `--separate-git-dir` repository records neither,
+/// so it cannot be told from a gitfile naming another repository and is
+/// refused.
 fn indexed_work_tree_git_dir(path: &Path) -> Option<std::path::PathBuf> {
     let dot_git = path.join(".git");
     let meta = std::fs::symlink_metadata(&dot_git).ok()?;
@@ -14800,7 +14802,7 @@ fn linked_worktree_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::Pat
     if !canonical.is_dir() {
         return None;
     }
-    // A submodule or separate git dir owns its object store, so a `commondir`
+    // A submodule owns its object store, so a `commondir`
     // file there means it borrows another repository's and is refused, as
     // `self_contained_git_dir` refuses it for a `.git` directory.
     if gitdir_file_points_at(&canonical, dot_git)
@@ -14832,8 +14834,8 @@ fn gitdir_file_points_at(git_dir: &Path, dot_git: &Path) -> bool {
     same_directory(&back, dot_git)
 }
 
-/// A submodule or `--separate-git-dir` repository records its work tree as
-/// `core.worktree` in `<git dir>/config`, relative to the git dir.
+/// A submodule records its work tree as `core.worktree` in
+/// `<git dir>/config`, relative to the git dir.
 fn core_worktree_points_at(git_dir: &Path, work_tree: &Path) -> bool {
     let Ok(output) = git_command_for_indexed_path(work_tree)
         .arg("config")
@@ -15303,34 +15305,10 @@ mod affected_tests_base_ref_tests {
         assert_other_repository_files_are_not_returned(via_commondir.path(), "commondir-repo");
     }
 
-    /// A `--separate-git-dir` repository and a submodule both have a gitfile
-    /// whose target has no `gitdir` back-pointer; `core.worktree` names the
-    /// work tree instead. Both must diff.
+    /// A submodule's gitfile target has no `gitdir` back-pointer; its
+    /// `core.worktree` names the work tree instead. It must diff.
     #[test]
-    fn affected_tests_base_ref_diffs_separate_git_dir_and_submodule() {
-        let sep_git = tempfile::tempdir().unwrap();
-        let sep_tree = tempfile::tempdir().unwrap();
-        git(
-            sep_tree.path(),
-            &[
-                "init",
-                "-q",
-                "--separate-git-dir",
-                &sep_git.path().join("repo.git").display().to_string(),
-            ],
-        );
-        git(
-            sep_tree.path(),
-            &["config", "user.email", "test@example.com"],
-        );
-        git(sep_tree.path(), &["config", "user.name", "Test"]);
-        git(sep_tree.path(), &["config", "commit.gpgsign", "false"]);
-        std::fs::write(sep_tree.path().join("tracked.txt"), "before\n").unwrap();
-        git(sep_tree.path(), &["add", "tracked.txt"]);
-        git(sep_tree.path(), &["commit", "-q", "-m", "init"]);
-        std::fs::write(sep_tree.path().join("tracked.txt"), "after\n").unwrap();
-        assert_diffs_tracked_file(sep_tree.path(), "separate-repo");
-
+    fn affected_tests_base_ref_diffs_a_submodule() {
         let inner = tempfile::tempdir().unwrap();
         init_repo_with_tracked_file(inner.path(), "tracked.txt");
         let outer = tempfile::tempdir().unwrap();
