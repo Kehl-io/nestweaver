@@ -183,7 +183,7 @@ pub fn derive_recommendation(
 ///      tier by edge confidence.
 pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<AffectedTestsResult> {
     let changed_files = crate::changed_files::require_changed_files(changed_files)?;
-    affected_tests_within(store, &changed_files, None)
+    affected_tests_within(store, &changed_files, None, None)
 }
 
 /// Canonical empty selection after a caller proved a VCS diff empty and
@@ -217,7 +217,20 @@ pub fn affected_tests_for_derived_diff(
     changed_files: &[String],
 ) -> Result<AffectedTestsResult> {
     let changed_files = crate::changed_files::validate_changed_file_entries(changed_files)?;
-    affected_tests_within(store, &changed_files, None)
+    affected_tests_within(store, &changed_files, None, None)
+}
+
+/// [`affected_tests_for_derived_diff`] limited to one repository.
+///
+/// A derived diff's paths are relative to that repository. The same relative
+/// path in another repository is not part of the change.
+pub fn affected_tests_for_derived_diff_in_repo(
+    store: &GraphStore,
+    repo_uid: &str,
+    changed_files: &[String],
+) -> Result<AffectedTestsResult> {
+    let changed_files = crate::changed_files::validate_changed_file_entries(changed_files)?;
+    affected_tests_within(store, &changed_files, None, Some(repo_uid))
 }
 
 /// Compute affected tests inside an induced symbol subgraph.
@@ -231,7 +244,7 @@ pub fn affected_tests_scoped(
     allowed_symbols: &HashSet<String>,
 ) -> Result<AffectedTestsResult> {
     let changed_files = crate::changed_files::require_changed_files(changed_files)?;
-    affected_tests_within(store, &changed_files, Some(allowed_symbols))
+    affected_tests_within(store, &changed_files, Some(allowed_symbols), None)
 }
 
 /// Scoped twin of [`affected_tests_for_derived_diff`].
@@ -241,13 +254,36 @@ pub fn affected_tests_scoped_for_derived_diff(
     allowed_symbols: &HashSet<String>,
 ) -> Result<AffectedTestsResult> {
     let changed_files = crate::changed_files::validate_changed_file_entries(changed_files)?;
-    affected_tests_within(store, &changed_files, Some(allowed_symbols))
+    affected_tests_within(store, &changed_files, Some(allowed_symbols), None)
+}
+
+/// Scoped twin of [`affected_tests_for_derived_diff_in_repo`].
+pub fn affected_tests_scoped_for_derived_diff_in_repo(
+    store: &GraphStore,
+    repo_uid: &str,
+    changed_files: &[String],
+    allowed_symbols: &HashSet<String>,
+) -> Result<AffectedTestsResult> {
+    let changed_files = crate::changed_files::validate_changed_file_entries(changed_files)?;
+    affected_tests_within(store, &changed_files, Some(allowed_symbols), Some(repo_uid))
+}
+
+fn symbols_for_changed_file(
+    store: &GraphStore,
+    file_path: &str,
+    repo_uid: Option<&str>,
+) -> Result<Vec<nestweaver_schema::Symbol>, nestweaver_store::StoreError> {
+    match repo_uid {
+        Some(repo) => store.symbols_in_file_in_repo(file_path, repo),
+        None => store.symbols_in_file(file_path),
+    }
 }
 
 fn affected_tests_within(
     store: &GraphStore,
     changed_files: &[String],
     allowed_symbols: Option<&HashSet<String>>,
+    repo_uid: Option<&str>,
 ) -> Result<AffectedTestsResult> {
     // Trust core: a failed traversal must surface as `Degraded` so a CI
     // consumer runs the full suite instead of trusting an incomplete subset.
@@ -255,8 +291,16 @@ fn affected_tests_within(
     let mut notifications: Vec<Notification> = Vec::new();
     // A stale repository degrades only when it owns or is linked to
     // a changed file; an unrelated one is disclosed without degrading.
-    let incompatibility =
-        crate::resolver_generation::incompatibility_for_changed_files(store, changed_files)?;
+    let incompatibility = match repo_uid {
+        Some(repo) => crate::resolver_generation::incompatibility_for_changed_files_in_repo(
+            store,
+            repo,
+            changed_files,
+        )?,
+        None => {
+            crate::resolver_generation::incompatibility_for_changed_files(store, changed_files)?
+        }
+    };
     let resolver_stale_repos = incompatibility.all();
     incompatibility.apply(&mut status, &mut notifications);
 
@@ -276,7 +320,7 @@ fn affected_tests_within(
     // are ALWAYS included in tier 1 below (TIA/Develocity always-include rule).
     let mut files_without_symbols: Vec<&String> = Vec::new();
     for file_path in changed_files {
-        match store.symbols_in_file(file_path) {
+        match symbols_for_changed_file(store, file_path, repo_uid) {
             Ok(syms) => {
                 let syms: Vec<_> = syms
                     .into_iter()
@@ -748,6 +792,32 @@ fn count_tests(files: &[AffectedTestFile]) -> usize {
 mod tests {
     use super::*;
     use nestweaver_schema::{EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+    #[test]
+    fn derived_diff_in_one_repo_ignores_the_same_path_in_another_repo() {
+        let store = GraphStore::in_memory().unwrap();
+        let mut alpha = sym("sym:alpha", "alpha_fn", "a.js");
+        alpha.repo_uid = "repo:alpha".to_string();
+        let mut beta = sym("sym:beta", "beta_fn", "a.js");
+        beta.repo_uid = "repo:beta".to_string();
+        store.insert_symbol(&alpha).unwrap();
+        store.insert_symbol(&beta).unwrap();
+        let result =
+            affected_tests_for_derived_diff_in_repo(&store, "repo:alpha", &["a.js".to_string()])
+                .unwrap();
+        let names: Vec<_> = result
+            .changed_symbols
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect();
+        assert_eq!(names, ["alpha_fn"], "{result:?}");
+        assert!(
+            result
+                .changed_symbols
+                .iter()
+                .all(|symbol| symbol.repo_uid == "repo:alpha")
+        );
+    }
 
     fn sym(uid: &str, name: &str, file: &str) -> Symbol {
         Symbol {

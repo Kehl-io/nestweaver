@@ -1343,6 +1343,16 @@ fn rebuild_full_index_write_set_from_disk(
         .map(|row| PathBuf::from(&row.path))
         .collect();
 
+    // The pre-wait snapshot can still name a file a watcher deleted while
+    // this run waited. Identical bytes must not count as "already indexed"
+    // unless the live graph still holds the path.
+    let live_paths: HashSet<String> = store
+        .list_files_by_repo(set.r_uid)
+        .context("list indexed files after publication yield")?
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect();
+
     let mut snapshot_hashes: HashMap<String, String> = set
         .all_files
         .iter()
@@ -1387,7 +1397,9 @@ fn rebuild_full_index_write_set_from_disk(
             .to_string_lossy()
             .into_owned();
         let snapshot_hash = snapshot_hashes.get(&rel).cloned();
-        if let (Some(hash), Some(meta)) = (snapshot_hash.clone(), cached_meta.get(&rel))
+        let in_graph = live_paths.contains(&rel);
+        if in_graph
+            && let (Some(hash), Some(meta)) = (snapshot_hash.clone(), cached_meta.get(&rel))
             && let Some((mtime, size)) = reader.file_meta_nanos(Path::new(&rel))?
             && mtime == meta.mtime_nanos
             && size == meta.size_bytes
@@ -1439,7 +1451,7 @@ fn rebuild_full_index_write_set_from_disk(
             size_bytes,
             content_hash: content_hash.clone(),
         };
-        if snapshot_hash.as_deref() == Some(content_hash.as_str()) {
+        if in_graph && snapshot_hash.as_deref() == Some(content_hash.as_str()) {
             kept.insert(rel.clone());
             actions.push(Refresh::TouchMeta { rel, file_meta });
             continue;
@@ -6664,6 +6676,17 @@ where
 /// 3. Emit `IMPLEMENTS_CONTRACT` edges (handler Symbol → Contract) carrying the
 ///    match confidence (1.0 exact verb+path, 0.8 base-path-inferred).
 ///
+#[cfg(test)]
+fn empty_contract_plan() -> ContractDerivationPlan {
+    ContractDerivationPlan {
+        contracts: Vec::new(),
+        edges: Vec::new(),
+        input_hashes: std::collections::BTreeMap::new(),
+        observed_input_hashes: std::collections::BTreeMap::new(),
+        skipped_files: Vec::new(),
+    }
+}
+
 pub(crate) struct ContractDerivationPlan {
     contracts: Vec<nestweaver_schema::Contract>,
     edges: Vec<nestweaver_schema::ResolvedEdge>,
@@ -10748,6 +10771,127 @@ mod tests {
         let indexed = incremental_index(&repo, &db, "test", url)
             .expect("a missing worktree file must not abort the incremental index");
         assert_eq!(indexed.files_added, 1, "{indexed:?}");
+    }
+
+    /// After a publication yield, identical bytes are not "already indexed"
+    /// when a watcher deleted the file's nodes. The refresh has to put the
+    /// path back into the write set as a change.
+    #[test]
+    fn yield_refresh_reinserts_a_file_the_graph_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let rel = "src/kept.py";
+        let source = "def kept():\n    return 1\n";
+        fs::write(repo.join(rel), source).unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let db = dir.path().join("graph.lbug");
+        let url = "https://example.test/yield-refresh";
+        let head = git(&["rev-parse", "HEAD"]);
+        index_directory_with_options_and_limits(
+            &repo,
+            &db,
+            "test",
+            url,
+            &head,
+            true,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+
+        let store = nestweaver_store::GraphStore::open(&db).unwrap();
+        let r_uid = nestweaver_schema::repo_uid("test", url);
+        let files = store.list_files_by_repo(&r_uid).unwrap();
+        let (uid, _) = files
+            .iter()
+            .find(|(_, path)| path == rel)
+            .expect("kept.py was indexed");
+        store.delete_file_node(uid).unwrap();
+        assert!(
+            store.list_files_by_repo(&r_uid).unwrap().is_empty(),
+            "the graph no longer holds the file"
+        );
+
+        let reader = crate::content_reader::FilesystemReader::with_limits(
+            &repo,
+            crate::index_limits::IndexLimits::default(),
+        );
+        let (mtime_nanos, size_bytes) = crate::content_reader::ContentReader::file_meta_nanos(
+            &reader,
+            std::path::Path::new(rel),
+        )
+        .unwrap()
+        .unwrap();
+        let content_hash = content_hash_hex(source);
+        let mut all_files = vec![nestweaver_schema::File {
+            uid: uid.clone(),
+            path: rel.to_string(),
+            repo_uid: r_uid.clone(),
+            content_hash: content_hash.clone(),
+        }];
+        let mut all_symbols = Vec::new();
+        let mut repo_file_edge_pairs = Vec::new();
+        let mut file_symbol_edge_pairs = Vec::new();
+        let mut parsed_files_for_resolver = Vec::new();
+        let mut ast_bindings_by_file = HashMap::new();
+        let mut handler_files = Vec::new();
+        let mut actually_changed_files = HashSet::new();
+        let mut present_files = HashSet::from([rel.to_string()]);
+        let mut files_count = 1usize;
+        let mut files_unchanged = 1usize;
+        let mut symbols_count = 0usize;
+        let mut filemeta = HashMap::from([(
+            rel.to_string(),
+            CachedFileMeta {
+                mtime_nanos,
+                size_bytes,
+                content_hash,
+            },
+        )]);
+        let mut file_languages = HashMap::new();
+        let mut spec_files = Vec::new();
+        let mut unreadable_dirs = Vec::new();
+        let mut skipped_files = Vec::new();
+        let mut type_envs = HashMap::new();
+        let mut contract_plan = empty_contract_plan();
+        let mut write_set = PublicationWriteSet {
+            r_uid: &r_uid,
+            repo_url: url,
+            all_files: &mut all_files,
+            all_symbols: &mut all_symbols,
+            repo_file_edge_pairs: &mut repo_file_edge_pairs,
+            file_symbol_edge_pairs: &mut file_symbol_edge_pairs,
+            parsed_files_for_resolver: &mut parsed_files_for_resolver,
+            ast_bindings_by_file: &mut ast_bindings_by_file,
+            handler_files: &mut handler_files,
+            actually_changed_files: &mut actually_changed_files,
+            present_files: &mut present_files,
+            files_count: &mut files_count,
+            files_unchanged: &mut files_unchanged,
+            symbols_count: &mut symbols_count,
+            new_filemeta: Some(&mut filemeta),
+        };
+        rebuild_full_index_write_set_from_disk(
+            &reader,
+            &store,
+            &mut write_set,
+            &mut file_languages,
+            &mut spec_files,
+            &mut unreadable_dirs,
+            &mut skipped_files,
+            None,
+            &mut type_envs,
+            &mut contract_plan,
+            crate::cpu_throttle::CpuThrottle::global(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            actually_changed_files.contains(rel),
+            "identical bytes must be rewritten when the graph lost the file; changed={actually_changed_files:?}"
+        );
+        assert!(all_files.iter().any(|file| file.path == rel));
     }
 
     /// nw-664 review: a binary file with a contract-language extension (an

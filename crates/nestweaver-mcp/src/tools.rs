@@ -14437,7 +14437,12 @@ fn tool_affected_tests(
     // dropped while the gate reports success. Only a stale repository
     // that owns or is linked to a changed file refuses; an unrelated one is
     // disclosed in the selection's notifications instead.
-    if let Some(refusal) = resolver_generation_refusal(store, visible, Some(&changed_files))? {
+    if let Some(refusal) = resolver_generation_refusal_in(
+        store,
+        visible,
+        Some(&changed_files),
+        selected_repo.as_ref().map(|repo| repo.uid.as_str()),
+    )? {
         return Ok(affected_tests_refusal_payload(&refusal));
     }
 
@@ -14457,8 +14462,13 @@ fn tool_affected_tests(
             )
             .context("affected_tests")?
         } else {
-            nestweaver_engine::affected_tests::affected_tests_scoped_for_derived_diff(
+            let repo_uid = selected_repo
+                .as_ref()
+                .map(|repo| repo.uid.as_str())
+                .context("a derived diff names the repository it was read from")?;
+            nestweaver_engine::affected_tests::affected_tests_scoped_for_derived_diff_in_repo(
                 store,
+                repo_uid,
                 &changed_files,
                 &allowed,
             )
@@ -14470,8 +14480,13 @@ fn tool_affected_tests(
             nestweaver_engine::rts_eval::run_recorded(store, &changed_files, db_path.as_deref())
                 .context("affected_tests")?
         } else {
-            nestweaver_engine::rts_eval::run_recorded_derived_diff(
+            let repo_uid = selected_repo
+                .as_ref()
+                .map(|repo| repo.uid.as_str())
+                .context("a derived diff names the repository it was read from")?;
+            nestweaver_engine::rts_eval::run_recorded_derived_diff_in_repo(
                 store,
+                repo_uid,
                 &changed_files,
                 db_path.as_deref(),
             )
@@ -14779,21 +14794,38 @@ fn linked_worktree_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::Pat
     if !canonical.is_dir() {
         return None;
     }
-    let back_text = std::fs::read_to_string(canonical.join("gitdir")).ok()?;
-    let back_line = back_text.lines().next()?.trim();
+    if gitdir_points_at(&canonical, dot_git) {
+        return Some(canonical);
+    }
+    // `git init --separate-git-dir` and submodules use a gitfile whose target
+    // is a normal git directory. That directory has no worktree `gitdir`
+    // back-pointer. Accept it when this work tree's own git dir is that target.
+    let absolute = rev_parse_git_path(path, "--absolute-git-dir")?;
+    if absolute == canonical {
+        Some(canonical)
+    } else {
+        None
+    }
+}
+
+fn gitdir_points_at(git_dir: &Path, dot_git: &Path) -> bool {
+    let Ok(back_text) = std::fs::read_to_string(git_dir.join("gitdir")) else {
+        return false;
+    };
+    let Some(back_line) = back_text.lines().next() else {
+        return false;
+    };
+    let back_line = back_line.trim();
     if back_line.is_empty() {
-        return None;
+        return false;
     }
     let back_raw = Path::new(back_line);
     let back = if back_raw.is_absolute() {
         back_raw.to_path_buf()
     } else {
-        canonical.join(back_raw)
+        git_dir.join(back_raw)
     };
-    if !same_directory(&back, dot_git) {
-        return None;
-    }
-    Some(canonical)
+    same_directory(&back, dot_git)
 }
 
 /// Path named by a `gitdir: <path>` gitfile. Relative paths are relative to
@@ -15093,6 +15125,54 @@ mod affected_tests_base_ref_tests {
             !nested_diff.contains("git diff for base_ref"),
             "the nested failure must not stay wrapped as 'git diff for base_ref': {nested_diff}"
         );
+    }
+
+    /// `git init --separate-git-dir` writes a gitfile with no worktree
+    /// `gitdir` back-pointer. That layout is still this repository.
+    #[test]
+    fn affected_tests_base_ref_accepts_separate_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join("separate.git");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git(
+            dir.path(),
+            &[
+                "init",
+                "-q",
+                "--separate-git-dir",
+                git_dir.to_str().unwrap(),
+                "work",
+            ],
+        );
+        git(&work, &["config", "user.email", "test@example.com"]);
+        git(&work, &["config", "user.name", "Test"]);
+        git(&work, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(work.join("kept.rs"), "fn kept() {}\n").unwrap();
+        git(&work, &["add", "kept.rs"]);
+        git(&work, &["commit", "-q", "-m", "init"]);
+        assert!(
+            work.join(".git").is_file(),
+            "separate-git-dir leaves a gitfile"
+        );
+        assert!(
+            !git_dir.join("gitdir").exists(),
+            "a separate git dir has no worktree back-pointer"
+        );
+
+        let uid = "repo:test:separate";
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&indexed_repo(uid, "separate-repo", &work))
+            .unwrap();
+        let result = tool_affected_tests(
+            &store,
+            json!({ "base_ref": "HEAD", "repo": "separate-repo" }),
+            None,
+        )
+        .expect("separate-git-dir is a git repository");
+        assert_eq!(result["repo"], json!("separate-repo"), "{result}");
+        assert_eq!(result["repo_uid"], json!(uid), "{result}");
     }
 
     /// An empty `.git` directory is not a repository. With `GIT_DIR` pointed
@@ -21259,6 +21339,15 @@ fn resolver_generation_refusal(
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
     changed_files: Option<&[String]>,
 ) -> Result<Option<nestweaver_engine::resolver_generation::DeadCodeRefusal>, anyhow::Error> {
+    resolver_generation_refusal_in(store, visible, changed_files, None)
+}
+
+fn resolver_generation_refusal_in(
+    store: &GraphStore,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+    changed_files: Option<&[String]>,
+    repo_uid: Option<&str>,
+) -> Result<Option<nestweaver_engine::resolver_generation::DeadCodeRefusal>, anyhow::Error> {
     let db_path = match (store.db_path(), current_db_path(store)) {
         (Some(path), _) => path.to_path_buf(),
         (None, Ok(path)) => path,
@@ -21275,12 +21364,21 @@ fn resolver_generation_refusal(
         .filter(|repo| repo_is_visible(&repo.uid, visible))
         .collect();
     if let Some(changed_files) = changed_files {
-        nestweaver_engine::resolver_generation::incompatibility_for_changed_files_at(
-            store,
-            Some(&db_path),
-            changed_files,
-        )?
-        .retain_degrading(&mut repos);
+        let incompatibility = match repo_uid {
+            Some(repo) => {
+                nestweaver_engine::resolver_generation::incompatibility_for_changed_files_in_repo(
+                    store,
+                    repo,
+                    changed_files,
+                )?
+            }
+            None => nestweaver_engine::resolver_generation::incompatibility_for_changed_files_at(
+                store,
+                Some(&db_path),
+                changed_files,
+            )?,
+        };
+        incompatibility.retain_degrading(&mut repos);
     }
     Ok(nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(&db_path, &repos))
 }
