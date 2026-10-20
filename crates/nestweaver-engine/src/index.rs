@@ -5568,7 +5568,8 @@ where
         // Directory-only callers may supply synthetic revisions, including full
         // hexadecimal strings. Require a local Git administrative entry as well
         // as a full object ID before consulting the committed tree. A failed tree
-        // listing for that repository must not publish a clean coverage report.
+        // listing for that repository must not publish a clean coverage report,
+        // but it is disclosed rather than blocking the working-tree index.
         if root_path.is_some()
             && matches!(indexed_sha.len(), 40 | 64)
             && indexed_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -5576,20 +5577,32 @@ where
         {
             let mut occupied = present_files.clone();
             occupied.extend(skipped_files.iter().map(|skipped| skipped.path.clone()));
-            let missing = prepare_missing_committed_sources(
+            match prepare_missing_committed_sources(
                 reader,
                 reader.root(),
                 indexed_sha,
                 &occupied,
                 false,
-            )?;
-            log_unprepared_committed_sources(&missing);
-            for outcome in missing.into_values() {
-                if let PreparedIncrementalOutcome::PolicySkipped(skipped) = outcome
-                    && skipped.reason_code == SkipReasonCode::ReadError
-                {
-                    skipped_files.push(skipped);
+            ) {
+                Ok(missing) => {
+                    log_unprepared_committed_sources(&missing);
+                    for outcome in missing.into_values() {
+                        if let PreparedIncrementalOutcome::PolicySkipped(skipped) = outcome
+                            && skipped.reason_code == SkipReasonCode::ReadError
+                        {
+                            skipped_files.push(skipped);
+                        }
+                    }
                 }
+                // An unknown commit is a wrong revision, not a coverage gap:
+                // recording it as indexed would be false. A known commit whose
+                // tree cannot be listed is a damaged object store.
+                Err(error)
+                    if crate::git_diff::resolve_commit_ref(reader.root(), indexed_sha).is_ok() =>
+                {
+                    skipped_files.push(unverified_committed_coverage(&error));
+                }
+                Err(error) => return Err(error),
             }
         }
         skipped_files.extend(contract_plan.skipped_files.iter().cloned());
@@ -8841,21 +8854,27 @@ fn log_unprepared_committed_sources(missing: &HashMap<String, PreparedIncrementa
 /// An unchanged SHA did no work, so an inventory failure must not fail the run
 /// (nw-287). Disclose it so coverage does not read complete either.
 fn record_unverified_unchanged_coverage(result: &mut IncrementalResult, error: &anyhow::Error) {
-    tracing::warn!(
-        error = %format!("{error:#}"),
-        "could not verify committed source coverage of an up-to-date repo"
-    );
     record_incremental_file_outcome(
         result,
-        IncrementalFileOutcome::PolicySkipped(SkippedFile::new(
-            ".".to_string(),
-            SkipReasonCode::ReadError,
-            format!(
-                "committed source coverage could not be verified ({error:#}); repair the \
-                 repository and re-run the index"
-            ),
-        )),
+        IncrementalFileOutcome::PolicySkipped(unverified_committed_coverage(error)),
     );
+}
+
+/// A committed-tree listing failure (for example a damaged object store) must
+/// neither block indexing the working tree nor let coverage read complete.
+fn unverified_committed_coverage(error: &anyhow::Error) -> SkippedFile {
+    tracing::warn!(
+        error = %format!("{error:#}"),
+        "could not verify committed source coverage"
+    );
+    SkippedFile::new(
+        ".".to_string(),
+        SkipReasonCode::ReadError,
+        format!(
+            "committed source coverage could not be verified ({error:#}); repair the \
+             repository and re-run the index"
+        ),
+    )
 }
 
 fn tracked_ignored_source_paths(
@@ -11135,6 +11154,46 @@ mod tests {
         assert_eq!(store.graph_generation(), generation);
         assert!(!store.is_index_publication_dirty());
         assert_eq!(store.count_symbols().unwrap(), 0);
+    }
+
+    /// The daemon's index funnel: a known commit whose tree cannot be listed
+    /// (a damaged object store) still indexes the working tree, but coverage
+    /// discloses that committed sources were not verified.
+    #[test]
+    fn full_local_index_discloses_unlistable_commit_tree_without_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("kept.py"), "def kept():\n    return 1\n").unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let sha = git(&["rev-parse", "HEAD"]);
+        let tree = git(&["rev-parse", "HEAD^{tree}"]);
+        fs::remove_file(repo.join(".git/objects").join(&tree[..2]).join(&tree[2..])).unwrap();
+        let store = GraphStore::in_memory().unwrap();
+        let reader = crate::content_reader::FilesystemReader::new(&repo);
+        let local_root = repo.display().to_string();
+        let result = index_into_store(
+            &reader,
+            &store,
+            "test",
+            "https://example.test/unlistable-tree",
+            &sha,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&local_root),
+        )
+        .expect("a damaged commit tree must not block indexing the working tree");
+        assert_eq!(result.skipped_files.len(), 1, "{:?}", result.skipped_files);
+        assert_eq!(result.skipped_files[0].path, ".");
+        assert_eq!(
+            result.skipped_files[0].reason_code,
+            SkipReasonCode::ReadError
+        );
+        assert_eq!(store.lookup_symbols_by_name("kept").unwrap().len(), 1);
+        assert!(!store.is_index_publication_dirty());
     }
 
     #[test]

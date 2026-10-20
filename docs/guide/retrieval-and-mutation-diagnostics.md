@@ -207,10 +207,12 @@ stays excluded across plain and forced indexes; a newly ignored incumbent is
 removed. One unreadable-directory disclosure covers its descendants. Only the
 final restoration plan logs individual read failures, up to ten per run plus
 a summary. An unchanged-commit index still enumerates committed paths to verify
-coverage, but only missing eligible sources are prepared. When that inventory
-is unavailable, an unchanged-commit index still succeeds without writing, but
-reports a `ReadError` skip for `.` so coverage does not read complete. A
-changed-commit index fails instead.
+coverage, but only missing eligible sources are prepared. When a known commit's
+tree cannot be listed (for example, a damaged object store), the working tree is
+still indexed and a `ReadError` skip for `.` keeps coverage from reading
+complete. An unknown commit fails the index. In the incremental path, an
+unavailable source walk is disclosed the same way at an unchanged commit and
+fails the index at a changed one.
 
 Source or contract preparation failures before graph writes retire a fresh
 publication marker and generation reservation, so correcting the input permits
