@@ -4946,17 +4946,22 @@ fn manifest_sidecar_cache_salt(db_path: &Path) -> u64 {
 /// from a list to a refusal on exactly that transition.
 fn resolver_generation_cache_salt(db_path: &Path) -> u64 {
     use std::hash::{Hash, Hasher};
-    let generations = nestweaver_engine::resolver_generation::load(db_path);
-    if generations.repos.is_empty() {
-        // No record at all is the pre-nw-124 state and the default the key
-        // already had; contribute nothing so existing entries still hit.
-        return 0;
-    }
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    // `repos` is a BTreeMap, so this walk is ordered and the salt is stable.
-    for (uid, generation) in &generations.repos {
-        uid.hash(&mut hasher);
-        generation.hash(&mut hasher);
+    match nestweaver_engine::resolver_generation::load_strict(db_path) {
+        Ok(None) => return 0,
+        Ok(Some(generations)) => {
+            // A valid empty record is distinct from absent or unreadable metadata.
+            "resolver_generation_sidecar".hash(&mut hasher);
+            for (uid, generation) in &generations.repos {
+                uid.hash(&mut hasher);
+                generation.hash(&mut hasher);
+            }
+        }
+        Err(error) => {
+            // A failed verification must never inherit an absent-record answer.
+            "resolver_generation_unverifiable".hash(&mut hasher);
+            format!("{error:#}").hash(&mut hasher);
+        }
     }
     hasher.finish()
 }
@@ -14710,15 +14715,8 @@ fn diff_affected_tests_base_ref(
     let path = Path::new(&repository.path);
     let Some(git_dir) = indexed_work_tree_git_dir(path) else {
         let error = affected_tests_not_a_git_repository(repository);
-        if let Some(target) = gitfile_target(path, &path.join(".git"))
-            .and_then(|target| std::fs::canonicalize(target).ok())
-            .filter(|target| target.file_name().is_some_and(|name| name == ".git"))
-        {
-            anyhow::bail!(
-                "{error}; if this is a separate Git directory named .git, register its worktree with git --git-dir <dir> config core.worktree <absolute-work-tree> (directory: {})",
-                target.display()
-            );
-        }
+        // Gitfile targets and Git's stderr can name paths outside the selected
+        // repository. Keep refused metadata private; identify only this repo.
         return Err(error);
     };
     match diff_indexed_work_tree(path, &git_dir, base_ref) {
@@ -14755,23 +14753,49 @@ fn affected_tests_not_a_git_repository(
 /// for another repository even when `<path>/.git` is empty.
 fn git_command_for_indexed_path(path: &Path) -> std::process::Command {
     let mut command = std::process::Command::new("git");
-    command.env_remove("GIT_DIR");
-    command.env_remove("GIT_WORK_TREE");
+    // Clear every inherited Git routing/configuration variable, including
+    // indexed config pairs, alternates, common/index dirs and injected config.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    command.env("GIT_CONFIG_NOSYSTEM", "1");
+    command.env("GIT_CONFIG_SYSTEM", "/dev/null");
+    command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    command.env("GIT_ATTR_NOSYSTEM", "1");
+    command.env("GIT_NO_LAZY_FETCH", "1");
+    command.env("GIT_NO_REPLACE_OBJECTS", "1");
+    command.env("GIT_OPTIONAL_LOCKS", "0");
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    // No inspection command needs a transport. This outranks repository
+    // protocol.*.allow even on Git versions without GIT_NO_LAZY_FETCH.
+    command.env("GIT_ALLOW_PROTOCOL", "");
     // The caller classifies failures by git's message text, so pin the locale.
     command.env("LC_ALL", "C");
     // The indexed tree can author the git config the diff reads, and
     // `core.fsmonitor` names a program git would run. `-c` outranks any
     // repository config.
-    command.args(["-c", "core.fsmonitor=false"]);
+    command.args([
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "diff.ignoreSubmodules=all",
+    ]);
     command.env_remove("LANGUAGE");
     command.arg("-C").arg(path);
     command
 }
 
-/// Discovery command plus `--git-dir` of the directory this path resolved to.
+/// Pin both metadata and the selected checkout, regardless of local config.
+/// `.` is resolved after `-C`, so relative indexed paths work too.
 fn git_command_for_resolved_git_dir(path: &Path, git_dir: &Path) -> std::process::Command {
     let mut command = git_command_for_indexed_path(path);
-    command.arg("--git-dir").arg(git_dir);
+    command
+        .arg("--git-dir")
+        .arg(git_dir)
+        .arg("--work-tree")
+        .arg(".");
     command
 }
 
@@ -14783,15 +14807,12 @@ fn git_command_for_resolved_git_dir(path: &Path, git_dir: &Path) -> std::process
 /// repository fails that comparison. A symlink `.git` is not a directory
 /// entry of this path, so it is not accepted.
 ///
-/// A gitfile (linked worktree or submodule) is accepted when the target
-/// directory points back at this work tree: through its `gitdir` file (linked
-/// worktree) or its `core.worktree` setting (submodule). The returned
-/// directory is that target. A `--separate-git-dir` repository may have neither
-/// back-pointer; its self-contained metadata is also accepted. Metadata alone
-/// cannot prove the ownership of an arbitrary separate git directory. An
-/// unregistered target named `.git` is refused because it may belong to the
-/// checkout beside it; register a separate directory with
-/// `git --git-dir <dir> config core.worktree <absolute-work-tree>` to disambiguate.
+/// A gitfile needs a matching linked-worktree back-pointer or explicit
+/// `core.worktree` registration. With neither, only self-contained metadata
+/// physically inside the checkout is accepted. Unregistered external targets
+/// cannot be distinguished from another bare/separate repository. Register a
+/// legitimate external layout with `git --git-dir <dir> config core.worktree
+/// <absolute-work-tree>`. Metadata provenance cannot be proven from copied data.
 fn indexed_work_tree_git_dir(path: &Path) -> Option<std::path::PathBuf> {
     let dot_git = path.join(".git");
     let meta = std::fs::symlink_metadata(&dot_git).ok()?;
@@ -14810,6 +14831,9 @@ fn indexed_work_tree_git_dir(path: &Path) -> Option<std::path::PathBuf> {
 /// `path/.git` when both git-dir queries name that directory and nothing else.
 fn self_contained_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::PathBuf> {
     let canonical = std::fs::canonicalize(dot_git).ok()?;
+    if !git_metadata_is_self_contained(path, &canonical, true) {
+        return None;
+    }
     let absolute = rev_parse_git_path(path, "--absolute-git-dir")?;
     let common = rev_parse_git_path(path, "--git-common-dir")?;
     if absolute == canonical && common == canonical {
@@ -14827,16 +14851,10 @@ fn linked_worktree_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::Pat
         return None;
     }
     let inside_work_tree = canonical.starts_with(std::fs::canonicalize(path).ok()?);
-    // `--separate-git-dir` can put its metadata inside the work tree. Do not
-    // trust back-pointers authored there to authorize borrowing a different
-    // repository's common directory or object database.
-    if inside_work_tree
-        && (canonical.join("commondir").exists()
-            || canonical.join("objects/info/alternates").exists()
-            || ["objects", "refs"]
-                .iter()
-                .any(|entry| !git_metadata_tree_is_self_contained(&canonical.join(entry))))
-    {
+    if !git_metadata_is_self_contained(path, &canonical, !canonical.join("commondir").exists()) {
+        return None;
+    }
+    if inside_work_tree && canonical.join("commondir").exists() {
         return None;
     }
     // A `commondir` must be the main repository this worktree is registered
@@ -14851,37 +14869,113 @@ fn linked_worktree_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::Pat
         GitdirBackPointer::Mismatch => return None,
         GitdirBackPointer::Absent => {}
     }
-    // A submodule records its work tree as `core.worktree`: proof it is ours.
-    if core_worktree_points_at(&canonical, path) {
-        return Some(canonical);
+    // A mismatching registration is authoritative: never reinterpret another
+    // submodule's metadata as an unregistered separate directory.
+    match core_worktree_registration(&canonical, path) {
+        GitdirBackPointer::Matches => return Some(canonical),
+        GitdirBackPointer::Mismatch => return None,
+        GitdirBackPointer::Absent => {}
     }
-    // `git init --separate-git-dir` leaves no back-pointer at all, so nothing
-    // proves the target is ours. Accept it when it is this work tree's own git
-    // dir, but never a normal repository's embedded `.git`: that directory
-    // belongs to the work tree beside it, and a gitfile naming one is how a
-    // tree would borrow another repository's refs and objects. A bare
-    // repository named by a gitfile cannot be told from a separate git dir.
-    if canonical.file_name().is_some_and(|name| name == ".git") {
+    // External unregistered metadata is indistinguishable from another bare
+    // or separate repository. Containment is the only fallback we can prove.
+    if !inside_work_tree {
         return None;
     }
     let absolute = rev_parse_git_path(path, "--absolute-git-dir")?;
-    if absolute == canonical {
-        Some(canonical)
-    } else {
-        None
-    }
+    (absolute == canonical).then_some(canonical)
 }
 
-/// Internal separate metadata must not redirect objects or refs through a
-/// symlink, including loose object files and pack directories. Ordinary and
-/// external Git directories do not incur this walk.
-fn git_metadata_tree_is_self_contained(root: &Path) -> bool {
+/// Validate config without following includes, plus every Git-controlled path
+/// that can route reads to another object/ref/index database. Rejecting includes
+/// is intentional: the subsequent plumbing must never read external config.
+fn git_metadata_is_self_contained(work_tree: &Path, git_dir: &Path, objects: bool) -> bool {
+    let Ok(entries) = std::fs::read_dir(git_dir) else {
+        return false;
+    };
+    // This also covers split-index sharedindex.*, shallow, packed-refs and
+    // future top-level control files, rather than an incomplete allowlist.
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let Ok(kind) = entry.file_type() else {
+            return false;
+        };
+        if kind.is_symlink() || (!kind.is_file() && !kind.is_dir()) {
+            return false;
+        }
+    }
+    if git_dir.join("info").exists()
+        && !git_metadata_tree_is_self_contained(&git_dir.join("info"), false)
+    {
+        return false;
+    }
+    for config in [git_dir.join("config"), git_dir.join("config.worktree")] {
+        if !config.exists() {
+            continue;
+        }
+        let output = git_command_for_indexed_path(work_tree)
+            .args(["config", "--no-includes", "--file"])
+            .arg(&config)
+            .args([
+                "--get-regexp",
+                "^(include|includeif)\\.|^extensions\\.partialclone$|^remote\\..*\\.promisor$",
+            ])
+            .output();
+        // Exit 1 means no matching keys; all other outcomes fail closed.
+        if !output.is_ok_and(|output| output.status.code() == Some(1)) {
+            return false;
+        }
+        let storage = git_command_for_indexed_path(work_tree)
+            .args(["config", "--no-includes", "--file"])
+            .arg(&config)
+            .args(["--get-all", "extensions.refStorage"])
+            .output();
+        if !storage.is_ok_and(|output| {
+            output.status.code() == Some(1)
+                || (output.status.success() && output.stdout == b"files\n")
+        }) {
+            return false;
+        }
+        let output = git_command_for_indexed_path(work_tree)
+            .args(["config", "--no-includes", "--file"])
+            .arg(&config)
+            .args(["--bool", "--get", "core.bare"])
+            .output();
+        if !output.is_ok_and(|output| {
+            output.status.code() == Some(1)
+                || (output.status.success() && output.stdout == b"false\n")
+        }) {
+            return false;
+        }
+    }
+    !objects
+        || (["objects/info/alternates", "objects/info/http-alternates"]
+            .iter()
+            .all(|entry| !git_dir.join(entry).exists())
+            && ["objects", "refs"].iter().all(|entry| {
+                git_metadata_tree_is_self_contained(&git_dir.join(entry), *entry == "objects")
+            }))
+}
+
+/// Metadata must not redirect reads through symlinks or special files. This
+/// visits loose objects and refs too; correctness takes precedence over using
+/// an unsafe object/ref directory as a shortcut.
+fn git_metadata_tree_is_self_contained(root: &Path, reject_promisor_packs: bool) -> bool {
+    let pack_dir = root.join("pack");
     let mut pending = vec![root.to_path_buf()];
     while let Some(path) = pending.pop() {
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
             return false;
         };
-        if metadata.file_type().is_symlink() {
+        if metadata.file_type().is_symlink()
+            || (!metadata.is_file() && !metadata.is_dir())
+            || (reject_promisor_packs
+                && path.parent() == Some(pack_dir.as_path())
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "promisor"))
+        {
             return false;
         }
         if metadata.is_dir() {
@@ -14922,6 +15016,9 @@ fn commondir_is_own_registration(git_dir: &Path) -> bool {
     let Ok(common) = std::fs::canonicalize(resolved) else {
         return false;
     };
+    if !git_metadata_is_self_contained(git_dir, &common, true) {
+        return false;
+    }
     let Some(worktrees) = git_dir.parent() else {
         return false;
     };
@@ -14967,34 +15064,49 @@ fn gitdir_back_pointer(git_dir: &Path, dot_git: &Path) -> GitdirBackPointer {
 
 /// A submodule records its work tree as `core.worktree` in
 /// `<git dir>/config`, relative to the git dir.
-fn core_worktree_points_at(git_dir: &Path, work_tree: &Path) -> bool {
-    let Ok(output) = git_command_for_indexed_path(work_tree)
-        .arg("config")
-        .arg("--file")
-        .arg(git_dir.join("config"))
-        .arg("--get")
-        .arg("core.worktree")
-        .output()
-    else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
+fn core_worktree_registration(git_dir: &Path, work_tree: &Path) -> GitdirBackPointer {
+    let mut registered = false;
+    for config in [git_dir.join("config"), git_dir.join("config.worktree")] {
+        let Ok(output) = git_command_for_indexed_path(work_tree)
+            .args(["config", "--no-includes", "--file"])
+            .arg(config)
+            .args(["--get-all", "core.worktree"])
+            .output()
+        else {
+            return GitdirBackPointer::Mismatch;
+        };
+        if output.status.code() == Some(1) {
+            continue;
+        }
+        if !output.status.success() {
+            return GitdirBackPointer::Mismatch;
+        }
+        let Ok(text) = String::from_utf8(output.stdout) else {
+            return GitdirBackPointer::Mismatch;
+        };
+        let mut lines = text.lines();
+        let Some(line) = lines.next().filter(|line| !line.is_empty()) else {
+            return GitdirBackPointer::Mismatch;
+        };
+        if lines.next().is_some() {
+            return GitdirBackPointer::Mismatch;
+        }
+        let raw = Path::new(line);
+        let target = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            git_dir.join(raw)
+        };
+        if !same_directory(&target, work_tree) {
+            return GitdirBackPointer::Mismatch;
+        }
+        registered = true;
     }
-    let Ok(text) = String::from_utf8(output.stdout) else {
-        return false;
-    };
-    let line = text.trim();
-    if line.is_empty() {
-        return false;
-    }
-    let raw = Path::new(line);
-    let target = if raw.is_absolute() {
-        raw.to_path_buf()
+    if registered {
+        GitdirBackPointer::Matches
     } else {
-        git_dir.join(raw)
-    };
-    same_directory(&target, work_tree)
+        GitdirBackPointer::Absent
+    }
 }
 
 /// Path named by a `gitdir: <path>` gitfile. Relative paths are relative to
@@ -15040,37 +15152,76 @@ fn rev_parse_git_path(path: &Path, flag: &str) -> Option<std::path::PathBuf> {
     std::fs::canonicalize(absolute).ok()
 }
 
-/// Diff `base_ref` with `--git-dir` set to the directory
-/// [`indexed_work_tree_git_dir`] resolved. The caller's `GIT_DIR` and
-/// `GIT_WORK_TREE` stay removed. The revision is resolved to a commit id
-/// before `git diff` sees it.
+/// Compare the resolved commit to the index, then conservatively include
+/// stat-dirty tracked worktree paths and every gitlink. The plumbing never
+/// converts worktree contents or recursively inspects another submodule.
 fn diff_indexed_work_tree(
     path: &Path,
     git_dir: &Path,
     base_ref: &str,
 ) -> Result<Vec<std::path::PathBuf>, anyhow::Error> {
     let oid = resolve_indexed_commit(path, git_dir, base_ref)?;
-    let mut command = git_command_for_resolved_git_dir(path, git_dir);
-    // Repository config can also route the work tree through core.worktree.
-    // Pin the checkout as well as its Git directory; -C alone does not do so.
-    command
-        .arg("--work-tree")
-        .arg(std::fs::canonicalize(path).context("failed to resolve indexed work tree")?)
-        .arg("diff")
-        .arg("--name-only")
-        .arg("-z")
+    let mut staged = git_command_for_resolved_git_dir(path, git_dir);
+    staged
+        .args([
+            "diff-index",
+            "--cached",
+            "--name-only",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=none",
+            "--submodule=short",
+            "-z",
+        ])
         .arg(&oid)
         .arg("--");
+    let mut files = affected_tests_git_names(staged)?;
+    // `git diff` hashes worktree contents and executes clean/process filters,
+    // even with --no-textconv. ls-files -m is stat-only, so it conservatively
+    // includes touched files while never asking Git to convert their contents.
+    let mut modified = git_command_for_resolved_git_dir(path, git_dir);
+    modified
+        .arg("--work-tree")
+        .arg(std::fs::canonicalize(path).context("failed to resolve indexed work tree")?)
+        .args(["ls-files", "--modified", "--deleted", "-z"]);
+    files.extend(affected_tests_git_names(modified)?);
+    // Inspecting submodule dirtiness recursively can run another repository's
+    // configured programs. Conservatively select every gitlink instead.
+    let mut entries = git_command_for_resolved_git_dir(path, git_dir);
+    entries.args(["ls-files", "--stage", "-z"]);
+    for record in affected_tests_git_output(entries)?.split(|byte| *byte == 0) {
+        if record.starts_with(b"160000 ") {
+            let name = record
+                .splitn(2, |byte| *byte == b'\t')
+                .nth(1)
+                .context("Git returned a malformed submodule index entry")?;
+            let name =
+                std::str::from_utf8(name).context("Git returned a non-UTF-8 submodule path")?;
+            files.push(std::path::PathBuf::from(name));
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn affected_tests_git_names(
+    command: std::process::Command,
+) -> Result<Vec<std::path::PathBuf>, anyhow::Error> {
+    parse_affected_tests_diff_names(&affected_tests_git_output(command)?)
+}
+
+fn affected_tests_git_output(command: std::process::Command) -> Result<Vec<u8>, anyhow::Error> {
     let output = nestweaver_engine::git_cmd::run_git_with_timeout(
         command,
         nestweaver_engine::git_cmd::git_net_timeout(),
     )
-    .context("failed to run git diff --name-only")?;
+    .map_err(|_| anyhow!("failed to inspect indexed Git changes"))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git diff failed: {}", stderr.trim());
+        anyhow::bail!("failed to inspect indexed Git changes");
     }
-    parse_affected_tests_diff_names(&output.stdout)
+    Ok(output.stdout)
 }
 
 fn resolve_indexed_commit(
@@ -15090,14 +15241,9 @@ fn resolve_indexed_commit(
         command,
         nestweaver_engine::git_cmd::git_net_timeout(),
     )
-    .with_context(|| format!("failed to resolve git commit ref in {}", path.display()))?;
+    .map_err(|_| anyhow!("failed to resolve git commit ref in indexed repository"))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "invalid git commit ref in {}: {}",
-            path.display(),
-            stderr.trim()
-        );
+        anyhow::bail!("invalid git commit ref in indexed repository");
     }
     let stdout = std::str::from_utf8(&output.stdout)
         .context("git rev-parse returned a non-UTF-8 object ID")?;
@@ -15333,6 +15479,12 @@ mod affected_tests_base_ref_tests {
             "a separate git dir has no worktree back-pointer"
         );
 
+        assert!(
+            indexed_work_tree_git_dir(&work).is_none(),
+            "external ownership must be registered"
+        );
+        git(&work, &["config", "core.worktree", work.to_str().unwrap()]);
+
         let uid = "repo:test:separate";
         let store = GraphStore::in_memory().unwrap();
         store
@@ -15399,7 +15551,14 @@ mod affected_tests_base_ref_tests {
                 &["config", "core.worktree", foreign.path().to_str().unwrap()],
             );
             std::fs::write(work.path().join("tracked.txt"), "after\n").unwrap();
-            assert_diffs_tracked_file(work.path(), "configured-foreign-worktree");
+            if separate {
+                assert!(
+                    indexed_work_tree_git_dir(work.path()).is_none(),
+                    "mismatching explicit registration must fail closed"
+                );
+            } else {
+                assert_diffs_tracked_file(work.path(), "configured-foreign-worktree");
+            }
         }
     }
 
@@ -15580,6 +15739,10 @@ mod affected_tests_base_ref_tests {
     }
 
     fn assert_other_repository_files_are_not_returned(path: &std::path::Path, name: &str) {
+        git(
+            path,
+            &["--work-tree=.", "diff", "--name-only", "HEAD", "--"],
+        );
         let uid = format!("repo:test:{name}");
         let store = GraphStore::in_memory().unwrap();
         store.insert_repo(&indexed_repo(&uid, name, path)).unwrap();
@@ -15652,6 +15815,17 @@ mod affected_tests_base_ref_tests {
         let sub = outer.path().join("sub");
         std::fs::write(sub.join("tracked.txt"), "after\n").unwrap();
         assert_diffs_tracked_file(&sub, "submodule-repo");
+        let impostor = tempfile::tempdir().unwrap();
+        // Preserve a Git-valid target but give its explicit registration the
+        // wrong checkout. Rewriting relative gitfile paths is not necessary:
+        // submodule add records an absolute target in this fixture.
+        let target = gitfile_target(&sub, &sub.join(".git")).unwrap();
+        std::fs::write(
+            impostor.path().join(".git"),
+            format!("gitdir: {}\n", target.display()),
+        )
+        .unwrap();
+        assert_other_repository_files_are_not_returned(impostor.path(), "copied-submodule");
     }
 
     fn assert_diffs_tracked_file(path: &std::path::Path, name: &str) {
@@ -15725,7 +15899,10 @@ mod affected_tests_base_ref_tests {
 
         let alternates = tempfile::tempdir().unwrap();
         let evil = alternates.path().join(".evil");
-        std::fs::create_dir_all(evil.join("objects").join("info")).unwrap();
+        git(
+            alternates.path(),
+            &["init", "-q", "--bare", evil.to_str().unwrap()],
+        );
         std::fs::write(alternates.path().join(".git"), "gitdir: .evil\n").unwrap();
         std::fs::write(evil.join("config"), "[core]\n\tworktree = ..\n").unwrap();
         std::fs::write(
@@ -15733,7 +15910,13 @@ mod affected_tests_base_ref_tests {
             format!("{}\n", real_git.join("objects").display()),
         )
         .unwrap();
-        std::fs::copy(real_git.join("HEAD"), evil.join("HEAD")).unwrap();
+        git(real.path(), &["update-ref", "refs/heads/borrowed", "HEAD"]);
+        std::fs::copy(
+            real_git.join("refs/heads/borrowed"),
+            evil.join("refs/heads/borrowed"),
+        )
+        .unwrap();
+        std::fs::write(evil.join("HEAD"), "ref: refs/heads/borrowed\n").unwrap();
         assert_other_repository_files_are_not_returned(alternates.path(), "forged-alternates");
     }
 
@@ -15745,59 +15928,445 @@ mod affected_tests_base_ref_tests {
         let real = tempfile::tempdir().unwrap();
         init_repo_with_tracked_file(real.path(), "only-real.txt");
         git(real.path(), &["update-ref", "refs/heads/borrowed", "HEAD"]);
-        for mode in ["alternates", "objects", "loose-object"] {
-            let forged = tempfile::tempdir().unwrap();
-            init_repo_with_tracked_file(forged.path(), "tracked.txt");
-            let evil = forged.path().join(".git-storage");
-            git(
-                forged.path(),
-                &["init", "-q", "--separate-git-dir", evil.to_str().unwrap()],
-            );
-            std::fs::remove_dir_all(evil.join("objects")).unwrap();
-            if mode == "objects" {
-                std::os::unix::fs::symlink(real.path().join(".git/objects"), evil.join("objects"))
-                    .unwrap();
-            } else if mode == "loose-object" {
-                std::fs::create_dir(evil.join("objects")).unwrap();
-                for entry in std::fs::read_dir(real.path().join(".git/objects")).unwrap() {
-                    let entry = entry.unwrap();
-                    let prefix = entry.file_name();
-                    if prefix.len() != 2 {
-                        continue;
-                    }
-                    let destination = evil.join("objects").join(&prefix);
-                    std::fs::create_dir(&destination).unwrap();
-                    for object in std::fs::read_dir(entry.path()).unwrap() {
-                        let object = object.unwrap();
-                        std::os::unix::fs::symlink(
-                            object.path(),
-                            destination.join(object.file_name()),
-                        )
-                        .unwrap();
+        for layout in ["ordinary", "internal", "external"] {
+            for mode in ["alternates", "objects", "loose-object"] {
+                let forged = tempfile::tempdir().unwrap();
+                init_repo_with_tracked_file(forged.path(), "tracked.txt");
+                // Do not let equal fixture blobs collapse victim deletion and
+                // our addition into a rename that displays only our filename.
+                git(forged.path(), &["config", "diff.renames", "false"]);
+                let external = tempfile::tempdir().unwrap();
+                let evil = match layout {
+                    "ordinary" => forged.path().join(".git"),
+                    "internal" => forged.path().join(".git-storage"),
+                    _ => external.path().join("metadata"),
+                };
+                if layout != "ordinary" {
+                    git(
+                        forged.path(),
+                        &["init", "-q", "--separate-git-dir", evil.to_str().unwrap()],
+                    );
+                    if layout == "external" {
+                        git(
+                            forged.path(),
+                            &["config", "core.worktree", forged.path().to_str().unwrap()],
+                        );
                     }
                 }
-            } else {
-                std::fs::create_dir_all(evil.join("objects/info")).unwrap();
-                std::fs::write(
-                    evil.join("objects/info/alternates"),
-                    format!("{}\n", real.path().join(".git/objects").display()),
+                std::fs::remove_dir_all(evil.join("objects")).unwrap();
+                if mode == "objects" {
+                    std::os::unix::fs::symlink(
+                        real.path().join(".git/objects"),
+                        evil.join("objects"),
+                    )
+                    .unwrap();
+                } else if mode == "loose-object" {
+                    std::fs::create_dir(evil.join("objects")).unwrap();
+                    for entry in std::fs::read_dir(real.path().join(".git/objects")).unwrap() {
+                        let entry = entry.unwrap();
+                        let prefix = entry.file_name();
+                        if prefix.len() != 2 {
+                            continue;
+                        }
+                        let destination = evil.join("objects").join(&prefix);
+                        std::fs::create_dir(&destination).unwrap();
+                        for object in std::fs::read_dir(entry.path()).unwrap() {
+                            let object = object.unwrap();
+                            std::os::unix::fs::symlink(
+                                object.path(),
+                                destination.join(object.file_name()),
+                            )
+                            .unwrap();
+                        }
+                    }
+                } else {
+                    std::fs::create_dir_all(evil.join("objects/info")).unwrap();
+                    std::fs::write(
+                        evil.join("objects/info/alternates"),
+                        format!("{}\n", real.path().join(".git/objects").display()),
+                    )
+                    .unwrap();
+                }
+                std::fs::copy(
+                    real.path().join(".git/refs/heads/borrowed"),
+                    evil.join("refs/heads/borrowed"),
                 )
                 .unwrap();
+                std::fs::write(evil.join("HEAD"), "ref: refs/heads/borrowed\n").unwrap();
+                // Prove the unguarded command actually borrows victim filenames.
+                let baseline = std::process::Command::new("git")
+                    .current_dir(forged.path())
+                    .args(["diff", "--name-only", "HEAD"])
+                    .output()
+                    .unwrap();
+                assert!(baseline.status.success());
+                assert!(
+                    String::from_utf8_lossy(&baseline.stdout).contains("only-real.txt"),
+                    "{layout}/{mode}: {}",
+                    String::from_utf8_lossy(&baseline.stdout)
+                );
+                assert_other_repository_files_are_not_returned(
+                    forged.path(),
+                    "borrowed-object-database",
+                );
             }
-            std::fs::copy(
-                real.path().join(".git/refs/heads/borrowed"),
-                evil.join("refs/heads/borrowed"),
+        }
+    }
+
+    #[test]
+    fn affected_tests_base_ref_rejects_unregistered_external_or_bare_metadata() {
+        for bare in [false, true] {
+            let victim = tempfile::tempdir().unwrap();
+            init_repo_with_tracked_file(victim.path(), "only-real.txt");
+            let container = tempfile::tempdir().unwrap();
+            let metadata = container.path().join("victim-metadata");
+            if bare {
+                git(
+                    container.path(),
+                    &[
+                        "clone",
+                        "-q",
+                        "--bare",
+                        victim.path().to_str().unwrap(),
+                        metadata.to_str().unwrap(),
+                    ],
+                );
+            } else {
+                git(
+                    victim.path(),
+                    &[
+                        "init",
+                        "-q",
+                        "--separate-git-dir",
+                        metadata.to_str().unwrap(),
+                    ],
+                );
+            }
+            let fake = tempfile::tempdir().unwrap();
+            std::fs::write(
+                fake.path().join(".git"),
+                format!("gitdir: {}\n", metadata.display()),
             )
             .unwrap();
-            std::fs::write(evil.join("HEAD"), "ref: refs/heads/borrowed\n").unwrap();
-            // Establish that the forged layout is valid to Git, rather than
-            // relying on an incomplete repository to make the tool refuse.
-            git(forged.path(), &["diff", "--name-only", "HEAD"]);
-            assert_other_repository_files_are_not_returned(
-                forged.path(),
-                "borrowed-object-database",
+            assert_other_repository_files_are_not_returned(fake.path(), "external-unregistered");
+            let selected = AffectedTestsBaseRefRepository {
+                uid: "repo:test:private".into(),
+                name: "private".into(),
+                path: fake.path().display().to_string(),
+            };
+            let error = diff_affected_tests_base_ref(&selected, "HEAD")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                !error.contains(metadata.to_str().unwrap()),
+                "refused target path leaked: {error}"
             );
         }
+    }
+
+    #[test]
+    fn affected_tests_base_ref_rejects_symlinked_control_files_and_refs() {
+        for entry in [
+            "index",
+            "packed-refs",
+            "config",
+            "config.worktree",
+            "refs",
+            "sharedindex",
+        ] {
+            let work = tempfile::tempdir().unwrap();
+            init_repo_with_tracked_file(work.path(), "tracked.txt");
+            git(work.path(), &["pack-refs", "--all"]);
+            let outside = tempfile::tempdir().unwrap();
+            let metadata = work.path().join(".git");
+            let relative = if entry == "sharedindex" {
+                git(work.path(), &["update-index", "--split-index"]);
+                std::fs::read_dir(&metadata)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .find(|entry| entry.to_string_lossy().starts_with("sharedindex."))
+                    .unwrap()
+            } else if entry == "config.worktree" {
+                std::fs::copy(metadata.join("config"), metadata.join(entry)).unwrap();
+                std::ffi::OsString::from(entry)
+            } else {
+                std::ffi::OsString::from(entry)
+            };
+            let original = metadata.join(&relative);
+            let target = outside.path().join(&relative);
+            std::fs::rename(&original, &target).unwrap();
+            std::os::unix::fs::symlink(&target, &original).unwrap();
+            std::fs::write(work.path().join("tracked.txt"), "after\n").unwrap();
+            assert_other_repository_files_are_not_returned(work.path(), "symlink-control-file");
+        }
+    }
+
+    #[test]
+    fn affected_tests_base_ref_does_not_disclose_a_victim_index() {
+        let work = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(work.path(), "tracked.txt");
+        let victim = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(victim.path(), "victim-secret.txt");
+        std::fs::remove_file(work.path().join(".git/index")).unwrap();
+        std::os::unix::fs::symlink(
+            victim.path().join(".git/index"),
+            work.path().join(".git/index"),
+        )
+        .unwrap();
+        let baseline = std::process::Command::new("git")
+            .current_dir(work.path())
+            .args(["ls-files", "--modified", "--deleted", "-z"])
+            .output()
+            .unwrap();
+        assert!(baseline.status.success());
+        assert!(
+            String::from_utf8_lossy(&baseline.stdout).contains("victim-secret.txt"),
+            "unguarded index inventory must disclose the victim filename"
+        );
+        let selected = AffectedTestsBaseRefRepository {
+            uid: "repo:test:index".into(),
+            name: "index".into(),
+            path: work.path().display().to_string(),
+        };
+        let error = diff_affected_tests_base_ref(&selected, "HEAD")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !error.contains("victim-secret.txt")
+                && !error.contains(victim.path().to_str().unwrap()),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn affected_tests_base_ref_refuses_an_absolute_head_symlink() {
+        let work = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(work.path(), "tracked.txt");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::rename(work.path().join(".git/HEAD"), outside.path().join("HEAD")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("HEAD"), work.path().join(".git/HEAD"))
+            .unwrap();
+        let baseline = std::process::Command::new("git")
+            .current_dir(work.path())
+            .args(["rev-parse", "--absolute-git-dir"])
+            .output()
+            .unwrap();
+        assert!(
+            !baseline.status.success(),
+            "Git already refuses an absolute HEAD symlink"
+        );
+        assert!(indexed_work_tree_git_dir(work.path()).is_none());
+    }
+
+    #[test]
+    fn affected_tests_base_ref_rejects_repository_config_includes() {
+        for worktree_config in [false, true] {
+            let work = tempfile::tempdir().unwrap();
+            init_repo_with_tracked_file(work.path(), "tracked.txt");
+            let external = tempfile::tempdir().unwrap();
+            let include = external.path().join("private-config");
+            std::fs::write(&include, "[user]\nname = private\n").unwrap();
+            if worktree_config {
+                git(
+                    work.path(),
+                    &["config", "extensions.worktreeConfig", "true"],
+                );
+                git(
+                    work.path(),
+                    &[
+                        "config",
+                        "--worktree",
+                        "include.path",
+                        include.to_str().unwrap(),
+                    ],
+                );
+            } else {
+                git(
+                    work.path(),
+                    &["config", "include.path", include.to_str().unwrap()],
+                );
+            }
+            assert_other_repository_files_are_not_returned(work.path(), "included-config");
+        }
+    }
+
+    #[test]
+    fn affected_tests_base_ref_never_runs_clean_or_process_filters() {
+        use std::os::unix::fs::PermissionsExt;
+        for process in [false, true] {
+            let work = tempfile::tempdir().unwrap();
+            init_repo_with_tracked_file(work.path(), "tracked.txt");
+            std::fs::write(work.path().join(".gitattributes"), "*.txt filter=attack\n").unwrap();
+            git(work.path(), &["add", ".gitattributes"]);
+            git(work.path(), &["commit", "-q", "-m", "attributes"]);
+            let executable = tempfile::tempdir().unwrap();
+            let marker = executable.path().join("executed");
+            let script = executable.path().join("filter");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\ntouch '{}'\n{}\n",
+                    marker.display(),
+                    if process { "exit 1" } else { "cat" }
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            git(
+                work.path(),
+                &[
+                    "config",
+                    if process {
+                        "filter.attack.process"
+                    } else {
+                        "filter.attack.clean"
+                    },
+                    script.to_str().unwrap(),
+                ],
+            );
+            std::fs::write(work.path().join("tracked.txt"), "after\n").unwrap();
+            // Demonstrate the reported exploit with the previous porcelain,
+            // even with both commonly suggested execution guards enabled.
+            let _baseline = std::process::Command::new("git")
+                .current_dir(work.path())
+                .args([
+                    "diff",
+                    "--name-only",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "HEAD",
+                    "--",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                marker.exists(),
+                "fixture must demonstrate executable {process}"
+            );
+            std::fs::remove_file(&marker).unwrap();
+            assert_diffs_tracked_file(work.path(), "untrusted-filter");
+            assert!(!marker.exists(), "the tool executed a repository filter");
+        }
+    }
+
+    #[test]
+    fn affected_tests_base_ref_accepts_a_branch_named_with_promisor_suffix() {
+        let work = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(work.path(), "tracked.txt");
+        git(work.path(), &["branch", "feature.promisor"]);
+        std::fs::write(
+            work.path().join(".git/info/note.promisor"),
+            "ordinary metadata",
+        )
+        .unwrap();
+        std::fs::write(work.path().join("tracked.txt"), "after\n").unwrap();
+        assert_diffs_tracked_file(work.path(), "promisor-suffix");
+    }
+
+    #[test]
+    fn affected_tests_base_ref_never_fetches_promisor_objects() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(work.path(), "tracked.txt");
+        let executable = tempfile::tempdir().unwrap();
+        let marker = executable.path().join("executed");
+        let script = executable.path().join("remote");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let head = std::process::Command::new("git")
+            .current_dir(work.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        let oid = String::from_utf8(head.stdout).unwrap();
+        let oid = oid.trim();
+        git(
+            work.path(),
+            &["config", "core.repositoryformatversion", "1"],
+        );
+        git(
+            work.path(),
+            &["config", "extensions.partialClone", "origin"],
+        );
+        git(work.path(), &["config", "remote.origin.promisor", "true"]);
+        git(
+            work.path(),
+            &[
+                "config",
+                "remote.origin.url",
+                &format!("ext::{}", script.display()),
+            ],
+        );
+        git(work.path(), &["config", "protocol.ext.allow", "always"]);
+        std::fs::remove_file(
+            work.path()
+                .join(".git/objects")
+                .join(&oid[..2])
+                .join(&oid[2..]),
+        )
+        .unwrap();
+        let baseline = std::process::Command::new("git")
+            .current_dir(work.path())
+            .env_remove("GIT_NO_LAZY_FETCH")
+            .env_remove("GIT_ALLOW_PROTOCOL")
+            .args(["diff-index", "--cached", "--name-only", "HEAD", "--"])
+            .output()
+            .unwrap();
+        assert!(!baseline.status.success());
+        assert!(
+            marker.exists(),
+            "missing-object fixture must execute its configured transport"
+        );
+        std::fs::remove_file(&marker).unwrap();
+        let selected = AffectedTestsBaseRefRepository {
+            uid: "repo:test:promisor".into(),
+            name: "promisor".into(),
+            path: work.path().display().to_string(),
+        };
+        let error = diff_affected_tests_base_ref(&selected, "HEAD").unwrap_err();
+        assert!(error.to_string().contains("not a git repository"));
+        assert!(!marker.exists(), "tool started a lazy fetch transport");
+    }
+
+    #[test]
+    fn affected_tests_base_ref_ignores_inherited_git_routing_and_config() {
+        const CHILD: &str = "NW_GIT_ROUTING_CHILD";
+        if let Some(path) = std::env::var_os(CHILD) {
+            assert_diffs_tracked_file(Path::new(&path), "inherited-routing");
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(work.path(), "tracked.txt");
+        std::fs::write(work.path().join("tracked.txt"), "after\n").unwrap();
+        let victim = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(victim.path(), "only-real.txt");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tools::affected_tests_base_ref_tests::affected_tests_base_ref_ignores_inherited_git_routing_and_config", "--nocapture"])
+            .env(CHILD, work.path())
+            .env("GIT_DIR", victim.path().join(".git"))
+            .env("GIT_COMMON_DIR", victim.path().join(".git"))
+            .env("GIT_WORK_TREE", victim.path())
+            .env("GIT_INDEX_FILE", victim.path().join(".git/index"))
+            .env("GIT_OBJECT_DIRECTORY", victim.path().join(".git/objects"))
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", victim.path().join(".git/objects"))
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.worktree")
+            .env("GIT_CONFIG_VALUE_0", victim.path())
+            .env("GIT_CONFIG_PARAMETERS", "'core.bare'='true'")
+            .env("GIT_CONFIG_SYSTEM", victim.path().join(".git/config"))
+            .env("GIT_CONFIG_GLOBAL", victim.path().join(".git/config"))
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// The repository's own config can name a `core.fsmonitor` program; the
@@ -21691,14 +22260,17 @@ mod investigate_body_complete_schema_tests {
 /// and is typically hidden from the model, so a disclosure placed there would
 /// be invisible to precisely the reader that needs it. It is a
 /// natural-language sentence because the model reads text.
-fn ranking_staleness_note(store: &GraphStore) -> Option<String> {
-    let db_path = generation_evidence_path(store).ok()?;
-    let repos = store.list_repos(None).ok()?;
-    let uids: Vec<String> = repos.into_iter().map(|repo| repo.uid).collect();
-    if uids.is_empty() {
-        return None;
-    }
-    nestweaver_engine::resolver_generation::staleness_note(&db_path, &uids)
+fn ranking_staleness_note(
+    store: &GraphStore,
+) -> Result<(Option<String>, Vec<String>), anyhow::Error> {
+    let db_path = generation_evidence_path(store)?;
+    let repos = store.list_repos(None)?;
+    let generations =
+        nestweaver_engine::resolver_generation::load_strict(&db_path)?.unwrap_or_default();
+    let stale = generations.stale_repos(repos.iter().map(|repo| repo.uid.as_str()));
+    let note =
+        nestweaver_engine::resolver_generation::staleness_note_for(&stale, Some(repos.len()));
+    Ok((note, stale))
 }
 
 /// The database whose resolver-generation sidecar is authoritative for `store`.
@@ -21750,47 +22322,68 @@ fn ranking_stale_repos(store: &GraphStore) -> Vec<String> {
 /// there is. Exporting the one attacher is what stops the daemon growing a
 /// second, drifting spelling of the same disclosure.
 pub fn attach_ranking_staleness(resp: &mut Value, store: &GraphStore) {
-    // nw-370: fail CLOSED when the answer cannot be computed.
-    //
-    // `ranking_stale_repos` and `ranking_staleness_note` both `.ok()?` their
-    // way out of a missing `CURRENT_DB_PATH` or a failing `list_repos`, and the
-    // two lines below then turned that into `rankings_stale: false` — a
-    // confident "your rankings are current" produced by an inability to look.
-    // That is the same defect this very field exists to remove: this file's own
-    // doc for it says "an absent key cannot be read as `false`", and a
-    // FABRICATED `false` is strictly worse than an absent one.
-    //
-    // It is not hypothetical. It fired on the first new caller: the daemon's
-    // `repo_map_json` runs its work on a `spawn_blocking` worker where the
-    // thread-local was unset, so `repo-map` via daemon replied "not stale" on a
-    // generation-3 database while `hubs` on the same daemon replied "stale".
-    // The call site is fixed; this makes the next one loud instead of silent.
-    let unavailable = match (generation_evidence_path(store), store.list_repos(None)) {
-        (Err(error), _) => Some(format!(
-            "the database path is not set on this server ({error})"
-        )),
-        (Ok(_), Err(error)) => Some(format!("the repo list could not be read ({error})")),
-        (Ok(_), Ok(_)) => None,
-    };
-    if let Some(reason) = unavailable {
-        resp["rankings_stale"] = json!(true);
-        // Empty, not absent: nothing can be PROVEN stale here, and naming a
-        // repo we did not check would be the same invention in the other
-        // direction.
-        resp["stale_repos"] = json!([]);
-        attach_note(
-            resp,
-            format!(
-                "resolver-generation staleness could not be determined because {reason};                  these rankings are UNVERIFIED, not verified-current. Check                  `nestweaver stale-check` before trusting them."
-            ),
-        );
-        return;
+    match ranking_staleness_note(store) {
+        Ok((note, stale_repos)) => {
+            resp["rankings_stale"] = json!(!stale_repos.is_empty());
+            resp["stale_repos"] = json!(stale_repos);
+            if let Some(note) = note {
+                attach_note(resp, note);
+            }
+        }
+        Err(error) => {
+            // Unknown compatibility cannot become a clean ranking or a claim
+            // that every repository simply predates the generation record.
+            let error = format!("{error:#}");
+            resp["rankings_stale"] = json!(true);
+            resp["stale_repos"] = json!([]);
+            resp["resolver_generation_error"] = json!(error);
+            attach_note(
+                resp,
+                format!(
+                    "could not verify resolver generation metadata; rankings may be stale: {error}. Repair the metadata and retry before trusting these rankings."
+                ),
+            );
+        }
     }
-    let note = ranking_staleness_note(store);
-    resp["rankings_stale"] = json!(note.is_some());
-    resp["stale_repos"] = json!(ranking_stale_repos(store));
-    if let Some(note) = note {
-        attach_note(resp, note);
+}
+
+#[cfg(test)]
+mod ranking_verification_error_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_ranking_generation_metadata_is_explicit_in_daemon_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let store = GraphStore::open(&db).unwrap();
+        let sidecar = nestweaver_engine::sidecar_path(
+            &db,
+            nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+        );
+        std::fs::write(&sidecar, "{malformed").unwrap();
+        let mut response = json!({"hubs": []});
+        attach_ranking_staleness(&mut response, &store);
+        assert_eq!(response["rankings_stale"], true);
+        assert_eq!(response["stale_repos"], json!([]));
+        assert!(
+            response["resolver_generation_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("decode resolver generation sidecar"))
+        );
+        assert!(
+            response["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("could not verify resolver generation metadata"))
+        );
+
+        std::fs::remove_file(sidecar).unwrap();
+        let mut absent = json!({"hubs": []});
+        attach_ranking_staleness(&mut absent, &store);
+        assert_eq!(
+            absent["rankings_stale"], false,
+            "an empty graph has no incompatible repositories"
+        );
+        assert!(absent.get("resolver_generation_error").is_none());
     }
 }
 
@@ -23809,6 +24402,7 @@ mod cache_dispatch_tests {
         let dirty = dispatch(&store, None, "affected_tests", args.clone(), None).unwrap();
         assert_eq!(dirty["changed_files"], json!(["main.js"]));
         fs::write(src.join("main.js"), &original).unwrap();
+        git(&["update-index", "--refresh"]);
         let clean_again = dispatch(&store, None, "affected_tests", args.clone(), None).unwrap();
         assert_eq!(clean_again["changed_files"], json!([]));
 
@@ -23838,6 +24432,44 @@ mod cache_dispatch_tests {
         assert_eq!(first, second);
         assert_eq!(CACHE_MISSES.with(|count| count.get()), 1);
         assert_eq!(CACHE_HITS.with(|count| count.get()), 1);
+    }
+
+    #[test]
+    fn cached_ranking_cannot_hide_failed_resolver_metadata_verification() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        let generation = store.graph_generation();
+        let sidecar = nestweaver_engine::sidecar_path(
+            &db_path,
+            nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+        );
+        if sidecar.exists() {
+            fs::remove_file(&sidecar).unwrap();
+        }
+        let args = json!({"limit": 5});
+        let initial = dispatch(&store, None, "hub_nodes", args.clone(), None).unwrap();
+        assert!(initial.get("resolver_generation_error").is_none());
+        let absent_salt = resolver_generation_cache_salt(&db_path);
+        assert_eq!(absent_salt, 0);
+        fs::write(&sidecar, "{malformed").unwrap();
+        assert_ne!(resolver_generation_cache_salt(&db_path), absent_salt);
+        let failed = dispatch(&store, None, "hub_nodes", args.clone(), None).unwrap();
+        assert_eq!(failed["rankings_stale"], true);
+        assert_eq!(failed["stale_repos"], json!([]));
+        assert!(
+            failed["resolver_generation_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("decode resolver generation sidecar"))
+        );
+        assert_eq!(CACHE_MISSES.with(|count| count.get()), 2);
+        assert_eq!(CACHE_HITS.with(|count| count.get()), 0);
+        fs::remove_file(sidecar).unwrap();
+        let repaired = dispatch(&store, None, "hub_nodes", args, None).unwrap();
+        assert!(repaired.get("resolver_generation_error").is_none());
+        assert_eq!(CACHE_HITS.with(|count| count.get()), 1);
+        assert_eq!(store.graph_generation(), generation);
     }
 
     /// The smallest argument object a schema accepts, so the only thing under
