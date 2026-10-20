@@ -1,0 +1,5 @@
+# Used instead of the root .dockerignore when building .oss-scanner/Dockerfile.
+# The scanner image keeps the whole checkout at /src (including .git, docs and
+# CI config); only local build output is left out.
+target/
+**/node_modules
