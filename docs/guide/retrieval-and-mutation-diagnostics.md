@@ -181,6 +181,9 @@ These checks also apply to ordinary `.git` directories and linked worktrees'
 common metadata. They walk object and ref directories,
 so repositories with many loose objects incur additional inspection time.
 Metadata alone cannot establish the provenance of arbitrary copied repositories.
+Config preflight disables repository discovery so Git cannot read includes
+before validation. Config files over 1 MiB are refused; preflight subprocesses
+also have time and output limits.
 
 The diff compares committed and staged names, then reads a stat-only inventory
 of tracked worktree changes. It never asks Git to convert worktree contents;

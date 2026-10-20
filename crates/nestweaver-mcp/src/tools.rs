@@ -14787,6 +14787,43 @@ fn git_command_for_indexed_path(path: &Path) -> std::process::Command {
     command
 }
 
+/// Inspect one config file without repository discovery. `--no-includes`
+/// applies to the config builtin, but Git startup otherwise reads repository
+/// includes before that builtin parses its arguments.
+fn git_metadata_config_command(path: &Path) -> std::process::Command {
+    let mut command = git_command_for_indexed_path(path);
+    command.arg("--git-dir=/dev/null");
+    command
+}
+
+/// Bound preflight config reads as well as the Git subprocess and its output.
+fn inspect_git_metadata_config(
+    path: &Path,
+    config: &Path,
+    arguments: &[&str],
+) -> Result<std::process::Output, anyhow::Error> {
+    const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+    match std::fs::symlink_metadata(config) {
+        Ok(metadata) if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES => {
+            anyhow::bail!("unsupported Git metadata configuration");
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => anyhow::bail!("cannot inspect Git metadata configuration"),
+    }
+    let mut command = git_metadata_config_command(path);
+    command
+        .args(["config", "--no-includes", "--file"])
+        .arg(config)
+        .args(arguments);
+    nestweaver_engine::git_cmd::run_git_with_timeout_and_output_limit(
+        command,
+        nestweaver_engine::git_cmd::git_net_timeout(),
+        64 * 1024,
+    )
+    .map_err(|_| anyhow!("cannot inspect Git metadata configuration"))
+}
+
 /// Pin both metadata and the selected checkout, regardless of local config.
 /// `.` is resolved after `-C`, so relative indexed paths work too.
 fn git_command_for_resolved_git_dir(path: &Path, git_dir: &Path) -> std::process::Command {
@@ -14914,34 +14951,31 @@ fn git_metadata_is_self_contained(work_tree: &Path, git_dir: &Path, objects: boo
         if !config.exists() {
             continue;
         }
-        let output = git_command_for_indexed_path(work_tree)
-            .args(["config", "--no-includes", "--file"])
-            .arg(&config)
-            .args([
+        let output = inspect_git_metadata_config(
+            work_tree,
+            &config,
+            &[
                 "--get-regexp",
                 "^(include|includeif)\\.|^extensions\\.partialclone$|^remote\\..*\\.promisor$",
-            ])
-            .output();
+            ],
+        );
         // Exit 1 means no matching keys; all other outcomes fail closed.
         if !output.is_ok_and(|output| output.status.code() == Some(1)) {
             return false;
         }
-        let storage = git_command_for_indexed_path(work_tree)
-            .args(["config", "--no-includes", "--file"])
-            .arg(&config)
-            .args(["--get-all", "extensions.refStorage"])
-            .output();
+        let storage = inspect_git_metadata_config(
+            work_tree,
+            &config,
+            &["--get-all", "extensions.refStorage"],
+        );
         if !storage.is_ok_and(|output| {
             output.status.code() == Some(1)
                 || (output.status.success() && output.stdout == b"files\n")
         }) {
             return false;
         }
-        let output = git_command_for_indexed_path(work_tree)
-            .args(["config", "--no-includes", "--file"])
-            .arg(&config)
-            .args(["--bool", "--get", "core.bare"])
-            .output();
+        let output =
+            inspect_git_metadata_config(work_tree, &config, &["--bool", "--get", "core.bare"]);
         if !output.is_ok_and(|output| {
             output.status.code() == Some(1)
                 || (output.status.success() && output.stdout == b"false\n")
@@ -15067,11 +15101,8 @@ fn gitdir_back_pointer(git_dir: &Path, dot_git: &Path) -> GitdirBackPointer {
 fn core_worktree_registration(git_dir: &Path, work_tree: &Path) -> GitdirBackPointer {
     let mut registered = false;
     for config in [git_dir.join("config"), git_dir.join("config.worktree")] {
-        let Ok(output) = git_command_for_indexed_path(work_tree)
-            .args(["config", "--no-includes", "--file"])
-            .arg(config)
-            .args(["--get-all", "core.worktree"])
-            .output()
+        let Ok(output) =
+            inspect_git_metadata_config(work_tree, &config, &["--get-all", "core.worktree"])
         else {
             return GitdirBackPointer::Mismatch;
         };
@@ -15131,10 +15162,14 @@ fn gitfile_target(work_tree: &Path, dot_git: &Path) -> Option<std::path::PathBuf
 /// `--git-common-dir` is often the relative path `.git`. Resolve that against
 /// the work tree, then canonicalize so it can be compared to `path/.git`.
 fn rev_parse_git_path(path: &Path, flag: &str) -> Option<std::path::PathBuf> {
-    let output = git_command_for_indexed_path(path)
-        .args(["rev-parse", flag])
-        .output()
-        .ok()?;
+    let mut command = git_command_for_indexed_path(path);
+    command.args(["rev-parse", flag]);
+    let output = nestweaver_engine::git_cmd::run_git_with_timeout_and_output_limit(
+        command,
+        nestweaver_engine::git_cmd::git_net_timeout(),
+        64 * 1024,
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -16154,6 +16189,69 @@ mod affected_tests_base_ref_tests {
         assert!(
             !baseline.status.success(),
             "Git already refuses an absolute HEAD symlink"
+        );
+        assert!(indexed_work_tree_git_dir(work.path()).is_none());
+    }
+
+    #[test]
+    fn affected_tests_base_ref_inspects_config_without_startup_includes() {
+        for worktree_config in [false, true] {
+            let work = tempfile::tempdir().unwrap();
+            init_repo_with_tracked_file(work.path(), "tracked.txt");
+            let outside = tempfile::tempdir().unwrap();
+            let include = outside.path().join("private-invalid-config");
+            std::fs::write(&include, "[invalid private configuration\n").unwrap();
+            let config = if worktree_config {
+                git(
+                    work.path(),
+                    &["config", "extensions.worktreeConfig", "true"],
+                );
+                git(
+                    work.path(),
+                    &[
+                        "config",
+                        "--worktree",
+                        "include.path",
+                        include.to_str().unwrap(),
+                    ],
+                );
+                work.path().join(".git/config.worktree")
+            } else {
+                git(
+                    work.path(),
+                    &["config", "include.path", include.to_str().unwrap()],
+                );
+                work.path().join(".git/config")
+            };
+            // Invalid included contents would make startup fail before the
+            // builtin honors --no-includes if discovery were enabled.
+            let inspected =
+                inspect_git_metadata_config(work.path(), &config, &["--get", "include.path"])
+                    .unwrap();
+            assert!(
+                inspected.status.success(),
+                "{}",
+                String::from_utf8_lossy(&inspected.stderr)
+            );
+            assert_eq!(
+                String::from_utf8(inspected.stdout).unwrap().trim(),
+                include.to_str().unwrap()
+            );
+            assert!(indexed_work_tree_git_dir(work.path()).is_none());
+        }
+    }
+
+    #[test]
+    fn affected_tests_base_ref_bounds_preflight_config_input() {
+        let work = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(work.path(), "tracked.txt");
+        let config = work.path().join(".git/config");
+        let mut contents = std::fs::read_to_string(&config).unwrap();
+        contents.push('#');
+        contents.push_str(&"x".repeat(1024 * 1024));
+        std::fs::write(&config, contents).unwrap();
+        assert!(
+            inspect_git_metadata_config(work.path(), &config, &["--get", "core.bare"]).is_err()
         );
         assert!(indexed_work_tree_git_dir(work.path()).is_none());
     }
