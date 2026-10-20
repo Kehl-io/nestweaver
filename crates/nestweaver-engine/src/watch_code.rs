@@ -1002,7 +1002,7 @@ impl CodeWatcher {
             if crate::manifest::is_manifest_input(relative)
                 && reader.accepts_path(relative)
                 && !path_has_symlink(&self.repo_root, relative)?
-                && manifest_path_not_gitignored(&self.repo_root, relative)?
+                && path_not_gitignored(&self.repo_root, relative)?
             {
                 manifest_changed = true;
             }
@@ -1064,7 +1064,7 @@ impl CodeWatcher {
             let relative = Path::new(&source_path);
             let eligible = (|| -> anyhow::Result<bool> {
                 Ok(reader.accepts_path(relative)
-                    && manifest_path_not_gitignored(&self.repo_root, relative)?
+                    && path_not_gitignored(&self.repo_root, relative)?
                     && !path_has_symlink(&self.repo_root, relative)?)
             })();
             match eligible {
@@ -1148,7 +1148,17 @@ impl CodeWatcher {
                 }
             };
             let rel_str = rel_path.to_string_lossy().into_owned();
-            if let Some(reason) = source_policy_exclusion(&reader, &self.repo_root, path)? {
+            // Startup drift enumerates through the walk, which already drops
+            // gitignored paths. A single event does not, so a tracked source
+            // the walk discloses as gitignored must stay out here too.
+            let exclusion = match source_policy_exclusion(&reader, &self.repo_root, path)? {
+                Some(reason) => Some(reason),
+                None if path.exists() && !path_not_gitignored(&self.repo_root, rel_path)? => {
+                    Some(crate::content_reader::TRACKED_BUT_IGNORED_REASON)
+                }
+                None => None,
+            };
+            if let Some(reason) = exclusion {
                 tracing::warn!(
                     path = %rel_path.display(), reason,
                     "watched source is policy-excluded; removing stale graph coverage"
@@ -1744,7 +1754,7 @@ impl CodeWatcher {
                 let absolute = self.repo_root.join(path);
                 let relative = Path::new(path);
                 if !reader.accepts_path(relative)
-                    || !manifest_path_not_gitignored(&self.repo_root, relative)?
+                    || !path_not_gitignored(&self.repo_root, relative)?
                     || path_has_symlink(&self.repo_root, relative)?
                 {
                     drift.spec_changed = true;
@@ -2232,11 +2242,7 @@ impl CodeWatcher {
                 let excluded = reader
                     .as_ref()
                     .is_some_and(|reader| !reader.accepts_path(&rel.join("nestweaver-probe")));
-                !excluded
-                    && !matches!(
-                        manifest_path_not_gitignored(&self.repo_root, rel),
-                        Ok(false)
-                    )
+                !excluded && !matches!(path_not_gitignored(&self.repo_root, rel), Ok(false))
             })
             .cloned()
             .collect();
@@ -2823,7 +2829,9 @@ fn status_path_is_indexable(reader: &crate::content_reader::FilesystemReader, pa
         && (is_supported_source(relative) || crate::contracts::is_spec_file(path))
 }
 
-fn manifest_path_not_gitignored(root: &Path, relative: &Path) -> anyhow::Result<bool> {
+/// Whether `relative` escapes the repository's gitignore rules, regardless of
+/// whether Git tracks it (`check-ignore --no-index`), as the walk decides.
+fn path_not_gitignored(root: &Path, relative: &Path) -> anyhow::Result<bool> {
     if !root.join(".git").exists() {
         return Ok(true);
     }
@@ -2838,7 +2846,7 @@ fn manifest_path_not_gitignored(root: &Path, relative: &Path) -> anyhow::Result<
         Some(0) => Ok(false),
         Some(1) => Ok(true),
         _ => anyhow::bail!(
-            "cannot determine manifest gitignore eligibility: {}",
+            "cannot determine gitignore eligibility: {}",
             String::from_utf8_lossy(&result.stderr)
         ),
     }
@@ -4174,6 +4182,59 @@ mod tests {
             .find(|s| s.name == name)
             .unwrap_or_else(|| panic!("symbol {name} should be indexed"))
             .uid
+    }
+
+    /// The walk discloses a tracked gitignored source and indexing keeps it out
+    /// of the graph. A save event must not publish it, or every later index
+    /// would fall back to a full reindex to retract it again.
+    #[test]
+    fn watcher_keeps_tracked_gitignored_sources_out_of_the_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root) = index_fixture_repo(&dir);
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "src/ignored.js\n").unwrap();
+        let ignored = root.join("src/ignored.js");
+        let kept = root.join("src/kept_new.js");
+        std::fs::write(&ignored, "export function ignoredFn() { return 1; }\n").unwrap();
+        std::fs::write(&kept, "export function keptFn() { return 2; }\n").unwrap();
+        git(&["add", "-f", "."]);
+        let reader = crate::content_reader::FilesystemReader::new(&root);
+        crate::content_reader::ContentReader::list_files(&reader).unwrap();
+        assert!(
+            crate::content_reader::ContentReader::skipped_dirs(&reader)
+                .iter()
+                .any(|row| row.path == "src/ignored.js"
+                    && row.reason == crate::content_reader::TRACKED_BUT_IGNORED_REASON),
+            "precondition: the walk discloses the tracked gitignored source"
+        );
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        process_fixture_batch(&watcher, &store, &r_uid, &root, &[ignored, kept]);
+        let files: Vec<String> = store
+            .list_files_by_repo(&r_uid)
+            .unwrap()
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        assert!(
+            !files.iter().any(|path| path == "src/ignored.js"),
+            "{files:?}"
+        );
+        assert!(
+            files.iter().any(|path| path == "src/kept_new.js"),
+            "{files:?}"
+        );
     }
 
     fn process_fixture_batch(
