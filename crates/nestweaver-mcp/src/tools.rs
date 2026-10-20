@@ -14724,23 +14724,21 @@ fn diff_affected_tests_base_ref(
                  `git --git-dir <git-dir> config core.worktree <absolute-work-tree>`"
             ));
         }
-        return Err(error);
+        return Err(anyhow!(
+            "{error}; its Git metadata uses a layout that cannot be verified as this \
+             checkout's own (for example alternates, metadata symlinks, config includes, a \
+             partial clone, or a repository Git refuses for its ownership)"
+        ));
     };
-    match diff_indexed_work_tree(path, &git_dir, base_ref) {
-        Ok(files) => Ok(files),
-        Err(error) => {
-            let detail = format!("{error:#}");
-            if detail.to_ascii_lowercase().contains("not a git repository") {
-                return Err(affected_tests_not_a_git_repository(repository));
-            }
-            anyhow::bail!(
-                "affected_tests base_ref failed for repository '{}' ({}) at {}: {detail}",
-                repository.name,
-                repository.uid,
-                repository.path
-            );
-        }
-    }
+    // Inner errors are fixed strings: Git's stderr can name foreign paths.
+    diff_indexed_work_tree(path, &git_dir, base_ref).map_err(|error| {
+        anyhow!(
+            "affected_tests base_ref failed for repository '{}' ({}) at {}: {error:#}",
+            repository.name,
+            repository.uid,
+            repository.path
+        )
+    })
 }
 
 fn affected_tests_not_a_git_repository(
@@ -14770,6 +14768,10 @@ fn git_command_for_indexed_path(path: &Path) -> std::process::Command {
     command.env("GIT_CONFIG_NOSYSTEM", "1");
     command.env("GIT_CONFIG_SYSTEM", "/dev/null");
     command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    // Git before 2.32 ignores GIT_CONFIG_GLOBAL; it also reads global
+    // attributes from XDG. Neither home may contribute configuration.
+    command.env("HOME", "/dev/null");
+    command.env("XDG_CONFIG_HOME", "/dev/null");
     command.env("GIT_ATTR_NOSYSTEM", "1");
     command.env("GIT_NO_LAZY_FETCH", "1");
     command.env("GIT_NO_REPLACE_OBJECTS", "1");
@@ -14778,7 +14780,7 @@ fn git_command_for_indexed_path(path: &Path) -> std::process::Command {
     // No inspection command needs a transport. This outranks repository
     // protocol.*.allow even on Git versions without GIT_NO_LAZY_FETCH.
     command.env("GIT_ALLOW_PROTOCOL", "");
-    // The caller classifies failures by git's message text, so pin the locale.
+    // Keep Git's diagnostics stable for any caller that inspects them.
     command.env("LC_ALL", "C");
     // The indexed tree can author the git config the diff reads, and
     // `core.fsmonitor` names a program git would run. `-c` outranks any
@@ -14789,9 +14791,72 @@ fn git_command_for_indexed_path(path: &Path) -> std::process::Command {
         "-c",
         "diff.ignoreSubmodules=all",
     ]);
+    for directory in trusted_safe_directories() {
+        command.arg("-c").arg({
+            let mut value = std::ffi::OsString::from("safe.directory=");
+            value.push(directory);
+            value
+        });
+    }
     command.env_remove("LANGUAGE");
     command.arg("-C").arg(path);
     command
+}
+
+/// The operator's own `safe.directory` entries from system and global config.
+///
+/// Those files are otherwise ignored, but dropping this one setting would
+/// refuse repositories owned by another user that the operator already trusts
+/// (container volumes, shared mounts). Command-line `safe.directory` is
+/// protected configuration, and the indexed repository cannot author it.
+/// Values are read with `--type=path`, since HOME is hidden from inspection.
+fn trusted_safe_directories() -> Vec<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<std::ffi::OsString>)>> =
+        std::sync::Mutex::new(None);
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((read_at, values)) = cache.as_ref()
+        && read_at.elapsed() < std::time::Duration::from_secs(30)
+    {
+        return values.clone();
+    }
+    let mut values = Vec::new();
+    for scope in ["--system", "--global"] {
+        let mut command = std::process::Command::new("git");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                command.env_remove(key);
+            }
+        }
+        command.current_dir("/").args([
+            "config",
+            scope,
+            "--type=path",
+            "--null",
+            "--get-all",
+            "safe.directory",
+        ]);
+        let Ok(output) = nestweaver_engine::git_cmd::run_git_with_timeout_and_output_limit(
+            command,
+            nestweaver_engine::git_cmd::git_net_timeout(),
+            64 * 1024,
+        ) else {
+            continue;
+        };
+        if !output.status.success() || !output.stdout.ends_with(&[0]) {
+            continue;
+        }
+        // An empty value resets the list in Git; keep it to preserve order.
+        values.extend(
+            output.stdout[..output.stdout.len() - 1]
+                .split(|byte| *byte == 0)
+                .map(|value| std::ffi::OsStr::from_bytes(value).to_owned()),
+        );
+    }
+    *cache = Some((std::time::Instant::now(), values.clone()));
+    values
 }
 
 /// Inspect one config file without repository discovery. `--no-includes`
@@ -14952,6 +15017,26 @@ fn indexed_work_tree_git_dir(path: &Path) -> Option<std::path::PathBuf> {
     None
 }
 
+/// The path Git reads from a one-path metadata file (`commondir`, a gitfile's
+/// `gitdir: ` value, a worktree's `gitdir`): everything before trailing CR/LF.
+/// A value that another reading could interpret differently (surrounding
+/// whitespace, an embedded line break or NUL, an empty path) is refused, so
+/// validation and Git always name the same directory.
+fn exact_git_path_value(bytes: &[u8]) -> Option<&[u8]> {
+    let mut value = bytes;
+    while let Some(rest) = value
+        .strip_suffix(b"\n")
+        .or_else(|| value.strip_suffix(b"\r"))
+    {
+        value = rest;
+    }
+    (!value.is_empty()
+        && !value.first().is_some_and(u8::is_ascii_whitespace)
+        && !value.last().is_some_and(u8::is_ascii_whitespace)
+        && !value.iter().any(|byte| matches!(byte, b'\n' | b'\r' | 0)))
+    .then_some(value)
+}
+
 /// Canonical common directory named by `<git_dir>/commondir`, if present.
 ///
 /// Git reads the whole file and strips only trailing CR/LF. A value that would
@@ -14965,20 +15050,7 @@ fn read_commondir(git_dir: &Path) -> Result<Option<std::path::PathBuf>, anyhow::
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => anyhow::bail!("cannot inspect indexed Git common directory"),
     };
-    let mut value = bytes.as_slice();
-    while let Some(rest) = value
-        .strip_suffix(b"\n")
-        .or_else(|| value.strip_suffix(b"\r"))
-    {
-        value = rest;
-    }
-    anyhow::ensure!(
-        !value.is_empty()
-            && !value.first().is_some_and(u8::is_ascii_whitespace)
-            && !value.last().is_some_and(u8::is_ascii_whitespace)
-            && !value.iter().any(|byte| matches!(byte, b'\n' | b'\r' | 0)),
-        "invalid indexed Git common directory"
-    );
+    let value = exact_git_path_value(&bytes).context("invalid indexed Git common directory")?;
     let common = Path::new(std::ffi::OsStr::from_bytes(value));
     let resolved = if common.is_absolute() {
         common.to_path_buf()
@@ -14993,7 +15065,7 @@ fn read_commondir(git_dir: &Path) -> Result<Option<std::path::PathBuf>, anyhow::
 /// `path/.git` when both git-dir queries name that directory and nothing else.
 fn self_contained_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::PathBuf> {
     let canonical = std::fs::canonicalize(dot_git).ok()?;
-    if !git_metadata_is_self_contained(path, &canonical, true) {
+    if !git_metadata_is_self_contained(path, &canonical, true, false) {
         return None;
     }
     let absolute = rev_parse_git_path(path, "--absolute-git-dir")?;
@@ -15013,7 +15085,12 @@ fn linked_worktree_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::Pat
         return None;
     }
     let inside_work_tree = canonical.starts_with(std::fs::canonicalize(path).ok()?);
-    if !git_metadata_is_self_contained(path, &canonical, !canonical.join("commondir").exists()) {
+    if !git_metadata_is_self_contained(
+        path,
+        &canonical,
+        !canonical.join("commondir").exists(),
+        false,
+    ) {
         return None;
     }
     if inside_work_tree && canonical.join("commondir").exists() {
@@ -15047,15 +15124,36 @@ fn linked_worktree_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::Pat
     (absolute == canonical).then_some(canonical)
 }
 
+/// Top-level metadata entries the inspection commands never read. Hook
+/// managers commonly symlink `hooks`, and the builtin fsmonitor daemon leaves a
+/// socket; refusing those would reject ordinary repositories. `logs` is not
+/// listed: `rev-parse` reads reflogs for revisions such as `HEAD@{1}`.
+const UNREAD_GIT_METADATA_ENTRIES: &[&str] = &[
+    "hooks",
+    "lfs",
+    "rr-cache",
+    "description",
+    "fsmonitor--daemon.ipc",
+];
+
 /// Validate config without following includes, plus every Git-controlled path
 /// that can route reads to another object/ref/index database. Rejecting includes
 /// is intentional: the subsequent plumbing must never read external config.
-fn git_metadata_is_self_contained(work_tree: &Path, git_dir: &Path, objects: bool) -> bool {
+///
+/// `common` marks the shared directory of a verified linked worktree, which
+/// may be a bare repository (`git clone --bare` plus `git worktree add`).
+fn git_metadata_is_self_contained(
+    work_tree: &Path,
+    git_dir: &Path,
+    objects: bool,
+    common: bool,
+) -> bool {
     let Ok(entries) = std::fs::read_dir(git_dir) else {
         return false;
     };
-    // This also covers split-index sharedindex.*, shallow, packed-refs and
-    // future top-level control files, rather than an incomplete allowlist.
+    // Every other top-level entry must be a plain file or directory. This
+    // covers split-index sharedindex.*, shallow, packed-refs and future
+    // control files, rather than relying on an incomplete denylist.
     for entry in entries {
         let Ok(entry) = entry else {
             return false;
@@ -15063,7 +15161,11 @@ fn git_metadata_is_self_contained(work_tree: &Path, git_dir: &Path, objects: boo
         let Ok(kind) = entry.file_type() else {
             return false;
         };
-        if kind.is_symlink() || (!kind.is_file() && !kind.is_dir()) {
+        if (kind.is_symlink() || (!kind.is_file() && !kind.is_dir()))
+            && !UNREAD_GIT_METADATA_ENTRIES
+                .iter()
+                .any(|name| entry.file_name() == *name)
+        {
             return false;
         }
     }
@@ -15103,7 +15205,8 @@ fn git_metadata_is_self_contained(work_tree: &Path, git_dir: &Path, objects: boo
             inspect_git_metadata_config(work_tree, &config, &["--bool", "--get", "core.bare"]);
         if !output.is_ok_and(|output| {
             output.status.code() == Some(1)
-                || (output.status.success() && output.stdout == b"false\n")
+                || (output.status.success()
+                    && (output.stdout == b"false\n" || (common && output.stdout == b"true\n")))
         }) {
             return false;
         }
@@ -15160,7 +15263,7 @@ fn commondir_is_own_registration(git_dir: &Path) -> bool {
         Ok(Some(common)) => common,
         Err(_) => return false,
     };
-    if !git_metadata_is_self_contained(git_dir, &common, true) {
+    if !git_metadata_is_self_contained(git_dir, &common, true, true) {
         return false;
     }
     let Some(worktrees) = git_dir.parent() else {
@@ -15180,20 +15283,18 @@ enum GitdirBackPointer {
 
 /// A linked worktree's `<git dir>/gitdir` names the `.git` gitfile it serves.
 fn gitdir_back_pointer(git_dir: &Path, dot_git: &Path) -> GitdirBackPointer {
-    let back_text = match std::fs::read_to_string(git_dir.join("gitdir")) {
-        Ok(text) => text,
+    use std::os::unix::ffi::OsStrExt;
+    let back_bytes = match std::fs::read(git_dir.join("gitdir")) {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return GitdirBackPointer::Absent;
         }
         Err(_) => return GitdirBackPointer::Mismatch,
     };
-    let Some(back_line) = back_text.lines().next().map(str::trim) else {
+    let Some(back_value) = exact_git_path_value(&back_bytes) else {
         return GitdirBackPointer::Mismatch;
     };
-    if back_line.is_empty() {
-        return GitdirBackPointer::Mismatch;
-    }
-    let back_raw = Path::new(back_line);
+    let back_raw = Path::new(std::ffi::OsStr::from_bytes(back_value));
     let back = if back_raw.is_absolute() {
         back_raw.to_path_buf()
     } else {
@@ -15253,13 +15354,11 @@ fn core_worktree_registration(git_dir: &Path, work_tree: &Path) -> GitdirBackPoi
 /// Path named by a `gitdir: <path>` gitfile. Relative paths are relative to
 /// the work tree, which is the directory that contains the gitfile.
 fn gitfile_target(work_tree: &Path, dot_git: &Path) -> Option<std::path::PathBuf> {
-    let text = std::fs::read_to_string(dot_git).ok()?;
-    let line = text.lines().next()?.trim();
-    let rest = line.strip_prefix("gitdir:")?.trim();
-    if rest.is_empty() {
-        return None;
-    }
-    let raw = Path::new(rest);
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = std::fs::read(dot_git).ok()?;
+    // Git requires exactly `gitdir: ` and takes the rest of the file.
+    let value = exact_git_path_value(bytes.strip_prefix(b"gitdir: ")?)?;
+    let raw = Path::new(std::ffi::OsStr::from_bytes(value));
     if raw.is_absolute() {
         Some(raw.to_path_buf())
     } else {
@@ -15397,7 +15496,7 @@ fn resolve_indexed_commit(
     )
     .map_err(|_| anyhow!("failed to resolve git commit ref in indexed repository"))?;
     if !output.status.success() {
-        anyhow::bail!("invalid git commit ref in indexed repository");
+        anyhow::bail!("'{revision}' does not name a commit in the indexed repository");
     }
     let stdout = std::str::from_utf8(&output.stdout)
         .context("git rev-parse returned a non-UTF-8 object ID")?;
@@ -15899,6 +15998,19 @@ mod affected_tests_base_ref_tests {
         }
     }
 
+    /// Record `file` in the index with an exact, non-racy stat, so a later
+    /// racy index makes Git hash its contents. Without this, an index written
+    /// in the same timestamp tick as the file can smudge the entry, and Git
+    /// then reports it modified without hashing (seen on CI runners).
+    fn record_clean_index_entry(work_tree: &std::path::Path, file: &std::path::Path) {
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::File::open(file)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        git(work_tree, &["update-index", "--really-refresh"]);
+    }
+
     fn init_repo_with_tracked_file(dir: &std::path::Path, file_name: &str) {
         git(dir, &["init", "-q"]);
         git(dir, &["config", "user.email", "test@example.com"]);
@@ -15930,6 +16042,13 @@ mod affected_tests_base_ref_tests {
             path,
             &["--work-tree=.", "diff", "--name-only", "HEAD", "--"],
         );
+        assert_refused_without_disclosure(path, name);
+    }
+
+    /// Fixtures that already ran [`assert_native_git_discloses_other_repository`]
+    /// must not run native Git again: on macOS a second diff of some forged
+    /// layouts fails after the first one succeeds.
+    fn assert_refused_without_disclosure(path: &std::path::Path, name: &str) {
         let uid = format!("repo:test:{name}");
         let store = GraphStore::in_memory().unwrap();
         store.insert_repo(&indexed_repo(&uid, name, path)).unwrap();
@@ -15966,7 +16085,7 @@ mod affected_tests_base_ref_tests {
         std::os::unix::fs::symlink(real.path().join(".git"), via_symlink.path().join(".git"))
             .unwrap();
         assert_native_git_discloses_other_repository(via_symlink.path(), "symlink-repo");
-        assert_other_repository_files_are_not_returned(via_symlink.path(), "symlink-repo");
+        assert_refused_without_disclosure(via_symlink.path(), "symlink-repo");
 
         let via_commondir = tempfile::tempdir().unwrap();
         let fake_git = via_commondir.path().join(".git");
@@ -15978,7 +16097,7 @@ mod affected_tests_base_ref_tests {
         .unwrap();
         std::fs::copy(real.path().join(".git").join("HEAD"), fake_git.join("HEAD")).unwrap();
         assert_native_git_discloses_other_repository(via_commondir.path(), "commondir-repo");
-        assert_other_repository_files_are_not_returned(via_commondir.path(), "commondir-repo");
+        assert_refused_without_disclosure(via_commondir.path(), "commondir-repo");
     }
 
     /// A submodule's gitfile target has no `gitdir` back-pointer; its
@@ -16033,6 +16152,78 @@ mod affected_tests_base_ref_tests {
         );
     }
 
+    /// Ordinary layouts the metadata checks must keep accepting: a linked
+    /// worktree of a bare clone, and a repository whose hooks are symlinked by
+    /// a hook manager.
+    #[test]
+    fn affected_tests_base_ref_accepts_bare_clone_worktrees_and_symlinked_hooks() {
+        let source = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(source.path(), "tracked.txt");
+        let parent = tempfile::tempdir().unwrap();
+        let bare = parent.path().join("bare.git");
+        git(
+            parent.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                source.path().to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        let linked = parent.path().join("linked");
+        git(
+            &bare,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "work",
+                linked.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(linked.join("tracked.txt"), "after\n").unwrap();
+        assert_diffs_tracked_file(&linked, "bare-clone-worktree");
+
+        let hooked = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(hooked.path(), "tracked.txt");
+        let shared_hooks = tempfile::tempdir().unwrap();
+        let hooks = hooked.path().join(".git/hooks");
+        if hooks.exists() {
+            std::fs::remove_dir_all(&hooks).unwrap();
+        }
+        std::os::unix::fs::symlink(shared_hooks.path(), &hooks).unwrap();
+        std::fs::write(hooked.path().join("tracked.txt"), "after\n").unwrap();
+        assert_diffs_tracked_file(hooked.path(), "symlinked-hooks");
+    }
+
+    /// Git requires exactly `gitdir: ` and takes the rest of the gitfile up to
+    /// trailing CR/LF. Values another parser could read differently are refused.
+    #[test]
+    fn gitfile_target_parses_exactly_as_git_does() {
+        let work = tempfile::tempdir().unwrap();
+        let dot_git = work.path().join(".git");
+        for (content, expected) in [
+            ("gitdir: meta\n", Some("meta")),
+            ("gitdir: meta\r\n", Some("meta")),
+            ("gitdir: meta", Some("meta")),
+            ("gitdir:meta\n", None),
+            ("gitdir:  meta\n", None),
+            ("gitdir: meta \n", None),
+            ("gitdir: meta\nother\n", None),
+            (" gitdir: meta\n", None),
+            ("gitdir: \n", None),
+        ] {
+            std::fs::write(&dot_git, content).unwrap();
+            assert_eq!(
+                gitfile_target(work.path(), &dot_git),
+                expected.map(|value| work.path().join(value)),
+                "{content:?}"
+            );
+        }
+    }
+
     /// A gitfile that names another repository's git dir, and a forged git dir
     /// that pairs `core.worktree` with another repository's `commondir`, must
     /// not let that repository's files through.
@@ -16049,7 +16240,7 @@ mod affected_tests_base_ref_tests {
         )
         .unwrap();
         assert_native_git_discloses_other_repository(foreign.path(), "foreign-gitfile");
-        assert_other_repository_files_are_not_returned(foreign.path(), "foreign-gitfile");
+        assert_refused_without_disclosure(foreign.path(), "foreign-gitfile");
 
         let forged = tempfile::tempdir().unwrap();
         let evil = forged.path().join(".evil");
@@ -16063,7 +16254,7 @@ mod affected_tests_base_ref_tests {
         .unwrap();
         std::fs::copy(real.path().join(".git").join("HEAD"), evil.join("HEAD")).unwrap();
         assert_native_git_discloses_other_repository(forged.path(), "forged-core-worktree");
-        assert_other_repository_files_are_not_returned(forged.path(), "forged-core-worktree");
+        assert_refused_without_disclosure(forged.path(), "forged-core-worktree");
     }
 
     /// A target inside the tree may be legitimate separate Git metadata, but
@@ -16087,10 +16278,7 @@ mod affected_tests_base_ref_tests {
             forged_gitdir.path(),
             "forged-gitdir-commondir",
         );
-        assert_other_repository_files_are_not_returned(
-            forged_gitdir.path(),
-            "forged-gitdir-commondir",
-        );
+        assert_refused_without_disclosure(forged_gitdir.path(), "forged-gitdir-commondir");
 
         let alternates = tempfile::tempdir().unwrap();
         let evil = alternates.path().join(".evil");
@@ -16113,7 +16301,7 @@ mod affected_tests_base_ref_tests {
         .unwrap();
         std::fs::write(evil.join("HEAD"), "ref: refs/heads/borrowed\n").unwrap();
         assert_native_git_discloses_other_repository(alternates.path(), "forged-alternates");
-        assert_other_repository_files_are_not_returned(alternates.path(), "forged-alternates");
+        assert_refused_without_disclosure(alternates.path(), "forged-alternates");
     }
 
     /// Git reads `commondir` whole and strips only trailing CR/LF. A value our
@@ -16149,7 +16337,7 @@ mod affected_tests_base_ref_tests {
             )
             .unwrap();
             assert_native_git_discloses_other_repository(attacker.path(), name);
-            assert_other_repository_files_are_not_returned(attacker.path(), name);
+            assert_refused_without_disclosure(attacker.path(), name);
         }
     }
 
@@ -16242,10 +16430,7 @@ mod affected_tests_base_ref_tests {
                     forged.path(),
                     "borrowed-object-database",
                 );
-                assert_other_repository_files_are_not_returned(
-                    forged.path(),
-                    "borrowed-object-database",
-                );
+                assert_refused_without_disclosure(forged.path(), "borrowed-object-database");
             }
         }
     }
@@ -16286,7 +16471,7 @@ mod affected_tests_base_ref_tests {
             )
             .unwrap();
             assert_native_git_discloses_other_repository(fake.path(), "external-unregistered");
-            assert_other_repository_files_are_not_returned(fake.path(), "external-unregistered");
+            assert_refused_without_disclosure(fake.path(), "external-unregistered");
             let selected = AffectedTestsBaseRefRepository {
                 uid: "repo:test:private".into(),
                 name: "private".into(),
@@ -16427,10 +16612,14 @@ mod affected_tests_base_ref_tests {
                 work.path().join(".git/config")
             };
             // Invalid included contents would make startup fail before the
-            // builtin honors --no-includes if discovery were enabled.
-            let inspected =
-                inspect_git_metadata_config(work.path(), &config, &["--get", "include.path"])
-                    .unwrap();
+            // builtin honors --no-includes if discovery were enabled. Use the
+            // production query: `--get include.path` succeeds either way.
+            let inspected = inspect_git_metadata_config(
+                work.path(),
+                &config,
+                &["--name-only", "--get-regexp", "^(include|includeif)\\."],
+            )
+            .unwrap();
             assert!(
                 inspected.status.success(),
                 "{}",
@@ -16438,7 +16627,7 @@ mod affected_tests_base_ref_tests {
             );
             assert_eq!(
                 String::from_utf8(inspected.stdout).unwrap().trim(),
-                include.to_str().unwrap()
+                "include.path"
             );
             assert!(indexed_work_tree_git_dir(work.path()).is_none());
         }
@@ -16572,6 +16761,7 @@ mod affected_tests_base_ref_tests {
                     .unwrap();
                     git(work.path(), &["add", ".gitattributes"]);
                     git(work.path(), &["commit", "-q", "-m", "attributes"]);
+                    record_clean_index_entry(work.path(), &work.path().join("tracked.txt"));
                     let executable = tempfile::tempdir().unwrap();
                     let marker = executable.path().join("executed");
                     let script = executable.path().join("filter");
@@ -16679,6 +16869,7 @@ mod affected_tests_base_ref_tests {
                 linked.to_str().unwrap(),
             ],
         );
+        record_clean_index_entry(&linked, &linked.join("tracked.txt"));
         let marker = linked_parent.path().join("executed");
         let script = linked_parent.path().join("filter");
         std::fs::write(
@@ -16897,8 +17088,9 @@ mod affected_tests_base_ref_tests {
             .env("GIT_CONFIG_SYSTEM", victim.path().join(".git/config"))
             .env("GIT_CONFIG_GLOBAL", victim.path().join(".git/config"))
             .output().unwrap();
+        // A renamed module would make `--exact` match nothing and exit 0.
         assert!(
-            output.status.success(),
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
             "{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
