@@ -14734,7 +14734,8 @@ function hello(name) { return "Hello " + name; }
         let error = incremental_index(&repo, &incremental_db, "test", repo_url)
             .expect_err("strict incremental contract preflight must fail");
         assert!(
-            format!("{error:#}").contains("prepare incremental contract derivation"),
+            format!("{error:#}")
+                .contains("rebuild incremental contract plan after publication lease"),
             "unexpected error: {error:#}"
         );
         let incremental_store = GraphStore::open_or_create(&incremental_db).unwrap();
@@ -20408,7 +20409,8 @@ module.exports = { check, plain };\n";
         assert!(
             error
                 .to_string()
-                .contains("prepare incremental source files")
+                .contains("rebuild incremental source files after publication lease"),
+            "unexpected error: {error:#}"
         );
 
         let store = GraphStore::open_or_create(&db_path).unwrap();
