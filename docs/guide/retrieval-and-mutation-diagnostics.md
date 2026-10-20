@@ -170,15 +170,43 @@ lite arguments: it negotiated `2024-11-05`, advertised tool capability, and
 returned the six registry tools in 0.019 seconds. This confirms server protocol
 compatibility, not a running Cursor/Codex/Claude host session.
 
-`affected_tests` with `base_ref` accepts linked worktrees, submodules, and
-self-contained separate Git directories, including metadata stored inside the
-checkout. Internal separate metadata cannot borrow a common directory or object
-database through `commondir`, alternates, or symlinks in its objects or refs.
-An unregistered separate directory named `.git` is ambiguous with another
-checkout's ordinary metadata and is refused. Register a legitimate separate
-layout explicitly with `git --git-dir <directory> config core.worktree
-<absolute-work-tree>`. This registration records the intended checkout;
-metadata alone cannot establish the provenance of arbitrary copied repositories.
+`affected_tests` with `base_ref` accepts ordinary repositories, registered
+linked worktrees and submodules, and self-contained separate metadata inside
+the checkout. External separate metadata requires a matching explicit
+`core.worktree` registration: `git --git-dir <directory> config core.worktree
+<absolute-work-tree>`. Mismatching registrations, bare repositories, arbitrary
+external gitfile targets, alternates, metadata symlinks, repository config
+includes, partial/promisor clones, and alternate ref-storage backends are refused.
+These checks also apply to ordinary `.git` directories and linked worktrees'
+common metadata. They walk object and ref directories,
+so repositories with many loose objects incur additional inspection time.
+Metadata alone cannot establish the provenance of arbitrary copied repositories.
+
+The diff compares committed and staged names, then reads a stat-only inventory
+of tracked worktree changes. It never asks Git to convert worktree contents;
+repository clean/process/textconv filters and fsmonitor programs do not run.
+Touched files whose bytes are unchanged can remain selected until a normal Git
+index refresh. Every submodule path is conservatively selected to avoid running
+submodule programs while inspecting its dirtiness. Inherited Git routing and
+configuration variables are ignored. Refused metadata paths and raw Git stderr
+are omitted from errors; the selected repository is still identified.
 
 `base_ref` requests re-read live Git state on every call, including identical
 requests; explicit `changed_files` inputs retain graph response caching.
+
+Source indexing preserves the walk's ignore policy when restoring committed
+files missing from the graph. A tracked source matched by Git ignore rules
+stays excluded across plain and forced indexes; a newly ignored incumbent is
+removed. One unreadable-directory disclosure covers its descendants. Only the
+final restoration plan logs individual read failures, up to ten per run plus
+a summary. An unchanged-commit index still enumerates committed paths to verify
+coverage, but only missing eligible sources are prepared. An unavailable Git
+inventory fails the index rather than claiming complete coverage.
+
+Source or contract preparation failures before graph writes retire a fresh
+publication marker and generation reservation, so correcting the input permits
+a plain retry. A recovered marker remains fenced because a previous writer may
+have committed changes. Ranking commands distinguish unreadable or malformed
+resolver metadata from a missing generation record: text warns that verification
+failed, and JSON carries `resolver_generation_error` with `rankings_stale: true`.
+Cached ranking results cannot hide that verification failure.
