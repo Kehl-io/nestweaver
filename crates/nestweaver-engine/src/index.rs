@@ -7894,10 +7894,19 @@ fn incremental_index_with_name_and_io_and_authority(
     // Wrap the entire incremental update in a single transaction so that a
     // crash mid-index doesn't leave partial data in the store. The indexed
     // SHA is updated inside the transaction — if we crash before commit, the
-    // next run replays from the old SHA.
-    let txn = store
-        .begin_transaction()
-        .with_context(|| "begin incremental transaction")?;
+    // next run replays from the old SHA. Nothing has been written yet, so a
+    // failure to begin retires this run's fresh marker like preparation does.
+    let txn = match store.begin_transaction() {
+        Ok(txn) => txn,
+        Err(error) => {
+            return Err(retire_failed_index_preparation(
+                publication,
+                Some(db_path),
+                epilogue_io,
+                anyhow::Error::from(error).context("begin incremental transaction"),
+            ));
+        }
+    };
 
     for change in &changes {
         match change {
@@ -8815,33 +8824,33 @@ fn paths_covered_by_changes(changes: &[crate::git_diff::FileChange]) -> HashSet<
     paths
 }
 
-/// Indexable paths in `sha`'s tree that the graph does not hold and that this
-/// run's diff does not already cover.
-///
-/// `git diff indexed_sha..HEAD` is empty for a source that was committed at or
-/// before `indexed_sha` and then dropped from the graph. Advancing the SHA
-/// without putting that path back leaves it missing forever.
 /// Individually logged committed sources that could not be prepared per run.
 const MAX_LOGGED_UNPREPARED: usize = 10;
 
 /// Log only the final restore plan, once its caller has finished preparing and
 /// refreshing after publication waits. Preflights must not multiply warnings.
 fn log_unprepared_committed_sources(missing: &HashMap<String, PreparedIncrementalOutcome>) {
-    let mut unprepared = 0usize;
-    for outcome in missing.values() {
-        if let PreparedIncrementalOutcome::PolicySkipped(skipped) = outcome
-            && skipped.reason_code == SkipReasonCode::ReadError
-        {
-            unprepared += 1;
-            if unprepared <= MAX_LOGGED_UNPREPARED {
-                tracing::warn!(
-                    path = %skipped.path,
-                    error = %skipped.reason,
-                    "committed source could not be prepared; leaving it out of the graph"
-                );
+    // Sorted so the individually logged paths are the same on every run.
+    let mut unprepared: Vec<&SkippedFile> = missing
+        .values()
+        .filter_map(|outcome| match outcome {
+            PreparedIncrementalOutcome::PolicySkipped(skipped)
+                if skipped.reason_code == SkipReasonCode::ReadError =>
+            {
+                Some(skipped)
             }
-        }
+            _ => None,
+        })
+        .collect();
+    unprepared.sort_by(|left, right| left.path.cmp(&right.path));
+    for skipped in unprepared.iter().take(MAX_LOGGED_UNPREPARED) {
+        tracing::warn!(
+            path = %skipped.path,
+            error = %skipped.reason,
+            "committed source could not be prepared; leaving it out of the graph"
+        );
     }
+    let unprepared = unprepared.len();
     if unprepared > MAX_LOGGED_UNPREPARED {
         tracing::warn!(
             unprepared,
@@ -8888,6 +8897,12 @@ fn tracked_ignored_source_paths(
         .collect()
 }
 
+/// Indexable paths in `sha`'s tree that the graph does not hold and that this
+/// run's diff does not already cover.
+///
+/// `git diff indexed_sha..HEAD` is empty for a source that was committed at or
+/// before `indexed_sha` and then dropped from the graph. Advancing the SHA
+/// without putting that path back leaves it missing forever.
 fn prepare_missing_committed_sources(
     reader: &dyn crate::content_reader::ContentReader,
     git_repo_path: &Path,

@@ -1136,6 +1136,16 @@ impl CodeWatcher {
         let mut prepared_paths = Vec::new();
         let mut changed: HashSet<String> = HashSet::new();
         let mut removed: HashSet<String> = HashSet::new();
+        // Startup drift enumerates through the walk, which already drops
+        // ignored paths. A single event does not, so a tracked source the walk
+        // discloses as ignored must stay out here too.
+        let hidden = sources_hidden_from_walk(
+            &self.repo_root,
+            relevant
+                .iter()
+                .filter(|path| is_supported_source(path) && path.is_file())
+                .filter_map(|path| path.strip_prefix(&self.repo_root).ok()),
+        );
         for path in relevant.iter().filter(|path| is_supported_source(path)) {
             let rel_path = match path.strip_prefix(&self.repo_root) {
                 Ok(r) => r,
@@ -1148,12 +1158,9 @@ impl CodeWatcher {
                 }
             };
             let rel_str = rel_path.to_string_lossy().into_owned();
-            // Startup drift enumerates through the walk, which already drops
-            // gitignored paths. A single event does not, so a tracked source
-            // the walk discloses as gitignored must stay out here too.
             let exclusion = match source_policy_exclusion(&reader, &self.repo_root, path)? {
                 Some(reason) => Some(reason),
-                None if path.exists() && !path_not_gitignored(&self.repo_root, rel_path)? => {
+                None if hidden.contains(rel_path) => {
                     Some(crate::content_reader::TRACKED_BUT_IGNORED_REASON)
                 }
                 None => None,
@@ -2829,6 +2836,54 @@ fn status_path_is_indexable(reader: &crate::content_reader::FilesystemReader, pa
         && (is_supported_source(relative) || crate::contracts::is_spec_file(path))
 }
 
+/// The `candidates` (repo-relative files) that `FilesystemReader`'s walk would
+/// not enumerate because of `.gitignore`, `.ignore`, `info/exclude` or global
+/// excludes. Uses the walker's own configuration, descending only into the
+/// candidates' ancestor directories, so one batch costs one shallow walk.
+///
+/// A walk error (for example an unreadable directory) yields no verdict:
+/// those paths are disclosed by indexing, and dropping their coverage here
+/// would disagree with it.
+fn sources_hidden_from_walk<'a>(
+    repo_root: &Path,
+    candidates: impl IntoIterator<Item = &'a Path>,
+) -> HashSet<PathBuf> {
+    let wanted: HashSet<PathBuf> = candidates.into_iter().map(Path::to_path_buf).collect();
+    if wanted.is_empty() {
+        return HashSet::new();
+    }
+    let ancestors: HashSet<PathBuf> = wanted
+        .iter()
+        .flat_map(|path| path.ancestors().skip(1))
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect();
+    let root = repo_root.to_path_buf();
+    let visit = wanted.clone();
+    let mut seen = HashSet::new();
+    for entry in ignore::WalkBuilder::new(repo_root)
+        .follow_links(false)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .filter_entry(move |entry| {
+            entry.path().strip_prefix(&root).is_ok_and(|rel| {
+                rel.as_os_str().is_empty() || ancestors.contains(rel) || visit.contains(rel)
+            })
+        })
+        .build()
+    {
+        let Ok(entry) = entry else {
+            return HashSet::new();
+        };
+        if let Ok(rel) = entry.path().strip_prefix(repo_root) {
+            seen.insert(rel.to_path_buf());
+        }
+    }
+    wanted.difference(&seen).cloned().collect()
+}
+
 /// Whether `relative` escapes the repository's gitignore rules, regardless of
 /// whether Git tracks it (`check-ignore --no-index`), as the walk decides.
 fn path_not_gitignored(root: &Path, relative: &Path) -> anyhow::Result<bool> {
@@ -4205,9 +4260,17 @@ mod tests {
         };
         git(&["init", "-q"]);
         std::fs::write(root.join(".gitignore"), "src/ignored.js\n").unwrap();
+        // The walk also honours `.ignore`, which `git check-ignore` does not.
+        std::fs::write(root.join(".ignore"), "src/dot_ignored.js\n").unwrap();
         let ignored = root.join("src/ignored.js");
+        let dot_ignored = root.join("src/dot_ignored.js");
         let kept = root.join("src/kept_new.js");
         std::fs::write(&ignored, "export function ignoredFn() { return 1; }\n").unwrap();
+        std::fs::write(
+            &dot_ignored,
+            "export function dotIgnoredFn() { return 3; }\n",
+        )
+        .unwrap();
         std::fs::write(&kept, "export function keptFn() { return 2; }\n").unwrap();
         git(&["add", "-f", "."]);
         let reader = crate::content_reader::FilesystemReader::new(&root);
@@ -4215,12 +4278,19 @@ mod tests {
         assert!(
             crate::content_reader::ContentReader::skipped_dirs(&reader)
                 .iter()
-                .any(|row| row.path == "src/ignored.js"
-                    && row.reason == crate::content_reader::TRACKED_BUT_IGNORED_REASON),
-            "precondition: the walk discloses the tracked gitignored source"
+                .filter(|row| row.reason == crate::content_reader::TRACKED_BUT_IGNORED_REASON)
+                .count()
+                == 2,
+            "precondition: the walk discloses both tracked ignored sources"
         );
         let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
-        process_fixture_batch(&watcher, &store, &r_uid, &root, &[ignored, kept]);
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            &[ignored, dot_ignored, kept],
+        );
         let files: Vec<String> = store
             .list_files_by_repo(&r_uid)
             .unwrap()
@@ -4229,6 +4299,10 @@ mod tests {
             .collect();
         assert!(
             !files.iter().any(|path| path == "src/ignored.js"),
+            "{files:?}"
+        );
+        assert!(
+            !files.iter().any(|path| path == "src/dot_ignored.js"),
             "{files:?}"
         );
         assert!(
