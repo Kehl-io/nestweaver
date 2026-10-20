@@ -185,11 +185,12 @@ Config preflight disables repository discovery so Git cannot read includes
 before validation. Config files over 1 MiB are refused; preflight subprocesses
 also have time and output limits.
 
-The diff compares committed and staged names, then reads a stat-only inventory
-of tracked worktree changes. It never asks Git to convert worktree contents;
-repository clean/process/textconv filters and fsmonitor programs do not run.
-Touched files whose bytes are unchanged can remain selected until a normal Git
-index refresh. Every submodule path is conservatively selected to avoid running
+The diff compares committed and staged names, then inspects tracked worktree
+changes. Git can hash worktree contents when checking a racy index, so every
+configured clean/process filter is neutralized before inspection; textconv and
+fsmonitor programs are disabled too. Converted files and touched files whose
+bytes are unchanged may be conservatively selected. A normal Git index refresh
+can clear stat dirtiness. Every submodule path is conservatively selected to avoid running
 submodule programs while inspecting its dirtiness. Inherited Git routing and
 configuration variables are ignored. Refused metadata paths and raw Git stderr
 are omitted from errors; the selected repository is still identified.

@@ -14836,6 +14836,95 @@ fn git_command_for_resolved_git_dir(path: &Path, git_dir: &Path) -> std::process
     command
 }
 
+/// Disable executable content conversion before any command inspects worktree
+/// contents. Even `ls-files --modified` hashes racy-index entries and invokes
+/// clean/process filters. Config is inspected without discovery or includes;
+/// linked worktrees also inherit drivers from their registered common directory.
+fn git_filter_overrides(path: &Path, git_dir: &Path) -> Result<Vec<String>, anyhow::Error> {
+    let mut directories = vec![git_dir.to_path_buf()];
+    let commondir = git_dir.join("commondir");
+    if commondir.exists() {
+        let text = std::fs::read_to_string(commondir)
+            .context("cannot inspect indexed Git common directory")?;
+        let common = text
+            .lines()
+            .next()
+            .filter(|line| !line.is_empty())
+            .context("invalid indexed Git common directory")?;
+        let common = Path::new(common);
+        directories.push(
+            std::fs::canonicalize(if common.is_absolute() {
+                common.to_path_buf()
+            } else {
+                git_dir.join(common)
+            })
+            .context("cannot resolve indexed Git common directory")?,
+        );
+    }
+    directories.sort();
+    directories.dedup();
+    let mut drivers = std::collections::BTreeSet::new();
+    for directory in directories {
+        for config in [directory.join("config"), directory.join("config.worktree")] {
+            let output = inspect_git_metadata_config(
+                path,
+                &config,
+                &[
+                    "--name-only",
+                    "--null",
+                    "--get-regexp",
+                    "^filter\\..*\\.(clean|process|required)$",
+                ],
+            )?;
+            if output.status.code() == Some(1) {
+                continue;
+            }
+            anyhow::ensure!(
+                output.status.success(),
+                "cannot inspect indexed Git filters"
+            );
+            anyhow::ensure!(
+                output.stdout.ends_with(&[0]),
+                "invalid indexed Git filter inventory"
+            );
+            for key in output.stdout[..output.stdout.len() - 1].split(|byte| *byte == 0) {
+                let key =
+                    std::str::from_utf8(key).context("unsupported Git filter configuration")?;
+                let (driver, _) = key
+                    .strip_prefix("filter.")
+                    .and_then(|key| key.rsplit_once('.'))
+                    .context("unsupported Git filter configuration")?;
+                // Git's -c parser splits at '=' and rejects newlines in keys.
+                // Preserve representable subsection names (including case,
+                // dots, spaces and UTF-8) without quoting them through a shell.
+                anyhow::ensure!(
+                    !driver.is_empty()
+                        && !driver.bytes().any(|byte| matches!(byte, b'=' | b'\n' | 0)),
+                    "unsupported Git filter configuration"
+                );
+                drivers.insert(driver.to_string());
+            }
+        }
+    }
+    let mut overrides = Vec::new();
+    let mut bytes = 0usize;
+    for driver in drivers {
+        for value in [
+            format!("filter.{driver}.clean="),
+            format!("filter.{driver}.process="),
+            format!("filter.{driver}.required=false"),
+        ] {
+            bytes = bytes.saturating_add(value.len() + 3);
+            anyhow::ensure!(
+                bytes <= 64 * 1024,
+                "indexed Git filter inventory exceeds safety limit"
+            );
+            overrides.push(value);
+        }
+    }
+    Ok(overrides)
+}
+
 /// Git directory to pass as `--git-dir` when `path` is an acceptable work tree.
 ///
 /// A normal repository is a non-symlink `.git` directory for which
@@ -15188,15 +15277,24 @@ fn rev_parse_git_path(path: &Path, flag: &str) -> Option<std::path::PathBuf> {
 }
 
 /// Compare the resolved commit to the index, then conservatively include
-/// stat-dirty tracked worktree paths and every gitlink. The plumbing never
-/// converts worktree contents or recursively inspects another submodule.
+/// stat-dirty tracked worktree paths and every gitlink. Executable conversion
+/// filters are neutralized, including racy-index hashing; another submodule is
+/// never recursively inspected.
 fn diff_indexed_work_tree(
     path: &Path,
     git_dir: &Path,
     base_ref: &str,
 ) -> Result<Vec<std::path::PathBuf>, anyhow::Error> {
+    let overrides = git_filter_overrides(path, git_dir)?;
+    let safe_command = || {
+        let mut command = git_command_for_resolved_git_dir(path, git_dir);
+        for value in &overrides {
+            command.arg("-c").arg(value);
+        }
+        command
+    };
     let oid = resolve_indexed_commit(path, git_dir, base_ref)?;
-    let mut staged = git_command_for_resolved_git_dir(path, git_dir);
+    let mut staged = safe_command();
     staged
         .args([
             "diff-index",
@@ -15212,10 +15310,10 @@ fn diff_indexed_work_tree(
         .arg(&oid)
         .arg("--");
     let mut files = affected_tests_git_names(staged)?;
-    // `git diff` hashes worktree contents and executes clean/process filters,
-    // even with --no-textconv. ls-files -m is stat-only, so it conservatively
-    // includes touched files while never asking Git to convert their contents.
-    let mut modified = git_command_for_resolved_git_dir(path, git_dir);
+    // ls-files usually compares stats, but racy-index entries can hash file
+    // contents. Driver overrides above suppress clean/process execution while
+    // retaining conservative selection when filtered contents differ.
+    let mut modified = safe_command();
     modified
         .arg("--work-tree")
         .arg(std::fs::canonicalize(path).context("failed to resolve indexed work tree")?)
@@ -15223,7 +15321,7 @@ fn diff_indexed_work_tree(
     files.extend(affected_tests_git_names(modified)?);
     // Inspecting submodule dirtiness recursively can run another repository's
     // configured programs. Conservatively select every gitlink instead.
-    let mut entries = git_command_for_resolved_git_dir(path, git_dir);
+    let mut entries = safe_command();
     entries.args(["ls-files", "--stage", "-z"]);
     for record in affected_tests_git_output(entries)?.split(|byte| *byte == 0) {
         if record.starts_with(b"160000 ") {
@@ -15773,6 +15871,22 @@ mod affected_tests_base_ref_tests {
         git(dir, &["commit", "-q", "-m", "init"]);
     }
 
+    /// The attack must be real: native Git lists the other repository's file,
+    /// so a later refusal is NestWeaver's, not Git's.
+    fn assert_native_git_discloses_other_repository(path: &std::path::Path, name: &str) {
+        let native = std::process::Command::new("git")
+            .args(["--work-tree=.", "diff", "--name-only", "HEAD", "--"])
+            .current_dir(path)
+            .output()
+            .expect("git");
+        assert!(
+            native.status.success()
+                && String::from_utf8_lossy(&native.stdout).contains("only-real.txt"),
+            "{name} fixture must disclose the other repository to native Git: {}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+    }
+
     fn assert_other_repository_files_are_not_returned(path: &std::path::Path, name: &str) {
         git(
             path,
@@ -15813,6 +15927,7 @@ mod affected_tests_base_ref_tests {
         let via_symlink = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(real.path().join(".git"), via_symlink.path().join(".git"))
             .unwrap();
+        assert_native_git_discloses_other_repository(via_symlink.path(), "symlink-repo");
         assert_other_repository_files_are_not_returned(via_symlink.path(), "symlink-repo");
 
         let via_commondir = tempfile::tempdir().unwrap();
@@ -15824,6 +15939,7 @@ mod affected_tests_base_ref_tests {
         )
         .unwrap();
         std::fs::copy(real.path().join(".git").join("HEAD"), fake_git.join("HEAD")).unwrap();
+        assert_native_git_discloses_other_repository(via_commondir.path(), "commondir-repo");
         assert_other_repository_files_are_not_returned(via_commondir.path(), "commondir-repo");
     }
 
@@ -15894,6 +16010,7 @@ mod affected_tests_base_ref_tests {
             format!("gitdir: {}\n", real.path().join(".git").display()),
         )
         .unwrap();
+        assert_native_git_discloses_other_repository(foreign.path(), "foreign-gitfile");
         assert_other_repository_files_are_not_returned(foreign.path(), "foreign-gitfile");
 
         let forged = tempfile::tempdir().unwrap();
@@ -15907,6 +16024,7 @@ mod affected_tests_base_ref_tests {
         )
         .unwrap();
         std::fs::copy(real.path().join(".git").join("HEAD"), evil.join("HEAD")).unwrap();
+        assert_native_git_discloses_other_repository(forged.path(), "forged-core-worktree");
         assert_other_repository_files_are_not_returned(forged.path(), "forged-core-worktree");
     }
 
@@ -15927,6 +16045,10 @@ mod affected_tests_base_ref_tests {
         std::fs::write(evil.join("gitdir"), "../.git\n").unwrap();
         std::fs::write(evil.join("commondir"), format!("{}\n", real_git.display())).unwrap();
         std::fs::copy(real_git.join("HEAD"), evil.join("HEAD")).unwrap();
+        assert_native_git_discloses_other_repository(
+            forged_gitdir.path(),
+            "forged-gitdir-commondir",
+        );
         assert_other_repository_files_are_not_returned(
             forged_gitdir.path(),
             "forged-gitdir-commondir",
@@ -15952,6 +16074,7 @@ mod affected_tests_base_ref_tests {
         )
         .unwrap();
         std::fs::write(evil.join("HEAD"), "ref: refs/heads/borrowed\n").unwrap();
+        assert_native_git_discloses_other_repository(alternates.path(), "forged-alternates");
         assert_other_repository_files_are_not_returned(alternates.path(), "forged-alternates");
     }
 
@@ -16040,6 +16163,10 @@ mod affected_tests_base_ref_tests {
                     "{layout}/{mode}: {}",
                     String::from_utf8_lossy(&baseline.stdout)
                 );
+                assert_native_git_discloses_other_repository(
+                    forged.path(),
+                    "borrowed-object-database",
+                );
                 assert_other_repository_files_are_not_returned(
                     forged.path(),
                     "borrowed-object-database",
@@ -16083,6 +16210,7 @@ mod affected_tests_base_ref_tests {
                 format!("gitdir: {}\n", metadata.display()),
             )
             .unwrap();
+            assert_native_git_discloses_other_repository(fake.path(), "external-unregistered");
             assert_other_repository_files_are_not_returned(fake.path(), "external-unregistered");
             let selected = AffectedTestsBaseRefRepository {
                 uid: "repo:test:private".into(),
@@ -16345,6 +16473,241 @@ mod affected_tests_base_ref_tests {
             assert_diffs_tracked_file(work.path(), "untrusted-filter");
             assert!(!marker.exists(), "the tool executed a repository filter");
         }
+    }
+
+    /// A racy index hashes even unchanged files. Native ls-files demonstrates
+    /// execution; the production diff must keep the useful result without it.
+    #[test]
+    fn affected_tests_base_ref_neutralizes_racy_index_filters() {
+        use std::os::unix::fs::PermissionsExt;
+        for dirty in [false, true] {
+            for process in [false, true] {
+                for worktree_config in [false, true] {
+                    let work = tempfile::tempdir().unwrap();
+                    init_repo_with_tracked_file(work.path(), "tracked.txt");
+                    let driver = if worktree_config {
+                        "lfs.Custom/Driver_é"
+                    } else {
+                        "lfs.Custom-Driver_2"
+                    };
+                    std::fs::write(
+                        work.path().join(".gitattributes"),
+                        format!("*.txt filter={driver}\n"),
+                    )
+                    .unwrap();
+                    git(work.path(), &["add", ".gitattributes"]);
+                    git(work.path(), &["commit", "-q", "-m", "attributes"]);
+                    let executable = tempfile::tempdir().unwrap();
+                    let marker = executable.path().join("executed");
+                    let script = executable.path().join("filter");
+                    std::fs::write(
+                        &script,
+                        format!(
+                            "#!/bin/sh\ntouch '{}'\n{}\n",
+                            marker.display(),
+                            if process { "exit 1" } else { "cat" }
+                        ),
+                    )
+                    .unwrap();
+                    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                    if worktree_config {
+                        git(
+                            work.path(),
+                            &["config", "extensions.worktreeConfig", "true"],
+                        );
+                    }
+                    let mut config_args = vec!["config"];
+                    if worktree_config {
+                        config_args.push("--worktree");
+                    }
+                    let key = format!(
+                        "filter.{driver}.{}",
+                        if process { "process" } else { "clean" }
+                    );
+                    let mut args = config_args.clone();
+                    args.extend([key.as_str(), script.to_str().unwrap()]);
+                    git(work.path(), &args);
+                    let required = format!("filter.{driver}.required");
+                    config_args.extend([required.as_str(), "true"]);
+                    git(work.path(), &config_args);
+                    let file = work.path().join("tracked.txt");
+                    let recorded_time = std::fs::metadata(&file).unwrap().modified().unwrap();
+                    if dirty {
+                        git(work.path(), &["config", "core.trustctime", "false"]);
+                        git(work.path(), &["config", "core.checkstat", "minimal"]);
+                        std::fs::write(&file, "after!\n").unwrap();
+                        std::fs::File::open(&file)
+                            .unwrap()
+                            .set_modified(recorded_time)
+                            .unwrap();
+                    }
+                    std::fs::File::open(work.path().join(".git/index"))
+                        .unwrap()
+                        .set_modified(recorded_time)
+                        .unwrap();
+                    let baseline = std::process::Command::new("git")
+                        .current_dir(work.path())
+                        .args([
+                            "-c",
+                            "core.fsmonitor=false",
+                            "ls-files",
+                            "--modified",
+                            "--deleted",
+                            "-z",
+                        ])
+                        .output()
+                        .unwrap();
+                    assert!(
+                        marker.exists(),
+                        "native racy hashing must execute (dirty={dirty}, process={process}, worktree={worktree_config}): {}",
+                        String::from_utf8_lossy(&baseline.stderr)
+                    );
+                    std::fs::remove_file(&marker).unwrap();
+                    let git_dir = indexed_work_tree_git_dir(work.path()).unwrap();
+                    let files = diff_indexed_work_tree(work.path(), &git_dir, "HEAD").unwrap();
+                    assert!(!marker.exists(), "racy-index inspection executed a filter");
+                    if dirty {
+                        assert!(
+                            files.iter().any(|path| path == Path::new("tracked.txt")),
+                            "same-size racy edit must remain selected: {files:?}"
+                        );
+                    } else {
+                        assert!(
+                            files.is_empty(),
+                            "unchanged racy file remains unchanged: {files:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn affected_tests_base_ref_neutralizes_linked_worktree_common_filters() {
+        use std::os::unix::fs::PermissionsExt;
+        let main = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(main.path(), "tracked.txt");
+        std::fs::write(main.path().join(".gitattributes"), "*.txt filter=lfs\n").unwrap();
+        git(main.path(), &["add", ".gitattributes"]);
+        git(main.path(), &["commit", "-q", "-m", "attributes"]);
+        let linked_parent = tempfile::tempdir().unwrap();
+        let linked = linked_parent.path().join("linked");
+        git(
+            main.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked-filter",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let marker = linked_parent.path().join("executed");
+        let script = linked_parent.path().join("filter");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(
+            main.path(),
+            &["config", "filter.lfs.clean", script.to_str().unwrap()],
+        );
+        git(main.path(), &["config", "filter.lfs.required", "true"]);
+        let git_dir = indexed_work_tree_git_dir(&linked).unwrap();
+        let recorded = std::fs::metadata(linked.join("tracked.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::fs::File::open(git_dir.join("index"))
+            .unwrap()
+            .set_modified(recorded)
+            .unwrap();
+        let _baseline = std::process::Command::new("git")
+            .current_dir(&linked)
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "ls-files",
+                "--modified",
+                "--deleted",
+                "-z",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            marker.exists(),
+            "native linked-worktree check must execute the common filter"
+        );
+        std::fs::remove_file(&marker).unwrap();
+        assert!(
+            diff_indexed_work_tree(&linked, &git_dir, "HEAD")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !marker.exists(),
+            "common-directory driver was not neutralized"
+        );
+    }
+
+    #[test]
+    fn affected_tests_base_ref_rejects_unrepresentable_filter_driver() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(work.path(), "tracked.txt");
+        std::fs::write(
+            work.path().join(".gitattributes"),
+            "*.txt filter=bad=name\n",
+        )
+        .unwrap();
+        git(work.path(), &["add", ".gitattributes"]);
+        git(work.path(), &["commit", "-q", "-m", "attributes"]);
+        let executable = tempfile::tempdir().unwrap();
+        let marker = executable.path().join("executed");
+        let script = executable.path().join("filter");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(
+            work.path(),
+            &["config", "filter.bad=name.clean", script.to_str().unwrap()],
+        );
+        std::fs::write(work.path().join("tracked.txt"), "after!\n").unwrap();
+        let _baseline = std::process::Command::new("git")
+            .current_dir(work.path())
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "diff",
+                "--name-only",
+                "HEAD",
+                "--",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            marker.exists(),
+            "unrepresentable driver fixture must be executable"
+        );
+        std::fs::remove_file(&marker).unwrap();
+        let git_dir = indexed_work_tree_git_dir(work.path()).unwrap();
+        let error = diff_indexed_work_tree(work.path(), &git_dir, "HEAD").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported Git filter configuration")
+        );
+        assert!(
+            !marker.exists(),
+            "unrepresentable driver must fail before worktree inspection"
+        );
     }
 
     #[test]
