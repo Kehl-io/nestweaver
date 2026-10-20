@@ -204,8 +204,10 @@ stays excluded across plain and forced indexes; a newly ignored incumbent is
 removed. One unreadable-directory disclosure covers its descendants. Only the
 final restoration plan logs individual read failures, up to ten per run plus
 a summary. An unchanged-commit index still enumerates committed paths to verify
-coverage, but only missing eligible sources are prepared. An unavailable Git
-inventory fails the index rather than claiming complete coverage.
+coverage, but only missing eligible sources are prepared. When that inventory
+is unavailable, an unchanged-commit index still succeeds without writing, but
+reports a `ReadError` skip for `.` so coverage does not read complete. A
+changed-commit index fails instead.
 
 Source or contract preparation failures before graph writes retire a fresh
 publication marker and generation reservation, so correcting the input permits

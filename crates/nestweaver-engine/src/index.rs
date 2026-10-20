@@ -7647,8 +7647,16 @@ fn incremental_index_with_name_and_io_and_authority(
     let policy_reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits)
         .unskipping(unskip)
         .excluding(excludes)?;
-    crate::content_reader::ContentReader::list_files(&policy_reader)
-        .context("refresh source inventory before incremental policy checks")?;
+    // An up-to-date repository does no work, so an inventory failure there is
+    // disclosed rather than fatal (nw-287). A changed SHA needs the walk.
+    let mut unverified_coverage = None;
+    if let Err(error) = crate::content_reader::ContentReader::list_files(&policy_reader) {
+        let error = error.context("refresh source inventory before incremental policy checks");
+        if old_sha != new_sha {
+            return Err(error);
+        }
+        unverified_coverage = Some(error);
+    }
     let ignored_files = tracked_ignored_source_paths(&policy_reader);
     if store.get_repo_index_policy(&r_uid)?.as_deref()
         != Some(
@@ -7682,25 +7690,31 @@ fn incremental_index_with_name_and_io_and_authority(
     // through the normal publication transaction even without a new commit.
     let mut unchanged_result = IncrementalResult::default();
     let mut restore_at_same_sha = false;
-    if old_sha == new_sha {
+    if old_sha == new_sha && unverified_coverage.is_none() {
         let occupied = store
             .list_files_by_repo(&r_uid)?
             .into_iter()
             .map(|(_, path)| path)
             .collect();
-        let missing = prepare_missing_committed_sources(
+        match prepare_missing_committed_sources(
             &policy_reader,
             repo_path,
             &new_sha,
             &occupied,
             false,
-        )
-        .context("check committed sources before unchanged-SHA shortcut")?;
-        restore_at_same_sha = missing
-            .values()
-            .any(|outcome| matches!(outcome, PreparedIncrementalOutcome::Ready(_)));
-        if !restore_at_same_sha {
-            record_missing_committed_source_skips(&missing, &mut unchanged_result);
+        ) {
+            Ok(missing) => {
+                restore_at_same_sha = missing
+                    .values()
+                    .any(|outcome| matches!(outcome, PreparedIncrementalOutcome::Ready(_)));
+                if !restore_at_same_sha {
+                    record_missing_committed_source_skips(&missing, &mut unchanged_result);
+                }
+            }
+            Err(error) => {
+                unverified_coverage =
+                    Some(error.context("check committed sources before unchanged-SHA shortcut"));
+            }
         }
     }
 
@@ -7738,7 +7752,10 @@ fn incremental_index_with_name_and_io_and_authority(
         // The missing-source preflight already walked this reader. Reuse its
         // disclosures rather than enumerate the same unchanged tree again.
         let mut result = unchanged_result;
-        drain_pruned_dirs_into_incremental(&policy_reader, &mut result);
+        match unverified_coverage {
+            Some(error) => record_unverified_unchanged_coverage(&mut result, &error),
+            None => drain_pruned_dirs_into_incremental(&policy_reader, &mut result),
+        }
         return Ok(result);
     }
 
@@ -8175,9 +8192,17 @@ where
         });
     }
 
-    reader
-        .list_files()
-        .context("refresh source inventory before incremental policy checks")?;
+    // An up-to-date repository does no work, so an inventory failure there is
+    // disclosed rather than fatal (nw-287). A changed SHA needs the walk.
+    if let Err(error) = reader.list_files() {
+        let error = error.context("refresh source inventory before incremental policy checks");
+        if old_sha != new_sha {
+            return Err(error);
+        }
+        let mut result = IncrementalResult::default();
+        record_unverified_unchanged_coverage(&mut result, &error);
+        return Ok(result);
+    }
     let ignored_files = tracked_ignored_source_paths(reader);
     let mut policy_removed: std::collections::HashSet<String> = store
         .list_files_by_repo(&r_uid)?
@@ -8194,9 +8219,23 @@ where
             .into_iter()
             .map(|(_, path)| path)
             .collect();
-        let missing =
-            prepare_missing_committed_sources(reader, git_repo_path, new_sha, &occupied, false)
-                .context("check committed sources before unchanged-SHA shortcut")?;
+        let missing = match prepare_missing_committed_sources(
+            reader,
+            git_repo_path,
+            new_sha,
+            &occupied,
+            false,
+        ) {
+            Ok(missing) => missing,
+            Err(error) => {
+                let mut result = IncrementalResult::default();
+                record_unverified_unchanged_coverage(
+                    &mut result,
+                    &error.context("check committed sources before unchanged-SHA shortcut"),
+                );
+                return Ok(result);
+            }
+        };
         if !missing
             .values()
             .any(|outcome| matches!(outcome, PreparedIncrementalOutcome::Ready(_)))
@@ -8797,6 +8836,26 @@ fn log_unprepared_committed_sources(missing: &HashMap<String, PreparedIncrementa
             "more committed sources could not be prepared than were logged individually"
         );
     }
+}
+
+/// An unchanged SHA did no work, so an inventory failure must not fail the run
+/// (nw-287). Disclose it so coverage does not read complete either.
+fn record_unverified_unchanged_coverage(result: &mut IncrementalResult, error: &anyhow::Error) {
+    tracing::warn!(
+        error = %format!("{error:#}"),
+        "could not verify committed source coverage of an up-to-date repo"
+    );
+    record_incremental_file_outcome(
+        result,
+        IncrementalFileOutcome::PolicySkipped(SkippedFile::new(
+            ".".to_string(),
+            SkipReasonCode::ReadError,
+            format!(
+                "committed source coverage could not be verified ({error:#}); repair the \
+                 repository and re-run the index"
+            ),
+        )),
+    );
 }
 
 fn tracked_ignored_source_paths(
@@ -10906,6 +10965,41 @@ mod tests {
         git(&["add", "-A"]);
         git(&["commit", "-q", "-m", message]);
         git
+    }
+
+    /// An up-to-date index did no work. A committed-tree listing failure must
+    /// not fail it, and must not let coverage read complete either.
+    #[test]
+    fn unchanged_sha_discloses_unverifiable_committed_sources_without_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("kept.py"), "def kept():\n    return 1\n").unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let sha = git(&["rev-parse", "HEAD"]);
+        let db = dir.path().join("graph.lbug");
+        let url = "https://example.test/unverifiable-unchanged";
+        index_directory(&repo, &db, "test", url, &sha).unwrap();
+        let generation = fs::read(crate::sidecar_path(&db, ".generation")).unwrap();
+        let tree = git(&["rev-parse", "HEAD^{tree}"]);
+        fs::remove_file(repo.join(".git/objects").join(&tree[..2]).join(&tree[2..])).unwrap();
+
+        let result = incremental_index(&repo, &db, "test", url)
+            .expect("an unchanged SHA must not fail on an unlistable commit tree");
+        assert_eq!(result.files_added, 0);
+        assert_eq!(result.skipped_files.len(), 1, "{:?}", result.skipped_files);
+        assert_eq!(result.skipped_files[0].path, ".");
+        assert_eq!(
+            result.skipped_files[0].reason_code,
+            SkipReasonCode::ReadError
+        );
+        assert_eq!(
+            fs::read(crate::sidecar_path(&db, ".generation")).unwrap(),
+            generation
+        );
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert!(!store.is_index_publication_dirty());
+        assert!(!store.lookup_symbols_by_name("kept").unwrap().is_empty());
     }
 
     #[test]
