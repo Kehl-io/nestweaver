@@ -177,6 +177,9 @@ the checkout. External separate metadata requires a matching explicit
 <absolute-work-tree>`. Mismatching registrations, bare repositories, arbitrary
 external gitfile targets, alternates, metadata symlinks, repository config
 includes, partial/promisor clones, and alternate ref-storage backends are refused.
+A `commondir` with surrounding whitespace or an embedded line break is refused,
+and the common directory Git resolves must equal the validated one. A refused
+gitfile reports the registration command without naming its target.
 These checks also apply to ordinary `.git` directories and linked worktrees'
 common metadata. They walk object and ref directories,
 so repositories with many loose objects incur additional inspection time.

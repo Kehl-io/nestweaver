@@ -14717,6 +14717,13 @@ fn diff_affected_tests_base_ref(
         let error = affected_tests_not_a_git_repository(repository);
         // Gitfile targets and Git's stderr can name paths outside the selected
         // repository. Keep refused metadata private; identify only this repo.
+        if std::fs::symlink_metadata(path.join(".git")).is_ok_and(|meta| meta.is_file()) {
+            return Err(anyhow!(
+                "{error}; its .git file names Git metadata that is not verifiably registered \
+                 to this work tree. For a separate Git directory, run \
+                 `git --git-dir <git-dir> config core.worktree <absolute-work-tree>`"
+            ));
+        }
         return Err(error);
     };
     match diff_indexed_work_tree(path, &git_dir, base_ref) {
@@ -14842,24 +14849,8 @@ fn git_command_for_resolved_git_dir(path: &Path, git_dir: &Path) -> std::process
 /// linked worktrees also inherit drivers from their registered common directory.
 fn git_filter_overrides(path: &Path, git_dir: &Path) -> Result<Vec<String>, anyhow::Error> {
     let mut directories = vec![git_dir.to_path_buf()];
-    let commondir = git_dir.join("commondir");
-    if commondir.exists() {
-        let text = std::fs::read_to_string(commondir)
-            .context("cannot inspect indexed Git common directory")?;
-        let common = text
-            .lines()
-            .next()
-            .filter(|line| !line.is_empty())
-            .context("invalid indexed Git common directory")?;
-        let common = Path::new(common);
-        directories.push(
-            std::fs::canonicalize(if common.is_absolute() {
-                common.to_path_buf()
-            } else {
-                git_dir.join(common)
-            })
-            .context("cannot resolve indexed Git common directory")?,
-        );
+    if let Some(common) = read_commondir(git_dir)? {
+        directories.push(common);
     }
     directories.sort();
     directories.dedup();
@@ -14949,9 +14940,54 @@ fn indexed_work_tree_git_dir(path: &Path) -> Option<std::path::PathBuf> {
         return self_contained_git_dir(path, &dot_git);
     }
     if meta.is_file() {
-        return linked_worktree_git_dir(path, &dot_git);
+        let git_dir = linked_worktree_git_dir(path, &dot_git)?;
+        // Our parsers must agree with Git's: the common directory Git itself
+        // resolves for this checkout is the one validated above.
+        let expected = read_commondir(&git_dir)
+            .ok()?
+            .unwrap_or_else(|| git_dir.clone());
+        let actual = rev_parse_git_path(path, "--git-common-dir")?;
+        return (actual == expected).then_some(git_dir);
     }
     None
+}
+
+/// Canonical common directory named by `<git_dir>/commondir`, if present.
+///
+/// Git reads the whole file and strips only trailing CR/LF. A value that would
+/// parse differently under any other reading (leading or trailing whitespace,
+/// an embedded line break or NUL, an empty path) is refused rather than
+/// interpreted, so validation and Git always name the same directory.
+fn read_commondir(git_dir: &Path) -> Result<Option<std::path::PathBuf>, anyhow::Error> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = match std::fs::read(git_dir.join("commondir")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => anyhow::bail!("cannot inspect indexed Git common directory"),
+    };
+    let mut value = bytes.as_slice();
+    while let Some(rest) = value
+        .strip_suffix(b"\n")
+        .or_else(|| value.strip_suffix(b"\r"))
+    {
+        value = rest;
+    }
+    anyhow::ensure!(
+        !value.is_empty()
+            && !value.first().is_some_and(u8::is_ascii_whitespace)
+            && !value.last().is_some_and(u8::is_ascii_whitespace)
+            && !value.iter().any(|byte| matches!(byte, b'\n' | b'\r' | 0)),
+        "invalid indexed Git common directory"
+    );
+    let common = Path::new(std::ffi::OsStr::from_bytes(value));
+    let resolved = if common.is_absolute() {
+        common.to_path_buf()
+    } else {
+        git_dir.join(common)
+    };
+    std::fs::canonicalize(resolved)
+        .map(Some)
+        .context("cannot resolve indexed Git common directory")
 }
 
 /// `path/.git` when both git-dir queries name that directory and nothing else.
@@ -15119,25 +15155,10 @@ fn git_metadata_tree_is_self_contained(root: &Path, reject_promisor_packs: bool)
 /// True when `git_dir` has no `commondir`, or when it is
 /// `<common>/worktrees/<name>` and its `commondir` resolves to `<common>`.
 fn commondir_is_own_registration(git_dir: &Path) -> bool {
-    let commondir = git_dir.join("commondir");
-    if !commondir.exists() {
-        return true;
-    }
-    let Ok(text) = std::fs::read_to_string(&commondir) else {
-        return false;
-    };
-    let line = text.lines().next().map(str::trim).unwrap_or_default();
-    if line.is_empty() {
-        return false;
-    }
-    let raw = Path::new(line);
-    let resolved = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        git_dir.join(raw)
-    };
-    let Ok(common) = std::fs::canonicalize(resolved) else {
-        return false;
+    let common = match read_commondir(git_dir) {
+        Ok(None) => return true,
+        Ok(Some(common)) => common,
+        Err(_) => return false,
     };
     if !git_metadata_is_self_contained(git_dir, &common, true) {
         return false;
@@ -15616,13 +15637,30 @@ mod affected_tests_base_ref_tests {
             indexed_work_tree_git_dir(&work).is_none(),
             "external ownership must be registered"
         );
-        git(&work, &["config", "core.worktree", work.to_str().unwrap()]);
-
         let uid = "repo:test:separate";
         let store = GraphStore::in_memory().unwrap();
         store
             .insert_repo(&indexed_repo(uid, "separate-repo", &work))
             .unwrap();
+        let refused = tool_affected_tests(
+            &store,
+            json!({ "base_ref": "HEAD", "repo": "separate-repo" }),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            refused.contains("separate-repo")
+                && refused.contains("it is not a git repository")
+                && refused.contains("config core.worktree <absolute-work-tree>"),
+            "the refusal must name the repository and how to register it: {refused}"
+        );
+        assert!(
+            !refused.contains(git_dir.to_str().unwrap()),
+            "the refusal must not disclose the gitfile target: {refused}"
+        );
+        git(&work, &["config", "core.worktree", work.to_str().unwrap()]);
+
         let result = tool_affected_tests(
             &store,
             json!({ "base_ref": "HEAD", "repo": "separate-repo" }),
@@ -16076,6 +16114,43 @@ mod affected_tests_base_ref_tests {
         std::fs::write(evil.join("HEAD"), "ref: refs/heads/borrowed\n").unwrap();
         assert_native_git_discloses_other_repository(alternates.path(), "forged-alternates");
         assert_other_repository_files_are_not_returned(alternates.path(), "forged-alternates");
+    }
+
+    /// Git reads `commondir` whole and strips only trailing CR/LF. A value our
+    /// parser would read differently must not validate one common directory
+    /// while Git opens another through a planted symlink.
+    #[test]
+    fn affected_tests_base_ref_rejects_commondir_parsed_differently_by_git() {
+        let real = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(real.path(), "only-real.txt");
+        let real_git = real.path().join(".git");
+        for (name, commondir, link) in [
+            ("commondir-trailing-space", "../.. \n", ".. "),
+            ("commondir-embedded-newline", "../..\n..\nx\n", "..\n..\nx"),
+        ] {
+            let staging = tempfile::tempdir().unwrap();
+            let host = staging.path().join("host");
+            std::fs::create_dir(&host).unwrap();
+            init_repo_with_tracked_file(&host, "host.txt");
+            let worktree = host.join(".git/worktrees/w");
+            std::fs::create_dir_all(&worktree).unwrap();
+            std::fs::write(worktree.join("commondir"), commondir).unwrap();
+            std::fs::copy(real_git.join("HEAD"), worktree.join("HEAD")).unwrap();
+            std::os::unix::fs::symlink(&real_git, host.join(".git/worktrees").join(link)).unwrap();
+            let attacker = tempfile::tempdir().unwrap();
+            std::fs::write(
+                attacker.path().join(".git"),
+                format!("gitdir: {}\n", worktree.display()),
+            )
+            .unwrap();
+            std::fs::write(
+                worktree.join("gitdir"),
+                format!("{}\n", attacker.path().join(".git").display()),
+            )
+            .unwrap();
+            assert_native_git_discloses_other_repository(attacker.path(), name);
+            assert_other_repository_files_are_not_returned(attacker.path(), name);
+        }
     }
 
     /// Valid refs/index plus borrowed objects would let Git diff another
