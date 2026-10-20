@@ -1087,7 +1087,7 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Install cargo-mutants
-        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
         with:
           # Pinned to the exact version the exit-code and outcomes.json
           # field-name comments below were verified against (`src/outcome.rs`
@@ -1207,7 +1207,7 @@ jobs:
       # Prebuilt binary via install-action instead of `cargo install cargo-audit`
       # (which compiles it from source on every run, ~3 min).
       - name: Install cargo-audit
-        uses: taiki-e/install-action@0758d235715de2f3551eacc980d9ae8fce9342c3 # cargo-audit 2026-09-02
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # cargo-audit 2026-09-02
         with:
           tool: cargo-audit
       # No `|| true`. This check is displayed as "Security Audit" on every pull
