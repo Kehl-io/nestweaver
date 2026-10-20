@@ -171,15 +171,19 @@ returned the six registry tools in 0.019 seconds. This confirms server protocol
 compatibility, not a running Cursor/Codex/Claude host session.
 
 `affected_tests` with `base_ref` accepts ordinary repositories, registered
-linked worktrees and submodules, and self-contained separate metadata inside
-the checkout. External separate metadata requires a matching explicit
+linked worktrees (including worktrees of a bare clone) and submodules, and
+self-contained separate metadata inside the checkout. External separate metadata requires a matching explicit
 `core.worktree` registration: `git --git-dir <directory> config core.worktree
-<absolute-work-tree>`. Mismatching registrations, bare repositories, arbitrary
-external gitfile targets, alternates, metadata symlinks, repository config
-includes, partial/promisor clones, and alternate ref-storage backends are refused.
-A `commondir` with surrounding whitespace or an embedded line break is refused,
-and the common directory Git resolves must equal the validated one. A refused
-gitfile reports the registration command without naming its target.
+<absolute-work-tree>`. Mismatching registrations, a gitfile naming a bare
+repository, arbitrary external gitfile targets, alternates (including reference
+clones), metadata symlinks, repository config includes, partial/promisor clones,
+and alternate ref-storage backends such as reftable are refused. Symlinked
+`hooks`, `lfs`, `rr-cache` and `description` entries and the fsmonitor daemon
+socket are tolerated, since the inspection never reads them. A gitfile,
+`commondir` or worktree `gitdir` value with surrounding whitespace or an
+embedded line break is refused, and the common directory Git resolves must
+equal the validated one. A refusal names the selected repository and the kind
+of problem, never a metadata path.
 These checks also apply to ordinary `.git` directories and linked worktrees'
 common metadata. They walk object and ref directories,
 so repositories with many loose objects incur additional inspection time.
@@ -190,8 +194,11 @@ also have time and output limits.
 
 The diff compares committed and staged names, then inspects tracked worktree
 changes. Git can hash worktree contents when checking a racy index, so every
-configured clean/process filter is neutralized before inspection; textconv and
-fsmonitor programs are disabled too. Converted files and touched files whose
+clean/process filter configured in the repository or its common directory is
+neutralized before inspection; textconv and fsmonitor programs are disabled
+too. System and global Git configuration and attributes are ignored, except
+that the operator's own `safe.directory` entries are forwarded so trusted
+repositories owned by another user still work. Converted files and touched files whose
 bytes are unchanged may be conservatively selected. A normal Git index refresh
 can clear stat dirtiness. Every submodule path is conservatively selected to avoid running
 submodule programs while inspecting its dirtiness. Inherited Git routing and
@@ -208,11 +215,11 @@ removed. One unreadable-directory disclosure covers its descendants. Only the
 final restoration plan logs individual read failures, up to ten per run plus
 a summary. An unchanged-commit index still enumerates committed paths to verify
 coverage, but only missing eligible sources are prepared. When a known commit's
-tree cannot be listed (for example, a damaged object store), the working tree is
-still indexed and a `ReadError` skip for `.` keeps coverage from reading
-complete. An unknown commit fails the index. In the incremental path, an
-unavailable source walk is disclosed the same way at an unchanged commit and
-fails the index at a changed one.
+tree cannot be listed (for example, a damaged object store), a full index (the
+daemon's `nestweaver index` route) still indexes the working tree and reports a
+`ReadError` skip for `.` so coverage does not read complete; an unknown commit
+fails. The incremental route (server mode) discloses an unavailable tree or
+source walk the same way at an unchanged commit, and fails at a changed one.
 
 Source or contract preparation failures before graph writes retire a fresh
 publication marker and generation reservation, so correcting the input permits

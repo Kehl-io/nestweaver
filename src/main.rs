@@ -2877,7 +2877,8 @@ impl ResolverStaleness {
     /// Exact answer: enumerate the repos and compare each recorded generation
     /// on the database this store was opened from.
     ///
-    /// That path is the same evidence `incompatible_repos_for_store` uses.
+    /// That is the database `incompatible_repos_for_store` reads, but this
+    /// path reads it strictly: unreadable metadata is reported, not stale.
     /// Passing a separate path let `repo-map` read the logical anchor after
     /// `open_store` had already followed publication `CURRENT`, so a Git SHA
     /// mismatch on an otherwise current graph was reported as every repository
