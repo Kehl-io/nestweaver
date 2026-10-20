@@ -3687,6 +3687,15 @@ mod tests {
     /// reading complete.
     #[test]
     fn incremental_index_discloses_an_unreadable_missed_source_and_still_records_head() {
+        assert_missing_source_disclosure_and_recovery(false);
+    }
+
+    #[test]
+    fn server_incremental_index_retries_missing_sources_at_the_same_sha() {
+        assert_missing_source_disclosure_and_recovery(true);
+    }
+
+    fn assert_missing_source_disclosure_and_recovery(server_mode: bool) {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap().join("repo");
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -3767,7 +3776,25 @@ mod tests {
         // Deleted from the working tree but still committed: it cannot be
         // prepared. That must not block the index, and must not read complete.
         std::fs::remove_file(root.join("src/missed.js")).unwrap();
-        let result = crate::index::incremental_index(&root, &db, "test", &url).unwrap();
+        let index = || {
+            if server_mode {
+                let store = GraphStore::open_or_create(&db).unwrap();
+                let reader = crate::content_reader::FilesystemReader::new(&root);
+                crate::index::incremental_index_with_reader_and_write_gate(
+                    &reader,
+                    &root,
+                    &store,
+                    "test",
+                    &url,
+                    &head(),
+                    || Ok(()),
+                )
+                .unwrap()
+            } else {
+                crate::index::incremental_index(&root, &db, "test", &url).unwrap()
+            }
+        };
+        let result = index();
         assert_eq!(result.files_added, 0, "{result:?}");
         assert!(
             result.skipped_files.iter().any(|skipped| {
@@ -3782,6 +3809,69 @@ mod tests {
             store.lookup_repo(&uid).unwrap().unwrap().indexed_sha,
             clean,
             "HEAD is recorded even though the committed source could not be restored"
+        );
+        let generation = store.graph_generation();
+        drop(store);
+
+        // Same commit, same missing source: a second invocation must not
+        // clear coverage merely because the first invocation recorded HEAD.
+        for _ in 0..2 {
+            let repeated = index();
+            assert_eq!(repeated.files_added, 0, "{repeated:?}");
+            assert_eq!(repeated.files_skipped, repeated.skipped_files.len());
+            assert_eq!(
+                repeated
+                    .skipped_files
+                    .iter()
+                    .filter(|skipped| {
+                        skipped.path == "src/missed.js"
+                            && skipped.reason_code == nestweaver_parser::SkipReasonCode::ReadError
+                    })
+                    .count(),
+                1,
+                "{repeated:?}"
+            );
+            let store = GraphStore::open_or_create(&db).unwrap();
+            assert_eq!(
+                store.graph_generation(),
+                generation,
+                "reporting the same read failure must not republish the graph"
+            );
+        }
+
+        // A restored source can still be ineligible. Report its actual skip
+        // reason instead of clearing the gap or continuing to call it unreadable.
+        std::fs::write(root.join("src/missed.js"), b"binary\0source").unwrap();
+        let binary = index();
+        assert_eq!(binary.files_added, 0, "{binary:?}");
+        assert_eq!(binary.skipped_files.len(), 1, "{binary:?}");
+        assert_eq!(
+            binary.skipped_files[0].reason_code,
+            nestweaver_parser::SkipReasonCode::Binary
+        );
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert_eq!(store.graph_generation(), generation);
+        drop(store);
+
+        // Restoring the bytes needs no commit: the same-SHA path must repair
+        // the graph through the ordinary publication transaction.
+        std::fs::write(root.join("src/missed.js"), missed_body).unwrap();
+        let restored = index();
+        assert_eq!(restored.files_added, 1, "{restored:?}");
+        assert!(restored.skipped_files.is_empty(), "{restored:?}");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert_eq!(store.lookup_repo(&uid).unwrap().unwrap().indexed_sha, clean);
+        assert!(!store.lookup_symbols_by_name("missed").unwrap().is_empty());
+        let restored_generation = store.graph_generation();
+        drop(store);
+        let steady = index();
+        assert_eq!(steady.files_added, 0, "{steady:?}");
+        assert!(steady.skipped_files.is_empty(), "{steady:?}");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert_eq!(
+            store.graph_generation(),
+            restored_generation,
+            "a healthy unchanged run must stay read-only"
         );
     }
 

@@ -4268,11 +4268,19 @@ pub fn dispatch_cancellable(
             || args.get("sections").is_some()
             || args.get("body_offset").is_some()
             || args.get("body_version").is_some());
-    let result = if is_cacheable_tool(name) && !cache_bypassed(&args) && !live_note_body {
-        maybe_cached(store, tantivy, name, args, embed_model, cancel, visible)
-    } else {
-        dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible)
-    };
+    // A Git diff reads live refs, index, worktree, and routing/config files.
+    // None advance the graph generation or indexed scope digest, so caching
+    // this request can replay an empty diff or bypass repository validation.
+    // Mirror the producer's precedence: explicit files use graph data only.
+    let live_git_diff = name == "affected_tests"
+        && args.get("changed_files").is_none()
+        && args.get("base_ref").and_then(Value::as_str).is_some();
+    let result =
+        if is_cacheable_tool(name) && !cache_bypassed(&args) && !live_note_body && !live_git_diff {
+            maybe_cached(store, tantivy, name, args, embed_model, cancel, visible)
+        } else {
+            dispatch_uncached(store, tantivy, name, args, embed_model, cancel, visible)
+        };
 
     // nw-315: THE tool layer is the author of provenance, because it is the
     // only layer every route passes through.
@@ -14701,7 +14709,17 @@ fn diff_affected_tests_base_ref(
 ) -> Result<Vec<std::path::PathBuf>, anyhow::Error> {
     let path = Path::new(&repository.path);
     let Some(git_dir) = indexed_work_tree_git_dir(path) else {
-        return Err(affected_tests_not_a_git_repository(repository));
+        let error = affected_tests_not_a_git_repository(repository);
+        if let Some(target) = gitfile_target(path, &path.join(".git"))
+            .and_then(|target| std::fs::canonicalize(target).ok())
+            .filter(|target| target.file_name().is_some_and(|name| name == ".git"))
+        {
+            anyhow::bail!(
+                "{error}; if this is a separate Git directory named .git, register its worktree with git --git-dir <dir> config core.worktree <absolute-work-tree> (directory: {})",
+                target.display()
+            );
+        }
+        return Err(error);
     };
     match diff_indexed_work_tree(path, &git_dir, base_ref) {
         Ok(files) => Ok(files),
@@ -14768,9 +14786,12 @@ fn git_command_for_resolved_git_dir(path: &Path, git_dir: &Path) -> std::process
 /// A gitfile (linked worktree or submodule) is accepted when the target
 /// directory points back at this work tree: through its `gitdir` file (linked
 /// worktree) or its `core.worktree` setting (submodule). The returned
-/// directory is that target. A `--separate-git-dir` repository records neither,
-/// so it cannot be told from a gitfile naming another repository and is
-/// refused.
+/// directory is that target. A `--separate-git-dir` repository may have neither
+/// back-pointer; its self-contained metadata is also accepted. Metadata alone
+/// cannot prove the ownership of an arbitrary separate git directory. An
+/// unregistered target named `.git` is refused because it may belong to the
+/// checkout beside it; register a separate directory with
+/// `git --git-dir <dir> config core.worktree <absolute-work-tree>` to disambiguate.
 fn indexed_work_tree_git_dir(path: &Path) -> Option<std::path::PathBuf> {
     let dot_git = path.join(".git");
     let meta = std::fs::symlink_metadata(&dot_git).ok()?;
@@ -14798,18 +14819,24 @@ fn self_contained_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::Path
     }
 }
 
-/// Per-worktree or submodule git dir that a gitfile names, when it provably
-/// belongs to this work tree.
+/// Resolve a gitfile target, checking any worktree registration it carries.
 fn linked_worktree_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::PathBuf> {
     let target = gitfile_target(path, dot_git)?;
     let canonical = std::fs::canonicalize(&target).ok()?;
     if !canonical.is_dir() {
         return None;
     }
-    // The indexed tree authors its own `.git` gitfile, so a target inside it is
-    // a git dir the tree forged (a real one lives in the superproject's
-    // `.git/modules` or the main repository's `.git/worktrees`, both outside).
-    if canonical.starts_with(std::fs::canonicalize(path).ok()?) {
+    let inside_work_tree = canonical.starts_with(std::fs::canonicalize(path).ok()?);
+    // `--separate-git-dir` can put its metadata inside the work tree. Do not
+    // trust back-pointers authored there to authorize borrowing a different
+    // repository's common directory or object database.
+    if inside_work_tree
+        && (canonical.join("commondir").exists()
+            || canonical.join("objects/info/alternates").exists()
+            || ["objects", "refs"]
+                .iter()
+                .any(|entry| !git_metadata_tree_is_self_contained(&canonical.join(entry))))
+    {
         return None;
     }
     // A `commondir` must be the main repository this worktree is registered
@@ -14843,6 +14870,33 @@ fn linked_worktree_git_dir(path: &Path, dot_git: &Path) -> Option<std::path::Pat
     } else {
         None
     }
+}
+
+/// Internal separate metadata must not redirect objects or refs through a
+/// symlink, including loose object files and pack directories. Ordinary and
+/// external Git directories do not incur this walk.
+fn git_metadata_tree_is_self_contained(root: &Path) -> bool {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() {
+            return false;
+        }
+        if metadata.is_dir() {
+            let Ok(entries) = std::fs::read_dir(path) else {
+                return false;
+            };
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    return false;
+                };
+                pending.push(entry.path());
+            }
+        }
+    }
+    true
 }
 
 /// True when `git_dir` has no `commondir`, or when it is
@@ -14997,7 +15051,11 @@ fn diff_indexed_work_tree(
 ) -> Result<Vec<std::path::PathBuf>, anyhow::Error> {
     let oid = resolve_indexed_commit(path, git_dir, base_ref)?;
     let mut command = git_command_for_resolved_git_dir(path, git_dir);
+    // Repository config can also route the work tree through core.worktree.
+    // Pin the checkout as well as its Git directory; -C alone does not do so.
     command
+        .arg("--work-tree")
+        .arg(std::fs::canonicalize(path).context("failed to resolve indexed work tree")?)
         .arg("diff")
         .arg("--name-only")
         .arg("-z")
@@ -15290,6 +15348,108 @@ mod affected_tests_base_ref_tests {
         assert_eq!(result["repo_uid"], json!(uid), "{result}");
     }
 
+    /// Separate metadata inside the checkout is a supported `git init` layout.
+    /// Check both discovery and an actual diff, including a relative gitfile.
+    #[test]
+    fn affected_tests_base_ref_diffs_internal_separate_git_dirs() {
+        for relative in [false, true] {
+            let work = tempfile::tempdir().unwrap();
+            init_repo_with_tracked_file(work.path(), "tracked.txt");
+            let git_dir = work.path().join(".git-storage");
+            git(
+                work.path(),
+                &[
+                    "init",
+                    "-q",
+                    "--separate-git-dir",
+                    git_dir.to_str().unwrap(),
+                ],
+            );
+            if relative {
+                std::fs::write(work.path().join(".git"), "gitdir: .git-storage\n").unwrap();
+            }
+            std::fs::write(work.path().join("tracked.txt"), "after\n").unwrap();
+            assert_diffs_tracked_file(work.path(), "internal-separate");
+        }
+    }
+
+    /// Even a valid metadata directory must diff the indexed checkout, not
+    /// whichever directory its local core.worktree config names.
+    #[test]
+    fn affected_tests_base_ref_pins_worktree_against_repository_config() {
+        for separate in [false, true] {
+            let work = tempfile::tempdir().unwrap();
+            init_repo_with_tracked_file(work.path(), "tracked.txt");
+            if separate {
+                let metadata = work.path().join(".git-storage");
+                git(
+                    work.path(),
+                    &[
+                        "init",
+                        "-q",
+                        "--separate-git-dir",
+                        metadata.to_str().unwrap(),
+                    ],
+                );
+            }
+            let foreign = tempfile::tempdir().unwrap();
+            std::fs::write(foreign.path().join("tracked.txt"), "before\n").unwrap();
+            git(
+                work.path(),
+                &["config", "core.worktree", foreign.path().to_str().unwrap()],
+            );
+            std::fs::write(work.path().join("tracked.txt"), "after\n").unwrap();
+            assert_diffs_tracked_file(work.path(), "configured-foreign-worktree");
+        }
+    }
+
+    #[test]
+    fn affected_tests_base_ref_diffs_a_relative_repository_path() {
+        let work = tempfile::Builder::new()
+            .prefix(".nw-relative-test-")
+            .tempdir_in(".")
+            .unwrap();
+        let relative = Path::new(".").join(work.path().file_name().unwrap());
+        init_repo_with_tracked_file(&relative, "tracked.txt");
+        std::fs::write(relative.join("tracked.txt"), "after\n").unwrap();
+        assert_diffs_tracked_file(&relative, "relative-worktree");
+    }
+
+    /// A separate directory named `.git` has the same shape as another
+    /// checkout's embedded metadata. Its explicit worktree registration
+    /// disambiguates it without trusting a gitfile to borrow a foreign repo.
+    #[test]
+    fn affected_tests_base_ref_diffs_registered_separate_dot_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let git_dir = dir.path().join("metadata/.git");
+        std::fs::create_dir_all(git_dir.parent().unwrap()).unwrap();
+        std::fs::create_dir(&work).unwrap();
+        git(
+            dir.path(),
+            &[
+                "init",
+                "-q",
+                "--separate-git-dir",
+                git_dir.to_str().unwrap(),
+                work.to_str().unwrap(),
+            ],
+        );
+        git(&work, &["config", "user.email", "test@example.com"]);
+        git(&work, &["config", "user.name", "Test"]);
+        git(&work, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(work.join("tracked.txt"), "before\n").unwrap();
+        git(&work, &["add", "tracked.txt"]);
+        git(&work, &["commit", "-q", "-m", "init"]);
+        assert!(
+            indexed_work_tree_git_dir(&work).is_none(),
+            "unregistered .git ownership is ambiguous"
+        );
+        git(&work, &["config", "core.worktree", work.to_str().unwrap()]);
+        std::fs::write(work.join("tracked.txt"), "after\n").unwrap();
+        assert_diffs_tracked_file(&work, "registered-separate-dot-git");
+    }
+
     /// Copying another linked worktree's gitfile must not be accepted. The
     /// target's `gitdir` pointer names the original worktree.
     #[test]
@@ -15541,9 +15701,9 @@ mod affected_tests_base_ref_tests {
         assert_other_repository_files_are_not_returned(forged.path(), "forged-core-worktree");
     }
 
-    /// The tree authors its own gitfile, so a git dir it plants inside itself
-    /// must never be trusted, whatever `gitdir`, `core.worktree`, `commondir`
-    /// or alternates it carries.
+    /// A target inside the tree may be legitimate separate Git metadata, but
+    /// its authored back-pointers must not authorize a foreign common dir or
+    /// object database.
     #[test]
     fn affected_tests_base_ref_rejects_git_dirs_planted_in_the_indexed_tree() {
         let real = tempfile::tempdir().unwrap();
@@ -15575,6 +15735,69 @@ mod affected_tests_base_ref_tests {
         .unwrap();
         std::fs::copy(real_git.join("HEAD"), evil.join("HEAD")).unwrap();
         assert_other_repository_files_are_not_returned(alternates.path(), "forged-alternates");
+    }
+
+    /// Valid refs/index plus borrowed objects would let Git diff another
+    /// repository. Internal separate metadata must reject both alternates and
+    /// a symlink to that object database.
+    #[test]
+    fn affected_tests_base_ref_rejects_internal_borrowed_object_database() {
+        let real = tempfile::tempdir().unwrap();
+        init_repo_with_tracked_file(real.path(), "only-real.txt");
+        git(real.path(), &["update-ref", "refs/heads/borrowed", "HEAD"]);
+        for mode in ["alternates", "objects", "loose-object"] {
+            let forged = tempfile::tempdir().unwrap();
+            init_repo_with_tracked_file(forged.path(), "tracked.txt");
+            let evil = forged.path().join(".git-storage");
+            git(
+                forged.path(),
+                &["init", "-q", "--separate-git-dir", evil.to_str().unwrap()],
+            );
+            std::fs::remove_dir_all(evil.join("objects")).unwrap();
+            if mode == "objects" {
+                std::os::unix::fs::symlink(real.path().join(".git/objects"), evil.join("objects"))
+                    .unwrap();
+            } else if mode == "loose-object" {
+                std::fs::create_dir(evil.join("objects")).unwrap();
+                for entry in std::fs::read_dir(real.path().join(".git/objects")).unwrap() {
+                    let entry = entry.unwrap();
+                    let prefix = entry.file_name();
+                    if prefix.len() != 2 {
+                        continue;
+                    }
+                    let destination = evil.join("objects").join(&prefix);
+                    std::fs::create_dir(&destination).unwrap();
+                    for object in std::fs::read_dir(entry.path()).unwrap() {
+                        let object = object.unwrap();
+                        std::os::unix::fs::symlink(
+                            object.path(),
+                            destination.join(object.file_name()),
+                        )
+                        .unwrap();
+                    }
+                }
+            } else {
+                std::fs::create_dir_all(evil.join("objects/info")).unwrap();
+                std::fs::write(
+                    evil.join("objects/info/alternates"),
+                    format!("{}\n", real.path().join(".git/objects").display()),
+                )
+                .unwrap();
+            }
+            std::fs::copy(
+                real.path().join(".git/refs/heads/borrowed"),
+                evil.join("refs/heads/borrowed"),
+            )
+            .unwrap();
+            std::fs::write(evil.join("HEAD"), "ref: refs/heads/borrowed\n").unwrap();
+            // Establish that the forged layout is valid to Git, rather than
+            // relying on an incomplete repository to make the tool refuse.
+            git(forged.path(), &["diff", "--name-only", "HEAD"]);
+            assert_other_repository_files_are_not_returned(
+                forged.path(),
+                "borrowed-object-database",
+            );
+        }
     }
 
     /// The repository's own config can name a `core.fsmonitor` program; the
@@ -23520,6 +23743,101 @@ mod cache_dispatch_tests {
         CACHE_MISSES.with(|c| c.set(0));
         RESPONSE_CACHE.with(|m| m.borrow_mut().clear());
         FLUSH_COUNTER.with(|c| c.set(0));
+    }
+
+    /// Repeating a base-ref request must observe live files and metadata even
+    /// while the graph and indexed scope stay unchanged. Exercise dispatch,
+    /// including its disk-backed cache, rather than just the Git helper.
+    #[test]
+    fn affected_tests_base_ref_revalidates_live_inputs_before_cache() {
+        reset_session();
+        let (dir, db_path) = index_on_disk();
+        let src = dir.path().join("repo");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(&src)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["add", "main.js"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        let generation = store.graph_generation();
+        let args = json!({ "base_ref": "HEAD" });
+        // Simulate a legacy binary's persisted clean result with the exact
+        // current key/salts. The bypass must ignore existing entries too.
+        let legacy = maybe_cached(
+            &store,
+            None,
+            "affected_tests",
+            args.clone(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(legacy["changed_files"], json!([]));
+        flush_response_cache();
+        reset_session();
+        let clean = dispatch(&store, None, "affected_tests", args.clone(), None).unwrap();
+        assert_eq!(clean["changed_files"], json!([]));
+        let original = fs::read_to_string(src.join("main.js")).unwrap();
+        fs::write(src.join("main.js"), format!("{original}\n// dirty\n")).unwrap();
+        let dirty = dispatch(&store, None, "affected_tests", args.clone(), None).unwrap();
+        assert_eq!(dirty["changed_files"], json!(["main.js"]));
+        fs::write(src.join("main.js"), &original).unwrap();
+        let clean_again = dispatch(&store, None, "affected_tests", args.clone(), None).unwrap();
+        assert_eq!(clean_again["changed_files"], json!([]));
+
+        let metadata_parent = dir.path().join("metadata");
+        fs::create_dir(&metadata_parent).unwrap();
+        let metadata = metadata_parent.join(".git");
+        fs::rename(src.join(".git"), &metadata).unwrap();
+        fs::write(
+            src.join(".git"),
+            format!("gitdir: {}\n", metadata.display()),
+        )
+        .unwrap();
+        let error = dispatch(&store, None, "affected_tests", args, None).unwrap_err();
+        assert!(
+            error.to_string().contains("not a git repository"),
+            "{error:#}"
+        );
+        assert_eq!(store.graph_generation(), generation);
+        assert_eq!(CACHE_HITS.with(|count| count.get()), 0);
+        assert_eq!(CACHE_MISSES.with(|count| count.get()), 0);
+
+        // Explicit files take precedence even when a base ref is present, and
+        // must retain graph caching. Check the public alias normalization too.
+        let explicit = json!({ "files": ["main.js"], "base_ref": "HEAD" });
+        let first = dispatch(&store, None, "affected_tests", explicit.clone(), None).unwrap();
+        let second = dispatch(&store, None, "affected_tests", explicit, None).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(CACHE_MISSES.with(|count| count.get()), 1);
+        assert_eq!(CACHE_HITS.with(|count| count.get()), 1);
     }
 
     /// The smallest argument object a schema accepts, so the only thing under

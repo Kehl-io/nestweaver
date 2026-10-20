@@ -169,3 +169,16 @@ An installed 10.0.0 stdio server was also exercised directly with the generated
 lite arguments: it negotiated `2024-11-05`, advertised tool capability, and
 returned the six registry tools in 0.019 seconds. This confirms server protocol
 compatibility, not a running Cursor/Codex/Claude host session.
+
+`affected_tests` with `base_ref` accepts linked worktrees, submodules, and
+self-contained separate Git directories, including metadata stored inside the
+checkout. Internal separate metadata cannot borrow a common directory or object
+database through `commondir`, alternates, or symlinks in its objects or refs.
+An unregistered separate directory named `.git` is ambiguous with another
+checkout's ordinary metadata and is refused. Register a legitimate separate
+layout explicitly with `git --git-dir <directory> config core.worktree
+<absolute-work-tree>`. This registration records the intended checkout;
+metadata alone cannot establish the provenance of arbitrary copied repositories.
+
+`base_ref` requests re-read live Git state on every call, including identical
+requests; explicit `changed_files` inputs retain graph response caching.
