@@ -5238,10 +5238,15 @@ where
                     // A file that vanished mid-scan is deleted, and one this
                     // process may not read is skipped and disclosed, as a
                     // binary one is: neither aborts publication for every
-                    // other file in the repository.
+                    // other file in the repository. An unreadable JS/TS/Java/
+                    // Kotlin source still fails (nw-664): it may be a
+                    // controller, and skipping it would publish a contract
+                    // set without its routes.
                     match io_error_kind(&err) {
                         Some(std::io::ErrorKind::NotFound) => return ParseOutcome::Vanished,
-                        Some(std::io::ErrorKind::PermissionDenied) => {
+                        Some(std::io::ErrorKind::PermissionDenied)
+                            if !is_contract_handler_language(*lang, false) =>
+                        {
                             return ParseOutcome::Skipped(unreadable_source(display_name, &err));
                         }
                         _ => {}
@@ -6470,18 +6475,10 @@ fn collect_contract_derivation_inputs(
                 skipped_files.push(SkippedFile::binary(rel_path.to_string_lossy().into_owned()));
                 continue;
             }
-            // One unreadable or vanished candidate used to fail strict mode
-            // for the whole repository, so a single `chmod 000` file blocked
-            // every index and every watcher batch. Unreadable is disclosed
-            // like binary (coverage degraded); vanished is simply gone.
+            // A candidate deleted since the scan is simply gone. An
+            // unreadable one still fails strict mode: it may be a controller,
+            // and skipping it would publish a contract set without its routes.
             Err(error) if io_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => continue,
-            Err(error) if io_error_kind(&error) == Some(std::io::ErrorKind::PermissionDenied) => {
-                skipped_files.push(unreadable_source(
-                    rel_path.to_string_lossy().into_owned(),
-                    &error,
-                ));
-                continue;
-            }
             Err(error) if strict => {
                 return Err(error).with_context(|| {
                     format!("read contract handler candidate {}", rel_path.display())
@@ -6695,16 +6692,14 @@ pub(crate) fn watcher_contract_input_snapshot(
         }
         let source = match reader.read_file(&rel_path) {
             Ok(source) => source,
-            // Binary cannot be a contract input; the plan skips it too. So
-            // does it skip (and disclose) an unreadable or vanished one.
+            // Binary cannot be a contract input; the plan skips it too, and a
+            // vanished one is gone. An unreadable one fails closed, as the
+            // plan does.
             Err(error)
                 if error
                     .downcast_ref::<crate::content_reader::BinarySource>()
                     .is_some()
-                    || matches!(
-                        io_error_kind(&error),
-                        Some(std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied)
-                    ) =>
+                    || io_error_kind(&error) == Some(std::io::ErrorKind::NotFound) =>
             {
                 continue;
             }
@@ -20825,10 +20820,10 @@ module.exports = { check, plain };\n";
         assert_eq!(result.skipped_files[0].reason_code, SkipReasonCode::Binary);
     }
 
-    /// QA: `chmod 000` on one source made every index exit 1 ("prepare strict
-    /// contract derivation: read contract handler candidate …: Permission
-    /// denied") and blocked every watcher batch. It is a skip, disclosed like
-    /// a binary file, and the rest of the repository publishes.
+    /// QA: `chmod 000` on one source failed the whole index. A source that
+    /// cannot carry contracts is a skip, disclosed like a binary file, and the
+    /// rest of the repository publishes. A contract-handler candidate still
+    /// fails closed (nw-664): it may be a controller.
     #[cfg(unix)]
     #[test]
     fn one_unreadable_source_is_skipped_and_disclosed_not_fatal() {
@@ -20838,13 +20833,8 @@ module.exports = { check, plain };\n";
         let db = dir.path().join("test.lbug");
         fs::create_dir_all(&repo).unwrap();
         fs::write(repo.join("clean.ts"), "export function alpha() {}\n").unwrap();
-        // A contract-handler candidate, so strict contract derivation reads it.
-        let locked = repo.join("locked.ts");
-        fs::write(
-            &locked,
-            "@Controller('x')\nexport class Locked { gamma() {} }\n",
-        )
-        .unwrap();
+        let locked = repo.join("locked.py");
+        fs::write(&locked, "def gamma():\n    return 1\n").unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
         if fs::read(&locked).is_ok() {
             // Running as root: permissions do not apply, nothing to test.
@@ -20858,7 +20848,7 @@ module.exports = { check, plain };\n";
         let locked_rows: Vec<_> = result
             .skipped_files
             .iter()
-            .filter(|skipped| skipped.path == "locked.ts")
+            .filter(|skipped| skipped.path == "locked.py")
             .collect();
         assert_eq!(locked_rows.len(), 1, "{:?}", result.skipped_files);
         assert_eq!(locked_rows[0].reason_code, SkipReasonCode::ReadError);
@@ -20866,6 +20856,37 @@ module.exports = { check, plain };\n";
             locked_rows[0].reason.contains("permission denied"),
             "{:?}",
             locked_rows[0]
+        );
+    }
+
+    /// Counterweight: an unreadable contract-handler candidate still fails the
+    /// index rather than publish a contract set without its routes.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_contract_candidate_still_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("clean.ts"), "export function alpha() {}\n").unwrap();
+        let locked = repo.join("locked.ts");
+        fs::write(
+            &locked,
+            "@Controller('x')\nexport class Locked { gamma() {} }\n",
+        )
+        .unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&locked).is_ok() {
+            // Running as root: permissions do not apply, nothing to test.
+            return;
+        }
+        let result = index_directory(&repo, &db, "test", "https://example.com/eacces-ts", "sha");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+        let error = result.expect_err("an unreadable controller must fail closed");
+        assert!(
+            format!("{error:#}").contains("locked.ts"),
+            "the error names the unreadable file: {error:#}"
         );
     }
 
