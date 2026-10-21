@@ -341,10 +341,9 @@ pub fn compute_local_changes(
     repo_url: &str,
 ) -> Result<Vec<AtomicChange>, anyhow::Error> {
     use anyhow::Context;
-    use std::process::Command;
 
     // Unstaged changes
-    let output = Command::new("git")
+    let output = crate::git_cmd::isolated_git()
         .args(["diff", "--name-only", "HEAD"])
         .current_dir(repo_path)
         .output()
@@ -356,7 +355,7 @@ pub fn compute_local_changes(
         .collect();
 
     // Staged but not yet committed changes
-    let staged = Command::new("git")
+    let staged = crate::git_cmd::isolated_git()
         .args(["diff", "--name-only", "--cached"])
         .current_dir(repo_path)
         .output()
@@ -382,7 +381,7 @@ pub fn compute_local_changes(
         }
 
         // Get old content from HEAD
-        let old_output = Command::new("git")
+        let old_output = crate::git_cmd::isolated_git()
             .args(["show", &format!("HEAD:{}", file)])
             .current_dir(repo_path)
             .output();
@@ -1090,6 +1089,62 @@ fn collect_transitive_references(
 
 #[cfg(test)]
 mod tests {
+
+    /// Comparing the working tree reads the index, which would run the
+    /// repository's `core.fsmonitor` program without isolation.
+    #[test]
+    fn local_changes_do_not_run_the_repository_fsmonitor() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        let repo = tempfile::tempdir().unwrap();
+        let markers = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("a.ts"), "export function a() {}\n").unwrap();
+        git(&["add", "a.ts"]);
+        git(&[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "a",
+        ]);
+        let fsmonitor = markers.path().join("fsmonitor");
+        std::fs::write(
+            &fsmonitor,
+            format!(
+                "#!/bin/sh\ntouch '{}'\n",
+                markers.path().join("ran").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fsmonitor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(&["config", "core.fsmonitor", fsmonitor.to_str().unwrap()]);
+        std::fs::write(
+            repo.path().join("a.ts"),
+            "export function a(x: number) {}\n",
+        )
+        .unwrap();
+
+        git(&["diff", "--name-only", "HEAD"]);
+        assert!(markers.path().join("ran").exists(), "baseline fsmonitor");
+        std::fs::remove_file(markers.path().join("ran")).unwrap();
+
+        let changes = compute_local_changes(repo.path(), "r").unwrap();
+        assert!(!changes.is_empty());
+        assert!(!markers.path().join("ran").exists(), "fsmonitor ran");
+    }
 
     /// nw-113: the `<module>` owner is an artefact of top-level calls, not an
     /// API. Removing a file's last top-level call must not read as a Breaking

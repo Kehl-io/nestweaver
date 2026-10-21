@@ -664,7 +664,7 @@ pub use brain_docgraph::{
 pub use brain_memory::{
     ConsolidationManifest, ConsolidationProposal, Contradiction, DanglingRelationship,
     MemoryLintReport, RelatedNode, SchemaDrift, StaleNote, SupersessionChain, memory_consolidate,
-    memory_lint, memory_related,
+    memory_consolidate_limited, memory_lint, memory_related,
 };
 pub use brainignore::{is_ignored, load_brain_ignore};
 pub use bridges::{BridgeNode, attach_communities, find_bridge_nodes};

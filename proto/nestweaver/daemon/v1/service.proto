@@ -288,6 +288,9 @@ message PruneStaleResponse {
   repeated string removed_vaults = 2;
   bool committed = 3;
   repeated ReconciliationFailure reconciliation_failures = 4;
+  // Sources KEPT because their root could not be checked (permission denied,
+  // I/O error): only a root that is definitely gone is pruned.
+  repeated string skipped_warnings = 5;
 }
 
 // nw-204. Reclaim embedding vectors left behind by deleted graph nodes.

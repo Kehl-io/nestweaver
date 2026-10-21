@@ -2538,6 +2538,24 @@ enum ChangeVerdict {
 /// Returns `Unchanged` when the cached metadata proves the file has not
 /// been modified, or `Changed` with the file content + new hash when it
 /// has (or when no cache entry exists).
+/// The I/O error kind behind a read failure, through any context layers.
+pub(crate) fn io_error_kind(error: &anyhow::Error) -> Option<std::io::ErrorKind> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .map(std::io::Error::kind)
+}
+
+/// A source this process may not read (`EACCES`): skipped and disclosed, so
+/// coverage reads degraded instead of the whole run failing.
+pub(crate) fn unreadable_source(path: String, error: &anyhow::Error) -> SkippedFile {
+    SkippedFile::new(
+        path,
+        SkipReasonCode::ReadError,
+        format!("unreadable (permission denied): {error:#}"),
+    )
+}
+
 fn tiered_change_check(
     reader: &dyn crate::content_reader::ContentReader,
     rel_path: &str,
@@ -5088,6 +5106,10 @@ where
             refreshed: Option<CachedFileMeta>,
         },
         Skipped(SkippedFile),
+        /// Deleted between the scan and its read (a checkout or rebase in
+        /// progress). Not present, so the deletion pass retracts any graphed
+        /// copy; not a coverage gap, so not disclosed as skipped.
+        Vanished,
         /// Transient I/O/parser failure. The full publication must abort;
         /// treating this as a policy skip could replace a complete incumbent
         /// graph with an incomplete one.
@@ -5212,6 +5234,22 @@ where
                         .is_some()
                     {
                         return ParseOutcome::Skipped(SkippedFile::binary(display_name));
+                    }
+                    // A file that vanished mid-scan is deleted, and one this
+                    // process may not read is skipped and disclosed, as a
+                    // binary one is: neither aborts publication for every
+                    // other file in the repository. An unreadable JS/TS/Java/
+                    // Kotlin source still fails (nw-664): it may be a
+                    // controller, and skipping it would publish a contract
+                    // set without its routes.
+                    match io_error_kind(&err) {
+                        Some(std::io::ErrorKind::NotFound) => return ParseOutcome::Vanished,
+                        Some(std::io::ErrorKind::PermissionDenied)
+                            if !is_contract_handler_language(*lang, false) =>
+                        {
+                            return ParseOutcome::Skipped(unreadable_source(display_name, &err));
+                        }
+                        _ => {}
                     }
                     return ParseOutcome::Failed(format!("stat/read {}: {err}", path.display()));
                 }
@@ -5359,6 +5397,7 @@ where
             ParseOutcome::Skipped(sf) => {
                 skipped_files.push(sf);
             }
+            ParseOutcome::Vanished => {}
             ParseOutcome::Failed(_) => unreachable!("failures are rejected before collection"),
             ParseOutcome::Parsed {
                 rel_path,
@@ -6387,11 +6426,12 @@ fn collect_contract_derivation_inputs(
         if !is_contract_handler_language(lang, has_grpc_specs) {
             continue;
         }
-        if reader
-            .file_meta_nanos(&rel_path)
-            .context("read contract input metadata")?
-            .is_some_and(|(_, size)| size > reader.max_source_file_bytes())
-        {
+        let metadata = match reader.file_meta_nanos(&rel_path) {
+            // Deleted since the scan: no longer a candidate.
+            Err(error) if io_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => continue,
+            metadata => metadata.context("read contract input metadata")?,
+        };
+        if metadata.is_some_and(|(_, size)| size > reader.max_source_file_bytes()) {
             tracing::debug!(path = %rel_path.display(), "skip oversized contract input before read");
             let observed_bytes = reader
                 .file_meta_nanos(&rel_path)
@@ -6435,6 +6475,10 @@ fn collect_contract_derivation_inputs(
                 skipped_files.push(SkippedFile::binary(rel_path.to_string_lossy().into_owned()));
                 continue;
             }
+            // A candidate deleted since the scan is simply gone. An
+            // unreadable one still fails strict mode: it may be a controller,
+            // and skipping it would publish a contract set without its routes.
+            Err(error) if io_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => continue,
             Err(error) if strict => {
                 return Err(error).with_context(|| {
                     format!("read contract handler candidate {}", rel_path.display())
@@ -6637,20 +6681,25 @@ pub(crate) fn watcher_contract_input_snapshot(
         if !is_spec && is_minified_or_bundled(&abs_path) {
             continue;
         }
-        if reader
-            .file_meta_nanos(&rel_path)
-            .with_context(|| format!("read watcher contract metadata {}", rel_path.display()))?
-            .is_some_and(|(_, size)| size > reader.max_source_file_bytes())
-        {
+        let metadata = match reader.file_meta_nanos(&rel_path) {
+            Err(error) if io_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => continue,
+            metadata => metadata.with_context(|| {
+                format!("read watcher contract metadata {}", rel_path.display())
+            })?,
+        };
+        if metadata.is_some_and(|(_, size)| size > reader.max_source_file_bytes()) {
             continue;
         }
         let source = match reader.read_file(&rel_path) {
             Ok(source) => source,
-            // Binary cannot be a contract input; the plan skips it too.
+            // Binary cannot be a contract input; the plan skips it too, and a
+            // vanished one is gone. An unreadable one fails closed, as the
+            // plan does.
             Err(error)
                 if error
                     .downcast_ref::<crate::content_reader::BinarySource>()
-                    .is_some() =>
+                    .is_some()
+                    || io_error_kind(&error) == Some(std::io::ErrorKind::NotFound) =>
             {
                 continue;
             }
@@ -20769,6 +20818,139 @@ module.exports = { check, plain };\n";
         assert_eq!(result.skipped_files.len(), 1);
         assert_eq!(result.skipped_files[0].path, "poisoned.rs");
         assert_eq!(result.skipped_files[0].reason_code, SkipReasonCode::Binary);
+    }
+
+    /// QA: `chmod 000` on one source failed the whole index. A source that
+    /// cannot carry contracts is a skip, disclosed like a binary file, and the
+    /// rest of the repository publishes. A contract-handler candidate still
+    /// fails closed (nw-664): it may be a controller.
+    #[cfg(unix)]
+    #[test]
+    fn one_unreadable_source_is_skipped_and_disclosed_not_fatal() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("clean.ts"), "export function alpha() {}\n").unwrap();
+        let locked = repo.join("locked.py");
+        fs::write(&locked, "def gamma():\n    return 1\n").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&locked).is_ok() {
+            // Running as root: permissions do not apply, nothing to test.
+            return;
+        }
+        let result = index_directory(&repo, &db, "test", "https://example.com/eacces", "sha");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+        let result = result.expect("one unreadable file must not abort publication");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert_eq!(store.lookup_symbols_by_name("alpha").unwrap().len(), 1);
+        let locked_rows: Vec<_> = result
+            .skipped_files
+            .iter()
+            .filter(|skipped| skipped.path == "locked.py")
+            .collect();
+        assert_eq!(locked_rows.len(), 1, "{:?}", result.skipped_files);
+        assert_eq!(locked_rows[0].reason_code, SkipReasonCode::ReadError);
+        assert!(
+            locked_rows[0].reason.contains("permission denied"),
+            "{:?}",
+            locked_rows[0]
+        );
+    }
+
+    /// Counterweight: an unreadable contract-handler candidate still fails the
+    /// index rather than publish a contract set without its routes.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_contract_candidate_still_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db = dir.path().join("test.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("clean.ts"), "export function alpha() {}\n").unwrap();
+        let locked = repo.join("locked.ts");
+        fs::write(
+            &locked,
+            "@Controller('x')\nexport class Locked { gamma() {} }\n",
+        )
+        .unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&locked).is_ok() {
+            // Running as root: permissions do not apply, nothing to test.
+            return;
+        }
+        let result = index_directory(&repo, &db, "test", "https://example.com/eacces-ts", "sha");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+        let error = result.expect_err("an unreadable controller must fail closed");
+        assert!(
+            format!("{error:#}").contains("locked.ts"),
+            "the error names the unreadable file: {error:#}"
+        );
+    }
+
+    /// QA: a file deleted between the scan and its read (a checkout or rebase
+    /// in progress) failed the whole index with "stat/read …: No such file or
+    /// directory". It is a deletion: not published, not disclosed as a skip.
+    #[test]
+    fn a_source_that_vanishes_mid_scan_is_a_deletion_not_a_failure() {
+        struct VanishingReader {
+            inner: crate::content_reader::FilesystemReader,
+        }
+        impl crate::content_reader::ContentReader for VanishingReader {
+            fn read_file(&self, rel_path: &Path) -> anyhow::Result<String> {
+                self.inner.read_file(rel_path)
+            }
+            fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
+                let mut files = self.inner.list_files()?;
+                // Listed by the scan, gone before the read.
+                files.push(PathBuf::from("gone.ts"));
+                files.push(PathBuf::from("gone.rs"));
+                Ok(files)
+            }
+            fn file_meta_nanos(&self, rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+                self.inner.file_meta_nanos(rel_path)
+            }
+            fn root(&self) -> &Path {
+                self.inner.root()
+            }
+            fn version_id(&self) -> &str {
+                self.inner.version_id()
+            }
+            fn max_source_file_bytes(&self) -> u64 {
+                self.inner.max_source_file_bytes()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("kept.ts"), "export function kept() {}\n").unwrap();
+        let reader = VanishingReader {
+            inner: crate::content_reader::FilesystemReader::new(dir.path()),
+        };
+        let store = GraphStore::in_memory().unwrap();
+        let result = index_into_store(
+            &reader,
+            &store,
+            "test",
+            "https://example.test/vanished-mid-scan",
+            "sha",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("a file deleted mid-scan must not abort publication");
+        assert_eq!(store.lookup_symbols_by_name("kept").unwrap().len(), 1);
+        assert!(
+            !result
+                .skipped_files
+                .iter()
+                .any(|skipped| skipped.path.starts_with("gone")),
+            "{:?}",
+            result.skipped_files
+        );
     }
 
     /// nw-355, the incremental half. `prepare_incremental_file` had the same

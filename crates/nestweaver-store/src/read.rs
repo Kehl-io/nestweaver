@@ -303,6 +303,35 @@ pub(crate) fn extract_string(row: &[Value], idx: usize) -> Result<String, StoreE
     }
 }
 
+/// A source display name, read tolerantly. A name holding a control
+/// character could be stored before names were validated, and one with a NUL
+/// made every vault listing fail the canary in [`extract_string`] — including
+/// the listing `brain remove` needs to find the vault to delete. The name is
+/// display-only (uid and root path identify the source), so it is returned
+/// with control characters escaped instead of failing the whole listing.
+pub(crate) fn extract_source_display_name(row: &[Value], idx: usize) -> Result<String, StoreError> {
+    match row.get(idx) {
+        Some(Value::String(s)) if s.chars().any(char::is_control) => {
+            let escaped: String = s
+                .chars()
+                .map(|c| {
+                    if c.is_control() {
+                        c.escape_unicode().to_string()
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect();
+            tracing::warn!(
+                name = %escaped,
+                "stored source name contains control characters; returning it escaped"
+            );
+            Ok(escaped)
+        }
+        _ => extract_string(row, idx),
+    }
+}
+
 /// One keyset page of notes from [`GraphStore::list_notes_after`].
 #[derive(Debug, Clone, Default)]
 pub struct NoteKeysetPage {
@@ -1757,7 +1786,7 @@ impl GraphStore {
             .map(|row| {
                 Ok(Vault {
                     uid: extract_string(&row, 0)?,
-                    name: extract_string(&row, 1)?,
+                    name: extract_source_display_name(&row, 1)?,
                     root_path: extract_string(&row, 2)?,
                     instance_id: extract_string(&row, 3)?,
                 })
@@ -3124,7 +3153,7 @@ impl GraphStore {
         match result.next() {
             Some(row) => Ok(Vault {
                 uid: extract_string(&row, 0)?,
-                name: extract_string(&row, 1)?,
+                name: extract_source_display_name(&row, 1)?,
                 root_path: extract_string(&row, 2)?,
                 instance_id: extract_string(&row, 3)?,
             }),
@@ -6553,5 +6582,61 @@ mod modified_since_precision_tests {
                     .collect()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod source_name_tests {
+    use super::*;
+    use nestweaver_schema::Vault;
+
+    fn vault(name: &str) -> Vault {
+        Vault {
+            uid: "vlt:t:1".into(),
+            name: name.into(),
+            root_path: "/t".into(),
+            instance_id: "t".into(),
+        }
+    }
+
+    #[test]
+    fn vault_writes_refuse_control_characters_before_writing() {
+        let store = GraphStore::in_memory().unwrap();
+        for name in ["\u{0}evil", "a\nb", "\u{1b}[31m"] {
+            assert!(store.insert_vault(&vault(name)).is_err(), "{name:?}");
+            assert!(store.upsert_vault(&vault(name)).is_err(), "{name:?}");
+        }
+        assert!(store.list_vaults(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stored_nul_name_is_listed_escaped_and_the_vault_stays_removable() {
+        // A database poisoned before names were validated: write the row with
+        // a raw query, bypassing the guarded writers.
+        let store = GraphStore::in_memory().unwrap();
+        {
+            let conn = store.conn().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "CREATE (:Vault {uid: $uid, name: $name, root_path: $rp, instance_id: $iid})",
+                )
+                .unwrap();
+            conn.execute(
+                &mut stmt,
+                vec![
+                    ("uid", Value::String("vlt:t:1".into())),
+                    ("name", Value::String("\u{0}evil".into())),
+                    ("rp", Value::String("/t".into())),
+                    ("iid", Value::String("t".into())),
+                ],
+            )
+            .unwrap();
+        }
+        let listed = store.list_vaults(None).expect("listing must not fail");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "\\u{0}evil");
+        assert_eq!(store.lookup_vault("vlt:t:1").unwrap().name, "\\u{0}evil");
+        store.delete_vault_cascade("vlt:t:1").unwrap();
+        assert!(store.list_vaults(None).unwrap().is_empty());
     }
 }

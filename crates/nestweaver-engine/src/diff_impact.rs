@@ -6,7 +6,6 @@
 //! analysis.
 
 use std::path::Path;
-use std::process::Command;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -45,6 +44,11 @@ pub fn compute_diff_changes(
     diff_spec: &str,
     repo_url: &str,
 ) -> Result<Vec<AtomicChange>, anyhow::Error> {
+    // Each side of the range becomes the start of a `git show <rev>:<path>`
+    // argument, so neither may read as an option.
+    for side in diff_spec.split("..") {
+        crate::git_cmd::ensure_revision_arg(side.trim_start_matches('.'))?;
+    }
     // Parse the base ref from the diff spec (everything before `..`)
     let base_ref = diff_spec
         .split("..")
@@ -58,7 +62,7 @@ pub fn compute_diff_changes(
     // (no `core.quotePath` C-quoting), so accented/CJK filenames survive
     // instead of being emitted as `"caf\303\251.js"` and silently dropped
     // when handed to `git show`.
-    let output = Command::new("git")
+    let output = crate::git_cmd::isolated_git()
         .args([
             "diff",
             "-M",
@@ -134,7 +138,7 @@ pub fn compute_diff_changes(
     }
 
     // Get deleted files. `--name-only -z` emits just NUL-separated paths.
-    let del_output = Command::new("git")
+    let del_output = crate::git_cmd::isolated_git()
         .args(["diff", "--name-only", "-z", "--diff-filter=D", diff_spec])
         .current_dir(repo_path)
         .output()
@@ -157,7 +161,7 @@ pub fn compute_diff_changes(
         }
 
         // Get old content from base ref using the base_path (handles renames).
-        let old_output = Command::new("git")
+        let old_output = crate::git_cmd::isolated_git()
             .args(["show", &format!("{}:{}", base_ref, entry.base_path)])
             .current_dir(repo_path)
             .output();
@@ -169,7 +173,7 @@ pub fn compute_diff_changes(
 
         // Get new content from HEAD (or working tree for the head side of the diff)
         let head_ref = diff_spec.split("..").nth(1).unwrap_or("HEAD");
-        let new_output = Command::new("git")
+        let new_output = crate::git_cmd::isolated_git()
             .args(["show", &format!("{}:{}", head_ref, entry.new_path)])
             .current_dir(repo_path)
             .output();
@@ -230,7 +234,7 @@ pub fn compute_diff_changes(
             continue;
         }
 
-        let old_output = Command::new("git")
+        let old_output = crate::git_cmd::isolated_git()
             .args(["show", &format!("{}:{}", base_ref, file)])
             .current_dir(repo_path)
             .output();
@@ -347,6 +351,21 @@ fn compute_rename_moves(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each side of the range starts a `git show <rev>:<path>` argument, so
+    /// an option-looking side (`--output=<file>` writes a file) is refused
+    /// before Git runs.
+    #[test]
+    fn option_looking_ranges_are_refused() {
+        let repo = tempfile::tempdir().unwrap();
+        for spec in ["--output=x", "main..--output=x", "main...-p"] {
+            let error = compute_diff_changes(repo.path(), spec, "r").unwrap_err();
+            assert!(
+                error.to_string().contains("starts with '-'"),
+                "{spec}: {error}"
+            );
+        }
+    }
 
     /// nw-113: renaming a file moves its real symbols; the `<module>` owner is
     /// a per-file artefact and must not be reported as a Breaking move.

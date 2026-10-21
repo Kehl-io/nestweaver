@@ -6637,6 +6637,84 @@ fn indexing_records_the_data_instance_id() {
     );
 }
 
+/// `nestweaver` with no daemon-bypass permit: the commands below refuse or
+/// answer before any store or daemon is touched.
+fn plain_cmd() -> Command {
+    let mut cmd = Command::cargo_bin("nestweaver").unwrap();
+    cmd.env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON");
+    cmd
+}
+
+/// Usage mistakes exit 64 (`EX_USAGE`), never 1: a missing change source, a
+/// misspelled `--format`/`--min-severity`, `list-features` without
+/// `--config` (as `list-links` already did) and a bare `interactions show`.
+#[test]
+fn usage_mistakes_exit_64() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("absent.lbug").display().to_string();
+    for args in [
+        vec!["pre-push-impact", "--db", &db],
+        vec!["pre-push-impact", "--local-changes", "--format", "xml"],
+        vec![
+            "pre-push-impact",
+            "--local-changes",
+            "--min-severity",
+            "fatal",
+        ],
+        vec!["list-features"],
+        vec!["interactions", "show", "--db", &db],
+    ] {
+        plain_cmd().args(&args).assert().code(64);
+    }
+    plain_cmd()
+        .args(["pre-push-impact", "--db", &db])
+        .assert()
+        .stderr(contains("--local-changes or --diff is required"));
+}
+
+/// Files changed with no symbol-level change is not "no local changes".
+#[test]
+fn pre_push_impact_says_files_changed_without_symbol_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    let git = |args: &[&str]| {
+        let status = StdCommand::new("git")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["-c", "user.email=t@example.com", "-c", "user.name=T"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    std::fs::write(repo.join("README.md"), "one\n").unwrap();
+    git(&["add", "README.md"]);
+    git(&["commit", "-q", "-m", "init"]);
+
+    plain_cmd()
+        .args(["pre-push-impact", "--local-changes", "--repo"])
+        .arg(repo)
+        .assert()
+        .success()
+        .stdout(contains("No local changes detected."));
+
+    std::fs::write(repo.join("README.md"), "two\n").unwrap();
+    plain_cmd()
+        .args(["pre-push-impact", "--local-changes", "--repo"])
+        .arg(repo)
+        .assert()
+        .success()
+        .stdout(
+            contains("1 file(s) changed, but no symbol-level changes")
+                .and(contains("No local changes detected.").not()),
+        );
+}
+
 /// nw-268: `pre-push-impact --max-depth` is bounded at parse time.
 ///
 /// It had no `value_parser`, so a mistyped `--max-depth 100000` arrived as a
@@ -15254,7 +15332,15 @@ fn direct_affected_tests_honours_a_declared_link_to_a_stale_repo() {
 
     let run = || {
         let output = nestweaver_cmd()
-            .args(["affected-tests", "--files", "mine.js", "--json", "--db"])
+            .args([
+                "affected-tests",
+                "--files",
+                "mine.js",
+                "--repo",
+                "mine-repo",
+                "--json",
+                "--db",
+            ])
             .arg(&db_path)
             .output()
             .unwrap();
@@ -16483,4 +16569,37 @@ fn not_found_and_usage_exit_codes_are_consistent() {
     assert_eq!(code, Some(2), "{stderr}");
     let payload: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(payload["error"], "not found", "{payload}");
+}
+
+/// A source name the graph cannot hold is a usage error, refused before any
+/// database or daemon is touched: a stored NUL name used to break every later
+/// vault listing, including the one `brain remove` needs.
+#[test]
+fn brain_add_refuses_a_control_character_name_before_touching_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    let db_path = dir.path().join("never-created.lbug");
+    for name in ["\u{1b}[31mevil", "a\nb", "   "] {
+        let mut cmd = Command::cargo_bin("nestweaver").unwrap();
+        let output = cmd
+            .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
+            .args(["brain", "add"])
+            .arg(&vault)
+            .args(["--name", name, "--db"])
+            .arg(&db_path)
+            .timeout(std::time::Duration::from_secs(20))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(64), "{name:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("invalid --name"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        !db_path.exists(),
+        "nothing may be written for a refused name"
+    );
 }

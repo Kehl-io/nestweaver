@@ -30,7 +30,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Command;
 
 /// Default activity weight. See the module-level "Clamp / weight rationale":
 /// `1.2` (not the RFC's `0.6`) is required for the factor to actually span the
@@ -164,11 +163,13 @@ pub fn git_activity_multiplier(score: Option<f64>, weight: f64) -> f64 {
 /// empty vec on any git failure (not a git repo, git missing, etc.) so callers
 /// degrade to the neutral / no-sidecar path.
 pub fn mine_commits(repo_path: &Path) -> Vec<CommitTouch> {
-    let output = match Command::new("git")
+    let output = match crate::git_cmd::isolated_git()
         .arg("-C")
         .arg(repo_path)
         .args([
             "log",
+            // A repository's `log.showSignature` would run its `gpg.program`.
+            "--no-show-signature",
             "--no-merges",
             "--name-only",
             "--pretty=format:\x01%H\t%aI",
@@ -477,6 +478,78 @@ mod tests {
     fn load_missing_sidecar_is_empty() {
         let loaded = load_git_activity_sidecar(Path::new("/nonexistent/path.json"));
         assert!(loaded.repos.is_empty());
+    }
+
+    /// A repository's own config must not run programs while its history is
+    /// mined: `log.showSignature` would hand every signed commit to the
+    /// repository's `gpg.program`.
+    #[test]
+    fn mining_commits_does_not_run_the_repository_gpg_program() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        let repo = tempfile::tempdir().unwrap();
+        let markers = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            output.stdout
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("a.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "a.rs"]);
+        git(&[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "a",
+        ]);
+        // Forge a signature header; Git hands it to gpg.program to verify.
+        let commit = String::from_utf8(git(&["cat-file", "commit", "HEAD"])).unwrap();
+        let signed = commit.replacen(
+            "\n\n",
+            "\ngpgsig -----BEGIN PGP SIGNATURE-----\n AAAA\n -----END PGP SIGNATURE-----\n\n",
+            1,
+        );
+        let signed_path = markers.path().join("signed");
+        std::fs::write(&signed_path, signed).unwrap();
+        let oid = String::from_utf8(git(&[
+            "hash-object",
+            "-w",
+            "-t",
+            "commit",
+            signed_path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        git(&["update-ref", "HEAD", oid.trim()]);
+        let gpg = markers.path().join("gpg");
+        std::fs::write(
+            &gpg,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nexit 1\n",
+                markers.path().join("ran").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gpg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(&["config", "log.showSignature", "true"]);
+        git(&["config", "gpg.program", gpg.to_str().unwrap()]);
+
+        git(&["log", "--format=%H"]);
+        assert!(markers.path().join("ran").exists(), "baseline gpg.program");
+        std::fs::remove_file(markers.path().join("ran")).unwrap();
+
+        let commits = mine_commits(repo.path());
+        assert_eq!(commits.len(), 1);
+        assert!(!markers.path().join("ran").exists(), "gpg.program ran");
     }
 }
 

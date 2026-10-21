@@ -14,7 +14,6 @@
 //! crash the whole diff.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::Result;
 
@@ -264,7 +263,7 @@ fn parse_api_symbols(file: &Path, source: &str) -> Vec<Symbol> {
 /// empty BEFORE snapshot.
 fn git_show(repo_root: &Path, base_ref: &str, file: &Path) -> Option<String> {
     let spec = format!("{}:{}", base_ref, file.display());
-    let output = Command::new("git")
+    let output = crate::git_cmd::isolated_git()
         .arg("-C")
         .arg(repo_root)
         .arg("show")
@@ -292,6 +291,7 @@ pub fn breaking_changes_from_git(
     base_ref: &str,
     changed_files: &[PathBuf],
 ) -> Result<Vec<BreakingChange>> {
+    crate::git_cmd::ensure_revision_arg(base_ref)?;
     let mut out = Vec::new();
 
     for file in changed_files {
@@ -328,6 +328,7 @@ mod tests {
     use super::*;
     use crate::signature_diff::{BreakKind, BreakTier};
     use nestweaver_schema::Visibility;
+    use std::process::Command;
 
     /// Whether `git` is on PATH; git-backed tests skip gracefully without it.
     fn git_available() -> bool {

@@ -1592,25 +1592,91 @@ fn watcher_status(state: &DaemonState) -> Option<nestweaver_proto::WatcherStatus
 }
 
 fn note_watcher_exit(state: &DaemonState, kind: &str, error: Option<String>) {
+    note_watcher_failure(state, kind, None, error, false);
+}
+
+/// Record a watcher failure. `target` is the watched repository of a code
+/// watcher, which names the command that restarts it. `batch` marks a
+/// watcher that is still running but could not publish its last batch: it
+/// is not indexing edits either, so it warns the same way, and it is the
+/// watcher's own next published batch that clears it.
+fn note_watcher_failure(
+    state: &DaemonState,
+    kind: &str,
+    target: Option<&Path>,
+    error: Option<String>,
+    batch: bool,
+) {
     let Some(error) = error else {
         return;
     };
-    let message = format!(
-        "{kind} watcher exited and is no longer indexing edits: {error}. \
-         Restart watching; later edits stay unindexed until it is running again."
-    );
+    let message = if batch {
+        format!(
+            "{kind} watcher{} is running but could not publish its last batch: {error}. \
+             Edits there stay unindexed until a batch publishes; it retries automatically.",
+            target
+                .map(|target| format!(" for {}", target.display()))
+                .unwrap_or_default()
+        )
+    } else {
+        format!(
+            "{kind} watcher exited and is no longer indexing edits: {error}. \
+             Restart watching; later edits stay unindexed until it is running again."
+        )
+    };
     if let Ok(mut slot) = state.last_watcher_failure.lock() {
-        *slot = Some(serde_json::json!({
+        let mut record = serde_json::json!({
             "kind": kind,
             "at_unix_seconds": std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_secs())
                 .unwrap_or_default(),
             "error": error,
-        }));
+        });
+        if let Some(target) = target {
+            record["target"] = serde_json::json!(target.display().to_string());
+        }
+        if batch {
+            record["batch"] = serde_json::json!(true);
+        }
+        *slot = Some(record);
     }
     if let Ok(mut slot) = state.watcher_failure.lock() {
         *slot = Some(message);
+    }
+}
+
+/// A code watcher's batch published: clear the warning only if it is this
+/// watcher's own batch failure, never a different watcher's exit.
+fn clear_watcher_batch_failure(state: &DaemonState, target: &Path) {
+    let own = state.last_watcher_failure.lock().ok().is_some_and(|slot| {
+        slot.as_ref().is_some_and(|last| {
+            last["batch"] == serde_json::json!(true)
+                && last["target"] == serde_json::json!(target.display().to_string())
+        })
+    });
+    if own {
+        clear_watcher_failure(state);
+    }
+}
+
+/// The command that restarts the watcher a failure names: a code watcher is
+/// restarted per repository, the vault watcher by `brain watch`.
+fn watcher_failure_action(state: &DaemonState) -> String {
+    let last = last_watcher_failure_json(state);
+    if last["kind"] != "code" {
+        return "nestweaver brain watch".to_string();
+    }
+    match last["target"].as_str() {
+        Some(target)
+            if target
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "/._-+".contains(c)) =>
+        {
+            format!("nestweaver watch {target}")
+        }
+        Some(target) => format!("nestweaver watch '{}'", target.replace('\'', "'\\''")),
+        None => "nestweaver watch <repo>".to_string(),
     }
 }
 
@@ -1646,7 +1712,11 @@ mod watcher_failure_disclosure_tests {
     #[test]
     fn a_dead_watcher_is_a_status_warning() {
         let mut value = serde_json::json!({"warnings": [{"kind": "other", "warning": "kept"}]});
-        disclose_watcher_failure(&mut value, Some("vault watcher exited"));
+        disclose_watcher_failure(
+            &mut value,
+            Some("vault watcher exited"),
+            "nestweaver brain watch",
+        );
         let warnings = value["warnings"].as_array().unwrap();
         assert_eq!(warnings.len(), 2);
         assert_eq!(warnings[1]["kind"], "watcher_exited");
@@ -1662,8 +1732,8 @@ mod watcher_failure_disclosure_tests {
     #[test]
     fn no_failure_adds_nothing() {
         let mut value = serde_json::json!({"notes": 1});
-        disclose_watcher_failure(&mut value, None);
-        disclose_watcher_failure(&mut value, Some(""));
+        disclose_watcher_failure(&mut value, None, "nestweaver brain watch");
+        disclose_watcher_failure(&mut value, Some(""), "nestweaver brain watch");
         assert!(value.get("warnings").is_none());
     }
 }
@@ -1705,14 +1775,14 @@ fn disclose_manifest_recovery(
 
 /// Attach a dead-watcher warning to a `brain status` document. Absence of a
 /// failure leaves the document unchanged, including when `warnings` is missing.
-fn disclose_watcher_failure(value: &mut serde_json::Value, failure: Option<&str>) {
+fn disclose_watcher_failure(value: &mut serde_json::Value, failure: Option<&str>, action: &str) {
     let Some(failure) = failure.filter(|message| !message.is_empty()) else {
         return;
     };
     let warning = serde_json::json!({
         "kind": "watcher_exited",
         "warning": failure,
-        "action": "nestweaver brain watch",
+        "action": action,
     });
     match value
         .get_mut("warnings")
@@ -2908,6 +2978,15 @@ fn resolve_effective_instance_id(requested: &str, state: &DaemonState) -> Result
         state.data_instance_id.clone()
     };
     pick_effective_instance_id(requested, &configured)
+}
+
+/// Refuse a requested source name the graph cannot safely store. Empty means
+/// "defaulted" and passes; the store repeats the control-character check.
+fn validate_request_source_name(name: &str) -> Result<(), Status> {
+    match nestweaver_schema::source_name_problem(name) {
+        Some(problem) => Err(Status::invalid_argument(problem)),
+        None => Ok(()),
+    }
 }
 
 fn resolve_request_note_limits(
@@ -4124,9 +4203,25 @@ impl DaemonService {
         let predecessors = watcher_task_ids(&self.state, None);
         let watcher_id = register_watcher(&self.state, shutdown_handle, force, owner_pid)?;
         describe_watcher(&self.state, watcher_id, "code", &repo_path);
+        // A watcher is running again: the previous one's exit is history
+        // (kept in `last_watcher_failure`), not a live warning. Cleared before
+        // the thread starts, so its own failure cannot be erased.
+        clear_watcher_failure(&self.state);
 
-        watcher =
-            watcher.with_mutation_lease_factory(daemon_mutation_lease_factory(self.state.clone()));
+        let report_state = self.state.clone();
+        let report_repo = repo_path.clone();
+        watcher = watcher
+            .with_mutation_lease_factory(daemon_mutation_lease_factory(self.state.clone()))
+            .with_batch_failure_reporter(move |failure| match failure {
+                Some(error) => note_watcher_failure(
+                    &report_state,
+                    "code",
+                    Some(&report_repo),
+                    Some(error.to_string()),
+                    true,
+                ),
+                None => clear_watcher_batch_failure(&report_state, &report_repo),
+            });
         let state = self.state.clone();
         let store = self.state.store.clone();
         let on_change = Self::make_embed_on_change(
@@ -4149,7 +4244,7 @@ impl DaemonService {
                 Ok(Err(error)) => log_code_watcher_error(error, watcher_id),
                 Err(_) => tracing::error!(watcher_id, "code watcher thread panicked"),
             }
-            note_watcher_exit(&state, "code", failure);
+            note_watcher_failure(&state, "code", Some(&repo_path), failure, false);
             clear_watcher_registration(&state, watcher_id);
         });
 
@@ -4979,6 +5074,25 @@ type ProgressStream = tokio_stream::wrappers::ReceiverStream<Result<IndexProgres
 struct PrunedRepos {
     names: Vec<String>,
     uids: Vec<String>,
+    /// Repos kept because their root could not be checked.
+    skipped: Vec<String>,
+}
+
+/// Whether a source root is DEFINITELY gone. Only `NotFound` proves that; a
+/// permission or I/O error says nothing about the source, and treating it as
+/// "gone" (as `Path::exists` does) deleted a vault whose parent was merely
+/// `chmod 000`. Such a root is kept and reported in `skipped`.
+fn source_root_missing(kind: &str, name: &str, root: &str, skipped: &mut Vec<String>) -> bool {
+    match Path::new(root).try_exists() {
+        Ok(exists) => !exists,
+        Err(error) => {
+            tracing::warn!(kind, name, root, %error, "prune_stale: kept source whose root cannot be checked");
+            skipped.push(format!(
+                "kept {kind} '{name}': cannot check {root}: {error}"
+            ));
+            false
+        }
+    }
 }
 
 impl PrunedRepos {
@@ -5009,7 +5123,8 @@ where
         let Some(path) = repo.local_root() else {
             continue;
         };
-        if !Path::new(path).exists() {
+        let display = repo.name.as_deref().unwrap_or(&repo.url);
+        if source_root_missing("repo", display, path, &mut removed_repos.skipped) {
             tracing::info!(
                 uid = %repo.uid,
                 url = %repo.url,
@@ -6077,12 +6192,18 @@ where
     let mut removed_vaults = Vec::new();
     let mut removed_vault_uids = Vec::new();
     let mut vault_mutation_attempted = false;
+    let mut skipped_warnings = removed_repos.skipped.clone();
 
     if error.is_none() {
         match state.store.list_vaults(None) {
             Ok(vaults) => {
                 for vault in &vaults {
-                    if !Path::new(&vault.root_path).exists() {
+                    if source_root_missing(
+                        "vault",
+                        &vault.name,
+                        &vault.root_path,
+                        &mut skipped_warnings,
+                    ) {
                         vault_mutation_attempted = true;
                         if let Err(delete_error) = delete_vault(&state.store, vault) {
                             error = Some(delete_error);
@@ -6135,6 +6256,7 @@ where
             removed_vaults,
             committed: changed,
             reconciliation_failures: to_proto_reconciliation_failures(&failures),
+            skipped_warnings,
         }),
     };
     finish_reconciled_mutation(mutation, "prune_stale", failures)
@@ -7340,6 +7462,7 @@ impl NestWeaverDaemon for DaemonService {
         } else {
             req.vault_name.clone()
         };
+        validate_request_source_name(&vault_name)?;
         let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         let extra_patterns = req.extra_ignore_patterns.clone();
         let force = req.force;
@@ -8207,6 +8330,7 @@ impl NestWeaverDaemon for DaemonService {
         let with_trigrams = resolve_trigram_policy(req.trigram_policy(), req.with_trigrams, false);
         let rebuild_trigrams = req.rebuild_trigrams;
         let with_git_activity = req.with_git_activity;
+        validate_request_source_name(&req.name)?;
         let name = if req.name.is_empty() {
             None
         } else {
@@ -8701,6 +8825,7 @@ impl NestWeaverDaemon for DaemonService {
         } else {
             req.vault_name.clone()
         };
+        validate_request_source_name(&vault_name)?;
         let extra_patterns = req.extra_ignore_patterns.clone();
         let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         let note_limits = resolve_request_note_limits(req.max_note_bytes, &self.state)?;
@@ -8879,6 +9004,15 @@ impl NestWeaverDaemon for DaemonService {
                         }
                     };
 
+                    // `brain list` reads this as "Last indexed"; without it the
+                    // column falls back to the newest note mtime.
+                    if let Err(error) = nestweaver_engine::record_last_indexed_at(
+                        &state.db_path,
+                        &result.index.vault_uid,
+                    ) {
+                        tracing::warn!(%error, "failed to record vault index timestamp");
+                    }
+
                     // DONE phase. nw-651: a coverage gap is disclosed (the
                     // skip rows, degraded coverage), not a failure — say why
                     // derivation was left un-Current instead of erroring.
@@ -8954,6 +9088,7 @@ impl NestWeaverDaemon for DaemonService {
         } else {
             req.vault_name.clone()
         };
+        validate_request_source_name(&vault_name)?;
         let extra_patterns = req.extra_ignore_patterns.clone();
         let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         let note_limits = resolve_request_note_limits(req.max_note_bytes, &self.state)?;
@@ -9222,6 +9357,15 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let config_path = PathBuf::from(&req.config_path);
+        // A relative path would resolve against the daemon's CWD, not the
+        // caller's, and silently load a different instance.toml.
+        if !config_path.is_absolute() {
+            return Err(Status::invalid_argument(format!(
+                "config_path must be absolute, got '{}': the daemon cannot resolve a \
+                 path relative to the caller's working directory",
+                req.config_path
+            )));
+        }
         let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         // Configuration I/O and parsing do not mutate the graph and must not
         // occupy the sole writer while a slow filesystem is being read.
@@ -10268,7 +10412,11 @@ impl NestWeaverDaemon for DaemonService {
         if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&json_resp.result_json) {
             value["runtime_telemetry"] = serde_json::json!("available");
             value["watcher"] = watcher_status_json(&self.state);
-            disclose_watcher_failure(&mut value, watcher_failure_message(&self.state).as_deref());
+            disclose_watcher_failure(
+                &mut value,
+                watcher_failure_message(&self.state).as_deref(),
+                &watcher_failure_action(&self.state),
+            );
             disclose_manifest_recovery(&mut value, &self.state.manifest_recovery.status());
             value["last_watcher_failure"] = last_watcher_failure_json(&self.state);
             value["watcher_pid"] =
@@ -10712,6 +10860,9 @@ impl NestWeaverDaemon for DaemonService {
             let value = args.get("value").cloned().ok_or_else(|| {
                 Status::invalid_argument("tool set_extension failed: 'value' is required")
             })?;
+            nestweaver_engine::extensions::validate_extension_property(key, &value).map_err(
+                |problem| Status::invalid_argument(format!("tool set_extension failed: {problem}")),
+            )?;
 
             let mut store = nestweaver_engine::extensions::load_extensions(&db_path);
             nestweaver_engine::extensions::set_property(&mut store, uid, key, value.clone());
@@ -18064,6 +18215,48 @@ credential_method = "gh"
         assert_embeddings_absent(&state, &[&note_uid, &heading_uid]);
     }
 
+    /// `brain list` shows "Last indexed" from the extension sidecar; a daemon
+    /// IndexVault that never recorded it fell back to the newest note mtime.
+    #[tokio::test]
+    async fn index_vault_records_last_indexed_at() {
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\n\nBody.\n").unwrap();
+        let vault_uid =
+            nestweaver_schema::vault_uid(&state.data_instance_id, &root.to_string_lossy());
+        assert_eq!(
+            nestweaver_engine::get_last_indexed_at(&state.db_path, &vault_uid),
+            None
+        );
+
+        let progress = index_vault_via_rpc(&state, &root).await;
+        assert!(
+            progress.iter().any(|p| p.phase == Phase::Done as i32),
+            "{progress:?}"
+        );
+        assert!(
+            nestweaver_engine::get_last_indexed_at(&state.db_path, &vault_uid).is_some(),
+            "a successful IndexVault records last_indexed_at"
+        );
+    }
+
+    /// A relative config_path would be resolved against the daemon's CWD and
+    /// load some other instance.toml; it is refused instead.
+    #[tokio::test]
+    async fn materialize_projects_rejects_relative_config_path() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state);
+        let mut request = Request::new(MaterializeProjectsRequest {
+            config_path: "instance.toml".to_string(),
+            ..Default::default()
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let status = service.materialize_projects(request).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("must be absolute"), "{status:?}");
+    }
+
     async fn index_vault_via_rpc(state: &Arc<DaemonState>, root: &Path) -> Vec<IndexProgress> {
         index_vault_via_rpc_with_ignore(state, root, &[]).await
     }
@@ -20253,6 +20446,59 @@ repos = ["alpha"]
             flag.load(Ordering::SeqCst),
             "the pruned repo's watcher stops"
         );
+    }
+
+    /// An UNREADABLE root is not a missing one: a vault under a `chmod 000`
+    /// parent used to be pruned because `Path::exists` folds every error into
+    /// false. It is kept and reported in `skipped_warnings`.
+    #[cfg(unix)]
+    #[test]
+    fn prune_stale_keeps_a_vault_whose_root_cannot_be_checked() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let locked = tmp.path().join("locked");
+        let root = locked.join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = root.try_exists().is_err();
+        let state = test_state_with_writer();
+        let root_str = root.to_string_lossy().into_owned();
+        seed_vault_note_heading_embeddings(&state, "vlt:prune:locked", "locked", &root_str);
+        let gone = tmp.path().join("gone").to_string_lossy().into_owned();
+        seed_vault_note_heading_embeddings(&state, "vlt:prune:gone", "gone", &gone);
+
+        let response = run_prune_stale_with(
+            &state,
+            delete_repo_cascade,
+            |store, vault| {
+                store
+                    .delete_vault_cascade(&vault.uid)
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            response.removed_vaults,
+            vec!["vault-vlt:prune:gone".to_string()]
+        );
+        let uids: Vec<String> = state
+            .store
+            .list_vaults(None)
+            .unwrap()
+            .into_iter()
+            .map(|vault| vault.uid)
+            .collect();
+        assert!(uids.contains(&"vlt:prune:locked".to_string()), "{uids:?}");
+        if unreadable {
+            // Root bypasses the permission bits, so only assert the warning
+            // where the root really could not be checked.
+            assert_eq!(response.skipped_warnings.len(), 1, "{response:?}");
+            assert!(response.skipped_warnings[0].contains("locked"));
+        }
     }
 
     #[test]
@@ -26259,6 +26505,62 @@ repos = ["alpha"]
         );
     }
 
+    /// A code watcher's warning names the command that restarts IT, not the
+    /// vault watcher's; a batch failure warns while the watcher still runs
+    /// and only that watcher's next published batch clears it.
+    #[test]
+    fn a_code_watcher_failure_names_its_own_restart_and_batch_failures_clear() {
+        let state = test_state_with_writer();
+        let repo = std::path::Path::new("/work/my repo");
+        super::note_watcher_failure(
+            &state,
+            "code",
+            Some(repo),
+            Some("repo root vanished".to_string()),
+            false,
+        );
+        assert_eq!(
+            super::watcher_failure_action(&state),
+            "nestweaver watch '/work/my repo'"
+        );
+        super::clear_watcher_batch_failure(&state, repo);
+        assert!(
+            super::watcher_failure_message(&state).is_some(),
+            "a batch publishing never clears a watcher EXIT"
+        );
+        super::clear_watcher_failure(&state);
+
+        super::note_watcher_failure(
+            &state,
+            "code",
+            Some(repo),
+            Some("read watcher contract input src/m5.ts: Permission denied".to_string()),
+            true,
+        );
+        let message = super::watcher_failure_message(&state).unwrap();
+        assert!(
+            message.contains("is running but could not publish"),
+            "{message}"
+        );
+        assert!(message.contains("/work/my repo"), "{message}");
+        assert_eq!(super::last_watcher_failure_json(&state)["batch"], true);
+        super::clear_watcher_batch_failure(&state, std::path::Path::new("/work/other"));
+        assert!(super::watcher_failure_message(&state).is_some());
+        super::clear_watcher_batch_failure(&state, repo);
+        assert!(super::watcher_failure_message(&state).is_none());
+        assert_eq!(
+            super::last_watcher_failure_json(&state)["kind"],
+            "code",
+            "the record outlives the warning"
+        );
+
+        super::note_watcher_exit(&state, "vault", Some("boom".to_string()));
+        assert_eq!(
+            super::watcher_failure_action(&state),
+            "nestweaver brain watch"
+        );
+    }
+
     /// V1: the dead-watcher warning is cleared when a replacement becomes
     /// ready, and that erased the only record of the production failure. The
     /// last failure stays visible after the restart, with its full chain.
@@ -30356,6 +30658,41 @@ external_model = "unavailable-test-model"
         })
         .await
         .expect("cancelled extension worker must finish after gate release");
+    }
+
+    /// An oversized value or a control-character key is refused before the
+    /// sidecar is touched: one 20 MB value used to be accepted and rewritten
+    /// on every later set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_extension_refuses_oversized_values_and_bad_keys() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+        let big = "x".repeat(nestweaver_engine::extensions::MAX_EXTENSION_VALUE_BYTES + 1);
+        let long_key = "k".repeat(nestweaver_engine::extensions::MAX_EXTENSION_KEY_BYTES + 1);
+        for args in [
+            serde_json::json!({ "uid": "sym:x", "key": "owner", "value": big }),
+            serde_json::json!({ "uid": "sym:x", "key": "own\u{0}er", "value": 1 }),
+            serde_json::json!({ "uid": "sym:x", "key": "own\ner", "value": 1 }),
+            serde_json::json!({ "uid": "sym:x", "key": long_key, "value": 1 }),
+        ] {
+            let mut req = Request::new(JsonRequest {
+                args_json: args.to_string(),
+            });
+            req.extensions_mut().insert(crate::auth::IsAdmin(true));
+            let status = service.set_extension(req).await.unwrap_err();
+            assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+        }
+        assert!(
+            nestweaver_engine::extensions::load_extensions(&state.db_path).is_empty(),
+            "a refused set must write nothing"
+        );
+
+        let mut req = Request::new(JsonRequest {
+            args_json: serde_json::json!({ "uid": "sym:x", "key": "owner", "value": "team-a" })
+                .to_string(),
+        });
+        req.extensions_mut().insert(crate::auth::IsAdmin(true));
+        service.set_extension(req).await.expect("an ordinary set");
     }
 
     /// nw-462: the DELETE must hold the gate exactly as the WRITE does.

@@ -2229,6 +2229,41 @@ pub fn remove_extension_key_durable(
     Ok(true)
 }
 
+/// Longest extension property key, in bytes.
+pub const MAX_EXTENSION_KEY_BYTES: usize = 256;
+/// Largest extension property value, in serialized JSON bytes. The sidecar is
+/// rewritten whole on every set, so one unbounded value (20 MB was accepted)
+/// made every later write and read of every property pay for it.
+pub const MAX_EXTENSION_VALUE_BYTES: usize = 64 * 1024;
+
+/// Refuse an extension property the sidecar should not hold: an empty, over-long
+/// or control-character key, or an over-large value. Checked before the
+/// sidecar is loaded, so a refusal writes nothing.
+pub fn validate_extension_property(key: &str, value: &serde_json::Value) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("'key' must not be empty".to_string());
+    }
+    if key.len() > MAX_EXTENSION_KEY_BYTES {
+        return Err(format!(
+            "'key' is {} bytes; the maximum is {MAX_EXTENSION_KEY_BYTES}",
+            key.len()
+        ));
+    }
+    if let Some(c) = key.chars().find(|c| c.is_control()) {
+        return Err(format!(
+            "'key' must not contain control characters (found {})",
+            c.escape_unicode()
+        ));
+    }
+    let value_bytes = serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len());
+    if value_bytes > MAX_EXTENSION_VALUE_BYTES {
+        return Err(format!(
+            "'value' is {value_bytes} bytes of JSON; the maximum is {MAX_EXTENSION_VALUE_BYTES}"
+        ));
+    }
+    Ok(())
+}
+
 /// Set a single property on a node. Creates the node entry if absent.
 pub fn set_property(store: &mut ExtensionStore, uid: &str, key: &str, value: serde_json::Value) {
     store

@@ -117,6 +117,23 @@ pub fn apply_git_isolation(cmd: &mut Command) {
     cmd.env("GIT_CONFIG_VALUE_4", "0");
 }
 
+/// A `git` command with [`apply_git_isolation`] already applied, for local
+/// reads of a repository NestWeaver did not write.
+pub fn isolated_git() -> Command {
+    let mut cmd = Command::new("git");
+    apply_git_isolation(&mut cmd);
+    cmd
+}
+
+/// Refuse a revision a caller would splice into a git argument, when git
+/// would parse it as an option instead (`--output=<file>` writes a file).
+pub fn ensure_revision_arg(revision: &str) -> Result<()> {
+    if revision.starts_with('-') {
+        anyhow::bail!("'{revision}' is not a revision: it starts with '-'");
+    }
+    Ok(())
+}
+
 /// SIGKILL the whole process group, reap the direct child, and join both reader
 /// threads. Killing the *group* (not just the direct pid) takes down git's
 /// network-helper subprocesses too, so their write-end of the pipes closes,

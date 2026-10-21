@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
@@ -38,9 +37,11 @@ pub fn compute_cochanges(
     min_confidence: f32,
 ) -> Result<Vec<CoChangeEdge>, anyhow::Error> {
     // Run git log to get commits and their changed files
-    let output = Command::new("git")
+    let output = crate::git_cmd::isolated_git()
         .args([
             "log",
+            // A repository's `log.showSignature` would run its `gpg.program`.
+            "--no-show-signature",
             "--name-only",
             "--format=%H",
             &format!("--max-count={max_commits}"),

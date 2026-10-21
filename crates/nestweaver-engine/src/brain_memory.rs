@@ -390,11 +390,20 @@ pub fn memory_lint(store: &GraphStore, now_epoch: f64) -> Result<MemoryLintRepor
     }
     // Build a title→uid index + the uid set to resolve frontmatter references.
     let mut by_title: HashMap<String, Vec<&str>> = HashMap::new();
+    let mut by_path: HashMap<String, Vec<&str>> = HashMap::new();
     for n in &notes {
         by_title
             .entry(n.title.to_lowercase())
             .or_default()
             .push(n.uid.as_str());
+        let path = n.file_path.replace('\\', "/").to_lowercase();
+        if let Some(stem) = path.strip_suffix(".md") {
+            by_path
+                .entry(stem.to_string())
+                .or_default()
+                .push(n.uid.as_str());
+        }
+        by_path.entry(path).or_default().push(n.uid.as_str());
     }
     for n in &notes {
         let Some(fm) = n.frontmatter.as_deref() else {
@@ -410,7 +419,7 @@ pub fn memory_lint(store: &GraphStore, now_epoch: f64) -> Result<MemoryLintRepor
             ("relates_to", "RELATES_TO"),
         ] {
             for reference in frontmatter_refs(&json, key) {
-                let resolved = resolve_reference(&reference, &uid_set, &by_title);
+                let resolved = resolve_reference(&reference, &uid_set, &by_title, &by_path);
                 if resolved.is_none() {
                     dangling_relationships.push(DanglingRelationship {
                         source_uid: n.uid.clone(),
@@ -460,19 +469,24 @@ fn frontmatter_refs(json: &serde_json::Value, key: &str) -> Vec<String> {
     }
 }
 
-/// Resolve a frontmatter reference (note UID or title) against the vault.
-/// Returns `None` when it matches no note (a dangling relationship).
+/// Resolve a frontmatter reference (note UID, vault-relative path, or title,
+/// optionally written as an Obsidian `[[link|alias]]`) against the vault — the
+/// same forms typed-edge derivation accepts. Returns `None` when it matches no
+/// note (a dangling relationship).
 fn resolve_reference(
     reference: &str,
     uid_set: &HashSet<&str>,
     by_title: &HashMap<String, Vec<&str>>,
+    by_path: &HashMap<String, Vec<&str>>,
 ) -> Option<String> {
-    let raw = reference.trim();
+    let raw = crate::index_md::frontmatter_link_target(reference);
     if uid_set.contains(raw) {
         return Some(raw.to_string());
     }
-    by_title
-        .get(&raw.to_lowercase())
+    let key = raw.replace('\\', "/").to_lowercase();
+    by_path
+        .get(&key)
+        .or_else(|| by_title.get(&key))
         .and_then(|uids| uids.first().map(|u| u.to_string()))
 }
 
@@ -681,6 +695,10 @@ pub struct ConsolidationManifest {
     pub proposals: Vec<ConsolidationProposal>,
     /// Apply summaries, recovery locations, and re-index guidance.
     pub warnings: Vec<String>,
+    /// Proposals discovered before any `limit` was applied. Not serialized:
+    /// callers report it next to the returned list.
+    #[serde(skip)]
+    pub proposals_discovered: usize,
 }
 
 const CONSOLIDATION_JOURNAL_VERSION: u32 = 1;
@@ -751,6 +769,18 @@ pub fn memory_consolidate(
     apply: bool,
     now_epoch: f64,
 ) -> Result<ConsolidationManifest> {
+    memory_consolidate_limited(store, apply, now_epoch, None)
+}
+
+/// [`memory_consolidate`] that keeps only the first `limit` proposals (in
+/// their stable uid order) BEFORE applying, so an apply never moves a note the
+/// response does not list. Journal recovery is unaffected by the limit.
+pub fn memory_consolidate_limited(
+    store: &GraphStore,
+    apply: bool,
+    now_epoch: f64,
+    limit: Option<usize>,
+) -> Result<ConsolidationManifest> {
     let notes = store.list_notes(None).map_err(|e| anyhow::anyhow!(e))?;
     let mut warnings = Vec::new();
     if notes.is_empty() && !apply {
@@ -760,6 +790,7 @@ pub fn memory_consolidate(
             apply_errors: false,
             proposals: vec![],
             warnings,
+            proposals_discovered: 0,
         });
     }
 
@@ -872,6 +903,10 @@ pub fn memory_consolidate(
             .cmp(&b.source_uid)
             .then(a.promote_to.cmp(&b.promote_to))
     });
+    let proposals_discovered = proposals.len();
+    if let Some(limit) = limit {
+        proposals.truncate(limit);
+    }
 
     if apply {
         match apply_proposals(store, &proposals, &notes) {
@@ -890,6 +925,7 @@ pub fn memory_consolidate(
                     apply_errors: outcome.apply_errors,
                     proposals: outcome.proposals,
                     warnings,
+                    proposals_discovered,
                 });
             }
             Err(e) => {
@@ -900,6 +936,7 @@ pub fn memory_consolidate(
                     apply_errors: true,
                     proposals,
                     warnings,
+                    proposals_discovered,
                 });
             }
         }
@@ -911,6 +948,7 @@ pub fn memory_consolidate(
         apply_errors: false,
         proposals,
         warnings,
+        proposals_discovered,
     })
 }
 
@@ -2570,10 +2608,20 @@ mod tests {
         // vault is a dangling relationship. (The graph store cannot physically
         // hold an edge to a missing node, so detection works off the declared
         // frontmatter intent.)
-        let (_dir, root) = make_vault(&[(
-            "Orphaned.md",
-            "---\ndepends_on: [Nonexistent Note]\n---\n# Orphaned\n",
-        )]);
+        let (_dir, root) = make_vault(&[
+            (
+                "Orphaned.md",
+                "---\ndepends_on: [Nonexistent Note]\n---\n# Orphaned\n",
+            ),
+            // Obsidian link syntax resolves: path, alias and heading forms.
+            (
+                "Linked.md",
+                "---\ndepends_on: \"[[Projects/Billing|Billing]]\"\n\
+                 caused_by: [\"[[Projects/Billing#Costs]]\"]\n\
+                 relates_to: \"[[Orphaned]]\"\n---\n# Linked\n",
+            ),
+            ("Projects/Billing.md", "# Billing\n\n## Costs\n"),
+        ]);
         let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
         let report = memory_lint(&store, 1_900_000_000.0).unwrap();
         assert!(
@@ -2584,6 +2632,48 @@ mod tests {
             "expected a dangling relationship for the missing target, got {:?}",
             report.dangling_relationships
         );
+        assert!(
+            !report
+                .dangling_relationships
+                .iter()
+                .any(|d| d.target_uid.contains("[[")),
+            "an Obsidian-link reference to an existing note is not dangling: {:?}",
+            report.dangling_relationships
+        );
+
+        // And the same references derive typed edges, so related finds them.
+        let linked = uid_for(&store, "Linked");
+        let billing = uid_for(&store, "Billing");
+        let orphaned = uid_for(&store, "Orphaned");
+        let edges = store.typed_note_edges().unwrap();
+        for (target, edge_type) in [
+            (&billing, "DEPENDS_ON"),
+            (&billing, "CAUSED_BY"),
+            (&orphaned, "RELATES_TO"),
+        ] {
+            assert!(
+                edges
+                    .iter()
+                    .any(|(s, t, et)| s == &linked && t == target && et == edge_type),
+                "expected Linked {edge_type} {target}, got {edges:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn frontmatter_link_target_strips_only_link_syntax() {
+        use crate::index_md::frontmatter_link_target;
+        assert_eq!(
+            frontmatter_link_target(" [[Projects/Billing]] "),
+            "Projects/Billing"
+        );
+        assert_eq!(frontmatter_link_target("[[Billing|alias]]"), "Billing");
+        assert_eq!(
+            frontmatter_link_target("[[Billing#Costs|alias]]"),
+            "Billing"
+        );
+        assert_eq!(frontmatter_link_target("C# notes"), "C# notes");
+        assert_eq!(frontmatter_link_target("a|b"), "a|b");
     }
 
     #[test]
@@ -3195,6 +3285,44 @@ mod tests {
             journals
                 .iter()
                 .all(|journal| journal.phase == ConsolidationPhase::Complete)
+        );
+    }
+
+    #[test]
+    fn consolidate_apply_honours_the_limit_before_moving_anything() {
+        let (_dir, root) = make_vault(&[
+            ("_logs/2025-01-01.md", "# First log\n"),
+            ("_logs/2025-01-02.md", "# Second log\n"),
+            (
+                "_ideas/idea-a.md",
+                "[[_logs/2025-01-01]] and [[_logs/2025-01-02]]\n",
+            ),
+            (
+                "_ideas/idea-b.md",
+                "[[_logs/2025-01-01]] and [[_logs/2025-01-02]]\n",
+            ),
+            (
+                "_ideas/idea-c.md",
+                "[[_logs/2025-01-01]] and [[_logs/2025-01-02]]\n",
+            ),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let manifest = memory_consolidate_limited(&store, true, 4_000_000_000.0, Some(1)).unwrap();
+        assert!(manifest.applied, "warnings: {:?}", manifest.warnings);
+        assert_eq!(manifest.proposals_discovered, 2);
+        assert_eq!(manifest.proposals.len(), 1);
+        // Only the returned proposal moved; the other log is untouched.
+        let moved = &manifest.proposals[0].source_path;
+        let (kept, promoted) = if moved.ends_with("2025-01-01.md") {
+            ("_logs/2025-01-02.md", "_ideas/2025-01-01.md")
+        } else {
+            ("_logs/2025-01-01.md", "_ideas/2025-01-02.md")
+        };
+        assert!(root.join(promoted).exists());
+        assert!(
+            root.join(kept).exists(),
+            "a deferred proposal must not be applied"
         );
     }
 
