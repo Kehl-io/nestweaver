@@ -7780,11 +7780,11 @@ fn tool_schema_brain_context() -> Value {
                 },
                 "weight_ppr": {
                     "type": "number",
-                    "description": "PPR ranking weight for hybrid RRF fusion. Default 0.7."
+                    "description": "PPR ranking weight for hybrid RRF fusion. Default 0.40, or `[embedding] weight_ppr` from the instance config."
                 },
                 "weight_bm25": {
                     "type": "number",
-                    "description": "BM25 text search weight for hybrid RRF fusion. Default 0.3."
+                    "description": "BM25 text search weight for hybrid RRF fusion. Default 0.25, or `[embedding] weight_bm25` from the instance config."
                 },
                 "weight_semantic": {
                     "type": "number",

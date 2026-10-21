@@ -28,16 +28,24 @@ pub fn write_status(path: &Path, wrote: GuideSectionWrite) -> String {
 /// Create `path` with the generated body inside the markers, or replace only
 /// the existing marked span. A file with no single well-formed pair is left
 /// unchanged and this returns an error.
+///
+/// A symbolic link (a `CLAUDE.md` linked to `AGENTS.md`, or into a dotfiles
+/// checkout) is written THROUGH: the link's target is updated and the link
+/// stays a link. The atomic rename used to land on the link path itself,
+/// replacing the link with a regular file and leaving its target stale. A
+/// dangling link is refused, because creating its target would write a file
+/// where this command was never pointed.
 pub fn write_marked_section(
     path: &Path,
     generated: &str,
 ) -> Result<GuideSectionWrite, anyhow::Error> {
-    if !path.exists() {
+    if !nestweaver_engine::user_config::probe(path)?.existed {
         let text = render_marked(generated)?;
         atomic_write(path, &text)?;
         return Ok(GuideSectionWrite::Created);
     }
-    let existing = std::fs::read_to_string(path).with_context(|| {
+    let target = nestweaver_engine::user_config::resolve_for_write(path, "the same command")?;
+    let existing = std::fs::read_to_string(&target).with_context(|| {
         format!(
             "read {} before updating the NestWeaver section",
             path.display()
@@ -45,7 +53,7 @@ pub fn write_marked_section(
     })?;
     let updated = splice_marked(&existing, generated)
         .with_context(|| format!("{} was left unchanged", path.display()))?;
-    atomic_write(path, &updated)?;
+    atomic_write(&target, &updated)?;
     Ok(GuideSectionWrite::Updated)
 }
 
@@ -192,5 +200,48 @@ mod tests {
             assert!(write_marked_section(&path, "generated").is_err());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         }
+    }
+
+    /// `generate-guide` replaced a symlinked `CLAUDE.md` with a regular file:
+    /// the link was gone and its target (often `AGENTS.md`) kept stale text.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_guide_is_written_through_and_stays_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = path_in(&dir, "AGENTS.md");
+        let link = path_in(&dir, "CLAUDE.md");
+        std::fs::write(
+            &target,
+            "KEEP\n<!-- nestweaver:begin -->\nOLD\n<!-- nestweaver:end -->\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", &link).unwrap();
+
+        assert_eq!(
+            write_marked_section(&link, "NEW").unwrap(),
+            GuideSectionWrite::Updated
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must survive"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "KEEP\n<!-- nestweaver:begin -->\nNEW\n<!-- nestweaver:end -->\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlinked_guide_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = path_in(&dir, "CLAUDE.md");
+        let missing = path_in(&dir, "gone.md");
+        std::os::unix::fs::symlink(&missing, &link).unwrap();
+        assert!(write_marked_section(&link, "NEW").is_err());
+        assert!(!missing.exists());
     }
 }

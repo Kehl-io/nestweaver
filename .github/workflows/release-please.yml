@@ -1335,10 +1335,13 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           ARCHIVE="nestweaver-${RELEASE_TAG}-$TARGET.tar.gz"
+          # The MIT notice travels with the binary: LICENSE sits at the archive
+          # root next to `nestweaver` (the second -C switches back to the
+          # checkout for it).
           if [[ "$TARGET" == *-unknown-linux-gnu ]]; then
-            tar czf "$ARCHIVE" -C "target/$TARGET/release" nestweaver lib
+            tar czf "$ARCHIVE" -C "target/$TARGET/release" nestweaver lib -C "$GITHUB_WORKSPACE" LICENSE
           else
-            tar czf "$ARCHIVE" -C "target/$TARGET/release" nestweaver
+            tar czf "$ARCHIVE" -C "target/$TARGET/release" nestweaver -C "$GITHUB_WORKSPACE" LICENSE
           fi
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
       - name: Generate SHA-256 checksum
@@ -1355,6 +1358,7 @@ jobs:
           tar xzf "$ARCHIVE" -C "$EXTRACT_DIR"
           BIN="$EXTRACT_DIR/nestweaver"
           test -x "$BIN"
+          cmp "$EXTRACT_DIR/LICENSE" LICENSE
           if [ "${{ runner.os }}" = Linux ]; then
             python3 scripts/verify-linux-archive.py "$EXTRACT_DIR" --negative-control
           fi

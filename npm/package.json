@@ -6,8 +6,8 @@
     "nestweaver": "bin/nestweaver"
   },
   "files": [
+    "LICENSE",
     "bin/",
-    "media/",
     "README.md"
   ],
   "homepage": "https://docs.nestweaver.kehl.io",

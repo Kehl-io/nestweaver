@@ -250,18 +250,27 @@ fn prepend_guidance_to_task_prompt(event: &Value, instructions: &str) -> Option<
     Some(input)
 }
 
-/// Build the PreToolUse hook entry (Claude-Code shape) for the `Task` matcher.
+/// The PreToolUse matcher for Claude Code's subagent tool. Claude Code renamed
+/// that tool from `Task` to `Agent`; matchers are regexes over the tool name,
+/// so this matches both the current and the older name.
+const CLAUDE_SUBAGENT_MATCHER: &str = "Task|Agent";
+
+/// The matcher older releases wrote. An entry with it and NestWeaver's command
+/// is upgraded in place to [`CLAUDE_SUBAGENT_MATCHER`].
+const LEGACY_CLAUDE_SUBAGENT_MATCHER: &str = "Task";
+
+/// Build the PreToolUse hook entry (Claude-Code shape) for the subagent tool.
 ///
 /// Shape:
 /// ```json
 /// {
-///   "matcher": "Task",
+///   "matcher": "Task|Agent",
 ///   "hooks": [{ "type": "command", "command": "nestweaver admin instructions --for-subagent" }]
 /// }
 /// ```
 fn claude_task_hook_entry() -> Value {
     json!({
-        "matcher": "Task",
+        "matcher": CLAUDE_SUBAGENT_MATCHER,
         "hooks": [
             { "type": "command", "command": HOOK_COMMAND }
         ]
@@ -269,7 +278,7 @@ fn claude_task_hook_entry() -> Value {
 }
 
 /// Compute the JSON patch (the full desired `hooks.PreToolUse` array) to add a
-/// `Task`-matcher PreToolUse hook to an existing settings document.
+/// subagent-matcher (`Task|Agent`) PreToolUse hook to an existing settings document.
 ///
 /// `existing` is the current settings JSON (e.g. parsed
 /// `.claude/settings.local.json`); pass an empty object if there is none. The
@@ -318,7 +327,16 @@ pub fn compute_claude_hook_patch(existing: &Value) -> Result<Value, anyhow::Erro
         }
         // Shape validation above ensures this is an array.
         if let Some(entries) = hooks["PreToolUse"].as_array_mut() {
-            entries.push(claude_task_hook_entry());
+            // An entry from an older release (matcher `Task` only) never fires
+            // for the `Agent` tool. Widen its matcher rather than adding a
+            // second entry, which would run the hook twice on `Task`.
+            match entries
+                .iter_mut()
+                .find(|entry| is_nestweaver_hook_entry(entry, LEGACY_CLAUDE_SUBAGENT_MATCHER))
+            {
+                Some(legacy) => legacy["matcher"] = json!(CLAUDE_SUBAGENT_MATCHER),
+                None => entries.push(claude_task_hook_entry()),
+            }
         }
         settings["hooks"] = hooks;
     }
@@ -345,22 +363,26 @@ fn validate_claude_hook_containers(existing: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn is_nestweaver_hook_entry(entry: &Value, matcher: &str) -> bool {
+    entry["matcher"] == matcher
+        && entry
+            .get("hooks")
+            .and_then(Value::as_array)
+            .is_some_and(|hooks| {
+                hooks
+                    .iter()
+                    .any(|hook| hook["type"] == "command" && hook["command"] == HOOK_COMMAND)
+            })
+}
+
 fn has_exact_claude_hook(existing: &Value) -> bool {
     existing
         .pointer("/hooks/PreToolUse")
         .and_then(Value::as_array)
         .is_some_and(|entries| {
-            entries.iter().any(|entry| {
-                entry["matcher"] == "Task"
-                    && entry
-                        .get("hooks")
-                        .and_then(Value::as_array)
-                        .is_some_and(|hooks| {
-                            hooks.iter().any(|hook| {
-                                hook["type"] == "command" && hook["command"] == HOOK_COMMAND
-                            })
-                        })
-            })
+            entries
+                .iter()
+                .any(|entry| is_nestweaver_hook_entry(entry, CLAUDE_SUBAGENT_MATCHER))
         })
 }
 
@@ -453,7 +475,7 @@ pub fn read_runtime_settings(path: &Path) -> Result<crate::user_config::JsonConf
 
 /// Merge the runtime hook into `path`, preserving every key it does not own.
 ///
-/// NestWeaver owns its exact command entry under the `Task` matcher in
+/// NestWeaver owns its exact command entry under the `Task|Agent` matcher in
 /// `hooks.PreToolUse`. Everything else in the document is the user's, and this
 /// function either preserves all of it or writes nothing at all:
 ///
@@ -629,7 +651,7 @@ mod tests {
             .as_array()
             .expect("PreToolUse array");
         assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["matcher"], "Task");
+        assert_eq!(arr[0]["matcher"], "Task|Agent");
         let cmd = arr[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("admin instructions --for-subagent"));
     }
@@ -675,7 +697,7 @@ mod tests {
             .as_array()
             .expect("delta PreToolUse array");
         assert_eq!(arr.len(), 1, "delta is just the added Task entry");
-        assert_eq!(arr[0]["matcher"], "Task");
+        assert_eq!(arr[0]["matcher"], "Task|Agent");
         assert!(rendered.contains("PreToolUse"));
         assert!(rendered.contains("Task"));
 
@@ -697,10 +719,10 @@ mod tests {
 
     #[test]
     fn dry_run_delta_empty_when_already_installed() {
-        // If the Task matcher is already present, the delta adds nothing.
+        // If the subagent matcher is already present, the delta adds nothing.
         let existing = json!({
             "hooks": { "PreToolUse": [ {
-                "matcher": "Task",
+                "matcher": "Task|Agent",
                 "hooks": [ { "type": "command", "command": HOOK_COMMAND } ]
             } ] }
         });
@@ -763,7 +785,7 @@ mod tests {
 
         let settings = read_runtime_settings(&path).unwrap();
         let delta = compute_hook_delta(Runtime::Claude, &settings.value).unwrap();
-        assert_eq!(delta["hooks"]["PreToolUse"][0]["matcher"], "Task");
+        assert_eq!(delta["hooks"]["PreToolUse"][0]["matcher"], "Task|Agent");
     }
 
     #[test]
@@ -816,7 +838,7 @@ mod tests {
             .iter()
             .filter_map(|entry| entry["matcher"].as_str())
             .collect();
-        assert_eq!(matchers, vec!["Edit", "Task"]);
+        assert_eq!(matchers, vec!["Edit", "Task|Agent"]);
     }
 
     #[test]
@@ -854,7 +876,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.local.json");
         let original = "{\n  // mine\n  \"hooks\": { \"PreToolUse\": [ \
-                        { \"matcher\": \"Task\", \"hooks\": [{ \"type\": \"command\", \"command\": \"nestweaver admin instructions --for-subagent\" }] } ] }\n}\n";
+                        { \"matcher\": \"Task|Agent\", \"hooks\": [{ \"type\": \"command\", \"command\": \"nestweaver admin instructions --for-subagent\" }] } ] }\n}\n";
         std::fs::write(&path, original).unwrap();
 
         assert_eq!(
@@ -926,7 +948,7 @@ mod tests {
             "the user's key must survive the merge: {after}"
         );
         assert_eq!(
-            after["hooks"]["PreToolUse"][0]["matcher"], "Task",
+            after["hooks"]["PreToolUse"][0]["matcher"], "Task|Agent",
             "and the hook must actually be installed: {after}"
         );
         assert!(
@@ -992,7 +1014,7 @@ mod tests {
             HookInstall::Installed
         );
         let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task");
+        assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task|Agent");
     }
 
     #[test]
@@ -1104,5 +1126,31 @@ mod exact_hook_regressions {
                 &compute_hook_patch(Runtime::Claude, &value).unwrap()
             ));
         }
+    }
+
+    /// Claude Code's subagent tool is now `Agent`; a `Task`-only matcher never
+    /// fires for it. An entry written by an older release is widened in place —
+    /// not duplicated, which would run the hook twice on `Task`.
+    #[test]
+    fn a_legacy_task_only_entry_is_widened_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.local.json");
+        let legacy = json!({"env": {"K": "v"}, "hooks": {"PreToolUse": [
+            {"matcher": "Edit", "hooks": [{"type": "command", "command": "mine"}]},
+            {"matcher": "Task", "hooks": [{"type": "command", "command": HOOK_COMMAND}]}
+        ]}});
+        std::fs::write(&path, legacy.to_string()).unwrap();
+        assert!(!hook_already_present(Runtime::Claude, &legacy).unwrap());
+
+        assert_eq!(
+            install_hook(Runtime::Claude, &path).unwrap(),
+            HookInstall::Installed
+        );
+        let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let entries = after["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "{after}");
+        assert_eq!(entries[0], legacy["hooks"]["PreToolUse"][0]);
+        assert_eq!(entries[1]["matcher"], "Task|Agent");
+        assert_eq!(after["env"]["K"], "v");
     }
 }

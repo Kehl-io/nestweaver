@@ -105,8 +105,28 @@ function resolveBinaryPath(pkgName, resolveFn) {
   }
 }
 
+/// Signals the launcher relays to the binary. With `stdio: "inherit"` a
+/// terminal Ctrl-C reaches both processes (same process group), but a signal
+/// sent to the launcher's PID alone -- `kill <pid>`, a supervisor's SIGTERM, a
+/// closed terminal's SIGHUP -- reaches only the launcher. `spawnSync` could not
+/// react to it at all: the launcher died and the binary was orphaned,
+/// still holding the database. NestWeaver has no "second Ctrl-C forces"
+/// behaviour, so a duplicate SIGINT from the terminal is harmless.
+const FORWARDED_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"];
+
+/// How the launcher should end once the binary has: the same exit code, or
+/// the same signal re-raised on itself so the parent shell sees a signal death
+/// (exit status 128+n), not a plain failure.
+function exitDisposition(code, signal) {
+  if (signal) {
+    return { signal };
+  }
+  return { code: code === null || code === undefined ? 1 : code };
+}
+
 module.exports = {
   PLATFORM_PACKAGES,
+  FORWARDED_SIGNALS,
   platformKey,
   platformPackageName,
   isMuslLinux,
@@ -114,31 +134,40 @@ module.exports = {
   muslMessage,
   missingPlatformPackageMessage,
   resolveBinaryPath,
+  exitDisposition,
 };
 
 // ── Execution ────────────────────────────────────────────────────────────
 
+/// The musl check costs a full `process.report.getReport()` (~28 ms on every
+/// invocation). It only changes the outcome when the glibc binary cannot be
+/// found or started -- the platform packages declare `libc: ["glibc"]`, so a
+/// musl system never gets one installed -- so it now runs on those failure
+/// paths only, to explain them.
+function exitIfMusl(platform, arch) {
+  if (platform !== "linux") {
+    return;
+  }
+  let glibcVersionRuntime;
+  let reportAvailable = false;
+  try {
+    if (process.report && typeof process.report.getReport === "function") {
+      glibcVersionRuntime = process.report.getReport().header.glibcVersionRuntime;
+      reportAvailable = true;
+    }
+  } catch {
+    reportAvailable = false;
+  }
+  if (isMuslLinux(platform, glibcVersionRuntime, reportAvailable)) {
+    console.error(muslMessage(platform, arch));
+    process.exit(1);
+  }
+}
+
 function main() {
-  const { spawnSync } = require("child_process");
+  const { spawn } = require("child_process");
   const platform = process.platform;
   const arch = process.arch;
-
-  if (platform === "linux") {
-    let glibcVersionRuntime;
-    let reportAvailable = false;
-    try {
-      if (process.report && typeof process.report.getReport === "function") {
-        glibcVersionRuntime = process.report.getReport().header.glibcVersionRuntime;
-        reportAvailable = true;
-      }
-    } catch {
-      reportAvailable = false;
-    }
-    if (isMuslLinux(platform, glibcVersionRuntime, reportAvailable)) {
-      console.error(muslMessage(platform, arch));
-      process.exit(1);
-    }
-  }
 
   const pkgName = platformPackageName(platform, arch);
   if (!pkgName) {
@@ -151,18 +180,43 @@ function main() {
     require.resolve(specifier),
   );
   if (error) {
+    exitIfMusl(platform, arch);
     console.error(missingPlatformPackageMessage(pkgName, version));
     process.exit(1);
   }
 
-  const result = spawnSync(binaryPath, process.argv.slice(2), { stdio: "inherit" });
-  if (result.error) {
-    console.error(
-      `Failed to execute NestWeaver binary at ${binaryPath}: ${result.error.message}`,
-    );
+  const child = spawn(binaryPath, process.argv.slice(2), { stdio: "inherit" });
+  const relays = FORWARDED_SIGNALS.map((signal) => {
+    const relay = () => {
+      try {
+        child.kill(signal);
+      } catch {
+        // The child already exited; its "exit" handler ends the launcher.
+      }
+    };
+    process.on(signal, relay);
+    return [signal, relay];
+  });
+
+  child.on("error", (err) => {
+    exitIfMusl(platform, arch);
+    console.error(`Failed to execute NestWeaver binary at ${binaryPath}: ${err.message}`);
     process.exit(1);
-  }
-  process.exit(result.status === null ? 1 : result.status);
+  });
+
+  child.on("exit", (code, signal) => {
+    const outcome = exitDisposition(code, signal);
+    if (outcome.signal) {
+      // Drop the relays first, or re-raising the signal would only relay it to
+      // the dead child again instead of ending this process.
+      for (const [name, relay] of relays) {
+        process.removeListener(name, relay);
+      }
+      process.kill(process.pid, outcome.signal);
+      return;
+    }
+    process.exit(outcome.code);
+  });
 }
 
 // Only run when executed as the npm bin entry point; `require` must be free
