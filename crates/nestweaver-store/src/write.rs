@@ -879,6 +879,21 @@ fn insert_references_code_rows_on(
     Ok(statements)
 }
 
+/// Defense in depth for source display names: every vault listing echoes the
+/// stored name, and one holding a NUL trips the read-side corruption canary,
+/// so a single bad name made every listing (and the removal that would repair
+/// it) fail. Interfaces validate first; this refuses before anything is
+/// written. Empty is allowed here — it means "defaulted".
+fn refuse_control_chars_in_source_name(kind: &str, name: &str) -> Result<(), StoreError> {
+    if let Some(c) = name.chars().find(|c| c.is_control()) {
+        return Err(StoreError::Query(format!(
+            "refusing to store {kind} name with control character {}",
+            c.escape_unicode()
+        )));
+    }
+    Ok(())
+}
+
 impl GraphStore {
     fn plan_instance_project_merges(
         &self,
@@ -957,6 +972,7 @@ impl GraphStore {
         conn: &crate::db::StoreConnection<'_>,
         repo: &Repo,
     ) -> Result<(), StoreError> {
+        refuse_control_chars_in_source_name("repo", repo.name.as_deref().unwrap_or(""))?;
         exec_params(
             conn,
             "CREATE (:Repo {uid: $uid, url: $url, indexed_sha: $sha, \
@@ -1984,6 +2000,7 @@ impl GraphStore {
         wikilink_to_note_edges: &[(&str, &str, f32, &str, &str)],
         wikilink_to_heading_edges: &[(&str, &str, f32, &str, &str)],
     ) -> Result<usize, StoreError> {
+        refuse_control_chars_in_source_name("vault", &vault.name)?;
         Self::validate_bulk_vault_reindex_input(
             vault,
             notes,
@@ -2332,6 +2349,7 @@ impl GraphStore {
 
     pub fn insert_vault(&self, vault: &Vault) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        refuse_control_chars_in_source_name("vault", &vault.name)?;
         exec_params(
             &conn,
             "CREATE (:Vault {uid: $uid, name: $name, root_path: $rp, instance_id: $iid})",
@@ -2348,6 +2366,7 @@ impl GraphStore {
         let conn = self.conn()?;
         // Updating metadata must retain containment and other incident edges.
         // Watcher startup calls this for vaults that are already indexed.
+        refuse_control_chars_in_source_name("vault", &vault.name)?;
         exec_params(
             &conn,
             "MERGE (v:Vault {uid: $uid}) \
@@ -3474,6 +3493,7 @@ impl GraphStore {
         project_note_edges: &[(&str, &str)],
         prune_tags: bool,
     ) -> Result<(), StoreError> {
+        refuse_control_chars_in_source_name("vault", &vault.name)?;
         let conn = self.begin_transaction()?;
         let mutation = (|| {
             exec_params(

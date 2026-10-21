@@ -2910,6 +2910,15 @@ fn resolve_effective_instance_id(requested: &str, state: &DaemonState) -> Result
     pick_effective_instance_id(requested, &configured)
 }
 
+/// Refuse a requested source name the graph cannot safely store. Empty means
+/// "defaulted" and passes; the store repeats the control-character check.
+fn validate_request_source_name(name: &str) -> Result<(), Status> {
+    match nestweaver_schema::source_name_problem(name) {
+        Some(problem) => Err(Status::invalid_argument(problem)),
+        None => Ok(()),
+    }
+}
+
 fn resolve_request_note_limits(
     requested: u64,
     state: &DaemonState,
@@ -7340,6 +7349,7 @@ impl NestWeaverDaemon for DaemonService {
         } else {
             req.vault_name.clone()
         };
+        validate_request_source_name(&vault_name)?;
         let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         let extra_patterns = req.extra_ignore_patterns.clone();
         let force = req.force;
@@ -8207,6 +8217,7 @@ impl NestWeaverDaemon for DaemonService {
         let with_trigrams = resolve_trigram_policy(req.trigram_policy(), req.with_trigrams, false);
         let rebuild_trigrams = req.rebuild_trigrams;
         let with_git_activity = req.with_git_activity;
+        validate_request_source_name(&req.name)?;
         let name = if req.name.is_empty() {
             None
         } else {
@@ -8701,6 +8712,7 @@ impl NestWeaverDaemon for DaemonService {
         } else {
             req.vault_name.clone()
         };
+        validate_request_source_name(&vault_name)?;
         let extra_patterns = req.extra_ignore_patterns.clone();
         let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         let note_limits = resolve_request_note_limits(req.max_note_bytes, &self.state)?;
@@ -8954,6 +8966,7 @@ impl NestWeaverDaemon for DaemonService {
         } else {
             req.vault_name.clone()
         };
+        validate_request_source_name(&vault_name)?;
         let extra_patterns = req.extra_ignore_patterns.clone();
         let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         let note_limits = resolve_request_note_limits(req.max_note_bytes, &self.state)?;

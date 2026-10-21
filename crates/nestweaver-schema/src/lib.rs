@@ -19,7 +19,10 @@ pub use embedding::{
     EMBEDDING_PIPELINE_SCHEMA_VERSION, EmbeddingBackend, EmbeddingPipelineV2, EmbeddingPoolingMode,
     EmbeddingQuantization, EmbeddingSimilarity, EmbeddingTruncation,
 };
-pub use limits::{DEFAULT_DRAIN_CEILING_SECS, drain_ceiling_from_env, parse_drain_ceiling};
+pub use limits::{
+    DEFAULT_DRAIN_CEILING_SECS, MAX_SOURCE_NAME_CHARS, drain_ceiling_from_env, parse_drain_ceiling,
+    source_name_problem, validate_explicit_source_name,
+};
 pub use nodes::{
     Contract, EntryPointKind, File, FrameworkHint, Heading, MODULE_OWNER_CONTEXT_CAP,
     MODULE_OWNER_NAME, Note, NoteKind, Project, QualifiedSpec, Repo, ResolvedType, Section,

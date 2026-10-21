@@ -11909,12 +11909,26 @@ fn tool_schema_brain_add_source() -> Value {
                 "path": { "type": "string", "description": "Absolute or ~/-relative directory path to the vault, repo, or markdown folder to index." },
                 "name": {
                     "type": "string",
-                    "description": "Friendly display name (vaults only). Defaults to the directory name. Has no effect for code repos."
+                    "maxLength": nestweaver_schema::MAX_SOURCE_NAME_CHARS,
+                    "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$",
+                    "description": "Friendly display name (vaults only). Defaults to the directory name. Has no effect for code repos. At most 255 characters, not blank, and no control characters (NUL, CR, LF, ESC, ...)."
                 }
             },
             "required": ["path"]
         }
     })
+}
+
+/// The optional `name` argument, validated before anything is written: a
+/// stored name with a NUL made every later vault listing fail.
+fn add_source_name_arg(args: &Value) -> Result<Option<String>, anyhow::Error> {
+    match args.get("name") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(name)) => nestweaver_schema::validate_explicit_source_name(name)
+            .map(|()| Some(name.clone()))
+            .map_err(|problem| anyhow!("invalid 'name': {problem}")),
+        Some(_) => Err(anyhow!("'name' must be a string")),
+    }
 }
 
 fn resolve_add_source_path(raw_path: &str) -> Result<std::path::PathBuf, anyhow::Error> {
@@ -11924,6 +11938,35 @@ fn resolve_add_source_path(raw_path: &str) -> Result<std::path::PathBuf, anyhow:
 #[cfg(test)]
 mod add_source_path_tests {
     use super::*;
+
+    #[test]
+    fn a_control_character_or_oversized_name_is_refused_before_indexing() {
+        let long = "x".repeat(nestweaver_schema::MAX_SOURCE_NAME_CHARS + 1);
+        for name in ["\u{0}evil", "a\r\nb", "\u{1b}[2J", long.as_str()] {
+            let args = json!({ "path": "/tmp", "name": name });
+            assert!(
+                validate_tool_arguments("brain_add_source", &args).is_err(),
+                "schema must refuse {name:?}"
+            );
+            // The handler backstop for routes that skip schema validation.
+            assert!(
+                add_source_name_arg(&args).is_err(),
+                "handler must refuse {name:?}"
+            );
+        }
+        // Blank is a handler-only refusal: the schema only bounds the shape.
+        assert!(add_source_name_arg(&json!({ "path": "/tmp", "name": "  " })).is_err());
+        let ok = json!({ "path": "/tmp", "name": "My Vault" });
+        assert!(validate_tool_arguments("brain_add_source", &ok).is_ok());
+        assert_eq!(
+            add_source_name_arg(&ok).unwrap().as_deref(),
+            Some("My Vault")
+        );
+        assert_eq!(
+            add_source_name_arg(&json!({ "path": "/tmp" })).unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn empty_path_is_rejected_instead_of_becoming_the_working_directory() {
@@ -12012,11 +12055,7 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
             let kind = if has_obsidian { "obsidian" } else { "markdown" };
             // Empty when `name` is absent: the indexer then keeps a registered
             // vault's stored name, and names a new one after its directory.
-            let name = args
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .unwrap_or_default();
+            let name = add_source_name_arg(&args)?.unwrap_or_default();
             // We need a db_path for index_markdown_directory; but the server
             // already opened one. Reuse it indirectly: call the in-memory
             // primitive? No — that doesn't persist. Reopen the same DB by
@@ -22548,6 +22587,7 @@ fn dispatch_add_source_via_daemon(
         .get("path")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("'path' is required for brain_add_source"))?;
+    let name_arg = add_source_name_arg(&args)?;
     let path = resolve_add_source_path(raw_path)?
         .to_string_lossy()
         .into_owned();
@@ -22558,7 +22598,6 @@ fn dispatch_add_source_via_daemon(
     // literally), while for code repos an empty name is meaningful — the
     // daemon derives the repo name (package/remote) and a directory-name
     // default would override that derivation.
-    let name_arg = args.get("name").and_then(|v| v.as_str()).map(String::from);
 
     let resolved = std::path::Path::new(&path);
     // nw-089: validate the path exists — the old code returned a phantom
