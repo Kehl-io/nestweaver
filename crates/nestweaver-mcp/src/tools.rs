@@ -14724,6 +14724,9 @@ fn diff_affected_tests_base_ref(
                  `git --git-dir <git-dir> config core.worktree <absolute-work-tree>`"
             ));
         }
+        if std::fs::symlink_metadata(path.join(".git")).is_err() {
+            return Err(error);
+        }
         return Err(anyhow!(
             "{error}; its Git metadata uses a layout that cannot be verified as this \
              checkout's own (for example alternates, metadata symlinks, config includes, a \
