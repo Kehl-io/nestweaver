@@ -234,12 +234,11 @@ jobs:
         # in scripts/fetch-lbug-source.sh only.
         run: scripts/fetch-lbug-source.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        id: metal-cache
         with:
           # Only main saves: branch and PR caches are unreadable elsewhere and
           # evicted main's under the 10 GB repository cap. Branches restore main's.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-        id: metal-cache
-        with:
           # A cancelled build saved an incomplete exact-key cache; later hits
           # cannot replace it. Seed this new namespace only after success.
           cache-on-failure: false
