@@ -203,8 +203,17 @@ from `publication status`, then request it with:
 nestweaver publication cancel <uuid> --revision <revision> --db /path/to/brain.lbug
 ```
 
-A cancelled or retryably failed operation can be resumed. If it is no longer
-needed, discard it using its latest revision:
+A retryably failed operation can be resumed with
+`publication rebuild --operation <uuid>`. A cancellation cannot. When
+`run_publication_rebuild` loads an `--operation` journal that is already
+`cancel_requested`, it acknowledges that cancellation, prints
+`Publication <uuid> was cancelled at revision <n>.` (the cancelled operation
+record with `--json`), and exits 1. A rebuild that is already running when
+`publication cancel` lands is acknowledged in the worker loop and prints
+`Publication <uuid> is Cancelled at revision <n> (target <uuid>).` before the
+same exit 1. It does not continue the rebuild or switch the selected
+publication. If the operation is no longer needed, discard it using its latest
+revision:
 
 ```sh
 nestweaver publication discard <uuid> --revision <revision> --db /path/to/brain.lbug

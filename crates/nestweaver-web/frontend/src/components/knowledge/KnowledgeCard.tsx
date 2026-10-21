@@ -7,6 +7,7 @@ import { KnowledgeActionGrid } from "./KnowledgeActionGrid";
 import { RelationshipChips } from "./RelationshipChips";
 import { TrustBadge } from "./TrustBadge";
 import { JsonEvidence } from "./JsonEvidence";
+import { stripLeadingFrontmatter } from "../detail/stripFrontmatter";
 
 interface KnowledgeCardNode {
   uid: string;
@@ -29,7 +30,7 @@ interface KnowledgeCardProps {
 }
 
 function stripFrontmatterAndHeadings(body: string): string {
-  let text = body.replace(/^---[\s\S]*?---\n?/, "");
+  let text = stripLeadingFrontmatter(body).body;
   text = text.replace(/^#{1,6}\s+.*/gm, "");
   return text.replace(/\n{3,}/g, "\n\n").trim();
 }

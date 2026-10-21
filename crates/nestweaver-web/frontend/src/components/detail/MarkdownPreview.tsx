@@ -2,6 +2,7 @@ import { createElement, useMemo } from "react";
 import Markdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Heading } from "../../api/types";
+import { stripLeadingFrontmatter } from "./stripFrontmatter";
 
 interface MarkdownPreviewProps {
   body: string;
@@ -49,6 +50,7 @@ function remarkWikilinks() {
 }
 
 export function MarkdownPreview({ body, headings = [], onWikilink }: MarkdownPreviewProps) {
+  const { body: markdown, lineOffset } = stripLeadingFrontmatter(body);
   // Stable component types keep a focused heading mounted when navigation is consumed.
   const components = useMemo(() => {
     const components: Components = {
@@ -66,14 +68,17 @@ export function MarkdownPreview({ body, headings = [], onWikilink }: MarkdownPre
     };
     for (const tag of ["h1", "h2", "h3", "h4", "h5", "h6"] as const) {
       components[tag] = ({ node, children }) => {
-        const heading = headings.find((h) => h.start_line === node?.position?.start.line);
+        const renderedLine = node?.position?.start.line;
+        const heading = renderedLine == null
+          ? undefined
+          : headings.find((h) => h.start_line === renderedLine + lineOffset);
         return createElement(tag, { tabIndex: heading ? -1 : undefined,
           "data-heading-uid": heading?.uid, id: heading?.slug }, children);
       };
     }
     return components;
-  }, [headings, onWikilink]);
+  }, [headings, lineOffset, onWikilink]);
   return <div className="prose prose-sm min-w-0 max-w-none break-words text-[var(--color-text)]">
-    <Markdown remarkPlugins={[remarkGfm, remarkWikilinks]} components={components}>{body}</Markdown>
+    <Markdown remarkPlugins={[remarkGfm, remarkWikilinks]} components={components}>{markdown}</Markdown>
   </div>;
 }

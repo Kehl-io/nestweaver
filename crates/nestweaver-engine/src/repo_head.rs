@@ -19,10 +19,10 @@
 
 /// The HEAD sha of a local working tree, or `None` if it cannot be read.
 pub fn local_head(repo_path: &str) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["-C", repo_path, "rev-parse", "HEAD"])
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new("git");
+    command.args(["-C", repo_path, "rev-parse", "HEAD"]);
+    let output =
+        crate::git_cmd::run_git_with_timeout(command, std::time::Duration::from_secs(15)).ok()?;
     output
         .status
         .success()
@@ -100,11 +100,12 @@ pub fn current_head(local_missing: bool, local_root: Option<&str>, url: &str) ->
 /// because the caller only asks when HEAD already differs from the indexed
 /// SHA: a zero there is a contradiction, not an answer (nw-256).
 pub fn commits_between(repo_path: &str, from_sha: &str, to_sha: &str) -> Option<u64> {
-    let output = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
         .args(["-C", repo_path, "rev-list", "--count"])
-        .arg(format!("{from_sha}..{to_sha}"))
-        .output()
-        .ok()?;
+        .arg(format!("{from_sha}..{to_sha}"));
+    let output =
+        crate::git_cmd::run_git_with_timeout(command, std::time::Duration::from_secs(15)).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -117,6 +118,51 @@ pub fn commits_between(repo_path: &str, from_sha: &str, to_sha: &str) -> Option<
 /// countable.
 pub fn is_full_sha(value: &str) -> bool {
     value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// The commit distance `stale-check` publishes for one repo.
+///
+/// `current_head` is already resolved. Counting runs only when that HEAD
+/// differs from a full indexed SHA inside a local working tree. `None` is a
+/// failed `git rev-list` (uncountable). Every other case keeps the stored
+/// counter, including a real zero when HEAD and the indexed SHA match.
+pub fn commits_behind(
+    current_head: Option<&str>,
+    local_root: Option<&str>,
+    indexed_sha: &str,
+    stored: u32,
+) -> Option<u64> {
+    match (current_head, local_root) {
+        (Some(head), Some(path)) if is_full_sha(indexed_sha) && head != indexed_sha => {
+            commits_between(path, indexed_sha, head)
+        }
+        _ => Some(u64::from(stored)),
+    }
+}
+
+/// The commit distance `list-repos` publishes for one repo.
+///
+/// Same decision as [`commits_behind`], using the local HEAD `stale-check`
+/// reads for a working tree. A remote-only row is not probed: without a
+/// working tree `rev-list` cannot run, and `stale-check` keeps the stored
+/// counter there too.
+pub fn listing_commits_behind(repo: &nestweaver_schema::Repo) -> Option<u64> {
+    let Some(path) = repo.local_root() else {
+        return Some(u64::from(repo.staleness_commits_behind));
+    };
+    // A missing tree is the stored leftover, same as `commits_behind`. An
+    // existing tree whose HEAD cannot be read is uncountable: returning the
+    // stored 0 would say "current" while `stale-check` says unknown.
+    if !std::path::Path::new(path).exists() {
+        return Some(u64::from(repo.staleness_commits_behind));
+    }
+    let head = local_head(path)?;
+    commits_behind(
+        Some(&head),
+        Some(path),
+        &repo.indexed_sha,
+        repo.staleness_commits_behind,
+    )
 }
 
 #[cfg(test)]
@@ -224,6 +270,111 @@ mod tests {
             commits_between(repo.to_str().unwrap(), &"0".repeat(40), &head),
             None,
             "an unreachable range cannot be counted, and must not be reported as 0"
+        );
+    }
+
+    /// `list-repos` used to emit the stored `staleness_commits_behind` column.
+    /// That column stays 0 after HEAD moves, while `stale-check` counts
+    /// `indexed..HEAD`. Both surfaces must report that live distance, and a
+    /// repo whose indexed SHA is still HEAD must stay 0.
+    #[test]
+    fn list_repos_commits_behind_matches_stale_check_when_head_is_ahead() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir(&repo_dir).unwrap();
+        git(&repo_dir, &["init"]);
+        git(&repo_dir, &["config", "user.email", "t@t.com"]);
+        git(&repo_dir, &["config", "user.name", "T"]);
+        git(&repo_dir, &["commit", "--allow-empty", "-m", "indexed"]);
+        let path = repo_dir.to_str().unwrap();
+        let indexed = local_head(path).expect("indexed HEAD");
+
+        for message in ["two", "three", "four", "five"] {
+            git(&repo_dir, &["commit", "--allow-empty", "-m", message]);
+        }
+        let head = local_head(path).expect("moved HEAD");
+        assert_ne!(
+            indexed, head,
+            "the fixture must move HEAD past the indexed SHA"
+        );
+
+        let ahead = nestweaver_schema::Repo {
+            uid: "repo:ahead".to_string(),
+            url: format!("file://{path}"),
+            indexed_sha: indexed.clone(),
+            staleness_commits_behind: 0,
+            instance_id: "test".to_string(),
+            name: None,
+            root_path: Some(path.to_string()),
+        };
+        let current = nestweaver_schema::Repo {
+            uid: "repo:current".to_string(),
+            url: format!("file://{path}"),
+            indexed_sha: head.clone(),
+            staleness_commits_behind: 0,
+            instance_id: "test".to_string(),
+            name: None,
+            root_path: Some(path.to_string()),
+        };
+
+        let stale_check_ahead = commits_behind(Some(&head), Some(path), &indexed, 0);
+        let stale_check_current = commits_behind(Some(&head), Some(path), &head, 0);
+        assert_eq!(stale_check_ahead, Some(4));
+        assert_eq!(stale_check_current, Some(0));
+
+        let listed = crate::repos_json_with_display_name(&[ahead, current]);
+        let rows = listed.as_array().expect("list-repos rows");
+        assert_eq!(
+            rows[0]["staleness_commits_behind"].as_u64(),
+            stale_check_ahead,
+            "list-repos must publish the live distance, not the stored 0"
+        );
+        assert_eq!(
+            rows[1]["staleness_commits_behind"].as_u64(),
+            stale_check_current,
+            "a repo indexed at HEAD stays 0 in both commands"
+        );
+        assert_eq!(
+            rows[0]["staleness_commits_behind_uncountable"],
+            serde_json::json!(false)
+        );
+    }
+
+    /// A failed `rev-list` used to leave the stored 0 in place, so list-repos
+    /// read as current while stale-check read as unknown.
+    #[test]
+    fn list_repos_names_an_uncountable_distance_instead_of_a_stored_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir(&repo_dir).unwrap();
+        git(&repo_dir, &["init"]);
+        git(&repo_dir, &["config", "user.email", "t@t.com"]);
+        git(&repo_dir, &["config", "user.name", "T"]);
+        git(&repo_dir, &["commit", "--allow-empty", "-m", "indexed"]);
+        let path = repo_dir.to_str().unwrap();
+        let head = local_head(path).expect("HEAD");
+        let repo = nestweaver_schema::Repo {
+            uid: "repo:uncountable".to_string(),
+            url: format!("file://{path}"),
+            indexed_sha: "0".repeat(40),
+            staleness_commits_behind: 0,
+            instance_id: "test".to_string(),
+            name: None,
+            root_path: Some(path.to_string()),
+        };
+        assert_ne!(repo.indexed_sha, head);
+        assert_eq!(
+            listing_commits_behind(&repo),
+            None,
+            "an unreachable indexed sha cannot be counted"
+        );
+        let listed = crate::repos_json_with_display_name(&[repo]);
+        let row = &listed.as_array().expect("rows")[0];
+        assert_eq!(row["staleness_commits_behind"], 0);
+        assert_eq!(
+            row["staleness_commits_behind_uncountable"],
+            serde_json::json!(true),
+            "a stored 0 must be marked uncountable: {row}"
         );
     }
 }

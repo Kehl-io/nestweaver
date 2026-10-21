@@ -5,7 +5,7 @@
 //! headings, sections, wikilinks, or PPR integration yet — those land in
 //! later phases.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -478,14 +478,30 @@ pub struct NearLimitNote {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SkippedNotesSidecar {
     pub version: u32,
-    #[serde(default)]
-    pub skipped: Vec<SkippedFile>,
-    #[serde(default)]
-    pub notes_near_size_limit: Vec<NearLimitNote>,
-    #[serde(default)]
-    pub skipped_truncated: bool,
-    #[serde(default)]
-    pub near_limit_truncated: bool,
+    /// Per vault root (absolute path), that vault's skipped rows. Paths inside
+    /// a row stay vault-relative, except mirrored reconciliation debt, which
+    /// is already absolute. One vault's full refresh replaces only its key;
+    /// [`skipped_notes_status_json`] merges every vault. A v1 sidecar stored
+    /// one flat list for the whole database. Those rows name no vault, so
+    /// load keeps them under [`LEGACY_UNATTRIBUTED_VAULT_KEY`] until a full
+    /// vault index rewrites the file.
+    #[serde(default, deserialize_with = "deserialize_vault_keyed_rows")]
+    pub skipped: BTreeMap<String, Vec<SkippedFile>>,
+    /// Per vault root, notes still indexed but larger than half the configured
+    /// limit. Same keying and status merge as [`Self::skipped`].
+    #[serde(default, deserialize_with = "deserialize_vault_keyed_rows")]
+    pub notes_near_size_limit: BTreeMap<String, Vec<NearLimitNote>>,
+    /// Per vault root, whether that vault's skipped rows ran past
+    /// [`SKIPPED_NOTES_LIST_CAP`] on the write that replaced them. An
+    /// incremental merge only reloads the capped survivors, so it keeps the
+    /// stored bit. [`skipped_notes_status_json`] ORs every vault. A
+    /// database-wide `true` is kept on [`LEGACY_UNATTRIBUTED_VAULT_KEY`] so
+    /// status still reports truncation. `false` names no truncated vault.
+    #[serde(default, deserialize_with = "deserialize_truncation_bits")]
+    pub skipped_truncated: BTreeMap<String, bool>,
+    /// Per vault root, the near-size twin of [`Self::skipped_truncated`].
+    #[serde(default, deserialize_with = "deserialize_truncation_bits")]
+    pub near_limit_truncated: BTreeMap<String, bool>,
     /// nw-653: ABSOLUTE path -> whole-second mtime of each eligible note an
     /// index attempt could not ingest (binary, unreadable, unparseable). The
     /// watcher's startup reconciliation skips a missing note whose mtime still
@@ -521,13 +537,87 @@ impl Default for SkippedNotesSidecar {
     fn default() -> Self {
         Self {
             version: SKIPPED_NOTES_SIDECAR_VERSION,
-            skipped: Vec::new(),
-            notes_near_size_limit: Vec::new(),
-            skipped_truncated: false,
-            near_limit_truncated: false,
+            skipped: BTreeMap::new(),
+            notes_near_size_limit: BTreeMap::new(),
+            skipped_truncated: BTreeMap::new(),
+            near_limit_truncated: BTreeMap::new(),
             unindexable_mtimes: std::collections::BTreeMap::new(),
             reconciliation_pending: std::collections::BTreeMap::new(),
             frontmatter_unparsed: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+impl SkippedNotesSidecar {
+    /// Every vault's skipped rows, vault-root order. Owed reconciliation rows
+    /// stay ahead of that vault's other rows.
+    pub(crate) fn merged_skipped(&self) -> Vec<SkippedFile> {
+        self.skipped.values().flatten().cloned().collect()
+    }
+
+    /// Every vault's near-size rows, vault-root order.
+    pub(crate) fn merged_near(&self) -> Vec<NearLimitNote> {
+        self.notes_near_size_limit
+            .values()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+}
+
+/// Rows from a v1 sidecar that named no vault. Not a filesystem path, so it
+/// cannot collide with a vault root. A full index of any vault drops it.
+const LEGACY_UNATTRIBUTED_VAULT_KEY: &str = "\u{0}legacy-unattributed";
+
+/// Accept a per-vault object or a v1 flat list. The flat list is kept under
+/// [`LEGACY_UNATTRIBUTED_VAULT_KEY`] so status still discloses it.
+fn deserialize_vault_keyed_rows<'de, D, T>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Vec<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum VaultKeyedOrFlat<T> {
+        Keyed(BTreeMap<String, Vec<T>>),
+        Flat(Vec<T>),
+    }
+
+    match <VaultKeyedOrFlat<T> as serde::Deserialize>::deserialize(deserializer)? {
+        VaultKeyedOrFlat::Keyed(rows) => Ok(rows),
+        VaultKeyedOrFlat::Flat(rows) => {
+            let mut keyed = BTreeMap::new();
+            if !rows.is_empty() {
+                keyed.insert(LEGACY_UNATTRIBUTED_VAULT_KEY.to_string(), rows);
+            }
+            Ok(keyed)
+        }
+    }
+}
+
+/// A per-vault map, or the previous database-wide bool. `true` stays visible
+/// as truncation until a full index replaces the sidecar.
+fn deserialize_truncation_bits<'de, D>(deserializer: D) -> Result<BTreeMap<String, bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum StoredBits {
+        PerVault(BTreeMap<String, bool>),
+        DatabaseWide(bool),
+    }
+
+    match <StoredBits as serde::Deserialize>::deserialize(deserializer)? {
+        StoredBits::PerVault(bits) => Ok(bits),
+        StoredBits::DatabaseWide(database_wide) => {
+            let mut bits = BTreeMap::new();
+            if database_wide {
+                bits.insert(LEGACY_UNATTRIBUTED_VAULT_KEY.to_string(), true);
+            }
+            Ok(bits)
         }
     }
 }
@@ -550,12 +640,6 @@ pub fn filesystem_vault_reader(
     limits: crate::index_limits::NoteLimits,
 ) -> crate::content_reader::FilesystemReader {
     filesystem_note_reader(root, limits)
-}
-
-fn cap_sidecar_list<T>(mut items: Vec<T>) -> (Vec<T>, bool) {
-    let truncated = items.len() > SKIPPED_NOTES_LIST_CAP;
-    items.truncate(SKIPPED_NOTES_LIST_CAP);
-    (items, truncated)
 }
 
 fn near_limit_threshold(limit_bytes: u64) -> u64 {
@@ -584,45 +668,121 @@ fn maybe_near_limit(path: &str, size: u64, limit_bytes: u64) -> Option<NearLimit
     }
 }
 
+fn vault_sidecar_key(vault_root: &Path) -> String {
+    vault_root.to_string_lossy().into_owned()
+}
+
+fn insert_vault_rows<T>(map: &mut BTreeMap<String, Vec<T>>, key: String, rows: Vec<T>) {
+    if rows.is_empty() {
+        map.remove(&key);
+    } else {
+        map.insert(key, rows);
+    }
+}
+
+/// nw-653: owed reconciliation entries go FIRST in that vault's list, so the
+/// cap never cuts them; any stale mirror of them is replaced.
+/// nw-664 review: only VAULT debt is mirrored. The code watcher's rows stay
+/// under `reconciliation_pending` and are not "skipped notes".
+fn merge_reconciliation_into_skipped(
+    skipped: &mut BTreeMap<String, Vec<SkippedFile>>,
+    reconciliation_pending: &BTreeMap<String, Vec<SkippedFile>>,
+) {
+    let mut keys: Vec<String> = skipped.keys().cloned().collect();
+    for key in reconciliation_pending.keys() {
+        if !is_code_watch_key(key) {
+            keys.push(key.clone());
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    for key in keys {
+        let owed = reconciliation_pending
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        let mut rest = skipped.remove(&key).unwrap_or_default();
+        {
+            let owed_paths: HashSet<&str> = owed.iter().map(|file| file.path.as_str()).collect();
+            rest.retain(|file| {
+                !file.reason.starts_with(WATCH_RECONCILIATION_PENDING_REASON)
+                    && !owed_paths.contains(file.path.as_str())
+            });
+        }
+        rest.sort_by(|a, b| a.path.cmp(&b.path));
+        rest.dedup_by(|a, b| a.path == b.path);
+        let mut rows = owed;
+        rows.append(&mut rest);
+        insert_vault_rows(skipped, key, rows);
+    }
+}
+
+fn truncate_vault_rows<T>(map: &mut BTreeMap<String, Vec<T>>) {
+    for rows in map.values_mut() {
+        if rows.len() > SKIPPED_NOTES_LIST_CAP {
+            rows.truncate(SKIPPED_NOTES_LIST_CAP);
+        }
+    }
+    map.retain(|_, rows| !rows.is_empty());
+}
+
+/// Record truncation from each vault's pre-cap length. `authoritative` is the
+/// one vault this write re-derived in full: its bit follows that length and
+/// can clear. Every other vault keeps its stored bit unless the rows this
+/// write actually holds still run past the cap. An incremental merge that
+/// only reloads the capped survivors never clears.
+fn apply_truncation_bits<T>(
+    bits: &mut BTreeMap<String, bool>,
+    rows: &BTreeMap<String, Vec<T>>,
+    authoritative: Option<&str>,
+) {
+    if let Some(key) = authoritative {
+        let over = rows
+            .get(key)
+            .is_some_and(|vault_rows| vault_rows.len() > SKIPPED_NOTES_LIST_CAP);
+        if over {
+            bits.insert(key.to_string(), true);
+        } else {
+            bits.remove(key);
+        }
+    }
+    for (key, vault_rows) in rows {
+        if vault_rows.len() > SKIPPED_NOTES_LIST_CAP {
+            bits.insert(key.clone(), true);
+        }
+    }
+}
+
+fn any_truncation_bit(bits: &BTreeMap<String, bool>) -> bool {
+    bits.values().any(|bit| *bit)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_skipped_notes_sidecar(
-    skipped: &[SkippedFile],
-    near: &[NearLimitNote],
+    mut skipped: BTreeMap<String, Vec<SkippedFile>>,
+    mut near: BTreeMap<String, Vec<NearLimitNote>>,
     unindexable_mtimes: std::collections::BTreeMap<String, String>,
     reconciliation_pending: std::collections::BTreeMap<String, Vec<SkippedFile>>,
     // nw-585: a parameter rather than a default, so no writer of this shared
     // sidecar can rebuild it and silently drop another route's disclosure.
     frontmatter_unparsed: std::collections::BTreeMap<String, String>,
+    mut skipped_truncated: BTreeMap<String, bool>,
+    mut near_limit_truncated: BTreeMap<String, bool>,
+    authoritative_vault: Option<&str>,
 ) -> SkippedNotesSidecar {
-    // nw-653: owed reconciliation entries go FIRST, so the cap never cuts
-    // them; any stale mirror of them in `skipped` is replaced.
-    // nw-664 review: only VAULT debt is mirrored into the skipped-NOTES
-    // list; the code watcher's (source files, a repo root) is reported under
-    // `reconciliation_pending` alone rather than as "skipped notes".
-    let vault_owed = || {
-        reconciliation_pending
-            .iter()
-            .filter(|(key, _)| !is_code_watch_key(key))
-            .flat_map(|(_, files)| files)
-    };
-    let owed: HashSet<&str> = vault_owed().map(|file| file.path.as_str()).collect();
-    let skipped: Vec<SkippedFile> = vault_owed()
-        .cloned()
-        .chain(
-            skipped
-                .iter()
-                .filter(|file| {
-                    !file.reason.starts_with(WATCH_RECONCILIATION_PENDING_REASON)
-                        && !owed.contains(file.path.as_str())
-                })
-                .cloned(),
-        )
-        .collect();
-    let (skipped, skipped_truncated) = cap_sidecar_list(skipped);
-    let (notes_near_size_limit, near_limit_truncated) = cap_sidecar_list(near.to_vec());
+    merge_reconciliation_into_skipped(&mut skipped, &reconciliation_pending);
+    apply_truncation_bits(&mut skipped_truncated, &skipped, authoritative_vault);
+    truncate_vault_rows(&mut skipped);
+    for rows in near.values_mut() {
+        rows.sort_by(|a, b| a.path.cmp(&b.path));
+        rows.dedup_by(|a, b| a.path == b.path);
+    }
+    apply_truncation_bits(&mut near_limit_truncated, &near, authoritative_vault);
+    truncate_vault_rows(&mut near);
     SkippedNotesSidecar {
         version: SKIPPED_NOTES_SIDECAR_VERSION,
         skipped,
-        notes_near_size_limit,
+        notes_near_size_limit: near,
         skipped_truncated,
         near_limit_truncated,
         unindexable_mtimes,
@@ -743,19 +903,45 @@ fn persist_skipped_notes_replace(
     // A full index re-derives this vault's failures; other vaults' entries
     // are not its to drop, and owed watcher reconciliation is the watcher's
     // to clear.
-    update_skipped_notes_sidecar(db_path, |existing| {
-        let mut unindexable = existing.unindexable_mtimes;
-        unindexable.retain(|path, _| !Path::new(path).starts_with(vault_root));
-        record_ingest_failures(&mut unindexable, vault_root, skipped);
-        let mut frontmatter = existing.frontmatter_unparsed;
-        frontmatter.retain(|path, _| !Path::new(path).starts_with(vault_root));
-        record_frontmatter_unparsed(&mut frontmatter, vault_root, frontmatter_unparsed);
+    let key = vault_sidecar_key(vault_root);
+    update_skipped_notes_sidecar(db_path, |mut existing| {
+        existing.skipped.remove(LEGACY_UNATTRIBUTED_VAULT_KEY);
+        existing
+            .notes_near_size_limit
+            .remove(LEGACY_UNATTRIBUTED_VAULT_KEY);
+        existing
+            .skipped_truncated
+            .remove(LEGACY_UNATTRIBUTED_VAULT_KEY);
+        existing
+            .near_limit_truncated
+            .remove(LEGACY_UNATTRIBUTED_VAULT_KEY);
+        existing
+            .unindexable_mtimes
+            .retain(|path, _| !Path::new(path).starts_with(vault_root));
+        record_ingest_failures(&mut existing.unindexable_mtimes, vault_root, skipped);
+        existing
+            .frontmatter_unparsed
+            .retain(|path, _| !Path::new(path).starts_with(vault_root));
+        record_frontmatter_unparsed(
+            &mut existing.frontmatter_unparsed,
+            vault_root,
+            frontmatter_unparsed,
+        );
+        insert_vault_rows(&mut existing.skipped, key.clone(), skipped.to_vec());
+        insert_vault_rows(
+            &mut existing.notes_near_size_limit,
+            key.clone(),
+            near.to_vec(),
+        );
         Some(build_skipped_notes_sidecar(
-            skipped,
-            near,
-            unindexable,
+            existing.skipped,
+            existing.notes_near_size_limit,
+            existing.unindexable_mtimes,
             existing.reconciliation_pending,
-            frontmatter,
+            existing.frontmatter_unparsed,
+            existing.skipped_truncated,
+            existing.near_limit_truncated,
+            Some(&key),
         ))
     });
 }
@@ -803,43 +989,42 @@ fn persist_skipped_notes_merge(
         // walk produces (an unreadable or pruned directory, an ignore file it
         // could not apply) is in `skipped` again when it still holds. Keeping the
         // old ones kept a directory "unreadable" in `brain status` after its
-        // permissions were fixed, until the next full index.
-        sidecar.skipped.retain(|file| {
+        // permissions were fixed, until the next full index. Only this vault's
+        // key is edited; another vault's rows share the file and stay.
+        let key = vault_sidecar_key(vault_root);
+        let mut skipped_rows = sidecar.skipped.remove(&key).unwrap_or_default();
+        skipped_rows.retain(|file| {
             !touched.contains(file.path.as_str())
                 && !is_walk_row(vault_root, file)
                 && !is_replaced_symlink_row(vault_root, file)
         });
-        sidecar
+        skipped_rows.extend(skipped.iter().cloned());
+        insert_vault_rows(&mut sidecar.skipped, key.clone(), skipped_rows);
+        let mut near_rows = sidecar
             .notes_near_size_limit
-            .retain(|note| !touched.contains(note.path.as_str()));
-        sidecar.skipped.extend(skipped.iter().cloned());
-        sidecar.notes_near_size_limit.extend(near.iter().cloned());
-        sidecar.skipped.sort_by(|a, b| a.path.cmp(&b.path));
-        sidecar.skipped.dedup_by(|a, b| a.path == b.path);
-        sidecar
-            .notes_near_size_limit
-            .sort_by(|a, b| a.path.cmp(&b.path));
-        sidecar
-            .notes_near_size_limit
-            .dedup_by(|a, b| a.path == b.path);
-        let rebuilt = build_skipped_notes_sidecar(
-            &sidecar.skipped,
-            &sidecar.notes_near_size_limit,
+            .remove(&key)
+            .unwrap_or_default();
+        near_rows.retain(|note| !touched.contains(note.path.as_str()));
+        near_rows.extend(near.iter().cloned());
+        insert_vault_rows(&mut sidecar.notes_near_size_limit, key, near_rows);
+        Some(build_skipped_notes_sidecar(
+            sidecar.skipped,
+            sidecar.notes_near_size_limit,
             sidecar.unindexable_mtimes,
             sidecar.reconciliation_pending,
             sidecar.frontmatter_unparsed,
-        );
-        Some(rebuilt)
+            sidecar.skipped_truncated,
+            sidecar.near_limit_truncated,
+            None,
+        ))
     });
 }
 
 /// Whether a sidecar row came from the vault WALK rather than from reading a
 /// note: `.` (an unplaced walk error), a path that is a directory in this
-/// vault, or an ignore-file row. Judged against THIS vault's disk, because
-/// `skipped` holds vault-relative paths for every vault in the database: a
-/// directory row of another vault survives unless this vault has a directory
-/// at the same path. (A directory that has since been DELETED is not
-/// recognised and keeps its row until the next full index.)
+/// vault, or an ignore-file row. Called with this vault's own rows. (A
+/// directory that has since been DELETED is not recognised and keeps its row
+/// until the next full index.)
 fn is_walk_row(vault_root: &Path, file: &SkippedFile) -> bool {
     // A symlink row is not a walk row even when the link resolves to a
     // directory: an incremental watcher batch does not re-walk, so dropping
@@ -871,24 +1056,34 @@ fn is_replaced_symlink_row(vault_root: &Path, file: &SkippedFile) -> bool {
 
 /// Drop the symlink rows at `paths` (vault-relative): watcher events showed
 /// no symlink there any more.
-fn forget_symlink_rows(db_path: Option<&Path>, paths: &[String]) {
+fn forget_symlink_rows(db_path: Option<&Path>, vault_root: &Path, paths: &[String]) {
     let Some(db_path) = db_path.filter(|_| !paths.is_empty()) else {
         return;
     };
+    let key = vault_sidecar_key(vault_root);
     update_skipped_notes_sidecar(db_path, |mut sidecar| {
-        let before = sidecar.skipped.len();
-        sidecar
-            .skipped
-            .retain(|file| !(is_symlink_row(file) && paths.contains(&file.path)));
-        (sidecar.skipped.len() != before).then(|| {
-            build_skipped_notes_sidecar(
-                &sidecar.skipped,
-                &sidecar.notes_near_size_limit,
-                sidecar.unindexable_mtimes,
-                sidecar.reconciliation_pending,
-                sidecar.frontmatter_unparsed,
-            )
-        })
+        let remove_key = {
+            let rows = sidecar.skipped.get_mut(&key)?;
+            let before = rows.len();
+            rows.retain(|file| !(is_symlink_row(file) && paths.contains(&file.path)));
+            if rows.len() == before {
+                return None;
+            }
+            rows.is_empty()
+        };
+        if remove_key {
+            sidecar.skipped.remove(&key);
+        }
+        Some(build_skipped_notes_sidecar(
+            sidecar.skipped,
+            sidecar.notes_near_size_limit,
+            sidecar.unindexable_mtimes,
+            sidecar.reconciliation_pending,
+            sidecar.frontmatter_unparsed,
+            sidecar.skipped_truncated,
+            sidecar.near_limit_truncated,
+            None,
+        ))
     });
 }
 
@@ -1001,18 +1196,23 @@ pub(crate) fn disclose_unwatchable_vault_dirs(
     if rows.is_empty() {
         return;
     }
+    let key = vault_sidecar_key(vault_root);
     update_skipped_notes_sidecar(db_path, |mut sidecar| {
-        sidecar
-            .skipped
-            .retain(|file| !rows.iter().any(|row| row.path == file.path));
-        sidecar.skipped.extend(rows.iter().cloned());
-        sidecar.skipped.sort_by(|a, b| a.path.cmp(&b.path));
+        {
+            let entry = sidecar.skipped.entry(key).or_default();
+            entry.retain(|file| !rows.iter().any(|row| row.path == file.path));
+            entry.extend(rows.iter().cloned());
+            entry.sort_by(|a, b| a.path.cmp(&b.path));
+        }
         Some(build_skipped_notes_sidecar(
-            &sidecar.skipped,
-            &sidecar.notes_near_size_limit,
+            sidecar.skipped,
+            sidecar.notes_near_size_limit,
             sidecar.unindexable_mtimes,
             sidecar.reconciliation_pending,
             sidecar.frontmatter_unparsed,
+            sidecar.skipped_truncated,
+            sidecar.near_limit_truncated,
+            None,
         ))
     });
 }
@@ -1086,11 +1286,14 @@ pub(crate) fn record_vault_owed_paths(
         owed.sort_by(|a, b| a.path.cmp(&b.path));
         sidecar.reconciliation_pending.insert(key, owed);
         Some(build_skipped_notes_sidecar(
-            &sidecar.skipped,
-            &sidecar.notes_near_size_limit,
+            sidecar.skipped,
+            sidecar.notes_near_size_limit,
             sidecar.unindexable_mtimes,
             sidecar.reconciliation_pending,
             sidecar.frontmatter_unparsed,
+            sidecar.skipped_truncated,
+            sidecar.near_limit_truncated,
+            None,
         ))
     });
 }
@@ -1142,11 +1345,14 @@ pub(crate) fn record_vault_wikilink_debt(
         sidecar.reconciliation_pending.insert(key, owed);
         changed.then(|| {
             build_skipped_notes_sidecar(
-                &sidecar.skipped,
-                &sidecar.notes_near_size_limit,
+                sidecar.skipped,
+                sidecar.notes_near_size_limit,
                 sidecar.unindexable_mtimes,
                 sidecar.reconciliation_pending,
                 sidecar.frontmatter_unparsed,
+                sidecar.skipped_truncated,
+                sidecar.near_limit_truncated,
+                None,
             )
         })
     });
@@ -1183,11 +1389,14 @@ pub(crate) fn clear_vault_wikilink_debt(
             sidecar.reconciliation_pending.remove(&key);
         }
         Some(build_skipped_notes_sidecar(
-            &sidecar.skipped,
-            &sidecar.notes_near_size_limit,
+            sidecar.skipped,
+            sidecar.notes_near_size_limit,
             sidecar.unindexable_mtimes,
             sidecar.reconciliation_pending,
             sidecar.frontmatter_unparsed,
+            sidecar.skipped_truncated,
+            sidecar.near_limit_truncated,
+            None,
         ))
     });
 }
@@ -1242,11 +1451,14 @@ pub(crate) fn record_code_unwatched_dirs(
             sidecar.reconciliation_pending.insert(key, kept);
         }
         Some(build_skipped_notes_sidecar(
-            &sidecar.skipped,
-            &sidecar.notes_near_size_limit,
+            sidecar.skipped,
+            sidecar.notes_near_size_limit,
             sidecar.unindexable_mtimes,
             sidecar.reconciliation_pending,
             sidecar.frontmatter_unparsed,
+            sidecar.skipped_truncated,
+            sidecar.near_limit_truncated,
+            None,
         ))
     });
 }
@@ -1261,11 +1473,14 @@ fn replace_reconciliation_debt(db_path: &Path, key: String, mut owed: Vec<Skippe
             sidecar.reconciliation_pending.insert(key, owed);
         }
         Some(build_skipped_notes_sidecar(
-            &sidecar.skipped,
-            &sidecar.notes_near_size_limit,
+            sidecar.skipped,
+            sidecar.notes_near_size_limit,
             sidecar.unindexable_mtimes,
             sidecar.reconciliation_pending,
             sidecar.frontmatter_unparsed,
+            sidecar.skipped_truncated,
+            sidecar.near_limit_truncated,
+            None,
         ))
     });
 }
@@ -1311,11 +1526,14 @@ fn clear_reconciliation_paths(db_path: &Path, key: String, paths: &[PathBuf]) {
             sidecar.reconciliation_pending.remove(&key);
         }
         Some(build_skipped_notes_sidecar(
-            &sidecar.skipped,
-            &sidecar.notes_near_size_limit,
+            sidecar.skipped,
+            sidecar.notes_near_size_limit,
             sidecar.unindexable_mtimes,
             sidecar.reconciliation_pending,
             sidecar.frontmatter_unparsed,
+            sidecar.skipped_truncated,
+            sidecar.near_limit_truncated,
+            None,
         ))
     });
 }
@@ -1375,39 +1593,78 @@ pub(crate) fn record_code_unindexable_stamps(
             return None;
         }
         Some(build_skipped_notes_sidecar(
-            &sidecar.skipped,
-            &sidecar.notes_near_size_limit,
+            sidecar.skipped,
+            sidecar.notes_near_size_limit,
             sidecar.unindexable_mtimes,
             sidecar.reconciliation_pending,
             sidecar.frontmatter_unparsed,
+            sidecar.skipped_truncated,
+            sidecar.near_limit_truncated,
+            None,
         ))
     });
 }
 
 /// nw-653 review: forget a REMOVED vault's entries in the shared sidecar —
-/// its owed startup reconciliation and its unindexable-note mtimes (both
-/// keyed by absolute path, so they are unambiguously this vault's). Without
-/// this, `brain status` reported debt for a vault that no longer exists,
-/// forever: only that vault's watcher clears it. Other vaults' entries are
-/// untouched. Called by the daemon's `remove_vault` and `prune_stale`.
+/// its owed startup reconciliation, its unindexable-note mtimes, and its
+/// skipped and near-size rows. The maps are keyed by absolute vault root, so
+/// they are unambiguously this vault's. Without this, `brain status` reported
+/// debt and size disclosure for a vault that no longer exists. Other vaults'
+/// entries are untouched. Called by the daemon's `remove_vault` and
+/// `prune_stale`.
 pub fn forget_vault_skipped_notes(db_path: &Path, vault_root: &Path) {
-    update_skipped_notes_sidecar(db_path, |sidecar| {
-        let mut pending = sidecar.reconciliation_pending;
-        let mut unindexable = sidecar.unindexable_mtimes;
-        let mut frontmatter = sidecar.frontmatter_unparsed;
-        let before = (pending.len(), unindexable.len(), frontmatter.len());
-        pending.retain(|root, _| Path::new(root) != vault_root);
-        unindexable.retain(|path, _| !Path::new(path).starts_with(vault_root));
-        frontmatter.retain(|path, _| !Path::new(path).starts_with(vault_root));
-        if (pending.len(), unindexable.len(), frontmatter.len()) == before {
+    update_skipped_notes_sidecar(db_path, |mut sidecar| {
+        let before = (
+            sidecar.reconciliation_pending.len(),
+            sidecar.unindexable_mtimes.len(),
+            sidecar.frontmatter_unparsed.len(),
+            sidecar.skipped.len(),
+            sidecar.notes_near_size_limit.len(),
+            sidecar.skipped_truncated.len(),
+            sidecar.near_limit_truncated.len(),
+        );
+        sidecar
+            .reconciliation_pending
+            .retain(|root, _| Path::new(root) != vault_root);
+        sidecar
+            .unindexable_mtimes
+            .retain(|path, _| !Path::new(path).starts_with(vault_root));
+        sidecar
+            .frontmatter_unparsed
+            .retain(|path, _| !Path::new(path).starts_with(vault_root));
+        sidecar
+            .skipped
+            .retain(|root, _| Path::new(root) != vault_root);
+        sidecar
+            .notes_near_size_limit
+            .retain(|root, _| Path::new(root) != vault_root);
+        sidecar
+            .skipped_truncated
+            .retain(|root, _| Path::new(root) != vault_root);
+        sidecar
+            .near_limit_truncated
+            .retain(|root, _| Path::new(root) != vault_root);
+        let after = (
+            sidecar.reconciliation_pending.len(),
+            sidecar.unindexable_mtimes.len(),
+            sidecar.frontmatter_unparsed.len(),
+            sidecar.skipped.len(),
+            sidecar.notes_near_size_limit.len(),
+            sidecar.skipped_truncated.len(),
+            sidecar.near_limit_truncated.len(),
+        );
+        if after == before {
             return None;
         }
         Some(build_skipped_notes_sidecar(
-            &sidecar.skipped,
-            &sidecar.notes_near_size_limit,
-            unindexable,
-            pending,
-            frontmatter,
+            sidecar.skipped,
+            sidecar.notes_near_size_limit,
+            sidecar.unindexable_mtimes,
+            sidecar.reconciliation_pending,
+            sidecar.frontmatter_unparsed,
+            sidecar.skipped_truncated,
+            sidecar.near_limit_truncated,
+            None,
         ))
     });
 }
@@ -1430,11 +1687,14 @@ pub fn forget_repo_watch_state(db_path: &Path, repo_root: &Path) {
             return None;
         }
         Some(build_skipped_notes_sidecar(
-            &sidecar.skipped,
-            &sidecar.notes_near_size_limit,
+            sidecar.skipped,
+            sidecar.notes_near_size_limit,
             unindexable,
             pending,
             sidecar.frontmatter_unparsed,
+            sidecar.skipped_truncated,
+            sidecar.near_limit_truncated,
+            None,
         ))
     });
 }
@@ -1456,6 +1716,8 @@ pub const RECONCILIATION_PENDING_STATUS_NOTES: usize = 10;
 /// Shape consumed by `brain_status` / `brain_status_json`. Never walks the vault.
 pub fn skipped_notes_status_json(db_path: Option<&Path>) -> (serde_json::Value, serde_json::Value) {
     let sidecar = db_path.map(load_skipped_notes_sidecar).unwrap_or_default();
+    let skipped_rows = sidecar.merged_skipped();
+    let near_rows = sidecar.merged_near();
     // nw-653: `paths` carries no reasons, so an owed reconciliation would read
     // like a brainignored note. The uncapped count and the first few owed
     // notes WITH their reason are reported separately.
@@ -1475,9 +1737,9 @@ pub fn skipped_notes_status_json(db_path: Option<&Path>) -> (serde_json::Value, 
         .map(|(path, reason)| serde_json::json!({ "path": path, "reason": reason }))
         .collect();
     let skipped = serde_json::json!({
-        "count": sidecar.skipped.len(),
-        "paths": sidecar.skipped.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
-        "truncated": sidecar.skipped_truncated,
+        "count": skipped_rows.len(),
+        "paths": skipped_rows.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
+        "truncated": any_truncation_bit(&sidecar.skipped_truncated),
         "reconciliation_pending": sidecar
             .reconciliation_pending
             .values()
@@ -1488,9 +1750,9 @@ pub fn skipped_notes_status_json(db_path: Option<&Path>) -> (serde_json::Value, 
         "frontmatter_unparsed_notes": frontmatter_notes,
     });
     let near = serde_json::json!({
-        "count": sidecar.notes_near_size_limit.len(),
-        "notes": sidecar.notes_near_size_limit,
-        "truncated": sidecar.near_limit_truncated,
+        "count": near_rows.len(),
+        "notes": near_rows,
+        "truncated": any_truncation_bit(&sidecar.near_limit_truncated),
     });
     (skipped, near)
 }
@@ -2350,7 +2612,7 @@ pub(crate) fn refresh_watched_paths(
         ignore_set,
         Some(lease),
     )?;
-    forget_symlink_rows(store.db_path(), &not_symlinks);
+    forget_symlink_rows(store.db_path(), vault_root, &not_symlinks);
     Ok(reader
         .captured
         .into_inner()
@@ -5846,6 +6108,37 @@ fn skip_frontmatter(source: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_flat_skipped_notes_stay_visible_until_a_full_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let path = crate::sidecar_path(&db, super::SKIPPED_NOTES_SIDECAR_SUFFIX);
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "skipped": [{"path": "lost.md", "reason": "unreadable"}],
+                "notes_near_size_limit": [{"path": "big.md", "bytes": 9}],
+                "skipped_truncated": true,
+                "near_limit_truncated": false
+            }"#,
+        )
+        .unwrap();
+        let (skipped, near) = super::skipped_notes_status_json(Some(&db));
+        assert_eq!(skipped["count"], 1);
+        assert_eq!(skipped["paths"][0], "lost.md");
+        assert_eq!(skipped["truncated"], true);
+        assert_eq!(near["count"], 1);
+        assert_eq!(near["truncated"], false);
+
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        super::persist_skipped_notes_replace(Some(&db), &vault, &[], &[], &[]);
+        let (skipped, _) = super::skipped_notes_status_json(Some(&db));
+        assert_eq!(skipped["count"], 0);
+        assert_eq!(skipped["truncated"], false);
+    }
+
     /// nw-196: one predicate, on either side of the daemon wire. Only a
     /// `.brainignore` match is "requested"; an unreadable or oversized note
     /// is not, even when its code is `ignored` with another reason.
@@ -6776,7 +7069,7 @@ mod tests {
         };
         let locked_rows = || {
             load_skipped_notes_sidecar(&db)
-                .skipped
+                .merged_skipped()
                 .iter()
                 .filter(|row| row.path == "locked")
                 .count()
@@ -7415,6 +7708,21 @@ mod tests {
     }
 
     #[test]
+    fn h1_mixed_with_inline_code_is_stored_as_heading_text() {
+        let src =
+            "# Overview `_meta.continuation` has `has_more: true` with `cursor: null`\n\nBody.\n";
+        let (_dir, root) = make_vault(&[("overview.md", src)]);
+        let (_result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let notes = store.list_notes(None).unwrap();
+        assert_eq!(notes.len(), 1);
+        let headings = store.headings_in_note(&notes[0].uid).unwrap();
+        let expected = "Overview _meta.continuation has has_more: true with cursor: null";
+        assert_eq!(headings[0].text, expected);
+        assert_eq!(notes[0].title, headings[0].text);
+    }
+
+    #[test]
     fn indexes_nested_headings_and_parent_edges() {
         let src = "\
 # Top
@@ -7737,11 +8045,174 @@ sub b body
 
         let sidecar = load_skipped_notes_sidecar(&db_path);
         assert_eq!(sidecar.version, 1);
-        assert_eq!(sidecar.skipped.len(), 1);
-        assert_eq!(sidecar.skipped[0].path, "big.md");
-        assert_eq!(sidecar.skipped[0].reason_code, SkipReasonCode::Oversized);
-        assert_eq!(sidecar.notes_near_size_limit.len(), 1);
-        assert_eq!(sidecar.notes_near_size_limit[0].path, "near.md");
+        let skipped = sidecar.merged_skipped();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].path, "big.md");
+        assert_eq!(skipped[0].reason_code, SkipReasonCode::Oversized);
+        let near = sidecar.merged_near();
+        assert_eq!(near.len(), 1);
+        assert_eq!(near[0].path, "near.md");
+    }
+
+    /// nw-736: skipped and near-size rows are keyed by vault root. A full
+    /// refresh of vault B must keep vault A's near-size row, and status
+    /// merges both vaults. Removing A drops only A's rows.
+    #[test]
+    fn full_refresh_keeps_the_other_vaults_near_size_disclosure() {
+        let limit = 1024u64;
+        let note_limits = crate::index_limits::NoteLimits::new(limit).unwrap();
+        let note = |title: &str, size: usize| {
+            let prefix = format!("# {title}\n\n");
+            format!("{prefix}{}", "x".repeat(size - prefix.len()))
+        };
+        let near_a = note("Near A", 800);
+        let near_b = note("Near B", 900);
+        let (_dir_a, root_a) =
+            make_vault(&[("near-a.md", near_a.as_str()), ("keep-a.md", "# A\n")]);
+        let (_dir_b, root_b) =
+            make_vault(&[("near-b.md", near_b.as_str()), ("keep-b.md", "# B\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        let refresh = |root: &std::path::Path, name: &str| {
+            index_markdown_directory_with_ignore_and_deletion_count_and_note_limits(
+                root,
+                &db_path,
+                "default",
+                name,
+                &[],
+                note_limits,
+            )
+            .unwrap()
+        };
+
+        refresh(&root_a, "vault-a");
+        let near_paths = |near: &serde_json::Value| -> Vec<String> {
+            near["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|note| note["path"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let (_, near) = skipped_notes_status_json(Some(&db_path));
+        assert_eq!(near["count"], serde_json::json!(1), "{near}");
+        assert_eq!(near_paths(&near), vec!["near-a.md".to_string()], "{near}");
+
+        refresh(&root_b, "vault-b");
+        let (_, near) = skipped_notes_status_json(Some(&db_path));
+        assert_eq!(near["count"], serde_json::json!(2), "{near}");
+        let mut paths = near_paths(&near);
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["near-a.md".to_string(), "near-b.md".to_string()],
+            "{near}"
+        );
+
+        let sidecar = load_skipped_notes_sidecar(&db_path);
+        let key_a = std::fs::canonicalize(&root_a)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let key_b = std::fs::canonicalize(&root_b)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            sidecar
+                .notes_near_size_limit
+                .get(&key_a)
+                .map(|rows| rows.len()),
+            Some(1),
+            "vault A keeps its own key: {sidecar:?}"
+        );
+        assert_eq!(
+            sidecar
+                .notes_near_size_limit
+                .get(&key_b)
+                .map(|rows| rows.len()),
+            Some(1),
+            "vault B is keyed apart from A: {sidecar:?}"
+        );
+
+        forget_vault_skipped_notes(&db_path, std::path::Path::new(&key_a));
+        let (_, near) = skipped_notes_status_json(Some(&db_path));
+        assert_eq!(near["count"], serde_json::json!(1), "{near}");
+        assert_eq!(near_paths(&near), vec!["near-b.md".to_string()], "{near}");
+        assert!(
+            !load_skipped_notes_sidecar(&db_path)
+                .notes_near_size_limit
+                .contains_key(&key_a),
+            "removing A clears only A's near-size row"
+        );
+    }
+
+    /// nw-736: A's 51st near-size note is dropped on A's write. B's full
+    /// refresh reloads only the 50 survivors and must keep A's stored bit.
+    /// Status ORs the per-vault bits.
+    #[test]
+    fn full_refresh_keeps_the_other_vaults_near_size_truncation() {
+        let limit = 1024u64;
+        let note_limits = crate::index_limits::NoteLimits::new(limit).unwrap();
+        let notes_a: Vec<(String, String)> = (0..51)
+            .map(|index| {
+                let body = "x".repeat(700);
+                (
+                    format!("near-a-{index:02}.md"),
+                    format!("# Near {index:02}\n\n{body}"),
+                )
+            })
+            .collect();
+        let files_a: Vec<(&str, &str)> = notes_a
+            .iter()
+            .map(|(path, body)| (path.as_str(), body.as_str()))
+            .collect();
+        let (_dir_a, root_a) = make_vault(&files_a);
+        let near_b = format!("# Near B\n\n{}", "y".repeat(700));
+        let (_dir_b, root_b) =
+            make_vault(&[("near-b.md", near_b.as_str()), ("keep-b.md", "# B\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("brain.lbug");
+        let refresh = |root: &std::path::Path, name: &str| {
+            index_markdown_directory_with_ignore_and_deletion_count_and_note_limits(
+                root,
+                &db_path,
+                "default",
+                name,
+                &[],
+                note_limits,
+            )
+            .unwrap()
+        };
+
+        refresh(&root_a, "vault-a");
+        let (_, near) = skipped_notes_status_json(Some(&db_path));
+        assert_eq!(near["count"], serde_json::json!(50), "{near}");
+        assert_eq!(near["truncated"], serde_json::json!(true), "{near}");
+
+        refresh(&root_b, "vault-b");
+        let (_, near) = skipped_notes_status_json(Some(&db_path));
+        assert_eq!(near["count"], serde_json::json!(51), "{near}");
+        assert_eq!(near["truncated"], serde_json::json!(true), "{near}");
+
+        let sidecar = load_skipped_notes_sidecar(&db_path);
+        let key_a = std::fs::canonicalize(&root_a)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let key_b = std::fs::canonicalize(&root_b)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            sidecar.near_limit_truncated.get(&key_a).copied(),
+            Some(true),
+            "vault A keeps the bit from its own pre-cap length: {sidecar:?}"
+        );
+        assert!(
+            !sidecar.near_limit_truncated.contains_key(&key_b),
+            "vault B's under-cap write does not take a bit: {sidecar:?}"
+        );
     }
 
     #[test]
@@ -8332,7 +8803,10 @@ sub b body
         expect(&since.skipped, "--since refresh");
         let sidecar = load_skipped_notes_sidecar(&db_path);
         assert!(
-            sidecar.skipped.iter().any(|row| row.path == "linked-dir"),
+            sidecar
+                .merged_skipped()
+                .iter()
+                .any(|row| row.path == "linked-dir"),
             "the sidecar carries the disclosure: {sidecar:?}"
         );
     }
@@ -10210,9 +10684,9 @@ mod watch_reconciliation_disclosure_tests {
         assert_eq!(sidecar.reconciliation_pending.len(), 2, "{sidecar:?}");
         assert_eq!(
             sidecar
-                .skipped
-                .iter()
-                .map(|file| file.path.clone())
+                .merged_skipped()
+                .into_iter()
+                .map(|file| file.path)
                 .collect::<Vec<_>>(),
             vec![note.to_string_lossy().into_owned()],
             "only vault debt is mirrored as a skipped note"

@@ -281,21 +281,69 @@ pub fn repo_display_name(repo: &nestweaver_schema::Repo) -> String {
 /// route call this one function so the added field cannot drift between them
 /// (CONTRIBUTING "sibling gaps").
 pub fn repos_json_with_display_name(repos: &[nestweaver_schema::Repo]) -> serde_json::Value {
+    let distances = listing_distances(repos);
     serde_json::Value::Array(
         repos
             .iter()
-            .map(|repo| {
+            .zip(distances)
+            .map(|(repo, distance)| {
                 let mut value = serde_json::to_value(repo).unwrap_or(serde_json::Value::Null);
                 if let serde_json::Value::Object(ref mut map) = value {
                     map.insert(
                         "display_name".to_string(),
                         serde_json::Value::String(repo_display_name(repo)),
                     );
+                    // The column is the distance recorded at index time. After
+                    // HEAD moves it stays 0 until the next index, while
+                    // `stale-check` reports the live `rev-list` count. Publish
+                    // that same count. `None` (rev-list or HEAD failed) cannot
+                    // replace the `u32` column with null, because this payload
+                    // is also decoded as `Repo`. Name that case so a stored 0
+                    // is not read as a live "current".
+                    match distance {
+                        Some(behind) => {
+                            map.insert(
+                                "staleness_commits_behind".to_string(),
+                                serde_json::Value::from(behind),
+                            );
+                            map.insert(
+                                "staleness_commits_behind_uncountable".to_string(),
+                                serde_json::Value::Bool(false),
+                            );
+                        }
+                        None => {
+                            map.insert(
+                                "staleness_commits_behind_uncountable".to_string(),
+                                serde_json::Value::Bool(true),
+                            );
+                        }
+                    }
                 }
                 value
             })
             .collect(),
     )
+}
+
+/// Live distances for `list-repos`. Each repo is one or two local git
+/// processes; a wide inventory used to run those one after another, so one
+/// slow tree stalled the whole list. Eight at a time keeps the wall clock
+/// near the slowest repo instead of the sum.
+fn listing_distances(repos: &[nestweaver_schema::Repo]) -> Vec<Option<u64>> {
+    const WIDTH: usize = 8;
+    let mut distances = Vec::with_capacity(repos.len());
+    for chunk in repos.chunks(WIDTH) {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|repo| scope.spawn(|| crate::repo_head::listing_commits_behind(repo)))
+                .collect();
+            for handle in handles {
+                distances.push(handle.join().unwrap_or(None));
+            }
+        });
+    }
+    distances
 }
 
 /// Why a repository selector did not resolve. The class decides the exit

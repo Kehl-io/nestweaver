@@ -470,6 +470,105 @@ mod dispatch_err_to_status_tests {
             Some(nestweaver_mcp::tools::TOOL_TARGET_NOT_FOUND_CODE)
         );
     }
+
+    /// Uncompressed header-list size, per RFC 7540: name + value + 32 per field.
+    /// hyper rejects a list at or above its 16KiB default with PROTOCOL_ERROR.
+    fn grpc_status_header_list_size(status: &tonic::Status) -> usize {
+        let mut headers = http::HeaderMap::new();
+        status
+            .add_header(&mut headers)
+            .expect("a bounded status encodes into header values");
+        headers
+            .iter()
+            .map(|(name, value)| name.as_str().len() + value.as_bytes().len() + 32)
+            .sum()
+    }
+
+    fn brain_context_seed_miss(seeds: &[&str]) -> anyhow::Error {
+        let seeds: Vec<String> = seeds.iter().map(|seed| (*seed).to_string()).collect();
+        let store = GraphStore::in_memory().expect("in-memory store");
+        let error = nestweaver_engine::build_brain_context_hybrid_with_aliases(
+            &store,
+            &seeds,
+            None,
+            &nestweaver_engine::HybridSearchConfig::default(),
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("an unknown seed resolves nothing");
+        nestweaver_mcp::tools::seeds_not_found(&store, error, &seeds, &["No seeds resolved."], None)
+    }
+
+    fn assert_seed_miss_fits(seeds: &[&str]) -> tonic::Status {
+        let status = dispatch_err_to_status("brain_context", brain_context_seed_miss(seeds));
+        assert!(
+            status.message().contains("No seeds resolved."),
+            "the CLI classifies exit 2 from this sentence: {}",
+            status.message()
+        );
+        for seed in seeds {
+            assert!(
+                !status.message().contains(*seed),
+                "the status message must not echo a raw over-long seed"
+            );
+            assert!(
+                !status
+                    .details()
+                    .windows(seed.len())
+                    .any(|window| window == seed.as_bytes()),
+                "the status details must not echo a raw over-long seed"
+            );
+        }
+        let envelope = nestweaver_mcp::tools::envelope_from_status_details(status.details())
+            .expect("the miss is still a not-found envelope");
+        assert_eq!(envelope["status"], "not_found");
+        let header_list = grpc_status_header_list_size(&status);
+        assert!(
+            header_list <= 16 * 1024,
+            "gRPC status header list is {header_list} bytes, above hyper's 16KiB default"
+        );
+        status
+    }
+
+    /// The engine shares one byte budget across all unresolved seeds. A long
+    /// seed and its remaining tail collapse into one aggregate marker, and
+    /// both gRPC status copies must still fit the transport's header budget.
+    #[test]
+    fn an_overlong_unresolved_seed_stays_inside_the_grpc_header_limit() {
+        let long = "q".repeat(10_000);
+        let four_byte_char = "\u{10000}";
+        assert_eq!(four_byte_char.len(), 4);
+        let four_byte = four_byte_char.repeat(10_000);
+        for seeds in [
+            vec![long.as_str()],
+            vec![four_byte.as_str()],
+            vec![long.as_str(); 8],
+        ] {
+            let status = assert_seed_miss_fits(&seeds);
+            let marker = format!("… ({} more)", seeds.len());
+            assert!(status.message().contains(&marker), "{}", status.message());
+            let envelope = nestweaver_mcp::tools::envelope_from_status_details(status.details())
+                .expect("the miss keeps its not-found envelope");
+            assert_eq!(envelope["seeds"], serde_json::json!([marker]));
+        }
+
+        let short = "how does auth work";
+        let short_status =
+            dispatch_err_to_status("brain_context", brain_context_seed_miss(&[short]));
+        assert!(
+            short_status.message().contains(short),
+            "a short seed stays in the not-found message: {}",
+            short_status.message()
+        );
+        assert!(
+            !short_status.message().contains(" chars)"),
+            "a short seed is not truncated: {}",
+            short_status.message()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3887,6 +3986,23 @@ async fn stop_and_drain_watcher(state: &DaemonState, id: u64) -> bool {
     stopped
 }
 
+/// nw-744 (3): after a vault is removed, stop the vault watcher registered
+/// on its root. `brain remove` deletes the graph row and leaves the directory
+/// in place, so a still-running watcher treats the next save as a first index
+/// and recreates the vault with that one note. Roots compare canonically.
+fn forget_removed_vault_watch(state: &DaemonState, root: &Path) {
+    use nestweaver_engine::vault_registration::canonical;
+    let watcher_id = state.watcher_stop.lock().ok().and_then(|guard| {
+        guard
+            .as_ref()
+            .filter(|w| w.kind == "vault" && canonical(Path::new(&w.target)) == canonical(root))
+            .map(|w| w.id)
+    });
+    if let Some(id) = watcher_id {
+        stop_watcher_registration(state, id);
+    }
+}
+
 /// nw-664 review: after a repo is removed or pruned, stop the code watcher
 /// registered on its root (if the canonical slot holds one) and forget its
 /// code-watcher state. Left running, an owed startup-reconciliation retry or
@@ -6612,6 +6728,15 @@ fn run_remove_vault_with_projection(
     if mutation.is_ok() {
         forget_vault_registration(state, vault_uid, root_path.as_deref());
     }
+    // nw-744 (3): only a removal that actually dropped the vault. A confirmed
+    // no-op never had a row for this watcher to resurrect, and a failed delete
+    // must leave the live watcher in place.
+    if mutation.is_ok()
+        && !confirmed_noop
+        && let Some(root) = root_path.as_deref()
+    {
+        forget_removed_vault_watch(state, Path::new(root));
+    }
     let mut failures = Vec::new();
     if !confirmed_noop {
         failures = finalize_node_graph_deletion(state, "remove_vault");
@@ -9114,10 +9239,16 @@ impl NestWeaverDaemon for DaemonService {
         let base_mutation_factory = daemon_mutation_lease_factory(self.state.clone());
         let writing_tx = tx.clone();
         let project_total = instance_config.projects.len() as u64;
+        // The engine calls this factory on every publication collision, while
+        // the returned lease still holds the write gate. `blocking_send` on a
+        // full 16-slot channel would wait in that critical section, so the
+        // collision path could never drop the gate for the watcher that owns
+        // publication. `try_send` reports the writing phase when the client is
+        // reading and otherwise continues into the yield.
         let mutation_factory: nestweaver_engine::WatchMutationLeaseFactory =
             Arc::new(move |label| {
                 let lease = base_mutation_factory(label)?;
-                let _ = writing_tx.blocking_send(Ok(IndexProgress {
+                let _ = writing_tx.try_send(Ok(IndexProgress {
                     phase: Phase::Writing as i32,
                     message: "Applying the planned project graph in one transaction".to_string(),
                     files_processed: 0,
@@ -11217,25 +11348,32 @@ impl NestWeaverDaemon for DaemonService {
             ));
         }
 
+        // Preserve immediate shutdown refusal even when detection finds no
+        // projects. The worker re-admits at its actual mutation boundary.
+        if !dry_run {
+            drop(ConnectionGuard::write(&state)?);
+        }
+        let mutation_factory = (!dry_run).then(|| daemon_mutation_lease_factory(state.clone()));
         let detect = move || {
-            let detected = nestweaver_engine::project::detect_implicit_projects_with_publication(
-                &state.store,
-                &vault,
-                &vault_uid,
-                &instance_id,
-                dry_run,
-            )
-            .map_err(|error| {
-                Status::internal(format!("detect_implicit_projects failed: {error:#}"))
-            })?;
-            // nw-670 re-review R3: new implicit-project membership rescopes
-            // the notes it covers.
-            if !dry_run && detected.publication.changed() {
-                nestweaver_engine::code_links::mark_code_links_pending(
-                    &state.db_path,
-                    "implicit project membership changed",
-                );
-            }
+            let detected =
+                nestweaver_engine::project::detect_implicit_projects_with_publication_and_lease(
+                    &state.store,
+                    &vault,
+                    &vault_uid,
+                    &instance_id,
+                    dry_run,
+                    mutation_factory,
+                )
+                .map_err(|error| {
+                    if error
+                        .downcast_ref::<nestweaver_engine::WatchMutationRefused>()
+                        .is_some()
+                    {
+                        Status::unavailable(format!("detect_implicit_projects refused: {error:#}"))
+                    } else {
+                        Status::internal(format!("detect_implicit_projects failed: {error:#}"))
+                    }
+                })?;
             let disposition = match detected.publication.disposition {
                 nestweaver_engine::manifest::GraphMutationPublicationDisposition::ConfirmedNoChange => {
                     "confirmed_no_change"
@@ -11264,16 +11402,11 @@ impl NestWeaverDaemon for DaemonService {
             serde_json::to_string(&payload)
                 .map_err(|error| Status::internal(format!("serialization failed: {error:#}")))
         };
-        let result = if dry_run {
-            tokio::task::spawn_blocking(detect)
-                .await
-                .map_err(|error| {
-                    Status::internal(format!("detect_implicit_projects task panicked: {error}"))
-                })??
-        } else {
-            self.run_unary_mutation("detect_implicit_projects", detect)
-                .await?
-        };
+        let result = tokio::task::spawn_blocking(detect)
+            .await
+            .map_err(|error| {
+                Status::internal(format!("detect_implicit_projects task panicked: {error}"))
+            })??;
         Ok(Response::new(JsonResponse {
             result_json: result,
         }))
@@ -31614,6 +31747,205 @@ external_model = "unavailable-test-model"
             indexed.is_ok(),
             "first post-acknowledgement edit was missed"
         );
+        assert!(state.watcher_tasks.lock().unwrap().is_empty());
+    }
+
+    /// nw-744 (3): `brain remove` must stop the vault watcher. Leaving it
+    /// running makes the next save recreate the vault with that one note.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_vault_stops_its_watcher_so_a_later_save_does_not_recreate_it() {
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("Seed.md"), "# Seed\n\nkept\n").unwrap();
+        let service = DaemonService::new(state.clone());
+        let response = service
+            .watch_vault(Request::new(WatchVaultRequest {
+                vault_path: vault.path().to_string_lossy().into_owned(),
+                vault_name: "notes".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.ok, "{}", response.message);
+
+        let vault_uid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(found) = state
+                    .store
+                    .list_vaults(None)
+                    .unwrap()
+                    .into_iter()
+                    .find(|candidate| candidate.name == "notes")
+                {
+                    break found.uid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("watcher must publish the vault before removal");
+
+        let mut request = Request::new(RemoveVaultRequest {
+            vault_uid: vault_uid.clone(),
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let removed = service.remove_vault(request).await.unwrap().into_inner();
+        assert!(removed.committed, "vault removal must commit");
+        assert!(
+            watcher_status(&state).is_none(),
+            "brain remove must stop the vault watcher"
+        );
+        assert!(
+            state.store.list_vaults(None).unwrap().is_empty(),
+            "the vault row must be gone before the later save"
+        );
+
+        std::fs::write(
+            vault.path().join("Later.md"),
+            "# Later\n\nshould stay out\n",
+        )
+        .unwrap();
+
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let vaults = state.store.list_vaults(None).unwrap();
+                assert!(
+                    vaults.is_empty(),
+                    "removed vault was recreated by its watcher: {vaults:?}"
+                );
+                let finished = state
+                    .watcher_tasks
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|task| task.handle.is_finished());
+                if finished {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "vault watcher kept running after brain remove"
+        );
+        let notes = state.store.list_notes(None).unwrap();
+        assert!(
+            notes.is_empty(),
+            "a save after brain remove was indexed: {notes:?}"
+        );
+    }
+
+    /// nw-744 (3): a watcher already blocked on `watch_vault_initial` must
+    /// return once `brain remove` sets the stop flag and releases the write
+    /// gate. Acquiring that lease and then upserting recreates the vault.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn remove_vault_stops_a_watcher_blocked_on_the_initial_lease() {
+        use nestweaver_schema::Vault;
+        use nestweaver_schema::uid::vault_uid;
+
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("Seed.md"), "# Seed\n\nkept\n").unwrap();
+        let root = std::fs::canonicalize(vault.path()).unwrap();
+        let uid = vault_uid("default", &root.to_string_lossy());
+        state
+            .store
+            .insert_vault(&Vault {
+                uid: uid.clone(),
+                name: "notes".into(),
+                root_path: root.to_string_lossy().into_owned(),
+                instance_id: "default".into(),
+            })
+            .unwrap();
+
+        // Hold the gate so removal queues first and the watcher parks on its
+        // startup lease behind that removal. `waiting` flips just before the
+        // mutex wait; the watcher is not started until removal is already
+        // counted, and its own startup reaches the lease only after that.
+        let holder = state.write_gate.lock("test_initial_lease_barrier").await;
+        let remove_state = state.clone();
+        let remove_uid = uid.clone();
+        let removing = tokio::spawn(async move {
+            let service = DaemonService::new(remove_state);
+            let mut request = Request::new(RemoveVaultRequest {
+                vault_uid: remove_uid,
+            });
+            request.extensions_mut().insert(crate::auth::IsAdmin(true));
+            service.remove_vault(request).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.write_gate.waiting() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("vault removal must wait behind the startup barrier");
+
+        let service = DaemonService::new(state.clone());
+        let path = root.to_string_lossy().into_owned();
+        let starting = tokio::spawn(async move {
+            service
+                .watch_vault(Request::new(WatchVaultRequest {
+                    vault_path: path,
+                    vault_name: "notes".into(),
+                    instance_id: "default".into(),
+                    ..Default::default()
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.write_gate.waiting() < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("watcher must block on its initial lease behind removal");
+        assert_eq!(
+            state.write_gate.holder_snapshot().unwrap().0,
+            "test_initial_lease_barrier"
+        );
+        assert_eq!(
+            watcher_status(&state).map(|status| status.kind),
+            Some("vault".into()),
+            "the blocked watcher must be registered before removal runs"
+        );
+        drop(holder);
+
+        let removed = tokio::time::timeout(std::time::Duration::from_secs(10), removing)
+            .await
+            .expect("vault removal must finish after the barrier drops")
+            .unwrap()
+            .unwrap()
+            .into_inner();
+        assert!(removed.committed, "vault removal must commit");
+
+        std::fs::write(root.join("Later.md"), "# Later\n\nshould stay out\n").unwrap();
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), starting)
+            .await
+            .expect("blocked watcher must leave startup after removal")
+            .unwrap()
+            .unwrap()
+            .into_inner();
+        assert!(
+            !response.ok,
+            "a watcher that lost its vault during startup must not become ready: {}",
+            response.message
+        );
+        assert!(
+            state.store.list_vaults(None).unwrap().is_empty(),
+            "the initial lease must not recreate the removed vault: {:?}",
+            state.store.list_vaults(None).unwrap()
+        );
+        assert!(
+            state.store.list_notes(None).unwrap().is_empty(),
+            "a save after brain remove was indexed: {:?}",
+            state.store.list_notes(None).unwrap()
+        );
+        assert!(watcher_status(&state).is_none());
         assert!(state.watcher_tasks.lock().unwrap().is_empty());
     }
 

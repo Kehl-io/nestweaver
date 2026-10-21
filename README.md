@@ -1152,7 +1152,7 @@ nestweaver ui --db ./nestweaver.lbug --port 8080 --watch  # live re-indexing
 
 **Accessibility:** all six task journeys have a keyboard-only path; reduced-motion preserves every static meaning channel; graph answers always have a table/JSON equivalent; a screen-reader landmark summary mirrors the canvas.
 
-**WASM mode** — Append `?engine=wasm` to the URL to run graph algorithms client-side via WebAssembly. The browser downloads a MessagePack snapshot and executes PPR locally — no server round-trips for queries. Requires building the wasm first (use `--remap-path-prefix` so the build
+**WASM mode** — Append `?engine=wasm` to load a WebAssembly copy of the graph snapshot. The browser downloads a MessagePack snapshot and the status bar shows its node and edge counts. Queries, including PPR, run on the server. Requires building the wasm first (use `--remap-path-prefix` so the build
 machine's home path isn't baked into the artifact):
 `RUSTFLAGS="--remap-path-prefix=$HOME=/build" wasm-pack build crates/nestweaver-wasm --target web --out-dir ../../crates/nestweaver-web/frontend/src/wasm`.
 

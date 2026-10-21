@@ -1,9 +1,10 @@
 //! Trigram-accelerated first-party regex search over indexed text.
 //!
-//! NestWeaver already stores searchable text in the graph: `Section.text_content`
-//! (markdown brain bodies), `Note.title`, and `Symbol.signature`. This module
-//! lets agents run a real `regex` against that text without shelling out to
-//! `rg`/`grep`, with a disposable per-scope Tantivy trigram accelerator.
+//! NestWeaver already stores searchable text in the graph: section bodies plus
+//! the heading line that owns them, `Note.title`, frontmatter, and
+//! `Symbol.signature`. This module lets agents run a real `regex` against that
+//! text without shelling out to `rg`/`grep`, with a disposable per-scope
+//! Tantivy trigram accelerator. `^` and `$` are line anchors.
 //!
 //! ## Correctness vs. optimization
 //!
@@ -21,6 +22,8 @@ use std::time::Instant;
 
 use lbug::Value;
 use serde::{Deserialize, Serialize};
+
+use nestweaver_schema::{Heading, Section};
 
 use crate::db::GraphStore;
 use crate::error::{CancelReason, StoreError};
@@ -80,6 +83,11 @@ fn compile_pattern(pattern: &str) -> Result<regex::Regex, StoreError> {
     regex::RegexBuilder::new(pattern)
         .size_limit(REGEX_SIZE_LIMIT)
         .dfa_size_limit(REGEX_SIZE_LIMIT)
+        // rg/grep treat ^ and $ as line anchors. The regex crate does not,
+        // unless the pattern says (?m). Heading searches such as `^## Blockers`
+        // and count-patterns of `^` / `$` are per line (nw-738). `(?-m)` still
+        // anchors the whole candidate.
+        .multi_line(true)
         .build()
         .map_err(|e| StoreError::Query(format!("invalid regex: {e}")))
 }
@@ -515,6 +523,81 @@ fn candidate_digest(candidates: &[Candidate]) -> String {
         hasher.update(&[0xff]);
     }
     hasher.finalize().to_hex().to_string()
+}
+
+/// Searchable section text, and whether that text is more than the stored body.
+///
+/// The markdown indexer keeps the heading on a Heading node. `text_content`
+/// starts on the following line, so `## Blockers` was absent from every
+/// candidate (nw-738). Prepend one ATX line and pad so the body keeps its
+/// file line numbers when the heading occupies more than one source line.
+fn searchable_section(
+    heading: Option<&Heading>,
+    body: &str,
+    body_start: u32,
+) -> Option<(String, u32, bool)> {
+    let heading_line = heading.and_then(|heading| {
+        let text = heading.text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        let level = usize::from(heading.level).clamp(1, 6);
+        let start = if heading.start_line > 0 {
+            heading.start_line
+        } else {
+            body_start.max(1)
+        };
+        Some((start, format!("{} {text}", "#".repeat(level))))
+    });
+    let Some((heading_start, heading_line)) = heading_line else {
+        if body.is_empty() {
+            return None;
+        }
+        return Some((body.to_string(), body_start, false));
+    };
+    if body.is_empty() {
+        return Some((heading_line.clone(), heading_start, true));
+    }
+    let gap = body_start.saturating_sub(heading_start).max(1);
+    let mut text = heading_line;
+    for _ in 1..gap {
+        text.push('\n');
+    }
+    text.push('\n');
+    text.push_str(body);
+    Some((text, heading_start, true))
+}
+
+fn section_candidate(
+    section: Section,
+    path: &str,
+    scope_uid: String,
+    headings: &HashMap<String, Heading>,
+) -> Option<Candidate> {
+    let heading = section
+        .heading_uid
+        .as_deref()
+        .and_then(|uid| headings.get(uid));
+    let (text, start_line, heading_included) =
+        searchable_section(heading, &section.text_content, section.start_line)?;
+    let text_hash = if heading_included || section.text_hash.is_empty() {
+        text_hash(&text)
+    } else {
+        section.text_hash
+    };
+    let title = heading
+        .map(|heading| heading.text.trim().to_string())
+        .unwrap_or_default();
+    Some(Candidate {
+        uid: section.uid,
+        scope_uid,
+        text_hash,
+        kind: "Section".to_string(),
+        title,
+        location: format!("{path}:{start_line}"),
+        text,
+        start_line,
+    })
 }
 
 /// Lowercase 3-grams of `s`, deduplicated. Operates on Unicode scalar values
@@ -1314,6 +1397,25 @@ impl GraphStore {
         Ok(states)
     }
 
+    /// Heading text keyed by uid. A short heading scan is joined onto sections
+    /// because `Section.text_content` does not include the heading line.
+    /// `degraded` is true when a corrupt heading row was skipped (nw-335).
+    fn heading_index(
+        &self,
+        uids: &[String],
+    ) -> Result<(HashMap<String, Heading>, bool), StoreError> {
+        if uids.is_empty() {
+            return Ok((HashMap::new(), false));
+        }
+        let (rows, integrity) = self.lookup_headings_by_uids_with_integrity(uids)?;
+        Ok((
+            rows.into_iter()
+                .map(|heading| (heading.uid.clone(), heading))
+                .collect(),
+            integrity.is_degraded(),
+        ))
+    }
+
     /// Collect all searchable candidate nodes (Sections, Notes, Frontmatter,
     /// Symbols), optionally filtered by `path_prefix` (matched against
     /// location) and `kinds` (case-insensitive kind names: "Section", "Note",
@@ -1356,8 +1458,9 @@ impl GraphStore {
         // entire job is to report an incomplete candidate set as incomplete.
         let mut degraded = false;
 
-        // Sections — body text is the richest source. We need the parent note's
-        // file_path for the location, so build a note_uid -> path map once.
+        // Sections — body text plus the heading line that owns it. The parent
+        // note supplies the file path. Headings are a separate node, so load
+        // them once and join by `heading_uid` (nw-738).
         if want_kind("Section") {
             let (notes, integrity) = self.list_notes_with_integrity(None)?;
             degraded |= integrity.is_degraded();
@@ -1370,37 +1473,36 @@ impl GraphStore {
                 .collect();
             let (sections, integrity) = self.list_all_sections_with_integrity()?;
             degraded |= integrity.is_degraded();
+            let heading_uids: Vec<String> = sections
+                .iter()
+                .filter(|section| {
+                    path_prefix.is_none_or(|prefix| {
+                        note_path
+                            .get(&section.note_uid)
+                            .is_some_and(|(path, _)| path.starts_with(prefix))
+                    })
+                })
+                .filter_map(|section| section.heading_uid.clone())
+                .collect();
+            let (headings, headings_degraded) = self.heading_index(&heading_uids)?;
+            degraded |= headings_degraded;
             for s in sections {
                 if interrupted()? {
                     return Ok((out, Some(RegexTruncationReason::Deadline)));
                 }
-                if s.text_content.is_empty() {
-                    continue;
-                }
                 let (path, scope_uid) = note_path.get(&s.note_uid).cloned().unwrap_or_default();
-                let location = format!("{path}:{}", s.start_line);
                 if let Some(prefix) = path_prefix
                     && !path.starts_with(prefix)
                 {
                     continue;
                 }
+                let Some(candidate) = section_candidate(s, &path, scope_uid, &headings) else {
+                    continue;
+                };
                 if out.len() >= limits.max_candidates {
                     return Ok((out, Some(RegexTruncationReason::CandidateCap)));
                 }
-                out.push(Candidate {
-                    uid: s.uid,
-                    scope_uid,
-                    text_hash: if s.text_hash.is_empty() {
-                        text_hash(&s.text_content)
-                    } else {
-                        s.text_hash
-                    },
-                    kind: "Section".to_string(),
-                    title: String::new(),
-                    location,
-                    text: s.text_content,
-                    start_line: s.start_line,
-                });
+                out.push(candidate);
             }
         }
 
@@ -1668,14 +1770,18 @@ impl GraphStore {
                 // this scope's notes in memory.
                 let (sections, integrity) = self.list_all_sections_with_integrity()?;
                 degraded |= integrity.is_degraded();
+                let heading_uids: Vec<String> = sections
+                    .iter()
+                    .filter(|section| note_paths.contains_key(&section.note_uid))
+                    .filter_map(|section| section.heading_uid.clone())
+                    .collect();
+                let (headings, headings_degraded) = self.heading_index(&heading_uids)?;
+                degraded |= headings_degraded;
                 for section in sections {
                     if interrupted()? {
                         return Ok((candidates, Some(RegexTruncationReason::Deadline)));
                     }
                     if !note_paths.contains_key(&section.note_uid) {
-                        continue;
-                    }
-                    if section.text_content.is_empty() {
                         continue;
                     }
                     let path = note_paths
@@ -1685,23 +1791,15 @@ impl GraphStore {
                     if path_prefix.is_some_and(|prefix| !path.starts_with(prefix)) {
                         continue;
                     }
+                    let Some(candidate) =
+                        section_candidate(section, &path, scope_uid.clone(), &headings)
+                    else {
+                        continue;
+                    };
                     if candidates.len() >= limits.max_candidates {
                         return Ok((candidates, Some(RegexTruncationReason::CandidateCap)));
                     }
-                    candidates.push(Candidate {
-                        uid: section.uid,
-                        scope_uid: scope_uid.clone(),
-                        text_hash: if section.text_hash.is_empty() {
-                            text_hash(&section.text_content)
-                        } else {
-                            section.text_hash
-                        },
-                        kind: "Section".to_string(),
-                        title: String::new(),
-                        location: format!("{path}:{}", section.start_line),
-                        text: section.text_content,
-                        start_line: section.start_line,
-                    });
+                    candidates.push(candidate);
                 }
             }
         }
@@ -1738,6 +1836,7 @@ impl GraphStore {
         let mut ordered: Vec<_> = uids.iter().cloned().collect();
         ordered.sort();
         let mut candidates = Vec::new();
+        let mut degraded = false;
         if want_kind("Symbol") {
             for chunk in ordered.chunks(256) {
                 if interrupted()? {
@@ -1834,12 +1933,22 @@ impl GraphStore {
                         .map(|note| (note.uid, (note.file_path, note.vault_uid))),
                 );
             }
+            let heading_uids: Vec<String> = sections
+                .iter()
+                .filter(|section| {
+                    path_prefix.is_none_or(|prefix| {
+                        note_paths
+                            .get(&section.note_uid)
+                            .is_some_and(|(path, _)| path.starts_with(prefix))
+                    })
+                })
+                .filter_map(|section| section.heading_uid.clone())
+                .collect();
+            let (headings, headings_degraded) = self.heading_index(&heading_uids)?;
+            degraded |= headings_degraded;
             for section in sections {
                 if interrupted()? {
                     return Ok((candidates, Some(RegexTruncationReason::Deadline)));
-                }
-                if section.text_content.is_empty() {
-                    continue;
                 }
                 let (path, scope_uid) = note_paths
                     .get(&section.note_uid)
@@ -1848,28 +1957,21 @@ impl GraphStore {
                 if path_prefix.is_some_and(|prefix| !path.starts_with(prefix)) {
                     continue;
                 }
+                let Some(candidate) = section_candidate(section, &path, scope_uid, &headings)
+                else {
+                    continue;
+                };
                 if candidates.len() >= limits.max_candidates {
                     return Ok((candidates, Some(RegexTruncationReason::CandidateCap)));
                 }
-                candidates.push(Candidate {
-                    uid: section.uid,
-                    scope_uid,
-                    text_hash: if section.text_hash.is_empty() {
-                        text_hash(&section.text_content)
-                    } else {
-                        section.text_hash
-                    },
-                    kind: "Section".to_string(),
-                    title: String::new(),
-                    location: format!("{path}:{}", section.start_line),
-                    text: section.text_content,
-                    start_line: section.start_line,
-                });
+                candidates.push(candidate);
             }
         }
         Ok((
             candidates,
-            interrupted()?.then_some(RegexTruncationReason::Deadline),
+            interrupted()?
+                .then_some(RegexTruncationReason::Deadline)
+                .or_else(|| degraded.then_some(RegexTruncationReason::UndecodableRows)),
         ))
     }
 
@@ -2875,7 +2977,7 @@ mod tests {
     }
 
     use super::*;
-    use nestweaver_schema::{Note, NoteKind, Section, Symbol, SymbolKind, Visibility};
+    use nestweaver_schema::{Heading, Note, NoteKind, Section, Symbol, SymbolKind, Visibility};
 
     /// nw-142: within ONE literal the trigrams are CONJUNCTS - a match must
     /// contain all of them. Only across alternation branches are they
@@ -3545,6 +3647,111 @@ mod tests {
         let uids: HashSet<&str> = res.results.iter().map(|m| m.uid.as_str()).collect();
         assert!(uids.contains("sec:v:1:a"), "should match the section body");
         assert!(uids.contains("sym:1"), "should match the symbol signature");
+    }
+
+    /// nw-738. Heading text lives on a Heading node; `Section.text_content`
+    /// starts on the next line. A ready trigram index must still find
+    /// `^## Blockers` and the word `Blockers` under a path prefix, and `^`
+    /// must match once per line.
+    #[test]
+    fn regex_search_matches_markdown_heading_line() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(&temp.path().join("brain.lbug")).unwrap();
+        let path = "Workspaces/NestWeaver/notes/2026-09/architecture/plan.md";
+        let prefix = "Workspaces/NestWeaver/notes/2026-09/architecture";
+        store
+            .insert_note(&Note {
+                uid: "note:plan".to_string(),
+                vault_uid: "vlt:plan".to_string(),
+                file_path: path.to_string(),
+                title: "Upgrade plan".to_string(),
+                note_kind: NoteKind::General,
+                word_count: 0,
+                content_hash: "h".to_string(),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_heading(&Heading {
+                uid: "head:blockers".to_string(),
+                note_uid: "note:plan".to_string(),
+                level: 2,
+                text: "Blockers".to_string(),
+                slug: "blockers".to_string(),
+                start_line: 12,
+                end_line: 12,
+                content_hash: "h".to_string(),
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_section(&Section {
+                uid: "sec:plan:blockers".to_string(),
+                note_uid: "note:plan".to_string(),
+                heading_uid: Some("head:blockers".to_string()),
+                start_line: 13,
+                end_line: 14,
+                text_hash: "body".to_string(),
+                text_content: "Nothing about the title word lives in the body.".to_string(),
+                word_count: 8,
+                pagerank_score: None,
+            })
+            .unwrap();
+        store.rebuild_trigram_index().unwrap();
+
+        for pattern in ["(?m)^## Blockers", "^## Blockers", "Blockers"] {
+            let result = store
+                .regex_search(pattern, Some(prefix), None, None, None)
+                .unwrap();
+            assert!(
+                !result.scanned_fallback,
+                "{pattern} should be answered from the trigram index: {result:?}"
+            );
+            let hit = result
+                .results
+                .iter()
+                .find(|hit| hit.uid == "sec:plan:blockers")
+                .unwrap_or_else(|| panic!("{pattern} missed the heading line: {result:?}"));
+            assert_eq!(hit.kind, "Section", "{pattern}");
+            assert_eq!(hit.line, Some(12), "{pattern}");
+            assert!(
+                hit.snippet.contains("## Blockers"),
+                "{pattern} snippet was {}",
+                hit.snippet
+            );
+        }
+
+        let body = store
+            .regex_search("title word", Some(prefix), None, None, None)
+            .unwrap();
+        let body_hit = body
+            .results
+            .iter()
+            .find(|hit| hit.uid == "sec:plan:blockers")
+            .expect("body match");
+        assert_eq!(
+            body_hit.line,
+            Some(13),
+            "prepending the heading must not shift the body line"
+        );
+
+        let counts = store
+            .count_patterns(
+                &["^".to_string()],
+                Some(prefix),
+                Some(&["Section".to_string()]),
+            )
+            .unwrap();
+        assert_eq!(
+            counts[0].total_matches, 2,
+            "^ must match each line of the heading plus body: {counts:?}"
+        );
     }
 
     #[test]

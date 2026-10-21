@@ -95,3 +95,132 @@ fn planned_worker_resumes_two_crashes_and_commits_exact_identity_before_graph() 
     );
     assert!(publication::read_current(&root).unwrap().is_none());
 }
+
+/// nw-742: a cancel-requested operation is not resumed. Rebuild acknowledges
+/// the cancellation, names it, and exits 1.
+#[test]
+fn a_cancelled_operation_rebuild_fails_closed_and_names_the_cancellation() {
+    let scratch = tempfile::tempdir().unwrap();
+    let db = scratch.path().join("brain.lbug");
+    drop(nestweaver_store::GraphStore::open_or_create(&db).unwrap());
+    let config = scratch.path().join("instance.toml");
+    std::fs::write(
+        &config,
+        include_str!("../examples/minimal-instance.toml").replace(
+            "~/.local/share/nestweaver/minimal",
+            &scratch.path().join("state").display().to_string(),
+        ),
+    )
+    .unwrap();
+    let root = publication::default_publication_root(&db);
+
+    let mut started = assert_cmd::Command::cargo_bin("nestweaver").unwrap();
+    let started = started
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
+        .env("NESTWEAVER_TEST_STOP_BEFORE_PHASE", "planned")
+        .args(["publication", "rebuild", "--no-activate", "--config"])
+        .arg(&config)
+        .arg("--db")
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert_eq!(
+        started.status.code(),
+        Some(88),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&started.stdout),
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let operation = String::from_utf8_lossy(&started.stderr)
+        .lines()
+        .find_map(|line| line.strip_prefix("Publication operation: "))
+        .unwrap_or_else(|| {
+            panic!(
+                "no operation uuid in: {}",
+                String::from_utf8_lossy(&started.stderr)
+            )
+        })
+        .trim()
+        .to_string();
+    let created = publication_operation::load_operation(&root, &operation).unwrap();
+    assert!(!created.cancel_requested);
+
+    let mut cancel = assert_cmd::Command::cargo_bin("nestweaver").unwrap();
+    cancel
+        .env("NESTWEAVER_NO_DAEMON", "1")
+        .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+        .args([
+            "publication",
+            "cancel",
+            &operation,
+            "--revision",
+            &created.revision.to_string(),
+            "--db",
+        ])
+        .arg(&db)
+        .assert()
+        .success();
+
+    let rebuild = |json: bool| {
+        let mut command = assert_cmd::Command::cargo_bin("nestweaver").unwrap();
+        command
+            .env("NESTWEAVER_NO_DAEMON", "1")
+            .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
+            .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
+            .args(["publication", "rebuild", "--no-activate", "--config"])
+            .arg(&config)
+            .arg("--db")
+            .arg(&db)
+            .arg("--operation")
+            .arg(&operation);
+        if json {
+            command.arg("--json");
+        }
+        command.output().unwrap()
+    };
+
+    let refused = rebuild(false);
+    let stdout = String::from_utf8_lossy(&refused.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert_ne!(
+        refused.status.code(),
+        Some(0),
+        "a cancelled rebuild must not claim success: {stdout}{stderr}"
+    );
+    assert_eq!(refused.status.code(), Some(1), "{stdout}{stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "Publication {operation} was cancelled at revision"
+        )),
+        "failure text missing: {stdout}{stderr}"
+    );
+    assert!(
+        !stdout.contains("is Activated"),
+        "cancelled rebuild claimed activation: {stdout}"
+    );
+    assert!(
+        !stderr.contains("Publication operation:"),
+        "cancelled rebuild started a new operation: {stderr}"
+    );
+    let acknowledged = publication_operation::load_operation(&root, &operation).unwrap();
+    assert_eq!(
+        acknowledged.phase,
+        publication_operation::PublicationPhase::Cancelled
+    );
+    assert!(acknowledged.cancel_requested);
+    assert!(publication::read_current(&root).unwrap().is_none());
+
+    let json = rebuild(true);
+    let json_stdout = String::from_utf8_lossy(&json.stdout).into_owned();
+    let json_stderr = String::from_utf8_lossy(&json.stderr).into_owned();
+    assert_eq!(json.status.code(), Some(1), "{json_stdout}{json_stderr}");
+    let record: serde_json::Value = serde_json::from_str(&json_stdout).unwrap_or_else(|error| {
+        panic!("cancelled json record missing ({error}): {json_stdout}{json_stderr}")
+    });
+    assert_eq!(record["phase"], "cancelled");
+    assert_eq!(record["plan"]["operation_uuid"], operation);
+    assert_eq!(record["cancel_requested"], true);
+    assert!(publication::read_current(&root).unwrap().is_none());
+}

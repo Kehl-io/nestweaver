@@ -308,21 +308,7 @@ fn extract_headings(body: &str) -> Vec<RawHeading> {
     for node in root.descendants() {
         let data = node.data.borrow();
         if let NodeValue::Heading(h) = &data.value {
-            let mut text = String::new();
-            // comrak text concatenation — visit all descendants' Text nodes.
-            for child in node.descendants() {
-                let cdata = child.data.borrow();
-                match &cdata.value {
-                    NodeValue::Text(t) => {
-                        text.push_str(t);
-                    }
-                    NodeValue::Code(c) => {
-                        text.push_str(&c.literal);
-                    }
-                    _ => {}
-                }
-            }
-            let text = text.trim().to_string();
+            let text = collect_heading_text(node).trim().to_string();
             if text.is_empty() {
                 continue;
             }
@@ -570,6 +556,24 @@ fn yaml_to_json(value: &serde_yaml::Value) -> Result<serde_json::Value, String> 
     })
 }
 
+/// Plain text of a heading, including inline code literals.
+///
+/// Title extraction and the heading outline both use this so a heading that
+/// mixes prose with `` `code` `` stores the same string in both places.
+fn collect_heading_text<'a>(node: &'a comrak::nodes::AstNode<'a>) -> String {
+    use comrak::nodes::NodeValue;
+
+    let mut text = String::new();
+    for child in node.descendants() {
+        match &child.data.borrow().value {
+            NodeValue::Text(t) => text.push_str(t),
+            NodeValue::Code(c) => text.push_str(&c.literal),
+            _ => {}
+        }
+    }
+    text
+}
+
 /// Extract the first H1 (`# Heading`) from the body, falling back to an
 /// ATX-style match. Returns `None` if no H1 is found.
 fn extract_first_h1(body: &str) -> Option<String> {
@@ -579,19 +583,16 @@ fn extract_first_h1(body: &str) -> Option<String> {
     let root = parse_document(&arena, body, &Options::default());
 
     for node in root.descendants() {
-        if let NodeValue::Heading(h) = &node.data.borrow().value
-            && h.level == 1
-        {
-            let mut text = String::new();
-            for child in node.descendants() {
-                if let NodeValue::Text(t) = &child.data.borrow().value {
-                    text.push_str(t);
-                }
-            }
-            let trimmed = text.trim().to_string();
-            if !trimmed.is_empty() {
-                return Some(trimmed);
-            }
+        let level = match &node.data.borrow().value {
+            NodeValue::Heading(h) => h.level,
+            _ => continue,
+        };
+        if level != 1 {
+            continue;
+        }
+        let trimmed = collect_heading_text(node).trim().to_string();
+        if !trimmed.is_empty() {
+            return Some(trimmed);
         }
     }
     None
@@ -1755,6 +1756,16 @@ mod tests {
         assert!(note.word_count >= 4);
         assert_eq!(note.frontmatter, serde_json::json!({}));
         assert!(note.frontmatter_error.is_none());
+    }
+
+    #[test]
+    fn h1_mixed_with_inline_code_keeps_code_text_in_the_title() {
+        let src =
+            "# Overview `_meta.continuation` has `has_more: true` with `cursor: null`\n\nBody.\n";
+        let note = parse_markdown("notes/overview.md", src).unwrap();
+        let expected = "Overview _meta.continuation has has_more: true with cursor: null";
+        assert_eq!(note.headings[0].text, expected);
+        assert_eq!(note.title, note.headings[0].text);
     }
 
     #[test]

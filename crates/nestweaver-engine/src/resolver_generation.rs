@@ -437,7 +437,8 @@ where
     deserializer.deserialize_map(UniqueGenerations)
 }
 
-/// Strict, bounded sidecar read for a future recovery writer.
+/// Strict, bounded sidecar read, used where unreadable metadata must be
+/// reported rather than treated as stale (ranking diagnostics).
 ///
 /// Only a missing path returns `None`. Malformed/unknown shapes, duplicate
 /// entries, non-regular files, oversized records and any future generation
@@ -764,6 +765,17 @@ pub fn incompatibility_for_changed_files(
     incompatibility_for_changed_files_at(store, store.db_path(), changed_files)
 }
 
+/// [`incompatibility_for_changed_files`] for a diff that belongs to one
+/// repository. The same relative path in another repository is not an owner
+/// and is not a changed symbol.
+pub fn incompatibility_for_changed_files_in_repo(
+    store: &GraphStore,
+    repo_uid: &str,
+    changed_files: &[String],
+) -> anyhow::Result<ResolverIncompatibility> {
+    incompatibility_for_changed_files_scoped(store, store.db_path(), changed_files, Some(repo_uid))
+}
+
 /// [`incompatibility_for_changed_files`] against the sidecar of an explicit
 /// `db_path`, for hosts that carry the database path beside the store.
 /// `None` means no database file, and so nothing incompatible.
@@ -771,6 +783,15 @@ pub fn incompatibility_for_changed_files_at(
     store: &GraphStore,
     db_path: Option<&Path>,
     changed_files: &[String],
+) -> anyhow::Result<ResolverIncompatibility> {
+    incompatibility_for_changed_files_scoped(store, db_path, changed_files, None)
+}
+
+fn incompatibility_for_changed_files_scoped(
+    store: &GraphStore,
+    db_path: Option<&Path>,
+    changed_files: &[String],
+    repo_scope: Option<&str>,
 ) -> anyhow::Result<ResolverIncompatibility> {
     let Some(db_path) = db_path else {
         return Ok(ResolverIncompatibility::default());
@@ -792,9 +813,11 @@ pub fn incompatibility_for_changed_files_at(
         // unknown to the graph contributes no owner; it is disclosed as
         // unassessed by the analysis itself. A LOOKUP ERROR propagates: read
         // as "no owner" it would quietly demote a stale owner to unrelated.
-        let symbols = store
-            .symbols_in_file(file)
-            .with_context(|| format!("map changed file {file} to its repository"))?;
+        let symbols = match repo_scope {
+            Some(repo) => store.symbols_in_file_in_repo(file, repo),
+            None => store.symbols_in_file(file),
+        }
+        .with_context(|| format!("map changed file {file} to its repository"))?;
         owning.extend(
             symbols
                 .into_iter()
@@ -804,7 +827,11 @@ pub fn incompatibility_for_changed_files_at(
         let repos = store
             .repos_indexing_file(file)
             .with_context(|| format!("map changed file {file} to its repository"))?;
-        owning.extend(repos.into_iter().filter(|uid| !uid.is_empty()));
+        owning.extend(
+            repos
+                .into_iter()
+                .filter(|uid| !uid.is_empty() && repo_scope.is_none_or(|repo| uid == repo)),
+        );
     }
     let (owning_changed_files, rest): (Vec<String>, Vec<String>) = incompatible
         .into_iter()

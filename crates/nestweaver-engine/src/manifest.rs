@@ -1010,7 +1010,30 @@ pub fn try_begin_non_code_graph_mutation_publication<'a>(
     begin_graph_mutation_publication_on_lease(store, lease, operation, reason, true).map(Some)
 }
 
-fn begin_graph_mutation_publication_on_lease<'a>(
+/// Acquire both writer authorities without holding the write gate while
+/// waiting for a publisher that may need that gate to finish.
+pub(crate) fn acquire_mutation_publication_leases<'a>(
+    store: &'a nestweaver_store::GraphStore,
+    factory: Option<&crate::watcher::WatchMutationLeaseFactory>,
+    label: &'static str,
+) -> Result<
+    (
+        Option<Box<dyn crate::watcher::WatchMutationLease>>,
+        nestweaver_store::IndexPublicationLease<'a>,
+    ),
+    anyhow::Error,
+> {
+    loop {
+        let mutation = factory.map(|factory| factory(label)).transpose()?;
+        if let Some(publication) = store.try_acquire_index_publication_lease()? {
+            return Ok((mutation, publication));
+        }
+        drop(mutation);
+        store.wait_until_index_publication_unowned();
+    }
+}
+
+pub(crate) fn begin_graph_mutation_publication_on_lease<'a>(
     store: &'a nestweaver_store::GraphStore,
     lease: nestweaver_store::IndexPublicationLease<'a>,
     operation: String,

@@ -1077,6 +1077,69 @@ fn is_file_path(input: &str) -> bool {
 /// placeholder instead.
 const INVESTIGATE_HINT_MAX_CHARS: usize = 200;
 
+/// Total UTF-8 bytes of unresolved-seed text copied into the
+/// "No seeds resolved." message.
+///
+/// The not-found envelope repeats that same text in `seeds` and embeds the
+/// message, and the daemon percent-encodes the status (a 4-byte character
+/// becomes 12 bytes) and base64-encodes the details. One budget, shared by
+/// every seed and by both copies, keeps that header list under hyper's 16KiB
+/// default: one 10_000-character seed of 4-byte characters, and several
+/// over-long ASCII seeds together. Seeds whose combined text fits are echoed
+/// unchanged. Seeds that do not fit collapse into one `… (N more)` summary
+/// that stays inside the same budget.
+pub const UNRESOLVED_SEED_ECHO_BUDGET_BYTES: usize = 1024;
+
+/// Bound unresolved seeds before they are echoed into an error or a
+/// not-found envelope.
+///
+/// The whole list shares [`UNRESOLVED_SEED_ECHO_BUDGET_BYTES`]. Seeds that
+/// fit are copied whole. The first that does not fit, and every seed after
+/// it, become one `… (N more)` summary. That summary is omitted when it
+/// would itself exceed the budget.
+pub fn bound_unresolved_seed_echoes(seeds: &[String]) -> Vec<String> {
+    let mut remaining = UNRESOLVED_SEED_ECHO_BUDGET_BYTES;
+    let mut echoed = Vec::new();
+    for (index, seed) in seeds.iter().enumerate() {
+        if seed.len() <= remaining {
+            echoed.push(seed.clone());
+            remaining -= seed.len();
+            continue;
+        }
+        let summary = format!("… ({} more)", seeds.len() - index);
+        if summary.len() <= remaining {
+            echoed.push(summary);
+        }
+        break;
+    }
+    echoed
+}
+
+#[cfg(test)]
+mod unresolved_seed_echo_tests {
+    use super::*;
+
+    #[test]
+    fn many_short_unresolved_seeds_stay_inside_the_byte_budget() {
+        let seeds = vec!["unknown-seed-name".repeat(8); 500];
+        let echoed = bound_unresolved_seed_echoes(&seeds);
+        let bytes: usize = echoed.iter().map(String::len).sum();
+        assert!(
+            bytes <= UNRESOLVED_SEED_ECHO_BUDGET_BYTES,
+            "{bytes} bytes, {} entries",
+            echoed.len()
+        );
+        assert!(
+            echoed.len() < seeds.len(),
+            "the tail must collapse instead of one marker per seed"
+        );
+        assert!(
+            echoed.last().is_some_and(|last| last.contains("more")),
+            "{echoed:?}"
+        );
+    }
+}
+
 /// Build a copy-pasteable `nestweaver investigate` argument from the raw
 /// seeds a caller passed to `context` / `brain context`, so a not-found
 /// error can name the EXACT command that would have worked instead of just
@@ -3646,13 +3709,17 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         anyhow::bail!("{}", empty_seed_container_message(&empty_containers));
     }
     if seed_uids.is_empty() {
+        // nw-822: the unresolved list is echoed into the gRPC status. One
+        // shared budget covers every seed, so a multi-kilobyte miss stays a
+        // not-found error after the envelope copies the same text again.
+        let echoed_unresolved = bound_unresolved_seed_echoes(&unresolved);
         anyhow::bail!(
             "No seeds resolved. Tried as UIDs, note titles, tags (with or without '#'), symbol \
              names. Semantic enrichment requires a resolved input seed. This command resolves a NAME (UID, note title, tag, or \
              symbol name) — for a natural-language question, run `nestweaver investigate {}` \
              instead, which falls back to full-text search. Unresolved: {:?}",
             shell_single_quote_seeds(inputs),
-            unresolved,
+            echoed_unresolved,
         );
     }
 

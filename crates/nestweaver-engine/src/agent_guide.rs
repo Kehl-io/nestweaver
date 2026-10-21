@@ -605,7 +605,9 @@ pub fn generate_guide_with_tools(
     out.push_str("nestweaver ui --db ./nestweaver.lbug --port 8080\n");
     out.push_str("nestweaver ui --db ./nestweaver.lbug --port 8080 --watch  # live re-indexing\n");
     out.push_str("```\n\n");
-    out.push_str("Open `http://localhost:8080` after starting. Append `?engine=wasm` to the URL to run graph algorithms (PPR) client-side via WebAssembly — the browser downloads a MessagePack snapshot and executes queries locally with no server round-trips.\n\n");
+    // nw-752: `?engine=wasm` loads the snapshot for the status bar. `wasmPpr`
+    // has no callers, so this sentence must not claim local query execution.
+    out.push_str("Open `http://localhost:8080` after starting. Append `?engine=wasm` to load a WebAssembly copy of the graph snapshot. The browser downloads a MessagePack snapshot and the status bar shows its node and edge counts. Queries, including PPR, run on the server.\n\n");
     out.push_str("**API endpoints** (served by the running UI process):\n\n");
     out.push_str("| Endpoint | Description |\n");
     out.push_str("|----------|-------------|\n");

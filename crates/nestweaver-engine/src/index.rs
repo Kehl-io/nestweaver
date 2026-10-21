@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -109,7 +109,9 @@ pub struct CachedFileMeta {
 /// Map from repo-relative path to cached file metadata.
 pub type FileMetaCache = HashMap<String, CachedFileMeta>;
 
-/// Sidecar format version. v3 = nanosecond mtimes (nw-200). v2 = per-repo
+/// Sidecar format version. v4 moves with the resolution-deps sidecar so an
+/// upgrade that must re-resolve unresolved imports also rebuilds filemeta.
+/// v3 = nanosecond mtimes (nw-200). v2 = per-repo
 /// keying (nw-022). v1 (implicit, unversioned flat map) fails deserialization
 /// and loads as empty — a deliberate fail-open that costs one full re-index and
 /// can never mis-classify a file.
@@ -123,7 +125,7 @@ pub type FileMetaCache = HashMap<String, CachedFileMeta>;
 /// Paired with `resolution_cache::CACHE_VERSION`: bumping one requires
 /// bumping the other (both sidecars must be invalidated together), enforced
 /// by `resolution_cache::tests::cache_version_moves_with_filemeta_version`.
-pub const FILEMETA_VERSION: u32 = 3;
+pub const FILEMETA_VERSION: u32 = 4;
 
 /// On-disk shape of `<db>.filemeta.json`: change-detection metadata keyed by
 /// repo uid, then repo-relative path. Two repos sharing one DB can never
@@ -955,17 +957,26 @@ pub(crate) fn establish_index_publication_marker_with_io<'a>(
 /// left a leftover watcher-batch marker in front of a multi-hour `index_repo`
 /// parse. If the lease is owned, drop the write gate, wait until it is free,
 /// re-acquire write, then retry.
-fn acquire_index_publication_after_write_gate<'a, G, F>(
+///
+/// A snapshot collected before that wait is stale once the other publisher
+/// finalizes: it can delete files they added and overwrite files they edited.
+/// `rebuild_after_yield` runs only after a wait, once this run holds both the
+/// write gate and the publication lease, and before the dirty marker. Callers
+/// rebuild the write set from disk there, before any delete or replace.
+fn acquire_index_publication_after_write_gate<'a, G, F, R>(
     store: &'a GraphStore,
     db_path: Option<&Path>,
     operation: &str,
     io: &dyn IndexEpilogueIo,
     write_guard: &mut Option<G>,
     mut reacquire_write: F,
+    mut rebuild_after_yield: R,
 ) -> Result<nestweaver_store::IndexPublicationLease<'a>, anyhow::Error>
 where
     F: FnMut() -> Result<G, anyhow::Error>,
+    R: FnMut() -> Result<(), anyhow::Error>,
 {
+    let mut yielded = false;
     let lease = loop {
         match store.try_acquire_index_publication_lease() {
             Ok(Some(lease)) => break lease,
@@ -979,6 +990,7 @@ where
                 *write_guard = Some(reacquire_write().with_context(|| {
                     format!("{operation}: re-acquire write gate after publication yield")
                 })?);
+                yielded = true;
             }
             Err(error) => {
                 return Err(anyhow::anyhow!(
@@ -987,8 +999,604 @@ where
             }
         }
     };
+    if yielded {
+        rebuild_after_yield().with_context(|| {
+            format!("{operation}: rebuild write set from disk after publication yield")
+        })?;
+    }
     establish_index_publication_marker_on_lease(lease, db_path, operation, io)
         .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+struct ParsedPublicationFile {
+    rel_path: String,
+    lang: Language,
+    file_meta: CachedFileMeta,
+    content_hash: String,
+    symbols: Vec<RawSymbol>,
+    references: Vec<RawReference>,
+    type_bindings: Vec<AstTypeBinding>,
+    source: Option<String>,
+}
+
+struct PublicationWriteSet<'a> {
+    r_uid: &'a str,
+    repo_url: &'a str,
+    all_files: &'a mut Vec<File>,
+    all_symbols: &'a mut Vec<Symbol>,
+    repo_file_edge_pairs: &'a mut Vec<(String, String)>,
+    file_symbol_edge_pairs: &'a mut Vec<(String, String)>,
+    parsed_files_for_resolver: &'a mut Vec<ParsedFileEntry>,
+    ast_bindings_by_file: &'a mut HashMap<String, Vec<AstTypeBinding>>,
+    handler_files: &'a mut Vec<HandlerFileData>,
+    actually_changed_files: &'a mut HashSet<String>,
+    present_files: &'a mut HashSet<String>,
+    files_count: &'a mut usize,
+    files_unchanged: &'a mut usize,
+    symbols_count: &'a mut usize,
+    new_filemeta: Option<&'a mut FileMetaCache>,
+}
+
+impl PublicationWriteSet<'_> {
+    /// Drop one path from the pre-wait snapshot so a disk refresh can insert
+    /// the current parse, or so a path that left the tree is not rewritten.
+    fn forget(&mut self, rel_path: &str) {
+        let was_present = self.present_files.contains(rel_path);
+        let was_changed = self.actually_changed_files.contains(rel_path);
+        if was_present && !was_changed {
+            *self.files_unchanged = self.files_unchanged.saturating_sub(1);
+        }
+        self.present_files.remove(rel_path);
+        self.actually_changed_files.remove(rel_path);
+
+        let counted = self
+            .parsed_files_for_resolver
+            .iter()
+            .find(|(path, ..)| path == rel_path)
+            .map(|(_, symbols, ..)| symbols.len())
+            .unwrap_or_else(|| {
+                self.all_symbols
+                    .iter()
+                    .filter(|symbol| symbol.file_path == rel_path)
+                    .count()
+            });
+        *self.symbols_count = self.symbols_count.saturating_sub(counted);
+
+        let file_uid = file_uid(self.r_uid, rel_path);
+        let removed_file = self.all_files.iter().any(|file| file.path == rel_path);
+        self.all_files.retain(|file| file.path != rel_path);
+        if removed_file {
+            *self.files_count = self.files_count.saturating_sub(1);
+        }
+        self.all_symbols
+            .retain(|symbol| symbol.file_path != rel_path);
+        self.repo_file_edge_pairs
+            .retain(|(_, file)| file != &file_uid);
+        self.file_symbol_edge_pairs
+            .retain(|(file, _)| file != &file_uid);
+        self.parsed_files_for_resolver
+            .retain(|(path, ..)| path != rel_path);
+        self.ast_bindings_by_file.remove(rel_path);
+        self.handler_files
+            .retain(|handler| handler.rel_path != rel_path);
+        if let Some(cache) = self.new_filemeta.as_mut() {
+            cache.remove(rel_path);
+        }
+    }
+
+    fn record_parsed(&mut self, parsed: ParsedPublicationFile) {
+        let ParsedPublicationFile {
+            rel_path,
+            lang,
+            file_meta,
+            content_hash,
+            symbols: raw_symbols,
+            references: raw_references,
+            type_bindings: raw_type_bindings,
+            source,
+        } = parsed;
+
+        self.present_files.insert(rel_path.clone());
+        self.actually_changed_files.insert(rel_path.clone());
+
+        if let Some(cache) = self.new_filemeta.as_mut() {
+            cache.insert(rel_path.clone(), file_meta);
+        }
+
+        let f_uid = file_uid(self.r_uid, &rel_path);
+
+        self.all_files.push(File {
+            uid: f_uid.clone(),
+            path: rel_path.clone(),
+            repo_uid: self.r_uid.to_string(),
+            content_hash,
+        });
+
+        self.repo_file_edge_pairs
+            .push((self.r_uid.to_string(), f_uid.clone()));
+        *self.files_count += 1;
+
+        // F2.0: run the (previously dormant) framework detector and
+        // attach hints to the symbols it identifies. The detector keys
+        // off the lowercase language string + per-symbol signatures.
+        let mut hint_by_index: HashMap<usize, nestweaver_schema::FrameworkHint> = HashMap::new();
+        if let Some(lang_str) = crate::contracts::framework_language_str(lang) {
+            for (sym_idx, hint) in
+                nestweaver_parser::detect_frameworks(&raw_symbols, &rel_path, lang_str)
+            {
+                hint_by_index.insert(sym_idx, hint);
+            }
+        }
+
+        // F2.2: NestJS controllers carry `@Controller(...)` as a
+        // decorator on the line *above* the class, which the TS parser
+        // does not fold into the class signature, so `detect_frameworks`
+        // misses it. Recover the controller from the retained source.
+        let class_starts: Vec<(usize, u32)> = raw_symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.kind == nestweaver_schema::SymbolKind::Class)
+            .map(|(i, s)| (i, s.start_line))
+            .collect();
+        if let Some(src) = source.as_deref()
+            && let Some(ctrl_idx) =
+                crate::contracts::detect_nestjs_controller_index(src, &class_starts)
+        {
+            hint_by_index
+                .entry(ctrl_idx)
+                .or_insert_with(|| nestweaver_schema::FrameworkHint {
+                    framework: "nestjs".into(),
+                    role: "controller".into(),
+                });
+        }
+
+        // F2.2: if this file has a Spring/NestJS controller, capture the
+        // data needed to derive IMPLEMENTS_CONTRACT edges later.
+        let controller_framework = hint_by_index
+            .values()
+            .find(|h| h.role == "controller")
+            .map(|h| h.framework.clone())
+            .or_else(|| {
+                // nw-160: Express and Fastify have no controller CLASS —
+                // routes are registered inside function bodies, so their
+                // hints carry role "handler". Requiring "controller"
+                // meant those files never became handler files and no
+                // HTTP contract was ever minted from them.
+                hint_by_index
+                    .values()
+                    .find(|h| {
+                        h.role == "handler" && matches!(h.framework.as_str(), "express" | "fastify")
+                    })
+                    .map(|h| h.framework.clone())
+                    .or_else(|| {
+                        // The signature-based hint cannot see a route
+                        // registered inside a function BODY, so recover
+                        // it from the retained source.
+                        //
+                        // nw-292 (F-CT-4): this recovery is LANGUAGE
+                        // GATED. The `framework_language_str(lang)`
+                        // check above guards `detect_frameworks` only,
+                        // so this `or_else` used to run on every file of
+                        // every language — which is why NestWeaver
+                        // minted `GET /a` out of a Rust `assert_eq!`
+                        // and `POST /oauth/token` out of its own test
+                        // fixture in `contracts.rs`.
+                        source.as_deref().and_then(|src| {
+                            crate::contracts::detect_node_route_framework_for_language(
+                                src,
+                                crate::contracts::framework_language_str(lang).unwrap_or(""),
+                            )
+                            .map(str::to_string)
+                        })
+                    })
+            });
+        let mut handler_file = controller_framework.map(|framework| {
+            let class_signature = raw_symbols
+                .iter()
+                .zip(0..)
+                .find(|(_, i)| hint_by_index.get(i).is_some_and(|h| h.role == "controller"))
+                .map(|(s, _)| s.signature.clone())
+                .unwrap_or_default();
+            HandlerFileData {
+                framework,
+                class_signature,
+                rel_path: rel_path.clone(),
+                symbols: Vec::new(),
+            }
+        });
+
+        for (sym_idx, raw_sym) in raw_symbols.iter().enumerate() {
+            let s_uid = symbol_uid(self.r_uid, &rel_path, &raw_sym.name, raw_sym.start_line);
+
+            if let Some(hf) = handler_file.as_mut() {
+                hf.symbols.push((
+                    s_uid.clone(),
+                    crate::contracts::HandlerSymbol {
+                        name: raw_sym.name.clone(),
+                        signature: raw_sym.signature.clone(),
+                        start_line: raw_sym.start_line,
+                        kind: raw_sym.kind,
+                    },
+                ));
+            }
+
+            let scope_str = raw_sym.scope_chain.as_deref().unwrap_or("");
+            let canonical = canonical_symbol_id(self.repo_url, &rel_path, &raw_sym.name, scope_str);
+
+            self.all_symbols.push(Symbol {
+                uid: s_uid.clone(),
+                name: raw_sym.name.clone(),
+                kind: raw_sym.kind,
+                repo_uid: self.r_uid.to_string(),
+                file_path: rel_path.clone(),
+                start_line: raw_sym.start_line,
+                end_line: raw_sym.end_line,
+                signature: raw_sym.signature.clone(),
+                summary: None,
+                content_hash: raw_sym.content_hash.clone(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: raw_sym.is_entry_point,
+                entry_point_kind: raw_sym.entry_point_kind,
+                visibility: raw_sym.visibility,
+                type_info: raw_sym.type_info.clone(),
+                framework_hint: hint_by_index.remove(&sym_idx),
+                canonical_id: Some(canonical),
+            });
+
+            self.file_symbol_edge_pairs
+                .push((f_uid.clone(), s_uid.clone()));
+            *self.symbols_count += 1;
+        }
+
+        if let Some(hf) = handler_file.take() {
+            self.handler_files.push(hf);
+        }
+
+        if !raw_type_bindings.is_empty() {
+            self.ast_bindings_by_file
+                .insert(rel_path.clone(), raw_type_bindings);
+        }
+        self.parsed_files_for_resolver
+            .push((rel_path, raw_symbols, raw_references, source));
+    }
+}
+
+/// True when a spec path still in the tree does not have the bytes this plan
+/// hashed. OpenAPI, protobuf, and GraphQL files are not source parses, so an
+/// in-place edit leaves the path list alone and never re-parses as a source
+/// file. Callers still have to prepare the contract plan again.
+fn spec_declaration_bytes_differ(
+    reader: &dyn crate::content_reader::ContentReader,
+    spec_files: &[PathBuf],
+    input_hashes: &std::collections::BTreeMap<String, String>,
+) -> Result<bool, anyhow::Error> {
+    let repo_path = reader.root();
+    for spec_path in spec_files {
+        let rel = spec_path
+            .strip_prefix(repo_path)
+            .unwrap_or(spec_path)
+            .to_string_lossy()
+            .into_owned();
+        let current = current_spec_declaration_hash(reader, &rel)?;
+        if input_hashes.get(&rel) != current.as_ref() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Hash of a spec the contract plan would read, or `None` when that read is
+/// skipped (oversized or binary). A real IO error is returned so the caller
+/// does not publish the pre-wait plan over a spec it can no longer read.
+fn current_spec_declaration_hash(
+    reader: &dyn crate::content_reader::ContentReader,
+    rel: &str,
+) -> Result<Option<String>, anyhow::Error> {
+    match reader.read_file(Path::new(rel)) {
+        Ok(source) if (source.len() as u64) <= reader.max_source_file_bytes() => {
+            Ok(Some(crate::hash::blake3_hex(&source)))
+        }
+        Ok(_) => Ok(None),
+        Err(error)
+            if error
+                .downcast_ref::<crate::content_reader::SourceTooLarge>()
+                .is_some()
+                || error
+                    .downcast_ref::<crate::content_reader::BinarySource>()
+                    .is_some() =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error).with_context(|| format!("read watched contract spec {rel}")),
+    }
+}
+
+/// Replace the pre-wait snapshot with the working tree as it exists once this
+/// run holds the publication lease. Paths the other publisher created are
+/// parsed in; paths they edited are re-parsed; paths that left the tree are
+/// dropped before the delete/replace that follows. Spec bytes are compared
+/// even when no spec path was added or removed, and a difference prepares the
+/// contract plan again from the reader.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_full_index_write_set_from_disk(
+    reader: &dyn crate::content_reader::ContentReader,
+    store: &GraphStore,
+    set: &mut PublicationWriteSet<'_>,
+    file_languages: &mut HashMap<String, Language>,
+    spec_files: &mut Vec<PathBuf>,
+    unreadable_dirs: &mut Vec<PathBuf>,
+    skipped_files: &mut Vec<SkippedFile>,
+    parsed_cache: Option<&mut crate::parsed_cache::ParsedCache>,
+    type_envs: &mut HashMap<String, nestweaver_resolver::types::TypeEnvironment>,
+    contract_plan: &mut ContractDerivationPlan,
+    cpu_throttle: &crate::cpu_throttle::CpuThrottle,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<(), anyhow::Error> {
+    let discovered = reader
+        .list_files()
+        .context("ContentReader::list_files failed")?;
+    *unreadable_dirs = reader
+        .skipped_dirs()
+        .iter()
+        .filter(|row| row.reason == crate::content_reader::UNREADABLE_DIR_REASON)
+        .map(|row| PathBuf::from(&row.path))
+        .collect();
+
+    // The pre-wait snapshot can still name a file a watcher deleted or
+    // edited while this run waited. Existence is not enough: the graph hash
+    // has to match the bytes on disk, or the refresh would keep the
+    // watcher's content after the user undid that edit.
+    let live_hashes: HashMap<String, String> = store
+        .list_file_hashes_by_repo(set.r_uid)
+        .context("list indexed file hashes after publication yield")?
+        .into_iter()
+        .collect();
+
+    let mut snapshot_hashes: HashMap<String, String> = set
+        .all_files
+        .iter()
+        .map(|file| (file.path.clone(), file.content_hash.clone()))
+        .collect();
+    if let Some(cache) = set.new_filemeta.as_deref() {
+        for (path, meta) in cache {
+            snapshot_hashes
+                .entry(path.clone())
+                .or_insert_with(|| meta.content_hash.clone());
+        }
+    }
+    let cached_meta = set.new_filemeta.as_deref().cloned().unwrap_or_default();
+
+    let repo_path = reader.root();
+    let mut next_specs = Vec::new();
+    let mut kept: HashSet<String> = HashSet::new();
+    enum Refresh {
+        TouchMeta {
+            rel: String,
+            file_meta: CachedFileMeta,
+        },
+        Skip(SkippedFile),
+        Replace(ParsedPublicationFile),
+    }
+    let mut actions: Vec<Refresh> = Vec::new();
+
+    for rel_listed in &discovered {
+        let abs = repo_path.join(rel_listed);
+        if crate::contracts::is_spec_file(&abs.to_string_lossy()) {
+            next_specs.push(abs.clone());
+        }
+        if is_minified_or_bundled(&abs) {
+            continue;
+        }
+        let Some(lang) = detect_language(&abs) else {
+            continue;
+        };
+        let rel = abs
+            .strip_prefix(repo_path)
+            .unwrap_or(&abs)
+            .to_string_lossy()
+            .into_owned();
+        let snapshot_hash = snapshot_hashes.get(&rel).cloned();
+        let graph_hash = live_hashes.get(&rel);
+        if graph_hash.is_some()
+            && let (Some(hash), Some(meta)) = (snapshot_hash.clone(), cached_meta.get(&rel))
+            && let Some((mtime, size)) = reader.file_meta_nanos(Path::new(&rel))?
+            && mtime == meta.mtime_nanos
+            && size == meta.size_bytes
+            && meta.content_hash == hash
+            && graph_hash == Some(&hash)
+        {
+            kept.insert(rel);
+            continue;
+        }
+
+        let source = match reader.read_file(Path::new(&rel)) {
+            Ok(source) => source,
+            Err(error) => {
+                if let Some(oversized) =
+                    error.downcast_ref::<crate::content_reader::SourceTooLarge>()
+                {
+                    actions.push(Refresh::Skip(SkippedFile::oversized(
+                        rel,
+                        oversized.observed_bytes,
+                        oversized.limit_bytes,
+                    )));
+                    continue;
+                }
+                if error
+                    .downcast_ref::<crate::content_reader::BinarySource>()
+                    .is_some()
+                {
+                    actions.push(Refresh::Skip(SkippedFile::binary(rel)));
+                    continue;
+                }
+                return Err(error).with_context(|| format!("stat/read {}", abs.display()));
+            }
+        };
+        let limit_bytes = reader.max_source_file_bytes();
+        let observed_bytes = source.len() as u64;
+        if observed_bytes > limit_bytes {
+            actions.push(Refresh::Skip(SkippedFile::oversized(
+                rel,
+                observed_bytes,
+                limit_bytes,
+            )));
+            continue;
+        }
+        let content_hash = content_hash_hex(&source);
+        let (mtime_nanos, size_bytes) = reader
+            .file_meta_nanos(Path::new(&rel))?
+            .unwrap_or((0, observed_bytes));
+        let file_meta = CachedFileMeta {
+            mtime_nanos,
+            size_bytes,
+            content_hash: content_hash.clone(),
+        };
+        if graph_hash == Some(&content_hash) {
+            kept.insert(rel.clone());
+            actions.push(Refresh::TouchMeta { rel, file_meta });
+            continue;
+        }
+
+        let parsed = match parse_source(&abs, &source) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return Err(error).with_context(|| format!("parse {}", abs.display()));
+            }
+        };
+        if let Some(skipped) = parsed.unparsable_skip(rel.clone()) {
+            actions.push(Refresh::Skip(skipped));
+            continue;
+        }
+        const SOURCE_RETENTION_CAP: usize = 2 * 1024 * 1024;
+        let source = if matches!(lang, Language::TypeScript | Language::JavaScript) {
+            Some(source.clone())
+        } else if source.len() <= SOURCE_RETENTION_CAP {
+            Some(source)
+        } else {
+            None
+        };
+        kept.insert(rel.clone());
+        actions.push(Refresh::Replace(ParsedPublicationFile {
+            rel_path: rel,
+            lang,
+            file_meta,
+            content_hash,
+            symbols: parsed.symbols,
+            references: parsed.references,
+            type_bindings: parsed.type_bindings,
+            source,
+        }));
+    }
+
+    let mut parsed_cache = parsed_cache;
+    let mut changed = false;
+    for action in actions {
+        match action {
+            Refresh::TouchMeta { rel, file_meta } => {
+                if let Some(cache) = set.new_filemeta.as_mut() {
+                    cache.insert(rel, file_meta);
+                }
+            }
+            Refresh::Skip(skipped) => {
+                let was_present = set.present_files.contains(&skipped.path);
+                file_languages.remove(&skipped.path);
+                set.forget(&skipped.path);
+                changed |= was_present;
+                if !skipped_files.iter().any(|existing| {
+                    existing.path == skipped.path && existing.reason_code == skipped.reason_code
+                }) {
+                    skipped_files.push(skipped);
+                }
+            }
+            Refresh::Replace(parsed) => {
+                file_languages.insert(parsed.rel_path.clone(), parsed.lang);
+                if let Some(cache) = parsed_cache.as_deref_mut() {
+                    cache.insert(
+                        parsed.content_hash.clone(),
+                        crate::parsed_cache::CachedParseResult {
+                            symbols: parsed.symbols.clone(),
+                            references: parsed.references.clone(),
+                            type_bindings: parsed.type_bindings.clone(),
+                        },
+                    );
+                }
+                set.forget(&parsed.rel_path);
+                set.record_parsed(parsed);
+                changed = true;
+            }
+        }
+    }
+
+    let stale: Vec<String> = set
+        .present_files
+        .iter()
+        .filter(|path| !kept.contains(*path) && !path_under_unreadable_dir(path, unreadable_dirs))
+        .cloned()
+        .collect();
+    for path in stale {
+        file_languages.remove(&path);
+        set.forget(&path);
+        changed = true;
+    }
+
+    next_specs.sort();
+    let spec_paths_changed = next_specs != *spec_files;
+    if spec_paths_changed {
+        *spec_files = next_specs;
+        changed = true;
+    }
+    // Source create/edit/delete already set `changed` and will re-prepare
+    // below. This is the remaining case: the spec path list is stable, but
+    // an in-place edit changed the bytes the pre-wait plan hashed.
+    let spec_bytes_changed =
+        !changed && spec_declaration_bytes_differ(reader, spec_files, &contract_plan.input_hashes)?;
+    tracing::info!(
+        changed,
+        spec_bytes_changed,
+        files = set.present_files.len(),
+        "rebuilt index write set from disk after publication yield"
+    );
+    if !changed && !spec_bytes_changed {
+        return Ok(());
+    }
+
+    if changed {
+        set.handler_files
+            .sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+        *type_envs = build_type_environments(
+            reader,
+            set.parsed_files_for_resolver,
+            file_languages,
+            set.ast_bindings_by_file,
+            cpu_throttle,
+            cancel,
+        )?;
+    }
+    let contract_plan_result = if *set.files_unchanged == 0 {
+        prepare_contract_derivation(
+            reader,
+            set.r_uid,
+            spec_files,
+            set.handler_files,
+            set.all_symbols,
+            true,
+        )
+    } else {
+        prepare_incremental_contract_derivation(reader, set.r_uid, set.repo_url)
+    };
+    *contract_plan = match contract_plan_result {
+        Ok(plan) => plan,
+        Err(error) => {
+            if let Err(marker_error) =
+                store.set_contract_derivation_failed(set.r_uid, &error.to_string())
+            {
+                tracing::warn!("recording contract derivation failure failed: {marker_error}");
+            }
+            return Err(error).context("prepare strict contract derivation");
+        }
+    };
+    Ok(())
 }
 
 /// The marker-establishment half of [`establish_index_publication_marker_with_io`],
@@ -1046,6 +1654,39 @@ pub(crate) fn establish_index_publication_marker_on_lease<'a>(
             )
         })?;
     Ok(lease)
+}
+
+/// Preparation has not changed the graph. Retire this run's fresh marker and
+/// reservation, but preserve a recovered publication whose previous owner may
+/// already have committed changes.
+fn retire_failed_index_preparation(
+    publication: nestweaver_store::IndexPublicationLease<'_>,
+    db_path: Option<&Path>,
+    io: &dyn IndexEpilogueIo,
+    primary: anyhow::Error,
+) -> anyhow::Error {
+    if publication.is_recovered() {
+        return primary;
+    }
+    let cleanup = (|| -> Result<(), anyhow::Error> {
+        if let Some(db_path) = db_path {
+            publication
+                .store()
+                .with_index_publication_rank_barrier(|| {
+                    publication.cancel_generation()?;
+                    io.clear_marker(&crate::sidecar_path(db_path, ".index-dirty"))?;
+                    Ok::<(), anyhow::Error>(())
+                })?;
+        }
+        publication.release()?;
+        Ok(())
+    })();
+    match cleanup {
+        Ok(()) => primary,
+        Err(error) => primary.context(format!(
+            "failed to retire uncommitted index marker after preparation failure: {error:#}"
+        )),
+    }
 }
 
 fn finalize_committed_index_with_io(
@@ -3837,16 +4478,25 @@ struct IndexResolution {
     insertable_edges: Vec<nestweaver_schema::ResolvedEdge>,
     inferred_cross_repo_edges: Vec<nestweaver_schema::ResolvedEdge>,
     member_of_edges: Vec<nestweaver_schema::ResolvedEdge>,
+    /// Importer rel-path → unresolved import specifiers, for files this pass
+    /// actually resolved. Empty when resolution was skipped. nw-806.
+    unresolved_imports: HashMap<String, HashSet<String>>,
 }
 
-#[derive(Clone, Copy)]
 struct PrepareIndexResolution<'a> {
     store: &'a GraphStore,
     reader: &'a dyn crate::content_reader::ContentReader,
     r_uid: &'a str,
-    parsed_files_for_resolver: &'a [ParsedFileEntry],
+    /// Mutable so a seeded importer that filemeta left out of this view can be
+    /// parsed into it before resolution. The publication deletes outgoing
+    /// edges for every resolve-filter member; that parse has to land first.
+    parsed_files_for_resolver: &'a mut Vec<ParsedFileEntry>,
     file_languages: &'a HashMap<String, Language>,
     actually_changed_files: &'a std::collections::HashSet<String>,
+    /// Changed files that were not in the store before this pass deleted
+    /// stale file nodes. A recreated import target is in here; a modification
+    /// of a file that already had a node is not.
+    added_files: &'a std::collections::HashSet<String>,
     files_unchanged: usize,
     resolution_deps: Option<&'a crate::resolution_cache::ResolutionDeps>,
 }
@@ -3957,6 +4607,7 @@ fn prepare_index_resolution(
         parsed_files_for_resolver,
         file_languages,
         actually_changed_files,
+        added_files,
         files_unchanged,
         resolution_deps,
     } = prep;
@@ -3989,6 +4640,54 @@ fn prepare_index_resolution(
         Default::default()
     };
 
+    let skip_resolution = actually_changed_files.is_empty()
+        && resolution_deps.is_some_and(|rd| !rd.is_empty_for_repo(r_uid));
+
+    let resolve_filter = if !skip_resolution
+        && !actually_changed_files.is_empty()
+        && files_unchanged > 0
+        && resolution_deps.is_some_and(|rd| !rd.is_empty_for_repo(r_uid))
+    {
+        let deps = resolution_deps.as_ref().unwrap();
+        let mut affected = deps.affected_files_for_repo(r_uid, actually_changed_files);
+        // nw-806. Dependency rows only name files that already resolved.
+        // After a delete, the importer's row no longer names the deleted
+        // file; the specifier lives on the unresolved sidecar. Seed the same
+        // importers the incremental path would, or this filter never
+        // re-resolves them when the file is created again.
+        //
+        // An untouched importer whose filemeta hits and whose parsed cache
+        // misses stays Unchanged and never enters the resolver view. Parse it
+        // into that view before resolution. The filter names it only after
+        // that parse is included: publication deletes outgoing edges for every
+        // filter member, and naming the importer earlier drops edges this
+        // pass cannot rebuild.
+        let seeded =
+            unresolved_importers_of_added_files(reader, deps, r_uid, added_files, file_languages);
+        let included = include_missing_seeded_importer_parses(
+            reader,
+            parsed_files_for_resolver,
+            &mut type_envs,
+            file_languages,
+            &seeded,
+        );
+        for path in &seeded {
+            if !included.contains(path) {
+                affected.remove(path);
+            }
+        }
+        affected.extend(included);
+        tracing::info!(
+            changed = actually_changed_files.len(),
+            affected = affected.len(),
+            total = parsed_files_for_resolver.len(),
+            "incremental resolution"
+        );
+        Some(affected)
+    } else {
+        None
+    };
+
     {
         let all_symbols_with_returns: std::collections::HashMap<
             &str,
@@ -4007,7 +4706,7 @@ fn prepare_index_resolution(
 
         if !all_symbols_with_returns.is_empty() {
             let mut seeded = 0usize;
-            for (file_path, _symbols, _refs, source_opt) in parsed_files_for_resolver {
+            for (file_path, _symbols, _refs, source_opt) in parsed_files_for_resolver.iter() {
                 if let Some(env) = type_envs.get_mut(file_path) {
                     let source_str = match source_opt {
                         Some(s) => s.clone(),
@@ -4031,29 +4730,6 @@ fn prepare_index_resolution(
         .iter()
         .map(|(path, syms, refs, _)| (path.clone(), syms.clone(), refs.clone()))
         .collect();
-
-    let skip_resolution = actually_changed_files.is_empty()
-        && resolution_deps.is_some_and(|rd| !rd.is_empty_for_repo(r_uid));
-
-    let resolve_filter = if !skip_resolution
-        && !actually_changed_files.is_empty()
-        && files_unchanged > 0
-        && resolution_deps.is_some_and(|rd| !rd.is_empty_for_repo(r_uid))
-    {
-        let affected = resolution_deps
-            .as_ref()
-            .unwrap()
-            .affected_files_for_repo(r_uid, actually_changed_files);
-        tracing::info!(
-            changed = actually_changed_files.len(),
-            affected = affected.len(),
-            total = resolver_view.len(),
-            "incremental resolution"
-        );
-        Some(affected)
-    } else {
-        None
-    };
 
     if skip_resolution {
         tracing::info!("no files changed, skipping resolution");
@@ -4107,12 +4783,27 @@ fn prepare_index_resolution(
         .collect();
 
     resolve_pb.finish_and_clear();
+    // nw-806: remember specifiers that did not resolve so a later added file
+    // can find the importers. Only files this pass resolved are recorded;
+    // everyone else keeps the sidecar entry they already have.
+    let unresolved_imports = if skip_resolution {
+        HashMap::new()
+    } else {
+        let only = resolve_filter.clone().unwrap_or_else(|| {
+            resolver_view
+                .iter()
+                .map(|(path, _, _)| path.clone())
+                .collect()
+        });
+        unresolved_imports_for_resolved_files(&resolver_view, file_languages, &workspace_ctx, &only)
+    };
     let resolution = IndexResolution {
         skip_resolution,
         resolve_filter,
         insertable_edges,
         inferred_cross_repo_edges,
         member_of_edges,
+        unresolved_imports,
     };
     tracing::info!(
         edges_resolved = resolution.edges_count(),
@@ -4302,7 +4993,7 @@ where
     // nodes under them must be RETAINED (while the row below discloses them),
     // so both the whole-repo replacement and the vanished-file prune consult
     // this. Captured here because the recorder is cleared on every walk.
-    let unreadable_dirs: Vec<PathBuf> = reader
+    let mut unreadable_dirs: Vec<PathBuf> = reader
         .skipped_dirs()
         .iter()
         .filter(|row| row.reason == crate::content_reader::UNREADABLE_DIR_REASON)
@@ -4346,7 +5037,7 @@ where
     // Keep each scanned file's language through cached parses too. Resolving
     // an entire mixed repository with its most common language loses imports
     // from the other languages, and ties depend on HashMap iteration order.
-    let file_languages: HashMap<String, Language> = file_entries
+    let mut file_languages: HashMap<String, Language> = file_entries
         .iter()
         .map(|(path, language)| {
             (
@@ -4679,170 +5370,33 @@ where
                 type_bindings: raw_type_bindings,
                 source,
             } => {
-                present_files.insert(rel_path.clone());
-                actually_changed_files.insert(rel_path.clone());
-
-                // Record in the new filemeta cache.
-                if let Some(ref mut new_cache) = new_filemeta.as_deref_mut() {
-                    new_cache.insert(rel_path.clone(), file_meta);
+                PublicationWriteSet {
+                    r_uid: &r_uid,
+                    repo_url,
+                    all_files: &mut all_files,
+                    all_symbols: &mut all_symbols,
+                    repo_file_edge_pairs: &mut repo_file_edge_pairs,
+                    file_symbol_edge_pairs: &mut file_symbol_edge_pairs,
+                    parsed_files_for_resolver: &mut parsed_files_for_resolver,
+                    ast_bindings_by_file: &mut ast_bindings_by_file,
+                    handler_files: &mut handler_files,
+                    actually_changed_files: &mut actually_changed_files,
+                    present_files: &mut present_files,
+                    files_count: &mut files_count,
+                    files_unchanged: &mut files_unchanged,
+                    symbols_count: &mut symbols_count,
+                    new_filemeta: new_filemeta.as_deref_mut(),
                 }
-
-                let f_uid = file_uid(&r_uid, &rel_path);
-
-                all_files.push(File {
-                    uid: f_uid.clone(),
-                    path: rel_path.clone(),
-                    repo_uid: r_uid.clone(),
+                .record_parsed(ParsedPublicationFile {
+                    rel_path,
+                    lang,
+                    file_meta,
                     content_hash,
+                    symbols: raw_symbols,
+                    references: raw_references,
+                    type_bindings: raw_type_bindings,
+                    source,
                 });
-
-                repo_file_edge_pairs.push((r_uid.clone(), f_uid.clone()));
-                files_count += 1;
-
-                // F2.0: run the (previously dormant) framework detector and
-                // attach hints to the symbols it identifies. The detector keys
-                // off the lowercase language string + per-symbol signatures.
-                let mut hint_by_index: HashMap<usize, nestweaver_schema::FrameworkHint> =
-                    HashMap::new();
-                if let Some(lang_str) = crate::contracts::framework_language_str(lang) {
-                    for (sym_idx, hint) in
-                        nestweaver_parser::detect_frameworks(&raw_symbols, &rel_path, lang_str)
-                    {
-                        hint_by_index.insert(sym_idx, hint);
-                    }
-                }
-
-                // F2.2: NestJS controllers carry `@Controller(...)` as a
-                // decorator on the line *above* the class, which the TS parser
-                // does not fold into the class signature, so `detect_frameworks`
-                // misses it. Recover the controller from the retained source.
-                let class_starts: Vec<(usize, u32)> = raw_symbols
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| s.kind == nestweaver_schema::SymbolKind::Class)
-                    .map(|(i, s)| (i, s.start_line))
-                    .collect();
-                if let Some(src) = source.as_deref()
-                    && let Some(ctrl_idx) =
-                        crate::contracts::detect_nestjs_controller_index(src, &class_starts)
-                {
-                    hint_by_index.entry(ctrl_idx).or_insert_with(|| {
-                        nestweaver_schema::FrameworkHint {
-                            framework: "nestjs".into(),
-                            role: "controller".into(),
-                        }
-                    });
-                }
-
-                // F2.2: if this file has a Spring/NestJS controller, capture the
-                // data needed to derive IMPLEMENTS_CONTRACT edges later.
-                let controller_framework = hint_by_index
-                    .values()
-                    .find(|h| h.role == "controller")
-                    .map(|h| h.framework.clone())
-                    .or_else(|| {
-                        // nw-160: Express and Fastify have no controller CLASS —
-                        // routes are registered inside function bodies, so their
-                        // hints carry role "handler". Requiring "controller"
-                        // meant those files never became handler files and no
-                        // HTTP contract was ever minted from them.
-                        hint_by_index
-                            .values()
-                            .find(|h| {
-                                h.role == "handler"
-                                    && matches!(h.framework.as_str(), "express" | "fastify")
-                            })
-                            .map(|h| h.framework.clone())
-                            .or_else(|| {
-                                // The signature-based hint cannot see a route
-                                // registered inside a function BODY, so recover
-                                // it from the retained source.
-                                //
-                                // nw-292 (F-CT-4): this recovery is LANGUAGE
-                                // GATED. The `framework_language_str(lang)`
-                                // check above guards `detect_frameworks` only,
-                                // so this `or_else` used to run on every file of
-                                // every language — which is why NestWeaver
-                                // minted `GET /a` out of a Rust `assert_eq!`
-                                // and `POST /oauth/token` out of its own test
-                                // fixture in `contracts.rs`.
-                                source.as_deref().and_then(|src| {
-                                    crate::contracts::detect_node_route_framework_for_language(
-                                        src,
-                                        crate::contracts::framework_language_str(lang)
-                                            .unwrap_or(""),
-                                    )
-                                    .map(str::to_string)
-                                })
-                            })
-                    });
-                let mut handler_file = controller_framework.map(|framework| {
-                    let class_signature = raw_symbols
-                        .iter()
-                        .zip(0..)
-                        .find(|(_, i)| hint_by_index.get(i).is_some_and(|h| h.role == "controller"))
-                        .map(|(s, _)| s.signature.clone())
-                        .unwrap_or_default();
-                    HandlerFileData {
-                        framework,
-                        class_signature,
-                        rel_path: rel_path.clone(),
-                        symbols: Vec::new(),
-                    }
-                });
-
-                for (sym_idx, raw_sym) in raw_symbols.iter().enumerate() {
-                    let s_uid = symbol_uid(&r_uid, &rel_path, &raw_sym.name, raw_sym.start_line);
-
-                    if let Some(hf) = handler_file.as_mut() {
-                        hf.symbols.push((
-                            s_uid.clone(),
-                            crate::contracts::HandlerSymbol {
-                                name: raw_sym.name.clone(),
-                                signature: raw_sym.signature.clone(),
-                                start_line: raw_sym.start_line,
-                                kind: raw_sym.kind,
-                            },
-                        ));
-                    }
-
-                    let scope_str = raw_sym.scope_chain.as_deref().unwrap_or("");
-                    let canonical =
-                        canonical_symbol_id(repo_url, &rel_path, &raw_sym.name, scope_str);
-
-                    all_symbols.push(Symbol {
-                        uid: s_uid.clone(),
-                        name: raw_sym.name.clone(),
-                        kind: raw_sym.kind,
-                        repo_uid: r_uid.clone(),
-                        file_path: rel_path.clone(),
-                        start_line: raw_sym.start_line,
-                        end_line: raw_sym.end_line,
-                        signature: raw_sym.signature.clone(),
-                        summary: None,
-                        content_hash: raw_sym.content_hash.clone(),
-                        embedding: None,
-                        pagerank_score: None,
-                        is_entry_point: raw_sym.is_entry_point,
-                        entry_point_kind: raw_sym.entry_point_kind,
-                        visibility: raw_sym.visibility,
-                        type_info: raw_sym.type_info.clone(),
-                        framework_hint: hint_by_index.remove(&sym_idx),
-                        canonical_id: Some(canonical),
-                    });
-
-                    file_symbol_edge_pairs.push((f_uid.clone(), s_uid.clone()));
-                    symbols_count += 1;
-                }
-
-                if let Some(hf) = handler_file.take() {
-                    handler_files.push(hf);
-                }
-
-                if !raw_type_bindings.is_empty() {
-                    ast_bindings_by_file.insert(rel_path.clone(), raw_type_bindings);
-                }
-                parsed_files_for_resolver.push((rel_path, raw_symbols, raw_references, source));
             }
         }
     }
@@ -4911,7 +5465,7 @@ where
 
     // nw-812: type environments are CPU-throttled parse-pool work. Build
     // them before taking the write gate so a throttle wait can never hold it.
-    let type_envs = build_type_environments(
+    let mut type_envs = build_type_environments(
         reader,
         &parsed_files_for_resolver,
         &file_languages,
@@ -4939,7 +5493,7 @@ where
     // This is also the funnel the CLI index actually reaches (nw-246).
     record_data_instance(store, instance_id);
 
-    let contract_plan = match contract_plan_result {
+    let mut contract_plan = match contract_plan_result {
         Ok(plan) => plan,
         Err(error) => {
             if let Err(marker_error) =
@@ -4950,14 +5504,6 @@ where
             return Err(error).context("prepare strict contract derivation");
         }
     };
-    skipped_files.extend(contract_plan.skipped_files.iter().cloned());
-    skipped_files.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| left.reason_code.cmp(&right.reason_code))
-    });
-    skipped_files
-        .dedup_by(|left, right| left.path == right.path && left.reason_code == right.reason_code);
 
     // Last cancellation observation point. Bailing in this window needs no
     // teardown: the marker call below is what creates `.index-dirty` and
@@ -4979,10 +5525,95 @@ where
         epilogue_io,
         &mut write_guard,
         acquire_write_guard,
+        || {
+            let mut write_set = PublicationWriteSet {
+                r_uid: &r_uid,
+                repo_url,
+                all_files: &mut all_files,
+                all_symbols: &mut all_symbols,
+                repo_file_edge_pairs: &mut repo_file_edge_pairs,
+                file_symbol_edge_pairs: &mut file_symbol_edge_pairs,
+                parsed_files_for_resolver: &mut parsed_files_for_resolver,
+                ast_bindings_by_file: &mut ast_bindings_by_file,
+                handler_files: &mut handler_files,
+                actually_changed_files: &mut actually_changed_files,
+                present_files: &mut present_files,
+                files_count: &mut files_count,
+                files_unchanged: &mut files_unchanged,
+                symbols_count: &mut symbols_count,
+                new_filemeta: new_filemeta.as_deref_mut(),
+            };
+            rebuild_full_index_write_set_from_disk(
+                reader,
+                store,
+                &mut write_set,
+                &mut file_languages,
+                &mut spec_files,
+                &mut unreadable_dirs,
+                &mut skipped_files,
+                parsed_cache.as_deref_mut(),
+                &mut type_envs,
+                &mut contract_plan,
+                cpu_throttle,
+                cancel.map(|flag| flag.as_ref()),
+            )
+        },
     )?;
     let _write_guard = write_guard;
     let graph_mutation_attempted = std::cell::Cell::new(false);
     let graph_result = (|| -> Result<IndexResult, anyhow::Error> {
+        // The filesystem walk cannot enumerate a tracked source deleted from a
+        // dirty working tree. Disclose that coverage gap on every local index,
+        // including unchanged-HEAD runs through the daemon's full-index funnel.
+        // Directory-only callers may supply synthetic revisions, including full
+        // hexadecimal strings. Require a local Git administrative entry as well
+        // as a full object ID before consulting the committed tree. A failed tree
+        // listing for that repository must not publish a clean coverage report,
+        // but it is disclosed rather than blocking the working-tree index.
+        if root_path.is_some()
+            && matches!(indexed_sha.len(), 40 | 64)
+            && indexed_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && reader.root().join(".git").symlink_metadata().is_ok()
+        {
+            let mut occupied = present_files.clone();
+            occupied.extend(skipped_files.iter().map(|skipped| skipped.path.clone()));
+            match prepare_missing_committed_sources(
+                reader,
+                reader.root(),
+                indexed_sha,
+                &occupied,
+                false,
+            ) {
+                Ok(missing) => {
+                    log_unprepared_committed_sources(&missing);
+                    for outcome in missing.into_values() {
+                        if let PreparedIncrementalOutcome::PolicySkipped(skipped) = outcome
+                            && skipped.reason_code == SkipReasonCode::ReadError
+                        {
+                            skipped_files.push(skipped);
+                        }
+                    }
+                }
+                // An unknown commit is a wrong revision, not a coverage gap:
+                // recording it as indexed would be false. A known commit whose
+                // tree cannot be listed is a damaged object store.
+                Err(error)
+                    if crate::git_diff::resolve_commit_ref(reader.root(), indexed_sha).is_ok() =>
+                {
+                    skipped_files.push(unverified_committed_coverage(&error));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        skipped_files.extend(contract_plan.skipped_files.iter().cloned());
+        skipped_files.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.reason_code.cmp(&right.reason_code))
+        });
+        skipped_files.dedup_by(|left, right| {
+            left.path == right.path && left.reason_code == right.reason_code
+        });
         // Re-identify prune: when a local repo previously indexed under a
         // `file://<root_path>` identity is now indexed under a different
         // identity (its git origin remote), the old file:// node is a stale
@@ -5051,6 +5682,25 @@ where
         //     parsed file just the same and its prune skips those paths.
         let force_reindex =
             existing_repo.is_some() && files_unchanged == 0 && unreadable_dirs.is_empty();
+        // Snapshot before the per-file deletes below. Those deletes remove
+        // the nodes of files we are about to re-insert, so a later listing
+        // cannot tell a recreated file from a modification.
+        let added_files: std::collections::HashSet<String> = match store.list_files_by_repo(&r_uid)
+        {
+            Ok(stored) => {
+                let stored: std::collections::HashSet<String> =
+                    stored.into_iter().map(|(_, path)| path).collect();
+                actually_changed_files
+                    .iter()
+                    .filter(|path| !stored.contains(*path))
+                    .cloned()
+                    .collect()
+            }
+            Err(error) => {
+                tracing::warn!("listing files for unresolved-import re-resolution failed: {error}");
+                std::collections::HashSet::new()
+            }
+        };
         // nw-204: this whole-store re-index path deletes symbols too, and used
         // to discard the fact entirely. Accumulate what it removed so the
         // epilogue can tombstone the embeddings of symbols that do not come
@@ -5148,9 +5798,10 @@ where
                 store,
                 reader,
                 r_uid: &r_uid,
-                parsed_files_for_resolver: &parsed_files_for_resolver,
+                parsed_files_for_resolver: &mut parsed_files_for_resolver,
                 file_languages: &file_languages,
                 actually_changed_files: &actually_changed_files,
+                added_files: &added_files,
                 files_unchanged,
                 resolution_deps: resolution_deps.as_deref(),
             },
@@ -5299,6 +5950,9 @@ where
                             if resolved.contains(file) {
                                 let deps = file_deps.remove(file).unwrap_or_default();
                                 rd.set_deps_for_repo(&r_uid, file.clone(), deps);
+                                if let Some(specs) = resolution.unresolved_imports.get(file) {
+                                    rd.set_unresolved_for_repo(&r_uid, file.clone(), specs.clone());
+                                }
                             }
                         }
                     }
@@ -5306,6 +5960,9 @@ where
                         for (path, _, _, _) in &parsed_files_for_resolver {
                             let deps = file_deps.remove(path).unwrap_or_default();
                             rd.set_deps_for_repo(&r_uid, path.clone(), deps);
+                            if let Some(specs) = resolution.unresolved_imports.get(path) {
+                                rd.set_unresolved_for_repo(&r_uid, path.clone(), specs.clone());
+                            }
                         }
                     }
                 }
@@ -6097,6 +6754,17 @@ where
 /// 3. Emit `IMPLEMENTS_CONTRACT` edges (handler Symbol → Contract) carrying the
 ///    match confidence (1.0 exact verb+path, 0.8 base-path-inferred).
 ///
+#[cfg(test)]
+fn empty_contract_plan() -> ContractDerivationPlan {
+    ContractDerivationPlan {
+        contracts: Vec::new(),
+        edges: Vec::new(),
+        input_hashes: std::collections::BTreeMap::new(),
+        observed_input_hashes: std::collections::BTreeMap::new(),
+        skipped_files: Vec::new(),
+    }
+}
+
 pub(crate) struct ContractDerivationPlan {
     contracts: Vec<nestweaver_schema::Contract>,
     edges: Vec<nestweaver_schema::ResolvedEdge>,
@@ -6992,14 +7660,24 @@ fn incremental_index_with_name_and_io_and_authority(
     let policy_reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits)
         .unskipping(unskip)
         .excluding(excludes)?;
+    // An up-to-date repository does no work, so an inventory failure there is
+    // disclosed rather than fatal (nw-287). A changed SHA needs the walk.
+    let mut unverified_coverage = None;
+    if let Err(error) = crate::content_reader::ContentReader::list_files(&policy_reader) {
+        let error = error.context("refresh source inventory before incremental policy checks");
+        if old_sha != new_sha {
+            return Err(error);
+        }
+        unverified_coverage = Some(error);
+    }
+    let ignored_files = tracked_ignored_source_paths(&policy_reader);
     if store.get_repo_index_policy(&r_uid)?.as_deref()
         != Some(
             crate::content_reader::ContentReader::eligibility_fingerprint(&policy_reader).as_str(),
         )
-        || store
-            .list_files_by_repo(&r_uid)?
-            .iter()
-            .any(|(_, path)| !policy_reader.accepts_path(Path::new(path)))
+        || store.list_files_by_repo(&r_uid)?.iter().any(|(_, path)| {
+            !policy_reader.accepts_path(Path::new(path)) || ignored_files.contains(Path::new(path))
+        })
     {
         return full_index_fallback(
             &store,
@@ -7019,8 +7697,42 @@ fn incremental_index_with_name_and_io_and_authority(
         );
     }
 
-    // 4. Nothing changed.
-    if old_sha == new_sha {
+    // A prior run can record HEAD while disclosing a committed source it
+    // could not restore. Recheck the missing sources before the SHA shortcut:
+    // report a persistent read failure again, or restore newly readable bytes
+    // through the normal publication transaction even without a new commit.
+    let mut unchanged_result = IncrementalResult::default();
+    let mut restore_at_same_sha = false;
+    if old_sha == new_sha && unverified_coverage.is_none() {
+        let occupied = store
+            .list_files_by_repo(&r_uid)?
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        match prepare_missing_committed_sources(
+            &policy_reader,
+            repo_path,
+            &new_sha,
+            &occupied,
+            false,
+        ) {
+            Ok(missing) => {
+                restore_at_same_sha = missing
+                    .values()
+                    .any(|outcome| matches!(outcome, PreparedIncrementalOutcome::Ready(_)));
+                if !restore_at_same_sha {
+                    record_missing_committed_source_skips(&missing, &mut unchanged_result);
+                }
+            }
+            Err(error) => {
+                unverified_coverage =
+                    Some(error.context("check committed sources before unchanged-SHA shortcut"));
+            }
+        }
+    }
+
+    // 4. Nothing changed and no previously missing source can be restored.
+    if old_sha == new_sha && !restore_at_same_sha {
         // Working-tree manifests can change without a commit. This shortcut
         // does not publish a new graph generation, so invalidate derived
         // suggestions only when captured package inputs actually differ from
@@ -7050,42 +7762,12 @@ fn incremental_index_with_name_and_io_and_authority(
             tracing::info!("manifest suggestions await daemon reconciliation");
         }
         tracing::debug!(sha = old_sha, "repo is already up to date; skipping");
-        // nw-387 RESIDUAL: THE DISCLOSURE HAS TO BE DURABLE, AND THIS IS THE
-        // BRANCH THAT BROKE IT. On the item's own fixture (`canary.py` plus a
-        // committed `vendor/v.py`) run 1 reported `degraded` and exited 1; run
-        // 2 — a plain `nestweaver index` over the same unchanged tree, which is
-        // the normal CI shape — took exactly this early return, handed back
-        // `IncrementalResult::default()`, and reported `skipped_files: []`,
-        // `coverage_status: "complete"`, exit 0. The pruned tree is still
-        // missing on run 2; only the report changed. A gate a second run
-        // silently clears is worse than no gate, because it teaches people to
-        // re-run until it passes.
-        //
-        // A prune is a property of the tree and the config, not of the diff, so
-        // it must be RE-DERIVED here rather than remembered — and re-deriving it
-        // needs the walk, which is why `list_files` is called for its side
-        // effect on the recorder and its result discarded. That is a real cost
-        // on an up-to-date repo (one `ignore` walk, no parsing, no reads), paid
-        // deliberately: `nestweaver index` is user-invoked, and the alternative
-        // is a coverage claim that is only true the first time.
-        let reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits)
-            .unskipping(unskip)
-            .excluding(excludes)?;
-        let mut result = IncrementalResult::default();
-        // Fully qualified because this module deliberately does not import the
-        // `ContentReader` trait; every other call here goes through `&dyn`.
-        if let Err(error) = crate::content_reader::ContentReader::list_files(&reader) {
-            // Enumeration failure is not "nothing was pruned" (nw-287). Say so
-            // and return the clean result rather than inventing rows: the index
-            // itself is untouched on this branch, so a hard error here would
-            // fail a run that did no work.
-            tracing::warn!(
-                %error,
-                "could not re-walk an up-to-date repo; pruned directories are not \
-                 disclosed on this run"
-            );
-        } else {
-            drain_pruned_dirs_into_incremental(&reader, &mut result);
+        // The missing-source preflight already walked this reader. Reuse its
+        // disclosures rather than enumerate the same unchanged tree again.
+        let mut result = unchanged_result;
+        match unverified_coverage {
+            Some(error) => record_unverified_unchanged_coverage(&mut result, &error),
+            None => drain_pruned_dirs_into_incremental(&policy_reader, &mut result),
         }
         return Ok(result);
     }
@@ -7101,9 +7783,7 @@ fn incremental_index_with_name_and_io_and_authority(
         "processing incremental changes"
     );
 
-    let reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits)
-        .unskipping(unskip)
-        .excluding(excludes)?;
+    let reader = policy_reader;
     // nw-418/nw-652: ask the READER whether a path is skipped rather than
     // re-deriving the rule here. `unskipping` normalises the names (it trims
     // them) and the reader alone can answer the manifest probe `target` needs,
@@ -7116,56 +7796,117 @@ fn incremental_index_with_name_and_io_and_authority(
 
     // nw-008 Phase 0 — transitive reverse-dependents from the LIVE graph, BEFORE
     // any mutation (the per-file `DETACH DELETE` destroys the edges we walk).
-    let (changed_files, removed_files) = partition_changed_removed(&changes, skip_reader);
-    let rdeps = collect_reverse_dep_files(&store, &r_uid, &changed_files, &removed_files);
-    let contract_plan = match prepare_incremental_contract_derivation(&reader, &r_uid, repo_url) {
-        Ok(plan) => plan,
-        Err(error) => {
-            if let Err(marker_error) =
-                store.set_contract_derivation_failed(&r_uid, &error.to_string())
-            {
-                tracing::warn!("recording contract derivation failure failed: {marker_error}");
-            }
-            return Err(error).context("prepare incremental contract derivation");
-        }
-    };
-    // nw-664 review: through the one dedupe the per-file rows use, so a file
-    // both the contract plan and the change loop skip (a binary `.ts`) is one
-    // row and one `files_skipped`, whatever order the two report in.
-    for skipped in &contract_plan.skipped_files {
-        record_incremental_file_outcome(
-            &mut result,
-            IncrementalFileOutcome::PolicySkipped(skipped.clone()),
-        );
-    }
-    // nw-387 RESIDUAL: the changed-file half of the same durability problem.
-    // Free here — `prepare_incremental_contract_derivation` has just walked the
-    // tree via `list_files`, so the recorder is populated and current.
-    //
-    // This is also what covers the per-file `skips_path(rel_path)`
-    // `continue`s in the change loop below, which are silent by construction: a
-    // file added under `vendor/` is dropped there with no row, and the pruned
-    // DIRECTORY reported here is the same artefact the full scan reports for
-    // the same repo. Disclosing at directory granularity keeps the two commands
-    // saying the same thing.
-    drain_pruned_dirs_into_incremental(&reader, &mut result);
-    let prepared_files =
-        prepare_incremental_files(&reader, &changes).context("prepare incremental source files")?;
-
+    let (mut changed_files, mut removed_files) = partition_changed_removed(&changes, skip_reader);
+    let mut occupied: HashSet<String> = store
+        .list_files_by_repo(&r_uid)
+        .with_context(|| "list files before restoring committed sources")?
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect();
+    occupied.extend(paths_covered_by_changes(&changes));
+    let mut missing_committed =
+        prepare_missing_committed_sources(skip_reader, repo_path, &new_sha, &occupied, false)
+            .context("prepare committed sources missing from the graph")?;
+    extend_changed_with_missing_sources(&mut changed_files, &missing_committed);
+    let mut rdeps = collect_reverse_dep_files(&store, &r_uid, &changed_files, &removed_files);
+    extend_rdeps_for_added_files(
+        skip_reader,
+        &store,
+        Some(db_path),
+        &r_uid,
+        &changed_files,
+        &removed_files,
+        &mut rdeps,
+    );
     let publication = establish_index_publication_marker_with_io(
         &store,
         Some(db_path),
         "incremental index",
         epilogue_io,
     )?;
+    let prepared_plan = (|| -> Result<_, anyhow::Error> {
+        // The publication lease may have waited on another writer. Re-read the
+        // tree before this transaction stores source prepared before that wait.
+        (changed_files, removed_files) = partition_changed_removed(&changes, skip_reader);
+        occupied = store
+            .list_files_by_repo(&r_uid)
+            .with_context(|| "list files after incremental publication lease")?
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        occupied.extend(paths_covered_by_changes(&changes));
+        missing_committed =
+            prepare_missing_committed_sources(skip_reader, repo_path, &new_sha, &occupied, true)
+                .context("rebuild committed sources missing from the graph")?;
+        extend_changed_with_missing_sources(&mut changed_files, &missing_committed);
+        rdeps = collect_reverse_dep_files(&store, &r_uid, &changed_files, &removed_files);
+        extend_rdeps_for_added_files(
+            skip_reader,
+            &store,
+            Some(db_path),
+            &r_uid,
+            &changed_files,
+            &removed_files,
+            &mut rdeps,
+        );
+        let prepared_files = prepare_incremental_files(&reader, &changes)
+            .context("rebuild incremental source files after publication lease")?;
+        let contract_plan = match prepare_incremental_contract_derivation(&reader, &r_uid, repo_url)
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                if let Err(marker_error) =
+                    store.set_contract_derivation_failed(&r_uid, &error.to_string())
+                {
+                    tracing::warn!("recording contract derivation failure failed: {marker_error}");
+                }
+                return Err(error)
+                    .context("rebuild incremental contract plan after publication lease");
+            }
+        };
+        Ok((prepared_files, contract_plan))
+    })();
+    let (prepared_files, contract_plan) = match prepared_plan {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Err(retire_failed_index_preparation(
+                publication,
+                Some(db_path),
+                epilogue_io,
+                error,
+            ));
+        }
+    };
+    // Recorded from the post-lease plan: the publication wait can change which
+    // files the walk skips. A file both this plan and the change loop skip is
+    // one row, because `record_incremental_file_outcome` dedupes by path.
+    for skipped in &contract_plan.skipped_files {
+        record_incremental_file_outcome(
+            &mut result,
+            IncrementalFileOutcome::PolicySkipped(skipped.clone()),
+        );
+    }
+    // `prepare_incremental_contract_derivation` has just walked the tree, so
+    // the prune recorder is current. A directory added under `vendor/` is
+    // dropped by the change loop with no row; this discloses that directory.
+    drain_pruned_dirs_into_incremental(&reader, &mut result);
 
     // Wrap the entire incremental update in a single transaction so that a
     // crash mid-index doesn't leave partial data in the store. The indexed
     // SHA is updated inside the transaction — if we crash before commit, the
-    // next run replays from the old SHA.
-    let txn = store
-        .begin_transaction()
-        .with_context(|| "begin incremental transaction")?;
+    // next run replays from the old SHA. Nothing has been written yet, so a
+    // failure to begin retires this run's fresh marker like preparation does.
+    let txn = match store.begin_transaction() {
+        Ok(txn) => txn,
+        Err(error) => {
+            return Err(retire_failed_index_preparation(
+                publication,
+                Some(db_path),
+                epilogue_io,
+                anyhow::Error::from(error).context("begin incremental transaction"),
+            ));
+        }
+    };
 
     for change in &changes {
         match change {
@@ -7335,6 +8076,19 @@ fn incremental_index_with_name_and_io_and_authority(
         }
     }
 
+    // A source already in this tree is absent from `indexed_sha..HEAD`. Put it
+    // back before the SHA write in this same transaction, then re-resolve.
+    write_missing_committed_sources_on(
+        skip_reader,
+        &missing_committed,
+        &r_uid,
+        repo_url,
+        &store,
+        &txn,
+        &mut result,
+    )
+    .context("restore committed sources missing from the graph")?;
+
     // nw-008 Phase 2 — re-resolve reverse-dependents and surgically restore the
     // cross-file edges the per-file `DETACH DELETE` removed (same transaction).
     let reresolved = reresolve_affected_dependents(&reader, &txn, &r_uid, &changed_files, &rdeps)?;
@@ -7374,6 +8128,15 @@ fn incremental_index_with_name_and_io_and_authority(
     if let Err(error) = store.clear_contract_derivation_failed(&r_uid) {
         tracing::warn!("clearing contract derivation marker failed: {error}");
     }
+    persist_unresolved_imports(
+        &reader,
+        &store,
+        db_path,
+        &r_uid,
+        &changed_files,
+        &removed_files,
+        &rdeps,
+    );
 
     // AFTER the commit, never before: a modified file has its symbols deleted
     // and re-inserted under the same UIDs, so the pre-commit graph would report
@@ -7394,6 +8157,7 @@ fn incremental_index_with_name_and_io_and_authority(
         true,
     )?;
     append_incremental_parses(Some(db_path), &prepared_files);
+    append_incremental_parses(Some(db_path), &missing_committed);
 
     Ok(result)
 }
@@ -7450,15 +8214,60 @@ where
         });
     }
 
+    // An up-to-date repository does no work, so an inventory failure there is
+    // disclosed rather than fatal (nw-287). A changed SHA needs the walk.
+    if let Err(error) = reader.list_files() {
+        let error = error.context("refresh source inventory before incremental policy checks");
+        if old_sha != new_sha {
+            return Err(error);
+        }
+        let mut result = IncrementalResult::default();
+        record_unverified_unchanged_coverage(&mut result, &error);
+        return Ok(result);
+    }
+    let ignored_files = tracked_ignored_source_paths(reader);
     let mut policy_removed: std::collections::HashSet<String> = store
         .list_files_by_repo(&r_uid)?
         .into_iter()
-        .filter_map(|(_, path)| (!reader.accepts_path(Path::new(&path))).then_some(path))
+        .filter_map(|(_, path)| {
+            (!reader.accepts_path(Path::new(&path)) || ignored_files.contains(Path::new(&path)))
+                .then_some(path)
+        })
         .collect();
 
     if old_sha == new_sha && policy_removed.is_empty() {
-        tracing::debug!(sha = old_sha, "repo is already up to date; skipping");
-        return Ok(IncrementalResult::default());
+        let occupied = store
+            .list_files_by_repo(&r_uid)?
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        let missing = match prepare_missing_committed_sources(
+            reader,
+            git_repo_path,
+            new_sha,
+            &occupied,
+            false,
+        ) {
+            Ok(missing) => missing,
+            Err(error) => {
+                let mut result = IncrementalResult::default();
+                record_unverified_unchanged_coverage(
+                    &mut result,
+                    &error.context("check committed sources before unchanged-SHA shortcut"),
+                );
+                return Ok(result);
+            }
+        };
+        if !missing
+            .values()
+            .any(|outcome| matches!(outcome, PreparedIncrementalOutcome::Ready(_)))
+        {
+            tracing::debug!(sha = old_sha, "repo is already up to date; skipping");
+            let mut result = IncrementalResult::default();
+            record_missing_committed_source_skips(&missing, &mut result);
+            drain_pruned_dirs_into_incremental(reader, &mut result);
+            return Ok(result);
+        }
     }
 
     if !crate::git_diff::is_ancestor(git_repo_path, &old_sha, new_sha) {
@@ -7507,14 +8316,34 @@ where
     // nw-008 Phase 0 — compute transitive reverse-dependents from the LIVE
     // graph BEFORE any mutation. The per-file `DETACH DELETE` below destroys the
     // edges we walk here, so this ordering is correctness-critical.
-    let (changed_files, removed_files) = partition_changed_removed(&changes, skip_reader);
-    let rdeps = collect_reverse_dep_files(store, &r_uid, &changed_files, &removed_files);
+    let (mut changed_files, mut removed_files) = partition_changed_removed(&changes, skip_reader);
+    let mut occupied: HashSet<String> = store
+        .list_files_by_repo(&r_uid)
+        .with_context(|| "list files before restoring committed sources")?
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect();
+    occupied.extend(paths_covered_by_changes(&changes));
+    let mut missing_committed =
+        prepare_missing_committed_sources(skip_reader, git_repo_path, new_sha, &occupied, false)
+            .context("prepare committed sources missing from the graph")?;
+    extend_changed_with_missing_sources(&mut changed_files, &missing_committed);
+    let mut rdeps = collect_reverse_dep_files(store, &r_uid, &changed_files, &removed_files);
+    extend_rdeps_for_added_files(
+        skip_reader,
+        store,
+        store.db_path(),
+        &r_uid,
+        &changed_files,
+        &removed_files,
+        &mut rdeps,
+    );
     let contract_plan_result = prepare_incremental_contract_derivation(reader, &r_uid, repo_url);
-    let prepared_files = prepare_incremental_files(reader, &changes)
+    let mut prepared_files = prepare_incremental_files(reader, &changes)
         .context("prepare server incremental source files")?;
 
     let mut write_guard = Some(acquire_write_guard()?);
-    let contract_plan = match contract_plan_result {
+    let mut contract_plan = match contract_plan_result {
         Ok(plan) => plan,
         Err(error) => {
             if let Err(marker_error) =
@@ -7532,6 +8361,56 @@ where
         &FileSystemIndexEpilogueIo,
         &mut write_guard,
         acquire_write_guard,
+        || {
+            // The other publisher may have added or deleted files while this
+            // run waited. Rebuild the restore set, not only the diff files.
+            (changed_files, removed_files) = partition_changed_removed(&changes, skip_reader);
+            occupied = store
+                .list_files_by_repo(&r_uid)
+                .with_context(|| "list files after publication yield")?
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect();
+            occupied.extend(paths_covered_by_changes(&changes));
+            missing_committed = prepare_missing_committed_sources(
+                skip_reader,
+                git_repo_path,
+                new_sha,
+                &occupied,
+                true,
+            )
+            .context("rebuild committed sources missing from the graph")?;
+            extend_changed_with_missing_sources(&mut changed_files, &missing_committed);
+            rdeps = collect_reverse_dep_files(store, &r_uid, &changed_files, &removed_files);
+            extend_rdeps_for_added_files(
+                skip_reader,
+                store,
+                store.db_path(),
+                &r_uid,
+                &changed_files,
+                &removed_files,
+                &mut rdeps,
+            );
+            prepared_files = prepare_incremental_files(reader, &changes)
+                .context("rebuild server incremental source files after publication yield")?;
+            contract_plan = match prepare_incremental_contract_derivation(reader, &r_uid, repo_url)
+            {
+                Ok(plan) => plan,
+                Err(error) => {
+                    if let Err(marker_error) =
+                        store.set_contract_derivation_failed(&r_uid, &error.to_string())
+                    {
+                        tracing::warn!(
+                            "recording contract derivation failure failed: {marker_error}"
+                        );
+                    }
+                    return Err(error).context(
+                        "rebuild server incremental contract plan after publication yield",
+                    );
+                }
+            };
+            Ok(())
+        },
     )?;
     let _write_guard = write_guard;
     let txn = store
@@ -7726,6 +8605,19 @@ where
         }
     }
 
+    // A source already in this tree is absent from `indexed_sha..HEAD`. Put it
+    // back before the SHA write in this same transaction, then re-resolve.
+    write_missing_committed_sources_on(
+        skip_reader,
+        &missing_committed,
+        &r_uid,
+        repo_url,
+        store,
+        &txn,
+        &mut result,
+    )
+    .context("restore committed sources missing from the graph")?;
+
     // nw-008 Phase 2 — re-resolve the reverse-dependents computed in Phase 0
     // and surgically restore the cross-file edges that the per-file
     // `DETACH DELETE` removed (same transaction).
@@ -7763,6 +8655,17 @@ where
     if let Err(error) = store.clear_contract_derivation_failed(&r_uid) {
         tracing::warn!("clearing contract derivation marker failed: {error}");
     }
+    if let Some(db_path) = store.db_path() {
+        persist_unresolved_imports(
+            reader,
+            store,
+            db_path,
+            &r_uid,
+            &changed_files,
+            &removed_files,
+            &rdeps,
+        );
+    }
 
     // See the note at the sibling call site: this must follow the commit.
     tombstone_deleted_symbol_embeddings_after_commit(
@@ -7781,6 +8684,7 @@ where
         true,
     )?;
     append_incremental_parses(store.db_path(), &prepared_files);
+    append_incremental_parses(store.db_path(), &missing_committed);
 
     Ok(result)
 }
@@ -7902,6 +8806,273 @@ fn prepare_incremental_file(
     }))
 }
 
+fn paths_covered_by_changes(changes: &[crate::git_diff::FileChange]) -> HashSet<String> {
+    let mut paths = HashSet::new();
+    for change in changes {
+        match change {
+            crate::git_diff::FileChange::Added(path)
+            | crate::git_diff::FileChange::Modified(path)
+            | crate::git_diff::FileChange::Deleted(path) => {
+                paths.insert(path.to_string_lossy().into_owned());
+            }
+            crate::git_diff::FileChange::Renamed { from, to } => {
+                paths.insert(from.to_string_lossy().into_owned());
+                paths.insert(to.to_string_lossy().into_owned());
+            }
+        }
+    }
+    paths
+}
+
+/// Individually logged committed sources that could not be prepared per run.
+const MAX_LOGGED_UNPREPARED: usize = 10;
+
+/// Log only the final restore plan, once its caller has finished preparing and
+/// refreshing after publication waits. Preflights must not multiply warnings.
+fn log_unprepared_committed_sources(missing: &HashMap<String, PreparedIncrementalOutcome>) {
+    // Sorted so the individually logged paths are the same on every run.
+    let mut unprepared: Vec<&SkippedFile> = missing
+        .values()
+        .filter_map(|outcome| match outcome {
+            PreparedIncrementalOutcome::PolicySkipped(skipped)
+                if skipped.reason_code == SkipReasonCode::ReadError =>
+            {
+                Some(skipped)
+            }
+            _ => None,
+        })
+        .collect();
+    unprepared.sort_by(|left, right| left.path.cmp(&right.path));
+    for skipped in unprepared.iter().take(MAX_LOGGED_UNPREPARED) {
+        tracing::warn!(
+            path = %skipped.path,
+            error = %skipped.reason,
+            "committed source could not be prepared; leaving it out of the graph"
+        );
+    }
+    let unprepared = unprepared.len();
+    if unprepared > MAX_LOGGED_UNPREPARED {
+        tracing::warn!(
+            unprepared,
+            logged = MAX_LOGGED_UNPREPARED,
+            "more committed sources could not be prepared than were logged individually"
+        );
+    }
+}
+
+/// An unchanged SHA did no work, so an inventory failure must not fail the run
+/// (nw-287). Disclose it so coverage does not read complete either.
+fn record_unverified_unchanged_coverage(result: &mut IncrementalResult, error: &anyhow::Error) {
+    record_incremental_file_outcome(
+        result,
+        IncrementalFileOutcome::PolicySkipped(unverified_committed_coverage(error)),
+    );
+}
+
+/// A committed-tree listing failure (for example a damaged object store) must
+/// neither block indexing the working tree nor let coverage read complete.
+fn unverified_committed_coverage(error: &anyhow::Error) -> SkippedFile {
+    tracing::warn!(
+        error = %format!("{error:#}"),
+        "could not verify committed source coverage"
+    );
+    SkippedFile::new(
+        ".".to_string(),
+        SkipReasonCode::ReadError,
+        format!(
+            "committed source coverage could not be verified ({error:#}); repair the \
+             repository and re-run the index"
+        ),
+    )
+}
+
+fn tracked_ignored_source_paths(
+    reader: &dyn crate::content_reader::ContentReader,
+) -> HashSet<PathBuf> {
+    reader
+        .skipped_dirs()
+        .into_iter()
+        .filter(|row| row.reason == crate::content_reader::TRACKED_BUT_IGNORED_REASON)
+        .map(|row| PathBuf::from(row.path))
+        .collect()
+}
+
+/// Indexable paths in `sha`'s tree that the graph does not hold and that this
+/// run's diff does not already cover.
+///
+/// `git diff indexed_sha..HEAD` is empty for a source that was committed at or
+/// before `indexed_sha` and then dropped from the graph. Advancing the SHA
+/// without putting that path back leaves it missing forever.
+fn prepare_missing_committed_sources(
+    reader: &dyn crate::content_reader::ContentReader,
+    git_repo_path: &Path,
+    sha: &str,
+    already_present: &HashSet<String>,
+    refresh_inventory: bool,
+) -> Result<HashMap<String, PreparedIncrementalOutcome>, anyhow::Error> {
+    // The commit tree is a superset of the filesystem reader's accepted
+    // inventory. Refresh its disclosures before restoring holes: a tracked
+    // gitignored file must stay excluded, and an unreadable subtree is already
+    // represented by one directory-level ReadError rather than one per child.
+    if refresh_inventory {
+        reader
+            .list_files()
+            .context("refresh source inventory before restoring committed sources")?;
+    }
+    let disclosures = reader.skipped_dirs();
+    let unreadable_dirs: Vec<PathBuf> = disclosures
+        .iter()
+        .filter(|row| row.reason == crate::content_reader::UNREADABLE_DIR_REASON)
+        .map(|row| PathBuf::from(&row.path))
+        .collect();
+    let ignored_files: HashSet<PathBuf> = disclosures
+        .into_iter()
+        .filter(|row| row.reason == crate::content_reader::TRACKED_BUT_IGNORED_REASON)
+        .map(|row| PathBuf::from(row.path))
+        .collect();
+    let mut prepared = HashMap::new();
+    for path in crate::git_diff::list_commit_paths(git_repo_path, sha)
+        .context("list committed paths before recording HEAD")?
+    {
+        let rel = path.to_string_lossy();
+        if already_present.contains(rel.as_ref())
+            || path_under_unreadable_dir(rel.as_ref(), &unreadable_dirs)
+            || ignored_files.contains(&path)
+            || !reader.accepts_path(&path)
+            || reader.skips_path(&path)
+            || !is_parseable(&path)
+            || committed_source_needs_no_restore(reader, &path)
+        {
+            continue;
+        }
+        match prepare_incremental_file(reader, &path) {
+            Ok(outcome) => {
+                prepared.insert(rel.into_owned(), outcome);
+            }
+            // Restoring a missing source is best effort. A committed path can
+            // be unreadable (a directory the walk already discloses as a
+            // ReadError, a mode-000 file), absent from a dirty working tree
+            // (deleted or renamed without a commit), or unparsable. Failing
+            // the index here would block every later commit until the tree
+            // is repaired. The path stays out of the graph, is disclosed as a
+            // `ReadError` skip so coverage does not read complete, and is
+            // retried on the next index, even when HEAD has not changed.
+            Err(error) => {
+                prepared.insert(
+                    rel.into_owned(),
+                    PreparedIncrementalOutcome::PolicySkipped(SkippedFile::new(
+                        path.to_string_lossy().into_owned(),
+                        SkipReasonCode::ReadError,
+                        format!(
+                            "committed source could not be read or parsed ({error:#}), so it \
+                             is not in the graph; restore it and re-run the index"
+                        ),
+                    )),
+                );
+            }
+        }
+    }
+    Ok(prepared)
+}
+
+/// Oversized and minified sources are policy skips. Stat them instead of
+/// reading and parsing a file the restore will discard. Files that cannot be
+/// stat'ed are left to the caller so the failure is disclosed.
+fn committed_source_needs_no_restore(
+    reader: &dyn crate::content_reader::ContentReader,
+    path: &Path,
+) -> bool {
+    if is_minified_or_bundled(&reader.root().join(path)) {
+        return true;
+    }
+    match reader.file_meta_nanos(path) {
+        Ok(Some((_, bytes))) => bytes > reader.max_source_file_bytes(),
+        // `None` means this reader has no filesystem metadata (a bare git
+        // repo), not that the path is missing.
+        Ok(None) => false,
+        // A path that cannot even be stat'ed (deleted from the working tree,
+        // or in an unreadable directory) is NOT skipped here: it falls through
+        // to `prepare_incremental_file`, fails, and is disclosed as a
+        // `ReadError` skip instead of vanishing.
+        Err(_) => false,
+    }
+}
+
+fn extend_changed_with_missing_sources(
+    changed: &mut HashSet<String>,
+    missing: &HashMap<String, PreparedIncrementalOutcome>,
+) {
+    for (path, outcome) in missing {
+        if matches!(outcome, PreparedIncrementalOutcome::Ready(_)) {
+            changed.insert(path.clone());
+        }
+    }
+}
+
+/// Preserve missing-source disclosure on a read-only unchanged-SHA run.
+/// Deliberate policy skips do not require a graph publication just to retry
+/// restoring them; a source that becomes readable takes the normal write path.
+fn record_missing_committed_source_skips(
+    missing: &HashMap<String, PreparedIncrementalOutcome>,
+    result: &mut IncrementalResult,
+) {
+    log_unprepared_committed_sources(missing);
+    for outcome in missing.values() {
+        if let PreparedIncrementalOutcome::PolicySkipped(skipped) = outcome {
+            record_incremental_file_outcome(
+                result,
+                IncrementalFileOutcome::PolicySkipped(skipped.clone()),
+            );
+        }
+    }
+}
+
+/// Insert prepared committed sources that this transaction has not already
+/// written. Call before `update_repo_sha_on` so a crash rolls the SHA and the
+/// restored file back together.
+fn write_missing_committed_sources_on(
+    reader: &dyn crate::content_reader::ContentReader,
+    missing: &HashMap<String, PreparedIncrementalOutcome>,
+    r_uid: &str,
+    repo_url: &str,
+    store: &nestweaver_store::GraphStore,
+    txn: &nestweaver_store::DbConnection<'_>,
+    result: &mut IncrementalResult,
+) -> Result<(), anyhow::Error> {
+    log_unprepared_committed_sources(missing);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let present: HashSet<String> = nestweaver_store::GraphStore::list_files_by_repo_on(txn, r_uid)
+        .with_context(|| "list files before restoring committed sources")?
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect();
+    for (path, outcome) in missing {
+        if present.contains(path) {
+            continue;
+        }
+        match outcome {
+            PreparedIncrementalOutcome::Excluded => {}
+            PreparedIncrementalOutcome::PolicySkipped(skipped) => {
+                record_incremental_file_outcome(
+                    result,
+                    IncrementalFileOutcome::PolicySkipped(skipped.clone()),
+                );
+            }
+            PreparedIncrementalOutcome::Ready(prepared) => {
+                let outcome = write_prepared_incremental_file_txn(
+                    reader, prepared, r_uid, repo_url, store, txn,
+                )?;
+                if record_incremental_file_outcome(result, outcome) {
+                    result.files_added += 1;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn prepare_incremental_files(
     reader: &dyn crate::content_reader::ContentReader,
     changes: &[crate::git_diff::FileChange],
@@ -7911,6 +9082,7 @@ fn prepare_incremental_files(
     // cannot disagree about which files exist. They used to: the loop's
     // `expect("parseable added file was prepared")` is only sound because both
     // sides apply the identical predicate.
+    let ignored_files = tracked_ignored_source_paths(reader);
     let mut prepared = HashMap::new();
     for change in changes {
         let path = match change {
@@ -7921,6 +9093,13 @@ fn prepare_incremental_files(
         };
         let Some(path) = path else { continue };
         if reader.skips_path(path) || !is_parseable(path) {
+            continue;
+        }
+        if ignored_files.contains(path) {
+            prepared.insert(
+                path.to_string_lossy().into_owned(),
+                PreparedIncrementalOutcome::Excluded,
+            );
             continue;
         }
         prepared.insert(
@@ -8123,6 +9302,386 @@ fn partition_changed_removed(
 /// per-file `DETACH DELETE` in the mutation loop destroys the very edges this
 /// query reads.
 ///
+/// nw-806. An added file has no reverse edges: they left with the previous
+/// copy, and an import that never resolved never had one. Seed importers
+/// whose persisted unresolved specifiers name the new path so the re-resolve
+/// pass rebuilds those edges.
+pub(crate) fn extend_rdeps_for_added_files(
+    reader: &dyn crate::content_reader::ContentReader,
+    store: &GraphStore,
+    db_path: Option<&Path>,
+    r_uid: &str,
+    changed: &HashSet<String>,
+    removed: &HashSet<String>,
+    rdeps: &mut HashSet<String>,
+) {
+    let Some(db_path) = db_path else {
+        return;
+    };
+    // Added paths are a subset of `changed`. A delete-only batch has nothing
+    // for an unresolved specifier to start naming.
+    if changed.is_empty() {
+        return;
+    }
+    let deps = crate::resolution_cache::ResolutionDeps::load(&crate::sidecar_path(
+        db_path,
+        ".resolution_deps.bin",
+    ));
+    let Some(unresolved) = deps.unresolved_for_repo(r_uid) else {
+        return;
+    };
+    if unresolved.is_empty() {
+        return;
+    }
+    let Ok(listed) = store.list_files_by_repo(r_uid) else {
+        tracing::warn!("listing files for unresolved-import re-resolution failed");
+        return;
+    };
+    let existing: HashSet<String> = listed.into_iter().map(|(_, path)| path).collect();
+    let added: HashSet<String> = changed
+        .iter()
+        .filter(|path| !existing.contains(*path))
+        .cloned()
+        .collect();
+    if added.is_empty() {
+        return;
+    }
+    let mut known = existing;
+    for path in removed {
+        known.remove(path);
+    }
+    known.extend(changed.iter().cloned());
+    let seeded = importers_of_added_paths(reader, unresolved, &added, &known);
+    if seeded.is_empty() {
+        return;
+    }
+    tracing::info!(
+        count = seeded.len(),
+        "re-resolving files whose unresolved imports name an added file"
+    );
+    rdeps.extend(seeded);
+}
+
+/// After a committed incremental or watcher batch, refresh unresolved import
+/// specifiers for the files this batch re-resolved (and drop entries for
+/// files that are gone). A delete-only batch does not re-resolve — the
+/// target's edges die with its symbols — so this parse is what records the
+/// specifier the next create has to find.
+pub(crate) fn persist_unresolved_imports(
+    reader: &dyn crate::content_reader::ContentReader,
+    store: &GraphStore,
+    db_path: &Path,
+    r_uid: &str,
+    changed: &HashSet<String>,
+    removed: &HashSet<String>,
+    rdeps: &HashSet<String>,
+) {
+    let mut refresh = rdeps.clone();
+    refresh.extend(changed.iter().cloned());
+    for path in removed {
+        refresh.remove(path);
+    }
+    if refresh.is_empty() && removed.is_empty() {
+        return;
+    }
+    let path = crate::sidecar_path(db_path, ".resolution_deps.bin");
+    let mut deps = crate::resolution_cache::ResolutionDeps::load(&path);
+    if !removed.is_empty() {
+        deps.drop_files_for_repo(r_uid, removed);
+    }
+    if !refresh.is_empty() {
+        match store.list_files_by_repo(r_uid) {
+            Ok(listed) => {
+                let known: HashSet<String> = listed.into_iter().map(|(_, file)| file).collect();
+                for (file, specifiers) in unresolved_imports_on_disk(reader, &known, &refresh) {
+                    deps.set_unresolved_for_repo(r_uid, file, specifiers);
+                }
+            }
+            Err(error) => {
+                tracing::warn!("listing files to persist unresolved imports failed: {error}");
+            }
+        }
+    }
+    if let Err(error) = deps.save(&path) {
+        tracing::warn!("failed to save unresolved import specifiers: {error:#}");
+    }
+}
+
+fn language_uses_workspace_context(language: Language) -> bool {
+    matches!(
+        language,
+        Language::JavaScript
+            | Language::TypeScript
+            | Language::Vue
+            | Language::Svelte
+            | Language::Astro
+    )
+}
+
+/// Workspace packages and tsconfig aliases for import resolution. This is the
+/// discovery `build_reresolve_edges_unlogged` uses, so a stored alias or
+/// workspace specifier maps onto the same path the re-resolve pass sees.
+fn workspace_context_for_languages(
+    reader: &dyn crate::content_reader::ContentReader,
+    languages: impl IntoIterator<Item = Language>,
+) -> nestweaver_resolver::WorkspaceContext {
+    if languages.into_iter().any(language_uses_workspace_context) {
+        discover_workspace_context_with(|path| {
+            reader
+                .read_file(path)
+                .map_err(|error| std::io::Error::other(error.to_string()))
+        })
+    } else {
+        nestweaver_resolver::WorkspaceContext::default()
+    }
+}
+
+/// Importers whose unresolved specifiers resolve to a path in `added`.
+///
+/// nw-806. The full-index resolve filter starts from dependency rows, which
+/// no longer name a file once its delete has been indexed. This is the same
+/// importer set [`importers_of_added_paths`] feeds the incremental path.
+fn unresolved_importers_of_added_files(
+    reader: &dyn crate::content_reader::ContentReader,
+    deps: &crate::resolution_cache::ResolutionDeps,
+    r_uid: &str,
+    added: &HashSet<String>,
+    file_languages: &HashMap<String, Language>,
+) -> HashSet<String> {
+    if added.is_empty() {
+        return HashSet::new();
+    }
+    let Some(unresolved) = deps
+        .unresolved_for_repo(r_uid)
+        .filter(|slice| !slice.is_empty())
+    else {
+        return HashSet::new();
+    };
+    let known: HashSet<String> = file_languages.keys().cloned().collect();
+    importers_of_added_paths(reader, unresolved, added, &known)
+}
+
+/// Parse seeded importers that are missing from `parsed_files` into that view.
+///
+/// nw-806. Filemeta can classify an untouched importer as Unchanged when the
+/// parsed cache misses or is stale. Resolution only sees
+/// `parsed_files_for_resolver`, so the importer's edges are rebuilt only when
+/// this parse is included. Callers must add a seeded path to the resolve
+/// filter — the set whose outgoing edges are deleted — only when this returns
+/// it.
+///
+/// Returns the seeded paths present in `parsed_files` after the attempt,
+/// including importers that were already in the view.
+fn include_missing_seeded_importer_parses(
+    reader: &dyn crate::content_reader::ContentReader,
+    parsed_files: &mut Vec<ParsedFileEntry>,
+    type_envs: &mut HashMap<String, nestweaver_resolver::types::TypeEnvironment>,
+    file_languages: &HashMap<String, Language>,
+    seeded: &HashSet<String>,
+) -> HashSet<String> {
+    let mut present: HashSet<String> = parsed_files
+        .iter()
+        .map(|(path, _, _, _)| path.clone())
+        .collect();
+    for rel_path in seeded {
+        if present.contains(rel_path) {
+            continue;
+        }
+        let Some(language) = file_languages
+            .get(rel_path)
+            .copied()
+            .or_else(|| detect_language(Path::new(rel_path)))
+        else {
+            tracing::warn!(
+                file = %rel_path,
+                "seeded importer has no detected language; leaving its edges in place"
+            );
+            continue;
+        };
+        let Ok(source) = reader.read_file(Path::new(rel_path)) else {
+            tracing::warn!(
+                file = %rel_path,
+                "seeded importer could not be read; leaving its edges in place"
+            );
+            continue;
+        };
+        let Ok(parsed) = parse_source(&reader.root().join(rel_path), &source) else {
+            tracing::warn!(
+                file = %rel_path,
+                "seeded importer could not be parsed; leaving its edges in place"
+            );
+            continue;
+        };
+        if parsed.unparsable_skip(rel_path.clone()).is_some() {
+            tracing::warn!(
+                file = %rel_path,
+                "seeded importer was unparsable; leaving its edges in place"
+            );
+            continue;
+        }
+        let env = nestweaver_resolver::types::TypeEnvironment::build(
+            &source,
+            language,
+            &parsed.symbols,
+            &parsed.type_bindings,
+        );
+        if env.binding_count() > 0 || env.has_scoped_call_assignments() {
+            type_envs.insert(rel_path.clone(), env);
+        }
+        // Same retention rule as a normal parse: JS/TS keep source for
+        // decorator recovery; other languages keep it under 2 MB.
+        const SOURCE_RETENTION_CAP: usize = 2 * 1024 * 1024;
+        let retained = if matches!(language, Language::TypeScript | Language::JavaScript)
+            || source.len() <= SOURCE_RETENTION_CAP
+        {
+            Some(source)
+        } else {
+            None
+        };
+        parsed_files.push((
+            rel_path.clone(),
+            parsed.symbols,
+            parsed.references,
+            retained,
+        ));
+        present.insert(rel_path.clone());
+    }
+    seeded
+        .iter()
+        .filter(|path| present.contains(path.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Files in `unresolved` whose stored specifiers resolve to a path in `added`
+/// once `known_files` (including the added paths) is the resolution set.
+fn importers_of_added_paths(
+    reader: &dyn crate::content_reader::ContentReader,
+    unresolved: &HashMap<String, HashSet<String>>,
+    added: &HashSet<String>,
+    known_files: &HashSet<String>,
+) -> HashSet<String> {
+    let mut by_lang: HashMap<Language, Vec<String>> = HashMap::new();
+    for file in unresolved.keys() {
+        let Some(language) = detect_language(Path::new(file)) else {
+            continue;
+        };
+        by_lang.entry(language).or_default().push(file.clone());
+    }
+    let workspace = workspace_context_for_languages(reader, by_lang.keys().copied());
+    let known: HashSet<&str> = known_files.iter().map(String::as_str).collect();
+    let mut seeded = HashSet::new();
+    for (language, importers) in by_lang {
+        for importer in importers {
+            let Some(specs) = unresolved.get(&importer) else {
+                continue;
+            };
+            let names_added = specs.iter().any(|specifier| {
+                nestweaver_resolver::imports::resolved_import_path(
+                    &importer, specifier, &known, language, &workspace,
+                )
+                .is_some_and(|target| target != importer && added.contains(&target))
+            });
+            if names_added {
+                seeded.insert(importer);
+            }
+        }
+    }
+    seeded
+}
+
+fn unresolved_imports_on_disk(
+    reader: &dyn crate::content_reader::ContentReader,
+    known_files: &HashSet<String>,
+    refresh: &HashSet<String>,
+) -> HashMap<String, HashSet<String>> {
+    let mut languages = HashMap::new();
+    let mut references = HashMap::new();
+    let mut parsed = HashSet::new();
+    for rel in refresh {
+        let Some(language) = detect_language(Path::new(rel)) else {
+            continue;
+        };
+        let Ok(source) = reader.read_file(Path::new(rel)) else {
+            continue;
+        };
+        let Ok(parsed_file) = parse_source(&reader.root().join(rel), &source) else {
+            continue;
+        };
+        languages.insert(rel.clone(), language);
+        parsed.insert(rel.clone());
+        references.insert(rel.clone(), parsed_file.references);
+    }
+    let workspace = workspace_context_for_languages(reader, languages.values().copied());
+    unresolved_import_specifiers(&references, known_files, &languages, &workspace, &parsed)
+}
+
+/// Unresolved import specifiers for `only`, resolved against `known_files`.
+/// An empty set means the file was resolved and every import specifier hit a
+/// known file — callers use that to clear a stale entry.
+///
+/// Resolves each specifier directly. Building an import graph would walk an
+/// export map for every known path, including files this batch did not parse.
+fn unresolved_import_specifiers(
+    references: &HashMap<String, Vec<RawReference>>,
+    known_files: &HashSet<String>,
+    languages: &HashMap<String, Language>,
+    workspace: &nestweaver_resolver::WorkspaceContext,
+    only: &HashSet<String>,
+) -> HashMap<String, HashSet<String>> {
+    let known: HashSet<&str> = known_files.iter().map(String::as_str).collect();
+    let mut out = HashMap::new();
+    for path in only {
+        let Some(language) = languages.get(path) else {
+            continue;
+        };
+        let Some(file_refs) = references.get(path) else {
+            continue;
+        };
+        let mut specs = HashSet::new();
+        for reference in file_refs {
+            let specifier = match reference.kind {
+                nestweaver_parser::ReferenceKind::Import
+                | nestweaver_parser::ReferenceKind::Includes
+                | nestweaver_parser::ReferenceKind::Uses => Some(reference.name.as_str()),
+                nestweaver_parser::ReferenceKind::ImportAlias if !reference.context.is_empty() => {
+                    Some(reference.context.as_str())
+                }
+                _ => None,
+            };
+            if let Some(specifier) = specifier.filter(|specifier| !specifier.is_empty())
+                && nestweaver_resolver::imports::resolved_import_path(
+                    path, specifier, &known, *language, workspace,
+                )
+                .is_none()
+            {
+                specs.insert(specifier.to_string());
+            }
+        }
+        out.insert(path.clone(), specs);
+    }
+    out
+}
+
+/// Specifiers that failed to resolve for files in `only` that this pass
+/// actually parsed. Known paths include every scanned file, not only the
+/// parsed subset, so an unchanged target is not recorded as unresolved.
+fn unresolved_imports_for_resolved_files(
+    resolver_view: &[(String, Vec<RawSymbol>, Vec<RawReference>)],
+    file_languages: &HashMap<String, Language>,
+    workspace: &nestweaver_resolver::WorkspaceContext,
+    only: &HashSet<String>,
+) -> HashMap<String, HashSet<String>> {
+    let known_files: HashSet<String> = file_languages.keys().cloned().collect();
+    let mut references = HashMap::new();
+    for (path, _symbols, file_refs) in resolver_view {
+        if only.contains(path) {
+            references.insert(path.clone(), file_refs.clone());
+        }
+    }
+    unresolved_import_specifiers(&references, &known_files, file_languages, workspace, only)
+}
+
 /// `pub(crate)` so the live code watcher (`watch_code.rs`) can run the same
 /// nw-008 Phase 0 — without it a watcher reindex loses every cross-file edge
 /// incident to the re-indexed file.
@@ -8508,24 +10067,7 @@ fn build_reresolve_edges_unlogged(
         }
     }
 
-    let workspace_ctx = if file_languages.values().any(|language| {
-        matches!(
-            language,
-            Language::JavaScript
-                | Language::TypeScript
-                | Language::Vue
-                | Language::Svelte
-                | Language::Astro
-        )
-    }) {
-        discover_workspace_context_with(|p| {
-            reader
-                .read_file(p)
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        })
-    } else {
-        Default::default()
-    };
+    let workspace_ctx = workspace_context_for_languages(reader, file_languages.values().copied());
 
     // Unchanged JS/TS targets need their exact public keys, not just stored
     // symbol visibility. Hydrate direct targets of scoped files, then only
@@ -9459,6 +11001,582 @@ mod tests {
         git
     }
 
+    /// An up-to-date index did no work. A committed-tree listing failure must
+    /// not fail it, and must not let coverage read complete either.
+    #[test]
+    fn unchanged_sha_discloses_unverifiable_committed_sources_without_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("kept.py"), "def kept():\n    return 1\n").unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let sha = git(&["rev-parse", "HEAD"]);
+        let db = dir.path().join("graph.lbug");
+        let url = "https://example.test/unverifiable-unchanged";
+        index_directory(&repo, &db, "test", url, &sha).unwrap();
+        let generation = fs::read(crate::sidecar_path(&db, ".generation")).unwrap();
+        let tree = git(&["rev-parse", "HEAD^{tree}"]);
+        fs::remove_file(repo.join(".git/objects").join(&tree[..2]).join(&tree[2..])).unwrap();
+
+        let result = incremental_index(&repo, &db, "test", url)
+            .expect("an unchanged SHA must not fail on an unlistable commit tree");
+        assert_eq!(result.files_added, 0);
+        assert_eq!(result.skipped_files.len(), 1, "{:?}", result.skipped_files);
+        assert_eq!(result.skipped_files[0].path, ".");
+        assert_eq!(
+            result.skipped_files[0].reason_code,
+            SkipReasonCode::ReadError
+        );
+        assert_eq!(
+            fs::read(crate::sidecar_path(&db, ".generation")).unwrap(),
+            generation
+        );
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert!(!store.is_index_publication_dirty());
+        assert!(!store.lookup_symbols_by_name("kept").unwrap().is_empty());
+    }
+
+    #[test]
+    fn force_and_incremental_keep_tracked_gitignored_sources_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("kept.py"), "def kept():\n    return 1\n").unwrap();
+        fs::write(repo.join("ignored.py"), "def ignored():\n    return 2\n").unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let db = dir.path().join("graph.lbug");
+        let url = "https://example.test/tracked-ignored-consistency";
+        index_directory(&repo, &db, "test", url, &git(&["rev-parse", "HEAD"])).unwrap();
+        {
+            let store = GraphStore::open_or_create(&db).unwrap();
+            assert!(!store.lookup_symbols_by_name("ignored").unwrap().is_empty());
+        }
+        fs::write(repo.join(".gitignore"), "ignored.py\n").unwrap();
+        git(&["add", ".gitignore"]);
+        git(&["commit", "-q", "-m", "ignore previously tracked source"]);
+        let sha = git(&["rev-parse", "HEAD"]);
+        let assert_excluded = |skips: &[SkippedFile]| {
+            assert_eq!(skips.len(), 1, "{skips:?}");
+            assert_eq!(skips[0].path, "ignored.py");
+            assert_eq!(skips[0].reason_code, SkipReasonCode::Ignored);
+            let store = GraphStore::open_or_create(&db).unwrap();
+            assert!(store.lookup_symbols_by_name("ignored").unwrap().is_empty());
+            assert!(
+                store
+                    .lookup_symbols_by_name("changed_ignored")
+                    .unwrap()
+                    .is_empty()
+            );
+        };
+        let introduced_rule = incremental_index(&repo, &db, "test", url).unwrap();
+        assert!(introduced_rule.fell_back_to_full);
+        assert_excluded(&introduced_rule.skipped_files);
+        for _ in 0..2 {
+            let full =
+                index_directory_with_options(&repo, &db, "test", url, &sha, true, None).unwrap();
+            assert_excluded(&full.skipped_files);
+            let generation = fs::read(crate::sidecar_path(&db, ".generation")).unwrap();
+            let plain = incremental_index(&repo, &db, "test", url).unwrap();
+            assert_excluded(&plain.skipped_files);
+            assert_eq!(plain.files_added, 0);
+            assert_eq!(
+                fs::read(crate::sidecar_path(&db, ".generation")).unwrap(),
+                generation
+            );
+        }
+        fs::write(
+            repo.join("ignored.py"),
+            "def changed_ignored():\n    return 3\n",
+        )
+        .unwrap();
+        git(&["add", "-u"]);
+        git(&["commit", "-q", "-m", "edit tracked ignored source"]);
+        let changed = incremental_index(&repo, &db, "test", url).unwrap();
+        assert_excluded(&changed.skipped_files);
+    }
+
+    #[test]
+    fn server_incremental_retracts_tracked_gitignored_incumbent_at_same_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("kept.py"), "def kept():\n    return 1\n").unwrap();
+        fs::write(repo.join("ignored.py"), "def ignored():\n    return 2\n").unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let sha = git(&["rev-parse", "HEAD"]);
+        let url = "https://example.test/server-ignore-policy";
+        let (_, store) = index_directory_in_memory(&repo, "test", url, &sha).unwrap();
+        assert!(!store.lookup_symbols_by_name("ignored").unwrap().is_empty());
+        fs::write(repo.join(".gitignore"), "ignored.py\n").unwrap();
+        let reader = crate::content_reader::FilesystemReader::new(&repo);
+        let result = incremental_index_with_reader_and_write_gate(
+            &reader,
+            &repo,
+            &store,
+            "test",
+            url,
+            &sha,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(result.files_deleted, 1);
+        assert_eq!(result.skipped_files.len(), 1);
+        assert_eq!(result.skipped_files[0].path, "ignored.py");
+        assert!(store.lookup_symbols_by_name("ignored").unwrap().is_empty());
+        let generation = store.graph_generation();
+        let repeated = incremental_index_with_reader_and_write_gate(
+            &reader,
+            &repo,
+            &store,
+            "test",
+            url,
+            &sha,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(repeated.files_added, 0);
+        assert_eq!(repeated.skipped_files.len(), 1);
+        assert_eq!(store.graph_generation(), generation);
+    }
+
+    #[test]
+    fn full_local_index_tree_listing_failure_retires_uncommitted_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("kept.py"), "def kept():\n    return 1\n").unwrap();
+        let _git = commit_all_in(&repo, "initial");
+        let db = dir.path().join("graph.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let generation = store.graph_generation();
+        let reader = crate::content_reader::FilesystemReader::new(&repo);
+        let local_root = repo.display().to_string();
+        let error = index_into_store(
+            &reader,
+            &store,
+            "test",
+            "https://example.test/unknown-commit",
+            &"a".repeat(40),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&local_root),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("list committed paths"));
+        assert_eq!(store.graph_generation(), generation);
+        assert!(!store.is_index_publication_dirty());
+        assert_eq!(store.count_symbols().unwrap(), 0);
+    }
+
+    /// The daemon's index funnel: a known commit whose tree cannot be listed
+    /// (a damaged object store) still indexes the working tree, but coverage
+    /// discloses that committed sources were not verified.
+    #[test]
+    fn full_local_index_discloses_unlistable_commit_tree_without_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("kept.py"), "def kept():\n    return 1\n").unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let sha = git(&["rev-parse", "HEAD"]);
+        let tree = git(&["rev-parse", "HEAD^{tree}"]);
+        fs::remove_file(repo.join(".git/objects").join(&tree[..2]).join(&tree[2..])).unwrap();
+        let store = GraphStore::in_memory().unwrap();
+        let reader = crate::content_reader::FilesystemReader::new(&repo);
+        let local_root = repo.display().to_string();
+        let result = index_into_store(
+            &reader,
+            &store,
+            "test",
+            "https://example.test/unlistable-tree",
+            &sha,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&local_root),
+        )
+        .expect("a damaged commit tree must not block indexing the working tree");
+        assert_eq!(result.skipped_files.len(), 1, "{:?}", result.skipped_files);
+        assert_eq!(result.skipped_files[0].path, ".");
+        assert_eq!(
+            result.skipped_files[0].reason_code,
+            SkipReasonCode::ReadError
+        );
+        assert_eq!(store.lookup_symbols_by_name("kept").unwrap().len(), 1);
+        assert!(!store.is_index_publication_dirty());
+    }
+
+    #[test]
+    fn full_local_index_accepts_non_git_directory_with_hexadecimal_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("kept.py"), "def kept():\n    return 1\n").unwrap();
+        let (result, store) = index_directory_in_memory(
+            dir.path(),
+            "test",
+            "https://example.test/non-git-directory",
+            &"a".repeat(40),
+        )
+        .unwrap();
+        assert!(result.skipped_files.is_empty());
+        assert_eq!(store.lookup_symbols_by_name("kept").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn full_local_index_discloses_missing_committed_sources_until_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("kept.py"), "def kept():\n    return 1\n").unwrap();
+        let missing = repo.join("missing.py");
+        let source = "def restored_same_sha():\n    return 2\n";
+        fs::write(&missing, source).unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let sha = git(&["rev-parse", "HEAD"]);
+        fs::remove_file(&missing).unwrap();
+        let store = GraphStore::in_memory().unwrap();
+        let reader = crate::content_reader::FilesystemReader::new(&repo);
+        let local_root = repo.display().to_string();
+        let run = || {
+            index_into_store(
+                &reader,
+                &store,
+                "test",
+                "https://example.test/full-missing-source",
+                &sha,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&local_root),
+            )
+            .unwrap()
+        };
+        for _ in 0..2 {
+            let result = run();
+            assert!(result.skipped_files.iter().any(|skipped| {
+                skipped.path == "missing.py" && skipped.reason_code == SkipReasonCode::ReadError
+            }));
+            assert!(
+                store
+                    .lookup_symbols_by_name("restored_same_sha")
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        fs::write(&missing, source).unwrap();
+        assert!(run().skipped_files.is_empty());
+        assert_eq!(
+            store
+                .lookup_symbols_by_name("restored_same_sha")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(run().skipped_files.is_empty());
+    }
+
+    /// A committed file missing from the graph and deleted in the worktree
+    /// is not in `git diff`. Restoring it used to stat a missing path and
+    /// fail the whole incremental index, so `indexed_sha` never moved.
+    #[test]
+    fn uncommitted_deletion_of_a_graph_hole_does_not_fail_incremental_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/kept.py"), "def kept():\n    return 1\n").unwrap();
+        fs::write(repo.join("src/gone.py"), "def gone():\n    return 2\n").unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let db = dir.path().join("graph.lbug");
+        let url = "https://example.test/uncommitted-delete";
+        let head = git(&["rev-parse", "HEAD"]);
+        index_directory_with_options_and_limits(
+            &repo,
+            &db,
+            "test",
+            url,
+            &head,
+            true,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+        {
+            let store = nestweaver_store::GraphStore::open(&db).unwrap();
+            let repo_uid = nestweaver_schema::repo_uid("test", url);
+            let files = store.list_files_by_repo(&repo_uid).unwrap();
+            let (uid, _) = files
+                .iter()
+                .find(|(_, path)| path == "src/gone.py")
+                .expect("gone.py was indexed");
+            store.delete_file_node(uid).unwrap();
+        }
+        fs::remove_file(repo.join("src/gone.py")).unwrap();
+        fs::write(repo.join("src/later.py"), "def later():\n    return 3\n").unwrap();
+        git(&["add", "src/later.py"]);
+        git(&["commit", "-q", "-m", "later"]);
+        let indexed = incremental_index(&repo, &db, "test", url)
+            .expect("a missing worktree file must not abort the incremental index");
+        assert_eq!(indexed.files_added, 1, "{indexed:?}");
+    }
+
+    /// After a publication yield, identical bytes are not "already indexed"
+    /// when a watcher deleted the file's nodes. The refresh has to put the
+    /// path back into the write set as a change.
+    #[test]
+    fn yield_refresh_reinserts_a_file_the_graph_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let rel = "src/kept.py";
+        let source = "def kept():\n    return 1\n";
+        fs::write(repo.join(rel), source).unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let db = dir.path().join("graph.lbug");
+        let url = "https://example.test/yield-refresh";
+        let head = git(&["rev-parse", "HEAD"]);
+        index_directory_with_options_and_limits(
+            &repo,
+            &db,
+            "test",
+            url,
+            &head,
+            true,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+
+        let store = nestweaver_store::GraphStore::open(&db).unwrap();
+        let r_uid = nestweaver_schema::repo_uid("test", url);
+        let files = store.list_files_by_repo(&r_uid).unwrap();
+        let (uid, _) = files
+            .iter()
+            .find(|(_, path)| path == rel)
+            .expect("kept.py was indexed");
+        store.delete_file_node(uid).unwrap();
+        assert!(
+            store.list_files_by_repo(&r_uid).unwrap().is_empty(),
+            "the graph no longer holds the file"
+        );
+
+        let reader = crate::content_reader::FilesystemReader::with_limits(
+            &repo,
+            crate::index_limits::IndexLimits::default(),
+        );
+        let (mtime_nanos, size_bytes) = crate::content_reader::ContentReader::file_meta_nanos(
+            &reader,
+            std::path::Path::new(rel),
+        )
+        .unwrap()
+        .unwrap();
+        let content_hash = content_hash_hex(source);
+        let mut all_files = vec![nestweaver_schema::File {
+            uid: uid.clone(),
+            path: rel.to_string(),
+            repo_uid: r_uid.clone(),
+            content_hash: content_hash.clone(),
+        }];
+        let mut all_symbols = Vec::new();
+        let mut repo_file_edge_pairs = Vec::new();
+        let mut file_symbol_edge_pairs = Vec::new();
+        let mut parsed_files_for_resolver = Vec::new();
+        let mut ast_bindings_by_file = HashMap::new();
+        let mut handler_files = Vec::new();
+        let mut actually_changed_files = HashSet::new();
+        let mut present_files = HashSet::from([rel.to_string()]);
+        let mut files_count = 1usize;
+        let mut files_unchanged = 1usize;
+        let mut symbols_count = 0usize;
+        let mut filemeta = HashMap::from([(
+            rel.to_string(),
+            CachedFileMeta {
+                mtime_nanos,
+                size_bytes,
+                content_hash,
+            },
+        )]);
+        let mut file_languages = HashMap::new();
+        let mut spec_files = Vec::new();
+        let mut unreadable_dirs = Vec::new();
+        let mut skipped_files = Vec::new();
+        let mut type_envs = HashMap::new();
+        let mut contract_plan = empty_contract_plan();
+        let mut write_set = PublicationWriteSet {
+            r_uid: &r_uid,
+            repo_url: url,
+            all_files: &mut all_files,
+            all_symbols: &mut all_symbols,
+            repo_file_edge_pairs: &mut repo_file_edge_pairs,
+            file_symbol_edge_pairs: &mut file_symbol_edge_pairs,
+            parsed_files_for_resolver: &mut parsed_files_for_resolver,
+            ast_bindings_by_file: &mut ast_bindings_by_file,
+            handler_files: &mut handler_files,
+            actually_changed_files: &mut actually_changed_files,
+            present_files: &mut present_files,
+            files_count: &mut files_count,
+            files_unchanged: &mut files_unchanged,
+            symbols_count: &mut symbols_count,
+            new_filemeta: Some(&mut filemeta),
+        };
+        rebuild_full_index_write_set_from_disk(
+            &reader,
+            &store,
+            &mut write_set,
+            &mut file_languages,
+            &mut spec_files,
+            &mut unreadable_dirs,
+            &mut skipped_files,
+            None,
+            &mut type_envs,
+            &mut contract_plan,
+            crate::cpu_throttle::CpuThrottle::global(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            actually_changed_files.contains(rel),
+            "identical bytes must be rewritten when the graph lost the file; changed={actually_changed_files:?}"
+        );
+        assert!(all_files.iter().any(|file| file.path == rel));
+    }
+
+    /// A watcher can index an edit and the user can undo it before this run
+    /// publishes. The snapshot hash then matches the bytes on disk, and the
+    /// graph still holds the watcher's hash. Existence is not enough: the
+    /// refresh has to rewrite the path.
+    #[test]
+    fn yield_refresh_rewrites_a_file_whose_graph_hash_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let rel = "src/kept.py";
+        let source = "def kept():\n    return 1\n";
+        fs::write(repo.join(rel), source).unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let db = dir.path().join("graph.lbug");
+        let url = "https://example.test/yield-hash";
+        let head = git(&["rev-parse", "HEAD"]);
+        index_directory_with_options_and_limits(
+            &repo,
+            &db,
+            "test",
+            url,
+            &head,
+            true,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+
+        let store = nestweaver_store::GraphStore::open(&db).unwrap();
+        let r_uid = nestweaver_schema::repo_uid("test", url);
+        let files = store.list_files_by_repo(&r_uid).unwrap();
+        let (uid, _) = files
+            .iter()
+            .find(|(_, path)| path == rel)
+            .expect("kept.py was indexed");
+        let content_hash = content_hash_hex(source);
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: uid.clone(),
+                path: rel.to_string(),
+                repo_uid: r_uid.clone(),
+                content_hash: "watcher-edit-then-undo".to_string(),
+            })
+            .unwrap();
+        let live = store
+            .list_file_hashes_by_repo(&r_uid)
+            .unwrap()
+            .into_iter()
+            .find(|(path, _)| path == rel)
+            .map(|(_, hash)| hash);
+        assert_ne!(live.as_deref(), Some(content_hash.as_str()));
+
+        let reader = crate::content_reader::FilesystemReader::with_limits(
+            &repo,
+            crate::index_limits::IndexLimits::default(),
+        );
+        let (mtime_nanos, size_bytes) = crate::content_reader::ContentReader::file_meta_nanos(
+            &reader,
+            std::path::Path::new(rel),
+        )
+        .unwrap()
+        .unwrap();
+        let mut all_files = vec![nestweaver_schema::File {
+            uid: uid.clone(),
+            path: rel.to_string(),
+            repo_uid: r_uid.clone(),
+            content_hash: content_hash.clone(),
+        }];
+        let mut all_symbols = Vec::new();
+        let mut repo_file_edge_pairs = Vec::new();
+        let mut file_symbol_edge_pairs = Vec::new();
+        let mut parsed_files_for_resolver = Vec::new();
+        let mut ast_bindings_by_file = HashMap::new();
+        let mut handler_files = Vec::new();
+        let mut actually_changed_files = HashSet::new();
+        let mut present_files = HashSet::from([rel.to_string()]);
+        let mut files_count = 1usize;
+        let mut files_unchanged = 1usize;
+        let mut symbols_count = 0usize;
+        let mut filemeta = HashMap::from([(
+            rel.to_string(),
+            CachedFileMeta {
+                mtime_nanos,
+                size_bytes,
+                content_hash,
+            },
+        )]);
+        let mut file_languages = HashMap::new();
+        let mut spec_files = Vec::new();
+        let mut unreadable_dirs = Vec::new();
+        let mut skipped_files = Vec::new();
+        let mut type_envs = HashMap::new();
+        let mut contract_plan = empty_contract_plan();
+        let mut write_set = PublicationWriteSet {
+            r_uid: &r_uid,
+            repo_url: url,
+            all_files: &mut all_files,
+            all_symbols: &mut all_symbols,
+            repo_file_edge_pairs: &mut repo_file_edge_pairs,
+            file_symbol_edge_pairs: &mut file_symbol_edge_pairs,
+            parsed_files_for_resolver: &mut parsed_files_for_resolver,
+            ast_bindings_by_file: &mut ast_bindings_by_file,
+            handler_files: &mut handler_files,
+            actually_changed_files: &mut actually_changed_files,
+            present_files: &mut present_files,
+            files_count: &mut files_count,
+            files_unchanged: &mut files_unchanged,
+            symbols_count: &mut symbols_count,
+            new_filemeta: Some(&mut filemeta),
+        };
+        rebuild_full_index_write_set_from_disk(
+            &reader,
+            &store,
+            &mut write_set,
+            &mut file_languages,
+            &mut spec_files,
+            &mut unreadable_dirs,
+            &mut skipped_files,
+            None,
+            &mut type_envs,
+            &mut contract_plan,
+            crate::cpu_throttle::CpuThrottle::global(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            actually_changed_files.contains(rel),
+            "disk bytes that disagree with the graph hash must be rewritten; changed={actually_changed_files:?}"
+        );
+    }
+
     /// nw-664 review: a binary file with a contract-language extension (an
     /// MPEG transport stream is `.ts`) used to fail a plain incremental index
     /// in strict contract derivation ("prepare incremental contract
@@ -9684,6 +11802,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first.files_count, 1, "the readable file is still indexed");
+        assert_eq!(
+            first.skipped_files.len(),
+            1,
+            "directory disclosure must cover its descendants"
+        );
         let row = first
             .skipped_files
             .iter()
@@ -9707,12 +11830,22 @@ mod tests {
             second.skipped_files
         );
         assert_eq!(second.files_skipped, second.skipped_files.len());
+        assert_eq!(
+            second.skipped_files.len(),
+            1,
+            "unchanged SHA must not expand directory disclosure"
+        );
 
         fs::write(repo.join("later.py"), "def later():\n    return 3\n").unwrap();
         git(&["add", "later.py"]);
         git(&["commit", "-q", "-m", "later"]);
         let third = incremental_index(&repo, &db, "test", repo_url).unwrap();
         assert_eq!(third.files_added, 1, "precondition: the new file landed");
+        assert_eq!(
+            third.skipped_files.len(),
+            1,
+            "changed SHA must not expand directory disclosure"
+        );
         assert!(
             third.skipped_files.iter().any(is_locked_row),
             "the changed-file incremental branch must disclose it too: {:?}",
@@ -10756,6 +12889,7 @@ mod tests {
             &FileSystemIndexEpilogueIo,
             &mut write_guard,
             reacquire,
+            || Ok(()),
         )
         .expect("yield must break the deadlock");
         assert!(
@@ -10764,6 +12898,247 @@ mod tests {
         );
         drop(lease);
         watcher.join().expect("watcher finalize");
+    }
+
+    /// A publisher that holds the publication lease can create or edit files
+    /// while this index waits. The publish has to follow the disk after the
+    /// write gate is reacquired, not the snapshot collected before the wait.
+    #[test]
+    fn index_publish_keeps_files_created_or_edited_while_publication_lease_is_held() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let main_path = repo.join("src/main.js");
+        let during_path = repo.join("src/during_yield.js");
+        fs::write(&main_path, "function snapshot_only() {}\n").unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+        let gate = crate::WriteGate::new();
+        let saw_gated_write = Arc::new(AtomicBool::new(false));
+        let observed_gate = gate.clone();
+        let flag = Arc::clone(&saw_gated_write);
+        store.set_write_observer(Some(Arc::new(move |_| {
+            if observed_gate.holder_snapshot().is_some() {
+                flag.store(true, Ordering::Release);
+            }
+        })));
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let watcher_gate = gate.clone();
+        let (saw_yield, indexed) = std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                let publication = store.acquire_index_publication_lease().unwrap();
+                held_tx.send(()).unwrap();
+                let start = std::time::Instant::now();
+                let deadline = std::time::Duration::from_secs(10);
+                while !saw_gated_write.load(Ordering::Acquire) && start.elapsed() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                while watcher_gate.holder_snapshot().is_some() && start.elapsed() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let saw = saw_gated_write.load(Ordering::Acquire)
+                    && watcher_gate.holder_snapshot().is_none();
+                if saw {
+                    fs::write(&main_path, "function watcher_live() {}\n").unwrap();
+                    fs::write(&during_path, "function created_during_yield() {}\n").unwrap();
+                }
+                drop(publication);
+                saw
+            });
+            held_rx
+                .recv()
+                .expect("other publisher holds the publication lease");
+            let opts = IndexOptions::new("yield-inst", "https://example.test/yield", "sha-yield")
+                .write_gate(gate, "index_repo");
+            let indexed = index_directory_with_store_opts(
+                &store,
+                &repo,
+                &dir.path().join("yield.lbug"),
+                &opts,
+                None,
+            );
+            (watcher.join().unwrap(), indexed)
+        });
+        store.set_write_observer(None);
+        assert!(
+            saw_yield,
+            "index must yield the write gate while the publication lease is held"
+        );
+        indexed.expect("index publishes");
+
+        let main_disk = fs::read_to_string(repo.join("src/main.js")).unwrap();
+        let during_disk = fs::read_to_string(repo.join("src/during_yield.js")).unwrap();
+        assert!(
+            main_disk.contains("function watcher_live"),
+            "disk edit must stick: {main_disk}"
+        );
+        assert!(
+            during_disk.contains("function created_during_yield"),
+            "created file must stick: {during_disk}"
+        );
+
+        let r_uid = repo_uid("yield-inst", "https://example.test/yield");
+        let symbol_names = |path: &str| {
+            let mut names: Vec<String> = store
+                .symbols_in_file_in_repo(path, &r_uid)
+                .unwrap()
+                .into_iter()
+                .map(|symbol| symbol.name)
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            symbol_names("src/main.js"),
+            vec!["watcher_live".to_string()],
+            "edited file must publish the disk text, not the pre-wait snapshot"
+        );
+        assert_eq!(
+            symbol_names("src/during_yield.js"),
+            vec!["created_during_yield".to_string()],
+            "file created while the lease was held must be in the graph"
+        );
+        assert!(
+            store
+                .list_all_symbols()
+                .unwrap()
+                .iter()
+                .all(|symbol| symbol.name != "snapshot_only"),
+            "pre-wait symbol must not survive publication"
+        );
+    }
+
+    /// An in-place OpenAPI edit does not add or remove a spec path, so the
+    /// post-yield source refresh has nothing to re-parse. The plan still has
+    /// to be prepared from the bytes on disk: the operation that edit added
+    /// must publish, and an operation the other publisher committed while
+    /// holding the lease must survive that publish.
+    #[test]
+    fn index_publish_keeps_openapi_edited_in_place_while_publication_lease_is_held() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let spec_path = repo.join("openapi.yaml");
+        let spec = |paths: &str| {
+            format!("openapi: 3.0.0\ninfo: {{ title: t, version: \"1\" }}\npaths:\n{paths}")
+        };
+        let health = "  /health:\n    get:\n      operationId: listHealth\n      responses: { \"200\": { description: ok } }\n";
+        let edited = "  /health:\n    get:\n      operationId: listHealth\n      responses: { \"200\": { description: ok } }\n  /orders:\n    post:\n      operationId: createOrder\n      responses: { \"200\": { description: ok } }\n  /audit:\n    get:\n      operationId: publisherAdded\n      responses: { \"200\": { description: ok } }\n";
+        fs::write(&spec_path, spec(health)).unwrap();
+        fs::write(repo.join("src/main.js"), "function snapshot_stable() {}\n").unwrap();
+
+        let store = GraphStore::in_memory().unwrap();
+        let gate = crate::WriteGate::new();
+        let saw_gated_write = Arc::new(AtomicBool::new(false));
+        let observed_gate = gate.clone();
+        let flag = Arc::clone(&saw_gated_write);
+        store.set_write_observer(Some(Arc::new(move |_| {
+            if observed_gate.holder_snapshot().is_some() {
+                flag.store(true, Ordering::Release);
+            }
+        })));
+
+        let instance_id = "yield-openapi";
+        let repo_url = "https://example.test/yield-openapi";
+        let r_uid = repo_uid(instance_id, repo_url);
+        let publisher_uid = nestweaver_schema::scoped_contract_uid(
+            &r_uid,
+            "http",
+            Some("GET"),
+            Some("/audit"),
+            Some("publisherAdded"),
+        );
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let watcher_gate = gate.clone();
+        let (saw_yield, indexed) = std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                let publication = store.acquire_index_publication_lease().unwrap();
+                held_tx.send(()).unwrap();
+                let start = std::time::Instant::now();
+                let deadline = std::time::Duration::from_secs(10);
+                while !saw_gated_write.load(Ordering::Acquire) && start.elapsed() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                while watcher_gate.holder_snapshot().is_some() && start.elapsed() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let saw = saw_gated_write.load(Ordering::Acquire)
+                    && watcher_gate.holder_snapshot().is_none();
+                if saw {
+                    fs::write(&spec_path, spec(edited)).unwrap();
+                    store
+                        .insert_contract(&nestweaver_schema::Contract {
+                            uid: publisher_uid.clone(),
+                            kind: "http".into(),
+                            verb: Some("GET".into()),
+                            path: Some("/audit".into()),
+                            operation_id: Some("publisherAdded".into()),
+                            repo_uid: r_uid.clone(),
+                            source_path: "openapi.yaml".into(),
+                            confidence: 1.0,
+                        })
+                        .expect("other publisher commits its operation while holding the lease");
+                }
+                drop(publication);
+                saw
+            });
+            held_rx
+                .recv()
+                .expect("other publisher holds the publication lease");
+            let opts = IndexOptions::new(instance_id, repo_url, "sha-yield")
+                .write_gate(gate, "index_repo");
+            let indexed = index_directory_with_store_opts(
+                &store,
+                &repo,
+                &dir.path().join("yield.lbug"),
+                &opts,
+                None,
+            );
+            (watcher.join().unwrap(), indexed)
+        });
+        store.set_write_observer(None);
+        assert!(
+            saw_yield,
+            "index must yield the write gate while the publication lease is held"
+        );
+        indexed.expect("index publishes");
+
+        let disk = fs::read_to_string(&spec_path).unwrap();
+        assert!(
+            disk.contains("operationId: createOrder"),
+            "in-place spec edit must stick: {disk}"
+        );
+        assert!(
+            disk.contains("operationId: publisherAdded"),
+            "other publisher's spec edit must stick: {disk}"
+        );
+
+        let mut operation_ids: Vec<String> = store
+            .list_contracts(Some(&r_uid))
+            .unwrap()
+            .into_iter()
+            .filter_map(|contract| contract.operation_id)
+            .collect();
+        operation_ids.sort();
+        assert!(
+            operation_ids.iter().any(|id| id == "createOrder"),
+            "operation added by the in-place edit must be published; got {operation_ids:?}"
+        );
+        assert!(
+            operation_ids.iter().any(|id| id == "publisherAdded"),
+            "operation added by the other publisher must not be removed; got {operation_ids:?}"
+        );
+        assert!(
+            operation_ids.iter().any(|id| id == "listHealth"),
+            "pre-wait operation must still be published; got {operation_ids:?}"
+        );
     }
 
     /// Insert a small NOTE-side graph alongside the code graph, so a recovery
@@ -12915,10 +15290,15 @@ function hello(name) { return "Hello " + name; }
         let error = incremental_index(&repo, &incremental_db, "test", repo_url)
             .expect_err("strict incremental contract preflight must fail");
         assert!(
-            format!("{error:#}").contains("prepare incremental contract derivation"),
+            format!("{error:#}")
+                .contains("rebuild incremental contract plan after publication lease"),
             "unexpected error: {error:#}"
         );
         let incremental_store = GraphStore::open_or_create(&incremental_db).unwrap();
+        assert!(
+            !incremental_store.is_index_publication_dirty(),
+            "failed contract preparation must retire its uncommitted marker"
+        );
         assert_eq!(snapshot(&incremental_store), post_only_snapshot);
         assert_eq!(
             fs::read(&generation_path).unwrap(),
@@ -12939,7 +15319,24 @@ function hello(name) { return "Hello " + name; }
             incremental_store
                 .contract_derivation_failures(Some(&repo_uid))
                 .unwrap(),
-            vec![repo_uid]
+            vec![repo_uid.clone()]
+        );
+        drop(incremental_store);
+        fs::write(
+            repo.join("openapi.v2.yaml"),
+            git(&["show", &format!("{third_sha}:openapi.v2.yaml")]),
+        )
+        .unwrap();
+        incremental_index(&repo, &incremental_db, "test", repo_url)
+            .expect("repairing the spec must allow a plain retry");
+        let repaired = GraphStore::open_or_create(&incremental_db).unwrap();
+        assert!(!repaired.is_index_publication_dirty());
+        assert_eq!(snapshot(&repaired), post_only_snapshot);
+        assert!(
+            repaired
+                .contract_derivation_failures(Some(&repo_uid))
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -15106,6 +17503,404 @@ module.exports = { check, plain };\n";
         assert!(
             !clusters_path.exists(),
             "node-UID-keyed cluster output must be invalidated after deletion"
+        );
+    }
+
+    /// nw-806. Delete an imported file, then create it again. The delete takes
+    /// the reverse edges with it, so the recreate must re-resolve importers
+    /// from the unresolved specifier recorded for that path.
+    #[test]
+    fn incremental_added_file_reresolves_unresolved_importers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("lib.js"),
+            "export function helper() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("app.js"),
+            "import { helper } from \"./lib.js\";\nexport function run() { return helper(); }\n",
+        )
+        .unwrap();
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        let repo_url = "https://example.com/nw-806";
+        index_directory(
+            &repo,
+            &db_path,
+            "test",
+            repo_url,
+            &git(&["rev-parse", "HEAD"]),
+        )
+        .unwrap();
+        let r_uid = repo_uid("test", repo_url);
+        let imports_lib = || {
+            GraphStore::open_or_create(&db_path)
+                .unwrap()
+                .files_referencing_file(&r_uid, "lib.js")
+                .unwrap()
+                .contains("app.js")
+        };
+        assert!(
+            imports_lib(),
+            "precondition: full index links app.js to lib.js"
+        );
+
+        fs::remove_file(repo.join("lib.js")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "delete lib.js"]);
+        let deleted = incremental_index(&repo, &db_path, "test", repo_url).unwrap();
+        assert!(
+            !deleted.fell_back_to_full,
+            "delete must stay on the incremental path"
+        );
+        assert!(
+            !imports_lib(),
+            "deleting lib.js must drop the importer edge"
+        );
+        let specs = crate::resolution_cache::ResolutionDeps::load(&crate::sidecar_path(
+            &db_path,
+            ".resolution_deps.bin",
+        ));
+        assert!(
+            specs
+                .unresolved_for_repo(&r_uid)
+                .and_then(|slice| slice.get("app.js"))
+                .is_some_and(|specifiers| specifiers.contains("./lib.js")),
+            "the deleted target's import specifier must be persisted"
+        );
+
+        fs::write(
+            repo.join("lib.js"),
+            "export function helper() { return 2; }\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "recreate lib.js"]);
+        let created = incremental_index(&repo, &db_path, "test", repo_url).unwrap();
+        assert!(
+            !created.fell_back_to_full,
+            "recreate must stay on the incremental path"
+        );
+        assert!(
+            imports_lib(),
+            "creating lib.js must re-resolve app.js, whose unresolved import names it"
+        );
+    }
+
+    /// nw-806. A tsconfig alias is not a relative specifier. Recreating the
+    /// target must still find the importer, and the stored specifier must
+    /// clear once that alias resolves.
+    #[test]
+    fn incremental_added_file_reresolves_aliased_unresolved_importer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(
+            repo.join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"@/*":["src/*"]}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/lib.ts"),
+            "export function helper() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/app.ts"),
+            "import { helper } from \"@/lib\";\nexport function run() { return helper(); }\n",
+        )
+        .unwrap();
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "NestWeaver Test"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        let repo_url = "https://example.com/nw-806-alias";
+        index_directory(
+            &repo,
+            &db_path,
+            "test",
+            repo_url,
+            &git(&["rev-parse", "HEAD"]),
+        )
+        .unwrap();
+        let r_uid = repo_uid("test", repo_url);
+        let imports_lib = || {
+            GraphStore::open_or_create(&db_path)
+                .unwrap()
+                .files_referencing_file(&r_uid, "src/lib.ts")
+                .unwrap()
+                .contains("src/app.ts")
+        };
+        assert!(
+            imports_lib(),
+            "precondition: full index links the tsconfig alias to src/lib.ts"
+        );
+
+        fs::remove_file(repo.join("src/lib.ts")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "delete src/lib.ts"]);
+        let deleted = incremental_index(&repo, &db_path, "test", repo_url).unwrap();
+        assert!(
+            !deleted.fell_back_to_full,
+            "delete must stay on the incremental path"
+        );
+        assert!(
+            !imports_lib(),
+            "deleting src/lib.ts must drop the importer edge"
+        );
+        let unresolved_alias = || {
+            crate::resolution_cache::ResolutionDeps::load(&crate::sidecar_path(
+                &db_path,
+                ".resolution_deps.bin",
+            ))
+            .unresolved_for_repo(&r_uid)
+            .and_then(|slice| slice.get("src/app.ts").cloned())
+            .is_some_and(|specifiers| specifiers.contains("@/lib"))
+        };
+        assert!(
+            unresolved_alias(),
+            "the deleted target's alias specifier must be persisted"
+        );
+
+        fs::write(
+            repo.join("src/lib.ts"),
+            "export function helper() { return 2; }\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "recreate src/lib.ts"]);
+        let created = incremental_index(&repo, &db_path, "test", repo_url).unwrap();
+        assert!(
+            !created.fell_back_to_full,
+            "recreate must stay on the incremental path"
+        );
+        assert!(
+            imports_lib(),
+            "creating src/lib.ts must re-resolve src/app.ts through the @/ alias"
+        );
+        assert!(
+            !unresolved_alias(),
+            "the alias must leave the unresolved set once it maps onto src/lib.ts"
+        );
+    }
+
+    /// nw-806. A non-force full index builds its resolve filter from
+    /// dependency rows. Re-resolving the importer while the target is gone
+    /// drops that row; the specifier stays on the unresolved sidecar.
+    /// Recreating the file must seed the importer into the filter without
+    /// another edit to the importer.
+    #[test]
+    fn full_index_recreated_file_reresolves_unresolved_importers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let app = |extra: &str| {
+            format!(
+                "import {{ helper }} from \"./lib.js\";\nexport function run() {{ return helper(){extra}; }}\n"
+            )
+        };
+        fs::write(
+            repo.join("lib.js"),
+            "export function helper() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(repo.join("app.js"), app("")).unwrap();
+        fs::write(
+            repo.join("other.js"),
+            "export function other() { return 0; }\n",
+        )
+        .unwrap();
+        let repo_url = "https://example.com/nw-806-full";
+        index_directory(&repo, &db_path, "test", repo_url, "sha-1").unwrap();
+        let r_uid = repo_uid("test", repo_url);
+        let imports_lib = || {
+            GraphStore::open_or_create(&db_path)
+                .unwrap()
+                .files_referencing_file(&r_uid, "lib.js")
+                .unwrap()
+                .contains("app.js")
+        };
+        assert!(
+            imports_lib(),
+            "precondition: full index links app.js to lib.js"
+        );
+
+        fs::remove_file(repo.join("lib.js")).unwrap();
+        fs::write(repo.join("app.js"), app(" + 1")).unwrap();
+        let deleted = index_directory(&repo, &db_path, "test", repo_url, "sha-2").unwrap();
+        assert!(
+            deleted.files_unchanged > 0,
+            "delete index must stay on the non-force path"
+        );
+        assert!(
+            !imports_lib(),
+            "deleting lib.js must drop the importer edge"
+        );
+        #[derive(Deserialize)]
+        struct DepsProbe {
+            version: u32,
+            repos: HashMap<String, HashMap<String, HashSet<String>>>,
+            #[serde(default)]
+            unresolved: HashMap<String, HashMap<String, HashSet<String>>>,
+        }
+        let sidecar = crate::sidecar_path(&db_path, ".resolution_deps.bin");
+        let probe: DepsProbe = rmp_serde::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+        let _ = probe.version;
+        let names_lib = probe
+            .repos
+            .get(&r_uid)
+            .and_then(|slice| slice.get("app.js"))
+            .is_some_and(|deps| deps.contains("lib.js"));
+        assert!(
+            !names_lib,
+            "the importer's dependency row must no longer name the deleted file"
+        );
+        assert!(
+            probe
+                .unresolved
+                .get(&r_uid)
+                .and_then(|slice| slice.get("app.js"))
+                .is_some_and(|specifiers| specifiers.contains("./lib.js")),
+            "the specifier must live on the unresolved sidecar, got {:?}",
+            probe.unresolved.get(&r_uid)
+        );
+
+        fs::write(
+            repo.join("lib.js"),
+            "export function helper() { return 2; }\n",
+        )
+        .unwrap();
+        let created = index_directory(&repo, &db_path, "test", repo_url, "sha-3").unwrap();
+        assert!(
+            created.files_unchanged > 0,
+            "recreate must stay on the non-force full index"
+        );
+        assert!(
+            imports_lib(),
+            "a full index of the recreated file must re-resolve app.js from the unresolved specifier"
+        );
+    }
+
+    /// nw-806. Same recreate as
+    /// [`full_index_recreated_file_reresolves_unresolved_importers`], but the
+    /// importer's parsed cache is gone while its filemeta entry is still
+    /// valid. The importer stays Unchanged, so it never enters the resolver
+    /// view unless the seeded-importer parse adds it before edges are deleted.
+    #[test]
+    fn full_index_recreated_file_reresolves_importer_with_missing_parsed_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let app = |extra: &str| {
+            format!(
+                "import {{ helper }} from \"./lib.js\";\nexport function run() {{ return helper(){extra}; }}\n"
+            )
+        };
+        fs::write(
+            repo.join("lib.js"),
+            "export function helper() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(repo.join("app.js"), app("")).unwrap();
+        fs::write(
+            repo.join("other.js"),
+            "export function other() { return 0; }\n",
+        )
+        .unwrap();
+        let repo_url = "https://example.com/nw-806-full-stale-parse";
+        index_directory(&repo, &db_path, "test", repo_url, "sha-1").unwrap();
+        let r_uid = repo_uid("test", repo_url);
+        let imports_lib = || {
+            GraphStore::open_or_create(&db_path)
+                .unwrap()
+                .files_referencing_file(&r_uid, "lib.js")
+                .unwrap()
+                .contains("app.js")
+        };
+        assert!(
+            imports_lib(),
+            "precondition: full index links app.js to lib.js"
+        );
+
+        fs::remove_file(repo.join("lib.js")).unwrap();
+        fs::write(repo.join("app.js"), app(" + 1")).unwrap();
+        let deleted = index_directory(&repo, &db_path, "test", repo_url, "sha-2").unwrap();
+        assert!(
+            deleted.files_unchanged > 0,
+            "delete index must stay on the non-force path"
+        );
+        assert!(
+            !imports_lib(),
+            "deleting lib.js must drop the importer edge"
+        );
+
+        let filemeta = load_filemeta_sidecar(&crate::sidecar_path(&db_path, ".filemeta.json"));
+        let app_hash = filemeta
+            .repos
+            .get(&r_uid)
+            .and_then(|files| files.get("app.js"))
+            .map(|meta| meta.content_hash.clone())
+            .expect("filemeta for the untouched importer must stay valid");
+        let cache_path = crate::sidecar_path(&db_path, ".parsed_cache.bin");
+        fs::remove_file(&cache_path).unwrap();
+        let _ = fs::remove_file(crate::parsed_cache::log_path(&cache_path));
+        assert!(
+            crate::parsed_cache::ParsedCache::load(&cache_path)
+                .get(&app_hash)
+                .is_none(),
+            "the importer's parsed cache must miss while filemeta is still valid"
+        );
+
+        fs::write(
+            repo.join("lib.js"),
+            "export function helper() { return 2; }\n",
+        )
+        .unwrap();
+        let created = index_directory(&repo, &db_path, "test", repo_url, "sha-3").unwrap();
+        assert!(
+            created.files_unchanged > 0,
+            "recreate must stay on the non-force full index"
+        );
+        assert!(
+            imports_lib(),
+            "a full index must re-resolve app.js even when its parsed cache missed and filemeta was valid"
         );
     }
 
@@ -18168,6 +20963,7 @@ module.exports = { check, plain };\n";
         let old_sha = git(&["rev-parse", "HEAD"]);
         let repo_url = "https://example.com/transient-read";
         index_directory(&repo, &db_path, "test", repo_url, &old_sha).unwrap();
+        let generation_before = fs::read(crate::sidecar_path(&db_path, ".generation")).unwrap();
 
         // nw-190: invalid UTF-8 now decodes lossily and is no longer a read
         // failure, so it cannot stand in for one. nw-355: neither can a binary
@@ -18191,10 +20987,19 @@ module.exports = { check, plain };\n";
         assert!(
             error
                 .to_string()
-                .contains("prepare incremental source files")
+                .contains("rebuild incremental source files after publication lease"),
+            "unexpected error: {error:#}"
         );
 
         let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(
+            !store.is_index_publication_dirty(),
+            "failed source preparation must retire its uncommitted marker"
+        );
+        assert_eq!(
+            fs::read(crate::sidecar_path(&db_path, ".generation")).unwrap(),
+            generation_before
+        );
         assert!(
             store
                 .symbols_in_file("main.rs")
@@ -18206,6 +21011,18 @@ module.exports = { check, plain };\n";
         assert_eq!(
             store.lookup_repo(&r_uid).unwrap().unwrap().indexed_sha,
             old_sha
+        );
+        drop(store);
+        fs::write(repo.join("main.rs"), "pub fn replacement() {}\n").unwrap();
+        incremental_index(&repo, &db_path, "test", repo_url)
+            .expect("restoring source must allow a plain retry without recovery");
+        let repaired = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(!repaired.is_index_publication_dirty());
+        assert!(
+            !repaired
+                .lookup_symbols_by_name("replacement")
+                .unwrap()
+                .is_empty()
         );
     }
 

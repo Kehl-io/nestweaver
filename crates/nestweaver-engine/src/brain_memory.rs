@@ -675,6 +675,9 @@ pub struct ConsolidationProposal {
 pub struct ConsolidationManifest {
     pub dry_run: bool,
     pub applied: bool,
+    /// A rejection or a failed apply, independent of warning wording.
+    /// A clean noop and a stale-graph skip stay false.
+    pub apply_errors: bool,
     pub proposals: Vec<ConsolidationProposal>,
     /// Apply summaries, recovery locations, and re-index guidance.
     pub warnings: Vec<String>,
@@ -722,6 +725,7 @@ struct JournalEntry {
 struct ApplyProposalsOutcome {
     all_succeeded: bool,
     had_work: bool,
+    apply_errors: bool,
     summaries: Vec<String>,
     proposals: Vec<ConsolidationProposal>,
 }
@@ -753,6 +757,7 @@ pub fn memory_consolidate(
         return Ok(ConsolidationManifest {
             dry_run: !apply,
             applied: false,
+            apply_errors: false,
             proposals: vec![],
             warnings,
         });
@@ -882,6 +887,7 @@ pub fn memory_consolidate(
                 return Ok(ConsolidationManifest {
                     dry_run: false,
                     applied: outcome.all_succeeded && outcome.had_work,
+                    apply_errors: outcome.apply_errors,
                     proposals: outcome.proposals,
                     warnings,
                 });
@@ -891,6 +897,7 @@ pub fn memory_consolidate(
                 return Ok(ConsolidationManifest {
                     dry_run: false,
                     applied: false,
+                    apply_errors: true,
                     proposals,
                     warnings,
                 });
@@ -901,6 +908,7 @@ pub fn memory_consolidate(
     Ok(ConsolidationManifest {
         dry_run: !apply,
         applied: false,
+        apply_errors: false,
         proposals,
         warnings,
     })
@@ -934,6 +942,7 @@ fn apply_proposals(
     // before publishing even the first Prepared checkpoint.
     let mut new_entries = Vec::new();
     let mut obsolete: Vec<String> = Vec::new();
+    let mut apply_errors = false;
     for proposal in proposals {
         let note = note_by_uid
             .get(proposal.source_uid.as_str())
@@ -951,7 +960,22 @@ fn apply_proposals(
             )
         })?;
         let source_relative = validate_vault_relative_path(Path::new(&proposal.source_path))?;
-        let destination_relative = destination_relative_path(proposal)?;
+        // One proposal with an unusable target (an idea referenced from
+        // vault-root sync.md and status.md, whose project path is empty)
+        // must not abort preflight. The remaining proposals are still
+        // prepared and applied; this row stays in the result with the
+        // validation error.
+        let destination_relative = match destination_relative_path(proposal) {
+            Ok(path) => path,
+            Err(error) => {
+                apply_errors = true;
+                obsolete.push(format!(
+                    "REJECTED: consolidation of '{}' to '{}' was not applied: {error}",
+                    proposal.source_path, proposal.promote_to
+                ));
+                continue;
+            }
+        };
         let id = consolidation_journal_id(
             &note.vault_uid,
             &proposal.source_uid,
@@ -1051,6 +1075,7 @@ fn apply_proposals(
                 Ok(drift) => drift,
                 Err(error) => {
                     all_ok = false;
+                    apply_errors = true;
                     summaries.push(format!(
                         "FAILED: cannot inspect completed consolidation '{}' in {}: {error}",
                         entry.journal.journal_id,
@@ -1078,6 +1103,7 @@ fn apply_proposals(
                     // on this run, and is reported as one.
                     Err(error) => {
                         all_ok = false;
+                        apply_errors = true;
                         summaries.push(format!(
                             "FAILED: could not retire completed consolidation '{}' at {}: {error}",
                             entry.journal.journal_id,
@@ -1114,6 +1140,7 @@ fn apply_proposals(
             }
             Err(error) => {
                 all_ok = false;
+                apply_errors = true;
                 summaries.push(format!(
                     "FAILED: consolidation '{}' remains recoverable at {:?} in {}: {error}",
                     entry.journal.journal_id,
@@ -1134,6 +1161,7 @@ fn apply_proposals(
     Ok(ApplyProposalsOutcome {
         all_succeeded: all_ok,
         had_work,
+        apply_errors,
         summaries,
         proposals: result_proposals,
     })

@@ -374,7 +374,7 @@ impl CodeWatcher {
         // race the initial snapshot are queued by the debouncer and replayed
         // below, closing the former scan-then-watch lost-event window.
         let (tx, rx) = std::sync::mpsc::channel::<RawWatchResult>();
-        let watcher =
+        let mut watcher =
             notify::recommended_watcher(move |result: Result<Event, notify::Error>| match result {
                 Ok(event) if event_should_be_queued(&event) => {
                     let _ = tx.send(Ok(event.paths));
@@ -385,6 +385,11 @@ impl CodeWatcher {
                 }
             })
             .context("init code filesystem watcher")?;
+        // A linked worktree's `.git` is a file. Commits write HEAD and refs in
+        // the git dir and common dir, which sit outside the checkout, so the
+        // root watch never sees a source-free commit.
+        let external_git_dirs = external_git_metadata_dirs(&self.repo_root);
+        watch_external_git_metadata(&mut watcher, &external_git_dirs);
         // nw-651 on Linux: an unreadable subdirectory must not stop the whole
         // subscription; it is skipped and disclosed instead (`watch_tree`).
         #[cfg(test)]
@@ -519,6 +524,14 @@ impl CodeWatcher {
                 }
             };
         }
+        // A commit that landed while nothing was watching never produces a
+        // live event. Once startup has applied the tree, record that HEAD
+        // under the same clean-tree rule as a live ref update.
+        if pending.is_none()
+            && self.record_applied_head_quietly(&store, &r_uid, false, "at startup")?
+        {
+            return Ok(());
+        }
         if let Some(ready) = self.ready_callback.take() {
             ready();
         }
@@ -546,7 +559,20 @@ impl CodeWatcher {
                     on_change.as_deref().map(|callback| callback as &dyn Fn()),
                     owed.failures,
                 ) {
-                    Ok(next) => pending = next,
+                    Ok(next) => {
+                        let landed = next.is_none();
+                        pending = next;
+                        if landed
+                            && self.record_applied_head_quietly(
+                                &store,
+                                &r_uid,
+                                false,
+                                "after reconciliation",
+                            )?
+                        {
+                            return Ok(());
+                        }
+                    }
                     Err(_) => return Ok(()),
                 }
             }
@@ -602,8 +628,32 @@ impl CodeWatcher {
                 subscribed_unwatchable = tree.unwatchable().to_vec();
                 self.sync_unwatched_dirs(&repo_url, &subscribed_unwatchable, false);
             }
-            let _mutation_lease = match self.acquire_mutation_lease("watch_code_batch") {
-                Ok(lease) => lease,
+            // nw-808: `.git` is not source. A commit that changes no indexable
+            // file only updates HEAD and refs, so it must still be able to
+            // record `indexed_sha` without a source batch.
+            let head_moved = batch
+                .iter()
+                .any(|path| git_head_or_refs_event(&self.repo_root, &external_git_dirs, path));
+            let source_events: Vec<PathBuf> = batch
+                .iter()
+                .filter(|path| !is_dot_git_metadata(&self.repo_root, &external_git_dirs, path))
+                .cloned()
+                .collect();
+            if source_events.is_empty() {
+                if head_moved
+                    && self.record_applied_head_quietly(
+                        &store,
+                        &r_uid,
+                        pending.is_some(),
+                        "after HEAD moved",
+                    )?
+                {
+                    return Ok(());
+                }
+                continue;
+            }
+            let mut mutation_lease = match self.acquire_mutation_lease("watch_code_batch") {
+                Ok(lease) => Some(lease),
                 Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
                     tracing::info!("CodeWatcher batch refused during shutdown; exiting");
                     return Ok(());
@@ -615,7 +665,7 @@ impl CodeWatcher {
                 &store,
                 &r_uid,
                 &repo_url,
-                &batch,
+                &source_events,
                 &crate::index::FileSystemIndexEpilogueIo,
                 on_change.as_deref().map(|callback| callback as &dyn Fn()),
             )?;
@@ -625,7 +675,7 @@ impl CodeWatcher {
                     // so any disclosure about them is stale.
                     // An unwatched directory's row stays: a batch touching
                     // it (or an ancestor) says nothing about its watch.
-                    let settled: Vec<PathBuf> = batch
+                    let settled: Vec<PathBuf> = source_events
                         .iter()
                         .filter(|path| {
                             !self
@@ -642,13 +692,26 @@ impl CodeWatcher {
                     );
                     files_processed
                 }
-                WatchBatchOutcome::Unchanged | WatchBatchOutcome::ManifestPending => continue,
+                WatchBatchOutcome::Unchanged | WatchBatchOutcome::ManifestPending => {
+                    drop(mutation_lease.take());
+                    if head_moved
+                        && self.record_applied_head_quietly(
+                            &store,
+                            &r_uid,
+                            pending.is_some(),
+                            "after HEAD moved",
+                        )?
+                    {
+                        return Ok(());
+                    }
+                    continue;
+                }
                 WatchBatchOutcome::PublishedPending {
                     files_processed,
                     reason,
                 } => {
                     tracing::warn!(error = %reason, files_processed, "code watcher committed; evidence repair remains owed");
-                    self.record_debt(&batch, &[], Some(&format!("{reason:#}")));
+                    self.record_debt(&source_events, &[], Some(&format!("{reason:#}")));
                     if pending.is_none() {
                         pending = Some(crate::watcher::PendingReconciliation {
                             paths: None,
@@ -687,9 +750,31 @@ impl CodeWatcher {
                             next_attempt: Instant::now(),
                         });
                     }
+                    drop(mutation_lease.take());
+                    if head_moved
+                        && self.record_applied_head_quietly(
+                            &store,
+                            &r_uid,
+                            true,
+                            "after HEAD moved",
+                        )?
+                    {
+                        return Ok(());
+                    }
                     continue;
                 }
             };
+            drop(mutation_lease.take());
+            if head_moved
+                && self.record_applied_head_quietly(
+                    &store,
+                    &r_uid,
+                    pending.is_some(),
+                    "after HEAD moved",
+                )?
+            {
+                return Ok(());
+            }
             let duration = start.elapsed();
             tracing::info!(
                 files_processed,
@@ -917,7 +1002,7 @@ impl CodeWatcher {
             if crate::manifest::is_manifest_input(relative)
                 && reader.accepts_path(relative)
                 && !path_has_symlink(&self.repo_root, relative)?
-                && manifest_path_not_gitignored(&self.repo_root, relative)?
+                && path_not_gitignored(&self.repo_root, relative)?
             {
                 manifest_changed = true;
             }
@@ -979,7 +1064,7 @@ impl CodeWatcher {
             let relative = Path::new(&source_path);
             let eligible = (|| -> anyhow::Result<bool> {
                 Ok(reader.accepts_path(relative)
-                    && manifest_path_not_gitignored(&self.repo_root, relative)?
+                    && path_not_gitignored(&self.repo_root, relative)?
                     && !path_has_symlink(&self.repo_root, relative)?)
             })();
             match eligible {
@@ -1051,6 +1136,27 @@ impl CodeWatcher {
         let mut prepared_paths = Vec::new();
         let mut changed: HashSet<String> = HashSet::new();
         let mut removed: HashSet<String> = HashSet::new();
+        // Startup drift enumerates through the walk, which already drops
+        // ignored paths. A single event does not, so a tracked source the walk
+        // discloses as ignored must stay out here too.
+        let hidden = sources_hidden_from_walk(
+            &self.repo_root,
+            relevant
+                .iter()
+                .filter(|path| is_supported_source(path) && path.is_file())
+                .filter_map(|path| path.strip_prefix(&self.repo_root).ok()),
+        );
+        // An ignored file the graph never held has nothing to retract; queuing
+        // a delete for it would still cost a full batch publication.
+        let graphed: HashSet<String> = if hidden.is_empty() {
+            HashSet::new()
+        } else {
+            store
+                .list_files_by_repo(r_uid)?
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect()
+        };
         for path in relevant.iter().filter(|path| is_supported_source(path)) {
             let rel_path = match path.strip_prefix(&self.repo_root) {
                 Ok(r) => r,
@@ -1063,7 +1169,17 @@ impl CodeWatcher {
                 }
             };
             let rel_str = rel_path.to_string_lossy().into_owned();
-            if let Some(reason) = source_policy_exclusion(&reader, &self.repo_root, path)? {
+            let exclusion = match source_policy_exclusion(&reader, &self.repo_root, path)? {
+                Some(reason) => Some(reason),
+                None if hidden.contains(rel_path) => {
+                    if !graphed.contains(&rel_str) {
+                        continue;
+                    }
+                    Some("repository ignore rules")
+                }
+                None => None,
+            };
+            if let Some(reason) = exclusion {
                 tracing::warn!(
                     path = %rel_path.display(), reason,
                     "watched source is policy-excluded; removing stale graph coverage"
@@ -1144,7 +1260,16 @@ impl CodeWatcher {
         // nw-008 Phase 0 — transitive reverse-dependents from the LIVE graph,
         // BEFORE any mutation (the per-file `DETACH DELETE` destroys the
         // edges this query walks).
-        let rdeps = crate::index::collect_reverse_dep_files(store, r_uid, &changed, &removed);
+        let mut rdeps = crate::index::collect_reverse_dep_files(store, r_uid, &changed, &removed);
+        crate::index::extend_rdeps_for_added_files(
+            &reader,
+            store,
+            Some(self.db_path.as_path()),
+            r_uid,
+            &changed,
+            &removed,
+            &mut rdeps,
+        );
         let replacement_symbols: Vec<_> = prepared_paths
             .iter()
             .filter_map(|path| match path {
@@ -1284,6 +1409,15 @@ impl CodeWatcher {
             .commit_transaction(&txn)
             .context("commit code watcher batch transaction")?;
         drop(txn);
+        crate::index::persist_unresolved_imports(
+            &reader,
+            store,
+            &self.db_path,
+            r_uid,
+            &changed,
+            &removed,
+            &rdeps,
+        );
         // A committed replacement cascades away both note mentions and other
         // repositories' inferred links. Record their owed repairs before any
         // fallible publication or evidence stage can return early.
@@ -1641,7 +1775,7 @@ impl CodeWatcher {
                 let absolute = self.repo_root.join(path);
                 let relative = Path::new(path);
                 if !reader.accepts_path(relative)
-                    || !manifest_path_not_gitignored(&self.repo_root, relative)?
+                    || !path_not_gitignored(&self.repo_root, relative)?
                     || path_has_symlink(&self.repo_root, relative)?
                 {
                     drift.spec_changed = true;
@@ -2129,11 +2263,7 @@ impl CodeWatcher {
                 let excluded = reader
                     .as_ref()
                     .is_some_and(|reader| !reader.accepts_path(&rel.join("nestweaver-probe")));
-                !excluded
-                    && !matches!(
-                        manifest_path_not_gitignored(&self.repo_root, rel),
-                        Ok(false)
-                    )
+                !excluded && !matches!(path_not_gitignored(&self.repo_root, rel), Ok(false))
             })
             .cloned()
             .collect();
@@ -2354,7 +2484,431 @@ fn is_watcher_input(path: &Path) -> bool {
     is_supported_source(path) || crate::contracts::is_spec_file(&path.to_string_lossy())
 }
 
-fn manifest_path_not_gitignored(root: &Path, relative: &Path) -> anyhow::Result<bool> {
+/// True when `path` is git metadata rather than source.
+///
+/// That is the checkout's `.git` directory, or — for a linked worktree — a
+/// file under the git dir or common dir from `git rev-parse`. A commit that
+/// changes no source file still writes those paths, and that is the only
+/// signal the watcher gets. Every other file there stays out of the source
+/// batch.
+fn is_dot_git_metadata(repo_root: &Path, external_git_dirs: &[PathBuf], path: &Path) -> bool {
+    repo_dot_git_suffix(repo_root, path).is_some()
+        || external_git_dirs.iter().any(|dir| path.starts_with(dir))
+}
+
+/// True when `path` is `HEAD` or a ref update that can move HEAD.
+/// Object and index writes are ignored: they do not by themselves mean the
+/// commit the graph should record has changed.
+///
+/// `external_git_dirs` are absolute git dirs and common dirs that sit outside
+/// the checkout. The same HEAD, refs, packed-refs, and reflog names count
+/// there as they do under an in-root `.git`.
+fn git_head_or_refs_event(repo_root: &Path, external_git_dirs: &[PathBuf], path: &Path) -> bool {
+    if let Some(relative) = repo_dot_git_suffix(repo_root, path)
+        && is_head_or_refs_inside_git_dir(relative)
+    {
+        return true;
+    }
+    external_git_dirs.iter().any(|dir| {
+        path.strip_prefix(dir)
+            .is_ok_and(is_head_or_refs_inside_git_dir)
+    })
+}
+
+/// Path inside the checkout's `.git`, or `Some` of an empty path when `path`
+/// is `.git` itself. `None` when `path` is not that directory.
+fn repo_dot_git_suffix<'a>(repo_root: &Path, path: &'a Path) -> Option<&'a Path> {
+    let relative = path.strip_prefix(repo_root).ok()?;
+    let mut parts = relative.components();
+    match parts.next() {
+        Some(std::path::Component::Normal(name)) if name == ".git" => Some(parts.as_path()),
+        _ => None,
+    }
+}
+
+fn is_head_or_refs_inside_git_dir(relative: &Path) -> bool {
+    let mut parts = relative.components();
+    match parts.next() {
+        Some(std::path::Component::Normal(name)) if name == "HEAD" => parts.next().is_none(),
+        Some(std::path::Component::Normal(name)) if name == "packed-refs" => parts.next().is_none(),
+        // Remote-tracking refs move on fetch without moving this worktree's
+        // HEAD. A shared common dir would otherwise wake every linked
+        // worktree's watcher.
+        Some(std::path::Component::Normal(name)) if name == "refs" => {
+            matches!(parts.next(), Some(std::path::Component::Normal(kind)) if kind == "heads")
+        }
+        Some(std::path::Component::Normal(name)) if name == "logs" => match parts.next() {
+            Some(std::path::Component::Normal(inner)) if inner == "HEAD" => parts.next().is_none(),
+            Some(std::path::Component::Normal(inner)) if inner == "refs" => matches!(
+                parts.next(),
+                Some(std::path::Component::Normal(kind)) if kind == "heads"
+            ),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Absolute `--git-dir` and `--git-common-dir` paths that sit outside `repo_root`.
+///
+/// An in-root `.git` directory is already covered by the checkout watch.
+/// A linked worktree's git dir and common dir are not.
+fn external_git_metadata_dirs(repo_root: &Path) -> Vec<PathBuf> {
+    let canonical_root =
+        std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut dirs = Vec::new();
+    for flag in ["--git-dir", "--git-common-dir"] {
+        let Some(dir) = rev_parse_absolute_dir(repo_root, flag) else {
+            continue;
+        };
+        if dir.starts_with(&canonical_root) || dirs.iter().any(|seen| seen == &dir) {
+            continue;
+        }
+        dirs.push(dir);
+    }
+    dirs
+}
+
+fn rev_parse_absolute_dir(repo_root: &Path, flag: &str) -> Option<PathBuf> {
+    let mut command = std::process::Command::new("git");
+    command.current_dir(repo_root).args(["rev-parse", flag]);
+    let output = crate::git_cmd::run_git_with_timeout(command, Duration::from_secs(15)).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let line = text.lines().next()?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let raw = PathBuf::from(line);
+    let absolute = if raw.is_absolute() {
+        raw
+    } else {
+        repo_root.join(raw)
+    };
+    Some(std::fs::canonicalize(&absolute).unwrap_or(absolute))
+}
+
+/// Subscribe to git metadata directories the checkout watch does not cover.
+/// A directory nested under one already watched is skipped: the recursive
+/// parent watch delivers its events, and classification still names it.
+fn watch_external_git_metadata(watcher: &mut impl notify::Watcher, dirs: &[PathBuf]) {
+    for dir in dirs {
+        if dirs
+            .iter()
+            .any(|other| other != dir && dir.starts_with(other))
+        {
+            continue;
+        }
+        if let Err(error) = watcher.watch(dir, notify::RecursiveMode::Recursive) {
+            tracing::warn!(
+                %error,
+                dir = %dir.display(),
+                "code watcher could not watch the git directory outside the worktree"
+            );
+        }
+    }
+}
+
+impl CodeWatcher {
+    /// Record HEAD in `indexed_sha` when the watcher has applied that tree.
+    ///
+    /// nw-808. Watcher batches never used to advance `indexed_sha`, and a
+    /// commit with no source change never started a batch, because `.git` is
+    /// skipped. `stale-check` then compared that stale SHA to HEAD.
+    ///
+    /// Update only when git status shows no modified or untracked indexable
+    /// source, the graph matches the worktree, and no resolution or
+    /// reconciliation debt is pending. A dirty worktree's graph holds
+    /// content HEAD does not, so it must stay behind. Debt means the graph
+    /// has not caught the tree yet. A clean status can still hide a committed
+    /// source the graph lacks; advancing then makes a later incremental index
+    /// treat `indexed_sha == HEAD` as an empty range and leave that file out.
+    /// Leave the SHA behind until the graph-versus-worktree check passes.
+    ///
+    /// Filemeta is not rewritten. Incremental indexing treats
+    /// `indexed_sha == HEAD` as an empty commit range and skips the diff.
+    /// That is the right short-circuit once the clean tree and a settled
+    /// watcher already match HEAD. Writing filemeta here would pretend a
+    /// full index had refreshed the stat cache. Startup drift still hashes
+    /// the graph when that cache is stale, so a later full index re-reads a
+    /// file whose stat moved.
+    /// Record HEAD, and report whether shutdown refused the write.
+    ///
+    /// `Ok(true)` means the watcher should exit. Other failures are logged
+    /// and the previous SHA is left in place.
+    fn record_applied_head_quietly(
+        &self,
+        store: &GraphStore,
+        r_uid: &str,
+        retry_pending: bool,
+        when: &'static str,
+    ) -> anyhow::Result<bool> {
+        match self.record_applied_head(store, r_uid, retry_pending) {
+            Ok(()) => Ok(false),
+            Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
+                tracing::info!("CodeWatcher HEAD record refused during shutdown; exiting");
+                Ok(true)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    when,
+                    "code watcher left indexed_sha unchanged"
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    fn record_applied_head(
+        &self,
+        store: &GraphStore,
+        r_uid: &str,
+        retry_pending: bool,
+    ) -> anyhow::Result<()> {
+        if self.applied_head_blocked(r_uid, retry_pending) {
+            return Ok(());
+        }
+        if !self.repo_root.join(".git").exists() {
+            return Ok(());
+        }
+        let Some(repo) = store.lookup_repo(r_uid)? else {
+            return Ok(());
+        };
+        let head = match crate::git_diff::current_head_sha(&self.repo_root) {
+            Ok(head) if crate::repo_head::is_full_sha(&head) => head,
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                tracing::debug!(%error, "code watcher has no HEAD sha to record");
+                return Ok(());
+            }
+        };
+        if head == repo.indexed_sha {
+            return Ok(());
+        }
+        // Status and the drift walk stay outside the write lease. They can
+        // take the full git-status budget on a large tree; holding the lease
+        // across that stalls every other writer.
+        let observed_generation = store.graph_generation();
+        let hashes_before: std::collections::BTreeMap<_, _> = store
+            .list_file_hashes_by_repo(r_uid)
+            .context("list indexed files before recording HEAD")?
+            .into_iter()
+            .collect();
+        let reader = self.reader_for(&repo.url)?;
+        match self.indexable_worktree_drift(&reader) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "code watcher did not record HEAD; git status failed"
+                );
+                return Ok(());
+            }
+        }
+        match self.graph_matches_worktree(store, r_uid, &repo.url) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(
+                    repo = %r_uid,
+                    "code watcher left indexed_sha behind; graph does not match the worktree"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "code watcher did not record HEAD; graph-versus-worktree check failed"
+                );
+                return Ok(());
+            }
+        }
+        let _lease = self.acquire_mutation_lease("watch_code_sha")?;
+        let Some(repo) = store.lookup_repo(r_uid)? else {
+            return Ok(());
+        };
+        if repo.indexed_sha == head {
+            return Ok(());
+        }
+        let hashes_after: std::collections::BTreeMap<_, _> = store
+            .list_file_hashes_by_repo(r_uid)
+            .context("list indexed files before recording HEAD")?
+            .into_iter()
+            .collect();
+        if store.graph_generation() != observed_generation || hashes_after != hashes_before {
+            tracing::info!(
+                repo = %r_uid,
+                "code watcher left indexed_sha unchanged; the graph changed during the HEAD check"
+            );
+            return Ok(());
+        }
+        store
+            .update_repo_sha(r_uid, &head)
+            .context("update_repo_sha")?;
+        tracing::info!(repo = %r_uid, sha = %head, "recorded indexed_sha at applied HEAD");
+        Ok(())
+    }
+
+    fn applied_head_blocked(&self, r_uid: &str, retry_pending: bool) -> bool {
+        if retry_pending || self.resolution_debt_path(r_uid).exists() {
+            return true;
+        }
+        if !self
+            .committed_replay_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+        {
+            return true;
+        }
+        let owed = crate::index_md::load_skipped_notes_sidecar(&self.db_path)
+            .reconciliation_pending
+            .remove(&crate::index_md::code_watch_key(&self.repo_root));
+        owed.is_some_and(|rows| !rows.is_empty())
+    }
+
+    /// `Ok(true)` when the graph already holds the worktree the watcher would
+    /// apply: startup drift has nothing to replay, no source it could not
+    /// read, and no spec change. A committed source missing from the graph
+    /// is replay, so HEAD stays behind until that file is present.
+    fn graph_matches_worktree(
+        &self,
+        store: &GraphStore,
+        r_uid: &str,
+        repo_url: &str,
+    ) -> anyhow::Result<bool> {
+        let drift = self.startup_drift(store, r_uid, repo_url)?;
+        Ok(drift.replay.is_empty() && drift.unreadable.is_empty() && !drift.spec_changed)
+    }
+
+    /// `Ok(true)` when git status reports a modified or untracked source the
+    /// indexer would admit. Non-source dirt (a dirty README) does not count.
+    fn indexable_worktree_drift(
+        &self,
+        reader: &crate::content_reader::FilesystemReader,
+    ) -> anyhow::Result<bool> {
+        let mut command = std::process::Command::new("git");
+        command.current_dir(&self.repo_root).args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ]);
+        let output = crate::git_cmd::run_git_with_timeout(command, Duration::from_secs(15))
+            .context("git status for watcher HEAD record")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "git status failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        porcelain_has_indexable_source(&output.stdout, reader)
+    }
+}
+
+fn porcelain_has_indexable_source(
+    bytes: &[u8],
+    reader: &crate::content_reader::FilesystemReader,
+) -> anyhow::Result<bool> {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        if rest.len() < 4 || rest[2] != b' ' {
+            anyhow::bail!("git status porcelain entry is truncated");
+        }
+        let renamed = matches!(rest[0], b'R' | b'C') || matches!(rest[1], b'R' | b'C');
+        let (path, next) = split_nul(&rest[3..])?;
+        rest = next;
+        if status_path_is_indexable(reader, path) {
+            return Ok(true);
+        }
+        if renamed {
+            let (prior, next) = split_nul(rest)?;
+            rest = next;
+            if status_path_is_indexable(reader, prior) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn split_nul(bytes: &[u8]) -> anyhow::Result<(&str, &[u8])> {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .context("git status entry is missing its NUL terminator")?;
+    let path = std::str::from_utf8(&bytes[..end]).context("git status path is not utf-8")?;
+    Ok((path, &bytes[end + 1..]))
+}
+
+fn status_path_is_indexable(reader: &crate::content_reader::FilesystemReader, path: &str) -> bool {
+    let relative = Path::new(path);
+    reader.accepts_path(relative)
+        && (is_supported_source(relative) || crate::contracts::is_spec_file(path))
+}
+
+/// The `candidates` (repo-relative files) that `FilesystemReader`'s walk would
+/// not enumerate because of `.gitignore`, `.ignore`, `info/exclude` or global
+/// excludes. Uses the walker's own configuration, descending only into the
+/// candidates' ancestor directories, so one batch costs one shallow walk.
+///
+/// A candidate below a directory the walk cannot read gets no verdict: those
+/// paths are disclosed by indexing, and dropping their coverage here would
+/// disagree with it. Other candidates in the batch are still decided.
+fn sources_hidden_from_walk<'a>(
+    repo_root: &Path,
+    candidates: impl IntoIterator<Item = &'a Path>,
+) -> HashSet<PathBuf> {
+    let wanted: HashSet<PathBuf> = candidates.into_iter().map(Path::to_path_buf).collect();
+    if wanted.is_empty() {
+        return HashSet::new();
+    }
+    let ancestors: HashSet<PathBuf> = wanted
+        .iter()
+        .flat_map(|path| path.ancestors().skip(1))
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect();
+    let root = repo_root.to_path_buf();
+    let visit = wanted.clone();
+    let mut seen = HashSet::new();
+    for entry in ignore::WalkBuilder::new(repo_root)
+        .follow_links(false)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .filter_entry(move |entry| {
+            entry.path().strip_prefix(&root).is_ok_and(|rel| {
+                rel.as_os_str().is_empty() || ancestors.contains(rel) || visit.contains(rel)
+            })
+        })
+        .build()
+    {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if let Ok(rel) = entry.path().strip_prefix(repo_root) {
+            seen.insert(rel.to_path_buf());
+        }
+    }
+    wanted
+        .difference(&seen)
+        .filter(|path| {
+            path.ancestors()
+                .skip(1)
+                .all(|dir| std::fs::read_dir(repo_root.join(dir)).is_ok())
+        })
+        .cloned()
+        .collect()
+}
+
+/// Whether `relative` escapes the repository's gitignore rules, regardless of
+/// whether Git tracks it (`check-ignore --no-index`), as the walk decides.
+fn path_not_gitignored(root: &Path, relative: &Path) -> anyhow::Result<bool> {
     if !root.join(".git").exists() {
         return Ok(true);
     }
@@ -2369,7 +2923,7 @@ fn manifest_path_not_gitignored(root: &Path, relative: &Path) -> anyhow::Result<
         Some(0) => Ok(false),
         Some(1) => Ok(true),
         _ => anyhow::bail!(
-            "cannot determine manifest gitignore eligibility: {}",
+            "cannot determine gitignore eligibility: {}",
             String::from_utf8_lossy(&result.stderr)
         ),
     }
@@ -2910,6 +3464,729 @@ mod tests {
         assert!(!skipped("/repo/src/main.rs"));
     }
 
+    /// nw-808: a commit that changes no source file only writes `.git`, which
+    /// indexing skips, so the live loop used to leave `indexed_sha` behind
+    /// HEAD. Record that HEAD when status shows no modified or untracked
+    /// indexable source, the graph already holds those sources, and no
+    /// resolution debt. A dirty source stays behind. A dirty non-source file
+    /// does not. Filemeta stays untouched so the incremental SHA short-circuit
+    /// is not paired with a fake stat refresh.
+    #[test]
+    fn watcher_records_head_after_a_source_free_commit_but_not_a_dirty_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.js"), "export function a() { return 1; }\n").unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["add", "src/a.js"]);
+        git(&["commit", "-m", "base"]);
+        let head = || -> String {
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git rev-parse HEAD failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        let base = head();
+        assert!(super::git_head_or_refs_event(
+            &root,
+            &[],
+            &root.join(".git/HEAD")
+        ));
+        assert!(super::git_head_or_refs_event(
+            &root,
+            &[],
+            &root.join(".git/refs/heads/main")
+        ));
+        assert!(super::git_head_or_refs_event(
+            &root,
+            &[],
+            &root.join(".git/packed-refs")
+        ));
+        assert!(!super::git_head_or_refs_event(
+            &root,
+            &[],
+            &root.join(".git/refs/remotes/origin/main")
+        ));
+        assert!(!super::git_head_or_refs_event(
+            &root,
+            &[],
+            &root.join(".git/objects/pack/pack")
+        ));
+        assert!(!super::git_head_or_refs_event(
+            &root,
+            &[],
+            &root.join(".git/index")
+        ));
+        assert!(!super::git_head_or_refs_event(
+            &root,
+            &[],
+            &root.join("src/a.js")
+        ));
+        assert!(super::is_dot_git_metadata(
+            &root,
+            &[],
+            &root.join(".git/objects/pack/pack")
+        ));
+
+        let db = dir.path().join("graph.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let url = format!("file://{}", root.display());
+        let uid = nestweaver_schema::repo_uid("test", &url);
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: uid.clone(),
+                url: url.clone(),
+                indexed_sha: base.clone(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: Some(root.display().to_string()),
+            })
+            .unwrap();
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        let filemeta = crate::sidecar_path(&db, ".filemeta.json");
+        let filemeta_bytes = br#"{"sentinel":"nw-808-filemeta"}"#;
+        std::fs::write(&filemeta, filemeta_bytes).unwrap();
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: nestweaver_schema::file_uid(&uid, "src/a.js"),
+                path: "src/a.js".to_string(),
+                repo_uid: uid.clone(),
+                content_hash: crate::hash::blake3_hex(
+                    &std::fs::read_to_string(root.join("src/a.js")).unwrap(),
+                ),
+            })
+            .unwrap();
+        let indexed = || store.lookup_repo(&uid).unwrap().unwrap().indexed_sha;
+
+        git(&["commit", "--allow-empty", "-m", "no source change"]);
+        let clean = head();
+        assert_ne!(clean, base);
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(indexed(), clean, "a clean source-free commit records HEAD");
+
+        std::fs::write(root.join("README.md"), "notes\n").unwrap();
+        git(&["commit", "--allow-empty", "-m", "still no source change"]);
+        let with_readme = head();
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            indexed(),
+            with_readme,
+            "a dirty non-source file does not keep indexed_sha behind HEAD"
+        );
+
+        watcher
+            .save_resolution_debt(&uid, &[root.join("src/a.js")])
+            .unwrap();
+        git(&["commit", "--allow-empty", "-m", "while resolution is owed"]);
+        let while_debt = head();
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            indexed(),
+            with_readme,
+            "resolution debt keeps the recorded SHA behind {while_debt}"
+        );
+        std::fs::remove_file(watcher.resolution_debt_path(&uid)).unwrap();
+
+        std::fs::write(
+            root.join("src/extra.js"),
+            "export function extra() { return 2; }\n",
+        )
+        .unwrap();
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            indexed(),
+            with_readme,
+            "an untracked indexable source must not be marked fresh at {while_debt}"
+        );
+        std::fs::remove_file(root.join("src/extra.js")).unwrap();
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            indexed(),
+            while_debt,
+            "once the indexable drift is gone, the applied HEAD is recorded"
+        );
+        assert_eq!(
+            std::fs::read(&filemeta).unwrap(),
+            filemeta_bytes,
+            "recording HEAD must not refresh filemeta"
+        );
+    }
+
+    /// A clean `git status` is not a graph match. `src/missed.js` stays
+    /// committed and is removed from the graph only; an empty commit moves
+    /// HEAD. Recording that HEAD would make a later incremental index see
+    /// `indexed_sha == HEAD`, add nothing, and leave `missed.js` absent.
+    /// The SHA stays on the previous commit until the graph holds the file.
+    /// A dirty source still does not advance.
+    #[test]
+    fn missed_committed_source_keeps_indexed_sha_behind_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let missed_body = "export function missed() { return 1; }\n";
+        std::fs::write(
+            root.join("src/kept.js"),
+            "export function kept() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/missed.js"), missed_body).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["add", "src/kept.js", "src/missed.js"]);
+        git(&["commit", "-m", "base"]);
+        let head = || -> String {
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git rev-parse HEAD failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        let base = head();
+        let db = dir.path().join("graph.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let url = format!("file://{}", root.display());
+        let uid = nestweaver_schema::repo_uid("test", &url);
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: uid.clone(),
+                url: url.clone(),
+                indexed_sha: base.clone(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: Some(root.display().to_string()),
+            })
+            .unwrap();
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: nestweaver_schema::file_uid(&uid, "src/kept.js"),
+                path: "src/kept.js".to_string(),
+                repo_uid: uid.clone(),
+                content_hash: crate::hash::blake3_hex(
+                    &std::fs::read_to_string(root.join("src/kept.js")).unwrap(),
+                ),
+            })
+            .unwrap();
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        let indexed = || store.lookup_repo(&uid).unwrap().unwrap().indexed_sha;
+        let graph_paths = || -> Vec<String> {
+            let mut paths = store
+                .list_file_hashes_by_repo(&uid)
+                .unwrap()
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths
+        };
+        assert_eq!(graph_paths(), vec!["src/kept.js".to_string()]);
+
+        git(&["commit", "--allow-empty", "-m", "no source change"]);
+        let clean = head();
+        assert_ne!(clean, base);
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(
+            status.stdout.is_empty(),
+            "the missed file is committed, so status is clean: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            indexed(),
+            base,
+            "a committed source missing from the graph keeps indexed_sha behind {clean}"
+        );
+        assert_eq!(graph_paths(), vec!["src/kept.js".to_string()]);
+
+        std::fs::write(
+            root.join("src/extra.js"),
+            "export function extra() { return 2; }\n",
+        )
+        .unwrap();
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            indexed(),
+            base,
+            "a dirty source tree must not advance indexed_sha to {clean}"
+        );
+        std::fs::remove_file(root.join("src/extra.js")).unwrap();
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            indexed(),
+            base,
+            "clearing the dirty file leaves the missing graph source behind {clean}"
+        );
+
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: nestweaver_schema::file_uid(&uid, "src/missed.js"),
+                path: "src/missed.js".to_string(),
+                repo_uid: uid.clone(),
+                content_hash: crate::hash::blake3_hex(missed_body),
+            })
+            .unwrap();
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            indexed(),
+            clean,
+            "once every committed source is in the graph, the clean HEAD is recorded"
+        );
+        assert_eq!(
+            graph_paths(),
+            vec!["src/kept.js".to_string(), "src/missed.js".to_string()]
+        );
+    }
+
+    /// A committed source that is gone from the working tree (deleted, not
+    /// committed) must not fail the incremental index or leave coverage
+    /// reading complete.
+    #[test]
+    fn incremental_index_discloses_an_unreadable_missed_source_and_still_records_head() {
+        assert_missing_source_disclosure_and_recovery(false);
+    }
+
+    #[test]
+    fn server_incremental_index_retries_missing_sources_at_the_same_sha() {
+        assert_missing_source_disclosure_and_recovery(true);
+    }
+
+    fn assert_missing_source_disclosure_and_recovery(server_mode: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let missed_body = "export function missed() { return 1; }\n";
+        std::fs::write(
+            root.join("src/kept.js"),
+            "export function kept() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/missed.js"), missed_body).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["add", "src/kept.js", "src/missed.js"]);
+        git(&["commit", "-m", "base"]);
+        let head = || -> String {
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git rev-parse HEAD failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        let base = head();
+        let db = dir.path().join("graph.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let url = format!("file://{}", root.display());
+        let uid = nestweaver_schema::repo_uid("test", &url);
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: uid.clone(),
+                url: url.clone(),
+                indexed_sha: base.clone(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: Some(root.display().to_string()),
+            })
+            .unwrap();
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: nestweaver_schema::file_uid(&uid, "src/kept.js"),
+                path: "src/kept.js".to_string(),
+                repo_uid: uid.clone(),
+                content_hash: crate::hash::blake3_hex(
+                    &std::fs::read_to_string(root.join("src/kept.js")).unwrap(),
+                ),
+            })
+            .unwrap();
+        let reader = crate::content_reader::FilesystemReader::with_limits(
+            &root,
+            crate::index_limits::IndexLimits::default(),
+        );
+        store
+            .set_repo_index_policy(&uid, &reader.eligibility_fingerprint())
+            .unwrap();
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        git(&["commit", "--allow-empty", "-m", "no source change"]);
+        let clean = head();
+        assert_ne!(clean, base);
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            store.lookup_repo(&uid).unwrap().unwrap().indexed_sha,
+            base,
+            "precondition: indexed_sha stays behind {clean} while missed.js is absent"
+        );
+        drop(store);
+
+        // Deleted from the working tree but still committed: it cannot be
+        // prepared. That must not block the index, and must not read complete.
+        std::fs::remove_file(root.join("src/missed.js")).unwrap();
+        let index = || {
+            if server_mode {
+                let store = GraphStore::open_or_create(&db).unwrap();
+                let reader = crate::content_reader::FilesystemReader::new(&root);
+                crate::index::incremental_index_with_reader_and_write_gate(
+                    &reader,
+                    &root,
+                    &store,
+                    "test",
+                    &url,
+                    &head(),
+                    || Ok(()),
+                )
+                .unwrap()
+            } else {
+                crate::index::incremental_index(&root, &db, "test", &url).unwrap()
+            }
+        };
+        let result = index();
+        assert_eq!(result.files_added, 0, "{result:?}");
+        assert!(
+            result.skipped_files.iter().any(|skipped| {
+                skipped.path == "src/missed.js"
+                    && skipped.reason_code == nestweaver_parser::SkipReasonCode::ReadError
+            }),
+            "the unreadable committed source must be disclosed: {:?}",
+            result.skipped_files
+        );
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert_eq!(
+            store.lookup_repo(&uid).unwrap().unwrap().indexed_sha,
+            clean,
+            "HEAD is recorded even though the committed source could not be restored"
+        );
+        let generation = store.graph_generation();
+        drop(store);
+
+        // Same commit, same missing source: a second invocation must not
+        // clear coverage merely because the first invocation recorded HEAD.
+        for _ in 0..2 {
+            let repeated = index();
+            assert_eq!(repeated.files_added, 0, "{repeated:?}");
+            assert_eq!(repeated.files_skipped, repeated.skipped_files.len());
+            assert_eq!(
+                repeated
+                    .skipped_files
+                    .iter()
+                    .filter(|skipped| {
+                        skipped.path == "src/missed.js"
+                            && skipped.reason_code == nestweaver_parser::SkipReasonCode::ReadError
+                    })
+                    .count(),
+                1,
+                "{repeated:?}"
+            );
+            let store = GraphStore::open_or_create(&db).unwrap();
+            assert_eq!(
+                store.graph_generation(),
+                generation,
+                "reporting the same read failure must not republish the graph"
+            );
+        }
+
+        // A restored source can still be ineligible. Report its actual skip
+        // reason instead of clearing the gap or continuing to call it unreadable.
+        std::fs::write(root.join("src/missed.js"), b"binary\0source").unwrap();
+        let binary = index();
+        assert_eq!(binary.files_added, 0, "{binary:?}");
+        assert_eq!(binary.skipped_files.len(), 1, "{binary:?}");
+        assert_eq!(
+            binary.skipped_files[0].reason_code,
+            nestweaver_parser::SkipReasonCode::Binary
+        );
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert_eq!(store.graph_generation(), generation);
+        drop(store);
+
+        // Restoring the bytes needs no commit: the same-SHA path must repair
+        // the graph through the ordinary publication transaction.
+        std::fs::write(root.join("src/missed.js"), missed_body).unwrap();
+        let restored = index();
+        assert_eq!(restored.files_added, 1, "{restored:?}");
+        assert!(restored.skipped_files.is_empty(), "{restored:?}");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert_eq!(store.lookup_repo(&uid).unwrap().unwrap().indexed_sha, clean);
+        assert!(!store.lookup_symbols_by_name("missed").unwrap().is_empty());
+        let restored_generation = store.graph_generation();
+        drop(store);
+        let steady = index();
+        assert_eq!(steady.files_added, 0, "{steady:?}");
+        assert!(steady.skipped_files.is_empty(), "{steady:?}");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert_eq!(
+            store.graph_generation(),
+            restored_generation,
+            "a healthy unchanged run must stay read-only"
+        );
+    }
+
+    /// `record_applied_head` leaves `indexed_sha` behind when `src/missed.js`
+    /// is committed and absent from the graph. The following incremental index
+    /// sees an empty `indexed_sha..HEAD` diff, so it must put that file back
+    /// in the same transaction that records HEAD.
+    #[test]
+    fn incremental_index_restores_missed_committed_source_before_recording_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let missed_body = "export function missed() { return 1; }\n";
+        std::fs::write(
+            root.join("src/kept.js"),
+            "export function kept() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/missed.js"), missed_body).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["add", "src/kept.js", "src/missed.js"]);
+        git(&["commit", "-m", "base"]);
+        let head = || -> String {
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git rev-parse HEAD failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        let base = head();
+        let db = dir.path().join("graph.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let url = format!("file://{}", root.display());
+        let uid = nestweaver_schema::repo_uid("test", &url);
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: uid.clone(),
+                url: url.clone(),
+                indexed_sha: base.clone(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: Some(root.display().to_string()),
+            })
+            .unwrap();
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: nestweaver_schema::file_uid(&uid, "src/kept.js"),
+                path: "src/kept.js".to_string(),
+                repo_uid: uid.clone(),
+                content_hash: crate::hash::blake3_hex(
+                    &std::fs::read_to_string(root.join("src/kept.js")).unwrap(),
+                ),
+            })
+            .unwrap();
+        let reader = crate::content_reader::FilesystemReader::with_limits(
+            &root,
+            crate::index_limits::IndexLimits::default(),
+        );
+        store
+            .set_repo_index_policy(&uid, &reader.eligibility_fingerprint())
+            .unwrap();
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        git(&["commit", "--allow-empty", "-m", "no source change"]);
+        let clean = head();
+        assert_ne!(clean, base);
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            store.lookup_repo(&uid).unwrap().unwrap().indexed_sha,
+            base,
+            "precondition: indexed_sha stays behind {clean} while missed.js is absent"
+        );
+        drop(store);
+
+        let result = crate::index::incremental_index(&root, &db, "test", &url).unwrap();
+        assert!(
+            !result.fell_back_to_full,
+            "the empty commit range must stay on the incremental path"
+        );
+        assert_eq!(
+            result.files_added, 1,
+            "only the missing committed source is added"
+        );
+
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert_eq!(
+            store.lookup_repo(&uid).unwrap().unwrap().indexed_sha,
+            clean,
+            "HEAD is recorded once the missing file is back in the graph"
+        );
+        let mut paths = store
+            .list_file_hashes_by_repo(&uid)
+            .unwrap()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["src/kept.js".to_string(), "src/missed.js".to_string()]
+        );
+        let names = store
+            .symbols_in_file_in_repo("src/missed.js", &uid)
+            .unwrap()
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect::<Vec<_>>();
+        assert!(
+            names.iter().any(|name| name == "missed"),
+            "restored file must be parsed, got {names:?}"
+        );
+    }
+
+    /// A linked worktree's `.git` is a file. A source-free commit updates the
+    /// git dir and common dir outside the checkout, so a watcher subscribed
+    /// only to the worktree root never calls `record_applied_head`.
+    #[cfg(unix)]
+    #[test]
+    fn linked_worktree_source_free_commit_advances_indexed_sha_while_the_watcher_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.js"), "export function a() { return 1; }\n").unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed in {}", cwd.display());
+        };
+        git(&root, &["init"]);
+        git(&root, &["config", "user.email", "test@example.com"]);
+        git(&root, &["config", "user.name", "Test"]);
+        git(&root, &["add", "src/a.js"]);
+        git(&root, &["commit", "-m", "base"]);
+        let wt_path = std::fs::canonicalize(dir.path()).unwrap().join("wt");
+        let wt_arg = wt_path.display().to_string();
+        git(&root, &["worktree", "add", "-b", "wt", &wt_arg]);
+        let wt = std::fs::canonicalize(&wt_path).unwrap();
+        assert!(
+            wt.join(".git").is_file(),
+            "a linked worktree .git is a file"
+        );
+        let external = super::external_git_metadata_dirs(&wt);
+        assert!(
+            !external.is_empty(),
+            "git dir and common dir sit outside {}",
+            wt.display()
+        );
+        assert!(
+            external.iter().all(|dir| !dir.starts_with(&wt)),
+            "external git dirs must stay outside the checkout: {external:?}"
+        );
+        let common = external
+            .iter()
+            .find(|dir| dir.join("refs").is_dir())
+            .cloned()
+            .expect("common git dir has refs");
+        assert!(super::git_head_or_refs_event(
+            &wt,
+            &external,
+            &common.join("refs/heads/wt")
+        ));
+        assert!(super::git_head_or_refs_event(
+            &wt,
+            &external,
+            &common.join("logs/refs/heads/wt")
+        ));
+        assert!(!super::git_head_or_refs_event(
+            &wt,
+            &external,
+            &common.join("refs/remotes/origin/main")
+        ));
+        assert!(!super::git_head_or_refs_event(
+            &wt,
+            &external,
+            &common.join("objects/pack/pack")
+        ));
+        assert!(super::is_dot_git_metadata(
+            &wt,
+            &external,
+            &common.join("objects/pack/pack")
+        ));
+        assert!(!super::is_dot_git_metadata(
+            &wt,
+            &external,
+            &wt.join("src/a.js")
+        ));
+
+        let head = |cwd: &Path| -> String {
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git rev-parse HEAD failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        let base = head(&wt);
+        let db = dir.path().join("graph.lbug");
+        let url = format!("file://{}", wt.display());
+        crate::index::index_directory(&wt, &db, "test", &url, &base).unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db).unwrap());
+        let uid = nestweaver_schema::repo_uid("test", &url);
+        let (stop, handle) =
+            spawn_live_code_watcher(CodeWatcher::new(&db, &wt, "test"), store.clone());
+
+        git(&wt, &["commit", "--allow-empty", "-m", "no source change"]);
+        let clean = head(&wt);
+        assert_ne!(clean, base);
+        wait_until("indexed_sha to follow the linked worktree commit", || {
+            store.lookup_repo(&uid).unwrap().unwrap().indexed_sha == clean
+        });
+        stop.stop();
+        handle.join().unwrap().unwrap();
+    }
+
     #[test]
     fn startup_event_drain_replays_every_queued_batch() {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2982,6 +4259,131 @@ mod tests {
             .find(|s| s.name == name)
             .unwrap_or_else(|| panic!("symbol {name} should be indexed"))
             .uid
+    }
+
+    /// The walk discloses a tracked gitignored source and indexing keeps it out
+    /// of the graph. A save event must not publish it, or every later index
+    /// would fall back to a full reindex to retract it again.
+    #[test]
+    fn watcher_keeps_tracked_gitignored_sources_out_of_the_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root) = index_fixture_repo(&dir);
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "src/ignored.js\n").unwrap();
+        // The walk also honours `.ignore`, which `git check-ignore` does not.
+        std::fs::write(root.join(".ignore"), "src/dot_ignored.js\n").unwrap();
+        let ignored = root.join("src/ignored.js");
+        let dot_ignored = root.join("src/dot_ignored.js");
+        let kept = root.join("src/kept_new.js");
+        std::fs::write(&ignored, "export function ignoredFn() { return 1; }\n").unwrap();
+        std::fs::write(
+            &dot_ignored,
+            "export function dotIgnoredFn() { return 3; }\n",
+        )
+        .unwrap();
+        std::fs::write(&kept, "export function keptFn() { return 2; }\n").unwrap();
+        git(&["add", "-f", "."]);
+        let reader = crate::content_reader::FilesystemReader::new(&root);
+        crate::content_reader::ContentReader::list_files(&reader).unwrap();
+        assert!(
+            crate::content_reader::ContentReader::skipped_dirs(&reader)
+                .iter()
+                .filter(|row| row.reason == crate::content_reader::TRACKED_BUT_IGNORED_REASON)
+                .count()
+                == 2,
+            "precondition: the walk discloses both tracked ignored sources"
+        );
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            &[ignored, dot_ignored, kept.clone()],
+        );
+        let files: Vec<String> = store
+            .list_files_by_repo(&r_uid)
+            .unwrap()
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        assert!(
+            !files.iter().any(|path| path == "src/ignored.js"),
+            "{files:?}"
+        );
+        assert!(
+            !files.iter().any(|path| path == "src/dot_ignored.js"),
+            "{files:?}"
+        );
+        assert!(
+            files.iter().any(|path| path == "src/kept_new.js"),
+            "{files:?}"
+        );
+        let graphed = |store: &GraphStore| -> Vec<String> {
+            store
+                .list_files_by_repo(&r_uid)
+                .unwrap()
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect()
+        };
+
+        // A source the graph holds is retracted once it becomes ignored.
+        std::fs::write(root.join(".gitignore"), "src/ignored.js\nsrc/kept_new.js\n").unwrap();
+        process_fixture_batch(&watcher, &store, &r_uid, &root, std::slice::from_ref(&kept));
+        assert!(
+            !graphed(&store).iter().any(|path| path == "src/kept_new.js"),
+            "a newly ignored incumbent must be retracted"
+        );
+
+        // A directory the walk cannot list must not void the verdict for the
+        // rest of the batch, nor drop coverage beneath it.
+        use std::os::unix::fs::PermissionsExt;
+        let locked_dir = root.join("src/locked");
+        std::fs::create_dir(&locked_dir).unwrap();
+        let locked = locked_dir.join("inside.js");
+        std::fs::write(&locked, "export function insideFn() { return 4; }\n").unwrap();
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            std::slice::from_ref(&locked),
+        );
+        assert!(
+            graphed(&store)
+                .iter()
+                .any(|path| path == "src/locked/inside.js")
+        );
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o111)).unwrap();
+        if std::fs::read_dir(&locked_dir).is_err() {
+            let ignored = root.join("src/ignored.js");
+            std::fs::write(&ignored, "export function ignoredFn() { return 5; }\n").unwrap();
+            std::fs::write(&locked, "export function insideFn() { return 6; }\n").unwrap();
+            process_fixture_batch(&watcher, &store, &r_uid, &root, &[ignored, locked]);
+            let files = graphed(&store);
+            assert!(
+                !files.iter().any(|path| path == "src/ignored.js"),
+                "an unlistable sibling must not publish ignored sources: {files:?}"
+            );
+            assert!(
+                files.iter().any(|path| path == "src/locked/inside.js"),
+                "coverage below an unlistable directory is kept: {files:?}"
+            );
+        }
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     fn process_fixture_batch(

@@ -2445,7 +2445,10 @@ fn scan_crash_reports_in(directories: &[PathBuf], supported: bool) -> CrashRecur
 }
 
 /// The closed set of node kinds accepted by `--kinds`.
-const NODE_KINDS: [&str; 3] = ["Section", "Note", "Symbol"];
+///
+/// `Frontmatter` is included because regex results already use that kind
+/// (nw-298, nw-738). Filtering on it used to be rejected as unknown.
+const NODE_KINDS: [&str; 4] = ["Section", "Note", "Symbol", "Frontmatter"];
 
 /// Parse and validate a `--kinds` token against [`NODE_KINDS`].
 ///
@@ -2490,6 +2493,19 @@ fn parse_brain_context_kind(value: &str) -> Result<String, String> {
     nestweaver_mcp::tools::validate_brain_context_kinds(&[value.to_string()])
         .map(|()| value.to_string())
         .map_err(|error| error.to_string())
+}
+
+/// MCP `project_context.response_format`: only `concise` or `detailed`,
+/// case-insensitive, the same two values the tool accepts. Anything else is a
+/// usage error that names `--detailed`, the CLI flag agents already have.
+fn parse_project_context_response_format(value: &str) -> Result<String, String> {
+    if value.eq_ignore_ascii_case("detailed") {
+        Ok("detailed".to_string())
+    } else if value.eq_ignore_ascii_case("concise") {
+        Ok("concise".to_string())
+    } else {
+        Err("expected 'concise' or 'detailed'; use --detailed for the detailed record".to_string())
+    }
 }
 
 /// A `--intent` value, checked at parse time so a bad one is a usage error
@@ -2719,15 +2735,40 @@ fn nodes_len(nodes: &serde_json::Value) -> u64 {
 /// `bridges` and PageRank confidently wrong for every repo not yet re-indexed,
 /// and previously nothing disclosed it. Emitted on stderr so `--json` consumers
 /// are told without the payload changing shape.
-fn warn_stale_resolver_rankings(store: &nestweaver_store::GraphStore, db_path: &std::path::Path) {
-    let Ok(repos) = store.list_repos(None) else {
-        return;
-    };
-    let uids: Vec<String> = repos.into_iter().map(|r| r.uid).collect();
-    if uids.is_empty() {
-        return;
+/// The resolver-generation caveat for the database `store` was opened from.
+///
+/// The sidecar is beside that file. A caller that still holds the logical
+/// anchor — the path before publication `CURRENT` is followed — must not
+/// supply it: an anchor with no generation record reads as generation 0, so
+/// every repository looks incompatible and the remedy says to force-reindex
+/// them all. Git SHA drift is not this verdict; `stale-check` reports that
+/// separately.
+fn resolver_ranking_note(store: &nestweaver_store::GraphStore) -> Option<String> {
+    let db_path = store.db_path()?;
+    let note = (|| -> anyhow::Result<Option<String>> {
+        let repos = store.list_repos(None)?;
+        let generations =
+            nestweaver_engine::resolver_generation::load_strict(db_path)?.unwrap_or_default();
+        let stale = generations.stale_repos(repos.iter().map(|repo| repo.uid.as_str()));
+        Ok(nestweaver_engine::resolver_generation::staleness_note_for(
+            &stale,
+            Some(repos.len()),
+        ))
+    })();
+    match note {
+        Ok(note) => note,
+        Err(error) => Some(resolver_verification_warning(&format!("{error:#}"))),
     }
-    if let Some(note) = nestweaver_engine::resolver_generation::staleness_note(db_path, &uids) {
+}
+
+fn resolver_verification_warning(error: &str) -> String {
+    format!(
+        "could not verify resolver generation metadata; rankings may be stale: {error}. Repair the metadata and retry before trusting these rankings."
+    )
+}
+
+fn warn_stale_resolver_rankings(store: &nestweaver_store::GraphStore) {
+    if let Some(note) = resolver_ranking_note(store) {
         eprintln!("warning: {note}");
     }
 }
@@ -2760,6 +2801,10 @@ fn warn_stale_resolver_rankings(store: &nestweaver_store::GraphStore, db_path: &
 /// `ResolverGenerations::stale_repos` is the sole computation for every route
 /// and stays that way.
 fn warn_stale_resolver_rankings_no_store(staleness: &ResolverStaleness) {
+    if let Some(error) = &staleness.verification_error {
+        eprintln!("warning: {}", resolver_verification_warning(error));
+        return;
+    }
     if !staleness.rankings_stale {
         return;
     }
@@ -2824,23 +2869,41 @@ struct ResolverStaleness {
     /// [`ResolverStaleness::from_sidecar`]. Population 1 of 4 — see the
     /// struct-level doc comment above.
     stale_repos: Vec<String>,
+    /// Verification failed; an empty stale list does not establish freshness.
+    verification_error: Option<String>,
 }
 
 impl ResolverStaleness {
-    /// Exact answer: enumerate the repos and compare each recorded generation.
-    /// Available only where we hold the store, i.e. the direct path.
-    fn from_store(store: &nestweaver_store::GraphStore, db_path: &std::path::Path) -> Self {
-        let uids: Vec<String> = store
-            .list_repos(None)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| r.uid)
-            .collect();
-        let stale_repos = nestweaver_engine::resolver_generation::load(db_path)
-            .stale_repos(uids.iter().map(String::as_str));
-        Self {
-            rankings_stale: !stale_repos.is_empty(),
-            stale_repos,
+    /// Exact answer: enumerate the repos and compare each recorded generation
+    /// on the database this store was opened from.
+    ///
+    /// That is the database `incompatible_repos_for_store` reads, but this
+    /// path reads it strictly: unreadable metadata is reported, not stale.
+    /// Passing a separate path let `repo-map` read the logical anchor after
+    /// `open_store` had already followed publication `CURRENT`, so a Git SHA
+    /// mismatch on an otherwise current graph was reported as every repository
+    /// being resolver-incompatible.
+    fn from_store(store: &nestweaver_store::GraphStore) -> Self {
+        let verification = (|| -> anyhow::Result<Vec<String>> {
+            let Some(db_path) = store.db_path() else {
+                return Ok(Vec::new());
+            };
+            let repos = store.list_repos(None)?;
+            let generations =
+                nestweaver_engine::resolver_generation::load_strict(db_path)?.unwrap_or_default();
+            Ok(generations.stale_repos(repos.iter().map(|repo| repo.uid.as_str())))
+        })();
+        match verification {
+            Ok(stale_repos) => Self {
+                rankings_stale: !stale_repos.is_empty(),
+                stale_repos,
+                verification_error: None,
+            },
+            Err(error) => Self {
+                rankings_stale: true,
+                stale_repos: Vec::new(),
+                verification_error: Some(format!("{error:#}")),
+            },
         }
     }
 
@@ -2872,6 +2935,10 @@ impl ResolverStaleness {
                     .iter()
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect(),
+                verification_error: value
+                    .get("resolver_generation_error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
             },
             _ => Self::from_sidecar(db_path),
         }
@@ -2896,12 +2963,22 @@ impl ResolverStaleness {
             db_path,
             nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
         );
-        let generations = nestweaver_engine::resolver_generation::load(db_path);
-        let recorded: Vec<String> = generations.repos.keys().cloned().collect();
-        let stale_repos = generations.stale_repos(recorded.iter().map(String::as_str));
-        Self {
-            rankings_stale: !sidecar.exists() || !stale_repos.is_empty(),
-            stale_repos,
+        match nestweaver_engine::resolver_generation::load_strict(db_path) {
+            Ok(generations) => {
+                let generations = generations.unwrap_or_default();
+                let stale_repos =
+                    generations.stale_repos(generations.repos.keys().map(String::as_str));
+                Self {
+                    rankings_stale: !sidecar.exists() || !stale_repos.is_empty(),
+                    stale_repos,
+                    verification_error: None,
+                }
+            }
+            Err(error) => Self {
+                rankings_stale: true,
+                stale_repos: Vec::new(),
+                verification_error: Some(format!("{error:#}")),
+            },
         }
     }
 }
@@ -3123,6 +3200,9 @@ fn ranking_json_payload<T: serde::Serialize>(
         // reading "N of M hubs", which is not what M is.
         "total_population": "symbols with at least one code edge (hub/bridge CANDIDATES)",
     });
+    if let Some(error) = &staleness.verification_error {
+        payload["resolver_generation_error"] = error.clone().into();
+    }
     if let Some(obj) = payload.as_object_mut() {
         // Bridges only. Absent on hubs rather than `false`, because a hub score
         // is a degree count and is never an estimate — a `sampled: false` there
@@ -3196,6 +3276,9 @@ fn print_repo_map_json(
         "rankings_stale": staleness.rankings_stale,
         "stale_repos": staleness.stale_repos,
     });
+    if let Some(error) = &staleness.verification_error {
+        payload["resolver_generation_error"] = error.clone().into();
+    }
     if let Some(obj) = payload.as_object_mut() {
         if let Some(t) = truncated {
             obj.insert("truncated".to_string(), serde_json::json!(t));
@@ -3262,8 +3345,22 @@ fn impact_json_not_found(symbol: &str) -> serde_json::Value {
 /// so every symbol-lookup command answers a miss with the same sentence and
 /// the same `path::name` suggestions.
 fn eprint_symbol_not_found(name_or_uid: &str, candidates: &[String]) {
-    eprintln!("Symbol '{name_or_uid}' not found.");
-    eprint_did_you_mean(candidates);
+    // `eprintln!` panics on EPIPE. The process boundary treats that panic as
+    // a closed stdout and exits 0, so a missing symbol with a closed stderr
+    // was succeeding with empty stdout instead of exiting 2.
+    let _ = eprint_symbol_not_found_to(&mut std::io::stderr().lock(), name_or_uid, candidates);
+}
+
+fn eprint_symbol_not_found_to(
+    writer: &mut impl std::io::Write,
+    name_or_uid: &str,
+    candidates: &[String],
+) -> std::io::Result<()> {
+    eprint_best_effort_to(writer, format_args!("Symbol '{name_or_uid}' not found."))?;
+    if let Some(line) = nestweaver_engine::did_you_mean::did_you_mean_line(candidates) {
+        eprint_best_effort_to(writer, line)?;
+    }
+    Ok(())
 }
 
 /// nw-113: the shared "Did you mean" line, printed only when there are
@@ -3271,7 +3368,7 @@ fn eprint_symbol_not_found(name_or_uid: &str, candidates: &[String]) {
 /// not-found message.
 fn eprint_did_you_mean(candidates: &[String]) {
     if let Some(line) = nestweaver_engine::did_you_mean::did_you_mean_line(candidates) {
-        eprintln!("{line}");
+        let _ = eprint_best_effort(line);
     }
 }
 
@@ -6703,11 +6800,12 @@ enum Commands {
         #[arg(long, help = "Path to nestweaver-instance.toml")]
         config: Option<PathBuf>,
     },
-    /// Regex search over indexed text (section bodies, note titles, symbol signatures)
+    /// Regex search over indexed text (section bodies and their heading lines, note titles, frontmatter, symbol signatures)
     ///
     /// First-party replacement for shelling out to rg/grep. Uses a trigram
     /// pre-filter when built (`index --with-trigrams`), else falls back to
     /// scanning all candidate text — always correct, just slower.
+    /// `^` and `$` are line anchors; `(?-m)` anchors the whole candidate.
     #[command(
         after_help = "Examples:\n  nestweaver regex-search 'fn\\s+authenticate'\n  nestweaver regex-search '(?i)todo' --path-prefix src/ --limit 20"
     )]
@@ -6728,7 +6826,7 @@ enum Commands {
             long,
             value_delimiter = ',',
             value_parser = parse_node_kind,
-            help = "Restrict to node kinds (comma-separated): Section,Note,Symbol"
+            help = "Restrict to node kinds (comma-separated): Section,Note,Symbol,Frontmatter"
         )]
         kinds: Option<Vec<String>>,
         #[arg(
@@ -6757,6 +6855,7 @@ enum Commands {
     ///
     /// Companion to regex-search. Reports total matches, files matched, and the
     /// busiest files for each pattern. Reuses the same trigram pre-filter.
+    /// `^` and `$` are line anchors; `(?-m)` anchors the whole candidate.
     #[command(
         after_help = "Examples:\n  nestweaver count-patterns 'TODO' 'FIXME'\n  nestweaver count-patterns '(?i)deprecated' --path-prefix src/"
     )]
@@ -6773,7 +6872,7 @@ enum Commands {
             long,
             value_delimiter = ',',
             value_parser = parse_node_kind,
-            help = "Restrict to node kinds (comma-separated): Section,Note,Symbol"
+            help = "Restrict to node kinds (comma-separated): Section,Note,Symbol,Frontmatter"
         )]
         kinds: Option<Vec<String>>,
         #[arg(long, help = "Output as JSON")]
@@ -7805,7 +7904,7 @@ enum Commands {
 
     /// Get context for a project: all notes and symbols, ranked by PPR
     #[command(
-        after_help = "Examples:\n  nestweaver project-context my-project\n  nestweaver project-context my-project --token-budget 4000 --json"
+        after_help = "Examples:\n  nestweaver project-context my-project\n  nestweaver project-context my-project --repos nestweaver --path-prefix src/ --kinds Symbol --tags api\n  nestweaver project-context my-project --response-format detailed --token-budget 4000 --json"
     )]
     ProjectContext {
         /// Project name, alias, or UID
@@ -7821,6 +7920,51 @@ enum Commands {
             help = "Return full detail (uid + relevance, larger default budget) instead of the concise orientation"
         )]
         detailed: bool,
+        /// MCP `response_format`. `detailed` is `--detailed`; `concise` is the
+        /// default orientation. Unknown values are refused at parse time with
+        /// a hint that names `--detailed`.
+        #[arg(
+            long = "response-format",
+            value_parser = parse_project_context_response_format,
+            help = "MCP response_format: 'concise' (default) or 'detailed' (same as --detailed)"
+        )]
+        response_format: Option<String>,
+        /// Scope results to these repositories. Each entry is forwarded as
+        /// MCP `repos`: exact repo UID, display name, clone URL, or local
+        /// root. An unresolvable or ambiguous entry is the tool's error.
+        /// Accepts comma-separated values or repeated `--repos` flags.
+        /// Omitted when unset — an empty array matches nothing.
+        #[arg(
+            long = "repos",
+            value_delimiter = ',',
+            help = "Scope results to these repo UIDs or names (comma-separated or repeated; MCP project_context repos)"
+        )]
+        repos: Vec<String>,
+        /// Keep only nodes whose location starts with this path prefix.
+        /// Forwarded as MCP `path_prefix`.
+        #[arg(
+            long = "path-prefix",
+            help = "Keep only nodes whose location starts with this path prefix (MCP project_context path_prefix)"
+        )]
+        path_prefix: Option<String>,
+        /// Filter result kinds. Case-insensitive prefix match, forwarded as
+        /// MCP `kinds` (the tool lowercases). Accepts comma-separated values
+        /// or repeated `--kinds` flags.
+        #[arg(
+            long = "kinds",
+            value_delimiter = ',',
+            help = "Filter result kinds by case-insensitive prefix, e.g. Symbol,Note (MCP project_context kinds)"
+        )]
+        kinds: Vec<String>,
+        /// Keep only note/section nodes tagged with any of these tags.
+        /// Forwarded as MCP `tags`. Accepts comma-separated values or
+        /// repeated `--tags` flags.
+        #[arg(
+            long = "tags",
+            value_delimiter = ',',
+            help = "Keep only note/section nodes tagged with any of these tags (MCP project_context tags)"
+        )]
+        tags: Vec<String>,
         // nw-316: `Option<bool>`, because a bare clap `bool` cannot express
         // "unset" and the tool's documented default is TRUE. Sending clap's
         // `false` unconditionally made that default UNREACHABLE on this route,
@@ -14871,6 +15015,223 @@ fn no_bytes_refusal(db_path: &std::path::Path) -> anyhow::Error {
 }
 
 #[cfg(test)]
+mod repo_map_resolver_generation_tests {
+    use super::*;
+    use nestweaver_engine::publication::{
+        self, ArtifactKind, CurrentPublicationPointer, PublicationBundleV3,
+    };
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "nw740")
+            .env("GIT_AUTHOR_EMAIL", "nw740@example.com")
+            .env("GIT_COMMITTER_NAME", "nw740")
+            .env("GIT_COMMITTER_EMAIL", "nw740@example.com")
+            .output()
+            .unwrap_or_else(|error| panic!("git {args:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "git {args:?}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// A published graph whose logical anchor has no generation sidecar.
+    /// Reading the anchor reports every repo as generation 0.
+    fn publish_repo(base: &Path, uid: &str, root: &Path, indexed_sha: &str) -> PathBuf {
+        let identity = nestweaver_store::PublicationIdentity::new_brain();
+        let root_dir = publication::default_publication_root(base);
+        let slot = publication::slot_path(&root_dir, &identity.publication_uuid).unwrap();
+        std::fs::create_dir_all(&slot).unwrap();
+        let graph_path = slot.join(publication::PUBLICATION_GRAPH_FILE);
+        let store = GraphStore::create_with_publication_identity(&graph_path, &identity).unwrap();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: uid.to_string(),
+                url: format!("file://{}", root.display()),
+                indexed_sha: indexed_sha.to_string(),
+                staleness_commits_behind: 1,
+                instance_id: "nw740".into(),
+                name: Some("ahead".into()),
+                root_path: Some(root.display().to_string()),
+            })
+            .unwrap();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: format!("{uid}-old"),
+                url: format!("file://{}/old", root.display()),
+                indexed_sha: indexed_sha.to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "nw740".into(),
+                name: Some("old-generation".into()),
+                root_path: Some(root.display().to_string()),
+            })
+            .unwrap();
+        let generation = store.graph_generation();
+        drop(store);
+        let ahead = uid.to_string();
+        let old = format!("{uid}-old");
+        nestweaver_engine::resolver_generation::record(&graph_path, &ahead).unwrap();
+        nestweaver_engine::resolver_generation::record(&graph_path, &old).unwrap();
+        let stamp_name = format!(
+            "{}{}",
+            publication::PUBLICATION_GRAPH_FILE,
+            nestweaver_store::engine_format::ENGINE_FORMAT_SIDECAR_SUFFIX
+        );
+        let descriptor = |path: &str, kind, fingerprint: &str| {
+            let bytes = std::fs::read(slot.join(path)).unwrap();
+            publication::ArtifactDescriptor {
+                path: path.to_string(),
+                kind,
+                artifact_schema_version: 1,
+                byte_size: bytes.len() as u64,
+                blake3: nestweaver_engine::hash::blake3_hex_bytes(&bytes),
+                brain_uuid: identity.brain_uuid.clone(),
+                publication_uuid: identity.publication_uuid.clone(),
+                producer_version: env!("CARGO_PKG_VERSION").to_string(),
+                source_graph_generation: generation,
+                algorithm_fingerprint: fingerprint.to_string(),
+            }
+        };
+        let bundle = PublicationBundleV3 {
+            format_version: nestweaver_engine::snapshot::SNAPSHOT_FORMAT_VERSION,
+            brain_uuid: identity.brain_uuid.clone(),
+            publication_uuid: identity.publication_uuid.clone(),
+            producer_version: env!("CARGO_PKG_VERSION").to_string(),
+            source_graph_generation: generation,
+            artifacts: vec![
+                descriptor(
+                    publication::PUBLICATION_GRAPH_FILE,
+                    ArtifactKind::Graph,
+                    "ladybugdb-graph-v1",
+                ),
+                descriptor(
+                    &stamp_name,
+                    ArtifactKind::CompatibilityStamp,
+                    "nestweaver-engine-format-v1",
+                ),
+            ],
+        };
+        let manifest = serde_json::to_vec_pretty(&bundle).unwrap();
+        std::fs::write(slot.join(publication::PUBLICATION_MANIFEST_FILE), &manifest).unwrap();
+        let pointer = CurrentPublicationPointer::new(
+            &identity,
+            None,
+            nestweaver_engine::hash::blake3_hex_bytes(&manifest),
+        )
+        .unwrap();
+        std::fs::write(
+            publication::current_pointer_path(&root_dir),
+            serde_json::to_vec_pretty(&pointer).unwrap(),
+        )
+        .unwrap();
+        graph_path
+    }
+
+    #[test]
+    fn a_repo_ahead_of_its_indexed_sha_is_not_resolver_incompatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        std::fs::write(repo.join("a.js"), "export function a() { return 1; }\n").unwrap();
+        git(&repo, &["add", "a.js"]);
+        git(&repo, &["commit", "-m", "indexed"]);
+        let indexed = git(&repo, &["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("a.js"), "export function a() { return 2; }\n").unwrap();
+        git(&repo, &["add", "a.js"]);
+        git(&repo, &["commit", "-m", "ahead"]);
+        let head = git(&repo, &["rev-parse", "HEAD"]);
+        assert_ne!(head, indexed, "HEAD must be ahead of the indexed SHA");
+        assert_ne!(
+            git(
+                &repo,
+                &["rev-list", "--count", &format!("{indexed}..{head}")]
+            ),
+            "0"
+        );
+
+        let base = dir.path().join("brain.lbug");
+        let uid = "repo:nw740:ahead";
+        let old = format!("{uid}-old");
+        let graph = publish_repo(&base, uid, &repo, &indexed);
+        assert!(
+            !nestweaver_engine::sidecar_path(
+                &base,
+                nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+            )
+            .exists(),
+            "the logical anchor must not carry the generation record"
+        );
+        let anchor_stale =
+            nestweaver_engine::resolver_generation::load(&base).stale_repos([uid, old.as_str()]);
+        assert_eq!(
+            anchor_stale,
+            vec![uid.to_string(), old.clone()],
+            "reading the anchor reports both repos incompatible; that is the false warning"
+        );
+
+        let store = open_store(Some(&base)).unwrap();
+        assert_eq!(store.db_path(), Some(graph.as_path()));
+        let current = ResolverStaleness::from_store(&store);
+        assert!(
+            !current.rankings_stale,
+            "HEAD ahead of the indexed SHA is not a resolver mismatch: {:?}",
+            current.stale_repos
+        );
+        assert!(
+            current.stale_repos.is_empty(),
+            "the SHA-ahead repo must not be listed for a force reindex: {:?}",
+            current.stale_repos
+        );
+        assert!(
+            resolver_ranking_note(&store).is_none(),
+            "repo-map must not advise `index --force` for a Git SHA mismatch: {:?}",
+            resolver_ranking_note(&store)
+        );
+        drop(store);
+
+        let sidecar = nestweaver_engine::sidecar_path(
+            &graph,
+            nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+        );
+        std::fs::write(
+            &sidecar,
+            serde_json::json!({
+                "repos": {
+                    uid: nestweaver_engine::resolver_generation::RESOLVER_GENERATION,
+                    old.as_str(): 1,
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = open_store(Some(&base)).unwrap();
+        let stale = ResolverStaleness::from_store(&store);
+        assert!(stale.rankings_stale);
+        assert_eq!(stale.stale_repos, vec![old.clone()]);
+        let note = resolver_ranking_note(&store).expect("an incompatible generation still warns");
+        assert!(
+            note.contains("1 of 2 repo(s) were incompatible with this resolver"),
+            "{note}"
+        );
+        assert!(
+            note.contains("nestweaver index --repo <path> --force"),
+            "{note}"
+        );
+        assert!(
+            !note.contains("2 of 2"),
+            "a Git SHA mismatch must not be counted as resolver-incompatible: {note}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod logical_publication_admission_tests {
     use super::*;
     use nestweaver_engine::publication;
@@ -16170,6 +16531,53 @@ fn eprint_best_effort(message: impl std::fmt::Display) -> anyhow::Result<()> {
     eprint_best_effort_to(&mut std::io::stderr().lock(), message).map_err(Into::into)
 }
 
+/// Stderr writer for lifecycle diagnostics. A closed pipe is not a command
+/// failure: tracing-subscriber would otherwise `eprintln!` the write error,
+/// panic, and the process boundary would exit 0.
+struct BrokenPipeStderr<W> {
+    inner: W,
+}
+
+impl BrokenPipeStderr<std::io::Stderr> {
+    fn process() -> Self {
+        Self::new(std::io::stderr())
+    }
+}
+
+impl<W> BrokenPipeStderr<W> {
+    fn new(inner: W) -> Self {
+        Self { inner }
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for BrokenPipeStderr<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.inner.write(buf) {
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(buf.len()),
+            other => other,
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.inner.flush() {
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            other => other,
+        }
+    }
+}
+
+macro_rules! cli_stderr_tracing {
+    () => {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive(tracing::Level::WARN.into()),
+            )
+            .with_writer(BrokenPipeStderr::process)
+            .log_internal_errors(false)
+    };
+}
+
 fn write_stderr_to(
     writer: &mut impl std::io::Write,
     message: impl std::fmt::Display,
@@ -16248,6 +16656,32 @@ mod broken_pipe_policy_tests {
                 .expect("closed stderr should not fail an ambiguous report");
         assert_eq!(result, (EXIT_AMBIGUOUS, None));
     }
+
+    #[test]
+    fn closed_stderr_lifecycle_warning_does_not_mask_not_found() {
+        use std::io::Write;
+
+        struct ClosedPipe;
+        impl std::io::Write for ClosedPipe {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+        }
+
+        let mut stderr = BrokenPipeStderr::new(ClosedPipe);
+        writeln!(
+            stderr,
+            "socket path exceeds the 104-byte sun_path limit — using /tmp fallback"
+        )
+        .expect("socket-path fallback warning must tolerate a closed stderr");
+        let exit = eprint_symbol_not_found_to(&mut stderr, "missing-symbol", &[])
+            .map(|()| EXIT_NOT_FOUND)
+            .expect("not-found message must tolerate a closed stderr");
+        assert_eq!(exit, EXIT_NOT_FOUND);
+    }
 }
 
 /// Give the `daemon start` parent its stderr subscriber back after the fork.
@@ -16258,13 +16692,7 @@ mod broken_pipe_policy_tests {
 /// because on the child's path a subscriber is already global.
 #[cfg(not(target_os = "macos"))]
 fn restore_parent_stderr_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::WARN.into()),
-        )
-        .with_writer(std::io::stderr)
-        .try_init();
+    let _ = cli_stderr_tracing!().try_init();
 }
 
 /// Convert a daemon `tonic::Status` into an error that renders its message
@@ -16394,13 +16822,7 @@ fn main() {
     #[cfg(target_os = "macos")]
     let forks_into_daemon = false;
     if !is_daemon_run && !forks_into_daemon {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive(tracing::Level::WARN.into()),
-            )
-            .with_writer(std::io::stderr)
-            .init();
+        cli_stderr_tracing!().init();
     }
     let out = OutputConfig::from_cli(&cli);
     let show_stats = cli.stats;
@@ -16464,8 +16886,10 @@ fn main() {
             };
             let report = into_diagnostic(e);
             if let Err(error) = write_stderr(format_args!("{report:?}")) {
+                // The failure message is what hit the closed pipe. Dropping
+                // it must not replace the command's exit code with success.
                 process::exit(if error.kind() == std::io::ErrorKind::BrokenPipe {
-                    EXIT_SUCCESS
+                    code
                 } else {
                     EXIT_ERROR
                 });
@@ -17116,6 +17540,87 @@ fn resolve_use_daemon(no_daemon_flag: bool, warn: bool) -> bool {
         );
     }
     true
+}
+
+/// JSON `project_context` arguments shared by the daemon and direct routes.
+///
+/// Empty scope filters are omitted. MCP `repos: []` means "no repo matches",
+/// which is a different request from leaving the filter off. `response_format`
+/// maps onto `--detailed`: `detailed` selects the detailed record and its
+/// 3000-token default; `concise` keeps the concise default unless `--detailed`
+/// is also set, which is a conflict.
+#[allow(clippy::too_many_arguments)]
+fn project_context_tool_args(
+    name: &str,
+    token_budget: Option<usize>,
+    detailed: bool,
+    response_format: Option<&str>,
+    include_components: Option<bool>,
+    since: Option<&str>,
+    recency_weight: f64,
+    recency_half_life_days: f64,
+    no_embed: bool,
+    repos: &[String],
+    path_prefix: Option<&str>,
+    kinds: &[String],
+    tags: &[String],
+) -> anyhow::Result<(serde_json::Value, usize)> {
+    let detailed = match response_format {
+        Some("detailed") => true,
+        Some("concise") if detailed => {
+            anyhow::bail!("--response-format concise conflicts with --detailed; pass one of them")
+        }
+        Some("concise") | None => detailed,
+        Some(other) => anyhow::bail!(
+            "invalid --response-format '{other}'; expected 'concise' or 'detailed' (use --detailed for the detailed record)"
+        ),
+    };
+    let response_format = if detailed { "detailed" } else { "concise" };
+    let token_budget = token_budget.unwrap_or(if detailed { 3000 } else { 1000 });
+    let mut project_args = serde_json::json!({
+        "project": name,
+        "token_budget": token_budget,
+        "response_format": response_format,
+        // nw-316: omitted when unset, so the TOOL's documented
+        // default of `true` governs. Sending clap's `false` here
+        // was what pinned this route to the opposite of the
+        // documented behaviour.
+        // nw-295: absent `since` sends `""`, not the key omitted.
+        // The daemon strips empty strings at `server.rs`, so this is
+        // benign THERE — but it is benign by the receiver's grace,
+        // and any caller reaching `tools::dispatch` directly with
+        // `since: ""` gets a spurious filter. Omit the key instead,
+        // so the request does not depend on who reads it.
+        "recency_weight": recency_weight,
+        "recency_half_life_days": recency_half_life_days,
+        // nw-430: `project-context` has a genuine semantic leg
+        // (the daemon's loaded embed model), unlike `search` and
+        // `context` above, which are rejected outright rather than
+        // silently ignoring this flag. Sent on both routes from
+        // the same `project_args`/`direct_args` clone, so the
+        // direct path is future-proofed for whenever it gains its
+        // own embed model.
+        "no_embed": no_embed,
+    });
+    if let Some(since) = since.filter(|value| !value.is_empty()) {
+        project_args["since"] = serde_json::json!(since);
+    }
+    if let Some(include_components) = include_components {
+        project_args["include_components"] = serde_json::json!(include_components);
+    }
+    if !repos.is_empty() {
+        project_args["repos"] = serde_json::json!(repos);
+    }
+    if let Some(prefix) = path_prefix.filter(|value| !value.is_empty()) {
+        project_args["path_prefix"] = serde_json::json!(prefix);
+    }
+    if !kinds.is_empty() {
+        project_args["kinds"] = serde_json::json!(kinds);
+    }
+    if !tags.is_empty() {
+        project_args["tags"] = serde_json::json!(tags);
+    }
+    Ok((project_args, token_budget))
 }
 
 fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
@@ -17832,8 +18337,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let Some(value) = try_hybrid_json_rpc(true, &db_path, None, "repo_map", args)? {
                     let map = value["map"].as_str().unwrap_or("");
                     // nw-370: read the daemon's own verdict, the same way
-                    // `hubs`/`bridges` do.
-                    let staleness = ResolverStaleness::from_daemon_response(&value, &db_path);
+                    // `hubs`/`bridges` do. The sidecar fallback has to follow
+                    // publication CURRENT too: the anchor this RPC dials has
+                    // no generation record of its own.
+                    let generation_db = selected_db_path(&db_path)?;
+                    let staleness = ResolverStaleness::from_daemon_response(&value, &generation_db);
                     print!("{map}");
                     warn_stale_resolver_rankings_no_store(&staleness);
                     return Ok((EXIT_SUCCESS, None));
@@ -17841,7 +18349,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             let store = open_store(db.as_deref())?;
-            let db_path = db.clone().unwrap_or_else(default_db_path);
             // nw-439: `repo-map --json` has no MCP/daemon twin that can
             // answer the full shape (the daemon's `repo_map_json` RPC exists
             // but cannot supply `truncated`/`files_returned`/`files_total` —
@@ -17871,12 +18378,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // this command — is computed over the edges an older resolver
             // wrote. Same disclosure as `hubs`, for a stronger reason: `hubs`
             // prints scores a reader can discount, this prints only an order.
-            warn_stale_resolver_rankings(&store, &db_path);
+            warn_stale_resolver_rankings(&store);
 
             if json {
                 print_repo_map_json(
                     &found.map,
-                    &ResolverStaleness::from_store(&store, &db_path),
+                    &ResolverStaleness::from_store(&store),
                     None,
                     Some(found.truncated()),
                     Some(found.files_returned),
@@ -19529,13 +20036,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // reaches the user in --json mode too. nw-308: stderr alone was
             // not enough — the bare-array payload had nowhere to put this, so
             // the `--json` consumer never saw it. The payload now carries it.
-            warn_stale_resolver_rankings(&store, &db_path);
+            warn_stale_resolver_rankings(&store);
 
             if json {
                 print_ranking_json(
                     "hubs",
                     &hubs,
-                    &ResolverStaleness::from_store(&store, &db_path),
+                    &ResolverStaleness::from_store(&store),
                     None,
                     &bounds,
                     None,
@@ -19734,7 +20241,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             .map_err(|e| nestweaver_mcp::tools::classify_index_publication_error(&store, e))?;
             let bounds = RankingBounds::from_bridges(&found);
             let mut bridges = found.bridges;
-            warn_stale_resolver_rankings(&store, &db_path);
+            warn_stale_resolver_rankings(&store);
 
             // Attach community connection info if clustering sidecar exists.
             if let Ok(Some(clustering)) = load_clusters(&db_path) {
@@ -19745,7 +20252,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 print_ranking_json(
                     "bridges",
                     &bridges,
-                    &ResolverStaleness::from_store(&store, &db_path),
+                    &ResolverStaleness::from_store(&store),
                     None,
                     &bounds,
                     None,
@@ -20091,12 +20598,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // thirty symbols. The other three levels are deliberately excluded:
             // File is not ranking-derived at all, and a flag present on every
             // level distinguishes nothing.
-            let hub_staleness = (parsed_level == SummaryLevel::Hub)
-                .then(|| ResolverStaleness::from_store(&store, &db_path));
+            let hub_staleness =
+                (parsed_level == SummaryLevel::Hub).then(|| ResolverStaleness::from_store(&store));
             if hub_staleness.is_some() {
                 // The store-holding variant, so this route prints the exact
                 // `N of M` denominator rather than the daemon route's floor.
-                warn_stale_resolver_rankings(&store, &db_path);
+                warn_stale_resolver_rankings(&store);
             }
 
             if json {
@@ -20121,6 +20628,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let (Some(staleness), Some(obj)) = (&hub_staleness, payload.as_object_mut()) {
                     obj.insert("rankings_stale".into(), staleness.rankings_stale.into());
                     obj.insert("stale_repos".into(), staleness.stale_repos.clone().into());
+                    if let Some(error) = &staleness.verification_error {
+                        obj.insert("resolver_generation_error".into(), error.clone().into());
+                    }
                 }
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else if display.is_empty() {
@@ -24349,6 +24859,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             name,
             token_budget,
             detailed,
+            response_format,
+            repos,
+            path_prefix,
+            kinds,
+            tags,
             include_components,
             json,
             db,
@@ -24364,42 +24879,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 anyhow::bail!("project name must be non-empty");
             }
             // Concise orientation by default (research-backed — see ADR
-            // server-mode-remainder-decisions); --detailed opts into the full record.
-            let response_format = if detailed { "detailed" } else { "concise" };
-            let token_budget = token_budget.unwrap_or(if detailed { 3000 } else { 1000 });
+            // server-mode-remainder-decisions); --detailed, or
+            // --response-format detailed, opts into the full record.
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-
-            let mut project_args = serde_json::json!({
-                    "project": name,
-                    "token_budget": token_budget,
-                    "response_format": response_format,
-                    // nw-316: omitted when unset, so the TOOL's documented
-                    // default of `true` governs. Sending clap's `false` here
-                    // was what pinned this route to the opposite of the
-                    // documented behaviour.
-                    // nw-295: absent `since` sends `""`, not the key omitted.
-                    // The daemon strips empty strings at `server.rs`, so this is
-                    // benign THERE — but it is benign by the receiver's grace,
-                    // and any caller reaching `tools::dispatch` directly with
-                    // `since: ""` gets a spurious filter. Omit the key instead,
-                    // so the request does not depend on who reads it.
-                    "recency_weight": recency_weight,
-                    "recency_half_life_days": recency_half_life_days,
-                    // nw-430: `project-context` has a genuine semantic leg
-                    // (the daemon's loaded embed model), unlike `search` and
-                    // `context` above, which are rejected outright rather than
-                    // silently ignoring this flag. Sent on both routes from
-                    // the same `project_args`/`direct_args` clone, so the
-                    // direct path is future-proofed for whenever it gains its
-                    // own embed model.
-                    "no_embed": no_embed,
-            });
-            if let Some(since) = since.as_deref().filter(|s| !s.is_empty()) {
-                project_args["since"] = serde_json::json!(since);
-            }
-            if let Some(include_components) = include_components {
-                project_args["include_components"] = serde_json::json!(include_components);
-            }
+            let (project_args, token_budget) = project_context_tool_args(
+                &name,
+                token_budget,
+                detailed,
+                response_format.as_deref(),
+                include_components,
+                since.as_deref(),
+                recency_weight,
+                recency_half_life_days,
+                no_embed,
+                &repos,
+                path_prefix.as_deref(),
+                &kinds,
+                &tags,
+            )?;
             // Both routes send the SAME arguments. The direct leg used to
             // build its own set from the same clap fields, which is how
             // `include_components` came to differ between them (nw-316 leg 2).
@@ -39328,7 +39825,7 @@ mod cli_bounds_tests {
                             "{argv:?} must be rejected — a typo must not read as an empty result"
                         );
                     }
-                    for good in ["Section", "note", "SYMBOL", "Note,Symbol"] {
+                    for good in ["Section", "note", "SYMBOL", "Note,Symbol", "Frontmatter"] {
                         let mut argv = prefix.to_vec();
                         argv.push(good);
                         assert!(
@@ -41056,6 +41553,115 @@ mod include_components_tri_state_tests {
     }
 }
 
+/// nw-482: `project-context` must accept the MCP scope filters and
+/// `--response-format`, which used to exit 64 as an unexpected argument.
+#[cfg(test)]
+mod project_context_scope_filter_tests {
+    use super::*;
+
+    fn parse(extra: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv: Vec<String> = ["nestweaver", "project-context", "nestweaver"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        argv.extend(extra.iter().copied().map(str::to_string));
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(argv))
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    fn forwarded(extra: &[&str]) -> (serde_json::Value, usize) {
+        let cli = parse(extra).expect("project-context must accept these arguments");
+        match cli.command {
+            Commands::ProjectContext {
+                name,
+                token_budget,
+                detailed,
+                response_format,
+                include_components,
+                since,
+                recency_weight,
+                recency_half_life_days,
+                no_embed,
+                repos,
+                path_prefix,
+                kinds,
+                tags,
+                ..
+            } => project_context_tool_args(
+                &name,
+                token_budget,
+                detailed,
+                response_format.as_deref(),
+                include_components,
+                since.as_deref(),
+                recency_weight,
+                recency_half_life_days,
+                no_embed,
+                &repos,
+                path_prefix.as_deref(),
+                &kinds,
+                &tags,
+            )
+            .expect("forwarded project_context arguments"),
+            _ => panic!("expected `project-context`"),
+        }
+    }
+
+    #[test]
+    fn scoped_call_forwards_mcp_filters_and_response_format_maps_or_hints() {
+        let (args, budget) = forwarded(&[
+            "--repos",
+            "nestweaver",
+            "--path-prefix",
+            "src/",
+            "--kinds",
+            "Symbol",
+            "--tags",
+            "workspace/nestweaver",
+            "--response-format",
+            "concise",
+        ]);
+        assert_eq!(args["project"], "nestweaver");
+        assert_eq!(args["repos"], serde_json::json!(["nestweaver"]));
+        assert_eq!(args["path_prefix"], "src/");
+        assert_eq!(args["kinds"], serde_json::json!(["Symbol"]));
+        assert_eq!(args["tags"], serde_json::json!(["workspace/nestweaver"]));
+        assert_eq!(args["response_format"], "concise");
+        assert_eq!(budget, 1000);
+        assert!(args.get("include_components").is_none());
+
+        let (unscoped, _) = forwarded(&[]);
+        for key in ["repos", "path_prefix", "kinds", "tags"] {
+            assert!(
+                unscoped.get(key).is_none(),
+                "an absent {key} must be omitted; an empty array is a different MCP filter"
+            );
+        }
+
+        let (detailed, detailed_budget) = forwarded(&["--response-format", "DETAILED"]);
+        assert_eq!(detailed["response_format"], "detailed");
+        assert_eq!(detailed_budget, 3000);
+        let (flag, flag_budget) = forwarded(&["--detailed"]);
+        assert_eq!(flag["response_format"], "detailed");
+        assert_eq!(flag_budget, 3000);
+
+        let error = match parse(&["--response-format", "full"]) {
+            Ok(_) => panic!("unknown --response-format must be rejected"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("--detailed"),
+            "a rejected --response-format must name --detailed: {message}"
+        );
+        assert_ne!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+}
+
 /// nw-316: the token budget must be spent at the rate the renderer charges.
 ///
 /// `render_cost_tokens` was a COPY of `nestweaver_mcp::tools::render_cost`'s
@@ -41767,10 +42373,81 @@ mod cli_honesty_sweep_tests {
             .expect("join")
     }
 
+    #[test]
+    fn malformed_resolver_metadata_is_disclosed_in_text_and_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let sidecar = nestweaver_engine::sidecar_path(
+            &db,
+            nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+        );
+        std::fs::write(&sidecar, "{malformed").unwrap();
+        let stale = ResolverStaleness::from_store(&store);
+        assert!(stale.rankings_stale);
+        assert!(stale.stale_repos.is_empty());
+        let error = stale
+            .verification_error
+            .as_deref()
+            .expect("verification failure is explicit");
+        assert!(
+            error.contains("decode resolver generation sidecar"),
+            "{error}"
+        );
+        let note = resolver_ranking_note(&store).expect("text must disclose failed verification");
+        assert!(
+            note.contains("could not verify resolver generation metadata"),
+            "{note}"
+        );
+        assert!(
+            !note.contains("no resolver generation is recorded"),
+            "{note}"
+        );
+        let payload = ranking_json_payload(
+            "hubs",
+            &Vec::<String>::new(),
+            &stale,
+            None,
+            &RankingBounds::default(),
+        );
+        assert_eq!(payload["rankings_stale"], true);
+        assert_eq!(payload["resolver_generation_error"], error);
+        let fallback = ResolverStaleness::from_sidecar(&db);
+        assert_eq!(fallback.verification_error.as_deref(), Some(error));
+        let daemon = ResolverStaleness::from_daemon_response(&payload, &db);
+        assert_eq!(daemon.verification_error.as_deref(), Some(error));
+
+        std::fs::remove_file(&sidecar).unwrap();
+        std::fs::create_dir(&sidecar).unwrap();
+        let unreadable = ResolverStaleness::from_store(&store);
+        assert!(unreadable.rankings_stale);
+        assert!(
+            unreadable
+                .verification_error
+                .as_deref()
+                .is_some_and(|error| error.contains("not a regular file"))
+        );
+        assert!(
+            resolver_ranking_note(&store).is_some_and(|note| note.contains("could not verify"))
+        );
+        std::fs::remove_dir(&sidecar).unwrap();
+        let absent = ResolverStaleness::from_sidecar(&db);
+        assert!(absent.rankings_stale);
+        assert!(
+            absent.verification_error.is_none(),
+            "absence is distinct from a failed read"
+        );
+        assert!(
+            resolver_ranking_note(&store).is_none(),
+            "an empty graph has no incompatible repositories"
+        );
+    }
+
     fn staleness_fixture() -> ResolverStaleness {
         ResolverStaleness {
             rankings_stale: false,
             stale_repos: vec![],
+            verification_error: None,
         }
     }
 
@@ -41835,6 +42512,7 @@ mod cli_honesty_sweep_tests {
                 "repo:default:alpha".to_string(),
                 "repo:default:mike".to_string(),
             ],
+            verification_error: None,
         };
         let payload = ranking_json_payload(
             "hubs",

@@ -890,25 +890,17 @@ pub(crate) fn begin_publication<'s>(
     ),
     anyhow::Error,
 > {
-    loop {
-        let guard = lease
-            .map(|factory| factory("code_link_reconcile"))
-            .transpose()?;
-        // nw-670 live eval #2: stamped as a code-link chunk, so ranked reads
-        // answer through it with disclosure instead of failing closed.
-        // D1: every publication through here changes note->code links or
-        // project memberships only, never a Symbol node or a code edge, so it
-        // keeps a warm code-only PageRank cache.
-        if let Some(publication) = crate::manifest::try_begin_non_code_graph_mutation_publication(
-            store,
-            "code link reconciliation",
-            Some(nestweaver_store::index_publication::MARKER_REASON_CODE_LINKS),
-        )? {
-            return Ok((guard, publication));
-        }
-        drop(guard);
-        store.wait_until_index_publication_unowned();
-    }
+    let (guard, publication_lease) =
+        crate::manifest::acquire_mutation_publication_leases(store, lease, "code_link_reconcile")?;
+    // Code-link chunks and project memberships preserve warm code-only ranks.
+    let publication = crate::manifest::begin_graph_mutation_publication_on_lease(
+        store,
+        publication_lease,
+        "code link reconciliation".to_string(),
+        Some(nestweaver_store::index_publication::MARKER_REASON_CODE_LINKS),
+        true,
+    )?;
+    Ok((guard, publication))
 }
 
 /// Publish a write made inside [`begin_publication`]: generation and

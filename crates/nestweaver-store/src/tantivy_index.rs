@@ -1000,35 +1000,54 @@ impl TantivyIndex {
         if query.trim().is_empty() {
             return None;
         }
-        let mut parser =
-            QueryParser::for_index(&self.index, vec![self.fields.title, self.fields.body]);
-        parser.set_field_boost(self.fields.title, 3.0);
-        match parser.parse_query(query) {
-            Ok(q) => q,
-            Err(_) => {
-                // Fall back to a "lenient" parse that escapes special
-                // chars by quoting — handles common user input like
-                // `auth/v2` or `path:foo` that breaks the parser.
-                let escaped = escape_query(query);
-                match parser.parse_query(&escaped) {
-                    Ok(q) => q,
-                    // Last resort: a bare boolean keyword (`a AND`), an unbalanced
-                    // quote, or other residual syntax that escape_query doesn't
-                    // neutralize (it only quotes tokens with special *chars*, not
-                    // keywords) must not hard-error a plain search. Treat the whole
-                    // input as a literal phrase; if even that won't parse, return no
-                    // hits rather than an error.
-                    Err(_) => {
-                        let phrase = format!("\"{}\"", query.replace('"', " "));
-                        match parser.parse_query(&phrase) {
-                            Ok(q) => q,
-                            Err(_) => return None,
-                        }
+        let parser = |query: &str| {
+            let mut parser =
+                QueryParser::for_index(&self.index, vec![self.fields.title, self.fields.body]);
+            parser.set_field_boost(self.fields.title, 3.0);
+            parser.parse_query(query)
+        };
+        // Tantivy's strict grammar panics, instead of returning Err, when a
+        // bare `*` is classified as an exist-query with no field (`*[]`,
+        // `*()`, `*{}`, and the same `*` plus other exist metacharacters).
+        // Escape that shape before `parse_query` sees it. Keyword queries,
+        // match-all `*`, and an unescaped `field:*` still use the raw parser.
+        // An escaped colon (`foo\:`) is not a field binder, and a backslash
+        // before a quote does not open a string.
+        let parsed = if bare_exist_query_panics(query) {
+            None
+        } else {
+            // The scanner above is not Tantivy's grammar. A shape it misses
+            // panics inside `parse_query` instead of returning Err.
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser(query)))
+                .ok()
+                .and_then(Result::ok)
+        };
+        let parsed = if let Some(parsed) = parsed {
+            parsed
+        } else {
+            // Fall back to a "lenient" parse that escapes special
+            // chars by quoting — handles common user input like
+            // `auth/v2` or `path:foo` that breaks the parser. A fresh
+            // parser: the raw attempt may have panicked.
+            let escaped = escape_query(query);
+            match parser(&escaped) {
+                Ok(q) => q,
+                // Last resort: a bare boolean keyword (`a AND`), an unbalanced
+                // quote, or other residual syntax that escape_query doesn't
+                // neutralize (it only quotes tokens with special *chars*, not
+                // keywords) must not hard-error a plain search. Treat the whole
+                // input as a literal phrase; if even that won't parse, return no
+                // hits rather than an error.
+                Err(_) => {
+                    let phrase = format!("\"{}\"", query.replace('"', " "));
+                    match parser(&phrase) {
+                        Ok(q) => q,
+                        Err(_) => return None,
                     }
                 }
             }
-        }
-        .into()
+        };
+        Some(parsed)
     }
 
     fn current_searcher(&self) -> tantivy::Searcher {
@@ -1979,6 +1998,96 @@ fn build_prf_query(query: &str, expansion: &[String], weight: f32, max_terms: us
     out
 }
 
+/// Characters that make Tantivy parse a leading `*` as `UserInputLeaf::Exists`.
+/// Whitespace, `)`, and end-of-input are the match-all form and do not panic.
+/// `)` is one of Tantivy's in-word escapes, but the match-all production
+/// accepts `*` before `)` before the exist production runs.
+const BARE_EXIST_FOLLOWERS: &[char] = &['^', '`', ':', '{', '}', '"', '\'', '[', ']', '(', '\\'];
+
+/// True when Tantivy's strict parser would hit
+/// `Exist query without a field isn't allowed` on `query`.
+///
+/// That `expect` fires when a leaf is a bare `*` (no unescaped `field:`
+/// prefix) and the next character is an exist metacharacter. `*`, `field:*`,
+/// a `*` inside a range, and ordinary keywords are left alone. A backslash
+/// escapes the next character outside a string as well as inside one, so
+/// `\"` and `\'` do not open a string around a following bare exist leaf.
+fn bare_exist_query_panics(query: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut bracket_depth: u32 = 0;
+    let mut escaped = false;
+    for (idx, c) in query.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            continue;
+        }
+        if !in_single && c == '"' {
+            in_double = !in_double;
+            continue;
+        }
+        if !in_double && c == '\'' {
+            // `what's *[]` is a word plus a bare exist leaf. A mid-word
+            // apostrophe is not a phrase quote; treating it as one hides
+            // the `*` from this scan and `parse_query` panics.
+            let mid_word = query[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|prev| prev.is_ascii_alphanumeric() || prev == '_');
+            if !mid_word || in_single {
+                in_single = !in_single;
+            }
+            continue;
+        }
+        if in_single || in_double {
+            continue;
+        }
+        match c {
+            '[' | '{' => bracket_depth += 1,
+            ']' | '}' => bracket_depth = bracket_depth.saturating_sub(1),
+            '*' if bracket_depth == 0 && star_starts_bare_exist(query, idx) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `star_idx` points at a `*` outside quotes and ranges.
+fn star_starts_bare_exist(query: &str, star_idx: usize) -> bool {
+    let Some(next) = query[star_idx + '*'.len_utf8()..].chars().next() else {
+        return false;
+    };
+    if !BARE_EXIST_FOLLOWERS.contains(&next) {
+        return false;
+    }
+    let prefix = &query[..star_idx];
+    let trimmed = prefix.trim_end();
+    // `title:*[]` and `title : *[]` bind the exist-query to a field.
+    // `foo\: *[]` does not: an odd run of backslashes escapes that colon.
+    if ends_with_unescaped_colon(trimmed) {
+        return false;
+    }
+    if trimmed.is_empty() || trimmed.len() != prefix.len() {
+        return true;
+    }
+    // A leaf can also start immediately after a group or an occur operator.
+    matches!(trimmed.chars().next_back(), Some('(' | '+' | '-'))
+}
+
+/// A trailing colon is Tantivy's field separator only when it is unescaped.
+/// An odd number of immediately preceding backslashes escapes it (`foo\:`).
+fn ends_with_unescaped_colon(trimmed: &str) -> bool {
+    let Some(before) = trimmed.strip_suffix(':') else {
+        return false;
+    };
+    let escaped = before.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1;
+    !escaped
+}
+
 /// Escape characters the Tantivy query parser treats specially. Used as
 /// the fallback when the user's raw query fails to parse.
 fn escape_query(q: &str) -> String {
@@ -2478,6 +2587,65 @@ mod tests {
             hits.len()
         );
         assert_eq!(hits[0].uid, "note:a", "title match should rank first");
+    }
+
+    #[test]
+    fn star_bracket_exist_queries_do_not_panic_and_later_search_works() {
+        let dir = tempdir().unwrap();
+        let idx = TantivyIndex::open_or_create(dir.path()).unwrap();
+        idx.update_note(
+            "note:a",
+            "Auth Title",
+            "vlt:t",
+            &["auth body stays searchable".to_string()],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        for query in [
+            "*[]",
+            "*()",
+            "*{}",
+            r"foo\: *[]",
+            r"foo\: *()",
+            r"foo\: *{}",
+            r"foo\: *^2",
+            r#"\" *[]"#,
+            r"\' *[]",
+            "what's *[]",
+        ] {
+            assert!(
+                bare_exist_query_panics(query),
+                "{query} must use the quoted-token fallback"
+            );
+            idx.search(query, 10)
+                .unwrap_or_else(|error| panic!("{query} search failed: {error}"));
+            idx.search_page(query, 10)
+                .unwrap_or_else(|error| panic!("{query} search_page failed: {error}"));
+        }
+
+        for query in ["*", "[]", "()", "{}", "title:*", "title: *[]", "auth"] {
+            assert!(
+                !bare_exist_query_panics(query),
+                "{query} must stay on the raw parser"
+            );
+        }
+        idx.search("title: *[]", 10)
+            .unwrap_or_else(|error| panic!("title: *[] search failed: {error}"));
+        assert!(bare_exist_query_panics("auth *[]"));
+
+        let all = idx.search("*", 10).unwrap();
+        assert!(
+            all.iter().any(|hit| hit.note_uid == "note:a"),
+            "match-all must still find the note, got {all:?}"
+        );
+        let later = idx.search_page("auth", 10).unwrap();
+        assert!(
+            later.hits.iter().any(|hit| hit.note_uid == "note:a"),
+            "a search after the bare exist queries must still work, got {later:?}"
+        );
     }
 
     #[test]

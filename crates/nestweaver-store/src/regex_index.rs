@@ -17,7 +17,11 @@ use tantivy::{DocAddress, DocSet, Index, ReloadPolicy, TERMINATED, TantivyDocume
 
 use crate::error::StoreError;
 
-pub const REGEX_INDEX_SCHEMA_VERSION: u32 = 4;
+/// Version 5 indexes the heading line with each section. Version 4 shards
+/// stored only `Section.text_content`, which starts after the heading, so a
+/// ready index missed `## Blockers` (nw-738). Search distrusts those shards
+/// and scans them until `index --with-trigrams` rebuilds them.
+pub const REGEX_INDEX_SCHEMA_VERSION: u32 = 5;
 pub const REGEX_TOKENIZER_FINGERPRINT: &str =
     "nestweaver-unicode-scalar-lowercase-distinct-trigram-v1";
 const METADATA_KIND: &str = "__nestweaver_regex_metadata__";
@@ -448,10 +452,15 @@ impl RegexIndex {
         writer
             .wait_merging_threads()
             .map_err(|error| StoreError::Query(format!("finish regex shard merge: {error}")))?;
+        // The code index has already committed. A first publication can still
+        // see `meta.json` missing on this read (nw-744). That `NotFound` must
+        // not fail the refresh; the open below is retried. A snapshot is
+        // rewritten only after a read has succeeded and the path is still
+        // absent. `meta.json` that names missing segments fails closed.
+        let committed_meta = snapshot_staged_meta(&staging.path().join("meta.json"))?;
         drop(index);
 
-        let verification = Index::open_in_dir(staging.path())
-            .map_err(|error| StoreError::Query(format!("reopen staged regex shard: {error}")))?;
+        let verification = reopen_staged_regex_shard(staging.path(), committed_meta)?;
         let verified_fields = inspect_fields(&verification.schema())?;
         let (verified_metadata, verified_count) = read_metadata(&verification, verified_fields)?;
         if verified_metadata != metadata || verified_count != documents.len() {
@@ -1318,6 +1327,134 @@ impl RegexIndex {
     }
 }
 
+/// Read the staged `meta.json` once. `NotFound` is not a refresh failure:
+/// the file can still be invisible immediately after commit (nw-744).
+fn snapshot_staged_meta(meta_path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
+    match read_staged_meta_file(meta_path) {
+        Ok(bytes) if bytes.is_empty() => Err(StoreError::Query(
+            "staged regex shard meta.json was empty after commit".to_string(),
+        )),
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(StoreError::Query(format!(
+            "read staged regex shard meta.json {}: {error}",
+            meta_path.display()
+        ))),
+    }
+}
+
+fn read_staged_meta_file(meta_path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(test)]
+    if let Some(miss) = take_post_commit_meta_miss(meta_path) {
+        return miss;
+    }
+    std::fs::read(meta_path)
+}
+
+/// Open the staged shard. `FileDoesNotExist(meta.json)` retries the open.
+/// Other open failures, including a `meta.json` whose segments are gone, fail
+/// closed so a bad generation is not published.
+fn reopen_staged_regex_shard(
+    path: &Path,
+    mut committed_meta: Option<Vec<u8>>,
+) -> Result<Index, StoreError> {
+    rewrite_staged_meta_snapshot(path, committed_meta.as_deref())?;
+    match Index::open_in_dir(path) {
+        Ok(index) => Ok(index),
+        Err(error) if staged_meta_missing(&error) => {
+            if committed_meta.is_none() {
+                committed_meta = snapshot_staged_meta(&path.join("meta.json"))?;
+            }
+            rewrite_staged_meta_snapshot(path, committed_meta.as_deref())?;
+            Index::open_in_dir(path)
+                .map_err(|retry| StoreError::Query(format!("reopen staged regex shard: {retry}")))
+        }
+        Err(error) => Err(StoreError::Query(format!(
+            "reopen staged regex shard: {error}"
+        ))),
+    }
+}
+
+fn staged_meta_missing(error: &tantivy::TantivyError) -> bool {
+    let text = error.to_string();
+    text.contains("FileDoesNotExist") && text.contains("meta.json")
+}
+
+/// Write `committed_meta` only when a read already produced those bytes and
+/// `meta.json` is still absent. An existing file is left untouched.
+fn rewrite_staged_meta_snapshot(
+    path: &Path,
+    committed_meta: Option<&[u8]>,
+) -> Result<(), StoreError> {
+    let Some(committed_meta) = committed_meta else {
+        return Ok(());
+    };
+    if committed_meta.is_empty() {
+        return Err(StoreError::Query(
+            "staged regex shard meta.json was empty after commit".to_string(),
+        ));
+    }
+    let meta_path = path.join("meta.json");
+    if !meta_path_absent(&meta_path)? {
+        return Ok(());
+    }
+    crate::durable_sidecar::atomic_replace_file(&meta_path, |file| file.write_all(committed_meta))
+        .map_err(|error| {
+            StoreError::Query(format!(
+                "restore staged regex shard meta.json {}: {error}",
+                meta_path.display()
+            ))
+        })
+}
+
+fn meta_path_absent(meta_path: &Path) -> Result<bool, StoreError> {
+    match meta_path.try_exists() {
+        Ok(exists) => Ok(!exists),
+        Err(error) => Err(StoreError::Query(format!(
+            "stat staged regex shard meta.json {}: {error}",
+            meta_path.display()
+        ))),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static MISS_POST_COMMIT_META_READ: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static STAGED_META_FAULT_FIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One-shot nw-744 seam. The post-commit `std::fs::read` of `meta.json` is the
+/// call that observes the absence. The committed bytes are put back after that
+/// read so the following open still sees the segment set.
+#[cfg(test)]
+fn take_post_commit_meta_miss(meta_path: &Path) -> Option<std::io::Result<Vec<u8>>> {
+    let armed = MISS_POST_COMMIT_META_READ.with(|cell| cell.replace(false));
+    if !armed {
+        return None;
+    }
+    let preserved = std::fs::read(meta_path).unwrap_or_else(|error| {
+        panic!(
+            "stage meta.json before the post-commit miss {}: {error}",
+            meta_path.display()
+        )
+    });
+    std::fs::remove_file(meta_path)
+        .unwrap_or_else(|error| panic!("remove staged meta.json {}: {error}", meta_path.display()));
+    let missed = std::fs::read(meta_path);
+    assert!(
+        missed
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+        "post-commit read did not observe a missing meta.json"
+    );
+    std::fs::write(meta_path, preserved).unwrap_or_else(|error| {
+        panic!("restore staged meta.json {}: {error}", meta_path.display())
+    });
+    STAGED_META_FAULT_FIRED.with(|cell| cell.set(true));
+    Some(missed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1334,6 +1471,56 @@ mod tests {
             candidate_count: count,
             candidate_digest: digest.to_string(),
         }
+    }
+
+    /// nw-744: the post-commit read of staged `meta.json` can be `NotFound`.
+    /// That miss must not fail publication. One shot — the fault makes that
+    /// read the call that observes the missing file.
+    #[test]
+    fn staged_reopen_restores_missing_meta_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = RegexIndex::new(temp.path());
+        let trigrams = HashSet::from(["abc".into()]);
+        let document = RegexShardDocument {
+            path: "src/lib.rs".into(),
+            uid: "one",
+            kind: "Symbol",
+            text_hash: "hash",
+            trigrams: &trigrams,
+        };
+        let published = metadata(1, 1, "digest-one");
+        struct ClearStagedMetaFault;
+        impl Drop for ClearStagedMetaFault {
+            fn drop(&mut self) {
+                MISS_POST_COMMIT_META_READ.with(|cell| cell.set(false));
+                STAGED_META_FAULT_FIRED.with(|cell| cell.set(false));
+            }
+        }
+        let _clear = ClearStagedMetaFault;
+        STAGED_META_FAULT_FIRED.with(|cell| cell.set(false));
+        MISS_POST_COMMIT_META_READ.with(|cell| cell.set(true));
+
+        index
+            .replace_scope(published.clone(), std::slice::from_ref(&document))
+            .unwrap();
+
+        assert!(
+            STAGED_META_FAULT_FIRED.with(|cell| cell.get()),
+            "the post-commit read did not observe a missing staged meta.json"
+        );
+        let generations = index.scope_root("repo:test").join("generations");
+        let published_meta = std::fs::read_dir(&generations)
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join("meta.json"))
+            .find(|path| path.is_file())
+            .expect("published generation is missing meta.json");
+        assert!(!std::fs::read(&published_meta).unwrap().is_empty());
+        assert_eq!(
+            index
+                .candidate_uids(&published, std::slice::from_ref(&trigrams), 10)
+                .unwrap(),
+            Some(HashSet::from(["one".to_string()]))
+        );
     }
 
     #[test]

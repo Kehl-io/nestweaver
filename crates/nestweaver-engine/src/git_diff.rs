@@ -205,6 +205,53 @@ pub fn current_head_sha(repo_path: &Path) -> Result<String, anyhow::Error> {
     Ok(sha)
 }
 
+/// Regular-file paths in the tree of `sha`.
+///
+/// Symlinks and gitlinks are omitted. An incremental diff of `indexed_sha..HEAD`
+/// does not list a source that was already in the indexed commit, so callers
+/// compare this listing with the graph before advancing the stored SHA.
+pub(crate) fn list_commit_paths(
+    repo_path: &Path,
+    sha: &str,
+) -> Result<Vec<PathBuf>, anyhow::Error> {
+    let oid = resolve_commit_ref(repo_path, sha).context("resolve git commit for tree listing")?;
+    let mut cmd = Command::new("git");
+    cmd.arg("ls-tree")
+        .arg("-r")
+        .arg("-z")
+        .arg(oid)
+        .current_dir(repo_path);
+    let output = run_git_with_timeout(cmd, git_net_timeout())
+        .with_context(|| format!("failed to run git ls-tree in {}", repo_path.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "git ls-tree failed in {}: {}",
+            repo_path.display(),
+            stderr.trim()
+        );
+    }
+
+    let mut paths = Vec::new();
+    for record in output.stdout.split(|&byte| byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let Some(tab) = record.iter().position(|&byte| byte == b'\t') else {
+            continue;
+        };
+        let mode = record[..tab]
+            .split(|&byte| byte == b' ')
+            .next()
+            .unwrap_or(&[]);
+        if mode == b"120000" || mode == b"160000" {
+            continue;
+        }
+        paths.push(bytes_to_pathbuf(&record[tab + 1..]));
+    }
+    Ok(paths)
+}
+
 /// Returns `true` if `old_sha` is an ancestor of `new_sha` in the repository.
 ///
 /// Runs `git merge-base --is-ancestor <old_sha> <new_sha>`. Returns `false`

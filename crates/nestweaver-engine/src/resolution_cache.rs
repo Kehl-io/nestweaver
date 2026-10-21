@@ -4,7 +4,12 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// Sidecar format version. v2 = per-repo keying (nw-045). v1 (a flat,
+/// Sidecar format version. v4 records unresolved import specifiers beside
+/// resolved deps. A v3 file has no such slice; loading it with an empty
+/// default would look like "nothing failed to resolve" and a later create of
+/// the target would not re-resolve the importer. v3 therefore fails the
+/// version check and loads empty, which forces the paired filemeta bypass
+/// and one full replacement. v2 = per-repo keying (nw-045). v1 (a flat,
 /// bare-rel-path `deps` map shared across all repos) fails deserialization
 /// and/or the version check and loads as empty — a deliberate fail-open.
 ///
@@ -21,7 +26,7 @@ use serde::{Deserialize, Serialize};
 /// Paired with `index::FILEMETA_VERSION`: bumping one requires bumping the
 /// other (both sidecars must be invalidated together), enforced by
 /// `tests::cache_version_moves_with_filemeta_version`.
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 
 /// Maximum number of transitive reverse-dependency hops expanded when deciding
 /// which files to re-resolve after a change. Shared by the local cache-based
@@ -36,6 +41,13 @@ pub const MAX_HOPS: usize = 2;
 struct ResolutionCacheFile {
     version: u32,
     repos: HashMap<String, HashMap<String, HashSet<String>>>,
+    /// repo uid → (importer rel-path → unresolved import specifiers).
+    ///
+    /// Absent on sidecars written before nw-806. Default keeps those files
+    /// loading at this version; failing the field closed would discard the
+    /// resolved-dep slice and force a full replacement.
+    #[serde(default)]
+    unresolved: HashMap<String, HashMap<String, HashSet<String>>>,
 }
 
 /// Tracks which files each file's resolved edges point to, sliced per repo so
@@ -46,6 +58,10 @@ struct ResolutionCacheFile {
 pub struct ResolutionDeps {
     /// repo_uid → (rel-path → set of rel-paths it depends on).
     repos: HashMap<String, HashMap<String, HashSet<String>>>,
+    /// repo_uid → (importer rel-path → unresolved import specifiers). nw-806:
+    /// a deleted target takes its reverse edges with it, so an added file can
+    /// only find importers that still name it in a specifier.
+    unresolved: HashMap<String, HashMap<String, HashSet<String>>>,
 }
 
 impl ResolutionDeps {
@@ -58,14 +74,14 @@ impl ResolutionDeps {
     /// as a cache-bypass trigger that forces a full replacement, so the
     /// fail-open can never resurrect a stale cross-repo edge decision.
     pub fn load(path: &Path) -> Self {
-        let repos = match std::fs::read(path) {
+        let (repos, unresolved) = match std::fs::read(path) {
             Ok(data) => match rmp_serde::from_slice::<ResolutionCacheFile>(&data) {
-                Ok(file) if file.version == CACHE_VERSION => file.repos,
-                _ => HashMap::new(),
+                Ok(file) if file.version == CACHE_VERSION => (file.repos, file.unresolved),
+                _ => (HashMap::new(), HashMap::new()),
             },
-            Err(_) => HashMap::new(),
+            Err(_) => (HashMap::new(), HashMap::new()),
         };
-        Self { repos }
+        Self { repos, unresolved }
     }
 
     /// Persist resolution deps to a MessagePack file.
@@ -73,6 +89,7 @@ impl ResolutionDeps {
         let file = ResolutionCacheFile {
             version: CACHE_VERSION,
             repos: self.repos.clone(),
+            unresolved: self.unresolved.clone(),
         };
         let data = rmp_serde::to_vec(&file).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
         crate::manifest::atomic_replace_file(path, |file| file.write_all(&data))
@@ -140,11 +157,53 @@ impl ResolutionDeps {
         self.repos.get(r_uid).is_none_or(|slice| slice.is_empty())
     }
 
+    /// Replace `file_path`'s unresolved import specifiers within `r_uid`.
+    /// An empty set drops the entry so a specifier that now resolves does not
+    /// keep seeding the importer. Never touches another repo's slice.
+    pub fn set_unresolved_for_repo(
+        &mut self,
+        r_uid: &str,
+        file_path: impl Into<String>,
+        specifiers: HashSet<String>,
+    ) {
+        let slice = self.unresolved.entry(r_uid.to_string()).or_default();
+        let file_path = file_path.into();
+        if specifiers.is_empty() {
+            slice.remove(&file_path);
+        } else {
+            slice.insert(file_path, specifiers);
+        }
+    }
+
+    /// Unresolved import specifiers recorded for `r_uid`, keyed by importer.
+    pub fn unresolved_for_repo(&self, r_uid: &str) -> Option<&HashMap<String, HashSet<String>>> {
+        self.unresolved.get(r_uid)
+    }
+
+    /// Drop `files` from `r_uid`'s resolved-dep and unresolved-specifier
+    /// slices. Other repos are untouched. Used when those files no longer
+    /// exist, so a deleted importer cannot keep naming targets.
+    pub fn drop_files_for_repo(&mut self, r_uid: &str, files: &HashSet<String>) {
+        if let Some(slice) = self.repos.get_mut(r_uid) {
+            for file in files {
+                slice.remove(file);
+            }
+        }
+        if let Some(slice) = self.unresolved.get_mut(r_uid) {
+            for file in files {
+                slice.remove(file);
+            }
+        }
+    }
+
     /// Evict entries for files that no longer exist in `r_uid`'s repo. Only
     /// this repo's slice is retained against `live_files`; other repos are
     /// untouched (nw-045 — the flat map previously forced a cross-repo union).
     pub fn retain_files_for_repo(&mut self, r_uid: &str, live_files: &HashSet<String>) {
         if let Some(slice) = self.repos.get_mut(r_uid) {
+            slice.retain(|file, _| live_files.contains(file));
+        }
+        if let Some(slice) = self.unresolved.get_mut(r_uid) {
             slice.retain(|file, _| live_files.contains(file));
         }
     }
@@ -154,7 +213,9 @@ impl ResolutionDeps {
     /// records. Used by `remove-repo` (nw-048/nw-045) so a re-added repo starts
     /// from a clean dependency slice instead of inheriting a stale one.
     pub fn remove_repo(&mut self, r_uid: &str) -> bool {
-        self.repos.remove(r_uid).is_some()
+        let removed_deps = self.repos.remove(r_uid).is_some();
+        let removed_unresolved = self.unresolved.remove(r_uid).is_some();
+        removed_deps || removed_unresolved
     }
 }
 
@@ -270,11 +331,54 @@ mod tests {
         original.set_deps_for_repo(R, "d.rs", HashSet::from(["a.rs".to_string()]));
         // A second repo's slice must survive the round trip intact.
         original.set_deps_for_repo("repo:y", "a.rs", HashSet::from(["z.rs".to_string()]));
+        original.set_unresolved_for_repo(R, "a.rs", HashSet::from(["./missing.rs".to_string()]));
 
         original.save(&path).expect("save should succeed");
 
         let loaded = ResolutionDeps::load(&path);
         assert_eq!(loaded.repos, original.repos);
+        assert_eq!(
+            loaded
+                .unresolved_for_repo(R)
+                .and_then(|slice| slice.get("a.rs")),
+            Some(&HashSet::from(["./missing.rs".to_string()]))
+        );
+    }
+
+    #[test]
+    fn v3_without_unresolved_field_keeps_resolved_deps() {
+        // Sidecars written before nw-806 have no `unresolved` field. They must
+        // keep their resolved-dep slice; discarding the file would fail open
+        // to empty and force a full replacement.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-v3.resolution_deps.bin");
+        // The on-disk repos map is repo → (file → deps). No `unresolved` field.
+        #[derive(Serialize)]
+        struct Version3File {
+            version: u32,
+            repos: HashMap<String, HashMap<String, HashSet<String>>>,
+        }
+        let mut slice = HashMap::new();
+        slice.insert("app.js".to_string(), HashSet::from(["lib.js".to_string()]));
+        let mut repos = HashMap::new();
+        repos.insert(R.to_string(), slice);
+        let legacy = Version3File {
+            version: CACHE_VERSION,
+            repos,
+        };
+        std::fs::write(&path, rmp_serde::to_vec(&legacy).unwrap()).unwrap();
+
+        let loaded = ResolutionDeps::load(&path);
+        let affected = loaded.affected_files_for_repo(R, &HashSet::from(["lib.js".to_string()]));
+        assert!(
+            affected.contains("app.js"),
+            "a v3 sidecar without unresolved specifiers must keep resolved deps"
+        );
+        assert!(
+            loaded
+                .unresolved_for_repo(R)
+                .is_none_or(|slice| slice.is_empty())
+        );
     }
 
     #[test]

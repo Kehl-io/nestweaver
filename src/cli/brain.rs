@@ -1043,7 +1043,7 @@ pub(crate) fn run_brain(
             // (nw-358). No fourth decider is added here; this reads the same
             // verdict and joins it to the rows by uid.
             let resolver_stale: std::collections::HashSet<String> =
-                ResolverStaleness::from_store(&store, &db_path)
+                ResolverStaleness::from_store(&store)
                     .stale_repos
                     .into_iter()
                     .collect();
@@ -1079,7 +1079,6 @@ pub(crate) fn run_brain(
                     &repo.url,
                 );
 
-                let is_valid_sha = nestweaver_engine::repo_head::is_full_sha(&repo.indexed_sha);
                 // nw-256: `Option<u64>`, mirroring `tool_stale_check`. The
                 // note directly below is about `is_stale` diverging between
                 // these two routes for exactly this reason; #310 fixed the
@@ -1089,13 +1088,14 @@ pub(crate) fn run_brain(
                 // count", and this branch is only reached when HEAD already
                 // differs from the indexed SHA — so a zero here is a
                 // self-contradiction ("stale, 0 commits behind"), not an
-                // answer.
-                let commits_behind: Option<u64> = match (&current_head, repo.local_root()) {
-                    (Some(head), Some(path)) if is_valid_sha && *head != repo.indexed_sha => {
-                        nestweaver_engine::repo_head::commits_between(path, &repo.indexed_sha, head)
-                    }
-                    _ => Some(repo.staleness_commits_behind as u64),
-                };
+                // answer. The decision lives in `repo_head::commits_behind`,
+                // which `list-repos` also calls.
+                let commits_behind = nestweaver_engine::repo_head::commits_behind(
+                    current_head.as_deref(),
+                    repo.local_root(),
+                    &repo.indexed_sha,
+                    repo.staleness_commits_behind,
+                );
                 // nw-163: BEHIND HEAD and nothing else — a deleted working
                 // tree is `status: "missing"` and `needs_reindex: true`, not
                 // "stale". The daemon path (`tool_stale_check`) was changed to
