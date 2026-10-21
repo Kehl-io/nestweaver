@@ -84,20 +84,22 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 ///   indexed repository authors its own `.git/config`, and both name programs
 ///   Git runs: indexing ran a repository's fsmonitor through `ls-files`. No
 ///   production call needs either (they read, fetch and clone bare).
+/// - `maintenance.auto=false` and `gc.auto=0`: no call should start
+///   background maintenance in a repository it only inspects or fetches.
 ///
 /// This does NOT touch the caller's `-c` args (the SSRF `http.curloptResolve` /
 /// `http.followRedirects` pins and the `http.lowSpeed*` guards): those are
 /// command-line args on the `Command` and take precedence over config anyway.
 ///
 /// CALLER CONTRACT: callers must NOT set their own `GIT_CONFIG_*` env on the
-/// `Command`. This sets `GIT_CONFIG_COUNT=3` (plus `KEY_n`/`VALUE_n`)
+/// `Command`. This sets `GIT_CONFIG_COUNT=5` (plus `KEY_n`/`VALUE_n`)
 /// unconditionally, so a caller-supplied entry would either be clobbered or
 /// silently ignored — pass config via `-c` args instead.
 pub fn apply_git_isolation(cmd: &mut Command) {
     cmd.env("GIT_CONFIG_NOSYSTEM", "1");
     cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
     cmd.env("GIT_TERMINAL_PROMPT", "0");
-    cmd.env("GIT_CONFIG_COUNT", "3");
+    cmd.env("GIT_CONFIG_COUNT", "5");
     cmd.env("GIT_CONFIG_KEY_0", "credential.helper");
     cmd.env("GIT_CONFIG_VALUE_0", "");
     cmd.env("GIT_CONFIG_KEY_1", "core.fsmonitor");
@@ -106,6 +108,13 @@ pub fn apply_git_isolation(cmd: &mut Command) {
     cmd.env("GIT_CONFIG_VALUE_1", "");
     cmd.env("GIT_CONFIG_KEY_2", "core.hooksPath");
     cmd.env("GIT_CONFIG_VALUE_2", "/dev/null");
+    // `fetch` starts auto-maintenance, whose worktree-prune task (Git 2.5x)
+    // follows a symlink planted in `worktrees/` and deletes the repository
+    // it points to.
+    cmd.env("GIT_CONFIG_KEY_3", "maintenance.auto");
+    cmd.env("GIT_CONFIG_VALUE_3", "false");
+    cmd.env("GIT_CONFIG_KEY_4", "gc.auto");
+    cmd.env("GIT_CONFIG_VALUE_4", "0");
 }
 
 /// SIGKILL the whole process group, reap the direct child, and join both reader
@@ -431,7 +440,7 @@ mod tests {
         assert_eq!(get("GIT_TERMINAL_PROMPT").as_deref(), Some("0"));
         // credential.helper= (empty) injected via the GIT_CONFIG_* env form —
         // the equivalent of `-c credential.helper=`, disabling all helpers.
-        assert_eq!(get("GIT_CONFIG_COUNT").as_deref(), Some("3"));
+        assert_eq!(get("GIT_CONFIG_COUNT").as_deref(), Some("5"));
         assert_eq!(
             get("GIT_CONFIG_KEY_0").as_deref(),
             Some("credential.helper")
@@ -446,6 +455,10 @@ mod tests {
         assert_eq!(get("GIT_CONFIG_VALUE_1").as_deref(), Some(""));
         assert_eq!(get("GIT_CONFIG_KEY_2").as_deref(), Some("core.hooksPath"));
         assert_eq!(get("GIT_CONFIG_VALUE_2").as_deref(), Some("/dev/null"));
+        assert_eq!(get("GIT_CONFIG_KEY_3").as_deref(), Some("maintenance.auto"));
+        assert_eq!(get("GIT_CONFIG_VALUE_3").as_deref(), Some("false"));
+        assert_eq!(get("GIT_CONFIG_KEY_4").as_deref(), Some("gc.auto"));
+        assert_eq!(get("GIT_CONFIG_VALUE_4").as_deref(), Some("0"));
     }
 
     /// The isolation must not clobber a caller's own `-c` args (the SSRF pins and
