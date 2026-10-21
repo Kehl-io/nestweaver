@@ -517,7 +517,7 @@ fn go_build_variant_edges(
                 && symbol.kind == target.kind
                 && symbol.parent_name == target.parent_name
                 && parent_dir(file) == parent_dir(target_file)
-                && graph.same_go_package(file, target_file)
+                && go_same_package(graph, file, target_file)
         })
         .map(|(file, symbol)| ResolvedEdge {
             source_uid: edge.source_uid.clone(),
@@ -532,6 +532,18 @@ fn go_build_variant_edges(
             }],
         })
         .collect()
+}
+
+/// Whether two Go files in one directory are in one package. An incremental
+/// re-resolve passes unchanged files without references, so their package
+/// clause is unknown; then the only legal same-directory split is an
+/// external `_test` package, so the same directory counts as the same
+/// package unless exactly one of the two is a `_test.go` file.
+fn go_same_package(graph: &ImportGraph, a: &str, b: &str) -> bool {
+    match (graph.go_package_of(a), graph.go_package_of(b)) {
+        (Some(left), Some(right)) => left == right,
+        _ => a.ends_with("_test.go") == b.ends_with("_test.go"),
+    }
 }
 
 /// Resolve a single non-import reference to a `ResolvedEdge`, or return `None`
@@ -2200,7 +2212,7 @@ fn normalize_return_type(
     let mut text = raw.trim();
     text = text.trim_start_matches(':').trim_start_matches("->").trim();
     // Defensive: a recorded type never includes a body or expression body.
-    text = text[..text.find(['{', '=']).unwrap_or(text.len())].trim();
+    text = text[..text.find(['{', '=', ';']).unwrap_or(text.len())].trim();
     loop {
         let before = text;
         for prefix in ["&mut ", "&", "*", "mut ", "?", "impl ", "dyn "] {
@@ -2289,8 +2301,10 @@ impl ReceiverInference<'_, '_, '_> {
     }
 
     /// Whether `file` is visible from the reference's file without a name
-    /// the receiver does not carry: itself, an import target, or a sibling in
-    /// the same directory (a Go package, a Python package).
+    /// the receiver does not carry: itself, a sibling in the same directory
+    /// (a Go package, a Python package), or an import target. A Go import
+    /// already records every file of its package; only a Python package
+    /// import also reaches the package's sibling modules.
     fn file_visible(&self, file: &str) -> bool {
         file == self.file_path
             || parent_dir(file) == parent_dir(self.file_path)
@@ -2298,7 +2312,19 @@ impl ReceiverInference<'_, '_, '_> {
                 .graph
                 .imports_of(self.file_path)
                 .iter()
-                .any(|(_, target)| target == file || parent_dir(target) == parent_dir(file))
+                .any(|(_, target)| {
+                    target == file
+                        || self.language == Language::Python
+                            && parent_dir(target) == parent_dir(file)
+                })
+    }
+
+    /// `file_visible`, minus a Go package imported under a qualifier: a bare
+    /// Go name never reaches it (see `candidate_matches`).
+    fn bare_name_visible(&self, file: &str) -> bool {
+        self.file_visible(file)
+            && !(self.language == Language::Go
+                && self.graph.go_requires_qualifier(self.file_path, file))
     }
 
     fn identifier_type(&self, name: &str) -> Option<String> {
@@ -2330,11 +2356,7 @@ impl ReceiverInference<'_, '_, '_> {
             .filter(|(file, symbol)| {
                 symbol.kind == SymbolKind::Function
                     && symbol.parent_name.is_none()
-                    && self.file_visible(file)
-                    // A bare Go name never reaches a package imported under
-                    // a qualifier (see `candidate_matches`).
-                    && !(self.language == Language::Go
-                        && self.graph.go_requires_qualifier(self.file_path, file))
+                    && self.bare_name_visible(file)
             })
             .collect();
         if functions.is_empty() {
@@ -2342,7 +2364,7 @@ impl ReceiverInference<'_, '_, '_> {
                 .iter()
                 .filter(|(file, symbol)| {
                     matches!(symbol.kind, SymbolKind::Class | SymbolKind::Enum)
-                        && self.file_visible(file)
+                        && self.bare_name_visible(file)
                 })
                 .collect();
             return (!types.is_empty()).then(|| callee.to_string());
@@ -2497,13 +2519,17 @@ fn receiver_chain_head(receiver: &str) -> &str {
 /// evidence establishes (`Child.make().run()` with an unannotated `make`).
 /// Linked only when
 ///
-/// - the chain starts at a repository type or function visible from this file
-///   and not shadowed by a local, so `new Map().get(k)` or `fetch().then()`
-///   never reach this; and
-/// - exactly one method of that name exists in the whole repository, and it is
-///   accessible from this file.
+/// - the chain starts at a repository TYPE visible from this file and not
+///   shadowed by a local (so `new Map().get(k)` or `fetch().then()` never
+///   reach this), and
+/// - exactly one method of that name exists in the whole repository, no free
+///   function shares the name, it is accessible from this file, and it is
+///   declared on that head type or one of its ancestors.
 ///
-/// A common name such as `get` that is declared twice anywhere links nothing.
+/// A function head (`q().get(k)`) is refused: an unannotated repo function
+/// can return anything, including an external type, so the repository's one
+/// `get` is no evidence (the nw-150 `buildQuery().where(..)` shape). A common
+/// name such as `get` that is declared twice anywhere links nothing.
 fn unique_expression_method<'s>(
     inference: &ReceiverInference<'_, 's, '_>,
     receiver: &str,
@@ -2521,10 +2547,9 @@ fn unique_expression_method<'s>(
         )
         .is_some()
         || !inference.symbol_map.get(head).is_some_and(|symbols| {
-            symbols.iter().any(|(file, symbol)| {
-                (is_type_symbol(symbol) || symbol.kind == SymbolKind::Function)
-                    && inference.file_visible(file)
-            })
+            symbols
+                .iter()
+                .any(|(file, symbol)| is_type_symbol(symbol) && inference.bare_name_visible(file))
         })
     {
         return None;
@@ -2555,7 +2580,28 @@ fn unique_expression_method<'s>(
     {
         return None;
     }
-    Some((file, symbol))
+    // The method's owner must be the head type or one of its ancestors.
+    let owner = symbol.parent_name.as_deref()?;
+    let mut current = vec![head.to_string()];
+    let mut visited = std::collections::HashSet::new();
+    for _ in 0..=RECEIVER_INFERENCE_DEPTH {
+        if current.iter().any(|ty| ty == owner) {
+            return Some((file, symbol));
+        }
+        let mut next = Vec::new();
+        for ty in current {
+            if visited.insert(ty.clone())
+                && let Some(parents) = inference.extends_map.get(&ty)
+            {
+                next.extend(parents.iter().cloned());
+            }
+        }
+        if next.is_empty() {
+            return None;
+        }
+        current = next;
+    }
+    None
 }
 
 fn method_belongs_to_origin(
@@ -11867,6 +11913,28 @@ export function readIt(b: Box) { size(); run(); b.run(); return value(); }
     }
 
     #[test]
+    fn qa_unique_method_fallback_refuses_a_repo_function_returning_anything() {
+        let path = "a.ts";
+        let source = "export class Store {\n  get(k: string): number { return 1; }\n}\nfunction q() { return new Map(); }\nexport function user() { return q().get('x'); }\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::TypeScript);
+        assert!(
+            !qa_calls(&files, &edges, (path, "user"), (path, "get", 2)),
+            "an unannotated repo function may return an external Map: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn qa_unique_method_fallback_needs_the_head_type_to_own_the_method() {
+        let path = "pkg/core.py";
+        let source = "class Other:\n    def run(self):\n        return 1\n\nclass Child:\n    @staticmethod\n    def make():\n        return Child()\n\ndef user():\n    return Child.make().run()\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::Python);
+        assert!(
+            !qa_calls(&files, &edges, (path, "user"), (path, "run", 2)),
+            "`run` belongs to an unrelated class: {edges:#?}"
+        );
+    }
+
+    #[test]
     fn qa_python_method_on_unannotated_factory_uses_unique_method_name() {
         let path = "pkg/core.py";
         let source = "class Base:\n    def run(self):\n        return 1\n\nclass Child(Base):\n    @staticmethod\n    def make():\n        return Child()\n\ndef user():\n    return Child.make().run()\n";
@@ -12068,6 +12136,45 @@ export function readIt(b: Box) { size(); run(); b.run(); return value(); }
             qa_calls(&files, &edges, (lib, "entry"), (util, "double", 1)),
             "{edges:#?}"
         );
+    }
+
+    #[test]
+    fn qa_go_build_variants_survive_an_incremental_pass_without_package_clauses() {
+        let node = "node.go";
+        let js = "node_js.go";
+        let net = "node_net.go";
+        let mut files = parsed_files(&[
+            (
+                node,
+                "package uuid\n\nfunc NodeID() string {\n\treturn getHardwareInterface(\"\")\n}\n",
+            ),
+            (
+                js,
+                "//go:build js\n\npackage uuid\n\nfunc getHardwareInterface(name string) string { return \"\" }\n",
+            ),
+            (
+                net,
+                "//go:build !js\n\npackage uuid\n\nfunc getHardwareInterface(name string) string { return name }\n",
+            ),
+        ]);
+        // An incremental re-resolve passes unchanged files without references.
+        for (path, _, references) in &mut files {
+            if path != node {
+                references.clear();
+            }
+        }
+        let edges = resolve_references(&files, Language::Go, "repo:test:abc");
+        for variant in [js, net] {
+            assert!(
+                qa_calls(
+                    &files,
+                    &edges,
+                    (node, "NodeID"),
+                    (variant, "getHardwareInterface", 5)
+                ),
+                "{variant}: {edges:#?}"
+            );
+        }
     }
 
     #[test]

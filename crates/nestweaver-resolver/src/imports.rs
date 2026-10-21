@@ -328,6 +328,12 @@ impl ImportGraph {
         })
     }
 
+    /// The package clause recorded for a Go file, when its references were
+    /// part of this resolution pass.
+    pub(crate) fn go_package_of(&self, file: &str) -> Option<&str> {
+        self.go_packages.get(file).map(String::as_str)
+    }
+
     pub(crate) fn same_go_package(&self, from: &str, to: &str) -> bool {
         self.go_packages
             .get(from)

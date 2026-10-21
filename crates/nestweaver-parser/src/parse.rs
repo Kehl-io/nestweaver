@@ -1274,12 +1274,12 @@ fn matching_paren(text: &str, open: usize) -> Option<usize> {
 }
 
 /// A signature's text after the return-type marker, ending where a body,
-/// expression body or `where` clause begins. The signature is the
+/// expression body, `where` clause or a bodiless declaration's `;` begins. The signature is the
 /// declaration's first line, so a one-line declaration carries its whole body
 /// (`static make(): K { return new K(); }`); the body is not part of the type.
 fn return_type_text(after_marker: &str) -> &str {
     let end = after_marker
-        .find(['{', '='])
+        .find(['{', '=', ';'])
         .unwrap_or(after_marker.len())
         .min(after_marker.find(" where").unwrap_or(after_marker.len()));
     after_marker[..end].trim().trim_end_matches(':').trim()
@@ -15134,6 +15134,8 @@ export function G(a) {\n\
         )
         .unwrap();
         let python = parse_source(Path::new("m.py"), "def make() -> K: return K()\n").unwrap();
+        let bodiless =
+            parse_source(Path::new("decl.ts"), "export function speak(): Foo;\n").unwrap();
         let ret = |symbols: &[RawSymbol], name: &str| {
             symbols
                 .iter()
@@ -15145,6 +15147,11 @@ export function G(a) {\n\
         assert_eq!(ret(&ts.symbols, "make").as_deref(), Some("K"));
         assert_eq!(ret(&rust.symbols, "new").as_deref(), Some("Self"));
         assert_eq!(ret(&python.symbols, "make").as_deref(), Some("K"));
+        assert_eq!(
+            ret(&bodiless.symbols, "speak").as_deref(),
+            Some("Foo"),
+            "a bodiless declaration's `;` is not part of the type"
+        );
     }
 
     #[test]
