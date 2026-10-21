@@ -80,7 +80,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 ///   repo-local config might still add. (We use the env form because callers pass
 ///   a fully-built `Command` whose args already include the git subcommand, so a
 ///   trailing `-c` arg would land *after* the subcommand and be misparsed.)
-/// - `core.fsmonitor=false` and `core.hooksPath=/dev/null` the same way. An
+/// - `core.fsmonitor=` (empty) and `core.hooksPath=/dev/null` the same way. An
 ///   indexed repository authors its own `.git/config`, and both name programs
 ///   Git runs: indexing ran a repository's fsmonitor through `ls-files`. No
 ///   production call needs either (they read, fetch and clone bare).
@@ -101,7 +101,9 @@ pub fn apply_git_isolation(cmd: &mut Command) {
     cmd.env("GIT_CONFIG_KEY_0", "credential.helper");
     cmd.env("GIT_CONFIG_VALUE_0", "");
     cmd.env("GIT_CONFIG_KEY_1", "core.fsmonitor");
-    cmd.env("GIT_CONFIG_VALUE_1", "false");
+    // Empty, not `false`: before Git 2.36 the value is a hook path, and
+    // `false` would run /bin/false. Empty disables it on every version.
+    cmd.env("GIT_CONFIG_VALUE_1", "");
     cmd.env("GIT_CONFIG_KEY_2", "core.hooksPath");
     cmd.env("GIT_CONFIG_VALUE_2", "/dev/null");
 }
@@ -441,7 +443,7 @@ mod tests {
         );
         // Repository config cannot name programs Git runs during inspection.
         assert_eq!(get("GIT_CONFIG_KEY_1").as_deref(), Some("core.fsmonitor"));
-        assert_eq!(get("GIT_CONFIG_VALUE_1").as_deref(), Some("false"));
+        assert_eq!(get("GIT_CONFIG_VALUE_1").as_deref(), Some(""));
         assert_eq!(get("GIT_CONFIG_KEY_2").as_deref(), Some("core.hooksPath"));
         assert_eq!(get("GIT_CONFIG_VALUE_2").as_deref(), Some("/dev/null"));
     }
