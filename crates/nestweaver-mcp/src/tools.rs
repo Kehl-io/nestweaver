@@ -18188,10 +18188,12 @@ fn tool_schema_set_extension() -> Value {
                 },
                 "key": {
                     "type": "string",
-                    "description": "Property name (e.g. \"team_owner\", \"deprecated\", \"review_needed\", \"priority\")."
+                    "maxLength": nestweaver_engine::extensions::MAX_EXTENSION_KEY_BYTES,
+                    "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$",
+                    "description": "Property name (e.g. \"team_owner\", \"deprecated\", \"review_needed\", \"priority\"). At most 256 bytes, no control characters."
                 },
                 "value": {
-                    "description": "Property value — any JSON value (string, number, boolean, object, array). Overwrites any existing value for this key on this node."
+                    "description": "Property value — any JSON value (string, number, boolean, object, array). Overwrites any existing value for this key on this node. At most 64 KiB once serialized as JSON; a larger value is refused."
                 }
             },
             "required": ["uid", "key", "value"]
@@ -18313,6 +18315,8 @@ fn tool_set_extension(args: Value) -> Result<Value, anyhow::Error> {
             .get("value")
             .cloned()
             .ok_or_else(|| anyhow!("'value' is required"))?;
+        nestweaver_engine::extensions::validate_extension_property(key, &value)
+            .map_err(|problem| anyhow!(problem))?;
 
         let mut store = load_extensions(&db_path);
         set_property(&mut store, uid, key, value.clone());

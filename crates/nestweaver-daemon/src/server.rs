@@ -10752,6 +10752,9 @@ impl NestWeaverDaemon for DaemonService {
             let value = args.get("value").cloned().ok_or_else(|| {
                 Status::invalid_argument("tool set_extension failed: 'value' is required")
             })?;
+            nestweaver_engine::extensions::validate_extension_property(key, &value).map_err(
+                |problem| Status::invalid_argument(format!("tool set_extension failed: {problem}")),
+            )?;
 
             let mut store = nestweaver_engine::extensions::load_extensions(&db_path);
             nestweaver_engine::extensions::set_property(&mut store, uid, key, value.clone());
@@ -30449,6 +30452,41 @@ external_model = "unavailable-test-model"
         })
         .await
         .expect("cancelled extension worker must finish after gate release");
+    }
+
+    /// An oversized value or a control-character key is refused before the
+    /// sidecar is touched: one 20 MB value used to be accepted and rewritten
+    /// on every later set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_extension_refuses_oversized_values_and_bad_keys() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+        let big = "x".repeat(nestweaver_engine::extensions::MAX_EXTENSION_VALUE_BYTES + 1);
+        let long_key = "k".repeat(nestweaver_engine::extensions::MAX_EXTENSION_KEY_BYTES + 1);
+        for args in [
+            serde_json::json!({ "uid": "sym:x", "key": "owner", "value": big }),
+            serde_json::json!({ "uid": "sym:x", "key": "own\u{0}er", "value": 1 }),
+            serde_json::json!({ "uid": "sym:x", "key": "own\ner", "value": 1 }),
+            serde_json::json!({ "uid": "sym:x", "key": long_key, "value": 1 }),
+        ] {
+            let mut req = Request::new(JsonRequest {
+                args_json: args.to_string(),
+            });
+            req.extensions_mut().insert(crate::auth::IsAdmin(true));
+            let status = service.set_extension(req).await.unwrap_err();
+            assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+        }
+        assert!(
+            nestweaver_engine::extensions::load_extensions(&state.db_path).is_empty(),
+            "a refused set must write nothing"
+        );
+
+        let mut req = Request::new(JsonRequest {
+            args_json: serde_json::json!({ "uid": "sym:x", "key": "owner", "value": "team-a" })
+                .to_string(),
+        });
+        req.extensions_mut().insert(crate::auth::IsAdmin(true));
+        service.set_extension(req).await.expect("an ordinary set");
     }
 
     /// nw-462: the DELETE must hold the gate exactly as the WRITE does.
