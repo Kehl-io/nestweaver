@@ -474,7 +474,7 @@ fn dispatch_method_daemon_cancellable(
         other => Frame::Error(error(
             id,
             error_code::METHOD_NOT_FOUND,
-            format!("method not implemented: {other}"),
+            crate::tools::method_not_implemented_message(other),
         )),
     }
 }
@@ -773,7 +773,7 @@ fn dispatch_method_cancellable(
         other => Frame::Error(error(
             id,
             error_code::METHOD_NOT_FOUND,
-            format!("method not implemented: {other}"),
+            crate::tools::method_not_implemented_message(other),
         )),
     }
 }

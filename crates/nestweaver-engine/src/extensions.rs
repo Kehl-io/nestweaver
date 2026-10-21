@@ -2264,6 +2264,268 @@ pub fn validate_extension_property(key: &str, value: &serde_json::Value) -> Resu
     Ok(())
 }
 
+/// Longest node UID an extension may be written under, in bytes. Real graph
+/// UIDs are well under 300 bytes; a 2 MB UID used to be accepted, after which
+/// every `query_extensions` answer that listed it overflowed the MCP output
+/// budget.
+pub const MAX_EXTENSION_UID_BYTES: usize = 1024;
+/// Most distinct nodes the sidecar may annotate. The sidecar is rewritten
+/// whole on every write, so its size is a per-write cost.
+pub const MAX_EXTENSION_NODES: usize = 100_000;
+/// Most properties one node may carry.
+pub const MAX_EXTENSION_PROPERTIES_PER_NODE: usize = 256;
+/// Largest serialized sidecar a write may produce.
+pub const MAX_EXTENSION_SIDECAR_BYTES: usize = 32 * 1024 * 1024;
+
+/// Keys NestWeaver itself writes into the sidecar. `set_extension` and
+/// `unset_extension` refuse them: overwriting `last_indexed_at` with a
+/// non-timestamp, or removing it, corrupted `brain status`'s per-vault
+/// staleness, which reads it back (`get_last_indexed_at`).
+pub const RESERVED_EXTENSION_KEYS: &[&str] = &["last_indexed_at"];
+
+/// Refuse a UID no extension should be written under: empty, over
+/// [`MAX_EXTENSION_UID_BYTES`], or containing a control character.
+///
+/// The UID is NOT required to name a live graph node. That is deliberate and
+/// documented on [`load_live_extensions`]: application-owned keys that are not
+/// graph UIDs, and graph-shaped keys whose node is absent until the next
+/// index, are supported metadata and must survive a merge or restart.
+pub fn validate_extension_uid(uid: &str) -> Result<(), String> {
+    if uid.is_empty() {
+        return Err("'uid' must not be empty".to_string());
+    }
+    if uid.len() > MAX_EXTENSION_UID_BYTES {
+        return Err(format!(
+            "'uid' is {} bytes; the maximum is {MAX_EXTENSION_UID_BYTES}",
+            uid.len()
+        ));
+    }
+    if let Some(c) = uid.chars().find(|c| c.is_control()) {
+        return Err(format!(
+            "'uid' must not contain control characters (found {})",
+            c.escape_unicode()
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a key NestWeaver owns (see [`RESERVED_EXTENSION_KEYS`]).
+pub fn refuse_reserved_extension_key(key: &str) -> Result<(), String> {
+    if RESERVED_EXTENSION_KEYS.contains(&key) {
+        return Err(format!(
+            "'key' '{key}' is reserved: NestWeaver maintains it itself and it cannot be set or \
+             unset through extensions"
+        ));
+    }
+    Ok(())
+}
+
+/// Every check a user/agent `set_extension` must pass before the sidecar is
+/// loaded: UID shape, reserved key, key shape and value size.
+pub fn validate_extension_write(
+    uid: &str,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    validate_extension_uid(uid)?;
+    validate_extension_property(key, value)?;
+    refuse_reserved_extension_key(key)
+}
+
+/// [`set_property`] for user/agent writes: refuses a write that would push the
+/// sidecar past [`MAX_EXTENSION_NODES`] or a node past
+/// [`MAX_EXTENSION_PROPERTIES_PER_NODE`]. Overwriting an existing key is
+/// always allowed. Nothing is changed on refusal.
+pub fn set_property_capped(
+    store: &mut ExtensionStore,
+    uid: &str,
+    key: &str,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    match store.get(uid) {
+        None if store.len() >= MAX_EXTENSION_NODES => {
+            return Err(format!(
+                "the extension sidecar already annotates {} nodes, the maximum is \
+                 {MAX_EXTENSION_NODES}; unset unused properties first",
+                store.len()
+            ));
+        }
+        Some(properties)
+            if !properties.contains_key(key)
+                && properties.len() >= MAX_EXTENSION_PROPERTIES_PER_NODE =>
+        {
+            return Err(format!(
+                "node already carries {} extension properties, the maximum is \
+                 {MAX_EXTENSION_PROPERTIES_PER_NODE}; unset unused properties first",
+                properties.len()
+            ));
+        }
+        _ => {}
+    }
+    set_property(store, uid, key, value);
+    Ok(())
+}
+
+/// Serialize the sidecar for a user/agent write, refusing one larger than
+/// [`MAX_EXTENSION_SIDECAR_BYTES`]. Pair with [`write_extensions_serialized`]
+/// so the sidecar is serialized once.
+pub fn serialize_extensions_capped(store: &ExtensionStore) -> Result<Vec<u8>, String> {
+    let bytes = serde_json::to_vec_pretty(store)
+        .map_err(|error| format!("serialize extension sidecar: {error}"))?;
+    if bytes.len() > MAX_EXTENSION_SIDECAR_BYTES {
+        return Err(format!(
+            "this write would grow the extension sidecar to {} bytes; the maximum is \
+             {MAX_EXTENSION_SIDECAR_BYTES}. Unset unused properties first",
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Durably replace the sidecar with bytes from
+/// [`serialize_extensions_capped`].
+pub fn write_extensions_serialized(db_path: &Path, bytes: &[u8]) -> Result<(), anyhow::Error> {
+    let path = sidecar_path(db_path);
+    nestweaver_store::durable_sidecar::atomic_replace_file(&path, |file| file.write_all(bytes))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "durably replace extension sidecar {}: {error}",
+                path.display()
+            )
+        })
+}
+
+/// Largest value a write response echoes back. A larger value (up to
+/// [`MAX_EXTENSION_VALUE_BYTES`]) is acknowledged by size instead, so a
+/// committed write can never be reported as failed because its own echo
+/// overflowed the MCP output budget.
+pub const MAX_EXTENSION_VALUE_ECHO_BYTES: usize = 1024;
+
+/// The response body of a committed `set_extension`.
+pub fn set_extension_response(
+    uid: &str,
+    key: &str,
+    value: &serde_json::Value,
+) -> serde_json::Value {
+    let value_bytes = serde_json::to_vec(value).map_or(0, |bytes| bytes.len());
+    let mut response = serde_json::json!({
+        "uid": uid,
+        "key": key,
+        "status": "saved",
+    });
+    if value_bytes <= MAX_EXTENSION_VALUE_ECHO_BYTES {
+        response["value"] = value.clone();
+    } else {
+        response["value_bytes"] = serde_json::json!(value_bytes);
+        response["value_echo_omitted"] = serde_json::json!(true);
+    }
+    response
+}
+
+/// Make an extension view safe to deliver: entries whose UID is over
+/// [`MAX_EXTENSION_UID_BYTES`] (written before that limit existed) are
+/// dropped and counted, and any value over [`MAX_EXTENSION_VALUE_BYTES`] is
+/// replaced by `{"value_omitted": true, "value_bytes": N}`. Without this one
+/// legacy 2 MB UID made every key/value `query_extensions` call fail.
+///
+/// Returns how many entries were dropped.
+pub fn bound_extension_entries(
+    entries: &mut Vec<(String, HashMap<String, serde_json::Value>)>,
+) -> usize {
+    let before = entries.len();
+    entries.retain(|(uid, _)| uid.len() <= MAX_EXTENSION_UID_BYTES);
+    for (_, properties) in entries.iter_mut() {
+        bound_extension_properties(properties);
+    }
+    before - entries.len()
+}
+
+/// Replace oversized values in one node's properties; see
+/// [`bound_extension_entries`].
+pub fn bound_extension_properties(properties: &mut HashMap<String, serde_json::Value>) {
+    properties.retain(|key, _| key.len() <= MAX_EXTENSION_KEY_BYTES);
+    for value in properties.values_mut() {
+        let bytes = serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len());
+        if bytes > MAX_EXTENSION_VALUE_BYTES {
+            *value = serde_json::json!({ "value_omitted": true, "value_bytes": bytes });
+        }
+    }
+}
+
+/// The `query_extensions` answer over an already-loaded extension view, shared
+/// by the daemon and the in-process MCP route so the two cannot drift.
+///
+/// `uid` mode returns one node's properties; `key` + `value` mode returns
+/// every matching node. Both are bounded with [`bound_extension_entries`], and
+/// key/value mode reports `oversized_entries_omitted` when legacy entries had
+/// to be dropped. A `uid` argument longer than [`MAX_EXTENSION_UID_BYTES`] is
+/// echoed truncated (no such entry can be delivered anyway).
+pub fn query_extensions_payload(
+    extensions: &ExtensionStore,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if let Some(uid) = args.get("uid").and_then(|value| value.as_str()) {
+        if uid.len() > MAX_EXTENSION_UID_BYTES {
+            let mut end = 256;
+            while !uid.is_char_boundary(end) {
+                end -= 1;
+            }
+            return Ok(serde_json::json!({
+                "uid": format!("{}…", &uid[..end]),
+                "uid_bytes": uid.len(),
+                "properties": {},
+            }));
+        }
+        let mut properties = get_all_properties(extensions, uid);
+        bound_extension_properties(&mut properties);
+        return Ok(serde_json::json!({
+            "uid": uid,
+            "properties": properties,
+        }));
+    }
+    let key = args
+        .get("key")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "provide either 'uid' or both 'key' and 'value'".to_string())?;
+    let value = args
+        .get("value")
+        .cloned()
+        .ok_or_else(|| "'value' is required when 'key' is given".to_string())?;
+    let mut entries: Vec<(String, HashMap<String, serde_json::Value>)> =
+        query_by_property(extensions, key, &value)
+            .into_iter()
+            .map(|uid| {
+                (
+                    uid.to_string(),
+                    extensions.get(uid).cloned().unwrap_or_default(),
+                )
+            })
+            .collect();
+    // Deterministic order: the store is a HashMap.
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let omitted = bound_extension_entries(&mut entries);
+    let results: Vec<serde_json::Value> = entries
+        .into_iter()
+        .map(|(uid, properties)| serde_json::json!({ "uid": uid, "properties": properties }))
+        .collect();
+    let mut payload = serde_json::json!({
+        "key": key,
+        "value": value,
+        "count": results.len(),
+        "results": results,
+    });
+    if omitted > 0 {
+        payload["oversized_entries_omitted"] = serde_json::json!(omitted);
+        payload["note"] = serde_json::json!(format!(
+            "{omitted} matching entr{} with a UID over {MAX_EXTENSION_UID_BYTES} bytes \
+             (written before that limit existed) cannot be delivered and were omitted; \
+             remove them with unset_extension",
+            if omitted == 1 { "y" } else { "ies" }
+        ));
+    }
+    Ok(payload)
+}
+
 /// Set a single property on a node. Creates the node entry if absent.
 pub fn set_property(store: &mut ExtensionStore, uid: &str, key: &str, value: serde_json::Value) {
     store
@@ -3657,5 +3919,103 @@ mod tests {
             );
             assert_eq!(handoff_snapshot(&db_path), before);
         }
+    }
+}
+
+#[cfg(test)]
+mod write_bound_tests {
+    use super::*;
+
+    #[test]
+    fn an_oversized_or_control_character_uid_is_refused() {
+        let value = serde_json::json!("x");
+        assert!(validate_extension_write("sym:a", "team", &value).is_ok());
+        let huge = "A".repeat(2_000_000);
+        let error = validate_extension_write(&huge, "team", &value).unwrap_err();
+        assert!(error.contains("'uid' is 2000000 bytes"), "{error}");
+        assert!(error.len() < 200, "the refusal must not echo the uid");
+        assert!(validate_extension_write("", "team", &value).is_err());
+        assert!(validate_extension_write("sym:\u{1b}[31m", "team", &value).is_err());
+    }
+
+    #[test]
+    fn internal_keys_are_reserved() {
+        let error =
+            validate_extension_write("vlt:default:x", "last_indexed_at", &serde_json::json!(1))
+                .unwrap_err();
+        assert!(error.contains("reserved"), "{error}");
+        assert!(refuse_reserved_extension_key("last_indexed_at").is_err());
+        assert!(refuse_reserved_extension_key("team").is_ok());
+    }
+
+    #[test]
+    fn node_and_property_caps_refuse_without_changing_the_store() {
+        let mut store = ExtensionStore::new();
+        for index in 0..MAX_EXTENSION_PROPERTIES_PER_NODE {
+            set_property_capped(
+                &mut store,
+                "sym:a",
+                &format!("k{index}"),
+                serde_json::json!(1),
+            )
+            .unwrap();
+        }
+        let error =
+            set_property_capped(&mut store, "sym:a", "one-more", serde_json::json!(1)).unwrap_err();
+        assert!(error.contains("maximum"), "{error}");
+        assert!(!store["sym:a"].contains_key("one-more"));
+        // Overwriting an existing key is always allowed at the cap.
+        set_property_capped(&mut store, "sym:a", "k0", serde_json::json!(2)).unwrap();
+
+        let mut store = ExtensionStore::new();
+        for index in 0..MAX_EXTENSION_NODES {
+            store.insert(format!("n{index}"), HashMap::new());
+        }
+        assert!(set_property_capped(&mut store, "fresh", "k", serde_json::json!(1)).is_err());
+        assert!(!store.contains_key("fresh"));
+        assert!(set_property_capped(&mut store, "n0", "k", serde_json::json!(1)).is_ok());
+    }
+
+    #[test]
+    fn a_sidecar_over_the_byte_cap_is_refused() {
+        let mut store = ExtensionStore::new();
+        let value = serde_json::json!("v".repeat(MAX_EXTENSION_VALUE_BYTES - 16));
+        for index in 0..(MAX_EXTENSION_SIDECAR_BYTES / MAX_EXTENSION_VALUE_BYTES + 1) {
+            set_property(&mut store, &format!("n{index}"), "big", value.clone());
+        }
+        let error = serialize_extensions_capped(&store).unwrap_err();
+        assert!(error.contains("maximum"), "{error}");
+    }
+
+    #[test]
+    fn a_large_value_is_acknowledged_by_size_not_echoed() {
+        let small = set_extension_response("sym:a", "team", &serde_json::json!("core"));
+        assert_eq!(small["value"], "core");
+        let large_value = serde_json::json!("v".repeat(60_000));
+        let large = set_extension_response("sym:a", "blob", &large_value);
+        assert!(large.get("value").is_none());
+        assert_eq!(large["value_echo_omitted"], true);
+        assert_eq!(large["value_bytes"], 60_002);
+        assert_eq!(large["status"], "saved");
+    }
+
+    #[test]
+    fn legacy_oversized_entries_are_dropped_or_summarized_for_delivery() {
+        let mut properties = HashMap::new();
+        properties.insert("team".to_string(), serde_json::json!("core"));
+        let mut huge_value = HashMap::new();
+        huge_value.insert(
+            "blob".to_string(),
+            serde_json::json!("v".repeat(MAX_EXTENSION_VALUE_BYTES + 1)),
+        );
+        let mut entries = vec![
+            ("A".repeat(2_000_000), properties.clone()),
+            ("sym:a".to_string(), properties),
+            ("sym:b".to_string(), huge_value),
+        ];
+        assert_eq!(bound_extension_entries(&mut entries), 1);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].1["blob"]["value_omitted"], true);
+        assert_eq!(entries[0].1["team"], "core");
     }
 }

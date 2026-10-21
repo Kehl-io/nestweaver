@@ -22,17 +22,17 @@ use nestweaver_engine::{
     generate_skill_with_tools, generate_summaries, get_all_properties, get_last_indexed_at,
     investigate, investigate_expand, investigate_hydrate, load_alias_sidecar, load_clusters,
     load_extensions, memory_consolidate_limited, memory_lint, memory_related, orphan_documents,
-    parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text, topic_clusters,
+    parse_iso8601_to_epoch, populate_inline_bodies, render_text, topic_clusters,
     truncate_to_budget_keeping_first,
 };
 use nestweaver_schema::SymbolKind;
 use nestweaver_store::tantivy_index::{SearchTotal, SearchTotalRelation};
 use nestweaver_store::{GraphStore, SearchLogicalIdentity, TantivyIndex};
 use serde_json::{Value, json};
-// In non-daemon builds, brain_add_source and set_extension write directly using
-// these primitives; in daemon builds those writes route through the daemon.
+// In non-daemon builds, brain_add_source writes directly using
+// this primitive; in daemon builds that write routes through the daemon.
 #[cfg(not(feature = "daemon"))]
-use nestweaver_engine::{index_markdown_directory_with_note_limits, save_extensions, set_property};
+use nestweaver_engine::index_markdown_directory_with_note_limits;
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
@@ -939,6 +939,138 @@ pub(crate) fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
     bounded
 }
 
+/// Longest method name a JSON-RPC "method not implemented" error echoes.
+const MAX_METHOD_NAME_IN_ERROR_BYTES: usize = 128;
+
+/// The -32601 message for an unknown JSON-RPC method. The name is caller
+/// input: a 1 MB method name used to come back as a 1 MB error.
+pub fn method_not_implemented_message(method: &str) -> String {
+    format!(
+        "method not implemented: {}",
+        truncate_utf8_bytes(method, MAX_METHOD_NAME_IN_ERROR_BYTES)
+    )
+}
+
+/// Bound a string that may echo caller input, keeping its HEAD and its TAIL
+/// and replacing the middle with `…[N of M bytes elided]…`.
+///
+/// Both ends matter in an error message: the head names the failure class
+/// (`failed to look up note with uid '…`) and the tail often carries the
+/// verdict (`…': not found`) that a client classifies on. Truncating only the
+/// end would cut exactly the part the CLI reads. UTF-8 safe; a value already
+/// within `max_bytes` is returned unchanged. The result never exceeds
+/// `max_bytes` once `max_bytes` is large enough to hold the marker itself
+/// (about 40 bytes); below that it degrades to [`truncate_utf8_bytes`].
+pub fn elide_middle_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let total = value.len();
+    // The marker's width depends on the elided count, which depends on the
+    // marker's width; size it for the widest count it can hold.
+    let marker_width = format!("…[{total} of {total} bytes elided]…").len();
+    if max_bytes < marker_width + 2 {
+        return truncate_utf8_bytes(value, max_bytes);
+    }
+    let keep = max_bytes - marker_width;
+    let mut head_end = keep.div_ceil(2);
+    while head_end > 0 && !value.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = total - (keep - keep.div_ceil(2));
+    while tail_start < total && !value.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let elided = tail_start - head_end;
+    format!(
+        "{}…[{elided} of {total} bytes elided]…{}",
+        &value[..head_end],
+        &value[tail_start..]
+    )
+}
+
+/// Bound every string inside a JSON value with [`elide_middle_utf8`].
+///
+/// Used where a structured envelope travels somewhere with a hard size limit
+/// (gRPC status details ride in an HTTP/2 header): the envelope keeps its
+/// shape and keys, so a client can still classify it, while any field that
+/// echoes caller input is cut to `max_string_bytes`.
+pub fn bound_json_strings(value: &mut Value, max_string_bytes: usize) {
+    match value {
+        Value::String(text) if text.len() > max_string_bytes => {
+            *text = elide_middle_utf8(text, max_string_bytes);
+        }
+        Value::Array(items) => {
+            for item in items {
+                bound_json_strings(item, max_string_bytes);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                bound_json_strings(item, max_string_bytes);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod echo_bound_tests {
+    use super::*;
+
+    #[test]
+    fn elision_keeps_both_ends_and_states_what_it_cut() {
+        let long = format!(
+            "failed to look up note with uid '{}': not found",
+            "A".repeat(2_000_000)
+        );
+        let bounded = elide_middle_utf8(&long, 512);
+        assert!(bounded.len() <= 512, "{} bytes", bounded.len());
+        assert!(bounded.starts_with("failed to look up note with uid 'AAA"));
+        assert!(bounded.ends_with("': not found"), "{bounded}");
+        assert!(bounded.contains(&format!("of {} bytes elided]", long.len())));
+        assert_eq!(elide_middle_utf8("short", 512), "short");
+    }
+
+    #[test]
+    fn elision_is_utf8_safe_at_every_width() {
+        let wide = "\u{10000}é".repeat(5_000);
+        for max in [0, 1, 7, 40, 41, 64, 100, 513, 1024] {
+            let bounded = elide_middle_utf8(&wide, max);
+            assert!(
+                bounded.len() <= max.max(3),
+                "max {max}: {} bytes",
+                bounded.len()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_method_name_is_not_echoed_in_full() {
+        let message = method_not_implemented_message(&"m".repeat(1_000_000));
+        assert!(message.len() < 200, "{} bytes", message.len());
+        assert!(message.starts_with("method not implemented: mmm"));
+        assert_eq!(
+            method_not_implemented_message("resources/list"),
+            "method not implemented: resources/list"
+        );
+    }
+
+    #[test]
+    fn json_strings_are_bounded_in_place_and_the_shape_survives() {
+        let mut envelope = json!({
+            "status": "not_found",
+            "uid": "x".repeat(10_000),
+            "did_you_mean": ["y".repeat(10_000), "short"],
+        });
+        bound_json_strings(&mut envelope, 256);
+        assert_eq!(envelope["status"], "not_found");
+        assert!(envelope["uid"].as_str().unwrap().len() <= 256);
+        assert!(envelope["did_you_mean"][0].as_str().unwrap().len() <= 256);
+        assert_eq!(envelope["did_you_mean"][1], "short");
+    }
+}
+
 /// Guidance for an argument sent to the WRONG tool, keyed by (tool, property).
 ///
 /// nw-408. `investigate_hydrate` carried this text INSIDE its handler, as a
@@ -1580,7 +1712,7 @@ fn compact_tool_description(name: &str) -> &'static str {
             "Run a Rust regex over indexed section text, note titles and symbol signatures. Bounded by a candidate cap and time budget; truncation_reason names the bound."
         }
         "count_patterns" => {
-            "Count regex matches per pattern (total, files matched, top files) without returning them; compare several patterns in one call. Same index as regex_search."
+            "Count regex matches per pattern (total, files matched, top files) without returning them; compare several patterns in one call. A max_millis cut marks a pattern truncated."
         }
         "brain_broken_links" => {
             "Unresolved and ambiguous vault wikilinks with repair suggestions; low_confidence lists fuzzy resolutions apart. Read the population counts, not the page."
@@ -4270,7 +4402,10 @@ pub fn dispatch_cancellable(
     //
     // `brain_status` is excluded on purpose: it is the diagnostic that REPORTS
     // this condition, so it must answer immediately rather than block on it.
-    if name != "brain_status" {
+    // `note_get` too: it ranks nothing and proves its own read consistent
+    // across a publication, so waiting would only add latency to every call
+    // made during an index.
+    if name != "brain_status" && name != "note_get" {
         wait_out_index_publication(store, cancel);
     }
 
@@ -4662,7 +4797,7 @@ fn dispatch_tool_arm(
         "get_summary" => tool_get_summary(store, args),
         "read_symbols" => tool_read_symbols(store, args),
         "regex_search" => tool_regex_search(store, args, cancel),
-        "count_patterns" => tool_count_patterns(store, args),
+        "count_patterns" => tool_count_patterns(store, args, cancel),
         "brain_broken_links" => tool_brain_broken_links(store, args),
         "brain_orphan_documents" => tool_brain_orphan_documents(store, args),
         "brain_topic_clusters" => tool_brain_topic_clusters(store, args),
@@ -6174,7 +6309,11 @@ fn tool_schema_regex_search() -> Value {
 
 /// F4: counts-only companion to regex_search. Counts matches per pattern across
 /// indexed text and reports the busiest files.
-fn tool_count_patterns(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+fn tool_count_patterns(
+    store: &GraphStore,
+    args: Value,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Value, anyhow::Error> {
     const MAX_PATTERNS: usize = 64;
     let patterns = parse_string_array(&args, "patterns")
         .filter(|p| !p.is_empty())
@@ -6194,16 +6333,28 @@ fn tool_count_patterns(store: &GraphStore, args: Value) -> Result<Value, anyhow:
     let kinds = parse_string_array(&args, "kinds");
     validate_regex_kinds(kinds.as_deref())?;
 
+    let max_millis = args.get("max_millis").and_then(|v| v.as_u64());
+
     let counts = store
-        .count_patterns(&patterns, path_prefix, kinds.as_deref())
+        .count_patterns_cancellable(&patterns, path_prefix, kinds.as_deref(), max_millis, cancel)
         .map_err(|e| anyhow!("count_patterns: {e}"))?;
-    Ok(json!({ "patterns": serde_json::to_value(counts)? }))
+    let truncated = counts.iter().any(|count| count.truncated);
+    let mut payload = json!({ "patterns": serde_json::to_value(counts)? });
+    if truncated {
+        payload["truncated"] = json!(true);
+        payload["truncation_reason"] = json!("deadline");
+        payload["retry_guidance"] = json!(
+            "The time budget ran out: patterns marked truncated report lower-bound counts. \
+             Narrow path_prefix or kinds, pass fewer patterns, or raise max_millis."
+        );
+    }
+    Ok(payload)
 }
 
 fn tool_schema_count_patterns() -> Value {
     json!({
         "name": "count_patterns",
-        "description": "Count regex matches across indexed text without returning the matches themselves — useful for frequency analysis. ^ and $ are line anchors; (?-m) anchors the whole candidate.\n\nGuidelines:\n- Pass multiple patterns to compare counts in one call\n- Returns per-pattern {pattern, total_matches, files_matched, top_files:[{path,count}], stale_index}\n- For actual match text, use regex_search instead\n\nLimitations:\n- Counts occurrences (non-overlapping, leftmost-first), the same thing `grep -o | wc -l` counts\n- Kinds are Section, Note, Symbol, and Frontmatter\n- Same trigram/fallback behavior as regex_search (stale_index flags a bypassed stale posting table)",
+        "description": "Count regex matches across indexed text without returning the matches themselves — useful for frequency analysis. ^ and $ are line anchors; (?-m) anchors the whole candidate.\n\nGuidelines:\n- Pass multiple patterns to compare counts in one call\n- Returns per-pattern {pattern, total_matches, files_matched, top_files:[{path,count}], stale_index}\n- For actual match text, use regex_search instead\n\nLimitations:\n- Counts occurrences (non-overlapping, leftmost-first), the same thing `grep -o | wc -l` counts\n- Kinds are Section, Note, Symbol, and Frontmatter\n- Same trigram/fallback behavior as regex_search (stale_index flags a bypassed stale posting table)\n- One time budget (max_millis, default 10000ms) covers all patterns; a pattern cut by it is truncated:true with lower-bound counts",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -6220,7 +6371,8 @@ fn tool_schema_count_patterns() -> Value {
                     "maxItems": MAX_KIND_FILTERS,
                     "items": { "type": "string" },
                     "description": "Restrict to these node kinds: Section, Note, Symbol, Frontmatter (case-insensitive). At most 32 entries."
-                }
+                },
+                "max_millis": { "type": "integer", "minimum": 1, "maximum": 600000, "description": "Wall-clock budget in milliseconds for the whole call, shared by all patterns (1-600000). Default 10000." }
             },
             "required": ["patterns"]
         }
@@ -10429,16 +10581,20 @@ fn note_body_window(
 }
 
 fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    // Multiple metadata/window queries must belong to one clean publication.
+    // Multiple metadata/window queries must describe one version of the note.
     // A watcher may finish between stamp rereads; the epoch closes that gap.
+    //
+    // A publication in flight is NOT refused up front any more. note_get
+    // ranks nothing, yet it used to fail for the WHOLE of a long index (the
+    // lease is held throughout), and its "overlaps index publication" text was
+    // then reworded by `classify_index_publication_error` into "ranked queries
+    // are failing closed". It now reads through the window and proves the
+    // answer consistent instead: the note's content hash is re-read after the
+    // metadata queries, and any change to it fails the read (see below).
     let publication_generation = store.graph_generation();
-    if bounded_delivery()
-        && (!store.index_publication_lease_is_unowned() || store.is_index_publication_dirty())
-    {
-        return Err(anyhow!(
-            "note read overlaps index publication; retry after publication completes"
-        ));
-    }
+    let publication_in_flight =
+        || !store.index_publication_lease_is_unowned() || store.is_index_publication_dirty();
+    let publishing_at_start = bounded_delivery() && publication_in_flight();
     let include_body = args
         .get("include_body")
         .and_then(|v| v.as_bool())
@@ -10727,16 +10883,28 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         || outline_text_truncated
         || outline_total > headings.len();
 
-    if bounded_delivery()
-        && (!store.index_publication_lease_is_unowned()
-            || store.is_index_publication_dirty()
-            || store.graph_generation() != publication_generation)
-    {
+    let publishing = publishing_at_start || (bounded_delivery() && publication_in_flight());
+    if bounded_delivery() && store.graph_generation() != publication_generation {
         return Err(anyhow!(
             "note index changed while reading; restart pagination"
         ));
     }
-    Ok(json!({
+    if publishing {
+        // A writer may have replaced this note's rows between the queries
+        // above. The content hash is written with the note, so an unchanged
+        // hash means the outline and sections read belong to the version
+        // being returned.
+        let unchanged = matches!(
+            store.lookup_note(&note.uid),
+            Ok(current) if current.content_hash == note.content_hash
+        );
+        if !unchanged {
+            return Err(anyhow!(
+                "note changed while it was being read during an index run; retry"
+            ));
+        }
+    }
+    let mut response = json!({
         "uid": note.uid,
         "title": note.title,
         "path": note.file_path,
@@ -10757,7 +10925,13 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         "frontmatter_unavailable": if frontmatter_truncated { Some("output_budget") } else { None },
         "truncated": truncated,
         "retry": if body_truncated { Some("Continue with next_body_offset as body_offset and returned body_version; keep UID/sections unchanged. Metadata and outline remain independently bounded.") } else if truncated { Some("Body is complete or omitted; only metadata/outline are bounded. Read the source file for complete metadata.") } else { None },
-    }))
+    });
+    if publishing {
+        // Answered from the live graph while an index publication was in
+        // flight; the note itself was verified unchanged across the read.
+        response["publication_in_progress"] = json!(true);
+    }
+    Ok(response)
 }
 
 // ── 4. backlinks ────────────────────────────────────────────────────────────
@@ -17914,8 +18088,7 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         payload["clusters"] = json!(rows);
         payload["total"] = json!(total);
         payload["returned"] = json!(rows.len());
-        payload["truncated"] =
-            json!(rows.len() < total || rows.iter().any(|c| c["members_truncated"] == true));
+        payload["truncated"] = json!(cluster_listing_truncated(&rows, total, cluster_offset));
         payload["graph_generation"] = json!(store.graph_generation());
         payload["cluster_offset"] = json!(cluster_offset);
         payload["next_cluster_offset"] =
@@ -17970,7 +18143,7 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
     let mut payload = json!({"resolution":output.resolution,"cluster_count":output.communities.len(),
         "symbol_count":output.communities.iter().map(|c|c.member_count).sum::<usize>(),
         "modularity":output.modularity,"limit":limit,"graph_generation":store.graph_generation(),"cached":false,
-        "clusters":rows,"total":total,"returned":rows.len(),"truncated":rows.len()<total || rows.iter().any(|c|c["members_truncated"]==true),
+        "clusters":rows,"total":total,"returned":rows.len(),"truncated":cluster_listing_truncated(&rows, total, cluster_offset),
         "cluster_offset":cluster_offset,"next_cluster_offset":if cluster_offset+rows.len()<total && !rows.is_empty() {Some(cluster_offset+rows.len())} else {None}});
     bind_cluster_page(
         &mut payload,
@@ -17979,6 +18152,19 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         offset > 0 || cluster_offset > 0,
     )?;
     Ok(payload)
+}
+
+/// Whether a `clusters` listing page left anything out: clusters AFTER this
+/// page, or members cut from a returned cluster. Clusters BEFORE the page
+/// (`cluster_offset`) are not an omission, and a page past the end is empty
+/// and complete. `rows.len() < total` reported an offset past the end as
+/// `truncated: true` beside `next_cluster_offset: null`, a cut with no way
+/// to continue it.
+fn cluster_listing_truncated(rows: &[Value], total: usize, cluster_offset: usize) -> bool {
+    cluster_offset.saturating_add(rows.len()) < total
+        || rows
+            .iter()
+            .any(|cluster| cluster["members_truncated"] == true)
 }
 
 /// `cluster_id` is a lookup by identifier: an id no community has is a miss
@@ -18374,6 +18560,8 @@ fn tool_unset_extension(args: Value) -> Result<Value, anyhow::Error> {
             .get("key")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("'key' must be a string"))?;
+        nestweaver_engine::extensions::refuse_reserved_extension_key(key)
+            .map_err(|problem| anyhow!(problem))?;
         let removed = nestweaver_engine::remove_extension_key_durable(&db_path, uid, key)?;
         Ok(json!({
             "uid": uid,
@@ -18423,19 +18611,19 @@ fn tool_set_extension(args: Value) -> Result<Value, anyhow::Error> {
             .get("value")
             .cloned()
             .ok_or_else(|| anyhow!("'value' is required"))?;
-        nestweaver_engine::extensions::validate_extension_property(key, &value)
+        nestweaver_engine::extensions::validate_extension_write(uid, key, &value)
             .map_err(|problem| anyhow!(problem))?;
 
         let mut store = load_extensions(&db_path);
-        set_property(&mut store, uid, key, value.clone());
-        save_extensions(&db_path, &store)?;
+        nestweaver_engine::extensions::set_property_capped(&mut store, uid, key, value.clone())
+            .map_err(|problem| anyhow!(problem))?;
+        let bytes = nestweaver_engine::extensions::serialize_extensions_capped(&store)
+            .map_err(|problem| anyhow!(problem))?;
+        nestweaver_engine::extensions::write_extensions_serialized(&db_path, &bytes)?;
 
-        Ok(json!({
-            "uid": uid,
-            "key": key,
-            "value": value,
-            "status": "saved",
-        }))
+        Ok(nestweaver_engine::extensions::set_extension_response(
+            uid, key, &value,
+        ))
     }
 }
 
@@ -18499,45 +18687,8 @@ fn tool_query_extensions(args: Value) -> Result<Value, anyhow::Error> {
         .ok_or_else(|| anyhow!("database path not set on server"))?;
 
     let store = load_extensions(&db_path);
-
-    // Single-UID lookup mode.
-    if let Some(uid) = args.get("uid").and_then(|v| v.as_str()) {
-        let props = get_all_properties(&store, uid);
-        return Ok(json!({
-            "uid": uid,
-            "properties": props,
-        }));
-    }
-
-    // Filter-by-key-value mode.
-    let key = args
-        .get("key")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("provide either 'uid' or both 'key' and 'value'"))?;
-    let value = args
-        .get("value")
-        .cloned()
-        .ok_or_else(|| anyhow!("'value' is required when 'key' is given"))?;
-
-    let matching_uids = query_by_property(&store, key, &value);
-
-    let results: Vec<Value> = matching_uids
-        .iter()
-        .map(|uid| {
-            let props = store.get(*uid).cloned().unwrap_or_default();
-            json!({
-                "uid": uid,
-                "properties": props,
-            })
-        })
-        .collect();
-
-    Ok(json!({
-        "key": key,
-        "value": value,
-        "count": results.len(),
-        "results": results,
-    }))
+    nestweaver_engine::extensions::query_extensions_payload(&store, &args)
+        .map_err(|problem| anyhow!(problem))
 }
 
 // ── 16. brain_diff ─────────────────────────────────────────────────────────
@@ -27050,8 +27201,13 @@ mod cache_dispatch_tests {
         );
     }
 
+    /// note_get ranks nothing, yet it used to refuse for the whole of a live
+    /// index publication (the lease is held for an entire index run), and the
+    /// refusal was then reworded into "ranked queries are failing closed".
+    /// It now reads through the window, verifies the note's content hash is
+    /// unchanged across its queries, and discloses `publication_in_progress`.
     #[test]
-    fn review2_paged_note_refuses_live_publication_even_without_disk_marker() {
+    fn review2_paged_note_reads_through_a_live_publication_with_disclosure() {
         let store = GraphStore::in_memory().unwrap();
         store.insert_vault(&vault_fixture()).unwrap();
         let note = note_fixture("note:publication-paging");
@@ -27062,13 +27218,13 @@ mod cache_dispatch_tests {
             !store.is_index_publication_dirty(),
             "in-memory fixture has no disk marker; exercise actual lease guard"
         );
-        let result = tool_note_get(&store, json!({"uid":note.uid,"include_body":false}));
-        assert!(
-            result.is_err(),
-            "a paged read must not start across a live index publication"
-        );
+        let during = tool_note_get(&store, json!({"uid":note.uid,"include_body":false}))
+            .expect("a non-ranking note read must not fail closed during an index");
+        assert_eq!(during["uid"], json!(note.uid));
+        assert_eq!(during["publication_in_progress"], true, "{during}");
         drop(lease);
-        assert!(tool_note_get(&store, json!({"uid":note.uid,"include_body":false})).is_ok());
+        let after = tool_note_get(&store, json!({"uid":note.uid,"include_body":false})).unwrap();
+        assert!(after.get("publication_in_progress").is_none(), "{after}");
         let _cli = scoped_tool_delivery(nestweaver_schema::ToolDeliveryProfile::FullCli);
         let lease = store.acquire_index_publication_lease().unwrap();
         assert!(
@@ -30100,6 +30256,38 @@ mod arg_alias_tests {
             tool_clusters(&store, json!({ "resolution": 1.0 })).expect("unscoped clusters call");
         assert_eq!(payload["graph_generation"], json!(store.graph_generation()));
         assert_eq!(payload["cached"], json!(false));
+    }
+
+    /// A `cluster_offset` past the end is an empty, COMPLETE page. It was
+    /// reported `truncated: true` beside `next_cluster_offset: null` — a cut
+    /// with no way to continue it.
+    #[test]
+    fn tool_clusters_offset_past_the_end_is_not_truncated() {
+        let store = cluster_scope_store();
+        let first =
+            tool_clusters(&store, json!({ "resolution": 1.0 })).expect("first clusters page");
+        let past_end = tool_clusters(
+            &store,
+            json!({
+                "resolution": 1.0,
+                "cluster_offset": 10_000,
+                "expected_generation": first["graph_generation"],
+                "page_token": first["page_token"],
+            }),
+        )
+        .expect("a page past the end");
+        assert_eq!(past_end["returned"], 0, "{past_end}");
+        assert_eq!(past_end["truncated"], false, "{past_end}");
+        assert!(past_end["next_cluster_offset"].is_null(), "{past_end}");
+
+        assert!(cluster_listing_truncated(&[json!({})], 3, 0));
+        assert!(!cluster_listing_truncated(&[json!({})], 3, 2));
+        assert!(!cluster_listing_truncated(&[], 3, 5));
+        assert!(cluster_listing_truncated(
+            &[json!({"members_truncated": true})],
+            1,
+            0
+        ));
     }
 
     #[test]

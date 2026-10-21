@@ -288,7 +288,21 @@ pub struct PatternCount {
     pub scanned_candidates: usize,
     #[serde(default)]
     pub timings: RegexStageTimings,
+    /// True when the counts are LOWER BOUNDS: the call's time budget ran out
+    /// before this pattern's corpus was fully counted (or before the pattern
+    /// was reached at all). `false` means the counts are exact.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Why `truncated` is set (`deadline`). Absent when the counts are exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation_reason: Option<RegexTruncationReason>,
 }
+
+/// Default wall-clock budget for one `count_patterns` call, shared by all of
+/// its patterns. Each pattern without a usable trigram is a full corpus scan,
+/// so without a budget 64 patterns of `.` ran for 46.8s and kept burning CPU
+/// after the client had gone.
+pub const COUNT_PATTERNS_DEFAULT_MAX_MILLIS: u64 = 10_000;
 
 /// Work performed by an incremental trigram refresh.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -2556,7 +2570,35 @@ impl GraphStore {
         path_prefix: Option<&str>,
         kinds: Option<&[String]>,
     ) -> Result<Vec<PatternCount>, StoreError> {
-        self.count_patterns_with_planning_cap(patterns, path_prefix, kinds, CANDIDATE_CAP)
+        self.count_patterns_cancellable(patterns, path_prefix, kinds, None, None)
+    }
+
+    /// [`Self::count_patterns`] under a wall-clock budget and cooperative
+    /// cancellation.
+    ///
+    /// `max_millis` (default [`COUNT_PATTERNS_DEFAULT_MAX_MILLIS`]) bounds the
+    /// WHOLE call, shared across patterns. When it runs out, the pattern being
+    /// counted and every pattern not yet reached come back `truncated: true`
+    /// with `truncation_reason: deadline`, and their counts are lower bounds —
+    /// never a confident short count. A tripped `cancel` (client disconnect or
+    /// RPC timeout) returns `StoreError::Cancelled` instead, so a partial
+    /// answer nobody is waiting for is neither computed nor cached.
+    pub fn count_patterns_cancellable(
+        &self,
+        patterns: &[String],
+        path_prefix: Option<&str>,
+        kinds: Option<&[String]>,
+        max_millis: Option<u64>,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Vec<PatternCount>, StoreError> {
+        self.count_patterns_with_planning_cap(
+            patterns,
+            path_prefix,
+            kinds,
+            CANDIDATE_CAP,
+            max_millis.unwrap_or(COUNT_PATTERNS_DEFAULT_MAX_MILLIS),
+            cancel,
+        )
     }
 
     // Small-budget regression seam; public behavior keeps the original cap.
@@ -2566,26 +2608,64 @@ impl GraphStore {
         path_prefix: Option<&str>,
         kinds: Option<&[String]>,
         planning_cap: usize,
+        deadline_ms: u64,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Vec<PatternCount>, StoreError> {
+        let check_cancel = || {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                Err(StoreError::Cancelled(CancelReason::Timeout))
+            } else {
+                Ok(())
+            }
+        };
+        let call_started = Instant::now();
         let mut out = Vec::new();
         for pattern in patterns {
+            check_cancel()?;
             let started = Instant::now();
             let re = compile_pattern(pattern)?;
+            if elapsed_millis(call_started) >= deadline_ms {
+                // The budget is spent: report the pattern as not counted
+                // rather than as a confident zero.
+                out.push(PatternCount {
+                    pattern: pattern.clone(),
+                    total_matches: 0,
+                    files_matched: 0,
+                    top_files: Vec::new(),
+                    stale_index: false,
+                    ready_scopes: 0,
+                    dirty_scopes: 0,
+                    error_scopes: 0,
+                    posting_hits: 0,
+                    hydrated_candidates: 0,
+                    scanned_candidates: 0,
+                    timings: RegexStageTimings::default(),
+                    truncated: true,
+                    truncation_reason: Some(RegexTruncationReason::Deadline),
+                });
+                continue;
+            }
 
             // Optional trigram narrowing.
             let planning_started = Instant::now();
             let clauses = required_trigram_clauses(pattern);
+            // Every phase measures the SHARED call budget from `call_started`.
             let plan = match &clauses {
                 Some(clauses) => self.regex_v3_candidate_uids(
                     clauses,
-                    started,
-                    u64::MAX,
-                    None,
+                    call_started,
+                    deadline_ms,
+                    cancel,
                     planning_cap,
                     false,
                 )?,
                 None => None,
             };
+            check_cancel()?;
+            // A planner that ran out of budget returns no plan; that must not
+            // silently become an unbudgeted full scan below.
+            let mut deadline_hit =
+                clauses.is_some() && plan.is_none() && elapsed_millis(call_started) >= deadline_ms;
             let planning_ms = elapsed_millis(planning_started);
             let stale_index = plan
                 .as_ref()
@@ -2595,56 +2675,63 @@ impl GraphStore {
             let mut total: u64 = 0;
             let mut scanned_candidates = 0usize;
             let hydration_started = Instant::now();
-            let (candidates, hydrated_candidates) = match &plan {
-                Some(plan) => {
-                    let mut candidates = self
-                        .collect_candidates_for_scopes(
+            let limits = || CandidateLimits {
+                cancel,
+                max_candidates: usize::MAX,
+            };
+            let (candidates, hydrated_candidates) = if deadline_hit {
+                (Vec::new(), 0)
+            } else {
+                match &plan {
+                    Some(plan) => {
+                        let (mut candidates, fallback_stop) = self.collect_candidates_for_scopes(
                             &plan.dirty_scopes,
                             path_prefix,
                             kinds,
-                            started,
-                            u64::MAX,
-                            CandidateLimits {
-                                cancel: None,
-                                max_candidates: usize::MAX,
-                            },
-                        )?
-                        .0;
-                    let hydrated = self
-                        .load_candidates_by_uid(
+                            call_started,
+                            deadline_ms,
+                            limits(),
+                        )?;
+                        let (hydrated, hydrated_stop) = self.load_candidates_by_uid(
                             &plan.matching_ready_uids,
                             path_prefix,
                             kinds,
-                            started,
-                            u64::MAX,
-                            CandidateLimits {
-                                cancel: None,
-                                max_candidates: usize::MAX,
-                            },
-                        )?
-                        .0;
-                    let hydrated_candidates = hydrated.len();
-                    candidates.extend(hydrated);
-                    (candidates, hydrated_candidates)
+                            call_started,
+                            deadline_ms,
+                            limits(),
+                        )?;
+                        deadline_hit |=
+                            stops_on_deadline(fallback_stop) || stops_on_deadline(hydrated_stop);
+                        let hydrated_candidates = hydrated.len();
+                        candidates.extend(hydrated);
+                        (candidates, hydrated_candidates)
+                    }
+                    None => {
+                        let (candidates, stop) = self.collect_candidates(
+                            path_prefix,
+                            kinds,
+                            call_started,
+                            deadline_ms,
+                            limits(),
+                        )?;
+                        deadline_hit |= stops_on_deadline(stop);
+                        (candidates, 0)
+                    }
                 }
-                None => (
-                    self.collect_candidates(
-                        path_prefix,
-                        kinds,
-                        started,
-                        u64::MAX,
-                        CandidateLimits {
-                            cancel: None,
-                            max_candidates: usize::MAX,
-                        },
-                    )?
-                    .0,
-                    0,
-                ),
             };
+            check_cancel()?;
             let hydration_ms = elapsed_millis(hydration_started);
             let verification_started = Instant::now();
-            for c in &candidates {
+            for (index, c) in candidates.iter().enumerate() {
+                // Checked every 64 candidates: cheap relative to a regex scan,
+                // and frequent enough that a disconnect stops the work.
+                if index % 64 == 0 {
+                    check_cancel()?;
+                    if elapsed_millis(call_started) >= deadline_ms {
+                        deadline_hit = true;
+                        break;
+                    }
+                }
                 scanned_candidates += 1;
                 // nw-300: `is_match` is a boolean, so `total` counted NODES
                 // that contained at least one match and reported that under a
@@ -2692,10 +2779,20 @@ impl GraphStore {
                     verification_ms,
                     total_ms: elapsed_millis(started),
                 },
+                truncated: deadline_hit,
+                truncation_reason: deadline_hit.then_some(RegexTruncationReason::Deadline),
             });
         }
         Ok(out)
     }
+}
+
+/// Whether a candidate collector stopped because the wall-clock budget ran
+/// out. `count_patterns` gathers without a candidate cap, so the only stop it
+/// can meet besides cancellation (an error) is the deadline; an undecodable
+/// row short-changes the corpus but is not a stop.
+fn stops_on_deadline(stop: Option<RegexTruncationReason>) -> bool {
+    matches!(stop, Some(RegexTruncationReason::Deadline))
 }
 
 fn elapsed_millis(started: Instant) -> u64 {
@@ -4041,10 +4138,54 @@ mod tests {
         assert!(complete[0].ready_scopes >= 8);
         assert!(complete[0].dirty_scopes >= 1);
         let small = store
-            .count_patterns_with_planning_cap(&patterns, None, None, 2)
+            .count_patterns_with_planning_cap(&patterns, None, None, 2, u64::MAX, None)
             .unwrap();
         assert_eq!(small[0].total_matches, complete[0].total_matches);
         assert_eq!(small[0].files_matched, complete[0].files_matched);
+    }
+
+    /// count_patterns had no deadline and no cancellation: 64 patterns of `.`
+    /// ran 46.8s and kept burning CPU after the client disconnected. A spent
+    /// budget now yields honestly truncated lower bounds; a tripped cancel
+    /// flag stops the call outright.
+    #[test]
+    fn count_patterns_honours_its_budget_and_cancellation() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
+        let store = store_with_text();
+        let patterns = ["authenticateUser".to_string(), ".".to_string()];
+
+        let complete = store.count_patterns(&patterns, None, None).unwrap();
+        assert!(complete.iter().all(|count| !count.truncated));
+        assert!(
+            complete
+                .iter()
+                .all(|count| count.truncation_reason.is_none())
+        );
+        assert!(complete[0].total_matches > 0);
+
+        let spent = store
+            .count_patterns_with_planning_cap(&patterns, None, None, CANDIDATE_CAP, 0, None)
+            .unwrap();
+        assert_eq!(spent.len(), 2, "every pattern is still reported");
+        for count in &spent {
+            assert!(count.truncated, "{count:?}");
+            assert_eq!(
+                count.truncation_reason,
+                Some(RegexTruncationReason::Deadline)
+            );
+        }
+        let json = serde_json::to_value(&spent[0]).unwrap();
+        assert_eq!(json["truncated"], true);
+        assert_eq!(json["truncation_reason"], "deadline");
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let error = store
+            .count_patterns_cancellable(&patterns, None, None, None, Some(&cancel))
+            .unwrap_err();
+        assert!(
+            matches!(error, StoreError::Cancelled(_)),
+            "a cancelled count must not return a partial answer: {error}"
+        );
     }
 
     #[test]
@@ -4065,7 +4206,7 @@ mod tests {
             "manual section + three symbol occurrences"
         );
         let bounded_plan = store
-            .count_patterns_with_planning_cap(&patterns, None, None, 1)
+            .count_patterns_with_planning_cap(&patterns, None, None, 1, u64::MAX, None)
             .unwrap();
         assert_eq!(
             bounded_plan[0].total_matches, 4,
@@ -4091,7 +4232,7 @@ mod tests {
             "one section and one symbol occurrence"
         );
         let bounded_plan = store
-            .count_patterns_with_planning_cap(&patterns, None, None, 1)
+            .count_patterns_with_planning_cap(&patterns, None, None, 1, u64::MAX, None)
             .unwrap();
         assert_eq!(
             bounded_plan[0].total_matches, 2,

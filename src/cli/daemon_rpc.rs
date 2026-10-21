@@ -732,6 +732,14 @@ pub(crate) fn pattern_count_from_tool_json(
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default(),
+        truncated: c
+            .get("truncated")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        truncation_reason: c
+            .get("truncation_reason")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
     })
 }
 

@@ -5305,6 +5305,9 @@ fn note_metadata_readiness_retryable(response: &serde_json::Value) -> bool {
         Some(
             "tool note_get failed: note read overlaps index publication; retry after publication completes"
         ) | Some("tool note_get failed: note index changed while reading; restart pagination")
+            | Some(
+                "tool note_get failed: note changed while it was being read during an index run; retry"
+            )
     )
 }
 
@@ -5319,6 +5322,7 @@ fn note_metadata_readiness_classifier_retries_only_publication_guards() {
     for message in [
         "tool note_get failed: note read overlaps index publication; retry after publication completes",
         "tool note_get failed: note index changed while reading; restart pagination",
+        "tool note_get failed: note changed while it was being read during an index run; retry",
     ] {
         assert!(
             note_metadata_readiness_retryable(&error(message)),
