@@ -15543,13 +15543,21 @@ fn same_directory(left: &Path, right: &Path) -> bool {
 mod affected_tests_base_ref_tests {
     use super::*;
 
-    /// Fixture Git ignores the runner's system and global config: CI runners
-    /// configure Git LFS globally, which collided with fixture filter names.
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .args(args)
+    /// Native Git for fixtures and baselines, without the machine's system or
+    /// global config. CI runners configure Git LFS globally, which collided
+    /// with fixture filter names; under that config native Git also deleted a
+    /// forged layout's victim HEAD, so baselines measured the runner, not Git.
+    fn fixture_git() -> std::process::Command {
+        let mut command = std::process::Command::new("git");
+        command
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        command
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = fixture_git()
+            .args(args)
             .current_dir(dir)
             .output()
             .expect("git");
@@ -16028,7 +16036,7 @@ mod affected_tests_base_ref_tests {
     /// The attack must be real: native Git lists the other repository's file,
     /// so a later refusal is NestWeaver's, not Git's.
     fn assert_native_git_discloses_other_repository(path: &std::path::Path, name: &str) {
-        let native = std::process::Command::new("git")
+        let native = fixture_git()
             .args(["--work-tree=.", "diff", "--name-only", "HEAD", "--"])
             .current_dir(path)
             .output()
@@ -16429,7 +16437,7 @@ mod affected_tests_base_ref_tests {
                 .unwrap();
                 std::fs::write(evil.join("HEAD"), "ref: refs/heads/borrowed\n").unwrap();
                 // Prove the unguarded command actually borrows victim filenames.
-                let baseline = std::process::Command::new("git")
+                let baseline = fixture_git()
                     .current_dir(forged.path())
                     .args(["diff", "--name-only", "HEAD"])
                     .output()
@@ -16550,7 +16558,7 @@ mod affected_tests_base_ref_tests {
             work.path().join(".git/index"),
         )
         .unwrap();
-        let baseline = std::process::Command::new("git")
+        let baseline = fixture_git()
             .current_dir(work.path())
             .args(["ls-files", "--modified", "--deleted", "-z"])
             .output()
@@ -16583,7 +16591,7 @@ mod affected_tests_base_ref_tests {
         std::fs::rename(work.path().join(".git/HEAD"), outside.path().join("HEAD")).unwrap();
         std::os::unix::fs::symlink(outside.path().join("HEAD"), work.path().join(".git/HEAD"))
             .unwrap();
-        let baseline = std::process::Command::new("git")
+        let baseline = fixture_git()
             .current_dir(work.path())
             .args(["rev-parse", "--absolute-git-dir"])
             .output()
@@ -16731,7 +16739,7 @@ mod affected_tests_base_ref_tests {
             std::fs::write(work.path().join("tracked.txt"), "after\n").unwrap();
             // Demonstrate the reported exploit with the previous porcelain,
             // even with both commonly suggested execution guards enabled.
-            let _baseline = std::process::Command::new("git")
+            let _baseline = fixture_git()
                 .current_dir(work.path())
                 .args([
                     "diff",
@@ -16825,7 +16833,7 @@ mod affected_tests_base_ref_tests {
                         .unwrap()
                         .set_modified(recorded_time)
                         .unwrap();
-                    let baseline = std::process::Command::new("git")
+                    let baseline = fixture_git()
                         .current_dir(work.path())
                         .args([
                             "-c",
@@ -16917,7 +16925,7 @@ mod affected_tests_base_ref_tests {
             .unwrap()
             .set_modified(recorded)
             .unwrap();
-        let _baseline = std::process::Command::new("git")
+        let _baseline = fixture_git()
             .current_dir(&linked)
             .args([
                 "-c",
@@ -16971,7 +16979,7 @@ mod affected_tests_base_ref_tests {
             &["config", "filter.bad=name.clean", script.to_str().unwrap()],
         );
         std::fs::write(work.path().join("tracked.txt"), "after!\n").unwrap();
-        let _baseline = std::process::Command::new("git")
+        let _baseline = fixture_git()
             .current_dir(work.path())
             .args([
                 "-c",
@@ -17029,7 +17037,7 @@ mod affected_tests_base_ref_tests {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let head = std::process::Command::new("git")
+        let head = fixture_git()
             .current_dir(work.path())
             .args(["rev-parse", "HEAD"])
             .output()
@@ -17062,7 +17070,7 @@ mod affected_tests_base_ref_tests {
                 .join(&oid[2..]),
         )
         .unwrap();
-        let baseline = std::process::Command::new("git")
+        let baseline = fixture_git()
             .current_dir(work.path())
             .env_remove("GIT_NO_LAZY_FETCH")
             .env_remove("GIT_ALLOW_PROTOCOL")
