@@ -15332,7 +15332,15 @@ fn direct_affected_tests_honours_a_declared_link_to_a_stale_repo() {
 
     let run = || {
         let output = nestweaver_cmd()
-            .args(["affected-tests", "--files", "mine.js", "--json", "--db"])
+            .args([
+                "affected-tests",
+                "--files",
+                "mine.js",
+                "--repo",
+                "mine-repo",
+                "--json",
+                "--db",
+            ])
             .arg(&db_path)
             .output()
             .unwrap();

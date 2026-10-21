@@ -186,6 +186,19 @@ pub fn affected_tests(store: &GraphStore, changed_files: &[String]) -> Result<Af
     affected_tests_within(store, &changed_files, None, None)
 }
 
+/// [`affected_tests`] limited to one repository.
+///
+/// Explicit paths are repo-relative too: the same relative path in another
+/// indexed repository is not part of the change.
+pub fn affected_tests_in_repo(
+    store: &GraphStore,
+    repo_uid: &str,
+    changed_files: &[String],
+) -> Result<AffectedTestsResult> {
+    let changed_files = crate::changed_files::require_changed_files(changed_files)?;
+    affected_tests_within(store, &changed_files, None, Some(repo_uid))
+}
+
 /// Canonical empty selection after a caller proved a VCS diff empty and
 /// checked the exact resolver compatibility of that diff's repository.
 /// This does not admit empty user/MCP input; those entry points still validate.
@@ -245,6 +258,17 @@ pub fn affected_tests_scoped(
 ) -> Result<AffectedTestsResult> {
     let changed_files = crate::changed_files::require_changed_files(changed_files)?;
     affected_tests_within(store, &changed_files, Some(allowed_symbols), None)
+}
+
+/// Scoped twin of [`affected_tests_in_repo`].
+pub fn affected_tests_scoped_in_repo(
+    store: &GraphStore,
+    repo_uid: &str,
+    changed_files: &[String],
+    allowed_symbols: &HashSet<String>,
+) -> Result<AffectedTestsResult> {
+    let changed_files = crate::changed_files::require_changed_files(changed_files)?;
+    affected_tests_within(store, &changed_files, Some(allowed_symbols), Some(repo_uid))
 }
 
 /// Scoped twin of [`affected_tests_for_derived_diff`].

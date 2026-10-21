@@ -657,6 +657,17 @@ pub fn run_recorded(
     attach_recording(store, result, db_path)
 }
 
+/// [`run_recorded`] limited to the repository the changed files belong to.
+pub fn run_recorded_in_repo(
+    store: &nestweaver_store::GraphStore,
+    repo_uid: &str,
+    changed_files: &[String],
+    db_path: Option<&Path>,
+) -> Result<AffectedTestsResult> {
+    let result = crate::affected_tests::affected_tests_in_repo(store, repo_uid, changed_files)?;
+    attach_recording(store, result, db_path)
+}
+
 /// Recorded affected-test selection for a trusted VCS-derived diff, including
 /// the valid zero-change case.
 pub fn run_recorded_derived_diff(
