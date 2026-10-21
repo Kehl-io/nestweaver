@@ -4639,16 +4639,10 @@ fn prepare_index_resolution(
     resolve_pb.set_message("Resolving cross-file references...");
     resolve_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let workspace_ctx = if file_languages.values().any(|language| {
-        matches!(
-            language,
-            Language::JavaScript
-                | Language::TypeScript
-                | Language::Vue
-                | Language::Svelte
-                | Language::Astro
-        )
-    }) {
+    let workspace_ctx = if file_languages
+        .values()
+        .any(|language| language_uses_workspace_context(*language))
+    {
         discover_workspace_context_with(|rel_path| {
             reader
                 .read_file(rel_path)
@@ -9464,6 +9458,8 @@ fn language_uses_workspace_context(language: Language) -> bool {
             | Language::Vue
             | Language::Svelte
             | Language::Astro
+            // `go.mod` / `go.work` map Go import paths onto directories.
+            | Language::Go
     )
 }
 
@@ -9626,10 +9622,11 @@ fn importers_of_added_paths(
                 continue;
             };
             let names_added = specs.iter().any(|specifier| {
-                nestweaver_resolver::imports::resolved_import_path(
+                nestweaver_resolver::imports::resolved_import_paths(
                     &importer, specifier, &known, language, &workspace,
                 )
-                .is_some_and(|target| target != importer && added.contains(&target))
+                .into_iter()
+                .any(|target| target != importer && added.contains(&target))
             });
             if names_added {
                 seeded.insert(importer);

@@ -38,6 +38,11 @@
 (import_header
   (identifier) @name) @reference.import
 
+; Package header: an import names a declaration of a package, whatever file
+; of that package declares it.
+(package_header
+  (identifier) @name) @reference.package
+
 ; Delegation specifiers (extends / implements): class Foo : Bar
 (delegation_specifier
   (user_type

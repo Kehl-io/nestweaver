@@ -2194,6 +2194,9 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     if lang == Language::Python {
         collect_python_import_bindings(tree.root_node(), source_bytes, &mut references);
     }
+    if lang == Language::Go {
+        annotate_go_import_names(tree.root_node(), source_bytes, &mut references);
+    }
 
     // nw-151: recover calls written inside Rust macro bodies.
     if lang == Language::Rust {
@@ -5815,6 +5818,30 @@ fn collect_python_import_bindings(
     while let Some(statement) = stack.pop() {
         let mut cursor = statement.walk();
         stack.extend(statement.named_children(&mut cursor));
+        if statement.kind() == "import_statement" {
+            // `import pkg.helpers as ph` binds `ph` to the whole module.
+            let mut cursor = statement.walk();
+            for binding in statement.children_by_field_name("name", &mut cursor) {
+                if binding.kind() != "aliased_import" {
+                    continue;
+                }
+                let (Some(module), Some(local)) = (
+                    binding.child_by_field_name("name"),
+                    binding.child_by_field_name("alias"),
+                ) else {
+                    continue;
+                };
+                references.push(RawReference {
+                    scope: None,
+                    name: local.utf8_text(source).unwrap_or("").into(),
+                    kind: ReferenceKind::ImportAlias,
+                    start_line: local.start_position().row as u32 + 1,
+                    context: module.utf8_text(source).unwrap_or("").into(),
+                    receiver: Some("*".into()),
+                });
+            }
+            continue;
+        }
         if statement.kind() != "import_from_statement" {
             continue;
         }
@@ -5843,6 +5870,46 @@ fn collect_python_import_bindings(
                 context: specifier.into(),
                 receiver: Some(original.utf8_text(source).unwrap_or("").into()),
             });
+        }
+    }
+}
+
+/// Record a Go import's explicit package name as its reference `receiver`.
+///
+/// `import c "example.com/app/calc"` binds the qualifier `c`, `.` makes the
+/// package's names usable bare, and `_` binds nothing. Without the name the
+/// resolver can only assume the package's own name, so `c.New` would never
+/// reach `calc`.
+fn annotate_go_import_names(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    references: &mut [RawReference],
+) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() != "import_spec" {
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+            continue;
+        }
+        let (Some(name), Some(path)) = (
+            node.child_by_field_name("name"),
+            node.child_by_field_name("path"),
+        ) else {
+            continue;
+        };
+        let (Ok(name), Ok(path)) = (name.utf8_text(source), path.utf8_text(source)) else {
+            continue;
+        };
+        let specifier = strip_quotes(path);
+        let lines = node.start_position().row as u32 + 1..=node.end_position().row as u32 + 1;
+        if let Some(reference) = references.iter_mut().find(|reference| {
+            reference.kind == ReferenceKind::Import
+                && lines.contains(&reference.start_line)
+                && reference.name == specifier
+                && reference.receiver.is_none()
+        }) {
+            reference.receiver = Some(name.to_string());
         }
     }
 }

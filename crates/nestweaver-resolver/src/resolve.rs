@@ -2028,6 +2028,24 @@ fn candidate_matches(
         }
         _ => {}
     }
+    if language == Language::Go {
+        // A Go import binds a package qualifier: `calc.New` names a
+        // top-level `New` in any file of the package `calc` names, and a
+        // bare `New` never names an imported (non-dot) package's file.
+        match reference.receiver.as_deref() {
+            Some(receiver) => {
+                if let Some(files) = graph.go_qualified_package(source_file, receiver) {
+                    return sym.parent_name.is_none()
+                        && files.iter().any(|file| file == candidate_file);
+                }
+            }
+            None => {
+                if graph.go_requires_qualifier(source_file, candidate_file) {
+                    return false;
+                }
+            }
+        }
+    }
     match reference.receiver.as_deref() {
         None => true,
         Some(receiver) if is_path_receiver(receiver) => path_denotes(candidate_file, sym, receiver),

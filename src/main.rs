@@ -2592,7 +2592,13 @@ fn describe_link_resolution(link: &nestweaver_engine::BrokenLink) -> String {
             format!("AMBIGUOUS — {} notes match", link.candidate_count)
         }
         Some(uid) => format!("resolves to {uid}"),
-        None => "UNRESOLVED — no such note".to_string(),
+        None => match link.missing_anchor.as_deref() {
+            Some(anchor) => match anchor.strip_prefix('^') {
+                Some(block) => format!("UNRESOLVED — the note has no block ^{block}"),
+                None => format!("UNRESOLVED — the note has no heading '{anchor}'"),
+            },
+            None => "UNRESOLVED — no such note".to_string(),
+        },
     }
 }
 

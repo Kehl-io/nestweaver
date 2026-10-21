@@ -39,6 +39,14 @@
 (import_declaration
   (identifier) @name) @reference.import
 
+; Package declaration: an import names a declaration of a package, and a
+; package-private top-level class need not live in a file named after it.
+(package_declaration
+  (scoped_identifier) @name) @reference.package
+
+(package_declaration
+  (identifier) @name) @reference.package
+
 ; Extends (superclass)
 (superclass
   (type_identifier) @name) @reference.extends
