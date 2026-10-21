@@ -5811,6 +5811,71 @@ mod seed_resolution_disclosure_tests {
         assert_eq!(result.seed_resolution_limit, None);
     }
 
+    /// QA #12: 256 seeds cost ~24 s because every unresolved seed re-read
+    /// the notes, tags, projects and the symbol table. One call now reads the
+    /// symbol table once however many seeds it resolves.
+    #[test]
+    fn brain_context_reads_the_symbol_table_once_for_many_seeds() {
+        let store = store_with_validate_definitions(3);
+        let mut seeds: Vec<String> = (0..40).map(|i| format!("no_such_seed_{i}")).collect();
+        seeds.push("validate1".to_string());
+        let before = nestweaver_store::symbol_table_fetches_on_this_thread();
+        let result = build_brain_context_hybrid_with_aliases(
+            &store,
+            &seeds,
+            None,
+            &HybridSearchConfig::default(),
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let fetches = nestweaver_store::symbol_table_fetches_on_this_thread() - before;
+        assert!(fetches <= 2, "symbol table fetched {fetches} times for 41 seeds");
+        assert!(result.seeds.iter().any(|seed| seed.uid == "sym:v1"), "{:?}", result.seeds);
+        assert_eq!(result.unresolved_seeds.len(), 40);
+    }
+
+    /// QA #2: a repo scope narrows bare-name seed resolution BEFORE the
+    /// per-seed cap, so out-of-scope matches cannot fill the cap and leave
+    /// the scoped repo's own definition unresolved.
+    #[test]
+    fn a_repo_scope_applies_before_the_seed_cap() {
+        let store = GraphStore::in_memory().unwrap();
+        for i in 0..(SEED_NAME_MATCH_LIMIT + 3) {
+            store
+                .insert_symbol(&symbol(&format!("other{i}"), "Parse"))
+                .unwrap();
+        }
+        let mut mine = symbol("zz_mine", "Parse");
+        mine.repo_uid = "repo:uuid".to_string();
+        store.insert_symbol(&mine).unwrap();
+        let config = HybridSearchConfig {
+            seed_scope_repo_uids: Some(std::collections::HashSet::from(["repo:uuid".to_string()])),
+            ..HybridSearchConfig::default()
+        };
+        let result = build_brain_context_hybrid_with_aliases(
+            &store,
+            &["Parse".to_string()],
+            None,
+            &config,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            result.seeds.iter().any(|seed| seed.uid == "sym:zz_mine"),
+            "{:?}",
+            result.seeds
+        );
+        assert_eq!(result.seed_matches_total, Some(1));
+    }
+
     #[test]
     fn brain_context_discloses_the_same_seed_cut_the_code_route_does() {
         let store = store_with_validate_definitions(50);
