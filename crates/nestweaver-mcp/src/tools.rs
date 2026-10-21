@@ -15543,9 +15543,13 @@ fn same_directory(left: &Path, right: &Path) -> bool {
 mod affected_tests_base_ref_tests {
     use super::*;
 
+    /// Fixture Git ignores the runner's system and global config: CI runners
+    /// configure Git LFS globally, which collided with fixture filter names.
     fn git(dir: &std::path::Path, args: &[&str]) {
         let output = std::process::Command::new("git")
             .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .current_dir(dir)
             .output()
             .expect("git");
@@ -16309,13 +16313,21 @@ mod affected_tests_base_ref_tests {
     /// while Git opens another through a planted symlink.
     #[test]
     fn affected_tests_base_ref_rejects_commondir_parsed_differently_by_git() {
-        let real = tempfile::tempdir().unwrap();
-        init_repo_with_tracked_file(real.path(), "only-real.txt");
-        let real_git = real.path().join(".git");
         for (name, commondir, link) in [
             ("commondir-trailing-space", "../.. \n", ".. "),
             ("commondir-embedded-newline", "../..\n..\nx\n", "..\n..\nx"),
         ] {
+            // A fresh victim per layout: nothing one case does can affect the
+            // next, and damage to the victim is attributed to the step causing it.
+            let real = tempfile::tempdir().unwrap();
+            init_repo_with_tracked_file(real.path(), "only-real.txt");
+            let real_git = real.path().join(".git");
+            let victim_intact = |step: &str| {
+                assert!(
+                    real_git.join("HEAD").is_file(),
+                    "{name}: the other repository lost its HEAD after {step}"
+                );
+            };
             let staging = tempfile::tempdir().unwrap();
             let host = staging.path().join("host");
             std::fs::create_dir(&host).unwrap();
@@ -16337,7 +16349,9 @@ mod affected_tests_base_ref_tests {
             )
             .unwrap();
             assert_native_git_discloses_other_repository(attacker.path(), name);
+            victim_intact("native git diff");
             assert_refused_without_disclosure(attacker.path(), name);
+            victim_intact("affected_tests");
         }
     }
 
@@ -16853,7 +16867,11 @@ mod affected_tests_base_ref_tests {
         use std::os::unix::fs::PermissionsExt;
         let main = tempfile::tempdir().unwrap();
         init_repo_with_tracked_file(main.path(), "tracked.txt");
-        std::fs::write(main.path().join(".gitattributes"), "*.txt filter=lfs\n").unwrap();
+        std::fs::write(
+            main.path().join(".gitattributes"),
+            "*.txt filter=nwtestfilter\n",
+        )
+        .unwrap();
         git(main.path(), &["add", ".gitattributes"]);
         git(main.path(), &["commit", "-q", "-m", "attributes"]);
         let linked_parent = tempfile::tempdir().unwrap();
@@ -16880,9 +16898,16 @@ mod affected_tests_base_ref_tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         git(
             main.path(),
-            &["config", "filter.lfs.clean", script.to_str().unwrap()],
+            &[
+                "config",
+                "filter.nwtestfilter.clean",
+                script.to_str().unwrap(),
+            ],
         );
-        git(main.path(), &["config", "filter.lfs.required", "true"]);
+        git(
+            main.path(),
+            &["config", "filter.nwtestfilter.required", "true"],
+        );
         let git_dir = indexed_work_tree_git_dir(&linked).unwrap();
         let recorded = std::fs::metadata(linked.join("tracked.txt"))
             .unwrap()
