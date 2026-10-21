@@ -633,7 +633,7 @@ fn prepare_restart_for(
                 request,
                 verified_platform_supervisor
             ),
-            "daemon PID {} is supervisor-managed, foreground, or has unknown lifecycle ownership; refusing to shut it down and replace it with a detached process. Restart it through its supervisor (for systemd: `systemctl --user restart nestweaver`; for launchd: `launchctl kickstart -k gui/$(id -u)/{}`), or stop it and run `nestweaver daemon --db {} start`",
+            "daemon PID {} is supervisor-managed, foreground, or has unknown lifecycle ownership; refusing to shut it down and replace it with a detached process. Restart it where it was started: stop and rerun a foreground `nestweaver daemon --db <db> run`, restart your own systemd unit (`systemctl --user restart <unit>`; NestWeaver ships none), or use launchd (`launchctl kickstart -k gui/$(id -u)/{}`). Alternatively stop it and run `nestweaver daemon --db {} start`",
             health.pid,
             nestweaver_daemon::lifecycle::launchd_label(&instance_id),
             db_path.display()
