@@ -2765,6 +2765,9 @@ impl GraphStore {
                 prefilter: None,
                 evaluated: None,
             };
+            // Any other collector stop (rows it could not decode) means the
+            // corpus was short: the counts are lower bounds and say so.
+            let mut corpus_stop: Option<RegexTruncationReason> = None;
             let (candidates, hydrated_candidates) = if deadline_hit {
                 (Vec::new(), 0)
             } else {
@@ -2788,6 +2791,7 @@ impl GraphStore {
                         )?;
                         deadline_hit |=
                             stops_on_deadline(fallback_stop) || stops_on_deadline(hydrated_stop);
+                        corpus_stop = stronger_truncation(fallback_stop, hydrated_stop);
                         let hydrated_candidates = hydrated.len();
                         candidates.extend(hydrated);
                         (candidates, hydrated_candidates)
@@ -2801,6 +2805,7 @@ impl GraphStore {
                             limits(),
                         )?;
                         deadline_hit |= stops_on_deadline(stop);
+                        corpus_stop = stop;
                         (candidates, 0)
                     }
                 }
@@ -2865,8 +2870,12 @@ impl GraphStore {
                     verification_ms,
                     total_ms: elapsed_millis(started),
                 },
-                truncated: deadline_hit,
-                truncation_reason: deadline_hit.then_some(RegexTruncationReason::Deadline),
+                truncated: deadline_hit || corpus_stop.is_some(),
+                truncation_reason: if deadline_hit {
+                    Some(RegexTruncationReason::Deadline)
+                } else {
+                    corpus_stop
+                },
             });
         }
         Ok(out)
@@ -2874,9 +2883,8 @@ impl GraphStore {
 }
 
 /// Whether a candidate collector stopped because the wall-clock budget ran
-/// out. `count_patterns` gathers without a candidate cap, so the only stop it
-/// can meet besides cancellation (an error) is the deadline; an undecodable
-/// row short-changes the corpus but is not a stop.
+/// out. `count_patterns` gathers without a candidate cap; any other stop it
+/// can meet (undecodable rows) is reported separately as a short corpus.
 fn stops_on_deadline(stop: Option<RegexTruncationReason>) -> bool {
     matches!(stop, Some(RegexTruncationReason::Deadline))
 }

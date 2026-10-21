@@ -10682,6 +10682,19 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
     let publication_in_flight =
         || !store.index_publication_lease_is_unowned() || store.is_index_publication_dirty();
     let publishing_at_start = bounded_delivery() && publication_in_flight();
+    // Read through only a LIVE publication. A marker no writer can finish (a
+    // crashed indexer) may sit over a partially written graph: that still
+    // fails closed, and `classify_index_publication_error` names the repair.
+    if publishing_at_start
+        && store.is_index_publication_dirty()
+        && store.db_path().is_some_and(|db_path| {
+            nestweaver_engine::index_publication::status(db_path).is_wedged()
+        })
+    {
+        return Err(anyhow!(
+            "note read overlaps index publication; retry after publication completes"
+        ));
+    }
     let include_body = args
         .get("include_body")
         .and_then(|v| v.as_bool())
@@ -28251,6 +28264,32 @@ mod cache_dispatch_tests {
             message.contains("not a dirty git working tree"),
             "the message must correct the wrong conclusion the reporter drew: {message}"
         );
+    }
+
+    /// note_get reads through a LIVE publication, but an ABANDONED marker (its
+    /// writer died, the graph may be partially written) still fails closed,
+    /// with the WEDGED remedy.
+    #[test]
+    fn note_get_still_fails_closed_on_an_abandoned_publication() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let dead = reaped_child_pid();
+        write_marker(&db_path, dead as u32, None);
+        let store = GraphStore::open(&db_path).unwrap();
+        assert!(store.is_index_publication_dirty());
+
+        let error = dispatch(
+            &store,
+            None,
+            "note_get",
+            json!({"uid": "note:any", "include_body": false}),
+            None,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("WEDGED"), "{message}");
+        assert!(message.contains("nestweaver repair"), "{message}");
     }
 
     #[test]

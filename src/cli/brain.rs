@@ -39,20 +39,6 @@ fn refuse_invalid_source_name(name: Option<&str>) -> Option<i32> {
     Some(EXIT_USAGE)
 }
 
-/// Without `--name`, `brain add` registers a new vault under the folder's own
-/// name, so that name is held to the `--name` rule. Refusing it here keeps a
-/// control character in a folder name a usage error rather than a refusal
-/// from inside the index. (A refresh keeps the stored name, so only `add`
-/// checks; the engine refuses an unstorable effective name on every route.)
-fn refuse_invalid_folder_name(folder_name: &str) -> Option<i32> {
-    let problem = nestweaver_schema::source_name_problem(folder_name)?;
-    eprintln!(
-        "Error: the folder name {folder_name:?} cannot be used as a vault name: {problem}. \
-         Pass --name to register it under another name."
-    );
-    Some(EXIT_USAGE)
-}
-
 pub(crate) fn run_brain(
     command: BrainCommands,
     out: &OutputConfig,
@@ -95,9 +81,6 @@ pub(crate) fn run_brain(
             } else {
                 String::new()
             };
-            if !name_given && let Some(code) = refuse_invalid_folder_name(&vault_name) {
-                return Ok((code, None));
-            }
 
             if !path.exists() {
                 eprintln!("Error: path does not exist: {}", path.display());

@@ -1453,7 +1453,14 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
             config.data_dir.display()
         );
     }
-    if config.replace && restore_target_occupied(&config.data_dir)? {
+    // A directory an earlier restore was interrupted on was already chosen as
+    // a restore target, and recovery has just put its previous contents
+    // back; replacing it is what that earlier --force asked for.
+    if config.replace
+        && !interrupted_restore
+        && recovery.preserved.is_none()
+        && restore_target_occupied(&config.data_dir)?
+    {
         refuse_replacing_foreign_directory(&config.data_dir)?;
     }
 
@@ -2392,10 +2399,15 @@ fn is_recognisable_data_dir(data_dir: &Path) -> anyhow::Result<bool> {
         let Some(name) = name.to_str() else {
             continue;
         };
-        let is_marker = name == crate::publication::PUBLICATION_MANIFEST_FILE
-            || name.ends_with(".lbug")
-            || name.ends_with(".kuzu");
-        if is_marker && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        // A database may be a symlink to the real file, and a legacy Kuzu
+        // database is a directory.
+        let is_marker = (name == crate::publication::PUBLICATION_MANIFEST_FILE && kind.is_file())
+            || (name.ends_with(".lbug") && (kind.is_file() || kind.is_symlink()))
+            || (name.ends_with(".kuzu") && (kind.is_file() || kind.is_dir() || kind.is_symlink()));
+        if is_marker {
             return Ok(true);
         }
     }
@@ -3542,6 +3554,9 @@ mod tests {
         let data_dir = dir.path().join("live");
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(data_dir.join("sentinel.txt"), b"keep").unwrap();
+        // A NestWeaver data directory: `--force` replaces only one of those
+        // (a directory with no database in it is refused even with --force).
+        drop(nestweaver_store::GraphStore::create(&data_dir.join("prior.lbug")).unwrap());
         let error = backup_restore(&RestoreConfig {
             snapshot_path: snapshot.clone(),
             data_dir: data_dir.clone(),
@@ -5171,6 +5186,9 @@ mod tests {
         let target = dir.path().join("existing");
         std::fs::create_dir(&target).unwrap();
         std::fs::write(target.join("sentinel"), "keep existing data").unwrap();
+        // A NestWeaver data directory, so the identity check (not the
+        // foreign-directory guard) is what refuses.
+        drop(nestweaver_store::GraphStore::create(&target.join("prior.lbug")).unwrap());
         let error = backup_restore(&RestoreConfig {
             snapshot_path: forged,
             data_dir: target.clone(),

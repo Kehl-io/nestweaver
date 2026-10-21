@@ -2216,7 +2216,8 @@ struct OutputConfig {
 
 impl OutputConfig {
     fn from_cli(cli: &Cli) -> Self {
-        let color = if cli.no_color || cli.plain || std::env::var("NO_COLOR").is_ok() {
+        let no_color_env = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+        let color = if cli.no_color || cli.plain || no_color_env {
             false
         } else {
             std::io::stderr().is_terminal()
@@ -17086,7 +17087,8 @@ fn stderr_tracing_ansi() -> bool {
     tracing_ansi_allowed(
         std::io::stderr().is_terminal(),
         CLI_NO_COLOR.load(std::sync::atomic::Ordering::Relaxed),
-        std::env::var_os("NO_COLOR").is_some(),
+        // no-color.org: "present and not an empty string".
+        std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
     )
 }
 

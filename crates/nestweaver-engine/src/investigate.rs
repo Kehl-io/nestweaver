@@ -706,18 +706,39 @@ fn update_bundle_store<T>(
         );
     }
     let mut store = load_bundle_store_checked(db_path)?;
+    let before: HashMap<String, Vec<u8>> = store
+        .bundles
+        .iter()
+        .map(|(id, bundle)| (id.clone(), serde_json::to_vec(bundle).unwrap_or_default()))
+        .collect();
     let out = f(&mut store)?;
     store.version = 1;
-    enforce_bundle_store_caps(&mut store);
+    // Bundles this update created or changed (an expand or hydrate of an OLD
+    // bundle) are what the caller is about to be told exist: never evict them.
+    let touched: std::collections::HashSet<String> = store
+        .bundles
+        .iter()
+        .filter(|(id, bundle)| {
+            before
+                .get(*id)
+                .is_none_or(|old| serde_json::to_vec(bundle).ok().as_ref() != Some(old))
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    enforce_bundle_store_caps(&mut store, &touched);
     save_bundle_store(db_path, &store)?;
     Ok(out)
 }
 
 /// Evict the oldest bundles until the store holds at most [`MAX_BUNDLES`] and
 /// serializes to at most [`MAX_BUNDLE_STORE_BYTES`]. Ties on `created_at`
-/// break by id, so eviction is deterministic. The newest bundle is never
-/// evicted: it is the one the caller was just handed.
-fn enforce_bundle_store_caps(store: &mut BundleStore) {
+/// break by id, so eviction is deterministic. The newest bundle and every id in
+/// `protected` (the bundles the current update created or changed) are never
+/// evicted: the caller was just handed them.
+fn enforce_bundle_store_caps(
+    store: &mut BundleStore,
+    protected: &std::collections::HashSet<String>,
+) {
     let mut by_age: Vec<(f64, String, usize)> = store
         .bundles
         .iter()
@@ -738,9 +759,13 @@ fn enforce_bundle_store_caps(store: &mut BundleStore) {
         .map(|(_, id, bytes)| bytes + id.len() + 8)
         .sum();
     let mut remaining = by_age.len();
+    let newest = by_age.last().map(|(_, id, _)| id.clone());
     for (_, id, bytes) in by_age {
         if remaining <= 1 || (remaining <= MAX_BUNDLES && total <= MAX_BUNDLE_STORE_BYTES) {
             break;
+        }
+        if protected.contains(&id) || newest.as_ref() == Some(&id) {
+            continue;
         }
         store.bundles.remove(&id);
         total = total.saturating_sub(bytes + id.len() + 8);
@@ -6088,7 +6113,7 @@ mod tests {
                 .bundles
                 .insert(id.clone(), sized_bundle(&id, now + index as f64, each));
         }
-        enforce_bundle_store_caps(&mut store);
+        enforce_bundle_store_caps(&mut store, &std::collections::HashSet::new());
         assert!(serde_json::to_vec(&store).unwrap().len() <= MAX_BUNDLE_STORE_BYTES);
         assert!(store.bundles.contains_key("big_5"));
         assert!(!store.bundles.contains_key("big_0"));
@@ -6099,8 +6124,44 @@ mod tests {
             "huge".to_string(),
             sized_bundle("huge", now, MAX_BUNDLE_STORE_BYTES + 1),
         );
-        enforce_bundle_store_caps(&mut single);
+        enforce_bundle_store_caps(&mut single, &std::collections::HashSet::new());
         assert!(single.bundles.contains_key("huge"));
+    }
+
+    /// Expanding or hydrating an OLD bundle grows it; the caps must evict
+    /// other bundles, never the one the caller is being answered about.
+    #[test]
+    fn bundle_store_caps_never_evict_the_bundle_being_updated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let now = now_epoch();
+        let mut store = BundleStore::default();
+        for index in 0..4 {
+            let id = format!("b{index}");
+            store
+                .bundles
+                .insert(id.clone(), sized_bundle(&id, now + index as f64, 8));
+        }
+        save_bundle_store(&db_path, &store).unwrap();
+        // The OLDEST bundle grows past the byte cap, as a large hydrate would.
+        update_bundle_store(&db_path, |store| {
+            store.bundles.get_mut("b0").unwrap().query = "q".repeat(MAX_BUNDLE_STORE_BYTES);
+            Ok(())
+        })
+        .unwrap();
+        let loaded = load_bundle_store(&db_path);
+        assert!(
+            loaded.bundles.contains_key("b0"),
+            "the updated bundle survives"
+        );
+        assert!(
+            loaded.bundles.contains_key("b3"),
+            "the newest bundle survives"
+        );
+        assert!(
+            !loaded.bundles.contains_key("b1"),
+            "older untouched bundles go"
+        );
     }
 
     #[test]

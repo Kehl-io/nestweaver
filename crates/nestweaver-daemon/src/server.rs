@@ -120,9 +120,15 @@ fn bound_status_details(details: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Transport backstop for [`bound_status`]: every gRPC response leaves through
-/// here, so a status built by any handler (not only the tool dispatch) cannot
-/// carry an oversized `grpc-message` / `grpc-status-details-bin` header.
+/// Transport backstop for [`bound_status`]: a status built by any handler (not
+/// only the tool dispatch) cannot carry an oversized `grpc-message` /
+/// `grpc-status-details-bin` HEADER.
+///
+/// Scope: this sees statuses sent as response headers — every unary failure
+/// and a stream that fails before its first message (trailers-only). A stream
+/// that fails mid-way sends its status in the body's trailers, which this
+/// layer does not rewrite; the streaming handlers build those statuses
+/// themselves and must keep them bounded.
 fn bound_grpc_response<B>(mut response: http::Response<B>) -> http::Response<B> {
     let headers = response.headers_mut();
     let header_len = |name: &http::HeaderName| headers.get(name).map_or(0, |value| value.len());
@@ -164,9 +170,8 @@ pub const WRITE_BUSY_CODE: &str = "write-busy";
 /// `set_extension` / `unset_extension` / `forget_interaction` wait for the
 /// write gate before answering "busy, retry". `0` refuses at once when busy.
 fn metadata_write_wait() -> Duration {
-    let secs = std::env::var("NESTWEAVER_METADATA_WRITE_WAIT_SECS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
+    // An unparsable value warns once, naming the variable, then falls back.
+    let secs = nestweaver_schema::env::env_parse::<u64>("NESTWEAVER_METADATA_WRITE_WAIT_SECS")
         .unwrap_or(DEFAULT_METADATA_WRITE_WAIT_SECS)
         .min(3600);
     Duration::from_secs(secs)
@@ -11140,25 +11145,38 @@ impl NestWeaverDaemon for DaemonService {
         // Errors are wrapped in the standard `tool <name> failed:` format (see
         // dispatch_err_to_status) so MCP clients don't mislabel tool argument
         // errors as gRPC transport failures.
-        self.run_metadata_mutation("set_extension", move || {
-            let args: serde_json::Value = serde_json::from_str(&req.args_json).map_err(|e| {
-                Status::invalid_argument(format!(
-                    "tool set_extension failed: invalid JSON in args_json: {e}"
-                ))
-            })?;
-            let uid = args.get("uid").and_then(|v| v.as_str()).ok_or_else(|| {
+        //
+        // Arguments are parsed and validated BEFORE the write gate: an invalid
+        // request must answer InvalidArgument at once, not "busy" after the
+        // bounded wait, and must not count as an active write in the drain.
+        let args: serde_json::Value = serde_json::from_str(&req.args_json).map_err(|e| {
+            Status::invalid_argument(format!(
+                "tool set_extension failed: invalid JSON in args_json: {e}"
+            ))
+        })?;
+        let uid = args
+            .get("uid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
                 Status::invalid_argument("tool set_extension failed: 'uid' must be a string")
-            })?;
-            let key = args.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
+            })?
+            .to_string();
+        let key = args
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
                 Status::invalid_argument("tool set_extension failed: 'key' must be a string")
-            })?;
-            let value = args.get("value").cloned().ok_or_else(|| {
-                Status::invalid_argument("tool set_extension failed: 'value' is required")
-            })?;
-            nestweaver_engine::extensions::validate_extension_write(uid, key, &value).map_err(
-                |problem| Status::invalid_argument(format!("tool set_extension failed: {problem}")),
-            )?;
+            })?
+            .to_string();
+        let value = args.get("value").cloned().ok_or_else(|| {
+            Status::invalid_argument("tool set_extension failed: 'value' is required")
+        })?;
+        nestweaver_engine::extensions::validate_extension_write(&uid, &key, &value).map_err(
+            |problem| Status::invalid_argument(format!("tool set_extension failed: {problem}")),
+        )?;
 
+        self.run_metadata_mutation("set_extension", move || {
+            let (uid, key) = (uid.as_str(), key.as_str());
             let mut store = nestweaver_engine::extensions::load_extensions(&db_path);
             nestweaver_engine::extensions::set_property_capped(&mut store, uid, key, value.clone())
                 .map_err(|problem| {
@@ -11204,26 +11222,34 @@ impl NestWeaverDaemon for DaemonService {
         let req = r.into_inner();
         let db_path = self.state.db_path.clone();
 
-        self.run_metadata_mutation("unset_extension", move || {
-            let args: serde_json::Value = serde_json::from_str(&req.args_json).map_err(|e| {
-                Status::invalid_argument(format!(
-                    "tool unset_extension failed: invalid JSON in args_json: {e}"
-                ))
-            })?;
-            let uid = args.get("uid").and_then(|v| v.as_str()).ok_or_else(|| {
+        // Validated before the write gate, like set_extension.
+        let args: serde_json::Value = serde_json::from_str(&req.args_json).map_err(|e| {
+            Status::invalid_argument(format!(
+                "tool unset_extension failed: invalid JSON in args_json: {e}"
+            ))
+        })?;
+        let uid = args
+            .get("uid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
                 Status::invalid_argument("tool unset_extension failed: 'uid' must be a string")
-            })?;
-            let key = args.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
+            })?
+            .to_string();
+        let key = args
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
                 Status::invalid_argument("tool unset_extension failed: 'key' must be a string")
-            })?;
-            // No UID length check here, on purpose: removing an oversized
-            // entry written before the limit existed must stay possible.
-            nestweaver_engine::extensions::refuse_reserved_extension_key(key).map_err(
-                |problem| {
-                    Status::invalid_argument(format!("tool unset_extension failed: {problem}"))
-                },
-            )?;
+            })?
+            .to_string();
+        // No UID length check here, on purpose: removing an oversized
+        // entry written before the limit existed must stay possible.
+        nestweaver_engine::extensions::refuse_reserved_extension_key(&key).map_err(|problem| {
+            Status::invalid_argument(format!("tool unset_extension failed: {problem}"))
+        })?;
 
+        self.run_metadata_mutation("unset_extension", move || {
+            let (uid, key) = (uid.as_str(), key.as_str());
             let removed = nestweaver_engine::remove_extension_key_durable(&db_path, uid, key)
                 .map_err(|e| Status::internal(format!("tool unset_extension failed: {e:#}")))?;
 
@@ -31125,6 +31151,36 @@ external_model = "unavailable-test-model"
             !ran.load(Ordering::Acquire),
             "a refused write must never run"
         );
+    }
+
+    /// An invalid metadata write is refused before the write gate: while an
+    /// index holds the gate it must answer InvalidArgument at once, not "busy"
+    /// after the bounded wait, and never count as an active write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_invalid_metadata_write_is_refused_without_waiting_for_the_gate() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+        let _held = state.write_gate.lock("index_repo").await;
+        let started = std::time::Instant::now();
+        let set = service
+            .set_extension(admin_json_request(serde_json::json!({
+                "uid": "vlt:default:x", "key": "last_indexed_at", "value": "x"
+            })))
+            .await
+            .unwrap_err();
+        assert_eq!(set.code(), tonic::Code::InvalidArgument, "{set:?}");
+        let unset = service
+            .unset_extension(admin_json_request(serde_json::json!({
+                "uid": "vlt:default:x", "key": "last_indexed_at"
+            })))
+            .await
+            .unwrap_err();
+        assert_eq!(unset.code(), tonic::Code::InvalidArgument, "{unset:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "validation must not wait for the gate"
+        );
+        assert_eq!(state.active_writes.load(Ordering::Relaxed), 0);
     }
 
     /// A client that gives up (cancel, disconnect, kill) while its write is

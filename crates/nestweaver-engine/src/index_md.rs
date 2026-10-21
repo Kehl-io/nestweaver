@@ -2774,7 +2774,6 @@ fn index_markdown_since_with_reader(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Refuse a vault name the store would reject, BEFORE the publication marker.
 ///
 /// The store refuses a control character in a vault name, but it does so
@@ -2796,6 +2795,7 @@ fn refuse_unstorable_vault_name(vault_name: &str, vault_root: &Path) -> anyhow::
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn index_markdown_since_with_reader_mode(
     store: &GraphStore,
     reader: &dyn ContentReader,

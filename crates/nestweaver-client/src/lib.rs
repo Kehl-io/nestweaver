@@ -1191,16 +1191,14 @@ impl DaemonClient {
         Self::connect_with_usage(db_path, config_path, autostart::DaemonUsage::LongRunning).await
     }
 
-    /// One attempt of [`Self::connect_with_usage`]'s first step: ensure a
-    /// daemon, connect, and run the bounded health check.
+    /// One retryable attempt of [`Self::connect_with_usage`]'s first step:
+    /// connect to the socket autostart reported, and run the bounded health
+    /// check.
+    #[allow(clippy::ptr_arg)]
     async fn connect_and_check_health(
-        db_path: &Path,
-        config_path: Option<&Path>,
-        usage: autostart::DaemonUsage,
-    ) -> Result<(PathBuf, Self, nestweaver_proto::HealthCheckResponse)> {
-        let sock_path =
-            autostart::ensure_daemon_for_client_async(db_path, config_path, usage).await?;
-        let mut client = Self::connect_to_socket(&sock_path).await?;
+        sock_path: &PathBuf,
+    ) -> Result<(Self, nestweaver_proto::HealthCheckResponse)> {
+        let mut client = Self::connect_to_socket(sock_path).await?;
         // Version check. Bounded so a connected-but-unresponsive daemon can't hang connect().
         let resp = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -1212,7 +1210,7 @@ impl DaemonClient {
         .context("health check timed out — daemon connected but unresponsive")?
         .context("health check failed")?
         .into_inner();
-        Ok((sock_path, client, resp))
+        Ok((client, resp))
     }
 
     async fn connect_with_usage(
@@ -1228,8 +1226,16 @@ impl DaemonClient {
         // a short bounded retry. Anything else fails at once.
         let mut attempt: u32 = 0;
         let (sock_path, mut client, resp) = loop {
-            match Self::connect_and_check_health(db_path, config_path, usage).await {
-                Ok(connected) => break connected,
+            // Ensuring (autostarting) the daemon is NOT retried: its failure
+            // is an answer, and the daemon's own startup error, now quoted in
+            // it, may well mention a refused connection. Only connecting to
+            // and health-checking a daemon it reported as up is retried; the
+            // next attempt re-ensures, so a daemon that finished exiting in
+            // between is started afresh.
+            let sock_path =
+                autostart::ensure_daemon_for_client_async(db_path, config_path, usage).await?;
+            match Self::connect_and_check_health(&sock_path).await {
+                Ok((client, resp)) => break (sock_path, client, resp),
                 Err(error)
                     if attempt < CONNECT_RETRY_ATTEMPTS && is_transient_connection_failure(&error) =>
                 {
@@ -3466,5 +3472,6 @@ mod transient_connection_tests {
         assert!(!is_transient_connection_failure(&answer));
         let mismatch = anyhow::anyhow!("explicit --config x does not match");
         assert!(!is_transient_connection_failure(&mismatch));
+
     }
 }
