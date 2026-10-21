@@ -436,19 +436,60 @@ pub(crate) fn build_import_graph_with_languages(
         .then(|| lang::kotlin::JvmPackageIndex::new(files, &language_of));
     // Python `from pkg import name` reads the attribute `name` of `pkg` first
     // and imports the submodule `pkg.name` only when no such attribute
-    // exists, so the top-level names of each module decide between the two.
+    // exists, so the module-level names of each module decide between the
+    // two: its module-level declarations, and the names its own module-level
+    // imports bind (`from .helpers import helpers` makes `pkg.helpers` the
+    // function, not the submodule).
     let python_top_level: HashMap<&str, HashSet<&str>> = files
         .iter()
         .filter(|(file_path, _, _)| language_of(file_path) == Language::Python)
-        .map(|(file_path, symbols, _)| {
-            (
-                file_path.as_str(),
-                symbols
+        .map(|(file_path, symbols, references)| {
+            let bodies: Vec<(u32, u32)> = symbols
+                .iter()
+                .filter(|symbol| {
+                    !symbol.is_module_owner()
+                        && matches!(
+                            symbol.kind,
+                            nestweaver_schema::SymbolKind::Function
+                                | nestweaver_schema::SymbolKind::Method
+                                | nestweaver_schema::SymbolKind::Class
+                        )
+                })
+                .map(|symbol| (symbol.start_line, symbol.end_line))
+                .collect();
+            // A nested `def` has no `parent_name` either; a span strictly
+            // inside another body is not module level.
+            let nested = |start: u32, end: u32| {
+                bodies.iter().any(|&(outer_start, outer_end)| {
+                    outer_start <= start
+                        && end <= outer_end
+                        && (outer_start, outer_end) != (start, end)
+                })
+            };
+            let inside_body = |line: u32| {
+                bodies
                     .iter()
-                    .filter(|symbol| symbol.parent_name.is_none() && !symbol.is_module_owner())
-                    .map(|symbol| symbol.name.as_str())
-                    .collect(),
-            )
+                    .any(|&(outer_start, outer_end)| outer_start <= line && line <= outer_end)
+            };
+            let mut names: HashSet<&str> = symbols
+                .iter()
+                .filter(|symbol| {
+                    symbol.parent_name.is_none()
+                        && !symbol.is_module_owner()
+                        && !nested(symbol.start_line, symbol.end_line)
+                })
+                .map(|symbol| symbol.name.as_str())
+                .collect();
+            names.extend(
+                references
+                    .iter()
+                    .filter(|reference| {
+                        reference.kind == ReferenceKind::ImportAlias
+                            && !inside_body(reference.start_line)
+                    })
+                    .map(|reference| reference.name.as_str()),
+            );
+            (file_path.as_str(), names)
         })
         .collect();
 
@@ -961,7 +1002,9 @@ pub fn resolved_import_path(
 /// single path [`resolved_import_path`] gives for any other language.
 ///
 /// A file added to a Go package is a new target of every importer of that
-/// package, which a single representative path cannot show.
+/// package, which a single representative path cannot show. Callers asking
+/// about many specifiers against one file set should hold one
+/// [`ImportTargets`] instead: this builds the Go package index per call.
 pub fn resolved_import_paths(
     from_file: &str,
     specifier: &str,
@@ -969,16 +1012,53 @@ pub fn resolved_import_paths(
     language: Language,
     workspace_ctx: &WorkspaceContext,
 ) -> Vec<String> {
-    if language == Language::Go {
-        return lang::go_lang::GoPackageIndex::new(known_files.iter().copied())
-            .package_files(specifier, &workspace_ctx.go_modules)
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+    ImportTargets::new(known_files).paths(from_file, specifier, language, workspace_ctx)
+}
+
+/// [`resolved_import_paths`] over one fixed file set, building the Go package
+/// index once (on first Go specifier) instead of once per specifier.
+pub struct ImportTargets<'a> {
+    known_files: &'a HashSet<&'a str>,
+    go_index: std::cell::OnceCell<lang::go_lang::GoPackageIndex<'a>>,
+}
+
+impl<'a> ImportTargets<'a> {
+    pub fn new(known_files: &'a HashSet<&'a str>) -> Self {
+        Self {
+            known_files,
+            go_index: std::cell::OnceCell::new(),
+        }
     }
-    resolve_specifier(from_file, specifier, known_files, language, workspace_ctx)
+
+    /// Every path `specifier` names from `from_file`; empty when none.
+    pub fn paths(
+        &self,
+        from_file: &str,
+        specifier: &str,
+        language: Language,
+        workspace_ctx: &WorkspaceContext,
+    ) -> Vec<String> {
+        if language == Language::Go {
+            return self
+                .go_index
+                .get_or_init(|| {
+                    lang::go_lang::GoPackageIndex::new(self.known_files.iter().copied())
+                })
+                .package_files(specifier, &workspace_ctx.go_modules)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        }
+        resolve_specifier(
+            from_file,
+            specifier,
+            self.known_files,
+            language,
+            workspace_ctx,
+        )
         .into_iter()
         .collect()
+    }
 }
 
 fn resolve_specifier(

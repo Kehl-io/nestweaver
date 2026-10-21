@@ -254,6 +254,27 @@ fn python_package_attribute_wins_over_submodule() {
     );
 }
 
+/// Counterweight: a package that re-binds a submodule's name by import
+/// (`from .helpers import helpers` in `__init__.py`) exposes that binding,
+/// not the submodule, so the client's `helpers()` is the function.
+#[test]
+fn python_package_import_binding_wins_over_submodule() {
+    let init = "from .helpers import helpers\n";
+    let helpers = "def helpers():\n    return 1\n";
+    let user = "from pkg import helpers\n\n\ndef run():\n    return helpers()\n";
+    let inputs = [
+        ("pkg/__init__.py", init),
+        ("pkg/helpers.py", helpers),
+        ("app/user.py", user),
+    ];
+    let (files, edges) = resolve(&inputs, Language::Python, &WorkspaceContext::default());
+    let calls = calls(&files, &edges);
+    assert!(
+        calls.contains("app/user.py::run -> pkg/helpers.py::helpers"),
+        "{calls:#?}"
+    );
+}
+
 /// QA kt1: Kotlin imports name declarations of a package, not files. Here no
 /// file is named after any imported symbol.
 #[test]

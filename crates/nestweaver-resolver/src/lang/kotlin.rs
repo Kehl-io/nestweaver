@@ -46,9 +46,11 @@ pub struct JvmPackageIndex<'a> {
     /// Declared package → files declaring it.
     declared: HashMap<&'a str, Vec<&'a str>>,
     /// Files whose package clause is not known (an unchanged file in an
-    /// incremental pass carries no references). Their package is inferred
-    /// from the conventional directory layout.
-    undeclared: Vec<&'a str>,
+    /// incremental pass carries no references), as `(directory, file)` keyed
+    /// by the directory's last segment. Their package is inferred from the
+    /// conventional directory layout; the key keeps that lookup from scanning
+    /// every such file per import.
+    undeclared: HashMap<&'a str, Vec<(&'a str, &'a str)>>,
     /// File → its top-level declaration names.
     top_level: HashMap<&'a str, HashSet<&'a str>>,
 }
@@ -59,7 +61,7 @@ impl<'a> JvmPackageIndex<'a> {
         language_of: &dyn Fn(&str) -> Language,
     ) -> Self {
         let mut declared: HashMap<&'a str, Vec<&'a str>> = HashMap::new();
-        let mut undeclared = Vec::new();
+        let mut undeclared: HashMap<&'a str, Vec<(&'a str, &'a str)>> = HashMap::new();
         let mut top_level = HashMap::new();
         for (file, symbols, references) in files {
             if !matches!(language_of(file), Language::Kotlin | Language::Java) {
@@ -73,7 +75,14 @@ impl<'a> JvmPackageIndex<'a> {
                     .entry(package.name.as_str())
                     .or_default()
                     .push(file.as_str()),
-                _ => undeclared.push(file.as_str()),
+                _ => {
+                    let dir = parent_dir(file);
+                    let last = dir.rsplit('/').next().unwrap_or(dir);
+                    undeclared
+                        .entry(last)
+                        .or_default()
+                        .push((dir, file.as_str()));
+                }
             }
             top_level.insert(
                 file.as_str(),
@@ -89,7 +98,6 @@ impl<'a> JvmPackageIndex<'a> {
         for files in declared.values_mut() {
             files.sort_unstable();
         }
-        undeclared.sort_unstable();
         Self {
             declared,
             undeclared,
@@ -101,12 +109,17 @@ impl<'a> JvmPackageIndex<'a> {
     /// directory spells it (`com/acme/a` for `com.acme.a`).
     fn package_files(&self, package: &str) -> Vec<&'a str> {
         let mut files = self.declared.get(package).cloned().unwrap_or_default();
-        let dir = package.replace('.', "/");
-        let suffix = format!("/{dir}");
-        files.extend(self.undeclared.iter().copied().filter(|file| {
-            let parent = parent_dir(file);
-            parent == dir || parent.ends_with(&suffix)
-        }));
+        let last = package.rsplit('.').next().unwrap_or(package);
+        if let Some(candidates) = self.undeclared.get(last) {
+            let dir = package.replace('.', "/");
+            let suffix = format!("/{dir}");
+            files.extend(
+                candidates
+                    .iter()
+                    .filter(|(parent, _)| *parent == dir || parent.ends_with(&suffix))
+                    .map(|(_, file)| *file),
+            );
+        }
         files.sort_unstable();
         files
     }

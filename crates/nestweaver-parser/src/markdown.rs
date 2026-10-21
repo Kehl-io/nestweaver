@@ -1526,13 +1526,20 @@ fn is_adr_heading(heading_text: &str) -> bool {
 ///
 /// Returns `(1-based line number, block_id)` pairs. Block IDs must consist
 /// entirely of alphanumerics and hyphens. The ` ^` prefix (space + caret) is
-/// required so the ID is not confused with normal caret usage.
+/// required so the ID is not confused with normal caret usage, except on a
+/// line holding nothing but the ID: Obsidian puts the ID of a list, table or
+/// quote on its own line after the block.
 fn extract_block_refs(text: &str) -> Vec<(u32, String)> {
     let mut refs = Vec::new();
     for (line_num, line) in text.lines().enumerate() {
         let trimmed = line.trim_end();
-        if let Some(pos) = trimmed.rfind(" ^") {
-            let block_id = &trimmed[pos + 2..];
+        let own_line = trimmed.trim_start().strip_prefix('^');
+        if let Some(pos) = trimmed
+            .rfind(" ^")
+            .map(|pos| pos + 2)
+            .or_else(|| own_line.map(|id| trimmed.len() - id.len()))
+        {
+            let block_id = &trimmed[pos..];
             if !block_id.is_empty() && block_id.chars().all(|c| c.is_alphanumeric() || c == '-') {
                 refs.push(((line_num + 1) as u32, block_id.to_string()));
             }
@@ -2442,6 +2449,14 @@ top 2 body
         let ids: Vec<&str> = note.block_refs.iter().map(|(_, id)| id.as_str()).collect();
         assert!(!ids.contains(&"bad ref"));
         assert!(ids.contains(&"good-ref"));
+    }
+
+    #[test]
+    fn block_ref_on_its_own_line_is_extracted() {
+        let src = "# n\n\n- one\n- two\n\n^list-id\n\nx^not-an-id\n";
+        let note = parse_markdown("x.md", src).unwrap();
+        let ids: Vec<&str> = note.block_refs.iter().map(|(_, id)| id.as_str()).collect();
+        assert_eq!(ids, vec!["list-id"]);
     }
 
     #[test]

@@ -173,6 +173,12 @@ pub fn broken_links(store: &GraphStore, max_suggestions: usize) -> Result<Vec<Br
         // advice read "fix this broken link by linking to itself" (nw-100).
         let (suggestions, suggested_total) =
             suggest_targets(&r.wikilink_text, &notes, max_suggestions, &r.source_uid);
+        // Computed before the literal moves `wikilink_text` out of `r`.
+        let anchor = if r.current_target_uid.is_empty() {
+            missing_anchor(&r.wikilink_text, &notes)
+        } else {
+            None
+        };
         out.push(BrokenLink {
             source_uid: r.source_uid,
             source_path: r.source_path,
@@ -180,11 +186,7 @@ pub fn broken_links(store: &GraphStore, max_suggestions: usize) -> Result<Vec<Br
             confidence: r.confidence,
             suggested_target_uids: suggestions,
             suggested_total,
-            missing_anchor: if r.current_target_uid.is_empty() {
-                missing_anchor(&r.wikilink_text, &notes)
-            } else {
-                None
-            },
+            missing_anchor: anchor,
             resolved_target_uid: if r.current_target_uid.is_empty() {
                 None
             } else {

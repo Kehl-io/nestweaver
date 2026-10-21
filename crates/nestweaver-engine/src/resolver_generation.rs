@@ -338,10 +338,23 @@ use std::path::Path;
 ///     re-exports under an alias reaches its definition. Kotlin/Java imports
 ///     resolve through the declared package (any file of it, wildcard
 ///     imports, nested classes) instead of a file named after the symbol.
-///     A graph indexed before this is missing those CALLS/IMPORTS edges, so
-///     `dead-code`, `blast-radius` and the rankings report live code as
-///     unreachable; parsed cache 8 carries the parser facts. Re-index:
-///     `nestweaver index --repo <path> --force`.
+///     Folded into the same bump (call resolution, same release): a method
+///     called on a call or `new` receiver (`new K().m()`, `K.make().m()`,
+///     `New(1).Add()`) resolves through the declared return type, and a
+///     method on an expression no evidence types links only when its name is
+///     unique in the repository; Rust trait default methods and turbofish
+///     calls resolve; `new Foo()` links the class in Java, C#, PHP, C++,
+///     Scala, Groovy and Dart, and a bare TS/JS `@decorator` references its
+///     function; Go methods carry their receiver type as `parent_name`
+///     (MEMBER_OF edges, typed Go method calls), and every Go build-variant
+///     duplicate is a callee; duplicate JS/TS `this.x =` properties collapse
+///     to one symbol; a bodiless Rust `mod x;` no longer owns the
+///     module-level lines below it (removing wrong IMPORTS edges); and a
+///     one-line declaration's body no longer leaks into its return type.
+///     A graph indexed before this is missing those edges (or keeps the
+///     wrong ones), so `dead-code`, `blast-radius` and the rankings report
+///     live code as unreachable; parsed cache 8 carries the parser facts.
+///     Re-index: `nestweaver index --repo <path> --force`.
 pub const RESOLVER_GENERATION: u32 = 12;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
