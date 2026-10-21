@@ -2486,6 +2486,37 @@ fn disclose_semantic_degradation(value: &mut serde_json::Value, embedding_state:
     }
 }
 
+/// A marker left by an embedding pass that died (see
+/// `nestweaver_engine::embed_pass_marker`): `embedding_status.interrupted_pass`
+/// carries the coverage, and a warning says the vectors are incomplete. The
+/// model is still usable, so this is not a `degraded_components` entry.
+fn disclose_interrupted_embed_pass(value: &mut serde_json::Value, db_path: &Path) {
+    let pass_active = value["embedding_status"]["pass_active"]
+        .as_bool()
+        .unwrap_or(false);
+    let index_live = value["embedding_status"]["index_live"]
+        .as_u64()
+        .unwrap_or(0);
+    let Some(interrupted) =
+        nestweaver_engine::embed_pass_marker::interrupted_pass_json(db_path, pass_active, index_live)
+    else {
+        value["embedding_status"]["interrupted_pass"] = serde_json::Value::Null;
+        return;
+    };
+    let message = serde_json::json!({
+        "kind": "embedding_pass_interrupted",
+        "warning": interrupted["message"].clone(),
+    });
+    value["embedding_status"]["interrupted_pass"] = interrupted;
+    match value
+        .get_mut("warnings")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(warnings) => warnings.push(message),
+        None => value["warnings"] = serde_json::json!([message]),
+    }
+}
+
 fn embedding_status_json(
     status: &EmbeddingRuntimeStatus,
     progress: &EmbedProgressSnapshot,
@@ -10738,6 +10769,7 @@ impl NestWeaverDaemon for DaemonService {
                 .unwrap_or_default()
                 .to_string();
             disclose_semantic_degradation(&mut value, &embedding_state);
+            disclose_interrupted_embed_pass(&mut value, &self.state.db_path);
             value["search_status"] = search_status_json(&search_capability_status(&self.state));
             // Daemon-side witness counter in the `cache` block (the
             // `hit_rate_pct` session-counter precedent): an adopted client
@@ -12245,6 +12277,7 @@ impl NestWeaverDaemon for DaemonService {
             let store = self.state.store.clone();
             let progress = Arc::clone(&self.state.embed_progress);
             let progress_scope = scope.clone();
+            let marker_db_path = self.state.db_path.clone();
 
             self.run_unary_mutation("embed", move || {
                 let discarded_embeddings = if repair_identity {
@@ -12301,6 +12334,24 @@ impl NestWeaverDaemon for DaemonService {
                 // pass measured in hours.
                 let plan = plan_embeddings(&store, &progress_scope, force)?;
                 progress.set_total(plan.eligible);
+                // Vectors since the last checkpoint die with the process. The
+                // marker outlives such a death so `brain status` can say the
+                // pass is incomplete; any exit this process survives drops it.
+                let _pass_marker = (plan.eligible > 0).then(|| {
+                    nestweaver_engine::embed_pass_marker::begin(
+                        &marker_db_path,
+                        &nestweaver_engine::embed_pass_marker::EmbedPassRecord {
+                            scope: progress_scope.clone(),
+                            started_at: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|elapsed| elapsed.as_secs())
+                                .unwrap_or(0),
+                            planned: plan.eligible,
+                            already_embedded: plan.skipped,
+                            pid: std::process::id(),
+                        },
+                    )
+                });
                 tracing::info!(
                     scope = %progress_scope,
                     force,

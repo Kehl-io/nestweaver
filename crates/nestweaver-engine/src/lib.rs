@@ -568,6 +568,7 @@ pub mod dead_code;
 pub mod did_you_mean;
 pub mod diff_impact;
 pub mod drain;
+pub mod embed_pass_marker;
 pub mod embedding;
 pub mod eval;
 pub mod export;

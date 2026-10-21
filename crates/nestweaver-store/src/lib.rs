@@ -73,7 +73,7 @@ pub use traverse::{
     ImpactSnapshot, SymbolNameTable, symbol_table_fetches_on_this_thread,
 };
 pub use write::{
-    CONTRACT_DERIVATION_FAILED_PREFIX, DeleteProjectCascadeError, DeleteProjectCascadeOutcome,
+    CONTRACT_DERIVATION_FAILED_PREFIX, REPO_PUBLICATION_INCOMPLETE_PREFIX, DeleteProjectCascadeError, DeleteProjectCascadeOutcome,
     DeleteRepoCascadeOutcome, DeleteVaultCascadeOutcome, DiscardedVault, InstanceProjectRecovery,
     InstanceRepoRecovery, InstanceUidHandoff, InstanceUidHandoffIdentity, InstanceUidMigrationPlan,
     InstanceUidRemap, InstanceUidRemapPlanState, InstanceVaultRecovery, MergeResult,
