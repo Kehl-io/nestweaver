@@ -2629,9 +2629,10 @@ fn is_already_exists(error: &std::io::Error) -> bool {
 /// made it follows, so a later restore can tell a dead run's leftover from a
 /// live one's.
 fn restore_staging_prefix(data_dir: &Path) -> String {
-    let name = data_dir
-        .file_name()
-        .map_or_else(|| "data".to_string(), |name| name.to_string_lossy().into_owned());
+    let name = data_dir.file_name().map_or_else(
+        || "data".to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
     format!(".{name}.restore-staging.")
 }
 
@@ -2676,8 +2677,12 @@ fn sweep_dead_pid_leftovers(dir: &Path, prefix: &str, directories: bool) {
             continue;
         };
         match removed {
-            Ok(()) => tracing::info!(path = %path.display(), pid, "removed leftover of a dead backup/restore"),
-            Err(error) => tracing::warn!(path = %path.display(), %error, "could not remove leftover of a dead backup/restore"),
+            Ok(()) => {
+                tracing::info!(path = %path.display(), pid, "removed leftover of a dead backup/restore")
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "could not remove leftover of a dead backup/restore")
+            }
         }
     }
 }
@@ -5689,7 +5694,9 @@ mod destination_guard_tests {
         })
         .expect_err("a foreign directory must be refused even with --force");
         assert!(
-            error.to_string().contains("does not look like a NestWeaver data"),
+            error
+                .to_string()
+                .contains("does not look like a NestWeaver data"),
             "{error:#}"
         );
         assert_eq!(std::fs::read(foreign.join("notes.txt")).unwrap(), b"mine");
@@ -5746,7 +5753,10 @@ mod destination_guard_tests {
             replace: false,
         })
         .unwrap();
-        assert!(!dead_staging.exists(), "dead restore's staging dir is swept");
+        assert!(
+            !dead_staging.exists(),
+            "dead restore's staging dir is swept"
+        );
         assert!(live_staging.exists());
         assert!(data.join("brain.lbug").exists());
     }

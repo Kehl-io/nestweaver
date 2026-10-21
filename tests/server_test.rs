@@ -3152,7 +3152,10 @@ async fn server_backup_rpc_produces_snapshot() {
         .await
         .expect_err("a relative output_path must be refused");
     assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
-    assert!(refused.message().contains("must be absolute"), "{refused:?}");
+    assert!(
+        refused.message().contains("must be absolute"),
+        "{refused:?}"
+    );
 
     let out = dir.path().join("snap.nwsnap.zst");
     let mut req = tonic::Request::new(BackupRequest {

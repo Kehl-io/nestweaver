@@ -1326,7 +1326,11 @@ pub(crate) fn record_vault_index_interrupted(db_path: Option<&Path>, vault_root:
             .entry(path.clone())
             .or_default();
         owed.retain(|row| !row.reason.contains(VAULT_INDEX_INTERRUPTED_MARKER));
-        owed.push(SkippedFile::new(path.clone(), SkipReasonCode::Other, reason));
+        owed.push(SkippedFile::new(
+            path.clone(),
+            SkipReasonCode::Other,
+            reason,
+        ));
         owed.sort_by(|a, b| a.path.cmp(&b.path));
         Some(build_skipped_notes_sidecar(
             sidecar.skipped,
@@ -8207,7 +8211,10 @@ sub b body
         );
         let message = format!("{:#}", incremental.expect_err("--since route too"));
         assert!(message.contains("--name"), "{message}");
-        assert!(!marker.exists(), "a refused --since add must not leave {marker:?}");
+        assert!(
+            !marker.exists(),
+            "a refused --since add must not leave {marker:?}"
+        );
 
         // The next write is not wedged.
         let ok = index_markdown_directory_with_store(&store, &root, &db_path, "default", "v", &[])

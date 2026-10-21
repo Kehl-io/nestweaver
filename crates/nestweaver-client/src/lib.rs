@@ -846,7 +846,10 @@ fn daemon_startup_error(log: &Path, since: std::time::SystemTime) -> Option<Stri
         .map(str::trim)
         .find(|line| line.starts_with("Daemon error:") || line.starts_with("Error:"))?;
     let line = line
-        .replace(" The database may be checkpointing; please retry later.", "")
+        .replace(
+            " The database may be checkpointing; please retry later.",
+            "",
+        )
         .replace("The database may be checkpointing; please retry later.", "");
     let line = line.trim();
     (!line.is_empty()).then(|| line.chars().take(2000).collect())
@@ -1237,10 +1240,14 @@ impl DaemonClient {
             match Self::connect_and_check_health(&sock_path).await {
                 Ok((client, resp)) => break (sock_path, client, resp),
                 Err(error)
-                    if attempt < CONNECT_RETRY_ATTEMPTS && is_transient_connection_failure(&error) =>
+                    if attempt < CONNECT_RETRY_ATTEMPTS
+                        && is_transient_connection_failure(&error) =>
                 {
                     attempt += 1;
-                    debug!(attempt, "daemon connection failed transiently, retrying: {error:#}");
+                    debug!(
+                        attempt,
+                        "daemon connection failed transiently, retrying: {error:#}"
+                    );
                     tokio::time::sleep(std::time::Duration::from_millis(200 * u64::from(attempt)))
                         .await;
                 }
@@ -3441,7 +3448,10 @@ mod daemon_startup_error_tests {
         .unwrap();
         let since = std::time::SystemTime::now();
         let error = daemon_startup_error(&log, since).expect("the error line");
-        assert!(error.starts_with("Daemon error: failed to open database"), "{error}");
+        assert!(
+            error.starts_with("Daemon error: failed to open database"),
+            "{error}"
+        );
         assert!(!error.contains("checkpointing"), "{error}");
         assert!(!error.contains("old failure"), "{error}");
 
@@ -3472,6 +3482,5 @@ mod transient_connection_tests {
         assert!(!is_transient_connection_failure(&answer));
         let mismatch = anyhow::anyhow!("explicit --config x does not match");
         assert!(!is_transient_connection_failure(&mismatch));
-
     }
 }

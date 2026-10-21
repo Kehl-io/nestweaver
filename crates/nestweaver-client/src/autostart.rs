@@ -1137,11 +1137,10 @@ fn graph_footprint_bytes(db_path: &Path) -> u64 {
 /// out-of-range value falls back to the default rather than failing the
 /// command — this is a patience knob, not a correctness input.
 pub fn daemon_boot_timeout() -> Duration {
-    explicit_daemon_boot_timeout_secs()
-        .map_or_else(
-            || Duration::from_secs(DEFAULT_DAEMON_BOOT_TIMEOUT_SECS),
-            Duration::from_secs,
-        )
+    explicit_daemon_boot_timeout_secs().map_or_else(
+        || Duration::from_secs(DEFAULT_DAEMON_BOOT_TIMEOUT_SECS),
+        Duration::from_secs,
+    )
 }
 
 /// `NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS` when it is a number in 1..=600; any

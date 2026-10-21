@@ -9953,9 +9953,10 @@ fn importers_of_added_paths(
                 continue;
             };
             let names_added = specs.iter().any(|specifier| {
-                targets.paths(&importer, specifier, language, &workspace)
-                .into_iter()
-                .any(|target| target != importer && added.contains(&target))
+                targets
+                    .paths(&importer, specifier, language, &workspace)
+                    .into_iter()
+                    .any(|target| target != importer && added.contains(&target))
             });
             if names_added {
                 seeded.insert(importer);

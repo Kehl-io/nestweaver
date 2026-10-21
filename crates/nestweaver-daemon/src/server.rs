@@ -2502,9 +2502,11 @@ fn disclose_interrupted_embed_pass(value: &mut serde_json::Value, db_path: &Path
     let index_live = value["embedding_status"]["index_live"]
         .as_u64()
         .unwrap_or(0);
-    let Some(interrupted) =
-        nestweaver_engine::embed_pass_marker::interrupted_pass_json(db_path, pass_active, index_live)
-    else {
+    let Some(interrupted) = nestweaver_engine::embed_pass_marker::interrupted_pass_json(
+        db_path,
+        pass_active,
+        index_live,
+    ) else {
         value["embedding_status"]["interrupted_pass"] = serde_json::Value::Null;
         return;
     };
@@ -15442,7 +15444,10 @@ pub async fn run_server(
             // "may be checkpointing; please retry later".
             Err(nestweaver_store::StoreError::Corruption(corruption)) => {
                 let detail = format!("{}: {}", corruption.kind, corruption.detail)
-                    .replace(" The database may be checkpointing; please retry later.", "")
+                    .replace(
+                        " The database may be checkpointing; please retry later.",
+                        "",
+                    )
                     .replace("The database may be checkpointing; please retry later.", "");
                 anyhow::bail!(
                     "failed to open database at {}: it is damaged ({}). This is not \
@@ -25038,7 +25043,10 @@ repos = ["alpha"]
             .unwrap_or_else(|_| "/proc/self".into());
         assert!(is_unsafe_index_root(&self_proc), "{self_proc:?}");
         for ok in ["/home/user/proc", "/srv/sys/app", "/home/user/dev/proc"] {
-            assert!(!is_unsafe_index_root(Path::new(ok)), "{ok:?} must be allowed");
+            assert!(
+                !is_unsafe_index_root(Path::new(ok)),
+                "{ok:?} must be allowed"
+            );
         }
     }
 

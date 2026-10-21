@@ -6666,7 +6666,11 @@ mod daemon_status_renderer_tests {
             written,
             "  Note\\u001b]0;pwned\\u0007\\u001b[2J\\u001b[H\\u000dspoof\\u009b31m\\u007f  [note]\tok\n"
         );
-        assert!(!written.chars().any(|c| c.is_control() && c != '\n' && c != '\t'));
+        assert!(
+            !written
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+        );
         // The CLI's own colour labels survive; conceal and background
         // colours, which can hide text, do not.
         assert_eq!(

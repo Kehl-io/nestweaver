@@ -16690,7 +16690,11 @@ fn json_database_problems_write_an_envelope_on_stdout() {
     let scratch = tempfile::tempdir().unwrap();
     let not_a_db = scratch.path().join("text.lbug");
     std::fs::write(&not_a_db, "not a database at all").unwrap();
-    for db in [scratch.path().join("nope.lbug"), not_a_db, scratch.path().to_path_buf()] {
+    for db in [
+        scratch.path().join("nope.lbug"),
+        not_a_db,
+        scratch.path().to_path_buf(),
+    ] {
         let output = qa_isolated_cmd(scratch.path())
             .args(["search", "anything", "--json", "--db"])
             .arg(&db)
@@ -16698,8 +16702,12 @@ fn json_database_problems_write_an_envelope_on_stdout() {
             .unwrap();
         assert!(!output.status.success(), "{}", db.display());
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
-            .unwrap_or_else(|e| panic!("{}: stdout is not one JSON envelope ({e}): {stdout:?}", db.display()));
+        let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!(
+                "{}: stdout is not one JSON envelope ({e}): {stdout:?}",
+                db.display()
+            )
+        });
         assert_eq!(envelope["error"], "database unavailable", "{envelope}");
         assert!(envelope["message"].as_str().is_some_and(|m| !m.is_empty()));
     }
@@ -16740,5 +16748,8 @@ fn an_invalid_tuning_variable_is_named_in_a_plain_warning() {
         stderr.contains("NESTWEAVER_LBUG_MAX_DB_SIZE") && stderr.contains("lots"),
         "the ignored value must be named: {stderr}"
     );
-    assert!(!stderr.contains('\u{1b}'), "non-TTY stderr must carry no ANSI: {stderr:?}");
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "non-TTY stderr must carry no ANSI: {stderr:?}"
+    );
 }

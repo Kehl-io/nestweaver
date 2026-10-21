@@ -37937,7 +37937,10 @@ mod ambiguous_name_contract_tests {
         };
         let sub_linked = read_sub(&worktree.join("src")).unwrap();
         assert!(sub_linked.to_string().contains("return n"), "{sub_linked}");
-        assert!(read_sub(&worktree).is_err(), "above the indexed subdirectory");
+        assert!(
+            read_sub(&worktree).is_err(),
+            "above the indexed subdirectory"
+        );
     }
 
     /// 12.1.1 (M1): a `read_symbols` target whose qualifier names no file
