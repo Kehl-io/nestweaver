@@ -118,6 +118,7 @@ fn configure_tool(name: &str, ctx: &SetupCtx, items: &mut Items) -> Result<(), a
         "windsurf" => setup_windsurf(ctx, items),
         "copilot" => setup_copilot(ctx, items),
         "aider" => setup_aider(ctx, items),
+        "cline" => setup_cline(ctx, items),
         other => {
             let Some(target) = json_registration(other, ctx.base)? else {
                 anyhow::bail!("unknown tool '{other}'");
@@ -137,7 +138,7 @@ struct JsonRegistration {
     /// The row label printed for this file.
     label: String,
     /// `mcpServers` for almost every host; VS Code's `.vscode/mcp.json` uses
-    /// `servers`.
+    /// `servers`, OpenCode's `opencode.json` uses `mcp`.
     servers_key: &'static str,
 }
 
@@ -152,13 +153,16 @@ fn json_registration(name: &str, base: &Path) -> Result<Option<JsonRegistration>
         // read by any Copilot surface.
         "vscode" | "copilot" => (".vscode/mcp.json", "servers"),
         "gemini" => (".gemini/settings.json", "mcpServers"),
-        "kiro" => (".kiro/settings.json", "mcpServers"),
+        // Kiro's workspace MCP file; `.kiro/settings.json` is not read for MCP.
+        "kiro" => (".kiro/settings/mcp.json", "mcpServers"),
         // Continue reads standalone server files from `.continue/mcpServers/`
         // and accepts the Claude/Cursor JSON shape there. `.continue/config.json`
         // is its deprecated main config, not an MCP file.
         "continue" => (".continue/mcpServers/nestweaver.json", "mcpServers"),
-        "cline" => (".cline/settings.json", "mcpServers"),
-        "opencode" => (".opencode/config.json", "mcpServers"),
+        // OpenCode reads `opencode.json` at the project root, servers under
+        // `mcp`, each `{"type": "local", "command": [argv...]}`. `.opencode/`
+        // holds agents, commands and plugins only.
+        "opencode" => ("opencode.json", "mcp"),
         "trae" => (".trae/config.json", "mcpServers"),
         "devin" => ("devin.json", "mcpServers"),
         "hermes" => (".hermes/config.json", "mcpServers"),
@@ -181,7 +185,9 @@ fn json_registration(name: &str, base: &Path) -> Result<Option<JsonRegistration>
 }
 
 fn probe_configured_tool(name: &str, base: &Path) {
-    if name != "aider" {
+    // Aider has no MCP client and Cline has no project-level file: setup
+    // writes no registration for either, so there is nothing to probe.
+    if name != "aider" && name != "cline" {
         match configured_mcp_entry(name, base) {
             Ok(entry) => crate::setup_probe::report(&entry, base),
             Err(error) => eprintln!(
@@ -207,12 +213,30 @@ fn configured_mcp_entry(name: &str, base: &Path) -> anyhow::Result<serde_json::V
     let target = json_registration(name, base)?
         .ok_or_else(|| anyhow::anyhow!("tool does not have a generated MCP registration"))?;
     let config = user_config::read_json_config(&target.path, SETUP_COMMAND)?;
-    config
+    let entry = config
         .value
         .get(target.servers_key)
         .and_then(|servers| servers.get("nestweaver"))
         .cloned()
-        .context("NestWeaver registration missing")
+        .context("NestWeaver registration missing")?;
+    Ok(normalize_registration(entry))
+}
+
+/// Present an OpenCode-shaped entry (`command` is the whole argv,
+/// `environment` the env) in the `command`/`args`/`env` shape the server probe
+/// reads. Every other entry is returned unchanged.
+fn normalize_registration(entry: serde_json::Value) -> serde_json::Value {
+    let Some(argv) = entry.get("command").and_then(|c| c.as_array()) else {
+        return entry;
+    };
+    let Some((program, args)) = argv.split_first() else {
+        return entry;
+    };
+    let mut normalized = serde_json::json!({ "command": program, "args": args });
+    if let Some(environment) = entry.get("environment") {
+        normalized["env"] = environment.clone();
+    }
+    normalized
 }
 
 /// Human hint for why a tool counts as "not detected".
@@ -230,7 +254,7 @@ fn detection_hint(name: &str) -> &'static str {
         "kiro" => "no .kiro/ directory and no `kiro` on PATH",
         "continue" => "no .continue/ directory",
         "cline" => "no .cline/ directory",
-        "opencode" => "no .opencode/ directory and no `opencode` on PATH",
+        "opencode" => "no opencode.json, no .opencode/ directory and no `opencode` on PATH",
         "trae" => "no .trae/ directory",
         "devin" => "no devin.json and no `devin` on PATH",
         "hermes" => "no .hermes/ directory and no `hermes` on PATH",
@@ -401,7 +425,9 @@ fn detect_tools(base: &Path) -> Vec<ToolSetup> {
         },
         ToolSetup {
             name: "opencode",
-            detected: base.join(".opencode").exists() || which_exists("opencode"),
+            detected: base.join("opencode.json").exists()
+                || base.join(".opencode").exists()
+                || which_exists("opencode"),
         },
         ToolSetup {
             name: "trae",
@@ -557,12 +583,21 @@ fn register_json(
         mcp_args(&db_str, ctx.base)?
     };
     let mut entry = serde_json::Map::new();
-    if target.servers_key == "servers" {
-        // VS Code's schema names the transport explicitly.
-        entry.insert("type".to_string(), serde_json::json!("stdio"));
+    if target.servers_key == "mcp" {
+        // OpenCode: one `command` array holding the whole argv.
+        let mut argv = vec![serde_json::json!("nestweaver")];
+        argv.extend(args.as_array().cloned().unwrap_or_default());
+        entry.insert("type".to_string(), serde_json::json!("local"));
+        entry.insert("command".to_string(), serde_json::Value::Array(argv));
+        entry.insert("enabled".to_string(), serde_json::json!(true));
+    } else {
+        if target.servers_key == "servers" {
+            // VS Code's schema names the transport explicitly.
+            entry.insert("type".to_string(), serde_json::json!("stdio"));
+        }
+        entry.insert("command".to_string(), serde_json::json!("nestweaver"));
+        entry.insert("args".to_string(), args);
     }
-    entry.insert("command".to_string(), serde_json::json!("nestweaver"));
-    entry.insert("args".to_string(), args);
     let outcome = merge_json_mcp(
         &target.path,
         target.servers_key,
@@ -578,8 +613,8 @@ fn register_json(
 fn setup_claude_code(ctx: &SetupCtx, items: &mut Items) -> Result<(), anyhow::Error> {
     let base = ctx.base;
     std::fs::create_dir_all(base.join(".claude"))?;
-    let target = json_registration("claude-code", base)?
-        .context("claude-code has a JSON registration")?;
+    let target =
+        json_registration("claude-code", base)?.context("claude-code has a JSON registration")?;
     let outcome = register_json(ctx, items, &target, false, "MCP server configured")?;
 
     std::fs::create_dir_all(base.join(".claude/skills/nestweaver"))?;
@@ -600,7 +635,10 @@ fn setup_claude_code(ctx: &SetupCtx, items: &mut Items) -> Result<(), anyhow::Er
     // (no --force) and the hooks cannot disagree.
     let hooks_db = outcome.effective_db(&ctx.db_str());
     let hooks_status = install_claude_hooks(&hooks_db, base)?;
-    items.push((".claude/settings.json".to_string(), hooks_status.to_string()));
+    items.push((
+        ".claude/settings.json".to_string(),
+        hooks_status.to_string(),
+    ));
     Ok(())
 }
 
@@ -863,8 +901,8 @@ fn setup_codex(ctx: &SetupCtx, items: &mut Items) -> Result<(), anyhow::Error> {
 }
 
 fn setup_windsurf(ctx: &SetupCtx, items: &mut Items) -> Result<(), anyhow::Error> {
-    let target = json_registration("windsurf", ctx.base)?
-        .context("windsurf has a JSON registration")?;
+    let target =
+        json_registration("windsurf", ctx.base)?.context("windsurf has a JSON registration")?;
     if let Some(parent) = target.path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -943,9 +981,37 @@ fn setup_aider(ctx: &SetupCtx, items: &mut Items) -> Result<(), anyhow::Error> {
             "removed the invalid `repo-map:` line an older NestWeaver wrote; Aider has \
              no MCP client, so nothing is registered"
         }
-        _ => "nothing written: Aider has no MCP client. Use the `nestweaver` CLI from Aider's shell",
+        _ => {
+            "nothing written: Aider has no MCP client. Use the `nestweaver` CLI from Aider's shell"
+        }
     };
     items.push((".aider.conf.yml".to_string(), status.to_string()));
+    Ok(())
+}
+
+/// Cline keeps MCP servers in ONE user-level file
+/// (`cline_mcp_settings.json`, inside the editor's extension storage, or
+/// `~/.cline/data/settings/` for the CLI) and reads no project-level file.
+/// `.cline/settings.json`, which setup used to write, is never read. Rather
+/// than edit a global file shared by every project, print the entry to add
+/// through Cline's "Configure MCP Servers" panel.
+fn setup_cline(ctx: &SetupCtx, items: &mut Items) -> Result<(), anyhow::Error> {
+    let snippet = serde_json::json!({
+        "mcpServers": {
+            "nestweaver": {
+                "command": "nestweaver",
+                "args": mcp_args(&ctx.db_str(), ctx.base)?,
+            }
+        }
+    });
+    items.push((
+        "cline_mcp_settings.json".to_string(),
+        format!(
+            "nothing written: Cline has no project-level MCP file. Open Cline's MCP \
+             Servers > Configure > Configure MCP Servers and add:\n{}",
+            serde_json::to_string_pretty(&snippet)?
+        ),
+    ));
     Ok(())
 }
 
@@ -1076,9 +1142,7 @@ fn merge_json_mcp(
 ) -> Result<Registration, anyhow::Error> {
     // The canonical argv is already in `config`; read the desired `--db` and
     // `--config` out of it rather than threading them through every caller.
-    let desired_args: Vec<Option<&str>> = config
-        .get("args")
-        .and_then(|a| a.as_array())
+    let desired_args: Vec<Option<&str>> = entry_argv(config)
         .map(|args| args.iter().map(|a| a.as_str()).collect())
         .unwrap_or_default();
     let desired_db = flag_value(desired_args.iter().copied(), "--db");
@@ -1132,7 +1196,7 @@ fn merge_json_mcp(
             .get_mut(servers_key)
             .and_then(|s| s.as_object_mut())
             .and_then(|s| s.get_mut(server_name))
-            && let Some(args) = server_entry.get_mut("args").and_then(|a| a.as_array_mut())
+            && let Some(args) = entry_argv_mut(server_entry)
         {
             args.retain(|arg| {
                 let arg_str = arg.as_str().unwrap_or("");
@@ -1144,12 +1208,7 @@ fn merge_json_mcp(
             });
 
             let existing_db = flag_value(args.iter().map(|a| a.as_str()), "--db");
-            match decide_db(
-                existing_db.as_deref(),
-                desired_db.as_deref(),
-                force,
-                base,
-            ) {
+            match decide_db(existing_db.as_deref(), desired_db.as_deref(), force, base) {
                 DbAction::Keep => {}
                 DbAction::Elsewhere { existing } => {
                     outcome = Registration::PointsElsewhere {
@@ -1201,6 +1260,25 @@ fn merge_json_mcp(
     }
 
     Ok(outcome)
+}
+
+/// The argv array of a JSON registration: `args`, or — for OpenCode, whose
+/// entries carry the whole argv in `command` — the `command` array. A flag
+/// search over the full argv is unaffected by the leading program name.
+fn entry_argv(entry: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    entry
+        .get("args")
+        .and_then(|a| a.as_array())
+        .or_else(|| entry.get("command").and_then(|c| c.as_array()))
+}
+
+fn entry_argv_mut(entry: &mut serde_json::Value) -> Option<&mut Vec<serde_json::Value>> {
+    let key = if entry.get("args").is_some_and(|a| a.is_array()) {
+        "args"
+    } else {
+        "command"
+    };
+    entry.get_mut(key).and_then(|a| a.as_array_mut())
 }
 
 /// Set the value after `flag` in a JSON argv, appending the pair if absent.
@@ -1330,7 +1408,9 @@ fn merge_codex_mcp(
             .iter()
             .position(|value| value.as_str() == Some("--config"))
         {
-            let Some(current) = args.get(config_index + 1).and_then(toml_edit::Value::as_str)
+            let Some(current) = args
+                .get(config_index + 1)
+                .and_then(toml_edit::Value::as_str)
             else {
                 anyhow::bail!(
                     "[mcp_servers.nestweaver] in {} has --config without a path",
@@ -1988,7 +2068,15 @@ mod mcp_arg_source_of_truth_tests {
             "command": "nestweaver",
             "args": ["mcp", "--db", "/db", "--config", "/cfg/instance.toml"]
         });
-        merge_json_mcp(&path, "mcpServers", "nestweaver", &desired, false, dir.path()).unwrap();
+        merge_json_mcp(
+            &path,
+            "mcpServers",
+            "nestweaver",
+            &desired,
+            false,
+            dir.path(),
+        )
+        .unwrap();
 
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -2506,7 +2594,11 @@ mod integration_fix_tests {
         .to_string();
         let out = run_sh(&command, &quiet, None);
         assert!(out.status.success());
-        assert!(out.stdout.is_empty(), "{:?}", String::from_utf8_lossy(&out.stdout));
+        assert!(
+            out.stdout.is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
     }
 
     /// `--db "$Q/B/d;touch PWNED;x/db.lbug"` was interpolated unquoted into
@@ -2579,7 +2671,10 @@ mod integration_fix_tests {
         let after = settings(dir.path());
         let pre = after["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre.len(), 2, "{after}");
-        assert!(pre.iter().any(|g| g["hooks"][0]["command"] == "my-own-hook.sh"));
+        assert!(
+            pre.iter()
+                .any(|g| g["hooks"][0]["command"] == "my-own-hook.sh")
+        );
         let ours = hook_command(&after, "PreToolUse");
         assert!(ours.contains(".tool_input.command"), "{ours}");
         assert!(!ours.contains("'.command"), "{ours}");
@@ -2646,7 +2741,10 @@ mod integration_fix_tests {
         let undetected = run_setup_for_tools(Some("cursor"), &ctx, false, tools)
             .unwrap_err()
             .to_string();
-        assert!(undetected.contains("Cursor was not detected"), "{undetected}");
+        assert!(
+            undetected.contains("Cursor was not detected"),
+            "{undetected}"
+        );
         assert!(undetected.contains("--all"), "{undetected}");
         assert!(!undetected.contains("valid options"), "{undetected}");
     }
@@ -2674,12 +2772,19 @@ mod integration_fix_tests {
             r#"{"mcpServers":{"nestweaver":{"command":"nestweaver","args":["mcp","--lite","--db","/old.lbug"]}}}"#,
         )
         .unwrap();
-        let desired = serde_json::json!({"command": "nestweaver", "args": ["mcp", "--db", "/new.lbug"]});
+        let desired =
+            serde_json::json!({"command": "nestweaver", "args": ["mcp", "--db", "/new.lbug"]});
         let before = std::fs::read_to_string(&path).unwrap();
 
-        let outcome =
-            merge_json_mcp(&path, "mcpServers", "nestweaver", &desired, false, dir.path())
-                .unwrap();
+        let outcome = merge_json_mcp(
+            &path,
+            "mcpServers",
+            "nestweaver",
+            &desired,
+            false,
+            dir.path(),
+        )
+        .unwrap();
         assert_eq!(
             outcome,
             Registration::PointsElsewhere {
@@ -2690,8 +2795,15 @@ mod integration_fix_tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         assert_eq!(outcome.effective_db("/new.lbug"), "/old.lbug");
 
-        let outcome =
-            merge_json_mcp(&path, "mcpServers", "nestweaver", &desired, true, dir.path()).unwrap();
+        let outcome = merge_json_mcp(
+            &path,
+            "mcpServers",
+            "nestweaver",
+            &desired,
+            true,
+            dir.path(),
+        )
+        .unwrap();
         assert_eq!(
             outcome,
             Registration::Rebound {
@@ -2719,8 +2831,15 @@ mod integration_fix_tests {
         let abs = dir.path().join("nestweaver.lbug").display().to_string();
         let desired = serde_json::json!({"command": "nestweaver", "args": ["mcp", "--db", abs]});
         assert_eq!(
-            merge_json_mcp(&path, "mcpServers", "nestweaver", &desired, false, dir.path())
-                .unwrap(),
+            merge_json_mcp(
+                &path,
+                "mcpServers",
+                "nestweaver",
+                &desired,
+                false,
+                dir.path()
+            )
+            .unwrap(),
             Registration::Unchanged
         );
     }
@@ -2731,8 +2850,7 @@ mod integration_fix_tests {
         let path = dir.path().join("config.toml");
         let original = "[mcp_servers.nestweaver]\ncommand = \"nestweaver\"\nargs = [\n    \"mcp\",\n    \"--db\",\n    \"/old.lbug\", # keep this comment\n]\n";
         std::fs::write(&path, original).unwrap();
-        let desired =
-            "\n[mcp_servers.nestweaver]\ncommand = \"nestweaver\"\nargs = [\"mcp\", \"--db\", \"/new.lbug\"]\n";
+        let desired = "\n[mcp_servers.nestweaver]\ncommand = \"nestweaver\"\nargs = [\"mcp\", \"--db\", \"/new.lbug\"]\n";
 
         assert!(matches!(
             merge_codex_mcp(&path, desired, false, dir.path()).unwrap(),
@@ -2803,6 +2921,53 @@ mod integration_fix_tests {
         for tool in ["vscode", "copilot", "continue"] {
             configured_mcp_entry(tool, tmp.path()).unwrap();
         }
+    }
+
+    /// Kiro reads `.kiro/settings/mcp.json`; OpenCode reads `opencode.json`
+    /// with servers under `mcp` and the argv in a `command` array; Cline has
+    /// no project-level file, so nothing is written for it.
+    #[test]
+    fn kiro_opencode_and_cline_follow_their_documented_formats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("t.lbug");
+        let ctx = test_ctx(&db, tmp.path());
+        for tool in ["kiro", "opencode"] {
+            configure_tool(tool, &ctx, &mut Items::new()).unwrap();
+        }
+        assert!(
+            args_of(
+                &tmp.path().join(".kiro/settings/mcp.json"),
+                "/mcpServers/nestweaver/args"
+            )
+            .contains(&"--db".to_string())
+        );
+        assert!(!tmp.path().join(".kiro/settings.json").exists());
+
+        let opencode: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join("opencode.json")).unwrap(),
+        )
+        .unwrap();
+        let entry = &opencode["mcp"]["nestweaver"];
+        assert_eq!(entry["type"], "local", "{opencode}");
+        assert_eq!(entry["command"][0], "nestweaver", "{opencode}");
+        assert_eq!(entry["command"][1], "mcp", "{opencode}");
+        assert!(entry.get("args").is_none(), "{opencode}");
+        assert!(!tmp.path().join(".opencode/config.json").exists());
+        // Read back in the probe's command/args shape.
+        let normalized = configured_mcp_entry("opencode", tmp.path()).unwrap();
+        assert_eq!(normalized["command"], "nestweaver");
+        assert_eq!(normalized["args"][0], "mcp");
+
+        // A re-run reconciles the same entry instead of adding another.
+        let mut items = Items::new();
+        configure_tool("opencode", &ctx, &mut items).unwrap();
+        assert_eq!(items[0].1, "already configured", "{items:?}");
+
+        let mut items = Items::new();
+        configure_tool("cline", &ctx, &mut items).unwrap();
+        assert!(!tmp.path().join(".cline").exists());
+        assert!(items[0].1.contains("Configure MCP Servers"), "{items:?}");
+        assert!(items[0].1.contains("\"nestweaver\""), "{items:?}");
     }
 
     /// `repo-map:` is not an Aider option. Setup no longer writes it and

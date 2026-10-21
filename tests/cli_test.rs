@@ -3753,6 +3753,10 @@ fn setup_does_not_overwrite_existing_skill_file() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
         .args(["setup", "--db", db_path.to_str().unwrap(), "--all"])
         .current_dir(dir.path())
+        // `--all` includes Windsurf, whose config is GLOBAL
+        // (~/.codeium/windsurf/mcp_config.json): keep it inside the tempdir so
+        // the test (and `--force`) never rebinds the developer's real entry.
+        .env("HOME", dir.path())
         .env("NESTWEAVER_NO_DAEMON", "1")
         .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
@@ -3791,6 +3795,10 @@ fn setup_force_overwrites_existing_skill_file() {
             "--force",
         ])
         .current_dir(dir.path())
+        // `--all` includes Windsurf, whose config is GLOBAL
+        // (~/.codeium/windsurf/mcp_config.json): keep it inside the tempdir so
+        // the test (and `--force`) never rebinds the developer's real entry.
+        .env("HOME", dir.path())
         .env("NESTWEAVER_NO_DAEMON", "1")
         .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
@@ -3817,6 +3825,10 @@ fn setup_does_not_overwrite_existing_cursor_rule() {
     std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
         .args(["setup", "--db", db_path.to_str().unwrap(), "--all"])
         .current_dir(dir.path())
+        // `--all` includes Windsurf, whose config is GLOBAL
+        // (~/.codeium/windsurf/mcp_config.json): keep it inside the tempdir so
+        // the test (and `--force`) never rebinds the developer's real entry.
+        .env("HOME", dir.path())
         .env("NESTWEAVER_NO_DAEMON", "1")
         .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
@@ -3853,6 +3865,10 @@ fn setup_strips_deprecated_args_from_existing_config() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
         .args(["setup", "--db", db_path.to_str().unwrap(), "--all"])
         .current_dir(dir.path())
+        // `--all` includes Windsurf, whose config is GLOBAL
+        // (~/.codeium/windsurf/mcp_config.json): keep it inside the tempdir so
+        // the test (and `--force`) never rebinds the developer's real entry.
+        .env("HOME", dir.path())
         .env("NESTWEAVER_NO_DAEMON", "1")
         .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
