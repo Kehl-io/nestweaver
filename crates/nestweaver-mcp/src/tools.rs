@@ -14784,10 +14784,13 @@ fn git_command_for_indexed_path(path: &Path) -> std::process::Command {
     command.env("LC_ALL", "C");
     // The indexed tree can author the git config the diff reads, and
     // `core.fsmonitor` names a program git would run. `-c` outranks any
-    // repository config.
+    // repository config. No inspection command fires hooks today; pinning
+    // `core.hooksPath` keeps a later index-writing command from doing so.
     command.args([
         "-c",
         "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
         "-c",
         "diff.ignoreSubmodules=all",
     ]);
