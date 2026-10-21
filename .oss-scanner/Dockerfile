@@ -49,10 +49,13 @@ ARG CARGO_BUILD_JOBS=8
 # Every crate the workspace depends on, for all targets.
 RUN cargo fetch --locked
 
-# The CLI as users build it (default features), installed on PATH, then the
-# workspace tests in the configuration Linux CI runs them. A step that fails
-# fails the build, and primary_contact gets the log.
-RUN cargo build --locked \
+# The workspace tests and the CLI they drive, with default features, then the
+# same tests in the configuration Linux CI runs them. Both passes resolve features
+# the same way (a plain `cargo build` leaves out dev-dependency features and would
+# compile about 200 crates a second time); ci-direct-tests only touches the root
+# crate. The first pass's binary, which has no CI-only feature, goes on PATH.
+# A step that fails fails the build, and primary_contact gets the log.
+RUN cargo test --locked --workspace --no-run \
     && install -m 0755 target/debug/nestweaver /usr/local/bin/nestweaver \
     && nestweaver --version \
     && cargo test --locked --workspace --features ci-direct-tests --no-run
