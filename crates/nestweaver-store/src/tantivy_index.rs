@@ -342,6 +342,10 @@ pub enum TantivyError {
     InvalidSchema(String),
     #[error("index was migrated to the current schema; reopen it before further use")]
     IndexReopenRequired,
+    /// QA #11: the query uses syntax this index cannot answer. A usage
+    /// error naming the construct, not an internal engine failure.
+    #[error("unsupported query: {0}")]
+    UnsupportedQuery(String),
 }
 
 impl From<tantivy::TantivyError> for TantivyError {
@@ -879,6 +883,7 @@ impl TantivyIndex {
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, TantivyError> {
         validate_presentation_limit(limit)?;
         self.ensure_reopen_not_required()?;
+        reject_field_exist_query(query)?;
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -904,6 +909,7 @@ impl TantivyIndex {
     ) -> Result<(Vec<SearchHit>, usize), TantivyError> {
         validate_presentation_limit(limit)?;
         self.ensure_reopen_not_required()?;
+        reject_field_exist_query(query)?;
         let Some(parsed) = self.parse_query(query) else {
             return Ok((Vec::new(), 0));
         };
@@ -968,6 +974,7 @@ impl TantivyIndex {
         if !self.counted_search_supported {
             return Err(TantivyError::CountedSearchRequiresReindex);
         }
+        reject_field_exist_query(query)?;
         let Some(parsed) = self.parse_query(query) else {
             return Ok(TantivySearchPage {
                 hits: Vec::new(),
@@ -2056,6 +2063,56 @@ fn bare_exist_query_panics(query: &str) -> bool {
     false
 }
 
+/// QA #11: `title:*` parses as Tantivy's field-EXISTS query, which needs a
+/// fast field; `title` and `body` are text fields, so the search failed at
+/// execution with an internal "Field title is not a fast field". Refuse the
+/// form up front as a usage error. Only a `*` that is a whole leaf after an
+/// unescaped `field:` is refused — `title:auth*`, a quoted `"title:*"` and
+/// `title: *[]` (handled by the bare-exist fallback) are untouched.
+fn reject_field_exist_query(query: &str) -> Result<(), TantivyError> {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (idx, c) in query.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '"' if !in_single => in_double = !in_double,
+            '\'' if !in_double => {
+                let mid_word = query[..idx]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|prev| prev.is_ascii_alphanumeric() || prev == '_');
+                if !mid_word || in_single {
+                    in_single = !in_single;
+                }
+            }
+            '*' if !in_single && !in_double => {
+                let next = query[idx + 1..].chars().next();
+                let whole_leaf = next.is_none_or(|ch| ch.is_whitespace() || ch == ')');
+                if whole_leaf && ends_with_unescaped_colon(query[..idx].trim_end()) {
+                    let field = query[..idx]
+                        .trim_end()
+                        .trim_end_matches(':')
+                        .rsplit(|ch: char| ch.is_whitespace() || ch == '(' || ch == '+' || ch == '-')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    return Err(TantivyError::UnsupportedQuery(format!(
+                        "`{field}:*` (field-exists) is not supported on text fields; \
+                         search for terms instead, e.g. `{field}:auth`"
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// `star_idx` points at a `*` outside quotes and ranges.
 fn star_starts_bare_exist(query: &str, star_idx: usize) -> bool {
     let Some(next) = query[star_idx + '*'.len_utf8()..].chars().next() else {
@@ -2634,6 +2691,21 @@ mod tests {
         }
         idx.search("title: *[]", 10)
             .unwrap_or_else(|error| panic!("title: *[] search failed: {error}"));
+        // QA #11: a field-exists leaf is a usage error, not an internal
+        // "not a fast field" failure at execution.
+        for query in ["title:*", "title: *", "auth AND body:*", "(title:*)"] {
+            let error = idx
+                .search_page(query, 10)
+                .expect_err("field-exists must be refused");
+            assert!(
+                matches!(error, TantivyError::UnsupportedQuery(ref message) if message.contains(":*")),
+                "{query}: {error}"
+            );
+            assert!(idx.search(query, 10).is_err());
+        }
+        for query in ["title:auth*", "\"title:*\"", "title\\:*"] {
+            assert!(reject_field_exist_query(query).is_ok(), "{query}");
+        }
         assert!(bare_exist_query_panics("auth *[]"));
 
         let all = idx.search("*", 10).unwrap();
