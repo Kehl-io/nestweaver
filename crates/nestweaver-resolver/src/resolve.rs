@@ -388,6 +388,16 @@ pub fn resolve_references_with_file_languages(
                         import.edge_type = EdgeType::Imports;
                         local_edges.push(import);
                     }
+                    if language == Language::Go {
+                        local_edges.extend(go_build_variant_edges(
+                            file_path,
+                            &reference.name,
+                            &edge,
+                            &symbol_map,
+                            &graph,
+                            repo_uid,
+                        ));
+                    }
                     local_edges.push(edge);
                 }
             }
@@ -457,6 +467,72 @@ pub fn resolve_references_with_file_languages(
     }
 
     edges
+}
+
+/// Go build-variant siblings of a resolved Go target.
+///
+/// Two declarations of one top-level name (or one method on one receiver
+/// type) in the same Go package only compile when build constraints keep them
+/// out of the same build: `//go:build js` in `node_js.go` and `!js` in
+/// `node_net.go`, or `_linux`/`_windows`/`_amd64` file suffixes. The tiers
+/// above pick ONE of them (the same-package tier sorts by path), so the call in
+/// `node.go` linked only `node_js.go`'s variant and the other was reported dead
+/// and had an empty blast radius. A call site calls whichever variant the
+/// build selects, so every variant is a callee. The parser does not record
+/// build constraints, and does not need to: the compiler already guarantees a
+/// same-package duplicate is a build variant.
+fn go_build_variant_edges(
+    file_path: &str,
+    name: &str,
+    edge: &ResolvedEdge,
+    symbol_map: &std::collections::HashMap<String, Vec<(&str, &RawSymbol)>>,
+    graph: &ImportGraph,
+    repo_uid: &str,
+) -> Vec<ResolvedEdge> {
+    if edge.edge_type != EdgeType::Calls || !edge.target_uid.starts_with("sym:") {
+        return Vec::new();
+    }
+    // The target's name is not on the edge; recover the symbol by UID among
+    // the reference's same-named candidates (an aliased import binds another
+    // name and simply finds nothing here).
+    let Some(siblings) = symbol_map.get(name) else {
+        return Vec::new();
+    };
+    let Some((target_file, target)) = siblings.iter().copied().find(|(file, symbol)| {
+        symbol_uid(repo_uid, file, &symbol.name, symbol.start_line) == edge.target_uid
+    }) else {
+        return Vec::new();
+    };
+    // A declaration in the calling file is the one this build compiles with
+    // that file; the same-file tier already chose it.
+    if target_file == file_path
+        || !matches!(target.kind, SymbolKind::Function | SymbolKind::Method)
+    {
+        return Vec::new();
+    }
+    siblings
+        .iter()
+        .filter(|(file, symbol)| {
+            *file != target_file
+                && *file != file_path
+                && symbol.kind == target.kind
+                && symbol.parent_name == target.parent_name
+                && parent_dir(file) == parent_dir(target_file)
+                && graph.same_go_package(file, target_file)
+        })
+        .map(|(file, symbol)| ResolvedEdge {
+            source_uid: edge.source_uid.clone(),
+            target_uid: symbol_uid(repo_uid, file, &symbol.name, symbol.start_line),
+            edge_type: edge.edge_type,
+            confidence: edge.confidence,
+            link_type: None,
+            evidence: vec![EdgeEvidence {
+                kind: "go_build_variant".to_string(),
+                weight: edge.confidence,
+                note: Some(format!("build variant of {target_file}")),
+            }],
+        })
+        .collect()
 }
 
 /// Resolve a single non-import reference to a `ResolvedEdge`, or return `None`
@@ -578,10 +654,39 @@ fn resolve_single_reference(
     }
 
     // ── Type-aware resolution for member calls with known receiver type ──
+    let file_env = type_envs.and_then(|envs| envs.get(file_path));
+    let receiver_inference = ReceiverInference {
+        file_path,
+        reference,
+        scope_index,
+        symbol_map,
+        extends_map,
+        graph,
+        language,
+        env: file_env,
+    };
+    // A receiver that is itself a call or `new` expression (`new K().m2()`,
+    // `K.make().m2()`, `k.m1().m2()`, `New(1).Add()`) has no binding of its
+    // own. Its type comes from the constructed type or the callee's declared
+    // return type, followed through the chain.
+    let inferred_receiver = if edge_type == EdgeType::Calls
+        && let Some(receiver) = reference.receiver.as_deref()
+        && is_expression_receiver(receiver)
+    {
+        receiver_inference
+            .infer(receiver, 0)
+            .map(|type_name| crate::type_extractors::TypeBinding {
+                type_name,
+                line: reference.start_line,
+                confidence: 0.85,
+                source: crate::type_extractors::BindingSource::ReturnType,
+            })
+    } else {
+        None
+    };
     if edge_type == EdgeType::Calls
         && let Some(ref receiver) = reference.receiver
-        && let Some(envs) = type_envs
-        && let Some(env) = envs.get(file_path)
+        && (file_env.is_some() || inferred_receiver.is_some())
     {
         // A direct `this.field` receiver can use that owning class's exact
         // declared property type. A longer chain or unknown factory supplies
@@ -627,9 +732,11 @@ fn resolve_single_reference(
         };
         let receiver_type = if field_binding.is_some() {
             field_binding.as_ref()
-        } else if receiver == "self" || receiver == "this" || receiver == "$this" {
+        } else if inferred_receiver.is_some() {
+            inferred_receiver.as_ref()
+        } else if let Some(env) = file_env.filter(|_| is_self_receiver(receiver)) {
             env.lookup_self(reference.start_line)
-        } else {
+        } else if let Some(env) = file_env {
             // A member or call chain has its own result type. The first
             // segment's binding cannot establish the complete receiver's type.
             if let Some(call_scope) = reference.scope {
@@ -654,6 +761,8 @@ fn resolve_single_reference(
             } else {
                 env.lookup(receiver, reference.start_line)
             }
+        } else {
+            None
         };
 
         if let Some(binding) = receiver_type.filter(|binding| {
@@ -711,6 +820,7 @@ fn resolve_single_reference(
                                 type_envs: envs,
                             })
                     }),
+                    false,
                 )
             };
             let direct: Vec<_> = symbol_map
@@ -791,6 +901,7 @@ fn resolve_single_reference(
                                     graph,
                                     language,
                                     None,
+                                    true,
                                 );
                                 let inherited: Vec<_> = symbol_map
                                     .get(method_name.as_str())
@@ -847,6 +958,32 @@ fn resolve_single_reference(
             }
             // Older unscoped environments retain the existing lower tiers.
         }
+    }
+
+    // A method called on a call/`new` expression no evidence could type: the
+    // name-based tiers below cannot match it (the receiver names no file and
+    // no type), so without this it was always dropped. See
+    // `unique_expression_method` for the gates that keep `get`/`then` out.
+    if edge_type == EdgeType::Calls
+        && inferred_receiver.is_none()
+        && let Some(receiver) = reference.receiver.as_deref()
+        && is_expression_receiver(receiver)
+        && let Some((target_file, target)) =
+            unique_expression_method(&receiver_inference, receiver, &reference.name, source_sym)
+    {
+        let confidence = confidence_score(MatchType::SamePackageFallback, language);
+        return Some(ResolvedEdge {
+            source_uid,
+            target_uid: symbol_uid(repo_uid, target_file, &target.name, target.start_line),
+            edge_type,
+            confidence,
+            link_type: None,
+            evidence: vec![EdgeEvidence {
+                kind: "unique_method_name".to_string(),
+                weight: confidence,
+                note: Some(format!("{receiver} -> {}", reference.name)),
+            }],
+        });
     }
 
     if name_is_locally_bound(
@@ -1753,7 +1890,15 @@ fn typed_receiver_origin(
     graph: &ImportGraph,
     language: Language,
     rust_origin: Option<RustReceiverEvidence<'_>>,
+    admit_traits: bool,
 ) -> Option<TypedReceiverOrigin> {
+    // An inherited lookup (the MRO walk) may land on a trait or interface:
+    // a Rust trait's default method, a Java default method. A receiver's own
+    // declared type still has to be a class or enum.
+    let type_kind = |kind: SymbolKind| {
+        matches!(kind, SymbolKind::Class | SymbolKind::Enum)
+            || admit_traits && matches!(kind, SymbolKind::Trait | SymbolKind::Interface)
+    };
     if language == Language::Rust
         && let Some(RustReceiverEvidence { origin, type_envs }) = rust_origin
     {
@@ -1855,7 +2000,7 @@ fn typed_receiver_origin(
         .into_iter()
         .flatten()
         .filter(|(file, symbol)| {
-            *file == source_file && matches!(symbol.kind, SymbolKind::Class | SymbolKind::Enum)
+            *file == source_file && type_kind(symbol.kind)
         })
         .collect();
     if local.len() == 1 {
@@ -1893,7 +2038,7 @@ fn typed_receiver_origin(
             .get(name)?
             .iter()
             .filter(|(candidate, symbol)| {
-                *candidate == file && matches!(symbol.kind, SymbolKind::Class | SymbolKind::Enum)
+                *candidate == file && type_kind(symbol.kind)
             })
             .count();
         return (declarations == 1).then(|| TypedReceiverOrigin {
@@ -1912,7 +2057,7 @@ fn typed_receiver_origin(
         .into_iter()
         .flatten()
         .filter(|(file, symbol)| {
-            matches!(symbol.kind, SymbolKind::Class | SymbolKind::Enum)
+            type_kind(symbol.kind)
                 && imports.iter().any(|(_, target)| target == file)
                 && (symbol.visibility != Visibility::Private
                     || language == Language::Rust && graph.resolves_parent(source_file, file))
@@ -1923,6 +2068,445 @@ fn typed_receiver_origin(
         name: type_name.into(),
         rust_class_position: None,
     })
+}
+
+/// Bound on nested receiver expressions followed by [`infer_receiver_type`]
+/// (`a.b().c().d()` is three levels).
+const RECEIVER_INFERENCE_DEPTH: u8 = 4;
+
+/// Everything [`infer_receiver_type`] reads. Bundled so the recursion does
+/// not thread ten parameters.
+struct ReceiverInference<'a, 'b> {
+    file_path: &'a str,
+    reference: &'a RawReference,
+    scope_index: &'a FileScopeIndex<'b>,
+    symbol_map: &'a std::collections::HashMap<String, Vec<(&'b str, &'b RawSymbol)>>,
+    extends_map: &'a std::collections::HashMap<String, Vec<String>>,
+    graph: &'a ImportGraph,
+    language: Language,
+    env: Option<&'a TypeEnvironment>,
+}
+
+/// Whether a receiver is itself a call or construction expression
+/// (`new K()`, `K.make()`, `k.m1()`, `New(1)`), as opposed to a name or a
+/// field path. Only these get receiver-expression inference.
+fn is_expression_receiver(receiver: &str) -> bool {
+    let receiver = receiver.trim();
+    receiver.ends_with(')') || receiver.starts_with("new ")
+}
+
+/// `callee` of a trailing call `callee(args)`, or `None` when `expr` does not
+/// end in one balanced argument list.
+fn split_trailing_call(expr: &str) -> Option<&str> {
+    if !expr.ends_with(')') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (index, ch) in expr.char_indices().rev() {
+        match ch {
+            ')' => depth += 1,
+            '(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(expr[..index].trim_end());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Drop trailing explicit type arguments from a callee: `f::<T>`, `f<T>`,
+/// Go's `Sum[int]`.
+fn strip_type_arguments(callee: &str) -> &str {
+    let mut callee = callee.trim_end();
+    for (open, close) in [('<', '>'), ('[', ']')] {
+        if callee.ends_with(close) {
+            let mut depth = 0i32;
+            for (index, ch) in callee.char_indices().rev() {
+                if ch == close {
+                    depth += 1;
+                } else if ch == open {
+                    depth -= 1;
+                    if depth == 0 {
+                        callee = callee[..index].trim_end();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    callee.strip_suffix("::").unwrap_or(callee)
+}
+
+/// Split `base.member` at its last top-level member separator (`.`, `?.`,
+/// `::`, `->`, `?->`). `None` when there is no separator outside brackets.
+fn split_member(expr: &str) -> Option<(&str, &str)> {
+    let bytes = expr.as_bytes();
+    let mut depth = 0i32;
+    let mut index = bytes.len();
+    while index > 0 {
+        index -= 1;
+        match bytes[index] {
+            b')' | b']' | b'}' => depth += 1,
+            b'(' | b'[' | b'{' => depth -= 1,
+            _ => {}
+        }
+        if depth != 0 {
+            continue;
+        }
+        let previous = index.checked_sub(1).map(|at| bytes[at]);
+        let (base_end, member_start) = match (bytes[index], previous) {
+            (b'.', _) => (index, index + 1),
+            (b':', Some(b':')) | (b'>', Some(b'-')) => (index - 1, index + 1),
+            _ => continue,
+        };
+        let base = expr[..base_end].trim_end().trim_end_matches('?').trim_end();
+        return Some((base, expr[member_start..].trim()));
+    }
+    None
+}
+
+fn is_identifier(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '$')
+        && !text.starts_with(|ch: char| ch.is_ascii_digit())
+}
+
+/// The type a receiver binding's internal tag names (`file#Type#line`,
+/// `Type@position`), as a bare type name.
+fn untagged_type(type_name: &str) -> &str {
+    let name = type_name.split('#').nth(1).unwrap_or(type_name);
+    name.split('@').next().unwrap_or(name)
+}
+
+fn is_type_symbol(symbol: &RawSymbol) -> bool {
+    matches!(
+        symbol.kind,
+        SymbolKind::Class
+            | SymbolKind::Enum
+            | SymbolKind::Interface
+            | SymbolKind::Trait
+            | SymbolKind::Extension
+    )
+}
+
+/// Normalize a recorded return type to a repository type name. Wrappers
+/// whose methods are not the inner type's (`Option<T>`, `Promise<T>`,
+/// `Vec<T>`) yield `None`; smart pointers deref to their inner type.
+fn normalize_return_type(
+    raw: &str,
+    owner: Option<&str>,
+    symbol_map: &std::collections::HashMap<String, Vec<(&str, &RawSymbol)>>,
+) -> Option<String> {
+    let mut text = raw.trim();
+    text = text.trim_start_matches(':').trim_start_matches("->").trim();
+    loop {
+        let before = text;
+        for prefix in ["&mut ", "&", "*", "mut ", "?", "impl "] {
+            text = text.strip_prefix(prefix).unwrap_or(text).trim_start();
+        }
+        if text == before {
+            break;
+        }
+    }
+    text = text.trim_end_matches(['?', '!']).trim_end();
+    if let Some((outer, rest)) = text.split_once('<') {
+        if !matches!(outer.trim(), "Box" | "Rc" | "Arc") {
+            return None;
+        }
+        let inner = rest.strip_suffix('>')?;
+        return normalize_return_type(inner, owner, symbol_map);
+    }
+    let name = match text {
+        "Self" | "self" | "static" | "this" | "$this" => owner?,
+        other => other.rsplit(['.', ':', '\\']).next().unwrap_or(other),
+    };
+    (is_identifier(name)
+        && symbol_map
+            .get(name)
+            .is_some_and(|symbols| symbols.iter().any(|(_, symbol)| is_type_symbol(symbol))))
+    .then(|| name.to_string())
+}
+
+impl ReceiverInference<'_, '_> {
+    /// The static type of a receiver expression, or `None` when nothing in
+    /// the graph establishes one. Every step needs exact evidence: a `new`
+    /// of a repository type, a declared return type, or a typed binding.
+    fn infer(&self, expr: &str, depth: u8) -> Option<String> {
+        if depth > RECEIVER_INFERENCE_DEPTH {
+            return None;
+        }
+        let expr = expr.trim();
+        if let Some(rest) = expr.strip_prefix("new ") {
+            let path: String = rest
+                .trim_start()
+                .chars()
+                .take_while(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$' | '.' | ':' | '\\'))
+                .collect();
+            let name = path.rsplit(['.', ':', '\\']).next()?;
+            return self.type_exists(name).then(|| name.to_string());
+        }
+        if let Some(callee) = split_trailing_call(expr) {
+            let callee = strip_type_arguments(callee);
+            if callee.starts_with("new ") {
+                return self.infer(callee, depth + 1);
+            }
+            return match split_member(callee) {
+                Some((base, method)) if is_identifier(method) => {
+                    self.member_call_type(base, method, depth)
+                }
+                Some(_) => None,
+                None if is_identifier(callee) => self.free_call_type(callee),
+                None => None,
+            };
+        }
+        if depth > 0 && is_identifier(expr) {
+            return self.identifier_type(expr);
+        }
+        None
+    }
+
+    fn type_exists(&self, name: &str) -> bool {
+        is_identifier(name)
+            && self
+                .symbol_map
+                .get(name)
+                .is_some_and(|symbols| symbols.iter().any(|(_, symbol)| is_type_symbol(symbol)))
+    }
+
+    /// Whether `file` is visible from the reference's file without a name
+    /// the receiver does not carry: itself, an import target, or a sibling in
+    /// the same directory (a Go package, a Python package).
+    fn file_visible(&self, file: &str) -> bool {
+        file == self.file_path
+            || parent_dir(file) == parent_dir(self.file_path)
+            || self
+                .graph
+                .imports_of(self.file_path)
+                .iter()
+                .any(|(_, target)| target == file || parent_dir(target) == parent_dir(file))
+    }
+
+    fn identifier_type(&self, name: &str) -> Option<String> {
+        let env = self.env?;
+        let binding = if is_self_receiver(name) {
+            env.lookup_self(self.reference.start_line)
+        } else if let Some(call_scope) = self.reference.scope {
+            let declaration =
+                active_lexical_binding(self.scope_index, self.reference, name, self.language)?;
+            env.lookup_declaration(name, declaration.scope?, call_scope.position)
+        } else {
+            env.lookup(name, self.reference.start_line)
+        }?;
+        let name = untagged_type(&binding.type_name);
+        self.type_exists(name).then(|| name.to_string())
+    }
+
+    /// A free call `f(...)`: a constructor-style call of a repository type
+    /// (`Child()`, `Point(1, 2)`), or a function with one declared return
+    /// type among the visible declarations.
+    fn free_call_type(&self, callee: &str) -> Option<String> {
+        if active_lexical_binding(self.scope_index, self.reference, callee, self.language).is_some() {
+            return None;
+        }
+        let symbols = self.symbol_map.get(callee)?;
+        let functions: Vec<_> = symbols
+            .iter()
+            .filter(|(file, symbol)| {
+                symbol.kind == SymbolKind::Function
+                    && symbol.parent_name.is_none()
+                    && self.file_visible(file)
+            })
+            .collect();
+        if functions.is_empty() {
+            let types: Vec<_> = symbols
+                .iter()
+                .filter(|(file, symbol)| {
+                    matches!(symbol.kind, SymbolKind::Class | SymbolKind::Enum)
+                        && self.file_visible(file)
+                })
+                .collect();
+            return (!types.is_empty()).then(|| callee.to_string());
+        }
+        let local: Vec<_> = functions
+            .iter()
+            .filter(|(file, _)| *file == self.file_path)
+            .collect();
+        let candidates: Vec<_> = if local.is_empty() {
+            functions.iter().collect()
+        } else {
+            local
+        };
+        self.agreed_return_type(candidates.iter().map(|(_, symbol)| *symbol), None)
+    }
+
+    /// `base.method(...)`: a static call when `base` names a repository type
+    /// that is not shadowed by a local, otherwise a call on `base`'s own
+    /// inferred type. Inherited methods are found through `extends`.
+    fn member_call_type(&self, base: &str, method: &str, depth: u8) -> Option<String> {
+        let base = base.trim();
+        let owner = if is_identifier(base)
+            && !is_self_receiver(base)
+            && self.type_exists(base)
+            && active_lexical_binding(self.scope_index, self.reference, base, self.language).is_none()
+            && self.identifier_type(base).is_none()
+        {
+            Some(base.to_string())
+        } else if is_identifier(base) && !is_self_receiver(base) && !self.type_exists(base) {
+            // A namespace or package qualifier (`calc.New(3)`): a free
+            // function reached through an import of that name.
+            match self.identifier_type(base) {
+                Some(owner) => Some(owner),
+                None => {
+                    return self
+                        .graph
+                        .bindings_named(self.file_path, base)
+                        .next()
+                        .and_then(|_| self.free_call_type(method));
+                }
+            }
+        } else if is_identifier(base) {
+            self.identifier_type(base)
+        } else {
+            self.infer(base, depth + 1)
+        }?;
+        self.method_return_type(&owner, method)
+    }
+
+    fn method_return_type(&self, owner: &str, method: &str) -> Option<String> {
+        let mut current = vec![owner.to_string()];
+        let mut visited = std::collections::HashSet::new();
+        for _ in 0..=RECEIVER_INFERENCE_DEPTH {
+            let mut next = Vec::new();
+            for owner in &current {
+                if !visited.insert(owner.clone()) {
+                    continue;
+                }
+                let methods: Vec<_> = self
+                    .symbol_map
+                    .get(method)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, symbol)| {
+                        symbol.kind == SymbolKind::Method
+                            && symbol.parent_name.as_deref() == Some(owner.as_str())
+                    })
+                    .map(|(_, symbol)| *symbol)
+                    .collect();
+                if !methods.is_empty() {
+                    return self.agreed_return_type(methods.into_iter(), Some(owner));
+                }
+                if let Some(parents) = self.extends_map.get(owner) {
+                    next.extend(parents.iter().cloned());
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            current = next;
+        }
+        None
+    }
+
+    /// The one normalized return type every candidate declares, or `None`
+    /// when any lacks one or they disagree.
+    fn agreed_return_type<'s>(
+        &self,
+        candidates: impl Iterator<Item = &'s RawSymbol>,
+        owner: Option<&str>,
+    ) -> Option<String> {
+        let mut agreed: Option<String> = None;
+        for symbol in candidates {
+            let raw = symbol.type_info.as_ref()?.return_type.as_deref()?;
+            let owner = owner.or(symbol.parent_name.as_deref());
+            let normalized = normalize_return_type(raw, owner, self.symbol_map)?;
+            match &agreed {
+                Some(existing) if *existing != normalized => return None,
+                _ => agreed = Some(normalized),
+            }
+        }
+        agreed
+    }
+}
+
+/// The leading name of a receiver chain: `Child` in `Child.make()`, `K` in
+/// `new K()`, `New` in `New(1)`.
+fn receiver_chain_head(receiver: &str) -> &str {
+    let receiver = receiver.trim();
+    let receiver = receiver.strip_prefix("new ").unwrap_or(receiver).trim_start();
+    let end = receiver
+        .find(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '$'))
+        .unwrap_or(receiver.len());
+    &receiver[..end]
+}
+
+/// Last-resort target for a method called on an expression whose type no
+/// evidence establishes (`Child.make().run()` with an unannotated `make`).
+/// Linked only when
+///
+/// - the chain starts at a repository type or function visible from this file
+///   and not shadowed by a local, so `new Map().get(k)` or `fetch().then()`
+///   never reach this; and
+/// - exactly one method of that name exists in the whole repository, and it is
+///   accessible from this file.
+///
+/// A common name such as `get` that is declared twice anywhere links nothing.
+fn unique_expression_method<'s>(
+    inference: &ReceiverInference<'_, 's>,
+    receiver: &str,
+    method: &str,
+    source: &RawSymbol,
+) -> Option<(&'s str, &'s RawSymbol)> {
+    let head = receiver_chain_head(receiver);
+    if !is_identifier(head)
+        || is_self_receiver(head)
+        || active_lexical_binding(
+            inference.scope_index,
+            inference.reference,
+            head,
+            inference.language,
+        )
+        .is_some()
+        || !inference.symbol_map.get(head).is_some_and(|symbols| {
+            symbols.iter().any(|(file, symbol)| {
+                (is_type_symbol(symbol) || symbol.kind == SymbolKind::Function)
+                    && inference.file_visible(file)
+            })
+        })
+    {
+        return None;
+    }
+    let symbols = inference.symbol_map.get(method)?;
+    // Any free function of that name makes the spelling ambiguous enough to
+    // refuse: the uniqueness is about the NAME, not just about methods.
+    if symbols
+        .iter()
+        .any(|(_, symbol)| symbol.kind == SymbolKind::Function)
+    {
+        return None;
+    }
+    let mut methods = symbols
+        .iter()
+        .filter(|(_, symbol)| symbol.kind == SymbolKind::Method);
+    let (file, symbol) = *methods.next()?;
+    if methods.next().is_some()
+        || !inference.file_visible(file)
+        || !typed_member_accessible(
+            inference.file_path,
+            file,
+            source,
+            symbol,
+            inference.language,
+            inference.graph,
+        )
+    {
+        return None;
+    }
+    Some((file, symbol))
 }
 
 fn method_belongs_to_origin(
@@ -2682,8 +3266,21 @@ impl<'a> Enclosing<'a> {
 /// every declaration look nested, and own every module-level reference. It is
 /// only the CALLS source for module-level calls (see
 /// `resolve_single_reference`), so every container test goes through here.
+///
+/// A Rust `mod x;` declaration is a `Module` with no body: its code lives in
+/// another file. As a one-line symbol it used to win the degenerate fallback
+/// for every following module-level line, so `use util::double;` written
+/// under `mod util;` was recorded as the module `util` importing `double`,
+/// and `blast-radius` on `double` listed the module as affected.
 fn can_contain_code(symbol: &RawSymbol) -> bool {
-    symbol.kind.contains_code() && !symbol.is_module_owner()
+    symbol.kind.contains_code() && !symbol.is_module_owner() && !is_bodiless_module(symbol)
+}
+
+/// A module declaration whose body lives elsewhere (`mod x;`).
+fn is_bodiless_module(symbol: &RawSymbol) -> bool {
+    symbol.kind == SymbolKind::Module
+        && symbol.end_line <= symbol.start_line
+        && symbol.signature.trim_end().ends_with(';')
 }
 
 /// nw-113: the symbol whose body scopes a binding declared on `line`, or
@@ -11155,6 +11752,283 @@ export function readIt(b: Box) { size(); run(); b.run(); return value(); }
                 call_targets(&files, &edges, path, "use"),
                 vec![uid_at(&files, path, "run", 4)],
                 "{path}: this.run() is unchanged"
+            );
+        }
+    }
+
+    // ── QA round: receiver expressions, construction, turbofish, variants ──
+
+    fn qa_calls(
+        files: &[(String, Vec<RawSymbol>, Vec<RawReference>)],
+        edges: &[ResolvedEdge],
+        from: (&str, &str),
+        to: (&str, &str, u32),
+    ) -> bool {
+        let source = uid(files, from.0, from.1);
+        let target = symbol_uid("repo:test:abc", to.0, to.1, to.2);
+        edges.iter().any(|edge| {
+            edge.edge_type == EdgeType::Calls
+                && edge.source_uid == source
+                && edge.target_uid == target
+        })
+    }
+
+    #[test]
+    fn qa_ts_method_on_new_static_and_chained_call_receivers_resolves() {
+        let path = "a.ts";
+        let source = "export class K {\n  m1(): K { return this; }\n  m2(): number { return 1; }\n  static make(): K { return new K(); }\n}\nexport function t1() { new K().m2(); }\nexport function t2() { const k = new K(); k.m1().m2(); }\nexport function t3() { K.make().m2(); }\nexport function t4() { const k: K = K.make(); k.m2(); }\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::TypeScript);
+        for caller in ["t1", "t2", "t3", "t4"] {
+            assert!(
+                qa_calls(&files, &edges, (path, caller), (path, "m2", 3)),
+                "{caller} must call K.m2: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qa_ts_expression_receiver_of_an_external_type_links_nothing() {
+        let path = "a.ts";
+        let source = "export class Store {\n  get(k: string): number { return 1; }\n}\nexport function user() { return new Map().get('x'); }\nexport function other() { return fetch('u').get('x'); }\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::TypeScript);
+        for caller in ["user", "other"] {
+            assert!(
+                !qa_calls(&files, &edges, (path, caller), (path, "get", 2)),
+                "{caller}: a Map/fetch result is not a Store: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qa_python_method_on_unannotated_factory_uses_unique_method_name() {
+        let path = "pkg/core.py";
+        let source = "class Base:\n    def run(self):\n        return 1\n\nclass Child(Base):\n    @staticmethod\n    def make():\n        return Child()\n\ndef user():\n    return Child.make().run()\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::Python);
+        assert!(
+            qa_calls(&files, &edges, (path, "user"), (path, "run", 2)),
+            "{edges:#?}"
+        );
+        assert!(
+            edges.iter().any(|edge| edge
+                .evidence
+                .iter()
+                .any(|evidence| evidence.kind == "unique_method_name")),
+            "the fallback must say what it is: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn qa_python_unique_method_fallback_refuses_a_name_declared_twice() {
+        let path = "pkg/core.py";
+        let source = "class A:\n    def get(self):\n        return 1\n\nclass B:\n    def get(self):\n        return 2\n    @staticmethod\n    def make():\n        return B()\n\ndef user():\n    return B.make().get()\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::Python);
+        let user = uid(&files, path, "user");
+        assert!(
+            !edges.iter().any(|edge| edge.edge_type == EdgeType::Calls
+                && edge.source_uid == user
+                && edge.target_uid.starts_with("sym:")),
+            "`get` is declared twice; nothing may be guessed: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn qa_rust_trait_default_method_resolves_through_the_impl() {
+        let path = "src/lib.rs";
+        let source = "pub trait Speak {\n    fn speak(&self) -> String;\n    fn shout(&self) -> String { self.speak() }\n}\npub struct Dog;\nimpl Speak for Dog {\n    fn speak(&self) -> String { String::new() }\n}\nimpl Dog {\n    pub fn new() -> Self { Dog }\n}\npub fn entry() {\n    let d = Dog::new();\n    let _ = d.shout();\n}\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::Rust);
+        assert!(
+            qa_calls(&files, &edges, (path, "entry"), (path, "shout", 3)),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn qa_rust_method_on_constructor_call_receiver_resolves() {
+        let path = "src/lib.rs";
+        let source = "pub struct Dog;\nimpl Dog {\n    pub fn new() -> Self { Dog }\n    pub fn bark(&self) {}\n}\npub fn entry() {\n    Dog::new().bark();\n}\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::Rust);
+        assert!(
+            qa_calls(&files, &edges, (path, "entry"), (path, "bark", 4)),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn qa_go_method_on_constructor_function_result_resolves() {
+        let calc = "internal/calc/calc.go";
+        let test = "internal/calc/calc_test.go";
+        let (files, edges) = review_edges(
+            &[
+                (
+                    calc,
+                    "package calc\n\ntype Impl struct{ base int }\n\nfunc New(b int) *Impl { return &Impl{base: b} }\n\nfunc (i *Impl) Add(a, b int) int { return i.base + a + b }\n",
+                ),
+                (
+                    test,
+                    "package calc\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif New(1).Add(1, 2) != 4 {\n\t\tt.Fatal(\"bad\")\n\t}\n}\n",
+                ),
+            ],
+            Language::Go,
+        );
+        assert!(
+            qa_calls(&files, &edges, (test, "TestAdd"), (calc, "Add", 7)),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn qa_rust_turbofish_calls_resolve_and_keep_their_receiver() {
+        let path = "src/lib.rs";
+        let source = "pub struct P;\nimpl P {\n    pub fn make<T>() -> P { P }\n}\nfn generic<T>(t: T) -> T { t }\nfn parse() {}\npub fn entry(x: &str) {\n    generic::<u8>(1);\n    P::make::<u8>();\n    let _ = x.parse::<u32>();\n}\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::Rust);
+        assert!(
+            qa_calls(&files, &edges, (path, "entry"), (path, "generic", 5)),
+            "{edges:#?}"
+        );
+        assert!(
+            qa_calls(&files, &edges, (path, "entry"), (path, "make", 3)),
+            "{edges:#?}"
+        );
+        assert!(
+            !qa_calls(&files, &edges, (path, "entry"), (path, "parse", 6)),
+            "`x.parse::<u32>()` is a method call, not the free fn `parse`: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn qa_new_expression_links_the_class_in_every_language() {
+        for (path, language, source, class_line) in [
+            (
+                "src/A.java",
+                Language::Java,
+                "class Foo { int bar() { return 1; } }\nclass User { void go() { new Foo(); } }\n",
+                1,
+            ),
+            (
+                "src/A.cs",
+                Language::CSharp,
+                "class Foo { public int Bar() { return 1; } }\nclass User { public void Go() { new Foo(); } }\n",
+                1,
+            ),
+            (
+                "src/a.php",
+                Language::Php,
+                "<?php\nclass Foo { public function bar() { return 1; } }\nfunction go() { return new Foo(); }\n",
+                2,
+            ),
+            (
+                "src/a.cpp",
+                Language::Cpp,
+                "class Foo { public: int bar() { return 1; } };\nvoid go() { Foo* f = new Foo(); }\n",
+                1,
+            ),
+            (
+                "src/A.scala",
+                Language::Scala,
+                "class Foo { def bar(): Int = 1 }\nobject User { def go(): Unit = { new Foo() } }\n",
+                1,
+            ),
+            (
+                "src/A.groovy",
+                Language::Groovy,
+                "class Foo { int bar() { return 1 } }\nclass User { void go() { new Foo() } }\n",
+                1,
+            ),
+            (
+                "lib/a.dart",
+                Language::Dart,
+                "class Foo { int bar() { return 1; } }\nvoid go() { new Foo(); }\n",
+                1,
+            ),
+        ] {
+            let (files, edges) = review_edges(&[(path, source)], language);
+            let target = symbol_uid("repo:test:abc", path, "Foo", class_line);
+            assert!(
+                edges
+                    .iter()
+                    .any(|edge| edge.edge_type == EdgeType::Calls && edge.target_uid == target),
+                "{path}: `new Foo()` must link the class: {:#?} {edges:#?}",
+                files[0].2
+            );
+        }
+    }
+
+    #[test]
+    fn qa_php_member_call_on_new_bound_variable_resolves() {
+        let path = "c.php";
+        let source = "<?php\nclass Foo { public function bar() { return 1; } }\nfunction mk() { $f = new Foo(); return $f->bar(); }\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::Php);
+        assert!(
+            qa_calls(&files, &edges, (path, "mk"), (path, "bar", 2)),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn qa_ts_bare_decorator_references_the_decorator_function() {
+        let path = "a.ts";
+        let source = "function log(target: any, key: string) {}\nexport class C {\n  @log\n  plus(n: number): number { return n; }\n}\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::TypeScript);
+        let log = uid(&files, path, "log");
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.edge_type == EdgeType::Calls && edge.target_uid == log),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn qa_rust_use_after_mod_declaration_is_not_owned_by_the_module() {
+        let lib = "src/lib.rs";
+        let util = "src/util.rs";
+        let (files, edges) = review_edges(
+            &[
+                (
+                    lib,
+                    "mod util;\nuse util::double;\n\npub fn entry() -> i32 { double(2) }\n",
+                ),
+                (util, "pub fn double(x: i32) -> i32 { x * 2 }\n"),
+            ],
+            Language::Rust,
+        );
+        let module = uid(&files, lib, "util");
+        assert!(
+            !edges.iter().any(|edge| edge.source_uid == module),
+            "`mod util;` has no body and owns nothing: {edges:#?}"
+        );
+        assert!(
+            qa_calls(&files, &edges, (lib, "entry"), (util, "double", 1)),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn qa_go_build_variants_are_all_callees() {
+        let node = "node.go";
+        let js = "node_js.go";
+        let net = "node_net.go";
+        let (files, edges) = review_edges(
+            &[
+                (
+                    node,
+                    "package uuid\n\nfunc NodeID() string {\n\treturn getHardwareInterface(\"\")\n}\n",
+                ),
+                (
+                    js,
+                    "//go:build js\n\npackage uuid\n\nfunc getHardwareInterface(name string) string { return \"\" }\n",
+                ),
+                (
+                    net,
+                    "//go:build !js\n\npackage uuid\n\nfunc getHardwareInterface(name string) string { return name }\n",
+                ),
+            ],
+            Language::Go,
+        );
+        for variant in [js, net] {
+            assert!(
+                qa_calls(&files, &edges, (node, "NodeID"), (variant, "getHardwareInterface", 5)),
+                "{variant}: {edges:#?}"
             );
         }
     }

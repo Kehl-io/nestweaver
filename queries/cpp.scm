@@ -157,3 +157,17 @@
 
 (preproc_include
   path: (system_lib_string) @name) @reference.includes
+
+; Object construction: `new Foo(...)` is a call of the class, exactly as
+; typescript.scm records it (nw-323 defect D). Without it a class that is only
+; ever instantiated had no inbound reference at all and `dead-code` reported it.
+(new_expression
+  type: (type_identifier) @name) @reference.call
+
+(new_expression
+  type: (template_type
+    name: (type_identifier) @name)) @reference.call
+
+(new_expression
+  type: (qualified_identifier
+    name: (type_identifier) @name)) @reference.call
