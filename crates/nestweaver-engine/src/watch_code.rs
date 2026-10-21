@@ -1146,6 +1146,17 @@ impl CodeWatcher {
                 .filter(|path| is_supported_source(path) && path.is_file())
                 .filter_map(|path| path.strip_prefix(&self.repo_root).ok()),
         );
+        // An ignored file the graph never held has nothing to retract; queuing
+        // a delete for it would still cost a full batch publication.
+        let graphed: HashSet<String> = if hidden.is_empty() {
+            HashSet::new()
+        } else {
+            store
+                .list_files_by_repo(r_uid)?
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect()
+        };
         for path in relevant.iter().filter(|path| is_supported_source(path)) {
             let rel_path = match path.strip_prefix(&self.repo_root) {
                 Ok(r) => r,
@@ -1161,7 +1172,10 @@ impl CodeWatcher {
             let exclusion = match source_policy_exclusion(&reader, &self.repo_root, path)? {
                 Some(reason) => Some(reason),
                 None if hidden.contains(rel_path) => {
-                    Some(crate::content_reader::TRACKED_BUT_IGNORED_REASON)
+                    if !graphed.contains(&rel_str) {
+                        continue;
+                    }
+                    Some("repository ignore rules")
                 }
                 None => None,
             };
@@ -2841,9 +2855,9 @@ fn status_path_is_indexable(reader: &crate::content_reader::FilesystemReader, pa
 /// excludes. Uses the walker's own configuration, descending only into the
 /// candidates' ancestor directories, so one batch costs one shallow walk.
 ///
-/// A walk error (for example an unreadable directory) yields no verdict:
-/// those paths are disclosed by indexing, and dropping their coverage here
-/// would disagree with it.
+/// A candidate below a directory the walk cannot read gets no verdict: those
+/// paths are disclosed by indexing, and dropping their coverage here would
+/// disagree with it. Other candidates in the batch are still decided.
 fn sources_hidden_from_walk<'a>(
     repo_root: &Path,
     candidates: impl IntoIterator<Item = &'a Path>,
@@ -2875,13 +2889,21 @@ fn sources_hidden_from_walk<'a>(
         .build()
     {
         let Ok(entry) = entry else {
-            return HashSet::new();
+            continue;
         };
         if let Ok(rel) = entry.path().strip_prefix(repo_root) {
             seen.insert(rel.to_path_buf());
         }
     }
-    wanted.difference(&seen).cloned().collect()
+    wanted
+        .difference(&seen)
+        .filter(|path| {
+            path.ancestors()
+                .skip(1)
+                .all(|dir| std::fs::read_dir(repo_root.join(dir)).is_ok())
+        })
+        .cloned()
+        .collect()
 }
 
 /// Whether `relative` escapes the repository's gitignore rules, regardless of
@@ -4289,7 +4311,7 @@ mod tests {
             &store,
             &r_uid,
             &root,
-            &[ignored, dot_ignored, kept],
+            &[ignored, dot_ignored, kept.clone()],
         );
         let files: Vec<String> = store
             .list_files_by_repo(&r_uid)
@@ -4309,6 +4331,59 @@ mod tests {
             files.iter().any(|path| path == "src/kept_new.js"),
             "{files:?}"
         );
+        let graphed = |store: &GraphStore| -> Vec<String> {
+            store
+                .list_files_by_repo(&r_uid)
+                .unwrap()
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect()
+        };
+
+        // A source the graph holds is retracted once it becomes ignored.
+        std::fs::write(root.join(".gitignore"), "src/ignored.js\nsrc/kept_new.js\n").unwrap();
+        process_fixture_batch(&watcher, &store, &r_uid, &root, std::slice::from_ref(&kept));
+        assert!(
+            !graphed(&store).iter().any(|path| path == "src/kept_new.js"),
+            "a newly ignored incumbent must be retracted"
+        );
+
+        // A directory the walk cannot list must not void the verdict for the
+        // rest of the batch, nor drop coverage beneath it.
+        use std::os::unix::fs::PermissionsExt;
+        let locked_dir = root.join("src/locked");
+        std::fs::create_dir(&locked_dir).unwrap();
+        let locked = locked_dir.join("inside.js");
+        std::fs::write(&locked, "export function insideFn() { return 4; }\n").unwrap();
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            std::slice::from_ref(&locked),
+        );
+        assert!(
+            graphed(&store)
+                .iter()
+                .any(|path| path == "src/locked/inside.js")
+        );
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o111)).unwrap();
+        if std::fs::read_dir(&locked_dir).is_err() {
+            let ignored = root.join("src/ignored.js");
+            std::fs::write(&ignored, "export function ignoredFn() { return 5; }\n").unwrap();
+            std::fs::write(&locked, "export function insideFn() { return 6; }\n").unwrap();
+            process_fixture_batch(&watcher, &store, &r_uid, &root, &[ignored, locked]);
+            let files = graphed(&store);
+            assert!(
+                !files.iter().any(|path| path == "src/ignored.js"),
+                "an unlistable sibling must not publish ignored sources: {files:?}"
+            );
+            assert!(
+                files.iter().any(|path| path == "src/locked/inside.js"),
+                "coverage below an unlistable directory is kept: {files:?}"
+            );
+        }
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     fn process_fixture_batch(
