@@ -28,8 +28,10 @@ features — so `--all-features` is provably a superset and can never cover less
 Guessing the list is unreliable: `--features embed` looks right and leaves
 `nestweaver-mcp` at 154, since what it actually needs is `daemon`.
 
-Two packages are exempt and run plain: `nestweaver-embed` and the root
-`nestweaver`, whose `metal` feature pulls `objc2` and does not compile on Linux.
+Off macOS the recipe passes every feature except those enabling `metal`
+(`nestweaver-embed`, the root `nestweaver` and `nestweaver-daemon` have one),
+because `metal` pulls `objc2` and does not compile on Linux. It also leaves out
+the CI-only `ci-direct-tests`.
 
 Switching between `-p` and `--workspace` also re-resolves features, which
 re-fingerprints the build and forces a full `lbug` C++ rebuild. Pick one shape

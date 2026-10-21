@@ -1401,7 +1401,9 @@ jobs:
             ${{ env.ARCHIVE }}
             ${{ env.ARCHIVE }}.sha256
           if-no-files-found: error
-          retention-days: 7
+          # ~50 MB per target. Kept 1 day so a release does not exhaust the org's
+          # shared artifact quota; resume must run within that window.
+          retention-days: 1
 
   dry-run-baseline:
     name: Capture dry-run visibility baseline
@@ -1606,7 +1608,8 @@ jobs:
           name: release-npm-packages
           path: ${{ runner.temp }}/npm-package
           if-no-files-found: error
-          retention-days: 7
+          # ~195 MB. Same 1-day window as the release bundles.
+          retention-days: 1
 
   publish-release:
     name: Publish complete release

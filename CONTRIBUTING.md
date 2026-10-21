@@ -460,7 +460,10 @@ version remain absent. The evidence must also contain the canary PR's blocked
 merge state and absent/`action_required` workflow observation.
 
 A private draft can be resumed only from the completed release workflow run
-whose artifacts and attestations belong to the same exact SHA. Resume deletes
+whose artifacts and attestations belong to the same exact SHA. Release
+bundles and npm packages are kept for 1 day, so `resume` and `recover-npm`
+must run within 24 hours of the source run; after that, delete the draft and
+re-run the release. Resume deletes
 and deterministically replaces only that release ID's private assets. If that
 source run is incomplete, delete only the explicitly bound private draft and
 then repair/re-run Release Please; cleanup refuses a public release or visible

@@ -54,9 +54,14 @@ known, accepted residual risks (not treated as vulnerabilities):
 - **`git rev-parse <ref>`** in the bare-clone reader passes a config/HEAD-derived
   ref without an end-of-options guard. Not attacker-reachable today (refs are
   `refs/heads/<branch>` / `HEAD` / `FETCH_HEAD`), noted for defense-in-depth.
-- **Advisory-flagged transitive dependencies.** `cargo audit` reports no
-  *vulnerability* advisories and exits 0. It does report three warnings, all in
-  transitive dependencies, verified on 2026-09-05:
+- **Advisory-flagged transitive dependencies.** `cargo audit` exits 0 with
+  the `zip` 8.6.0 advisories ignored in `.cargo/audit.toml`. `candle-core`
+  0.11, the latest release, requires `zip ^8.6.0`. NestWeaver reaches `zip`
+  only through candle's npz reader (`ZipArchive::by_index` / `by_name`), not
+  `ZipArchive::extract` or `ZipStreamReader::extract`, which is what
+  [RUSTSEC-2026-0367], [RUSTSEC-2026-0368], and [RUSTSEC-2026-0369] cover.
+  Drop the ignore when candle allows `zip` >= 9. Verified on 2026-10-19.
+  `cargo audit` also reports warnings, all in transitive dependencies:
   - `paste` 1.0.15 — unmaintained ([RUSTSEC-2024-0436]).
   - `cxx` 1.0.138 — unsound: `let_cxx_string!` can expose an uninitialized
     value under an exception-safety violation ([RUSTSEC-2026-0202]). Reached
@@ -77,3 +82,6 @@ known, accepted residual risks (not treated as vulnerabilities):
 [RUSTSEC-2024-0436]: https://rustsec.org/advisories/RUSTSEC-2024-0436
 [RUSTSEC-2026-0202]: https://rustsec.org/advisories/RUSTSEC-2026-0202
 [RUSTSEC-2026-0253]: https://rustsec.org/advisories/RUSTSEC-2026-0253
+[RUSTSEC-2026-0367]: https://rustsec.org/advisories/RUSTSEC-2026-0367
+[RUSTSEC-2026-0368]: https://rustsec.org/advisories/RUSTSEC-2026-0368
+[RUSTSEC-2026-0369]: https://rustsec.org/advisories/RUSTSEC-2026-0369
