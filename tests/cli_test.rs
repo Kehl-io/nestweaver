@@ -6637,6 +6637,84 @@ fn indexing_records_the_data_instance_id() {
     );
 }
 
+/// `nestweaver` with no daemon-bypass permit: the commands below refuse or
+/// answer before any store or daemon is touched.
+fn plain_cmd() -> Command {
+    let mut cmd = Command::cargo_bin("nestweaver").unwrap();
+    cmd.env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON");
+    cmd
+}
+
+/// Usage mistakes exit 64 (`EX_USAGE`), never 1: a missing change source, a
+/// misspelled `--format`/`--min-severity`, `list-features` without
+/// `--config` (as `list-links` already did) and a bare `interactions show`.
+#[test]
+fn usage_mistakes_exit_64() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("absent.lbug").display().to_string();
+    for args in [
+        vec!["pre-push-impact", "--db", &db],
+        vec!["pre-push-impact", "--local-changes", "--format", "xml"],
+        vec![
+            "pre-push-impact",
+            "--local-changes",
+            "--min-severity",
+            "fatal",
+        ],
+        vec!["list-features"],
+        vec!["interactions", "show", "--db", &db],
+    ] {
+        plain_cmd().args(&args).assert().code(64);
+    }
+    plain_cmd()
+        .args(["pre-push-impact", "--db", &db])
+        .assert()
+        .stderr(contains("--local-changes or --diff is required"));
+}
+
+/// Files changed with no symbol-level change is not "no local changes".
+#[test]
+fn pre_push_impact_says_files_changed_without_symbol_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    let git = |args: &[&str]| {
+        let status = StdCommand::new("git")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["-c", "user.email=t@example.com", "-c", "user.name=T"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    std::fs::write(repo.join("README.md"), "one\n").unwrap();
+    git(&["add", "README.md"]);
+    git(&["commit", "-q", "-m", "init"]);
+
+    plain_cmd()
+        .args(["pre-push-impact", "--local-changes", "--repo"])
+        .arg(repo)
+        .assert()
+        .success()
+        .stdout(contains("No local changes detected."));
+
+    std::fs::write(repo.join("README.md"), "two\n").unwrap();
+    plain_cmd()
+        .args(["pre-push-impact", "--local-changes", "--repo"])
+        .arg(repo)
+        .assert()
+        .success()
+        .stdout(
+            contains("1 file(s) changed, but no symbol-level changes")
+                .and(contains("No local changes detected.").not()),
+        );
+}
+
 /// nw-268: `pre-push-impact --max-depth` is bounded at parse time.
 ///
 /// It had no `value_parser`, so a mistyped `--max-depth 100000` arrived as a

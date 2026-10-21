@@ -151,6 +151,21 @@ const DEFAULT_EXTERNAL_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 /// command that rotates to a different validity than the one refused.
 const DEFAULT_TLS_VALIDITY_DAYS: u32 = 365;
 
+/// `pre-push-impact --format`.
+#[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
+enum PrePushFormat {
+    Human,
+    Json,
+}
+
+/// `pre-push-impact --min-severity`.
+#[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
+enum PrePushMinSeverity {
+    Breaking,
+    Warning,
+    Info,
+}
+
 /// Explicit device policy for direct local embedding.
 #[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
 enum CliEmbeddingAccelerator {
@@ -2135,9 +2150,8 @@ struct Cli {
 struct OutputConfig {
     quiet: bool,
     verbose: bool,
-    /// Whether colored output is enabled. Reserved for future use by
-    /// owo-colors formatting paths.
-    #[allow(dead_code)]
+    /// Whether colored output is enabled: off under `--no-color`, `--plain`,
+    /// `NO_COLOR` or a non-TTY stderr.
     color: bool,
 }
 
@@ -6995,8 +7009,8 @@ enum Commands {
         #[arg(long)]
         include_tests: bool,
         /// Output format: human (default), json
-        #[arg(long, default_value = "human")]
-        format: String,
+        #[arg(long, value_enum, ignore_case = true, default_value_t = PrePushFormat::Human)]
+        format: PrePushFormat,
         /// Repository path (default: current directory)
         #[arg(long)]
         repo: Option<PathBuf>,
@@ -7023,8 +7037,8 @@ enum Commands {
         #[arg(long)]
         diff: Option<String>,
         /// Minimum severity to include: breaking, warning, info
-        #[arg(long, default_value = "info")]
-        min_severity: String,
+        #[arg(long, value_enum, ignore_case = true, default_value_t = PrePushMinSeverity::Info)]
+        min_severity: PrePushMinSeverity,
         /// Override auto-detected repo URL for canonical ID computation
         #[arg(long)]
         repo_url: Option<String>,
@@ -7414,7 +7428,7 @@ enum Commands {
     #[command(after_help = "Examples:\n  nestweaver list-features --config ./instance.toml")]
     ListFeatures {
         #[arg(long, help = "Path to instance config file")]
-        config: Option<PathBuf>,
+        config: PathBuf,
         #[arg(long, help = "Output as JSON")]
         json: bool,
     },
@@ -16906,12 +16920,43 @@ fn main() {
 /// Print the degraded impact-analysis JSON shape (`{"impacts": [], "error": …}`)
 /// when `format == "json"`, so the server-unavailable / store-unavailable /
 /// analysis-failed fallback paths all emit an identical, consumer-parseable shape.
-fn print_impact_degraded_json(format: &str, reason: &str) -> anyhow::Result<()> {
-    if format == "json" {
+fn print_impact_degraded_json(json: bool, reason: &str) -> anyhow::Result<()> {
+    if json {
         let output = serde_json::json!({ "impacts": [], "error": reason });
         println!("{}", serde_json::to_string_pretty(&output)?);
     }
     Ok(())
+}
+
+/// A `pre-push-impact` severity label, in its ANSI colour only when `color`.
+fn severity_label(label: &str, ansi: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[{ansi}m{label}\x1b[0m")
+    } else {
+        label.to_string()
+    }
+}
+
+/// Files `pre-push-impact` saw changed: the working tree and index against
+/// HEAD, or the `--diff` range. 0 when git cannot say.
+fn pre_push_changed_file_count(repo_path: &Path, diff: Option<&str>) -> usize {
+    let range = diff.unwrap_or("HEAD");
+    if range.starts_with('-') {
+        return 0;
+    }
+    std::process::Command::new("git")
+        .args(["diff", "--name-only", "-z", range, "--"])
+        .current_dir(repo_path)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map_or(0, |output| {
+            output
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .count()
+        })
 }
 
 /// The coverage caveat every incomplete-impact disclosure ends with.
@@ -19424,9 +19469,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         }
 
         Commands::ListFeatures { config, json } => {
-            let config_path =
-                config.ok_or_else(|| anyhow::anyhow!("--config is required for list-features"))?;
-            let instance_config = nestweaver_engine::InstanceConfig::from_file(&config_path)?;
+            let instance_config = nestweaver_engine::InstanceConfig::from_file(&config)?;
             let features = instance_config.features.unwrap_or_default();
 
             if json {
@@ -21107,6 +21150,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
             InteractionCommands::Show { uid, top, kind, db } => {
+                if uid.is_none() && top.is_none() {
+                    // A usage error, like any other missing argument.
+                    eprintln!("Provide --uid <uid> or --top <N> [--kind <kind>].");
+                    return Ok((EXIT_USAGE, None));
+                }
                 // History lives beside the graph the daemon serves: follow the
                 // publication CURRENT, not a base left behind by a rebuild.
                 let db_path = selected_db_path(&db.unwrap_or_else(default_db_path))?;
@@ -21146,8 +21194,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                     }
                 } else {
-                    eprintln!("Provide --uid <uid> or --top <N> [--kind <kind>].");
-                    Ok((EXIT_ERROR, None))
+                    unreachable!("checked above: --uid or --top is present")
                 }
             }
         },
@@ -23850,8 +23897,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             if !local_changes && diff.is_none() {
                 eprintln!("error: --local-changes or --diff is required");
-                return Ok((EXIT_ERROR, None));
+                return Ok((EXIT_USAGE, None));
             }
+            let json = format == PrePushFormat::Json;
 
             let repo_path = repo.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             if !repo_path.join(".git").exists() {
@@ -23884,18 +23932,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
 
             if changes.is_empty() {
+                // Changed files with no symbol-level change (docs, config, a
+                // body edit the differ does not see) are not "no changes".
+                let changed_files = pre_push_changed_file_count(&repo_path, diff.as_deref());
                 if !out.quiet {
+                    let message = if changed_files == 0 {
+                        "No local changes detected.".to_string()
+                    } else {
+                        format!(
+                            "{changed_files} file(s) changed, but no symbol-level changes were detected; nothing to analyze."
+                        )
+                    };
                     // In JSON mode, status text must go to stderr so stdout
                     // stays a single clean JSON document for jq / format-comment.
-                    if format == "json" {
-                        eprintln!("No local changes detected.");
+                    if json {
+                        eprintln!("{message}");
                     } else {
-                        println!("No local changes detected.");
+                        println!("{message}");
                     }
                 }
-                if format == "json" {
+                if json {
                     let output = serde_json::json!({
                         "changes": 0,
+                        "changed_files": changed_files,
                         "impacts": [],
                         "total_impacted_files": 0,
                         "total_impacted_repos": 0,
@@ -23907,7 +23966,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // Dry-run mode: show the atomic changes without running impact analysis
             if dry_run {
-                if format == "json" {
+                if json {
                     let output = serde_json::json!({
                         "dry_run": true,
                         "changes": changes,
@@ -23930,7 +23989,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             if !out.quiet {
                 // Keep stdout clean for JSON consumers; route progress to stderr.
-                if format == "json" {
+                if json {
                     eprintln!("  Analyzing {} change(s)...", changes.len());
                 } else {
                     println!("  Analyzing {} change(s)...", changes.len());
@@ -23938,10 +23997,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             // Parse min_severity
-            let min_sev = match min_severity.to_lowercase().as_str() {
-                "breaking" => ImpactSeverity::Breaking,
-                "warning" => ImpactSeverity::Warning,
-                _ => ImpactSeverity::Info,
+            let min_sev = match min_severity {
+                PrePushMinSeverity::Breaking => ImpactSeverity::Breaking,
+                PrePushMinSeverity::Warning => ImpactSeverity::Warning,
+                PrePushMinSeverity::Info => ImpactSeverity::Info,
             };
 
             // Run impact analysis — either against a remote server or the local store
@@ -24012,7 +24071,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "warning: Server unavailable — skipping impact analysis ({})",
                             e
                         );
-                        print_impact_degraded_json(&format, "server_unavailable")?;
+                        print_impact_degraded_json(json, "server_unavailable")?;
                         return Ok((EXIT_SUCCESS, None));
                     }
                 }
@@ -24028,7 +24087,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "warning: failed to open store, skipping impact analysis ({})",
                             e
                         );
-                        print_impact_degraded_json(&format, "store_unavailable")?;
+                        print_impact_degraded_json(json, "store_unavailable")?;
                         return Ok((EXIT_SUCCESS, None));
                     }
                 };
@@ -24045,7 +24104,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             return Err(anyhow::anyhow!("impact analysis failed: {}", e));
                         }
                         eprintln!("warning: impact analysis failed, skipping ({})", e);
-                        print_impact_degraded_json(&format, "analysis_failed")?;
+                        print_impact_degraded_json(json, "analysis_failed")?;
                         return Ok((EXIT_SUCCESS, None));
                     }
                 }
@@ -24059,7 +24118,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Filter by minimum severity
             let impacts = nestweaver_engine::diff_impact::filter_by_severity(impacts, min_sev);
 
-            if format == "json" {
+            if json {
                 let output = serde_json::json!({
                     "changes": changes.len(),
                     "impacts": impacts,
@@ -24088,25 +24147,34 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         .filter(|i| i.severity == ImpactSeverity::Info)
                         .collect();
 
+                    // --no-color, --plain, NO_COLOR and a non-TTY stdout all
+                    // mean plain labels.
+                    let color = out.color && std::io::stdout().is_terminal();
                     println!();
                     for impact in &breaking {
                         println!(
-                            "  \x1b[31mBREAKING\x1b[0m: {} — {}",
-                            impact.affected_name, impact.reason
+                            "  {}: {} — {}",
+                            severity_label("BREAKING", "31", color),
+                            impact.affected_name,
+                            impact.reason
                         );
                         println!("    {}:{}", impact.affected_file, impact.affected_line);
                     }
                     for impact in &warnings {
                         println!(
-                            "  \x1b[33mWARNING\x1b[0m: {} — {}",
-                            impact.affected_name, impact.reason
+                            "  {}: {} — {}",
+                            severity_label("WARNING", "33", color),
+                            impact.affected_name,
+                            impact.reason
                         );
                         println!("    {}:{}", impact.affected_file, impact.affected_line);
                     }
                     for impact in &info {
                         println!(
-                            "  \x1b[34mINFO\x1b[0m: {} — {}",
-                            impact.affected_name, impact.reason
+                            "  {}: {} — {}",
+                            severity_label("INFO", "34", color),
+                            impact.affected_name,
+                            impact.reason
                         );
                         println!("    {}:{}", impact.affected_file, impact.affected_line);
                     }
