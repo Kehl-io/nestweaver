@@ -390,11 +390,20 @@ pub fn memory_lint(store: &GraphStore, now_epoch: f64) -> Result<MemoryLintRepor
     }
     // Build a title→uid index + the uid set to resolve frontmatter references.
     let mut by_title: HashMap<String, Vec<&str>> = HashMap::new();
+    let mut by_path: HashMap<String, Vec<&str>> = HashMap::new();
     for n in &notes {
         by_title
             .entry(n.title.to_lowercase())
             .or_default()
             .push(n.uid.as_str());
+        let path = n.file_path.replace('\\', "/").to_lowercase();
+        if let Some(stem) = path.strip_suffix(".md") {
+            by_path
+                .entry(stem.to_string())
+                .or_default()
+                .push(n.uid.as_str());
+        }
+        by_path.entry(path).or_default().push(n.uid.as_str());
     }
     for n in &notes {
         let Some(fm) = n.frontmatter.as_deref() else {
@@ -410,7 +419,7 @@ pub fn memory_lint(store: &GraphStore, now_epoch: f64) -> Result<MemoryLintRepor
             ("relates_to", "RELATES_TO"),
         ] {
             for reference in frontmatter_refs(&json, key) {
-                let resolved = resolve_reference(&reference, &uid_set, &by_title);
+                let resolved = resolve_reference(&reference, &uid_set, &by_title, &by_path);
                 if resolved.is_none() {
                     dangling_relationships.push(DanglingRelationship {
                         source_uid: n.uid.clone(),
@@ -460,19 +469,24 @@ fn frontmatter_refs(json: &serde_json::Value, key: &str) -> Vec<String> {
     }
 }
 
-/// Resolve a frontmatter reference (note UID or title) against the vault.
-/// Returns `None` when it matches no note (a dangling relationship).
+/// Resolve a frontmatter reference (note UID, vault-relative path, or title,
+/// optionally written as an Obsidian `[[link|alias]]`) against the vault — the
+/// same forms typed-edge derivation accepts. Returns `None` when it matches no
+/// note (a dangling relationship).
 fn resolve_reference(
     reference: &str,
     uid_set: &HashSet<&str>,
     by_title: &HashMap<String, Vec<&str>>,
+    by_path: &HashMap<String, Vec<&str>>,
 ) -> Option<String> {
-    let raw = reference.trim();
+    let raw = crate::index_md::frontmatter_link_target(reference);
     if uid_set.contains(raw) {
         return Some(raw.to_string());
     }
-    by_title
-        .get(&raw.to_lowercase())
+    let key = raw.replace('\\', "/").to_lowercase();
+    by_path
+        .get(&key)
+        .or_else(|| by_title.get(&key))
         .and_then(|uids| uids.first().map(|u| u.to_string()))
 }
 
@@ -2594,10 +2608,20 @@ mod tests {
         // vault is a dangling relationship. (The graph store cannot physically
         // hold an edge to a missing node, so detection works off the declared
         // frontmatter intent.)
-        let (_dir, root) = make_vault(&[(
-            "Orphaned.md",
-            "---\ndepends_on: [Nonexistent Note]\n---\n# Orphaned\n",
-        )]);
+        let (_dir, root) = make_vault(&[
+            (
+                "Orphaned.md",
+                "---\ndepends_on: [Nonexistent Note]\n---\n# Orphaned\n",
+            ),
+            // Obsidian link syntax resolves: path, alias and heading forms.
+            (
+                "Linked.md",
+                "---\ndepends_on: \"[[Projects/Billing|Billing]]\"\n\
+                 caused_by: [\"[[Projects/Billing#Costs]]\"]\n\
+                 relates_to: \"[[Orphaned]]\"\n---\n# Linked\n",
+            ),
+            ("Projects/Billing.md", "# Billing\n\n## Costs\n"),
+        ]);
         let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
         let report = memory_lint(&store, 1_900_000_000.0).unwrap();
         assert!(
@@ -2608,6 +2632,48 @@ mod tests {
             "expected a dangling relationship for the missing target, got {:?}",
             report.dangling_relationships
         );
+        assert!(
+            !report
+                .dangling_relationships
+                .iter()
+                .any(|d| d.target_uid.contains("[[")),
+            "an Obsidian-link reference to an existing note is not dangling: {:?}",
+            report.dangling_relationships
+        );
+
+        // And the same references derive typed edges, so related finds them.
+        let linked = uid_for(&store, "Linked");
+        let billing = uid_for(&store, "Billing");
+        let orphaned = uid_for(&store, "Orphaned");
+        let edges = store.typed_note_edges().unwrap();
+        for (target, edge_type) in [
+            (&billing, "DEPENDS_ON"),
+            (&billing, "CAUSED_BY"),
+            (&orphaned, "RELATES_TO"),
+        ] {
+            assert!(
+                edges
+                    .iter()
+                    .any(|(s, t, et)| s == &linked && t == target && et == edge_type),
+                "expected Linked {edge_type} {target}, got {edges:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn frontmatter_link_target_strips_only_link_syntax() {
+        use crate::index_md::frontmatter_link_target;
+        assert_eq!(
+            frontmatter_link_target(" [[Projects/Billing]] "),
+            "Projects/Billing"
+        );
+        assert_eq!(frontmatter_link_target("[[Billing|alias]]"), "Billing");
+        assert_eq!(
+            frontmatter_link_target("[[Billing#Costs|alias]]"),
+            "Billing"
+        );
+        assert_eq!(frontmatter_link_target("C# notes"), "C# notes");
+        assert_eq!(frontmatter_link_target("a|b"), "a|b");
     }
 
     #[test]
