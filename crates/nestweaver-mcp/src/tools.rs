@@ -14789,11 +14789,20 @@ fn git_command_for_indexed_path(path: &Path) -> std::process::Command {
     // `core.fsmonitor` names a program git would run. `-c` outranks any
     // repository config. No inspection command fires hooks today; pinning
     // `core.hooksPath` keeps a later index-writing command from doing so.
+    //
+    // `core.fsmonitor` is empty rather than `false`: before Git 2.36 the value
+    // is a hook path, and `false` would run /bin/false. Auto-maintenance is
+    // off too: its worktree-prune task follows a symlink planted in
+    // `worktrees/` and deletes the repository it points to.
     command.args([
         "-c",
-        "core.fsmonitor=false",
+        "core.fsmonitor=",
         "-c",
         "core.hooksPath=/dev/null",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "gc.auto=0",
         "-c",
         "diff.ignoreSubmodules=all",
     ]);
@@ -15604,11 +15613,16 @@ mod affected_tests_base_ref_tests {
     /// global config. CI runners configure Git LFS globally, which collided
     /// with fixture filter names; under that config native Git also deleted a
     /// forged layout's victim HEAD, so baselines measured the runner, not Git.
+    ///
+    /// Auto-maintenance is off as well: a fixture commit spawns detached
+    /// maintenance whose worktree-prune task follows the symlink planted in
+    /// `worktrees/` and deletes the victim repository mid-test.
     fn fixture_git() -> std::process::Command {
         let mut command = std::process::Command::new("git");
         command
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"]);
         command
     }
 
@@ -16265,6 +16279,30 @@ mod affected_tests_base_ref_tests {
         std::os::unix::fs::symlink(shared_hooks.path(), &hooks).unwrap();
         std::fs::write(hooked.path().join("tracked.txt"), "after\n").unwrap();
         assert_diffs_tracked_file(hooked.path(), "symlinked-hooks");
+    }
+
+    /// Repository config must not name programs or start maintenance: before
+    /// Git 2.36 `core.fsmonitor=false` ran /bin/false, and auto-maintenance's
+    /// worktree-prune follows planted `worktrees/` symlinks into other repos.
+    #[test]
+    fn inspection_git_pins_programs_and_maintenance_off() {
+        let command = git_command_for_indexed_path(Path::new("."));
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        for pinned in [
+            "core.fsmonitor=",
+            "core.hooksPath=/dev/null",
+            "maintenance.auto=false",
+            "gc.auto=0",
+        ] {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "-c" && pair[1] == pinned),
+                "missing -c {pinned}: {args:?}"
+            );
+        }
     }
 
     /// Global entries must be forwarded even though every Git subprocess here
