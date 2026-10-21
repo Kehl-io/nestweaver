@@ -20,10 +20,7 @@ pub fn parse_drain_ceiling(raw: &str) -> u64 {
 /// Read `NESTWEAVER_DRAIN_TIMEOUT_SECS` from the environment, falling back to
 /// the shared default when unset or invalid.
 pub fn drain_ceiling_from_env() -> u64 {
-    std::env::var("NESTWEAVER_DRAIN_TIMEOUT_SECS")
-        .ok()
-        .as_deref()
-        .map(parse_drain_ceiling)
+    crate::env::env_parse::<u64>("NESTWEAVER_DRAIN_TIMEOUT_SECS")
         .unwrap_or(DEFAULT_DRAIN_CEILING_SECS)
 }
 

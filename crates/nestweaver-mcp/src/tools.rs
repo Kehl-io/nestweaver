@@ -21683,9 +21683,7 @@ thread_local! {
 fn env_index_publication_wait_ms() -> u64 {
     const DEFAULT_MS: u64 = 3_000;
     const MAX_MS: u64 = 30_000;
-    std::env::var("NESTWEAVER_INDEX_PUBLICATION_WAIT_MS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
+    nestweaver_schema::env::env_parse::<u64>("NESTWEAVER_INDEX_PUBLICATION_WAIT_MS")
         .unwrap_or(DEFAULT_MS)
         .min(MAX_MS)
 }

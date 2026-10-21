@@ -39,6 +39,20 @@ fn refuse_invalid_source_name(name: Option<&str>) -> Option<i32> {
     Some(EXIT_USAGE)
 }
 
+/// Without `--name`, `brain add` registers a new vault under the folder's own
+/// name, so that name is held to the `--name` rule. Refusing it here keeps a
+/// control character in a folder name a usage error rather than a refusal
+/// from inside the index. (A refresh keeps the stored name, so only `add`
+/// checks; the engine refuses an unstorable effective name on every route.)
+fn refuse_invalid_folder_name(folder_name: &str) -> Option<i32> {
+    let problem = nestweaver_schema::source_name_problem(folder_name)?;
+    eprintln!(
+        "Error: the folder name {folder_name:?} cannot be used as a vault name: {problem}. \
+         Pass --name to register it under another name."
+    );
+    Some(EXIT_USAGE)
+}
+
 pub(crate) fn run_brain(
     command: BrainCommands,
     out: &OutputConfig,
@@ -81,6 +95,9 @@ pub(crate) fn run_brain(
             } else {
                 String::new()
             };
+            if !name_given && let Some(code) = refuse_invalid_folder_name(&vault_name) {
+                return Ok((code, None));
+            }
 
             if !path.exists() {
                 eprintln!("Error: path does not exist: {}", path.display());
@@ -3644,6 +3661,19 @@ pub(crate) fn daemon_runtime_status_lines(status: &serde_json::Value) -> Vec<Str
 pub(crate) fn vault_derivation_status_lines(status: &serde_json::Value) -> Vec<String> {
     let derivation = status.get("vault_derivation");
     let mut lines = Vec::new();
+    if let Some(foreign) = derivation.and_then(|derivation| derivation.get("foreign_records")) {
+        let instance = foreign
+            .get("daemon_instance")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        lines.push(format!(
+            "Vault derivation DEGRADED: the Markdown link records belong to a different \
+             instance than the running daemon's ({instance}), so link-graph tools refuse every \
+             vault. If the daemon was started with a --config whose instance_id differs from \
+             this database's, run `nestweaver daemon stop`, then `nestweaver daemon start \
+             --reset` (or --config naming the matching instance)."
+        ));
+    }
     if let Some(running) = derivation
         .and_then(|derivation| derivation.get("in_progress"))
         .filter(|running| running.is_object())
@@ -3766,6 +3796,23 @@ mod vault_derivation_status_tests {
         assert!(lines[0].contains("phase: refreshing notes"), "{}", lines[0]);
         assert!(lines[0].contains("4000 note(s)"), "{}", lines[0]);
         assert!(lines[0].contains("running 12s"), "{}", lines[0]);
+    }
+
+    /// QA: records stamped under another instance (a daemon autostarted by a
+    /// one-off `--config` naming a different instance_id) made every
+    /// link-graph read fail with ForeignRecord while status showed nothing.
+    #[test]
+    fn foreign_records_get_a_degraded_line_naming_the_fix() {
+        let status = serde_json::json!({
+            "vault_derivation": {
+                "foreign_records": { "daemon_instance": "other", "instance_stated_by_config": true }
+            }
+        });
+        let lines = vault_derivation_status_lines(&status);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("DEGRADED"), "{}", lines[0]);
+        assert!(lines[0].contains("(other)"), "{}", lines[0]);
+        assert!(lines[0].contains("daemon start --reset"), "{}", lines[0]);
     }
 
     /// Counterweight: no Blocked vault, no line.

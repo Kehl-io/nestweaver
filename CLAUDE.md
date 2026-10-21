@@ -224,6 +224,10 @@ by an error message the tool can print, so they belong somewhere findable.
 | `NESTWEAVER_CRASH_REPORT_DIRS` | platform | Extra directories scanned by `diagnostics capabilities` for nw-073 crash recurrence. |
 | `NESTWEAVER_GIT_CLONE_TIMEOUT_SECS` / `NESTWEAVER_GIT_NET_TIMEOUT_SECS` | — | Bounds on git clone / network operations during pull. |
 
+An unparsable or out-of-range value for a numeric variable above is ignored
+and the default used, with a one-time warning naming the variable (it used to
+be silent). An empty `NESTWEAVER_DB=` counts as unset.
+
 Server mode additionally reads `NESTWEAVER_BIND`, `NESTWEAVER_TOKEN`,
 `NESTWEAVER_ADMIN_TOKEN`, `NESTWEAVER_UPSTREAM`, and
 `NESTWEAVER_WEBHOOK_SECRET` / `NESTWEAVER_WEBHOOK_SECRET_OLD` (rotation).

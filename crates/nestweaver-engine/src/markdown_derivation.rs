@@ -204,9 +204,20 @@ pub struct DerivationUnavailable {
 /// admission error stays safe across authorization boundaries.
 fn admission_remedy(reason: AdmissionReason) -> &'static str {
     match reason {
-        AdmissionReason::ForeignRecord
-        | AdmissionReason::SourceBlocked
-        | AdmissionReason::RecordInvalid => {
+        // The common cause of a foreign record is not a damaged sidecar but a
+        // daemon running under ANOTHER instance: a one-off command with a
+        // `--config` whose instance_id differs from the database's autostarts
+        // the daemon under that config, and later configless starts reuse it.
+        // Name that fix first, because a refresh under the wrong instance
+        // does not help.
+        AdmissionReason::ForeignRecord => {
+            "; the records were written under a different instance than the running daemon's. \
+             If the daemon was started with a --config whose instance_id differs from this \
+             database's, restart it under the database's own: `nestweaver daemon stop`, then \
+             `nestweaver daemon start --reset` (or --config naming the matching instance). \
+             Otherwise run a full `nestweaver brain refresh <vault>` to re-derive it"
+        }
+        AdmissionReason::SourceBlocked | AdmissionReason::RecordInvalid => {
             "; run a full `nestweaver brain refresh <vault>` to re-derive it"
         }
         _ => "",

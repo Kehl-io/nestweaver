@@ -49,9 +49,7 @@ pub fn git_clone_timeout() -> Duration {
 
 fn env_secs(var: &str, default: u64) -> Duration {
     Duration::from_secs(
-        std::env::var(var)
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
+        nestweaver_schema::env::env_parse::<u64>(var)
             .filter(|s| *s > 0)
             .unwrap_or(default),
     )

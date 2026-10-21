@@ -32,6 +32,12 @@ pub(crate) fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                 None
             };
 
+            // Absolute, lexically (a symlink at the destination is replaced,
+            // not followed): the daemon route resolves a relative path in the
+            // daemon's working directory, not the caller's.
+            let output = std::path::absolute(&output).with_context(|| {
+                format!("failed to resolve backup destination {}", output.display())
+            })?;
             let config = nestweaver_engine::BackupConfig {
                 db_path: db_path.clone(),
                 output_path: output,

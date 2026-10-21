@@ -7625,6 +7625,15 @@ impl NestWeaverDaemon for DaemonService {
         if req.output_path.trim().is_empty() {
             return Err(Status::invalid_argument("output_path is required"));
         }
+        // A relative path would resolve against the daemon's CWD, not the
+        // caller's, and write the archive somewhere the caller never named.
+        if !std::path::Path::new(&req.output_path).is_absolute() {
+            return Err(Status::invalid_argument(format!(
+                "output_path must be absolute, got '{}': the daemon cannot resolve a path \
+                 relative to the caller's working directory",
+                req.output_path
+            )));
+        }
         let config = nestweaver_engine::BackupConfig {
             db_path: self.state.db_path.clone(),
             output_path: std::path::PathBuf::from(&req.output_path),
@@ -8609,9 +8618,7 @@ impl NestWeaverDaemon for DaemonService {
         // response stream open forever.
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let index_timeout = std::time::Duration::from_secs(
-            std::env::var("NESTWEAVER_INDEX_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
+            nestweaver_schema::env::env_parse::<u64>("NESTWEAVER_INDEX_TIMEOUT_SECS")
                 .filter(|s| *s > 0)
                 .unwrap_or(1800),
         );
@@ -15345,6 +15352,21 @@ pub async fn run_server(
         };
         match opened {
             Ok(s) => s,
+            // A damaged file is not a lock conflict, and retrying it never
+            // helps: say so instead of the lock guess and the engine's own
+            // "may be checkpointing; please retry later".
+            Err(nestweaver_store::StoreError::Corruption(corruption)) => {
+                let detail = format!("{}: {}", corruption.kind, corruption.detail)
+                    .replace(" The database may be checkpointing; please retry later.", "")
+                    .replace("The database may be checkpointing; please retry later.", "");
+                anyhow::bail!(
+                    "failed to open database at {}: it is damaged ({}). This is not \
+                     transient; retrying or restarting the daemon will not help. Restore it \
+                     from a backup (`nestweaver backup restore`) or rebuild it.",
+                    db_path.display(),
+                    detail.trim_end()
+                );
+            }
             Err(e) => {
                 return Err(e).with_context(|| {
                     format!(

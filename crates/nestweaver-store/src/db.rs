@@ -1355,9 +1355,7 @@ const _: () = {
 };
 
 fn env_u64(key: &str) -> Option<u64> {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
+    nestweaver_schema::env::env_parse::<u64>(key)
 }
 
 /// The address-space bound EVERY open needs, write-capable or not.
@@ -1432,7 +1430,7 @@ fn engine_max_threads() -> u64 {
 /// every store open in the binary reads. That is the whole property the test
 /// this replaces was reaching for.
 fn parse_max_threads(raw: Option<&str>) -> u64 {
-    raw.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1)
+    nestweaver_schema::env::parse_env_value::<u64>("NESTWEAVER_LBUG_MAX_THREADS", raw).unwrap_or(1)
 }
 
 fn hardened_system_config() -> lbug::SystemConfig {
@@ -1457,6 +1455,13 @@ fn hardened_system_config() -> lbug::SystemConfig {
     // alone.
     if let Ok(v) = std::env::var("NESTWEAVER_LBUG_AUTO_CHECKPOINT") {
         let on = !matches!(v.trim(), "0" | "false" | "off");
+        if !matches!(v.trim(), "0" | "false" | "off" | "1" | "true" | "on") {
+            nestweaver_schema::env::warn_invalid_env_once(
+                "NESTWEAVER_LBUG_AUTO_CHECKPOINT",
+                &v,
+                "expected 0/false/off or 1/true/on (treated as on)",
+            );
+        }
         cfg = cfg.auto_checkpoint(on);
     }
     #[cfg(test)]

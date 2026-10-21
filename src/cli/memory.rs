@@ -102,13 +102,7 @@ pub(crate) fn run_memory(
                         .map(|items| items.len() as u64)
                 })
                 .unwrap_or(0);
-            let failed_apply = apply
-                && !payload
-                    .get("applied")
-                    .and_then(|applied| applied.as_bool())
-                    .unwrap_or(false)
-                && proposal_count > 0;
-            if failed_apply {
+            if apply && consolidate_apply_failed(&payload, proposal_count) {
                 anyhow::bail!(
                     "memory consolidation apply did not complete; review the warnings above and recover the durable journal before retrying"
                 );
@@ -388,5 +382,46 @@ pub(crate) fn print_memory_related_text(uid: &str, payload: &serde_json::Value) 
             r["file_path"].as_str().unwrap_or("?"),
             r["via_edge"].as_str().unwrap_or("?")
         );
+    }
+}
+
+/// Whether `memory consolidate --apply` failed, keyed on the tool's own
+/// `apply_errors` flag like its MCP twin. "Nothing to apply" (every proposal
+/// a stale-graph SKIPPED row, or none at all) leaves `applied` false too, and
+/// used to exit 1 "apply did not complete" though nothing had failed. A
+/// payload without the flag (an older daemon) keeps the previous rule.
+fn consolidate_apply_failed(payload: &serde_json::Value, proposal_count: u64) -> bool {
+    let applied = payload
+        .get("applied")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if applied {
+        return false;
+    }
+    match payload
+        .get("apply_errors")
+        .and_then(serde_json::Value::as_bool)
+    {
+        Some(errors) => errors,
+        None => proposal_count > 0,
+    }
+}
+
+#[cfg(test)]
+mod consolidate_exit_tests {
+    use super::consolidate_apply_failed;
+    use serde_json::json;
+
+    #[test]
+    fn nothing_to_apply_is_not_a_failed_apply() {
+        let skipped_only = json!({"dry_run": false, "applied": false, "apply_errors": false});
+        assert!(!consolidate_apply_failed(&skipped_only, 3));
+        let failed = json!({"dry_run": false, "applied": false, "apply_errors": true});
+        assert!(consolidate_apply_failed(&failed, 3));
+        let done = json!({"dry_run": false, "applied": true, "apply_errors": false});
+        assert!(!consolidate_apply_failed(&done, 3));
+        // An older payload without the flag keeps the previous rule.
+        assert!(consolidate_apply_failed(&json!({"applied": false}), 1));
+        assert!(!consolidate_apply_failed(&json!({"applied": false}), 0));
     }
 }

@@ -1306,7 +1306,7 @@ impl InstanceConfig {
     }
 
     pub fn from_file(path: &std::path::Path) -> Result<Self, anyhow::Error> {
-        let contents = std::fs::read_to_string(path)?;
+        let contents = read_bounded_config(path)?;
         let mut config = Self::from_toml_str(&contents)?;
         if let Some(db) = config.db.as_deref() {
             config.db = Some(
@@ -1317,6 +1317,28 @@ impl InstanceConfig {
         }
         Ok(config)
     }
+}
+
+/// Largest instance config read, in bytes. A real config is a few KiB; the
+/// bound exists so `--config /dev/zero` (or a mistyped multi-GB file) fails
+/// promptly instead of reading until memory runs out.
+pub const MAX_INSTANCE_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+
+fn read_bounded_config(path: &std::path::Path) -> Result<String, anyhow::Error> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_INSTANCE_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_INSTANCE_CONFIG_BYTES {
+        anyhow::bail!(
+            "{} is larger than {} MiB, which no instance config is; refusing to read it",
+            path.display(),
+            MAX_INSTANCE_CONFIG_BYTES / (1024 * 1024)
+        );
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("{} is not valid UTF-8", path.display()))
 }
 
 // File configuration paths follow the canonical config's directory; raw TOML
