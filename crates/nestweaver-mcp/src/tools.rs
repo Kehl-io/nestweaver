@@ -21312,7 +21312,7 @@ fn tool_blast_radius(
 fn tool_schema_get_summary() -> Value {
     json!({
         "name": "get_summary",
-        "description": "Generate deterministic architectural summaries at three granularity levels: symbol, file, or cluster. Derived from graph data, no LLM needed.\n\nGuidelines:\n- level 'symbol' = per-function/class with callers/callees (at most 3 module-owner callers `path::<module>`, then `+N more files' top-level code`), 'file' = per-file exports, 'cluster' = community architecture\n- Use target to filter to a specific file, symbol, or cluster name\n- Use token_budget to cap output size for context windows\n\nLimitations:\n- Summaries reflect indexed graph state — may be stale if index is behind HEAD\n- For specific symbol source code use read_symbols; for call chains use flow_trace",
+        "description": "Generate deterministic architectural summaries at four levels: symbol, file, cluster, or hub. Derived from graph data, no LLM needed.\n\nGuidelines:\n- level 'symbol' = per-function/class with callers/callees (at most 3 module-owner callers `path::<module>`, then `+N more files' top-level code`), 'file' = per-file exports, 'cluster' = community architecture, 'hub' = top hub nodes with call-graph shape and role\n- Use target to filter to a specific file, symbol, or cluster name\n- Use token_budget to cap output size for context windows\n\nLimitations:\n- Summaries reflect indexed graph state — may be stale if index is behind HEAD\n- For specific symbol source code use read_symbols; for call chains use flow_trace",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,

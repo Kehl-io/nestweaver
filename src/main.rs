@@ -7975,9 +7975,10 @@ enum Commands {
     },
     /// Generate hierarchical code summaries for token-efficient retrieval
     ///
-    /// Creates deterministic, compact summaries at three levels: symbol
-    /// (function/class details), file (exports and imports), and cluster
-    /// (community architecture). No LLM needed -- summaries are derived
+    /// Creates deterministic, compact summaries at four levels: symbol
+    /// (function/class details), file (exports and imports), cluster
+    /// (community architecture), and hub (top hub nodes with call-graph
+    /// shape and role). No LLM needed -- summaries are derived
     /// entirely from graph data.
     #[command(
         after_help = "Examples:\n  nestweaver summary --level symbol\n  nestweaver summary --level file --json\n  nestweaver summary --level cluster --token-budget 2000"

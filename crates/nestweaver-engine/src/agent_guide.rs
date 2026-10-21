@@ -974,8 +974,8 @@ fn render_dynamic_tool_tables(out: &mut String, tool_docs: &[ToolDocEntry]) {
                 } else {
                     tool.key_params.join(", ")
                 };
-                // Truncate purpose to first ~120 chars for table readability
-                let purpose_short: String = tool.purpose.chars().take(120).collect();
+                // ~120 chars for table readability, cut on a word boundary.
+                let purpose_short = short_purpose(&tool.purpose, 120);
                 out.push_str(&format!(
                     "| `{}` | {} | {} |\n",
                     tool.name, purpose_short, params
@@ -984,6 +984,26 @@ fn render_dynamic_tool_tables(out: &mut String, tool_docs: &[ToolDocEntry]) {
             out.push('\n');
         }
     }
+}
+
+/// A tool purpose shortened to at most `max_chars` characters for a table
+/// cell. QA #11: a hard character cut published fragments such as "Retur"
+/// into every generated guide. A purpose that fits is returned whole; one
+/// whose first sentence fits is cut there; otherwise the cut falls on the
+/// last word boundary and is marked with an ellipsis.
+fn short_purpose(purpose: &str, max_chars: usize) -> String {
+    let purpose = purpose.trim();
+    if purpose.chars().count() <= max_chars {
+        return purpose.to_string();
+    }
+    let window: String = purpose.chars().take(max_chars).collect();
+    if let Some(end) = window.find(". ") {
+        return window[..=end].to_string();
+    }
+    let cut = window
+        .rfind(char::is_whitespace)
+        .map_or(window.as_str(), |space| &window[..space]);
+    format!("{}\u{2026}", cut.trim_end_matches([',', ';', ':', ' ']))
 }
 
 /// Render the legacy hardcoded tool tables (used when no dynamic metadata is available).
@@ -1287,6 +1307,24 @@ pub fn generate_agents_md_with_rules(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn short_purpose_never_cuts_mid_word() {
+        use super::short_purpose;
+        assert_eq!(short_purpose("Short one.", 120), "Short one.");
+        let long = "Find notes and symbols by keyword. Returns ranked rows with UIDs for every follow-up call an agent may want to make later on.";
+        assert_eq!(short_purpose(long, 60), "Find notes and symbols by keyword.");
+        let no_sentence = "Trace reverse dependencies of a symbol to understand what might break if it changes and Returns confidence";
+        assert_eq!(
+            short_purpose(no_sentence, 100),
+            "Trace reverse dependencies of a symbol to understand what might break if it changes and Returns\u{2026}"
+        );
+        // A cut inside the word keeps the whole word out rather than "Retur".
+        assert_eq!(
+            short_purpose(no_sentence, 92),
+            "Trace reverse dependencies of a symbol to understand what might break if it changes and\u{2026}"
+        );
+    }
+
     use super::*;
 
     const SECRET_CONFIG: &str = r#"
