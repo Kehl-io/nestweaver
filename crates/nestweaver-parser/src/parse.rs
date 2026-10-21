@@ -15104,6 +15104,50 @@ export function G(a) {\n\
     }
 
     #[test]
+    fn go_method_parent_is_its_receiver_type() {
+        let source = "package calc\n\ntype Impl struct{ base int }\n\nfunc (i *Impl) Add(a, b int) int { return i.base + a + b }\n\nfunc (l List[T]) Len() int { return 0 }\n\nfunc New(b int) *Impl { return &Impl{base: b} }\n";
+        let parsed = parse_source(Path::new("calc/calc.go"), source).unwrap();
+        let symbol = |name: &str| parsed.symbols.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(symbol("Add").parent_name.as_deref(), Some("Impl"));
+        assert_eq!(symbol("Len").parent_name.as_deref(), Some("List"));
+        assert_eq!(symbol("New").parent_name, None);
+        assert_eq!(
+            symbol("New")
+                .type_info
+                .as_ref()
+                .and_then(|info| info.return_type.as_deref()),
+            Some("*Impl"),
+            "a one-line body is not part of the return type"
+        );
+    }
+
+    #[test]
+    fn one_line_declarations_keep_only_the_declared_return_type() {
+        let ts = parse_source(
+            Path::new("a.ts"),
+            "export class K {\n  m1(): K { return this; }\n  static make(): K { return new K(); }\n}\n",
+        )
+        .unwrap();
+        let rust = parse_source(
+            Path::new("src/lib.rs"),
+            "pub struct Dog;\nimpl Dog {\n    pub fn new() -> Self { Dog }\n}\n",
+        )
+        .unwrap();
+        let python = parse_source(Path::new("m.py"), "def make() -> K: return K()\n").unwrap();
+        let ret = |symbols: &[RawSymbol], name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name == name)
+                .and_then(|s| s.type_info.as_ref())
+                .and_then(|info| info.return_type.clone())
+        };
+        assert_eq!(ret(&ts.symbols, "m1").as_deref(), Some("K"));
+        assert_eq!(ret(&ts.symbols, "make").as_deref(), Some("K"));
+        assert_eq!(ret(&rust.symbols, "new").as_deref(), Some("Self"));
+        assert_eq!(ret(&python.symbols, "make").as_deref(), Some("K"));
+    }
+
+    #[test]
     fn rust_turbofish_method_call_keeps_its_receiver() {
         let source =
             "fn f(x: &str) { let _ = x.parse::<u32>(); generic::<u8>(1); T::make::<u8>(); }\n";
