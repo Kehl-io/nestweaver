@@ -1298,6 +1298,79 @@ pub(crate) fn record_vault_owed_paths(
     });
 }
 
+/// Marks the row [`record_vault_index_interrupted`] writes, so
+/// [`clear_vault_index_interrupted`] removes only its own row.
+const VAULT_INDEX_INTERRUPTED_MARKER: &str = "full vault index did not finish";
+
+/// A full vault index replaces the vault's graph in one transaction, but the
+/// search index is rebuilt from the note bodies ON DISK. A process killed
+/// between the scan and that commit left the graph at its old state while
+/// search could already return the new text, and `brain status` read
+/// current. This row, written durably before the graph write, survives that
+/// death: `brain status` lists it under `reconciliation_pending` until a full
+/// index of the vault lands (or a brain watcher's startup reconciliation,
+/// which replays the disk-vs-graph drift, replaces the vault's debt).
+pub(crate) fn record_vault_index_interrupted(db_path: Option<&Path>, vault_root: &Path) {
+    let Some(db_path) = db_path else {
+        return;
+    };
+    let path = vault_root.to_string_lossy().into_owned();
+    let reason = format!(
+        "{WATCH_RECONCILIATION_PENDING_REASON}: {VAULT_INDEX_INTERRUPTED_MARKER}; the graph may \
+         predate the notes on disk while search already shows their new text. Run \
+         `nestweaver brain refresh {path}`"
+    );
+    update_skipped_notes_sidecar(db_path, |mut sidecar| {
+        let owed = sidecar
+            .reconciliation_pending
+            .entry(path.clone())
+            .or_default();
+        owed.retain(|row| !row.reason.contains(VAULT_INDEX_INTERRUPTED_MARKER));
+        owed.push(SkippedFile::new(path.clone(), SkipReasonCode::Other, reason));
+        owed.sort_by(|a, b| a.path.cmp(&b.path));
+        Some(build_skipped_notes_sidecar(
+            sidecar.skipped,
+            sidecar.notes_near_size_limit,
+            sidecar.unindexable_mtimes,
+            sidecar.reconciliation_pending,
+            sidecar.frontmatter_unparsed,
+            sidecar.skipped_truncated,
+            sidecar.near_limit_truncated,
+            None,
+        ))
+    });
+}
+
+/// Retire [`record_vault_index_interrupted`]'s row once a full index of the
+/// vault has committed. Other owed rows stay.
+pub(crate) fn clear_vault_index_interrupted(db_path: Option<&Path>, vault_root: &Path) {
+    let Some(db_path) = db_path else {
+        return;
+    };
+    let key = vault_root.to_string_lossy().into_owned();
+    update_skipped_notes_sidecar(db_path, |mut sidecar| {
+        let owed = sidecar.reconciliation_pending.get_mut(&key)?;
+        let before = owed.len();
+        owed.retain(|row| !row.reason.contains(VAULT_INDEX_INTERRUPTED_MARKER));
+        if owed.len() == before {
+            return None;
+        }
+        if owed.is_empty() {
+            sidecar.reconciliation_pending.remove(&key);
+        }
+        Some(build_skipped_notes_sidecar(
+            sidecar.skipped,
+            sidecar.notes_near_size_limit,
+            sidecar.unindexable_mtimes,
+            sidecar.reconciliation_pending,
+            sidecar.frontmatter_unparsed,
+            sidecar.skipped_truncated,
+            sidecar.near_limit_truncated,
+            None,
+        ))
+    });
+}
+
 /// V1: marks the rows [`record_vault_wikilink_debt`] writes, so
 /// [`clear_vault_wikilink_debt`] removes only its own rows and never another
 /// reason's (owed code links, an owed startup replay).
@@ -4827,6 +4900,9 @@ where
     // The durable dirty marker is established immediately before the first
     // possible graph write and remains until generation/artifact publication
     // has completed.
+    // Before the dirty marker and the graph write: a death from here until
+    // the commit below must stay visible after the restart.
+    record_vault_index_interrupted(store.db_path(), vault_root);
     let graph_publication =
         crate::manifest::begin_graph_mutation_publication(store, "full vault refresh")?;
     let notes_deleted = {
@@ -4930,6 +5006,7 @@ where
     }
 
     let publication = graph_publication.finish(true)?;
+    clear_vault_index_interrupted(store.db_path(), vault_root);
     // nw-587: evidence that survives losing the graph's un-checkpointed tail.
     // Local-directory vaults only: the server-mode path (`record_repo_sha`)
     // indexes a repo checkout under its URL, which `brain add` cannot re-add.
@@ -10833,5 +10910,33 @@ mod duplicate_vault_name_tests {
                 .any(|cause| cause.is::<crate::vault_registration::DuplicateVaultName>()),
             "{error:#}"
         );
+    }
+
+    /// QA: a full vault index killed after its scan (before its one graph
+    /// transaction committed) left the graph at its old state while search,
+    /// rebuilt from the bodies on disk, showed the new text, and `brain
+    /// status` read current. The row recorded before the write survives that
+    /// death and is disclosed until a full index of the vault lands.
+    #[test]
+    fn an_interrupted_full_vault_index_is_disclosed_until_one_lands() {
+        let (_dir, root) = make_vault(&[("a.md", "# A\n")]);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = db_dir.path().join("brain.lbug");
+        index_markdown_directory(&root, &db, "default", "v").unwrap();
+        let pending = || skipped_notes_status_json(Some(&db)).0["reconciliation_pending"].clone();
+        assert_eq!(pending(), 0, "a finished index owes nothing");
+
+        // What a process killed between the scan and the commit leaves.
+        let canonical = root.canonicalize().unwrap();
+        record_vault_index_interrupted(Some(&db), &canonical);
+        assert_eq!(pending(), 1);
+        let notes = skipped_notes_status_json(Some(&db)).0["reconciliation_pending_notes"].clone();
+        assert!(
+            notes.to_string().contains("brain refresh"),
+            "the disclosure names the remedy: {notes}"
+        );
+
+        index_markdown_directory(&root, &db, "default", "v").unwrap();
+        assert_eq!(pending(), 0, "a full index that lands retires the row");
     }
 }

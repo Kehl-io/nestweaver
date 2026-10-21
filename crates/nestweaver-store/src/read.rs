@@ -2743,9 +2743,68 @@ impl GraphStore {
     /// SHA plus the reader eligibility policy. That is not an interrupted write;
     /// see [`Self::repo_index_empty_complete`].
     pub fn repo_index_incomplete(&self, repo: &Repo) -> Result<bool, StoreError> {
+        if self.repo_publication_incomplete(&repo.uid)? {
+            return Ok(true);
+        }
         Ok(!repo.indexed_sha.is_empty()
             && !self.repo_has_content(repo)?
             && self.get_repo_index_policy(&repo.uid)?.is_none())
+    }
+
+    /// True when a publication of `repo_uid` started and never reached its
+    /// last write (the process died between its store transactions), so the
+    /// committed graph may be partial whatever its SHA says. See
+    /// [`crate::write::REPO_PUBLICATION_INCOMPLETE_PREFIX`].
+    pub fn repo_publication_incomplete(&self, repo_uid: &str) -> Result<bool, StoreError> {
+        let conn = self.conn()?;
+        let mut statement = conn
+            .prepare("MATCH (m:Meta {key: $k}) RETURN count(m)")
+            .map_err(|error| {
+                StoreError::Query(format!("prepare publication-incomplete debt: {error}"))
+            })?;
+        let mut rows = conn
+            .execute(
+                &mut statement,
+                vec![(
+                    "k",
+                    Value::String(format!(
+                        "{}{repo_uid}",
+                        crate::write::REPO_PUBLICATION_INCOMPLETE_PREFIX
+                    )),
+                )],
+            )
+            .map_err(|error| {
+                StoreError::Query(format!("read publication-incomplete debt: {error}"))
+            })?;
+        Ok(rows
+            .next()
+            .and_then(|row| extract_i64(&row, 0).ok())
+            .is_some_and(|count| count > 0))
+    }
+
+    /// Repo uids carrying publication-incomplete debt, sorted. Rows left by a
+    /// repo that has since been removed are ignored.
+    pub fn list_publication_incomplete_repos(&self) -> Result<Vec<String>, StoreError> {
+        let known: std::collections::HashSet<String> = self
+            .list_repos(None)?
+            .into_iter()
+            .map(|repo| repo.uid)
+            .collect();
+        let conn = self.conn()?;
+        let rows = conn
+            .query("MATCH (m:Meta) RETURN m.key")
+            .map_err(|error| StoreError::Query(format!("list Meta keys: {error}")))?;
+        let mut out: Vec<String> = rows
+            .filter_map(|row| extract_string(&row, 0).ok())
+            .filter_map(|key| {
+                key.strip_prefix(crate::write::REPO_PUBLICATION_INCOMPLETE_PREFIX)
+                    .map(str::to_string)
+            })
+            .filter(|uid| known.contains(uid))
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 
     /// True when an index finished (SHA and eligibility policy are present)

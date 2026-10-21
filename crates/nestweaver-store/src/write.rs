@@ -155,6 +155,19 @@ pub const CONTRACT_DERIVATION_GENERATION_KEY: &str = "contract_derivation_genera
 /// Per-repo debt left by the global v1 -> v2 Contract identity migration.
 pub const CONTRACT_DERIVATION_DEBT_PREFIX: &str = "contract_derivation_debt:";
 
+/// `Meta.key` prefix for the per-repo "publication incomplete" debt.
+///
+/// A non-forced `index` publishes in several store transactions (per-file
+/// deletes, bulk insert, resolved edges, contracts, SHA). A process killed
+/// between them leaves a graph that is neither the old nor the new one, and
+/// nothing in the committed rows says so: the SHA may already match HEAD and
+/// the filemeta sidecar may already describe the new files. The indexer
+/// commits this row BEFORE its first graph mutation and deletes it only after
+/// the run's last write, so a surviving row means "this repo's graph may be
+/// partial". It is read by [`GraphStore::repo_index_incomplete`] (stale-check
+/// `incomplete`, `needs_reindex`) and makes the next index a full replacement.
+pub const REPO_PUBLICATION_INCOMPLETE_PREFIX: &str = "repo_publication_incomplete:";
+
 /// What a classified destructive store mutation can prove about durable state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MutationDisposition {
@@ -8778,6 +8791,52 @@ impl GraphStore {
                 ("k", lbug::Value::String(key)),
                 ("v", lbug::Value::String(fingerprint.to_string())),
             ],
+        )
+    }
+
+    /// Record, in its own committed transaction, that a publication of
+    /// `repo_uid` has started and may be left partial. See
+    /// [`REPO_PUBLICATION_INCOMPLETE_PREFIX`].
+    pub fn set_repo_publication_incomplete(
+        &self,
+        repo_uid: &str,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.begin_transaction()?;
+        let key = format!("{REPO_PUBLICATION_INCOMPLETE_PREFIX}{repo_uid}");
+        let result = exec_params(
+            &conn,
+            "MATCH (m:Meta {key: $k}) DETACH DELETE m",
+            vec![("k", lbug::Value::String(key.clone()))],
+        )
+        .and_then(|()| {
+            exec_params(
+                &conn,
+                "CREATE (:Meta {key: $k, value: $v})",
+                vec![
+                    ("k", lbug::Value::String(key)),
+                    ("v", lbug::Value::String(reason.to_string())),
+                ],
+            )
+        })
+        .and_then(|()| self.commit_transaction(&conn));
+        if result.is_err() {
+            let _ = conn.query("ROLLBACK");
+        }
+        result
+    }
+
+    /// Retire the publication-incomplete debt for `repo_uid` after a
+    /// publication that rewrote the whole repo graph has fully landed.
+    pub fn clear_repo_publication_incomplete(&self, repo_uid: &str) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        exec_params(
+            &conn,
+            "MATCH (m:Meta {key: $k}) DETACH DELETE m",
+            vec![(
+                "k",
+                lbug::Value::String(format!("{REPO_PUBLICATION_INCOMPLETE_PREFIX}{repo_uid}")),
+            )],
         )
     }
 
