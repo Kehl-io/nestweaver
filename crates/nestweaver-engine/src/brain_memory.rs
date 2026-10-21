@@ -681,6 +681,10 @@ pub struct ConsolidationManifest {
     pub proposals: Vec<ConsolidationProposal>,
     /// Apply summaries, recovery locations, and re-index guidance.
     pub warnings: Vec<String>,
+    /// Proposals discovered before any `limit` was applied. Not serialized:
+    /// callers report it next to the returned list.
+    #[serde(skip)]
+    pub proposals_discovered: usize,
 }
 
 const CONSOLIDATION_JOURNAL_VERSION: u32 = 1;
@@ -751,6 +755,18 @@ pub fn memory_consolidate(
     apply: bool,
     now_epoch: f64,
 ) -> Result<ConsolidationManifest> {
+    memory_consolidate_limited(store, apply, now_epoch, None)
+}
+
+/// [`memory_consolidate`] that keeps only the first `limit` proposals (in
+/// their stable uid order) BEFORE applying, so an apply never moves a note the
+/// response does not list. Journal recovery is unaffected by the limit.
+pub fn memory_consolidate_limited(
+    store: &GraphStore,
+    apply: bool,
+    now_epoch: f64,
+    limit: Option<usize>,
+) -> Result<ConsolidationManifest> {
     let notes = store.list_notes(None).map_err(|e| anyhow::anyhow!(e))?;
     let mut warnings = Vec::new();
     if notes.is_empty() && !apply {
@@ -760,6 +776,7 @@ pub fn memory_consolidate(
             apply_errors: false,
             proposals: vec![],
             warnings,
+            proposals_discovered: 0,
         });
     }
 
@@ -872,6 +889,10 @@ pub fn memory_consolidate(
             .cmp(&b.source_uid)
             .then(a.promote_to.cmp(&b.promote_to))
     });
+    let proposals_discovered = proposals.len();
+    if let Some(limit) = limit {
+        proposals.truncate(limit);
+    }
 
     if apply {
         match apply_proposals(store, &proposals, &notes) {
@@ -890,6 +911,7 @@ pub fn memory_consolidate(
                     apply_errors: outcome.apply_errors,
                     proposals: outcome.proposals,
                     warnings,
+                    proposals_discovered,
                 });
             }
             Err(e) => {
@@ -900,6 +922,7 @@ pub fn memory_consolidate(
                     apply_errors: true,
                     proposals,
                     warnings,
+                    proposals_discovered,
                 });
             }
         }
@@ -911,6 +934,7 @@ pub fn memory_consolidate(
         apply_errors: false,
         proposals,
         warnings,
+        proposals_discovered,
     })
 }
 
@@ -3195,6 +3219,44 @@ mod tests {
             journals
                 .iter()
                 .all(|journal| journal.phase == ConsolidationPhase::Complete)
+        );
+    }
+
+    #[test]
+    fn consolidate_apply_honours_the_limit_before_moving_anything() {
+        let (_dir, root) = make_vault(&[
+            ("_logs/2025-01-01.md", "# First log\n"),
+            ("_logs/2025-01-02.md", "# Second log\n"),
+            (
+                "_ideas/idea-a.md",
+                "[[_logs/2025-01-01]] and [[_logs/2025-01-02]]\n",
+            ),
+            (
+                "_ideas/idea-b.md",
+                "[[_logs/2025-01-01]] and [[_logs/2025-01-02]]\n",
+            ),
+            (
+                "_ideas/idea-c.md",
+                "[[_logs/2025-01-01]] and [[_logs/2025-01-02]]\n",
+            ),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+
+        let manifest = memory_consolidate_limited(&store, true, 4_000_000_000.0, Some(1)).unwrap();
+        assert!(manifest.applied, "warnings: {:?}", manifest.warnings);
+        assert_eq!(manifest.proposals_discovered, 2);
+        assert_eq!(manifest.proposals.len(), 1);
+        // Only the returned proposal moved; the other log is untouched.
+        let moved = &manifest.proposals[0].source_path;
+        let (kept, promoted) = if moved.ends_with("2025-01-01.md") {
+            ("_logs/2025-01-02.md", "_ideas/2025-01-01.md")
+        } else {
+            ("_logs/2025-01-01.md", "_ideas/2025-01-02.md")
+        };
+        assert!(root.join(promoted).exists());
+        assert!(
+            root.join(kept).exists(),
+            "a deferred proposal must not be applied"
         );
     }
 

@@ -21,7 +21,7 @@ use nestweaver_engine::{
     generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_tools,
     generate_skill_with_tools, generate_summaries, get_all_properties, get_last_indexed_at,
     investigate, investigate_expand, investigate_hydrate, load_alias_sidecar, load_clusters,
-    load_extensions, memory_consolidate, memory_lint, memory_related, orphan_documents,
+    load_extensions, memory_consolidate_limited, memory_lint, memory_related, orphan_documents,
     parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text, topic_clusters,
     truncate_to_budget_keeping_first,
 };
@@ -6459,19 +6459,23 @@ fn tool_brain_memory_consolidate(store: &GraphStore, args: Value) -> Result<Valu
         1,
         RESULT_LIMIT_MAX,
     )?;
-    let mut manifest = serde_json::to_value(memory_consolidate(store, apply, now_epoch_secs())?)?;
-    // Truncate proposals to limit and report total.
+    // The limit is applied BEFORE apply: it used to apply every proposal and
+    // then trim the list, so `limit: 1` moved notes the response never named.
+    let consolidation = memory_consolidate_limited(store, apply, now_epoch_secs(), Some(limit))?;
+    let total = consolidation.proposals_discovered;
+    let mut manifest = serde_json::to_value(consolidation)?;
     if let Some(obj) = manifest.as_object_mut() {
-        let (total, returned) =
-            if let Some(proposals) = obj.get_mut("proposals").and_then(|v| v.as_array_mut()) {
-                let total = proposals.len();
-                proposals.truncate(limit);
-                (total, proposals.len())
-            } else {
-                (0, 0)
-            };
+        let returned = obj
+            .get("proposals")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
         obj.insert("proposals_total".to_string(), json!(total));
         obj.insert("proposals_returned".to_string(), json!(returned));
+        // Discovered but past the limit: neither returned nor applied.
+        obj.insert(
+            "proposals_deferred".to_string(),
+            json!(total.saturating_sub(limit)),
+        );
     }
     Ok(manifest)
 }
@@ -6494,7 +6498,7 @@ fn tool_schema_brain_memory_consolidate() -> Value {
                 // parameter at all). Fixed schema-side, so no write path had to
                 // be exercised to close it.
                 "limit": limit_schema(
-                    "Max proposals to return (1-1000, default 50). The total count is always reported.",
+                    "Max proposals to return AND, with apply:true, to apply (1-1000, default 50). Proposals past the limit are neither returned nor applied; proposals_total and proposals_deferred report them.",
                     DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             }
         }
