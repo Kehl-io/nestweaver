@@ -5859,8 +5859,7 @@ fn try_read_symbols_from_bare(
         merged.qualifier_ignored.extend(partial.qualifier_ignored);
         merged.truncated = merged.truncated || partial.truncated;
     }
-    merged.did_you_mean =
-        nestweaver_engine::read_symbols::not_found_suggestions(store, &merged.not_found);
+    nestweaver_engine::read_symbols::attach_not_found_suggestions(store, &mut merged);
 
     Some(merged)
 }

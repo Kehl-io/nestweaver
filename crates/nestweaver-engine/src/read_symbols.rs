@@ -136,6 +136,13 @@ pub struct ReadSymbolsResult {
     /// [`crate::did_you_mean::DID_YOU_MEAN_LIMIT`]. Absent when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub did_you_mean: Vec<String>,
+    /// QA #11: the same suggestions PER not-found target, each bounded to
+    /// [`crate::did_you_mean::DID_YOU_MEAN_LIMIT`]. The flat `did_you_mean`
+    /// above is one list capped at five across every miss, so a read with
+    /// several misses could not say which suggestion answered which target
+    /// and lost every target after the first few. Absent when empty.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub did_you_mean_by_target: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// How far the mandatory first symbol overran the requested budget.
@@ -558,11 +565,21 @@ fn shorter_qualified_reading(
 /// in spec order, deduplicated and bounded like every other miss. Best
 /// effort: a lookup failure is logged and suggests nothing.
 pub fn not_found_suggestions(store: &GraphStore, not_found: &[String]) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
+    flatten_suggestions(not_found, &not_found_suggestions_by_target(store, not_found))
+}
+
+/// QA #11: [`not_found_suggestions`] kept per target, each list bounded to
+/// [`crate::did_you_mean::DID_YOU_MEAN_LIMIT`]. A target with no suggestion
+/// is absent. One symbol-table fetch serves every target.
+pub fn not_found_suggestions_by_target(
+    store: &GraphStore,
+    not_found: &[String],
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut by_target = std::collections::BTreeMap::new();
     // I4: one symbol-table fetch for every not-found spec of the read.
     let mut table = None;
     for spec in not_found {
-        if spec.starts_with("sym:") {
+        if spec.starts_with("sym:") || by_target.contains_key(spec) {
             continue;
         }
         let mut found = crate::did_you_mean::did_you_mean_candidates_with_table(
@@ -586,16 +603,46 @@ pub fn not_found_suggestions(store: &GraphStore, not_found: &[String]) -> Vec<St
                 found.insert(0, reading);
             }
         }
+        let mut names: Vec<String> = Vec::new();
         for name in found {
             if names.len() == crate::did_you_mean::DID_YOU_MEAN_LIMIT {
-                return names;
+                break;
             }
             if !names.contains(&name) {
                 names.push(name);
             }
         }
+        if !names.is_empty() {
+            by_target.insert(spec.clone(), names);
+        }
+    }
+    by_target
+}
+
+/// The flat, spec-ordered, deduplicated and bounded `did_you_mean` list.
+fn flatten_suggestions(
+    not_found: &[String],
+    by_target: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for spec in not_found {
+        for name in by_target.get(spec).into_iter().flatten() {
+            if names.len() == crate::did_you_mean::DID_YOU_MEAN_LIMIT {
+                return names;
+            }
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
     }
     names
+}
+
+/// Fill both suggestion fields of `result` from its `not_found` targets.
+pub fn attach_not_found_suggestions(store: &GraphStore, result: &mut ReadSymbolsResult) {
+    let by_target = not_found_suggestions_by_target(store, &result.not_found);
+    result.did_you_mean = flatten_suggestions(&result.not_found, &by_target);
+    result.did_you_mean_by_target = by_target;
 }
 
 /// nw-113: the [`AmbiguousMatch::hint`] for `candidates` of `spec`.
@@ -742,7 +789,7 @@ pub fn read_symbols_budgeted(
         }
     }
 
-    result.did_you_mean = not_found_suggestions(store, &result.not_found);
+    attach_not_found_suggestions(store, &mut result);
 
     // 2. Expand with neighbours (adjacent symbols in the same file), de-duped.
     let mut ordered: Vec<(Symbol, bool)> = Vec::new();
@@ -962,7 +1009,7 @@ pub fn read_symbols_from_repo_roots(
             merged.budget_exceeded_by_first_symbol = partial.budget_exceeded_by_first_symbol;
         }
     }
-    merged.did_you_mean = not_found_suggestions(store, &merged.not_found);
+    attach_not_found_suggestions(store, &mut merged);
     merged
 }
 
@@ -1346,6 +1393,34 @@ app();
     /// 12.1.1 (B1/M1): a qualifier that names no file or container is not
     /// found, with `path::name` suggestions, the same as `symbol` and
     /// `impact`. It is never widened to the last segment.
+    /// QA #11: several misses in one read each keep their own suggestions;
+    /// the flat `did_you_mean` (one list capped at five) is unchanged.
+    #[test]
+    fn did_you_mean_is_reported_per_not_found_target() {
+        let (dir, store) = fixture_files(&[(
+            "b/svc.ts",
+            "export class Other { run() { return 3; } }\n\
+             export function strip(b: string) { return b; }\n",
+        )]);
+        let reader = FilesystemReader::new(dir.path());
+        let specs = ["nothere.ts::Other".to_string(), "nothere.ts::strip".to_string()];
+        let res = read_symbols(&store, &specs, &reader, 0, None);
+        assert_eq!(res.not_found, specs, "{res:?}");
+        assert_eq!(
+            res.did_you_mean_by_target.get("nothere.ts::Other").map(Vec::as_slice),
+            Some(&["b/svc.ts::Other".to_string()][..]),
+            "{res:?}"
+        );
+        assert_eq!(
+            res.did_you_mean_by_target.get("nothere.ts::strip").map(Vec::as_slice),
+            Some(&["b/svc.ts::strip".to_string()][..]),
+            "{res:?}"
+        );
+        assert_eq!(res.did_you_mean, ["b/svc.ts::Other", "b/svc.ts::strip"]);
+        let json = serde_json::to_value(&res).unwrap();
+        assert!(json["did_you_mean_by_target"].is_object(), "{json}");
+    }
+
     #[test]
     fn a_qualifier_naming_nothing_is_not_found_with_suggestions() {
         let (dir, store) = fixture_files(&[
