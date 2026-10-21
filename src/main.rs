@@ -151,6 +151,21 @@ const DEFAULT_EXTERNAL_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 /// command that rotates to a different validity than the one refused.
 const DEFAULT_TLS_VALIDITY_DAYS: u32 = 365;
 
+/// `pre-push-impact --format`.
+#[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
+enum PrePushFormat {
+    Human,
+    Json,
+}
+
+/// `pre-push-impact --min-severity`.
+#[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
+enum PrePushMinSeverity {
+    Breaking,
+    Warning,
+    Info,
+}
+
 /// Explicit device policy for direct local embedding.
 #[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
 enum CliEmbeddingAccelerator {
@@ -2135,9 +2150,8 @@ struct Cli {
 struct OutputConfig {
     quiet: bool,
     verbose: bool,
-    /// Whether colored output is enabled. Reserved for future use by
-    /// owo-colors formatting paths.
-    #[allow(dead_code)]
+    /// Whether colored output is enabled: off under `--no-color`, `--plain`,
+    /// `NO_COLOR` or a non-TTY stderr.
     color: bool,
 }
 
@@ -6995,8 +7009,8 @@ enum Commands {
         #[arg(long)]
         include_tests: bool,
         /// Output format: human (default), json
-        #[arg(long, default_value = "human")]
-        format: String,
+        #[arg(long, value_enum, ignore_case = true, default_value_t = PrePushFormat::Human)]
+        format: PrePushFormat,
         /// Repository path (default: current directory)
         #[arg(long)]
         repo: Option<PathBuf>,
@@ -7023,8 +7037,8 @@ enum Commands {
         #[arg(long)]
         diff: Option<String>,
         /// Minimum severity to include: breaking, warning, info
-        #[arg(long, default_value = "info")]
-        min_severity: String,
+        #[arg(long, value_enum, ignore_case = true, default_value_t = PrePushMinSeverity::Info)]
+        min_severity: PrePushMinSeverity,
         /// Override auto-detected repo URL for canonical ID computation
         #[arg(long)]
         repo_url: Option<String>,
@@ -7414,7 +7428,7 @@ enum Commands {
     #[command(after_help = "Examples:\n  nestweaver list-features --config ./instance.toml")]
     ListFeatures {
         #[arg(long, help = "Path to instance config file")]
-        config: Option<PathBuf>,
+        config: PathBuf,
         #[arg(long, help = "Output as JSON")]
         json: bool,
     },
@@ -8558,7 +8572,7 @@ enum Commands {
     /// data-driven/integration tests. "No tests found" is NOT safe-to-skip.
     #[command(
         name = "affected-tests",
-        after_help = "Examples:\n  nestweaver affected-tests --files src/auth.rs,src/db.rs\n  nestweaver affected-tests --base-ref main\n  nestweaver affected-tests --base-ref main --json"
+        after_help = "Examples:\n  nestweaver affected-tests --files src/auth.rs,src/db.rs\n  nestweaver affected-tests --files src/auth.rs --repo my-service\n  nestweaver affected-tests --base-ref main\n  nestweaver affected-tests --base-ref main --json"
     )]
     AffectedTests {
         #[arg(
@@ -8579,6 +8593,11 @@ enum Commands {
             help = "Git ref to diff against (e.g. main). Runs `git diff --name-only <ref>`: that compares the ref to your WORKING TREE, so uncommitted edits are included and this is NOT the merge-base (`<ref>...HEAD`) diff — pass a merge-base sha if that is what you want"
         )]
         base_ref: Option<String>,
+        #[arg(
+            long,
+            help = "Repository the changed files belong to (name or UID). Default: with --base-ref, the indexed repo checked out at the working directory's git root; with --files, the only indexed repo (required when several are indexed). Repo-relative paths then resolve in that repo only, never in another repo with the same relative path"
+        )]
+        repo: Option<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -16410,8 +16429,82 @@ fn bridge_nodes_rpc_args(top: usize, repos: &[String]) -> serde_json::Value {
 
 /// `affected_tests` reads `changed_files` (an array) — never a raw string
 /// under `files`.
-fn affected_tests_rpc_args(changed_files: &[String]) -> serde_json::Value {
-    serde_json::json!({ "changed_files": changed_files })
+///
+/// `repo` limits those repo-relative paths to one repository: without it a
+/// file at the same relative path in another indexed repo joined the change.
+fn affected_tests_rpc_args(changed_files: &[String], repo: Option<&str>) -> serde_json::Value {
+    let mut args = serde_json::json!({ "changed_files": changed_files });
+    if let Some(repo) = repo {
+        args["repo"] = serde_json::json!(repo);
+    }
+    args
+}
+
+/// Why `affected-tests` could not name the one repository its paths belong to.
+#[derive(Debug)]
+enum AffectedTestsRepoError {
+    /// `--repo` did not resolve; carries the typed repo-filter error.
+    Unresolved(anyhow::Error),
+    /// The `--base-ref` work tree is not an indexed repository.
+    NotIndexed(PathBuf),
+    /// Several repositories qualify and nothing names one.
+    Ambiguous(Vec<String>),
+}
+
+/// The repository an `affected-tests` run is limited to.
+///
+/// `--repo` wins and must resolve. A `--base-ref` diff (`diff_root` is the
+/// work tree it was read from) belongs to the indexed repo checked out
+/// there. Explicit `--files` belong to the only indexed repo; with several,
+/// the caller must say which, as the MCP tool requires for `base_ref`.
+/// `Ok(None)` only when nothing is indexed.
+fn affected_tests_target_repo<'a>(
+    repos: &'a [nestweaver_schema::Repo],
+    selector: Option<&str>,
+    diff_root: Option<&Path>,
+) -> Result<Option<&'a nestweaver_schema::Repo>, AffectedTestsRepoError> {
+    if let Some(selector) = selector {
+        return nestweaver_engine::resolve_repo_selector(repos, selector)
+            .map(Some)
+            .map_err(|error| {
+                AffectedTestsRepoError::Unresolved(anyhow::Error::new(
+                    nestweaver_engine::node_scope::RepoFilterUnresolved::new(selector, &error),
+                ))
+            });
+    }
+    let candidates: Vec<&nestweaver_schema::Repo> = match diff_root {
+        Some(root) => {
+            let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+            let owners: Vec<_> = repos
+                .iter()
+                .filter(|repo| {
+                    repo.local_root()
+                        .and_then(|path| Path::new(path).canonicalize().ok())
+                        .is_some_and(|path| path == root)
+                })
+                .collect();
+            if owners.is_empty() {
+                return Err(AffectedTestsRepoError::NotIndexed(root));
+            }
+            owners
+        }
+        None => repos.iter().collect(),
+    };
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(only)),
+        many => Err(AffectedTestsRepoError::Ambiguous(
+            many.iter()
+                .map(|repo| {
+                    format!(
+                        "{} ({})",
+                        nestweaver_engine::repo_display_name(repo),
+                        repo.uid
+                    )
+                })
+                .collect(),
+        )),
+    }
 }
 
 /// The filesystem root a source-reading RPC must send to the daemon.
@@ -16428,7 +16521,7 @@ fn affected_tests_rpc_args(changed_files: &[String]) -> serde_json::Value {
 /// caller, so an absent `--root` resolves here, on the client, rather than
 /// being left for the server to guess.
 fn client_source_root(root: Option<&std::path::Path>) -> String {
-    root.map(std::path::Path::to_path_buf)
+    root.map(abs_for_daemon)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
         .to_string_lossy()
         .into_owned()
@@ -16451,8 +16544,9 @@ fn read_symbols_rpc_args(
     if let Some(tb) = token_budget {
         args["token_budget"] = serde_json::json!(tb);
     }
+    // Absolute path: a relative `--root` would resolve against the daemon's CWD.
     if let Some(root) = root {
-        args["root"] = serde_json::json!(root.to_string_lossy().into_owned());
+        args["root"] = serde_json::json!(abs_for_daemon(root).to_string_lossy().into_owned());
     }
     args
 }
@@ -16483,8 +16577,9 @@ fn investigate_rpc_args(
     if let Some(tb) = token_budget {
         args["token_budget"] = serde_json::json!(tb);
     }
+    // Absolute path: a relative `--root` would resolve against the daemon's CWD.
     if let Some(root) = root {
-        args["root"] = serde_json::json!(root.to_string_lossy().into_owned());
+        args["root"] = serde_json::json!(abs_for_daemon(root).to_string_lossy().into_owned());
     }
     args
 }
@@ -16904,12 +16999,43 @@ fn main() {
 /// Print the degraded impact-analysis JSON shape (`{"impacts": [], "error": …}`)
 /// when `format == "json"`, so the server-unavailable / store-unavailable /
 /// analysis-failed fallback paths all emit an identical, consumer-parseable shape.
-fn print_impact_degraded_json(format: &str, reason: &str) -> anyhow::Result<()> {
-    if format == "json" {
+fn print_impact_degraded_json(json: bool, reason: &str) -> anyhow::Result<()> {
+    if json {
         let output = serde_json::json!({ "impacts": [], "error": reason });
         println!("{}", serde_json::to_string_pretty(&output)?);
     }
     Ok(())
+}
+
+/// A `pre-push-impact` severity label, in its ANSI colour only when `color`.
+fn severity_label(label: &str, ansi: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[{ansi}m{label}\x1b[0m")
+    } else {
+        label.to_string()
+    }
+}
+
+/// Files `pre-push-impact` saw changed: the working tree and index against
+/// HEAD, or the `--diff` range. 0 when git cannot say.
+fn pre_push_changed_file_count(repo_path: &Path, diff: Option<&str>) -> usize {
+    let range = diff.unwrap_or("HEAD");
+    if range.starts_with('-') {
+        return 0;
+    }
+    std::process::Command::new("git")
+        .args(["diff", "--name-only", "-z", range, "--"])
+        .current_dir(repo_path)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map_or(0, |output| {
+            output
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .count()
+        })
 }
 
 /// The coverage caveat every incomplete-impact disclosure ends with.
@@ -19422,9 +19548,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         }
 
         Commands::ListFeatures { config, json } => {
-            let config_path =
-                config.ok_or_else(|| anyhow::anyhow!("--config is required for list-features"))?;
-            let instance_config = nestweaver_engine::InstanceConfig::from_file(&config_path)?;
+            let instance_config = nestweaver_engine::InstanceConfig::from_file(&config)?;
             let features = instance_config.features.unwrap_or_default();
 
             if json {
@@ -21105,6 +21229,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
             InteractionCommands::Show { uid, top, kind, db } => {
+                if uid.is_none() && top.is_none() {
+                    // A usage error, like any other missing argument.
+                    eprintln!("Provide --uid <uid> or --top <N> [--kind <kind>].");
+                    return Ok((EXIT_USAGE, None));
+                }
                 // History lives beside the graph the daemon serves: follow the
                 // publication CURRENT, not a base left behind by a rebuild.
                 let db_path = selected_db_path(&db.unwrap_or_else(default_db_path))?;
@@ -21144,8 +21273,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
                     }
                 } else {
-                    eprintln!("Provide --uid <uid> or --top <N> [--kind <kind>].");
-                    Ok((EXIT_ERROR, None))
+                    unreachable!("checked above: --uid or --top is present")
                 }
             }
         },
@@ -22127,84 +22255,62 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         Commands::AffectedTests {
             files,
             base_ref,
+            repo,
             json,
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
             install_declared_links_for_direct_route(&db_path, None);
 
-            // Resolve changed files: explicit --files, else git diff against --base-ref.
-            // Computed up front so the daemon path can send a proper
-            // `changed_files` array (the tool never accepted the raw --files
-            // string under the legacy `files` key).
-            let (changed_files, explicitly_named): (Vec<String>, bool) =
-                if let Some(files_str) = files {
-                    (
-                        files_str.split(',').map(ToString::to_string).collect(),
-                        true,
-                    )
-                } else if let Some(base) = base_ref {
-                    let repo_root = detect_repo_root();
-                    out.status(&format!("Detecting changed files via git diff {base}..."));
-                    (
-                        changed_files_from_git(&repo_root, Some(&base))
-                            .context("git diff")?
-                            .iter()
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .collect(),
-                        false,
-                    )
-                } else {
-                    // nw-252: a USAGE error, so EXIT_USAGE (64, EX_USAGE from
-                    // sysexits.h) — the same code clap's own parse failures
-                    // return. Exiting 1 made "you invoked this wrong" and "the
-                    // operation failed" indistinguishable to a caller.
-                    eprintln!("Error: provide either --files or --base-ref");
-                    return Ok((EXIT_USAGE, None));
-                };
-
-            let changed_files = if explicitly_named {
-                match nestweaver_engine::changed_files::require_changed_files(&changed_files) {
-                    Ok(files) => files,
-                    Err(error) => {
-                        eprintln!("Error: {error}");
-                        return Ok((EXIT_USAGE, None));
+            if files.is_none() && base_ref.is_none() {
+                // nw-252: a USAGE error, so EXIT_USAGE (64, EX_USAGE from
+                // sysexits.h) — the same code clap's own parse failures
+                // return. Exiting 1 made "you invoked this wrong" and "the
+                // operation failed" indistinguishable to a caller.
+                eprintln!("Error: provide either --files or --base-ref");
+                return Ok((EXIT_USAGE, None));
+            }
+            let named_files = match files.as_deref() {
+                Some(files_str) => {
+                    let named: Vec<String> =
+                        files_str.split(',').map(ToString::to_string).collect();
+                    match nestweaver_engine::changed_files::require_changed_files(&named) {
+                        Ok(files) => Some(files),
+                        Err(error) => {
+                            eprintln!("Error: {error}");
+                            return Ok((EXIT_USAGE, None));
+                        }
                     }
                 }
-            } else {
-                changed_files
+                None => None,
             };
 
-            if changed_files.is_empty() {
-                // Only a successfully derived VCS diff reaches this branch.
-                // Resolve its actual repository, not every unrelated repo in
-                // a multi-repo graph, before rendering the canonical empty set.
-                require_existing_db(&db_path)?;
-                let repos: Vec<nestweaver_schema::Repo> = if use_daemon {
-                    let rt = tokio::runtime::Runtime::new()?;
-                    let mut client =
-                        rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None))?;
-                    let response = rt.block_on(client.inner_mut().list_repos_json(
-                        tonic::Request::new(nestweaver_proto::JsonRequest {
-                            args_json: "{}".to_string(),
-                        }),
-                    ))?;
-                    serde_json::from_str(&response.into_inner().result_json)?
-                } else {
-                    open_store(Some(&db_path))?.list_repos(None)?
-                };
-                let root = detect_repo_root()
-                    .canonicalize()
-                    .context("resolve git diff repository")?;
-                let target_repos: Vec<_> = repos
-                    .into_iter()
-                    .filter(|repo| {
-                        repo.local_root()
-                            .and_then(|path| Path::new(path).canonicalize().ok())
-                            .is_some_and(|path| path == root)
-                    })
-                    .collect();
-                if target_repos.is_empty() {
+            // Name the one repository the changed paths belong to before
+            // anything else: repo-relative paths sent without it matched a
+            // same-path file in every other indexed repo.
+            require_existing_db(&db_path)?;
+            let repos: Vec<nestweaver_schema::Repo> = if use_daemon {
+                let rt = tokio::runtime::Runtime::new()?;
+                let mut client =
+                    rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None))?;
+                let response = rt.block_on(client.inner_mut().list_repos_json(
+                    tonic::Request::new(nestweaver_proto::JsonRequest {
+                        args_json: "{}".to_string(),
+                    }),
+                ))?;
+                serde_json::from_str(&response.into_inner().result_json)?
+            } else {
+                open_store(Some(&db_path))?.list_repos(None)?
+            };
+            let working_root = detect_repo_root();
+            let diff_root =
+                (base_ref.is_some() && repo.is_none()).then_some(working_root.as_path());
+            let target_repo = match affected_tests_target_repo(&repos, repo.as_deref(), diff_root) {
+                Ok(target) => target.cloned(),
+                Err(AffectedTestsRepoError::Unresolved(error)) => {
+                    return Ok((report_unresolved_repo_filter(&error, json), None));
+                }
+                Err(AffectedTestsRepoError::NotIndexed(root)) => {
                     let note = format!(
                         "git diff repository {} is not indexed; run the full suite and index this repository",
                         root.display()
@@ -22218,6 +22324,62 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     eprintln!("Error: {note}");
                     return Ok((EXIT_NEEDS_REINDEX, None));
                 }
+                Err(AffectedTestsRepoError::Ambiguous(candidates)) => {
+                    eprintln!(
+                        "Error: the changed files could belong to any of {} indexed repositories ({}); pass --repo to name one",
+                        candidates.len(),
+                        candidates.join(", ")
+                    );
+                    return Ok((EXIT_USAGE, None));
+                }
+            };
+
+            // Resolve changed files: explicit --files, else git diff against --base-ref.
+            // Computed up front so the daemon path can send a proper
+            // `changed_files` array (the tool never accepted the raw --files
+            // string under the legacy `files` key).
+            let changed_files: Vec<String> = if let Some(named) = named_files {
+                named
+            } else if let Some(base) = base_ref {
+                // `--repo` names the work tree to diff; otherwise the
+                // working directory's, which `target_repo` was matched to.
+                let repo_root = match &target_repo {
+                    Some(target) if repo.is_some() => match target.local_root() {
+                        Some(root) if !root.is_empty() => PathBuf::from(root),
+                        _ => anyhow::bail!(
+                            "repository '{}' has no local working tree to diff; pass --files instead",
+                            nestweaver_engine::repo_display_name(target)
+                        ),
+                    },
+                    _ => working_root,
+                };
+                out.status(&format!("Detecting changed files via git diff {base}..."));
+                changed_files_from_git(&repo_root, Some(&base))
+                    .context("git diff")?
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect()
+            } else {
+                unreachable!("checked above: --files or --base-ref is present")
+            };
+
+            // Repository identity for `--json`, as the MCP tool reports it.
+            let with_repo_identity = |mut value: serde_json::Value| {
+                if let (Some(target), Some(object)) = (&target_repo, value.as_object_mut()) {
+                    object.entry("repo").or_insert_with(|| {
+                        serde_json::json!(nestweaver_engine::repo_display_name(target))
+                    });
+                    object
+                        .entry("repo_uid")
+                        .or_insert_with(|| serde_json::json!(target.uid));
+                }
+                value
+            };
+
+            if changed_files.is_empty() {
+                // Only a successfully derived VCS diff reaches this branch,
+                // and its repository was resolved above.
+                let target_repos: Vec<_> = target_repo.iter().cloned().collect();
                 if let Some(refusal) =
                     nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(
                         &db_path,
@@ -22233,7 +22395,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
                 let result = nestweaver_engine::affected_tests::empty_derived_selection();
                 if json {
-                    print_json_payload(&serde_json::to_value(&result)?)?;
+                    print_json_payload(&with_repo_identity(serde_json::to_value(&result)?))?;
                 } else {
                     render_affected_tests_result(&result, None);
                 }
@@ -22246,7 +22408,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // must lift a refusal from either tier before a CI consumer can
             // mistake the envelope for a successful empty selection.
             let daemon_result: Option<AffectedTestsRpcPayload> = if use_daemon {
-                let args = affected_tests_rpc_args(&changed_files);
+                let args = affected_tests_rpc_args(
+                    &changed_files,
+                    target_repo.as_ref().map(|target| target.uid.as_str()),
+                );
                 match try_hybrid_json_rpc(true, &db_path, None, "affected_tests", args)? {
                     Some(value) => {
                         let parsed = parse_affected_tests_rpc_payload(value)?;
@@ -22302,10 +22467,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // Only a stale repository that owns or is linked
                     // to a changed file refuses; an unrelated one is disclosed
                     // in the selection's notifications instead.
+                    let target_uid = target_repo.as_ref().map(|target| target.uid.as_str());
                     let mut repos = store.list_repos(None)?;
-                    nestweaver_engine::resolver_generation::incompatibility_for_changed_files_at(
+                    nestweaver_engine::resolver_generation::incompatibility_for_changed_files_in_repo_at(
                         &store,
                         Some(&db_path),
+                        target_uid,
                         &changed_files,
                     )?
                     .retain_degrading(&mut repos);
@@ -22324,11 +22491,19 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         eprintln!("Error: {}", affected_tests_refusal_note(&payload));
                         return Ok((EXIT_NEEDS_REINDEX, None));
                     }
-                    let result = nestweaver_engine::rts_eval::run_recorded(
-                        &store,
-                        &changed_files,
-                        Some(&db_path),
-                    )?;
+                    let result = match target_uid {
+                        Some(uid) => nestweaver_engine::rts_eval::run_recorded_in_repo(
+                            &store,
+                            uid,
+                            &changed_files,
+                            Some(&db_path),
+                        )?,
+                        None => nestweaver_engine::rts_eval::run_recorded(
+                            &store,
+                            &changed_files,
+                            Some(&db_path),
+                        )?,
+                    };
                     AffectedTestsRpcPayload::Single {
                         raw: serde_json::to_value(&result)?,
                         result: Box::new(result),
@@ -22339,7 +22514,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let (stats, exit) = match &result {
                 AffectedTestsRpcPayload::Single { raw, result } => {
                     if json {
-                        print_json_payload(raw)?;
+                        print_json_payload(&with_repo_identity(raw.clone()))?;
                     } else {
                         render_affected_tests_result(result, None);
                     }
@@ -23848,8 +24023,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             if !local_changes && diff.is_none() {
                 eprintln!("error: --local-changes or --diff is required");
-                return Ok((EXIT_ERROR, None));
+                return Ok((EXIT_USAGE, None));
             }
+            let json = format == PrePushFormat::Json;
 
             let repo_path = repo.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             if !repo_path.join(".git").exists() {
@@ -23882,18 +24058,29 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
 
             if changes.is_empty() {
+                // Changed files with no symbol-level change (docs, config, a
+                // body edit the differ does not see) are not "no changes".
+                let changed_files = pre_push_changed_file_count(&repo_path, diff.as_deref());
                 if !out.quiet {
+                    let message = if changed_files == 0 {
+                        "No local changes detected.".to_string()
+                    } else {
+                        format!(
+                            "{changed_files} file(s) changed, but no symbol-level changes were detected; nothing to analyze."
+                        )
+                    };
                     // In JSON mode, status text must go to stderr so stdout
                     // stays a single clean JSON document for jq / format-comment.
-                    if format == "json" {
-                        eprintln!("No local changes detected.");
+                    if json {
+                        eprintln!("{message}");
                     } else {
-                        println!("No local changes detected.");
+                        println!("{message}");
                     }
                 }
-                if format == "json" {
+                if json {
                     let output = serde_json::json!({
                         "changes": 0,
+                        "changed_files": changed_files,
                         "impacts": [],
                         "total_impacted_files": 0,
                         "total_impacted_repos": 0,
@@ -23905,7 +24092,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             // Dry-run mode: show the atomic changes without running impact analysis
             if dry_run {
-                if format == "json" {
+                if json {
                     let output = serde_json::json!({
                         "dry_run": true,
                         "changes": changes,
@@ -23928,7 +24115,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
 
             if !out.quiet {
                 // Keep stdout clean for JSON consumers; route progress to stderr.
-                if format == "json" {
+                if json {
                     eprintln!("  Analyzing {} change(s)...", changes.len());
                 } else {
                     println!("  Analyzing {} change(s)...", changes.len());
@@ -23936,10 +24123,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             }
 
             // Parse min_severity
-            let min_sev = match min_severity.to_lowercase().as_str() {
-                "breaking" => ImpactSeverity::Breaking,
-                "warning" => ImpactSeverity::Warning,
-                _ => ImpactSeverity::Info,
+            let min_sev = match min_severity {
+                PrePushMinSeverity::Breaking => ImpactSeverity::Breaking,
+                PrePushMinSeverity::Warning => ImpactSeverity::Warning,
+                PrePushMinSeverity::Info => ImpactSeverity::Info,
             };
 
             // Run impact analysis — either against a remote server or the local store
@@ -24010,7 +24197,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "warning: Server unavailable — skipping impact analysis ({})",
                             e
                         );
-                        print_impact_degraded_json(&format, "server_unavailable")?;
+                        print_impact_degraded_json(json, "server_unavailable")?;
                         return Ok((EXIT_SUCCESS, None));
                     }
                 }
@@ -24026,7 +24213,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             "warning: failed to open store, skipping impact analysis ({})",
                             e
                         );
-                        print_impact_degraded_json(&format, "store_unavailable")?;
+                        print_impact_degraded_json(json, "store_unavailable")?;
                         return Ok((EXIT_SUCCESS, None));
                     }
                 };
@@ -24043,7 +24230,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             return Err(anyhow::anyhow!("impact analysis failed: {}", e));
                         }
                         eprintln!("warning: impact analysis failed, skipping ({})", e);
-                        print_impact_degraded_json(&format, "analysis_failed")?;
+                        print_impact_degraded_json(json, "analysis_failed")?;
                         return Ok((EXIT_SUCCESS, None));
                     }
                 }
@@ -24057,7 +24244,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Filter by minimum severity
             let impacts = nestweaver_engine::diff_impact::filter_by_severity(impacts, min_sev);
 
-            if format == "json" {
+            if json {
                 let output = serde_json::json!({
                     "changes": changes.len(),
                     "impacts": impacts,
@@ -24086,25 +24273,34 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         .filter(|i| i.severity == ImpactSeverity::Info)
                         .collect();
 
+                    // --no-color, --plain, NO_COLOR and a non-TTY stdout all
+                    // mean plain labels.
+                    let color = out.color && std::io::stdout().is_terminal();
                     println!();
                     for impact in &breaking {
                         println!(
-                            "  \x1b[31mBREAKING\x1b[0m: {} — {}",
-                            impact.affected_name, impact.reason
+                            "  {}: {} — {}",
+                            severity_label("BREAKING", "31", color),
+                            impact.affected_name,
+                            impact.reason
                         );
                         println!("    {}:{}", impact.affected_file, impact.affected_line);
                     }
                     for impact in &warnings {
                         println!(
-                            "  \x1b[33mWARNING\x1b[0m: {} — {}",
-                            impact.affected_name, impact.reason
+                            "  {}: {} — {}",
+                            severity_label("WARNING", "33", color),
+                            impact.affected_name,
+                            impact.reason
                         );
                         println!("    {}:{}", impact.affected_file, impact.affected_line);
                     }
                     for impact in &info {
                         println!(
-                            "  \x1b[34mINFO\x1b[0m: {} — {}",
-                            impact.affected_name, impact.reason
+                            "  {}: {} — {}",
+                            severity_label("INFO", "34", color),
+                            impact.affected_name,
+                            impact.reason
                         );
                         println!("    {}:{}", impact.affected_file, impact.affected_line);
                     }
@@ -25304,8 +25500,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 ))
                 .context("failed to connect to daemon")?;
 
+            // Absolute path: the daemon runs with its own CWD and would load a
+            // different instance.toml for a client-relative `--config`.
+            let config_abs = std::fs::canonicalize(config_path).with_context(|| {
+                format!("failed to resolve config path {}", config_path.display())
+            })?;
             let mut stream = rt
-                .block_on(client.materialize_projects(&config_path.to_string_lossy(), instance_id))
+                .block_on(client.materialize_projects(&config_abs.to_string_lossy(), instance_id))
                 .context("materialize_projects RPC failed")?;
 
             let mut had_error = false;
@@ -36329,13 +36530,81 @@ credential_method = "gh"
         assert_eq!(bridges, serde_json::json!({ "top_n": 3 }));
         assert!(bridges.get("top").is_none());
 
-        let affected = affected_tests_rpc_args(&["src/a.rs".to_string(), "src/b.rs".to_string()]);
+        let affected =
+            affected_tests_rpc_args(&["src/a.rs".to_string(), "src/b.rs".to_string()], None);
         assert_eq!(
             affected,
             serde_json::json!({ "changed_files": ["src/a.rs", "src/b.rs"] })
         );
         assert!(affected["changed_files"].is_array());
         assert!(affected.get("files").is_none());
+
+        let scoped = affected_tests_rpc_args(&["src/a.rs".to_string()], Some("repo:uid"));
+        assert_eq!(scoped["repo"], "repo:uid");
+    }
+
+    /// `pre-push-impact` severity labels carry ANSI only when colour is on.
+    #[test]
+    fn severity_label_respects_color() {
+        assert_eq!(severity_label("BREAKING", "31", false), "BREAKING");
+        assert_eq!(
+            severity_label("BREAKING", "31", true),
+            "\x1b[31mBREAKING\x1b[0m"
+        );
+    }
+
+    /// `affected-tests` names the repository its repo-relative paths belong
+    /// to; unscoped, a same-path file in another indexed repo joined the change.
+    #[test]
+    fn affected_tests_target_repo_names_one_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = |name: &str| {
+            let root = dir.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            nestweaver_schema::Repo {
+                uid: format!("repo:test:{name}"),
+                url: format!("file://{}", root.display()),
+                indexed_sha: String::new(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: Some(name.to_string()),
+                root_path: Some(root.display().to_string()),
+            }
+        };
+        let one = [repo("alpha")];
+        let two = [repo("alpha"), repo("beta")];
+
+        // --files: the only indexed repo, or refuse to guess among several.
+        let only = affected_tests_target_repo(&one, None, None).unwrap();
+        assert_eq!(only.map(|r| r.uid.as_str()), Some("repo:test:alpha"));
+        assert!(matches!(
+            affected_tests_target_repo(&two, None, None),
+            Err(AffectedTestsRepoError::Ambiguous(candidates)) if candidates.len() == 2
+        ));
+        assert!(
+            affected_tests_target_repo(&[], None, None)
+                .unwrap()
+                .is_none()
+        );
+
+        // --repo wins; a miss keeps the typed repo-filter error.
+        let named = affected_tests_target_repo(&two, Some("beta"), None).unwrap();
+        assert_eq!(named.map(|r| r.uid.as_str()), Some("repo:test:beta"));
+        match affected_tests_target_repo(&two, Some("gamma"), None) {
+            Err(AffectedTestsRepoError::Unresolved(error)) => {
+                assert!(error_is_unresolved_repo_filter(&error), "{error:#}")
+            }
+            other => panic!("expected an unresolved repo filter, got {other:?}"),
+        }
+
+        // --base-ref: the repo checked out at the diffed work tree.
+        let diffed =
+            affected_tests_target_repo(&two, None, Some(&dir.path().join("beta"))).unwrap();
+        assert_eq!(diffed.map(|r| r.uid.as_str()), Some("repo:test:beta"));
+        assert!(matches!(
+            affected_tests_target_repo(&two, None, Some(dir.path())),
+            Err(AffectedTestsRepoError::NotIndexed(_))
+        ));
     }
 
     /// `read_symbols` sends `include_neighbors` (nw-088) and OMITS

@@ -787,6 +787,17 @@ pub fn incompatibility_for_changed_files_at(
     incompatibility_for_changed_files_scoped(store, db_path, changed_files, None)
 }
 
+/// [`incompatibility_for_changed_files_at`] limited to one repository when
+/// `repo_uid` names one, as [`incompatibility_for_changed_files_in_repo`] is.
+pub fn incompatibility_for_changed_files_in_repo_at(
+    store: &GraphStore,
+    db_path: Option<&Path>,
+    repo_uid: Option<&str>,
+    changed_files: &[String],
+) -> anyhow::Result<ResolverIncompatibility> {
+    incompatibility_for_changed_files_scoped(store, db_path, changed_files, repo_uid)
+}
+
 fn incompatibility_for_changed_files_scoped(
     store: &GraphStore,
     db_path: Option<&Path>,

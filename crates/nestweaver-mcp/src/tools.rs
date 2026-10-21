@@ -10751,13 +10751,16 @@ fn looks_like_note_path(input: &str) -> bool {
     input.contains('/') || input.contains('\\') || input.to_lowercase().ends_with(".md")
 }
 
+/// A path-qualified wikilink (`Workspaces/Payments/Decisions`) omits `.md`,
+/// so a path query without it also matches `<path>.md`.
 fn note_path_matches(file_path: &str, query: &str) -> bool {
     let fp = file_path.replace('\\', "/").to_lowercase();
     let q = query
         .replace('\\', "/")
         .trim_start_matches("./")
         .to_lowercase();
-    fp == q || fp.ends_with(&format!("/{q}"))
+    let matches = |q: &str| fp == q || fp.ends_with(&format!("/{q}"));
+    matches(&q) || (q.contains('/') && !q.ends_with(".md") && matches(&format!("{q}.md")))
 }
 
 /// Resolve a note by UID, vault-relative path, or title.
@@ -14362,7 +14365,7 @@ fn tool_schema_affected_tests() -> Value {
                 "repo": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Repository to diff for base_ref (repo uid, exact display name, or local root). Required when more than one local repository is visible; an omitted value then errors instead of diffing one unnamed repository. The result names the repository that was diffed."
+                    "description": "Repository the change belongs to (repo uid, exact display name, or local root). For base_ref, the repository to diff: required when more than one local repository is visible; an omitted value then errors instead of diffing one unnamed repository. With changed_files, limits those repo-relative paths to this repository. The result names the repository."
                 }
             },
             // nw-410: the either/or requirement, declared where the
@@ -14431,6 +14434,28 @@ fn tool_affected_tests(
             nestweaver_engine::changed_files::validate_changed_file_entries(&changed_files)?;
         selected_repo = Some(selected);
     }
+    // Explicit paths are repo-relative as well: with `repo`, a file at the
+    // same relative path in another indexed repository is not part of the
+    // change, so the selection is limited to the named repository.
+    if explicit_input && let Some(selector) = args.get("repo").and_then(|value| value.as_str()) {
+        let uid = nestweaver_engine::node_scope::resolve_repo_filter(
+            store,
+            std::slice::from_ref(&selector.to_string()),
+            visible,
+        )?
+        .into_iter()
+        .next()
+        .context("resolve_repo_filter returned no uid for a single selector")?;
+        let repo = list_affected_tests_base_ref_repositories(store, visible)?
+            .into_iter()
+            .find(|repo| repo.uid == uid)
+            .context("resolved repo uid is missing from the visible repo list")?;
+        selected_repo = Some(AffectedTestsBaseRefRepository {
+            name: nestweaver_engine::repo_display_name(&repo),
+            path: repo.local_root().unwrap_or_default().to_owned(),
+            uid: repo.uid,
+        });
+    }
 
     // Only a genuine "no input" (neither changed_files nor base_ref) is an error.
     // A `base_ref` that resolves to ZERO changed files (e.g. HEAD vs HEAD) is a
@@ -14468,11 +14493,19 @@ fn tool_affected_tests(
             .map(|(uid, _)| uid.clone())
             .collect();
         if explicit_input {
-            nestweaver_engine::affected_tests::affected_tests_scoped(
-                store,
-                &changed_files,
-                &allowed,
-            )
+            match selected_repo.as_ref() {
+                Some(repo) => nestweaver_engine::affected_tests::affected_tests_scoped_in_repo(
+                    store,
+                    &repo.uid,
+                    &changed_files,
+                    &allowed,
+                ),
+                None => nestweaver_engine::affected_tests::affected_tests_scoped(
+                    store,
+                    &changed_files,
+                    &allowed,
+                ),
+            }
             .context("affected_tests")?
         } else {
             let repo_uid = selected_repo
@@ -14490,8 +14523,20 @@ fn tool_affected_tests(
     } else {
         let db_path = current_db_path(store).ok();
         if explicit_input {
-            nestweaver_engine::rts_eval::run_recorded(store, &changed_files, db_path.as_deref())
-                .context("affected_tests")?
+            match selected_repo.as_ref() {
+                Some(repo) => nestweaver_engine::rts_eval::run_recorded_in_repo(
+                    store,
+                    &repo.uid,
+                    &changed_files,
+                    db_path.as_deref(),
+                ),
+                None => nestweaver_engine::rts_eval::run_recorded(
+                    store,
+                    &changed_files,
+                    db_path.as_deref(),
+                ),
+            }
+            .context("affected_tests")?
         } else {
             let repo_uid = selected_repo
                 .as_ref()
@@ -15732,6 +15777,80 @@ mod affected_tests_base_ref_tests {
             .expect("the only local repository must diff and be named");
         assert_eq!(implied["repo"], json!("git-repo"), "{implied}");
         assert_eq!(implied["repo_uid"], json!(git_uid), "{implied}");
+    }
+
+    /// Explicit `changed_files` are repo-relative too. With `repo`, the same
+    /// relative path in another indexed repository is not part of the change,
+    /// and the result names the repository it was limited to.
+    #[test]
+    fn affected_tests_changed_files_are_limited_to_the_named_repo() {
+        use nestweaver_schema::{Symbol, Visibility};
+        let alpha_dir = tempfile::tempdir().unwrap();
+        let beta_dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::in_memory().unwrap();
+        for (uid, name, root) in [
+            ("repo:test:alpha", "alpha", alpha_dir.path()),
+            ("repo:test:beta", "beta", beta_dir.path()),
+        ] {
+            store.insert_repo(&indexed_repo(uid, name, root)).unwrap();
+            store
+                .insert_symbol(&Symbol {
+                    uid: format!("sym:{name}"),
+                    name: format!("{name}_fn"),
+                    kind: SymbolKind::Function,
+                    repo_uid: uid.to_string(),
+                    file_path: "src/lib.rs".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                    signature: String::new(),
+                    summary: None,
+                    content_hash: name.to_string(),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Inferred,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+        }
+        let changed = |value: &Value| -> Vec<String> {
+            value["changed_symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|symbol| symbol["uid"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let unscoped =
+            tool_affected_tests(&store, json!({ "changed_files": ["src/lib.rs"] }), None).unwrap();
+        assert_eq!(changed(&unscoped).len(), 2, "{unscoped}");
+
+        let scoped = tool_affected_tests(
+            &store,
+            json!({ "changed_files": ["src/lib.rs"], "repo": "beta" }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(changed(&scoped), vec!["sym:beta".to_string()], "{scoped}");
+        assert_eq!(scoped["repo"], json!("beta"), "{scoped}");
+        assert_eq!(scoped["repo_uid"], json!("repo:test:beta"), "{scoped}");
+
+        let missing = tool_affected_tests(
+            &store,
+            json!({ "changed_files": ["src/lib.rs"], "repo": "gamma" }),
+            None,
+        )
+        .expect_err("an unknown repo must not fall back to every repo");
+        assert!(
+            missing
+                .chain()
+                .any(|cause| cause.is::<nestweaver_engine::node_scope::RepoFilterUnresolved>()),
+            "{missing:#}"
+        );
     }
 
     /// A directory nested inside a work tree is not that work tree. Git run
@@ -26524,6 +26643,25 @@ mod cache_dispatch_tests {
         store.insert_note(&two).unwrap();
         store.insert_note(&unique).unwrap();
         store
+    }
+
+    /// The brain links notes as `[[folder1/Same]]`, path-qualified without
+    /// `.md`; `note_get` and `backlinks` must resolve that form too.
+    #[test]
+    fn path_qualified_lookup_without_md_extension_resolves() {
+        let store = two_same_title_notes();
+        for path in ["folder1/Same", "folder1/Same.md"] {
+            let note = tool_note_get(&store, json!({ "title": path })).unwrap();
+            assert_eq!(note["uid"], "note:same-a", "{path}: {note}");
+            let links = tool_backlinks(&store, json!({ "title": path })).unwrap();
+            assert_ne!(links["status"], "ambiguous", "{path}: {links}");
+            assert!(links.get("error").is_none(), "{path}: {links}");
+        }
+        // A bare title stays ambiguous; the path form is what disambiguates.
+        let bare = tool_note_get(&store, json!({ "title": "Same" })).unwrap();
+        assert_eq!(bare["status"], "ambiguous", "{bare}");
+        assert!(note_path_matches("folder1/Same.md", "folder1/Same"));
+        assert!(!note_path_matches("folder1/Same.md", "Same"));
     }
 
     #[test]

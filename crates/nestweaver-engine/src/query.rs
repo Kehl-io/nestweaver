@@ -4391,13 +4391,16 @@ fn looks_like_note_path(input: &str) -> bool {
     input.contains('/') || input.contains('\\') || input.to_lowercase().ends_with(".md")
 }
 
+/// A path-qualified wikilink (`Workspaces/Payments/Decisions`) omits `.md`,
+/// so a path query without it also matches `<path>.md`.
 fn note_path_matches(file_path: &str, query: &str) -> bool {
     let fp = file_path.replace('\\', "/").to_lowercase();
     let q = query
         .replace('\\', "/")
         .trim_start_matches("./")
         .to_lowercase();
-    fp == q || fp.ends_with(&format!("/{q}"))
+    let matches = |q: &str| fp == q || fp.ends_with(&format!("/{q}"));
+    matches(&q) || (q.contains('/') && !q.ends_with(".md") && matches(&format!("{q}.md")))
 }
 
 fn notes_matching_title(
