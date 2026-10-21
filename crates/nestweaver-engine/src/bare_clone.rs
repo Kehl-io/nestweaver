@@ -374,14 +374,115 @@ pub fn read_origin_url(bare_path: &Path) -> Result<String> {
 /// parent repo's origin identity — it gets a `file://` identity instead. The
 /// trailing slash is trimmed so equivalent paths mint one canonical form
 /// (repo_uid normalizes this anyway; trimming keeps the stored display url tidy).
+///
+/// A checkout whose metadata belongs to another repository (see
+/// [`ensure_own_git_metadata`]) gets the `file://` identity too: reading the
+/// borrowed config would hand it the other repository's origin, and with it
+/// that repository's uid.
 pub fn mint_repo_identity(path: &Path) -> String {
     let file_url = format!("file://{}", path.display());
-    let url = if path.join(".git").exists() {
+    let url = if path.join(".git").exists() && ensure_own_git_metadata(path).is_ok() {
         read_origin_url(path).unwrap_or(file_url)
     } else {
         file_url
     };
     url.trim_end_matches('/').to_string()
+}
+
+/// Refuse a checkout whose `.git` makes Git use another repository's
+/// metadata.
+///
+/// Git takes a repository's config, refs and index from its common directory.
+/// A `.git` that names someone else's makes every Git command in this checkout
+/// read (and can make it write) that repository, and its origin becomes this
+/// checkout's identity: indexing it would replace the other repository's
+/// graph. Refused layouts:
+/// - a `.git` directory containing `commondir` (Git writes that file only in
+///   `<common>/worktrees/<id>`, never in a checkout's own `.git`);
+/// - a gitfile whose target has a `commondir` but is not registered under
+///   that common directory's `worktrees/` (a linked worktree always is);
+/// - a `.git` (symlink or gitfile) resolving to a directory named `.git`
+///   that belongs to another checkout.
+///
+/// Linked worktrees, submodules (`.git/modules/<name>`) and separate Git
+/// directories are accepted.
+pub fn ensure_own_git_metadata(path: &Path) -> Result<()> {
+    let dot_git = path.join(".git");
+    let meta = match std::fs::metadata(&dot_git) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", dot_git.display()));
+        }
+    };
+    let refuse = |why: &str| {
+        anyhow::anyhow!(
+            "refusing to index '{}': its .git {why}, so Git would read another \
+             repository's metadata and the index would take over that repository's identity",
+            path.display()
+        )
+    };
+    let checkout = std::fs::canonicalize(path)
+        .with_context(|| format!("cannot resolve {}", path.display()))?;
+    let foreign_dot_git = |git_dir: &Path| {
+        git_dir.file_name().is_some_and(|name| name == ".git")
+            && git_dir.parent() != Some(checkout.as_path())
+    };
+    if meta.is_dir() {
+        let git_dir = std::fs::canonicalize(&dot_git)
+            .with_context(|| format!("cannot resolve {}", dot_git.display()))?;
+        if foreign_dot_git(&git_dir) {
+            return Err(refuse("links to another checkout's .git"));
+        }
+        if std::fs::symlink_metadata(git_dir.join("commondir")).is_ok() {
+            return Err(refuse("names a common directory (`commondir`)"));
+        }
+        return Ok(());
+    }
+    let contents = std::fs::read_to_string(&dot_git)
+        .with_context(|| format!("cannot read {}", dot_git.display()))?;
+    let Some(target) = contents
+        .strip_prefix("gitdir: ")
+        .map(|value| value.trim_end_matches(['\n', '\r']))
+        .filter(|value| !value.is_empty())
+    else {
+        // Not a gitfile Git accepts either; Git itself refuses the checkout.
+        return Ok(());
+    };
+    let target = Path::new(target);
+    let target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        checkout.join(target)
+    };
+    let Ok(git_dir) = std::fs::canonicalize(&target) else {
+        // Git refuses a gitfile whose target does not exist.
+        return Ok(());
+    };
+    if foreign_dot_git(&git_dir) {
+        return Err(refuse("file names another checkout's .git"));
+    }
+    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(common) => common,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(refuse("file names metadata whose `commondir` is unreadable")),
+    };
+    let common = Path::new(common.trim_end_matches(['\n', '\r']));
+    let common = if common.is_absolute() {
+        common.to_path_buf()
+    } else {
+        git_dir.join(common)
+    };
+    let registered = std::fs::canonicalize(&common)
+        .ok()
+        .is_some_and(|common| git_dir.parent() == Some(common.join("worktrees").as_path()));
+    if registered {
+        Ok(())
+    } else {
+        Err(refuse(
+            "file names a worktree that its common directory does not register",
+        ))
+    }
 }
 
 /// Recursively compute directory size in bytes.
@@ -480,6 +581,127 @@ mod tests {
         create_source_repo(&src, &[("a.txt", "hi")]);
 
         assert!(read_origin_url(&src).is_err());
+    }
+
+    fn fixture_git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+    }
+
+    /// A repository with one commit and the given origin.
+    fn repo_with_origin(dir: &Path, origin: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        fixture_git(dir, &["init", "-q"]);
+        fixture_git(dir, &["config", "user.email", "t@example.com"]);
+        fixture_git(dir, &["config", "user.name", "t"]);
+        fixture_git(dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        fixture_git(dir, &["add", "a.txt"]);
+        fixture_git(dir, &["commit", "-q", "-m", "init"]);
+        fixture_git(dir, &["remote", "add", "origin", origin]);
+    }
+
+    /// A `.git` that borrows another repository's metadata must not mint that
+    /// repository's identity: indexing it would replace the victim's graph.
+    #[test]
+    fn borrowed_git_metadata_is_refused_and_never_mints_the_victim_identity() {
+        let tmp = TempDir::new().unwrap();
+        let victim = tmp.path().join("victim");
+        repo_with_origin(&victim, "https://example.com/acme/victim.git");
+        let victim_git = std::fs::canonicalize(victim.join(".git")).unwrap();
+
+        // A `.git` directory with `commondir` naming the victim, absolute and
+        // relative.
+        for (name, commondir) in [
+            ("absolute", victim_git.display().to_string()),
+            ("relative", "../../victim/.git".to_string()),
+        ] {
+            let evil = tmp.path().join(name);
+            std::fs::create_dir_all(evil.join(".git")).unwrap();
+            std::fs::write(evil.join(".git/commondir"), format!("{commondir}\n")).unwrap();
+            std::fs::write(evil.join(".git/HEAD"), "ref: refs/heads/master\n").unwrap();
+            assert_eq!(
+                read_origin_url(&evil).ok().as_deref(),
+                Some("https://example.com/acme/victim.git"),
+                "{name}: plain Git reads the victim's config through commondir"
+            );
+            let error = ensure_own_git_metadata(&evil).unwrap_err().to_string();
+            assert!(error.contains("commondir"), "{name}: {error}");
+            assert_eq!(
+                mint_repo_identity(&evil),
+                format!("file://{}", evil.display())
+            );
+        }
+
+        // A gitfile naming the victim's own `.git`, and one naming an
+        // unregistered worktree directory whose commondir is the victim.
+        let gitfile = tmp.path().join("gitfile");
+        std::fs::create_dir_all(&gitfile).unwrap();
+        std::fs::write(
+            gitfile.join(".git"),
+            format!("gitdir: {}\n", victim_git.display()),
+        )
+        .unwrap();
+        assert!(ensure_own_git_metadata(&gitfile).is_err());
+        assert_eq!(
+            mint_repo_identity(&gitfile),
+            format!("file://{}", gitfile.display())
+        );
+        let forged = tmp.path().join("forged-worktree");
+        std::fs::create_dir_all(&forged).unwrap();
+        std::fs::write(forged.join("commondir"), format!("{}\n", victim_git.display())).unwrap();
+        std::fs::write(forged.join("HEAD"), "ref: refs/heads/master\n").unwrap();
+        let worktree = tmp.path().join("worktree-evil");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), format!("gitdir: {}\n", forged.display())).unwrap();
+        std::fs::write(forged.join("gitdir"), format!("{}\n", worktree.join(".git").display()))
+            .unwrap();
+        assert!(ensure_own_git_metadata(&worktree).is_err());
+
+        // A symlinked `.git` to the victim's.
+        let linked = tmp.path().join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(&victim_git, linked.join(".git")).unwrap();
+        assert!(ensure_own_git_metadata(&linked).is_err());
+    }
+
+    /// Ordinary repositories, registered linked worktrees and submodules keep
+    /// their identity.
+    #[test]
+    fn own_git_metadata_layouts_are_accepted() {
+        let tmp = TempDir::new().unwrap();
+        let main = tmp.path().join("main");
+        repo_with_origin(&main, "https://example.com/acme/main.git");
+        ensure_own_git_metadata(&main).unwrap();
+        let linked = tmp.path().join("linked");
+        fixture_git(
+            &main,
+            &["worktree", "add", "-q", "-b", "side", linked.to_str().unwrap()],
+        );
+        ensure_own_git_metadata(&linked).unwrap();
+        assert_eq!(
+            mint_repo_identity(&linked),
+            "https://example.com/acme/main.git"
+        );
+        // A submodule-style gitfile into the parent's `.git/modules/<name>`.
+        let sub_git = main.join(".git/modules/sub");
+        std::fs::create_dir_all(sub_git.parent().unwrap()).unwrap();
+        let sub_source = tmp.path().join("sub-source");
+        repo_with_origin(&sub_source, "https://example.com/acme/sub.git");
+        std::fs::rename(sub_source.join(".git"), &sub_git).unwrap();
+        let sub = main.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(".git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        ensure_own_git_metadata(&sub).unwrap();
+        // Not a repository at all.
+        ensure_own_git_metadata(tmp.path()).unwrap();
     }
 
     /// A git repo ROOT with an origin remote mints that origin url.

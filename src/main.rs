@@ -20,11 +20,62 @@ fn write_cli_stdout(
     arguments: std::fmt::Arguments<'_>,
     newline: bool,
 ) -> std::io::Result<()> {
-    writer.write_fmt(arguments)?;
+    // Indexed content (note titles and bodies, headings, symbol names, file
+    // paths) reaches stdout through here, and any of it can carry terminal
+    // control sequences. Escape them at this one boundary.
+    let text = match arguments.as_str() {
+        Some(text) => std::borrow::Cow::Borrowed(text),
+        None => std::borrow::Cow::Owned(arguments.to_string()),
+    };
+    writer.write_all(terminal_safe(&text).as_bytes())?;
     if newline {
         writer.write_all(b"\n")?;
     }
     Ok(())
+}
+
+/// `text` with every control character a terminal would act on made visible.
+///
+/// C0 controls other than `\n` and `\t`, DEL and the C1 controls become
+/// `\u00XX`. That neutralizes cursor movement, screen clears, title and
+/// clipboard writes (OSC), hyperlinks and BEL. The `\u00XX` form is also a
+/// JSON string escape for the same character, so JSON output (where serde
+/// already escapes C0, and C1/DEL can only occur inside strings) decodes to
+/// the same values. Plain SGR colour sequences (`ESC [ <digits;> m`) pass
+/// through: the CLI colours its own labels with them, and they can only
+/// change colours.
+fn terminal_safe(text: &str) -> std::borrow::Cow<'_, str> {
+    fn is_control(c: char) -> bool {
+        (c.is_control() && c != '\n' && c != '\t') || c == '\u{7f}'
+    }
+    if !text.chars().any(is_control) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut safe = String::with_capacity(text.len() + 16);
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if c == '\u{1b}' {
+            let body = &rest[1..];
+            if let Some(params) = body.strip_prefix('[') {
+                let digits = params
+                    .find(|p: char| !(p.is_ascii_digit() || p == ';'))
+                    .unwrap_or(params.len());
+                if params[digits..].starts_with('m') {
+                    let length = 2 + digits + 1;
+                    safe.push_str(&rest[..length]);
+                    rest = &rest[length..];
+                    continue;
+                }
+            }
+        }
+        if is_control(c) {
+            safe.push_str(&format!("\\u{:04x}", u32::from(c)));
+        } else {
+            safe.push(c);
+        }
+        rest = &rest[c.len_utf8()..];
+    }
+    std::borrow::Cow::Owned(safe)
 }
 
 fn raise_stdout_failure(error: std::io::Error) -> ! {
@@ -4340,7 +4391,11 @@ mod blast_radius_exit_code_tests {
 /// cross-repo link rather than an observed call, and omitting the label is what
 /// let fabricated cross-language execution paths read as real ones (nw-111).
 fn render_flow_trace_text(payload: &serde_json::Value) {
-    render_flow_trace_text_to(&mut std::io::stdout().lock(), payload);
+    // Buffered and printed so the text crosses the terminal-safe stdout
+    // boundary like every other command's.
+    let mut text = Vec::new();
+    render_flow_trace_text_to(&mut text, payload);
+    print!("{}", String::from_utf8_lossy(&text));
 }
 
 /// [`render_flow_trace_text`] into any writer, so the text is testable. A
@@ -6477,6 +6532,40 @@ mod daemon_status_renderer_tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// Indexed text printed by `search`, `note get`, `backlinks`,
+    /// `regex-search` and the rest reaches the terminal through
+    /// `write_cli_stdout`, which must neutralize control sequences a title,
+    /// heading or body can carry.
+    #[test]
+    fn stdout_boundary_escapes_terminal_control_sequences() {
+        let title = "Note\u{1b}]0;pwned\u{7}\u{1b}[2J\u{1b}[H\rspoof\u{9b}31m\u{7f}";
+        let mut written = Vec::new();
+        write_cli_stdout(&mut written, format_args!("  {title}  [note]\tok"), true).unwrap();
+        let written = String::from_utf8(written).unwrap();
+        assert_eq!(
+            written,
+            "  Note\\u001b]0;pwned\\u0007\\u001b[2J\\u001b[H\\u000dspoof\\u009b31m\\u007f  [note]\tok\n"
+        );
+        assert!(!written.chars().any(|c| c.is_control() && c != '\n' && c != '\t'));
+        // The CLI's own colour labels survive.
+        assert_eq!(
+            terminal_safe("\u{1b}[31mBREAKING\u{1b}[0m \u{1b}[1;33mWARN\u{1b}[m"),
+            "\u{1b}[31mBREAKING\u{1b}[0m \u{1b}[1;33mWARN\u{1b}[m"
+        );
+        // JSON is unchanged in meaning: the escapes are JSON escapes.
+        let value = serde_json::json!({ "title": "a\u{9b}b\u{7f}c\u{1b}d" });
+        let json = serde_json::to_string(&value).unwrap();
+        let safe = terminal_safe(&json).into_owned();
+        assert!(!safe.chars().any(|c| c.is_control()));
+        let reparsed: serde_json::Value = serde_json::from_str(&safe).unwrap();
+        assert_eq!(reparsed, value);
+        // Plain text is borrowed, not copied.
+        assert!(matches!(
+            terminal_safe("plain\ttext\n"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]
@@ -8710,7 +8799,7 @@ enum Commands {
         /// Server URL (e.g., nestweaver.acme.com:9378)
         url: String,
         /// Bearer token for authentication
-        #[arg(long, env = "NESTWEAVER_TOKEN")]
+        #[arg(long, env = "NESTWEAVER_TOKEN", hide_env_values = true)]
         token: Option<String>,
         /// Authenticate interactively via device flow (opens a browser).
         /// Implied when no --token / NESTWEAVER_TOKEN is provided.
@@ -8825,7 +8914,7 @@ enum ServerAction {
         #[arg(long)]
         url: String,
         /// Admin bearer token (defaults to the NESTWEAVER_ADMIN_TOKEN env var)
-        #[arg(long, env = "NESTWEAVER_ADMIN_TOKEN")]
+        #[arg(long, env = "NESTWEAVER_ADMIN_TOKEN", hide_env_values = true)]
         token: Option<String>,
     },
 }
@@ -9047,11 +9136,11 @@ enum DaemonAction {
         tls_key: Option<PathBuf>,
 
         /// Bearer token for query auth
-        #[arg(long, env = "NESTWEAVER_AUTH_TOKEN")]
+        #[arg(long, env = "NESTWEAVER_AUTH_TOKEN", hide_env_values = true)]
         auth_token: Option<String>,
 
         /// Separate admin bearer token
-        #[arg(long, env = "NESTWEAVER_ADMIN_TOKEN")]
+        #[arg(long, env = "NESTWEAVER_ADMIN_TOKEN", hide_env_values = true)]
         admin_token: Option<String>,
 
         /// Write actual bound port to this file (for test harness)
@@ -9059,11 +9148,11 @@ enum DaemonAction {
         port_file: Option<PathBuf>,
 
         /// Webhook HMAC secret for verifying push event signatures
-        #[arg(long, env = "NESTWEAVER_WEBHOOK_SECRET")]
+        #[arg(long, env = "NESTWEAVER_WEBHOOK_SECRET", hide_env_values = true)]
         webhook_secret: Option<String>,
 
         /// Previous webhook secret (fallback during rotation)
-        #[arg(long, env = "NESTWEAVER_WEBHOOK_SECRET_OLD")]
+        #[arg(long, env = "NESTWEAVER_WEBHOOK_SECRET_OLD", hide_env_values = true)]
         webhook_secret_old: Option<String>,
 
         /// Path to instance.toml for server config (repos, polling, etc.)
@@ -11979,7 +12068,7 @@ fn git_hooks_dir(cwd: &Path) -> anyhow::Result<PathBuf> {
 /// Repo worktree root via `git rev-parse --show-toplevel`; None when git
 /// can't answer (already validated by the caller, so a failure is ignored).
 fn git_repo_root(cwd: &Path) -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
+    let output = nestweaver_engine::git_cmd::isolated_git()
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(cwd)
         .output()
@@ -17023,7 +17112,13 @@ fn pre_push_changed_file_count(repo_path: &Path, diff: Option<&str>) -> usize {
     if range.starts_with('-') {
         return 0;
     }
-    std::process::Command::new("git")
+    // `git diff` against the working tree runs the repository's fsmonitor and
+    // clean filters, and its config names both: the isolated command runs
+    // neither.
+    let Ok(mut command) = nestweaver_engine::git_cmd::isolated_git_in(repo_path) else {
+        return 0;
+    };
+    command
         .args(["diff", "--name-only", "-z", range, "--"])
         .current_dir(repo_path)
         .output()
@@ -17036,6 +17131,106 @@ fn pre_push_changed_file_count(repo_path: &Path, diff: Option<&str>) -> usize {
                 .filter(|path| !path.is_empty())
                 .count()
         })
+}
+
+#[cfg(test)]
+mod secret_env_help_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    /// `--help` prints an env-backed argument's current value unless the
+    /// argument hides it, so `NESTWEAVER_TOKEN=... nestweaver connect --help`
+    /// printed the token. Every secret-looking env argument must hide it.
+    #[test]
+    fn secret_env_arguments_hide_their_values_in_help() {
+        fn walk(command: &clap::Command, path: &str, leaks: &mut Vec<String>) {
+            for arg in command.get_arguments() {
+                let Some(env) = arg.get_env() else { continue };
+                let env = env.to_string_lossy().to_ascii_uppercase();
+                let secret = ["TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL"]
+                    .iter()
+                    .any(|word| env.contains(word));
+                if secret && !arg.is_hide_env_values_set() {
+                    leaks.push(format!("{path} --{} ({env})", arg.get_id()));
+                }
+            }
+            for sub in command.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), leaks);
+            }
+        }
+        let mut leaks = Vec::new();
+        let command = Cli::command();
+        walk(&command, "nestweaver", &mut leaks);
+        assert!(leaks.is_empty(), "secret env values shown in --help: {leaks:?}");
+        let mut checked = 0;
+        fn count(command: &clap::Command, checked: &mut usize) {
+            *checked += command
+                .get_arguments()
+                .filter(|arg| arg.is_hide_env_values_set())
+                .count();
+            for sub in command.get_subcommands() {
+                count(sub, checked);
+            }
+        }
+        count(&command, &mut checked);
+        assert!(checked >= 6, "the secret arguments were not found: {checked}");
+    }
+}
+
+#[cfg(test)]
+mod pre_push_changed_file_count_tests {
+    use super::pre_push_changed_file_count;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+    }
+
+    /// `pre-push-impact --local-changes` diffs the working tree. The
+    /// repository's fsmonitor and clean filter must not run.
+    #[test]
+    fn counts_changes_without_running_repository_programs() {
+        let repo = tempfile::tempdir().unwrap();
+        let markers = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "test@example.com"]);
+        git(root, &["config", "user.name", "Test"]);
+        git(root, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+        git(root, &["add", "a.rs"]);
+        git(root, &["commit", "-q", "-m", "init"]);
+        let program = markers.path().join("program.sh");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nexec cat\n",
+                markers.path().join("ran").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = program.to_str().unwrap();
+        std::fs::write(root.join(".gitattributes"), "*.rs filter=evil\n").unwrap();
+        git(root, &["config", "filter.evil.clean", program]);
+        git(root, &["config", "core.fsmonitor", program]);
+        // Same size, new content: only a content comparison can tell.
+        std::fs::write(root.join("a.rs"), "fn b() {}\n").unwrap();
+
+        assert_eq!(pre_push_changed_file_count(root, None), 1);
+        assert!(
+            !markers.path().join("ran").exists(),
+            "a repository program ran"
+        );
+    }
 }
 
 /// The coverage caveat every incomplete-impact disclosure ends with.
@@ -25952,12 +26147,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // root: `git config` walks up to an enclosing repo, and a
             // subdirectory index must not capture (and collide with) its
             // parent repo's identity.
+            nestweaver_engine::ensure_own_git_metadata(&repo_path)?;
             let repo_url = nestweaver_engine::mint_repo_identity(&repo_path);
 
             // Direct-write fallback for test/CI (NESTWEAVER_NO_DAEMON=1).
             out.status(&format!("Indexing {}", repo_path.display()));
 
-            let indexed_sha = std::process::Command::new("git")
+            let indexed_sha = nestweaver_engine::git_cmd::isolated_git()
                 .args(["rev-parse", "HEAD"])
                 .current_dir(&repo_path)
                 .output()
