@@ -67,8 +67,11 @@ pub struct CodeWatcher {
     /// Told when a batch or reconciliation fails to publish (`Some(error)`)
     /// and when one publishes again (`None`), so a supervisor can report a
     /// watcher that is alive but not indexing.
-    batch_failure_reporter: Option<Box<dyn Fn(Option<&str>) + Send + Sync>>,
+    batch_failure_reporter: Option<BatchFailureReporter>,
 }
+
+/// Receives a batch's publish error, or `None` once a batch publishes again.
+type BatchFailureReporter = Box<dyn Fn(Option<&str>) + Send + Sync>;
 
 /// The watcher's cross-repo relinker thread: signalled and joined on drop,
 /// so it never outlives the watcher (nor writes after it returns).
