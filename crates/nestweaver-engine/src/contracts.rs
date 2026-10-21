@@ -1828,9 +1828,16 @@ struct ParamShape {
 
 /// A short type name for a parameter schema (`string`, `integer`, a `$ref`
 /// target name), or `content` for a content-encoded parameter.
-fn schema_type_name(spec: &openapiv3::OpenAPI, sref: &openapiv3::ReferenceOr<openapiv3::Schema>) -> String {
+fn schema_type_name(
+    spec: &openapiv3::OpenAPI,
+    sref: &openapiv3::ReferenceOr<openapiv3::Schema>,
+) -> String {
     if let openapiv3::ReferenceOr::Reference { reference } = sref {
-        return reference.rsplit('/').next().unwrap_or(reference).to_string();
+        return reference
+            .rsplit('/')
+            .next()
+            .unwrap_or(reference)
+            .to_string();
     }
     let Some(schema) = resolve_schema(spec, sref, REF_DEPTH_CAP) else {
         return "any".to_string();
@@ -2116,7 +2123,10 @@ fn diff_params(
     if !removed_path.is_empty() && removed_path.len() == added_path.len() {
         for (old, new) in removed_path.into_iter().zip(added_path) {
             let (b, h) = (&base[old], &head[new]);
-            out.push((Info, format!("path parameter '{}' renamed to '{}'", old.1, new.1)));
+            out.push((
+                Info,
+                format!("path parameter '{}' renamed to '{}'", old.1, new.1),
+            ));
             if b.ty != h.ty {
                 out.push((
                     Breaking,
@@ -2173,7 +2183,10 @@ fn diff_params(
                 format!("{location} parameter '{name}' is now required"),
             ));
         } else if !h.required && b.required {
-            out.push((Info, format!("{location} parameter '{name}' is now optional")));
+            out.push((
+                Info,
+                format!("{location} parameter '{name}' is now optional"),
+            ));
         }
     }
     for (key, h) in head {
@@ -2187,7 +2200,10 @@ fn diff_params(
                 format!("required {location} parameter '{name}' added"),
             ));
         } else {
-            out.push((Info, format!("optional {location} parameter '{name}' added")));
+            out.push((
+                Info,
+                format!("optional {location} parameter '{name}' added"),
+            ));
         }
     }
     out
@@ -3280,7 +3296,10 @@ app.delete("/orders/:id", (req: any, res: any) => res.end());
             found.contains(&("POST /orders".into(), "createOrderHandler".into())),
             "{found:?}"
         );
-        assert_eq!(node_route_handler_name("(\"/x\", (req) => res.end())"), None);
+        assert_eq!(
+            node_route_handler_name("(\"/x\", (req) => res.end())"),
+            None
+        );
         assert_eq!(
             node_route_handler_name("(\"/x\", auth, h.run,\n)").as_deref(),
             Some("run")

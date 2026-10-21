@@ -11002,8 +11002,10 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
                 .selected_headings_bounded(&note.uid, names, MISSING_SECTION_PROBE)
                 .map_err(|e| anyhow!("selected_headings_bounded: {e}"))?;
             (found.len() < MISSING_SECTION_PROBE).then(|| {
-                let found_lower: Vec<String> =
-                    found.iter().map(|heading| heading.text.to_lowercase()).collect();
+                let found_lower: Vec<String> = found
+                    .iter()
+                    .map(|heading| heading.text.to_lowercase())
+                    .collect();
                 names
                     .iter()
                     .filter(|name| {
@@ -11012,7 +11014,8 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
                         // heading; a longer one matched on its full text.
                         !found_lower.iter().any(|text| {
                             *text == wanted
-                                || (text.chars().count() >= 256 && wanted.starts_with(text.as_str()))
+                                || (text.chars().count() >= 256
+                                    && wanted.starts_with(text.as_str()))
                         })
                     })
                     .cloned()
@@ -20878,9 +20881,7 @@ fn tool_schema_blast_radius() -> Value {
 /// An MCP agent cannot run that; it can call the `clusters` tool, which
 /// computes and persists the same sidecar. Rewrite the remediation for the
 /// MCP delivery profile only, keeping the descriptor stable.
-fn mcp_cluster_remediation(
-    notifications: &mut [nestweaver_engine::blast_radius::Notification],
-) {
+fn mcp_cluster_remediation(notifications: &mut [nestweaver_engine::blast_radius::Notification]) {
     for notification in notifications
         .iter_mut()
         .filter(|n| n.descriptor == "clusters-not-computed")
@@ -23538,11 +23539,7 @@ fn contained_source_root(
         std::fs::canonicalize(std::ffi::OsStr::from_bytes(value)).ok()
     });
     match common {
-        Some(common)
-            if indexed
-                .iter()
-                .any(|indexed| indexed.join(".git") == common) =>
-        {
+        Some(common) if indexed.iter().any(|indexed| indexed.join(".git") == common) => {
             Ok(canonical)
         }
         _ => Err(refused()),
@@ -26559,9 +26556,10 @@ mod cache_dispatch_tests {
         let store = GraphStore::open(&db_path).unwrap();
         let args = json!({ "changed_files": ["main.js"] });
         let has_missing_cluster_note = |value: &Value| {
-            value["notifications"]
-                .as_array()
-                .is_some_and(|all| all.iter().any(|n| n["descriptor"] == "clusters-not-computed"))
+            value["notifications"].as_array().is_some_and(|all| {
+                all.iter()
+                    .any(|n| n["descriptor"] == "clusters-not-computed")
+            })
         };
 
         let before = dispatch(&store, None, "blast_radius", args.clone(), None).unwrap();
@@ -26594,7 +26592,11 @@ mod cache_dispatch_tests {
             descriptor: "clusters-not-computed".to_string(),
         }];
         mcp_cluster_remediation(&mut notes);
-        assert!(notes[0].message.contains("`clusters` tool"), "{}", notes[0].message);
+        assert!(
+            notes[0].message.contains("`clusters` tool"),
+            "{}",
+            notes[0].message
+        );
         assert!(!notes[0].message.contains("nestweaver clusters"));
     }
 
@@ -27336,10 +27338,14 @@ mod cache_dispatch_tests {
                 embedding: None,
             })
             .unwrap();
-        let result =
-            tool_note_get(&store, json!({"uid": note.uid, "sections": ["intro", "Nope"]})).unwrap();
+        let result = tool_note_get(
+            &store,
+            json!({"uid": note.uid, "sections": ["intro", "Nope"]}),
+        )
+        .unwrap();
         assert_eq!(result["missing_sections"], json!(["Nope"]), "{result}");
-        let result = tool_note_get(&store, json!({"uid": note.uid, "sections": ["Intro"]})).unwrap();
+        let result =
+            tool_note_get(&store, json!({"uid": note.uid, "sections": ["Intro"]})).unwrap();
         assert!(result.get("missing_sections").is_none(), "{result}");
     }
 
@@ -30592,7 +30598,10 @@ mod arg_alias_tests {
             .unwrap();
         let result = tool_detect_changes(&store, json!({ "changed_files": ["src/a.rs"] })).unwrap();
         assert_eq!(result["changed_symbol_count"], 1, "{result}");
-        assert_eq!(result["changed_symbol_count"], result["affected_symbol_count"]);
+        assert_eq!(
+            result["changed_symbol_count"],
+            result["affected_symbol_count"]
+        );
     }
 
     #[test]
@@ -32645,7 +32654,12 @@ mod source_management_tests {
     /// a vault name still refuses (#513).
     #[test]
     fn remove_target_accepts_the_derived_repo_name_and_keeps_cross_kind_refusal() {
-        let repos = vec![repo("repo:u:u", "https://github.com/google/uuid", None, None)];
+        let repos = vec![repo(
+            "repo:u:u",
+            "https://github.com/google/uuid",
+            None,
+            None,
+        )];
         assert!(matches!(
             resolve_remove_target(&repos, &[], "uuid"),
             Ok(RemoveTarget::Repo(r)) if r.uid == "repo:u:u"
@@ -32659,7 +32673,10 @@ mod source_management_tests {
         let error = resolve_remove_target(&repos, &vaults, "uuid")
             .expect_err("a derived repo name equal to a vault name is ambiguous");
         let text = error.to_string();
-        assert!(text.contains("repo:u:u") && text.contains("vault:u:u"), "{text}");
+        assert!(
+            text.contains("repo:u:u") && text.contains("vault:u:u"),
+            "{text}"
+        );
     }
 
     #[cfg(feature = "daemon")]
@@ -37774,7 +37791,11 @@ mod ambiguous_name_contract_tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(repo.join("src")).unwrap();
-        std::fs::write(repo.join("src/util.js"), "function helper(n) { return n; }\n").unwrap();
+        std::fs::write(
+            repo.join("src/util.js"),
+            "function helper(n) { return n; }\n",
+        )
+        .unwrap();
         git(&repo, &["init", "-q"]);
         git(&repo, &["config", "user.email", "t@example.com"]);
         git(&repo, &["config", "user.name", "t"]);
@@ -37802,13 +37823,23 @@ mod ambiguous_name_contract_tests {
         )
         .unwrap();
         let error = read(outside.path()).unwrap_err();
-        assert!(format!("{error:#}").contains("not inside an indexed repository"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("not inside an indexed repository"),
+            "{error:#}"
+        );
 
         // A linked worktree of the indexed repository is still accepted.
         let worktree = dir.path().join("linked");
         git(
             &repo,
-            &["worktree", "add", "-q", "-b", "side", worktree.to_str().unwrap()],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                worktree.to_str().unwrap(),
+            ],
         );
         let linked = read(&worktree).unwrap();
         assert!(linked.to_string().contains("return n"), "{linked}");

@@ -927,7 +927,10 @@ impl GraphStore {
         let mut chains = self.container_chains(&uids, depth)?;
         if depth > 0 {
             for symbol in symbols {
-                if chains.get(&symbol.uid).is_some_and(|chain| !chain.is_empty()) {
+                if chains
+                    .get(&symbol.uid)
+                    .is_some_and(|chain| !chain.is_empty())
+                {
                     continue;
                 }
                 if let Some(receiver) =

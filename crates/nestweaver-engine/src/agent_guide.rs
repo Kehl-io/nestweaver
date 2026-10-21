@@ -1312,7 +1312,10 @@ mod tests {
         use super::short_purpose;
         assert_eq!(short_purpose("Short one.", 120), "Short one.");
         let long = "Find notes and symbols by keyword. Returns ranked rows with UIDs for every follow-up call an agent may want to make later on.";
-        assert_eq!(short_purpose(long, 60), "Find notes and symbols by keyword.");
+        assert_eq!(
+            short_purpose(long, 60),
+            "Find notes and symbols by keyword."
+        );
         let no_sentence = "Trace reverse dependencies of a symbol to understand what might break if it changes and Returns confidence";
         assert_eq!(
             short_purpose(no_sentence, 100),

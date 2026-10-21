@@ -2097,7 +2097,9 @@ fn reject_field_exist_query(query: &str) -> Result<(), TantivyError> {
                     let field = query[..idx]
                         .trim_end()
                         .trim_end_matches(':')
-                        .rsplit(|ch: char| ch.is_whitespace() || ch == '(' || ch == '+' || ch == '-')
+                        .rsplit(|ch: char| {
+                            ch.is_whitespace() || ch == '(' || ch == '+' || ch == '-'
+                        })
                         .next()
                         .unwrap_or_default()
                         .to_string();

@@ -663,12 +663,30 @@ mod tests {
     #[test]
     fn go_receiver_type_reads_the_receiver_from_the_signature() {
         use super::go_receiver_type;
-        assert_eq!(go_receiver_type("uuid.go", "func (u UUID) String() string {"), Some("UUID"));
-        assert_eq!(go_receiver_type("a/b.go", "func (g *Greeter) Greet() {"), Some("Greeter"));
-        assert_eq!(go_receiver_type("x.go", "func (l *List[T]) Len() int {"), Some("List"));
-        assert_eq!(go_receiver_type("x.go", "func (UUID) Version() Version {"), Some("UUID"));
-        assert_eq!(go_receiver_type("x.go", "func Parse(s string) (UUID, error) {"), None);
-        assert_eq!(go_receiver_type("x.rs", "func (u UUID) String() string {"), None);
+        assert_eq!(
+            go_receiver_type("uuid.go", "func (u UUID) String() string {"),
+            Some("UUID")
+        );
+        assert_eq!(
+            go_receiver_type("a/b.go", "func (g *Greeter) Greet() {"),
+            Some("Greeter")
+        );
+        assert_eq!(
+            go_receiver_type("x.go", "func (l *List[T]) Len() int {"),
+            Some("List")
+        );
+        assert_eq!(
+            go_receiver_type("x.go", "func (UUID) Version() Version {"),
+            Some("UUID")
+        );
+        assert_eq!(
+            go_receiver_type("x.go", "func Parse(s string) (UUID, error) {"),
+            None
+        );
+        assert_eq!(
+            go_receiver_type("x.rs", "func (u UUID) String() string {"),
+            None
+        );
     }
 
     fn symbol_at(name: &str, file_path: &str) -> super::Symbol {

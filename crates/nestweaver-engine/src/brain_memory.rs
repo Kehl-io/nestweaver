@@ -3021,11 +3021,19 @@ mod tests {
         let first = memory_consolidate_limited(&store, true, 4_000_000_000.0, Some(50)).unwrap();
         assert!(first.applied, "{:?}", first.warnings);
         assert_eq!(first.proposals_already_applied, 0);
-        assert!(!first.refresh_vault_paths.is_empty(), "the moved vault is named");
+        assert!(
+            !first.refresh_vault_paths.is_empty(),
+            "the moved vault is named"
+        );
 
         for apply in [false, true] {
-            let stale = memory_consolidate_limited(&store, apply, 4_000_000_000.0, Some(50)).unwrap();
-            assert!(stale.proposals.is_empty(), "apply={apply}: {:?}", stale.proposals);
+            let stale =
+                memory_consolidate_limited(&store, apply, 4_000_000_000.0, Some(50)).unwrap();
+            assert!(
+                stale.proposals.is_empty(),
+                "apply={apply}: {:?}",
+                stale.proposals
+            );
             assert_eq!(stale.proposals_discovered, 1, "apply={apply}");
             assert_eq!(stale.proposals_already_applied, 1, "apply={apply}");
             assert_eq!(

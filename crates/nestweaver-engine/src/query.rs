@@ -3460,8 +3460,9 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
     // five out-of-scope `Parse` matches fill the page and then be removed,
     // reporting `total: 0` for a repo that defines `Parse`.
     let seed_scope = config.seed_scope_repo_uids.as_ref();
-    let in_seed_scope =
-        |symbol: &nestweaver_schema::Symbol| seed_scope.is_none_or(|uids| uids.contains(&symbol.repo_uid));
+    let in_seed_scope = |symbol: &nestweaver_schema::Symbol| {
+        seed_scope.is_none_or(|uids| uids.contains(&symbol.repo_uid))
+    };
     for raw in inputs {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -4432,7 +4433,10 @@ fn note_path_matches(file_path: &str, query: &str) -> bool {
     matches(&q) || (q.contains('/') && !q.ends_with(".md") && matches(&format!("{q}.md")))
 }
 
-fn notes_matching_title(notes: &[nestweaver_schema::Note], title: &str) -> Vec<nestweaver_schema::Note> {
+fn notes_matching_title(
+    notes: &[nestweaver_schema::Note],
+    title: &str,
+) -> Vec<nestweaver_schema::Note> {
     let needle = title.to_lowercase();
     notes
         .iter()
@@ -4441,7 +4445,10 @@ fn notes_matching_title(notes: &[nestweaver_schema::Note], title: &str) -> Vec<n
         .collect()
 }
 
-fn notes_matching_path(notes: &[nestweaver_schema::Note], path: &str) -> Vec<nestweaver_schema::Note> {
+fn notes_matching_path(
+    notes: &[nestweaver_schema::Note],
+    path: &str,
+) -> Vec<nestweaver_schema::Note> {
     notes
         .iter()
         .filter(|n| note_path_matches(&n.file_path, path))
@@ -4493,7 +4500,11 @@ impl<'a> SeedLookups<'a> {
 
     fn notes(&mut self) -> Result<&[nestweaver_schema::Note], anyhow::Error> {
         if self.notes.is_none() {
-            self.notes = Some(self.store.list_notes(None).map_err(|e| anyhow::anyhow!(e))?);
+            self.notes = Some(
+                self.store
+                    .list_notes(None)
+                    .map_err(|e| anyhow::anyhow!(e))?,
+            );
         }
         Ok(self.notes.as_deref().unwrap_or_default())
     }
@@ -5833,8 +5844,15 @@ mod seed_resolution_disclosure_tests {
         )
         .unwrap();
         let fetches = nestweaver_store::symbol_table_fetches_on_this_thread() - before;
-        assert!(fetches <= 2, "symbol table fetched {fetches} times for 41 seeds");
-        assert!(result.seeds.iter().any(|seed| seed.uid == "sym:v1"), "{:?}", result.seeds);
+        assert!(
+            fetches <= 2,
+            "symbol table fetched {fetches} times for 41 seeds"
+        );
+        assert!(
+            result.seeds.iter().any(|seed| seed.uid == "sym:v1"),
+            "{:?}",
+            result.seeds
+        );
         assert_eq!(result.unresolved_seeds.len(), 40);
     }
 

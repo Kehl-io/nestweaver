@@ -6631,7 +6631,11 @@ mod daemon_status_renderer_tests {
             written,
             "  Note\\u001b]0;pwned\\u0007\\u001b[2J\\u001b[H\\u000dspoof\\u009b31m\\u007f  [note]\tok\n"
         );
-        assert!(!written.chars().any(|c| c.is_control() && c != '\n' && c != '\t'));
+        assert!(
+            !written
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+        );
         // The CLI's own colour labels survive.
         assert_eq!(
             terminal_safe("\u{1b}[31mBREAKING\u{1b}[0m \u{1b}[1;33mWARN\u{1b}[m"),
@@ -17406,10 +17410,8 @@ fn main() {
                 && let Some(envelope) = db_problem_json_envelope(admission_refused, &report)
             {
                 // Best effort: a closed stdout must not turn into a panic.
-                let _ = std::io::Write::write_fmt(
-                    &mut std::io::stdout(),
-                    format_args!("{envelope}\n"),
-                );
+                let _ =
+                    std::io::Write::write_fmt(&mut std::io::stdout(), format_args!("{envelope}\n"));
             }
             if let Err(error) = write_stderr(format_args!("{report:?}")) {
                 // The failure message is what hit the closed pipe. Dropping
@@ -17503,7 +17505,10 @@ mod secret_env_help_tests {
         let mut leaks = Vec::new();
         let command = Cli::command();
         walk(&command, "nestweaver", &mut leaks);
-        assert!(leaks.is_empty(), "secret env values shown in --help: {leaks:?}");
+        assert!(
+            leaks.is_empty(),
+            "secret env values shown in --help: {leaks:?}"
+        );
         let mut checked = 0;
         fn count(command: &clap::Command, checked: &mut usize) {
             *checked += command
@@ -17515,7 +17520,10 @@ mod secret_env_help_tests {
             }
         }
         count(&command, &mut checked);
-        assert!(checked >= 6, "the secret arguments were not found: {checked}");
+        assert!(
+            checked >= 6,
+            "the secret arguments were not found: {checked}"
+        );
     }
 }
 
@@ -23122,9 +23130,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 return Ok((EXIT_SUCCESS, None));
             }
             let rt = tokio::runtime::Runtime::new()?;
-            let mut client = rt.block_on(nestweaver_client::DaemonClient::connect_existing(
-                &db_path,
-            ))?;
+            let mut client =
+                rt.block_on(nestweaver_client::DaemonClient::connect_existing(&db_path))?;
             let resp = rt
                 .block_on(async {
                     client
@@ -28578,7 +28585,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         );
                         let unhealthy = matches!(state, "running_but_unreachable" | "unknown");
                         return Ok((
-                            if unhealthy { EXIT_DAEMON_UNHEALTHY } else { EXIT_SUCCESS },
+                            if unhealthy {
+                                EXIT_DAEMON_UNHEALTHY
+                            } else {
+                                EXIT_SUCCESS
+                            },
                             None,
                         ));
                     }
@@ -28734,7 +28745,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // The endpoint failed verification (printed above): the
                     // same "unknown" state the JSON route reports as unhealthy.
                     Ok((
-                        if endpoint_error.is_some() { EXIT_DAEMON_UNHEALTHY } else { EXIT_SUCCESS },
+                        if endpoint_error.is_some() {
+                            EXIT_DAEMON_UNHEALTHY
+                        } else {
+                            EXIT_SUCCESS
+                        },
                         None,
                     ))
                 }
@@ -44570,7 +44585,10 @@ mod cli_fix_round_tests {
     fn stderr_tracing_colours_only_an_unsuppressed_terminal() {
         assert!(tracing_ansi_allowed(true, false, false));
         assert!(!tracing_ansi_allowed(false, false, false), "a pipe or file");
-        assert!(!tracing_ansi_allowed(true, true, false), "--no-color / --plain");
+        assert!(
+            !tracing_ansi_allowed(true, true, false),
+            "--no-color / --plain"
+        );
         assert!(!tracing_ansi_allowed(true, false, true), "NO_COLOR");
     }
 

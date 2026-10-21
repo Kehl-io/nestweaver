@@ -2415,10 +2415,12 @@ fn recover_abandoned_index_publication_with_io_and_marker_hook(
     // Ranks and the generation are reconciled; rows the dead writer never
     // committed are not. Name the repos that still owe a full rebuild rather
     // than reporting the recovery as if the graph were whole.
-    let incomplete_repos = store.list_publication_incomplete_repos().unwrap_or_else(|error| {
-        tracing::warn!("listing publication-incomplete repos failed: {error}");
-        Vec::new()
-    });
+    let incomplete_repos = store
+        .list_publication_incomplete_repos()
+        .unwrap_or_else(|error| {
+            tracing::warn!("listing publication-incomplete repos failed: {error}");
+            Vec::new()
+        });
     Ok(IndexPublicationRecovery::Recovered {
         abandoned_writer_pid: pid,
         generation: store.graph_generation(),
@@ -5869,8 +5871,7 @@ where
         // back — the same treatment the incremental and watcher paths get.
         let mut reindex_deleted_uids: Vec<String> = Vec::new();
         let mut reindex_deleted_files: Vec<String> = Vec::new();
-        let mut removed_files: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut removed_files: std::collections::HashSet<String> = std::collections::HashSet::new();
         if !force_reindex && existing_repo.is_some() {
             // Incremental: only delete the specific files we're about to re-insert.
             for file in &all_files {
@@ -7044,7 +7045,8 @@ fn prepare_contract_derivation(
                 // produced any has nothing to protect, so it is skipped and
                 // disclosed as degraded coverage instead.
                 Err(error)
-                    if published_spec_sources.is_some_and(|published| !published.contains(&rel)) =>
+                    if published_spec_sources
+                        .is_some_and(|published| !published.contains(&rel)) =>
                 {
                     tracing::warn!("skipping unparseable contract spec {rel}: {error}");
                     skipped_files.push(SkippedFile {
@@ -15968,7 +15970,10 @@ function hello(name) { return "Hello " + name; }
         let (first, store) =
             index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123")
                 .expect("an unparseable, never-published spec must not fail the first index");
-        assert!(first.contracts_derived > 0, "the healthy spec still derives");
+        assert!(
+            first.contracts_derived > 0,
+            "the healthy spec still derives"
+        );
         assert!(
             first.skipped_files.iter().any(|skipped| {
                 skipped.path == "docs/openapi.yaml"
@@ -21312,7 +21317,10 @@ module.exports = { check, plain };\n";
             None,
         )
         .expect("a file deleted after its parse must not abort strict contract derivation");
-        assert!(!dir.path().join("m50.py").exists(), "the hook must have run");
+        assert!(
+            !dir.path().join("m50.py").exists(),
+            "the hook must have run"
+        );
         assert_eq!(store.lookup_symbols_by_name("kept").unwrap().len(), 1);
     }
 
@@ -23281,7 +23289,8 @@ impl Counter {
         let url = "https://example.test/modified-module-importers";
         index_directory(&repo, &db, "test", url, "s0").unwrap();
 
-        let a = |name: &str| format!("def other():\n    return 0\n\n\ndef {name}(x):\n    return x\n");
+        let a =
+            |name: &str| format!("def other():\n    return 0\n\n\ndef {name}(x):\n    return x\n");
         fs::write(repo.join("pkg/a.py"), a("foo")).unwrap();
         assert_incremental_matches_full(dir.path(), &repo, &db, url, "s1");
         assert!(
@@ -23312,7 +23321,11 @@ impl Counter {
             "export function greet(name: string): string { return name; }\n",
         )
         .unwrap();
-        fs::write(repo.join("src/util/index.ts"), "export * from \"./strings\";\n").unwrap();
+        fs::write(
+            repo.join("src/util/index.ts"),
+            "export * from \"./strings\";\n",
+        )
+        .unwrap();
         fs::write(
             repo.join("src/main.ts"),
             "import { greet } from \"./util\";\nexport function hello(): string { return greet(\"x\"); }\n",
@@ -23334,8 +23347,16 @@ impl Counter {
         };
         assert!(calls_greet(&db), "precondition: hello -> greet resolves");
 
-        fs::rename(repo.join("src/util/strings.ts"), repo.join("src/util/text.ts")).unwrap();
-        fs::write(repo.join("src/util/index.ts"), "export * from \"./text\";\n").unwrap();
+        fs::rename(
+            repo.join("src/util/strings.ts"),
+            repo.join("src/util/text.ts"),
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/util/index.ts"),
+            "export * from \"./text\";\n",
+        )
+        .unwrap();
         assert_incremental_matches_full(dir.path(), &repo, &db, url, "s1");
         assert!(calls_greet(&db), "hello -> greet must survive the rename");
 
@@ -23372,7 +23393,10 @@ impl Counter {
         assert!(filemeta.exists());
 
         let result = index_directory(&repo, &db, "test", url, "s0").unwrap();
-        assert_eq!(result.files_unchanged, 0, "nothing in the new store vouches for a file");
+        assert_eq!(
+            result.files_unchanged, 0,
+            "nothing in the new store vouches for a file"
+        );
         let store = GraphStore::open_or_create(&db).unwrap();
         assert_eq!(store.lookup_symbols_by_name("alpha").unwrap().len(), 1);
         assert_eq!(store.lookup_symbols_by_name("beta").unwrap().len(), 1);
@@ -23402,7 +23426,10 @@ impl Counter {
         }
 
         let result = index_directory(&repo, &db, "test", url, "s0").unwrap();
-        assert_eq!(result.files_unchanged, 1, "b.py is vouched for; a.py is not");
+        assert_eq!(
+            result.files_unchanged, 1,
+            "b.py is vouched for; a.py is not"
+        );
         let store = GraphStore::open_or_create(&db).unwrap();
         assert_eq!(store.lookup_symbols_by_name("alpha").unwrap().len(), 1);
         assert_eq!(store.lookup_symbols_by_name("beta").unwrap().len(), 1);
@@ -23419,8 +23446,11 @@ impl Counter {
         let repo = dir.path().join("repo");
         let db = dir.path().join("g.lbug");
         fs::create_dir_all(&repo).unwrap();
-        fs::write(repo.join("a.py"), "from b import beta\n\n\ndef alpha():\n    return beta()\n")
-            .unwrap();
+        fs::write(
+            repo.join("a.py"),
+            "from b import beta\n\n\ndef alpha():\n    return beta()\n",
+        )
+        .unwrap();
         fs::write(repo.join("b.py"), "def beta():\n    return 1\n").unwrap();
         fs::write(repo.join("c.py"), "def gamma():\n    return 1\n").unwrap();
         let url = "https://example.test/interrupted-publication";
@@ -23439,14 +23469,20 @@ impl Counter {
             store
                 .set_repo_publication_incomplete(&r_uid, "index graph write")
                 .unwrap();
-            store.delete_resolved_edges_for_file(&r_uid, "a.py").unwrap();
+            store
+                .delete_resolved_edges_for_file(&r_uid, "a.py")
+                .unwrap();
             assert!(store.repo_index_incomplete(&repo_row).unwrap());
             assert_eq!(
                 store.list_publication_incomplete_repos().unwrap(),
                 vec![r_uid.clone()]
             );
         }
-        assert_ne!(resolved_edge_set(&db), complete, "precondition: edges were lost");
+        assert_ne!(
+            resolved_edge_set(&db),
+            complete,
+            "precondition: edges were lost"
+        );
 
         let rebuilt = index_directory(&repo, &db, "test", url, "s0").unwrap();
         assert_eq!(rebuilt.files_unchanged, 0, "the debt forces a full rebuild");

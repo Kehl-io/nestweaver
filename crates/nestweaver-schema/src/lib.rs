@@ -28,8 +28,8 @@ pub use nodes::{
     Contract, EntryPointKind, File, FrameworkHint, Heading, MODULE_OWNER_CONTEXT_CAP,
     MODULE_OWNER_NAME, Note, NoteKind, Project, QualifiedSpec, Repo, ResolvedType, Section,
     Service, Symbol, SymbolKind, Tag, TypeInfo, Vault, Visibility, cap_module_owner_labels,
-    file_qualifier_rank, go_receiver_type, is_module_owner, is_module_owner_label, module_owner_label,
-    omitted_module_owners_phrase, split_file_qualifier, symbol_display_name,
+    file_qualifier_rank, go_receiver_type, is_module_owner, is_module_owner_label,
+    module_owner_label, omitted_module_owners_phrase, split_file_qualifier, symbol_display_name,
 };
 pub use repo_url::{normalized_repo_key, repo_name};
 pub use uid::{

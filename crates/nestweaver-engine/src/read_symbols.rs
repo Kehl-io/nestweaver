@@ -565,7 +565,10 @@ fn shorter_qualified_reading(
 /// in spec order, deduplicated and bounded like every other miss. Best
 /// effort: a lookup failure is logged and suggests nothing.
 pub fn not_found_suggestions(store: &GraphStore, not_found: &[String]) -> Vec<String> {
-    flatten_suggestions(not_found, &not_found_suggestions_by_target(store, not_found))
+    flatten_suggestions(
+        not_found,
+        &not_found_suggestions_by_target(store, not_found),
+    )
 }
 
 /// QA #11: [`not_found_suggestions`] kept per target, each list bounded to
@@ -1403,16 +1406,23 @@ app();
              export function strip(b: string) { return b; }\n",
         )]);
         let reader = FilesystemReader::new(dir.path());
-        let specs = ["nothere.ts::Other".to_string(), "nothere.ts::strip".to_string()];
+        let specs = [
+            "nothere.ts::Other".to_string(),
+            "nothere.ts::strip".to_string(),
+        ];
         let res = read_symbols(&store, &specs, &reader, 0, None);
         assert_eq!(res.not_found, specs, "{res:?}");
         assert_eq!(
-            res.did_you_mean_by_target.get("nothere.ts::Other").map(Vec::as_slice),
+            res.did_you_mean_by_target
+                .get("nothere.ts::Other")
+                .map(Vec::as_slice),
             Some(&["b/svc.ts::Other".to_string()][..]),
             "{res:?}"
         );
         assert_eq!(
-            res.did_you_mean_by_target.get("nothere.ts::strip").map(Vec::as_slice),
+            res.did_you_mean_by_target
+                .get("nothere.ts::strip")
+                .map(Vec::as_slice),
             Some(&["b/svc.ts::strip".to_string()][..]),
             "{res:?}"
         );
