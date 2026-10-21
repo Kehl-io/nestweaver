@@ -82,6 +82,31 @@ pub fn attach_context_graph(
         result.semantic_unavailable = None;
         result.degraded_components.clear();
     }
+    let (selected, omitted_nodes) = cap_context_nodes(result);
+    let edges = store.with_read_deadline(Instant::now() + Duration::from_secs(5), || {
+        store.context_edges(&selected)
+    })?;
+    ensure_context_generation(store, generation)?;
+    let omitted_edges = edges.total.saturating_sub(edges.edges.len());
+    Ok(ContextGraph {
+        edges: edges.edges,
+        meta: ContextGraphMeta {
+            generation,
+            node_limit: CONTEXT_NODE_LIMIT,
+            edge_limit: CONTEXT_EDGE_LIMIT,
+            omitted_nodes,
+            omitted_edges,
+            edge_count_relation: if edges.total_exact { "eq" } else { "gte" },
+            truncated: omitted_nodes > 0 || omitted_edges > 0 || !edges.total_exact,
+            edge_scope: "returned_nodes",
+        },
+    })
+}
+
+/// Select the visible context's nodes without spending a database read budget.
+/// Seed priority, deterministic ordering and omission counts share this path
+/// between production edge selection and the cap's boundary tests.
+fn cap_context_nodes(result: &mut BrainContextResult) -> (Vec<String>, usize) {
     let sort = |a: &crate::BrainNode, b: &crate::BrainNode| {
         b.relevance
             .total_cmp(&a.relevance)
@@ -105,25 +130,8 @@ pub fn attach_context_graph(
         .chain(&result.connected)
         .map(|node| node.uid.clone())
         .collect();
-    let edges = store.with_read_deadline(Instant::now() + Duration::from_secs(5), || {
-        store.context_edges(&selected)
-    })?;
-    ensure_context_generation(store, generation)?;
     let omitted_nodes = total_nodes.saturating_sub(selected.len());
-    let omitted_edges = edges.total.saturating_sub(edges.edges.len());
-    Ok(ContextGraph {
-        edges: edges.edges,
-        meta: ContextGraphMeta {
-            generation,
-            node_limit: CONTEXT_NODE_LIMIT,
-            edge_limit: CONTEXT_EDGE_LIMIT,
-            omitted_nodes,
-            omitted_edges,
-            edge_count_relation: if edges.total_exact { "eq" } else { "gte" },
-            truncated: omitted_nodes > 0 || omitted_edges > 0 || !edges.total_exact,
-            edge_scope: "returned_nodes",
-        },
-    })
+    (selected, omitted_nodes)
 }
 
 #[cfg(test)]
@@ -351,7 +359,6 @@ mod tests {
 
     #[test]
     fn node_cap_is_stable_and_keeps_seeds_first() {
-        let store = GraphStore::in_memory().unwrap();
         let mut result = BrainContextResult {
             seeds: vec![node("sym:seed")],
             connected: (0..510)
@@ -360,17 +367,20 @@ mod tests {
                 .collect(),
             ..Default::default()
         };
-        let graph = attach_context_graph(
-            &store,
-            &mut result,
-            &VisibleRepos::All,
-            store.graph_generation(),
-        )
-        .unwrap();
+        // Repeated nodes must not consume slots or inflate omitted counts,
+        // including a seed repeated among the connected nodes.
+        result.connected.push(node("sym:seed"));
+        result.connected.push(node("sym:0000"));
+        let (selected, omitted_nodes) = cap_context_nodes(&mut result);
         assert_eq!(result.seeds[0].uid, "sym:seed");
         assert_eq!(result.connected.len(), 499);
         assert_eq!(result.connected[0].uid, "sym:0000");
-        assert_eq!(graph.meta.omitted_nodes, 11);
-        assert!(graph.meta.truncated);
+        assert_eq!(selected[0], "sym:seed");
+        assert_eq!(selected.len(), CONTEXT_NODE_LIMIT);
+        assert_eq!(
+            selected.iter().collect::<HashSet<_>>().len(),
+            selected.len()
+        );
+        assert_eq!(omitted_nodes, 11);
     }
 }

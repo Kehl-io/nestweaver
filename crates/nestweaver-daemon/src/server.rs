@@ -533,46 +533,27 @@ mod dispatch_err_to_status_tests {
         status
     }
 
-    /// nw-822: a 6000-character unknown seed used to overflow the gRPC status
-    /// (message plus details) and surface as `h2 protocol error` instead of
-    /// not-found. The same echo is percent-encoded in the status and copied
-    /// again into the base64 details, so one 10_000-character seed of 4-byte
-    /// characters, and several over-long ASCII seeds together, must share one
-    /// budget. A short seed is still echoed whole.
+    /// The engine shares one byte budget across all unresolved seeds. A long
+    /// seed and its remaining tail collapse into one aggregate marker, and
+    /// both gRPC status copies must still fit the transport's header budget.
     #[test]
     fn an_overlong_unresolved_seed_stays_inside_the_grpc_header_limit() {
         let long = "q".repeat(10_000);
-        let status = assert_seed_miss_fits(&[&long]);
-        assert!(
-            status.message().contains("(10000 chars)"),
-            "the echo must carry a length marker: {}",
-            status.message()
-        );
-
-        // U+10000 is a 4-byte UTF-8 character. Percent-encoding expands each
-        // of those bytes, and the details repeat the echo.
         let four_byte_char = "\u{10000}";
-        assert_eq!(
-            four_byte_char.len(),
-            4,
-            "the fixture must be a 4-byte character"
-        );
+        assert_eq!(four_byte_char.len(), 4);
         let four_byte = four_byte_char.repeat(10_000);
-        let four_byte_status = assert_seed_miss_fits(&[&four_byte]);
-        assert!(
-            four_byte_status.message().contains("(10000 chars)"),
-            "the 4-byte echo must carry a length marker: {}",
-            four_byte_status.message()
-        );
-
-        let many = vec![long.as_str(); 8];
-        let many_status = assert_seed_miss_fits(&many);
-        assert_eq!(
-            many_status.message().matches("(10000 chars)").count(),
-            8,
-            "every over-long seed keeps a length marker: {}",
-            many_status.message()
-        );
+        for seeds in [
+            vec![long.as_str()],
+            vec![four_byte.as_str()],
+            vec![long.as_str(); 8],
+        ] {
+            let status = assert_seed_miss_fits(&seeds);
+            let marker = format!("… ({} more)", seeds.len());
+            assert!(status.message().contains(&marker), "{}", status.message());
+            let envelope = nestweaver_mcp::tools::envelope_from_status_details(status.details())
+                .expect("the miss keeps its not-found envelope");
+            assert_eq!(envelope["seeds"], serde_json::json!([marker]));
+        }
 
         let short = "how does auth work";
         let short_status =

@@ -437,7 +437,8 @@ where
     deserializer.deserialize_map(UniqueGenerations)
 }
 
-/// Strict, bounded sidecar read for a future recovery writer.
+/// Strict, bounded sidecar read, used where unreadable metadata must be
+/// reported rather than treated as stale (ranking diagnostics).
 ///
 /// Only a missing path returns `None`. Malformed/unknown shapes, duplicate
 /// entries, non-regular files, oversized records and any future generation

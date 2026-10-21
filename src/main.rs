@@ -2745,12 +2745,26 @@ fn nodes_len(nodes: &serde_json::Value) -> u64 {
 /// separately.
 fn resolver_ranking_note(store: &nestweaver_store::GraphStore) -> Option<String> {
     let db_path = store.db_path()?;
-    let repos = store.list_repos(None).ok()?;
-    let uids: Vec<String> = repos.into_iter().map(|r| r.uid).collect();
-    if uids.is_empty() {
-        return None;
+    let note = (|| -> anyhow::Result<Option<String>> {
+        let repos = store.list_repos(None)?;
+        let generations =
+            nestweaver_engine::resolver_generation::load_strict(db_path)?.unwrap_or_default();
+        let stale = generations.stale_repos(repos.iter().map(|repo| repo.uid.as_str()));
+        Ok(nestweaver_engine::resolver_generation::staleness_note_for(
+            &stale,
+            Some(repos.len()),
+        ))
+    })();
+    match note {
+        Ok(note) => note,
+        Err(error) => Some(resolver_verification_warning(&format!("{error:#}"))),
     }
-    nestweaver_engine::resolver_generation::staleness_note(db_path, &uids)
+}
+
+fn resolver_verification_warning(error: &str) -> String {
+    format!(
+        "could not verify resolver generation metadata; rankings may be stale: {error}. Repair the metadata and retry before trusting these rankings."
+    )
 }
 
 fn warn_stale_resolver_rankings(store: &nestweaver_store::GraphStore) {
@@ -2787,6 +2801,10 @@ fn warn_stale_resolver_rankings(store: &nestweaver_store::GraphStore) {
 /// `ResolverGenerations::stale_repos` is the sole computation for every route
 /// and stays that way.
 fn warn_stale_resolver_rankings_no_store(staleness: &ResolverStaleness) {
+    if let Some(error) = &staleness.verification_error {
+        eprintln!("warning: {}", resolver_verification_warning(error));
+        return;
+    }
     if !staleness.rankings_stale {
         return;
     }
@@ -2851,24 +2869,41 @@ struct ResolverStaleness {
     /// [`ResolverStaleness::from_sidecar`]. Population 1 of 4 — see the
     /// struct-level doc comment above.
     stale_repos: Vec<String>,
+    /// Verification failed; an empty stale list does not establish freshness.
+    verification_error: Option<String>,
 }
 
 impl ResolverStaleness {
     /// Exact answer: enumerate the repos and compare each recorded generation
     /// on the database this store was opened from.
     ///
-    /// That path is the same evidence `incompatible_repos_for_store` uses.
+    /// That is the database `incompatible_repos_for_store` reads, but this
+    /// path reads it strictly: unreadable metadata is reported, not stale.
     /// Passing a separate path let `repo-map` read the logical anchor after
     /// `open_store` had already followed publication `CURRENT`, so a Git SHA
     /// mismatch on an otherwise current graph was reported as every repository
     /// being resolver-incompatible.
     fn from_store(store: &nestweaver_store::GraphStore) -> Self {
-        let stale_repos =
-            nestweaver_engine::resolver_generation::incompatible_repos_for_store(store)
-                .unwrap_or_default();
-        Self {
-            rankings_stale: !stale_repos.is_empty(),
-            stale_repos,
+        let verification = (|| -> anyhow::Result<Vec<String>> {
+            let Some(db_path) = store.db_path() else {
+                return Ok(Vec::new());
+            };
+            let repos = store.list_repos(None)?;
+            let generations =
+                nestweaver_engine::resolver_generation::load_strict(db_path)?.unwrap_or_default();
+            Ok(generations.stale_repos(repos.iter().map(|repo| repo.uid.as_str())))
+        })();
+        match verification {
+            Ok(stale_repos) => Self {
+                rankings_stale: !stale_repos.is_empty(),
+                stale_repos,
+                verification_error: None,
+            },
+            Err(error) => Self {
+                rankings_stale: true,
+                stale_repos: Vec::new(),
+                verification_error: Some(format!("{error:#}")),
+            },
         }
     }
 
@@ -2900,6 +2935,10 @@ impl ResolverStaleness {
                     .iter()
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect(),
+                verification_error: value
+                    .get("resolver_generation_error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
             },
             _ => Self::from_sidecar(db_path),
         }
@@ -2924,12 +2963,22 @@ impl ResolverStaleness {
             db_path,
             nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
         );
-        let generations = nestweaver_engine::resolver_generation::load(db_path);
-        let recorded: Vec<String> = generations.repos.keys().cloned().collect();
-        let stale_repos = generations.stale_repos(recorded.iter().map(String::as_str));
-        Self {
-            rankings_stale: !sidecar.exists() || !stale_repos.is_empty(),
-            stale_repos,
+        match nestweaver_engine::resolver_generation::load_strict(db_path) {
+            Ok(generations) => {
+                let generations = generations.unwrap_or_default();
+                let stale_repos =
+                    generations.stale_repos(generations.repos.keys().map(String::as_str));
+                Self {
+                    rankings_stale: !sidecar.exists() || !stale_repos.is_empty(),
+                    stale_repos,
+                    verification_error: None,
+                }
+            }
+            Err(error) => Self {
+                rankings_stale: true,
+                stale_repos: Vec::new(),
+                verification_error: Some(format!("{error:#}")),
+            },
         }
     }
 }
@@ -3151,6 +3200,9 @@ fn ranking_json_payload<T: serde::Serialize>(
         // reading "N of M hubs", which is not what M is.
         "total_population": "symbols with at least one code edge (hub/bridge CANDIDATES)",
     });
+    if let Some(error) = &staleness.verification_error {
+        payload["resolver_generation_error"] = error.clone().into();
+    }
     if let Some(obj) = payload.as_object_mut() {
         // Bridges only. Absent on hubs rather than `false`, because a hub score
         // is a degree count and is never an estimate — a `sampled: false` there
@@ -3224,6 +3276,9 @@ fn print_repo_map_json(
         "rankings_stale": staleness.rankings_stale,
         "stale_repos": staleness.stale_repos,
     });
+    if let Some(error) = &staleness.verification_error {
+        payload["resolver_generation_error"] = error.clone().into();
+    }
     if let Some(obj) = payload.as_object_mut() {
         if let Some(t) = truncated {
             obj.insert("truncated".to_string(), serde_json::json!(t));
@@ -20573,6 +20628,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if let (Some(staleness), Some(obj)) = (&hub_staleness, payload.as_object_mut()) {
                     obj.insert("rankings_stale".into(), staleness.rankings_stale.into());
                     obj.insert("stale_repos".into(), staleness.stale_repos.clone().into());
+                    if let Some(error) = &staleness.verification_error {
+                        obj.insert("resolver_generation_error".into(), error.clone().into());
+                    }
                 }
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else if display.is_empty() {
@@ -42315,10 +42373,81 @@ mod cli_honesty_sweep_tests {
             .expect("join")
     }
 
+    #[test]
+    fn malformed_resolver_metadata_is_disclosed_in_text_and_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let sidecar = nestweaver_engine::sidecar_path(
+            &db,
+            nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+        );
+        std::fs::write(&sidecar, "{malformed").unwrap();
+        let stale = ResolverStaleness::from_store(&store);
+        assert!(stale.rankings_stale);
+        assert!(stale.stale_repos.is_empty());
+        let error = stale
+            .verification_error
+            .as_deref()
+            .expect("verification failure is explicit");
+        assert!(
+            error.contains("decode resolver generation sidecar"),
+            "{error}"
+        );
+        let note = resolver_ranking_note(&store).expect("text must disclose failed verification");
+        assert!(
+            note.contains("could not verify resolver generation metadata"),
+            "{note}"
+        );
+        assert!(
+            !note.contains("no resolver generation is recorded"),
+            "{note}"
+        );
+        let payload = ranking_json_payload(
+            "hubs",
+            &Vec::<String>::new(),
+            &stale,
+            None,
+            &RankingBounds::default(),
+        );
+        assert_eq!(payload["rankings_stale"], true);
+        assert_eq!(payload["resolver_generation_error"], error);
+        let fallback = ResolverStaleness::from_sidecar(&db);
+        assert_eq!(fallback.verification_error.as_deref(), Some(error));
+        let daemon = ResolverStaleness::from_daemon_response(&payload, &db);
+        assert_eq!(daemon.verification_error.as_deref(), Some(error));
+
+        std::fs::remove_file(&sidecar).unwrap();
+        std::fs::create_dir(&sidecar).unwrap();
+        let unreadable = ResolverStaleness::from_store(&store);
+        assert!(unreadable.rankings_stale);
+        assert!(
+            unreadable
+                .verification_error
+                .as_deref()
+                .is_some_and(|error| error.contains("not a regular file"))
+        );
+        assert!(
+            resolver_ranking_note(&store).is_some_and(|note| note.contains("could not verify"))
+        );
+        std::fs::remove_dir(&sidecar).unwrap();
+        let absent = ResolverStaleness::from_sidecar(&db);
+        assert!(absent.rankings_stale);
+        assert!(
+            absent.verification_error.is_none(),
+            "absence is distinct from a failed read"
+        );
+        assert!(
+            resolver_ranking_note(&store).is_none(),
+            "an empty graph has no incompatible repositories"
+        );
+    }
+
     fn staleness_fixture() -> ResolverStaleness {
         ResolverStaleness {
             rankings_stale: false,
             stale_repos: vec![],
+            verification_error: None,
         }
     }
 
@@ -42383,6 +42512,7 @@ mod cli_honesty_sweep_tests {
                 "repo:default:alpha".to_string(),
                 "repo:default:mike".to_string(),
             ],
+            verification_error: None,
         };
         let payload = ranking_json_payload(
             "hubs",

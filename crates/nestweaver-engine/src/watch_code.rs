@@ -1002,7 +1002,7 @@ impl CodeWatcher {
             if crate::manifest::is_manifest_input(relative)
                 && reader.accepts_path(relative)
                 && !path_has_symlink(&self.repo_root, relative)?
-                && manifest_path_not_gitignored(&self.repo_root, relative)?
+                && path_not_gitignored(&self.repo_root, relative)?
             {
                 manifest_changed = true;
             }
@@ -1064,7 +1064,7 @@ impl CodeWatcher {
             let relative = Path::new(&source_path);
             let eligible = (|| -> anyhow::Result<bool> {
                 Ok(reader.accepts_path(relative)
-                    && manifest_path_not_gitignored(&self.repo_root, relative)?
+                    && path_not_gitignored(&self.repo_root, relative)?
                     && !path_has_symlink(&self.repo_root, relative)?)
             })();
             match eligible {
@@ -1136,6 +1136,27 @@ impl CodeWatcher {
         let mut prepared_paths = Vec::new();
         let mut changed: HashSet<String> = HashSet::new();
         let mut removed: HashSet<String> = HashSet::new();
+        // Startup drift enumerates through the walk, which already drops
+        // ignored paths. A single event does not, so a tracked source the walk
+        // discloses as ignored must stay out here too.
+        let hidden = sources_hidden_from_walk(
+            &self.repo_root,
+            relevant
+                .iter()
+                .filter(|path| is_supported_source(path) && path.is_file())
+                .filter_map(|path| path.strip_prefix(&self.repo_root).ok()),
+        );
+        // An ignored file the graph never held has nothing to retract; queuing
+        // a delete for it would still cost a full batch publication.
+        let graphed: HashSet<String> = if hidden.is_empty() {
+            HashSet::new()
+        } else {
+            store
+                .list_files_by_repo(r_uid)?
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect()
+        };
         for path in relevant.iter().filter(|path| is_supported_source(path)) {
             let rel_path = match path.strip_prefix(&self.repo_root) {
                 Ok(r) => r,
@@ -1148,7 +1169,17 @@ impl CodeWatcher {
                 }
             };
             let rel_str = rel_path.to_string_lossy().into_owned();
-            if let Some(reason) = source_policy_exclusion(&reader, &self.repo_root, path)? {
+            let exclusion = match source_policy_exclusion(&reader, &self.repo_root, path)? {
+                Some(reason) => Some(reason),
+                None if hidden.contains(rel_path) => {
+                    if !graphed.contains(&rel_str) {
+                        continue;
+                    }
+                    Some("repository ignore rules")
+                }
+                None => None,
+            };
+            if let Some(reason) = exclusion {
                 tracing::warn!(
                     path = %rel_path.display(), reason,
                     "watched source is policy-excluded; removing stale graph coverage"
@@ -1744,7 +1775,7 @@ impl CodeWatcher {
                 let absolute = self.repo_root.join(path);
                 let relative = Path::new(path);
                 if !reader.accepts_path(relative)
-                    || !manifest_path_not_gitignored(&self.repo_root, relative)?
+                    || !path_not_gitignored(&self.repo_root, relative)?
                     || path_has_symlink(&self.repo_root, relative)?
                 {
                     drift.spec_changed = true;
@@ -2232,11 +2263,7 @@ impl CodeWatcher {
                 let excluded = reader
                     .as_ref()
                     .is_some_and(|reader| !reader.accepts_path(&rel.join("nestweaver-probe")));
-                !excluded
-                    && !matches!(
-                        manifest_path_not_gitignored(&self.repo_root, rel),
-                        Ok(false)
-                    )
+                !excluded && !matches!(path_not_gitignored(&self.repo_root, rel), Ok(false))
             })
             .cloned()
             .collect();
@@ -2823,7 +2850,65 @@ fn status_path_is_indexable(reader: &crate::content_reader::FilesystemReader, pa
         && (is_supported_source(relative) || crate::contracts::is_spec_file(path))
 }
 
-fn manifest_path_not_gitignored(root: &Path, relative: &Path) -> anyhow::Result<bool> {
+/// The `candidates` (repo-relative files) that `FilesystemReader`'s walk would
+/// not enumerate because of `.gitignore`, `.ignore`, `info/exclude` or global
+/// excludes. Uses the walker's own configuration, descending only into the
+/// candidates' ancestor directories, so one batch costs one shallow walk.
+///
+/// A candidate below a directory the walk cannot read gets no verdict: those
+/// paths are disclosed by indexing, and dropping their coverage here would
+/// disagree with it. Other candidates in the batch are still decided.
+fn sources_hidden_from_walk<'a>(
+    repo_root: &Path,
+    candidates: impl IntoIterator<Item = &'a Path>,
+) -> HashSet<PathBuf> {
+    let wanted: HashSet<PathBuf> = candidates.into_iter().map(Path::to_path_buf).collect();
+    if wanted.is_empty() {
+        return HashSet::new();
+    }
+    let ancestors: HashSet<PathBuf> = wanted
+        .iter()
+        .flat_map(|path| path.ancestors().skip(1))
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect();
+    let root = repo_root.to_path_buf();
+    let visit = wanted.clone();
+    let mut seen = HashSet::new();
+    for entry in ignore::WalkBuilder::new(repo_root)
+        .follow_links(false)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .filter_entry(move |entry| {
+            entry.path().strip_prefix(&root).is_ok_and(|rel| {
+                rel.as_os_str().is_empty() || ancestors.contains(rel) || visit.contains(rel)
+            })
+        })
+        .build()
+    {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if let Ok(rel) = entry.path().strip_prefix(repo_root) {
+            seen.insert(rel.to_path_buf());
+        }
+    }
+    wanted
+        .difference(&seen)
+        .filter(|path| {
+            path.ancestors()
+                .skip(1)
+                .all(|dir| std::fs::read_dir(repo_root.join(dir)).is_ok())
+        })
+        .cloned()
+        .collect()
+}
+
+/// Whether `relative` escapes the repository's gitignore rules, regardless of
+/// whether Git tracks it (`check-ignore --no-index`), as the walk decides.
+fn path_not_gitignored(root: &Path, relative: &Path) -> anyhow::Result<bool> {
     if !root.join(".git").exists() {
         return Ok(true);
     }
@@ -2838,7 +2923,7 @@ fn manifest_path_not_gitignored(root: &Path, relative: &Path) -> anyhow::Result<
         Some(0) => Ok(false),
         Some(1) => Ok(true),
         _ => anyhow::bail!(
-            "cannot determine manifest gitignore eligibility: {}",
+            "cannot determine gitignore eligibility: {}",
             String::from_utf8_lossy(&result.stderr)
         ),
     }
@@ -3682,6 +3767,199 @@ mod tests {
         );
     }
 
+    /// A committed source that is gone from the working tree (deleted, not
+    /// committed) must not fail the incremental index or leave coverage
+    /// reading complete.
+    #[test]
+    fn incremental_index_discloses_an_unreadable_missed_source_and_still_records_head() {
+        assert_missing_source_disclosure_and_recovery(false);
+    }
+
+    #[test]
+    fn server_incremental_index_retries_missing_sources_at_the_same_sha() {
+        assert_missing_source_disclosure_and_recovery(true);
+    }
+
+    fn assert_missing_source_disclosure_and_recovery(server_mode: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let missed_body = "export function missed() { return 1; }\n";
+        std::fs::write(
+            root.join("src/kept.js"),
+            "export function kept() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/missed.js"), missed_body).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["add", "src/kept.js", "src/missed.js"]);
+        git(&["commit", "-m", "base"]);
+        let head = || -> String {
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git rev-parse HEAD failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        let base = head();
+        let db = dir.path().join("graph.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let url = format!("file://{}", root.display());
+        let uid = nestweaver_schema::repo_uid("test", &url);
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: uid.clone(),
+                url: url.clone(),
+                indexed_sha: base.clone(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: Some(root.display().to_string()),
+            })
+            .unwrap();
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: nestweaver_schema::file_uid(&uid, "src/kept.js"),
+                path: "src/kept.js".to_string(),
+                repo_uid: uid.clone(),
+                content_hash: crate::hash::blake3_hex(
+                    &std::fs::read_to_string(root.join("src/kept.js")).unwrap(),
+                ),
+            })
+            .unwrap();
+        let reader = crate::content_reader::FilesystemReader::with_limits(
+            &root,
+            crate::index_limits::IndexLimits::default(),
+        );
+        store
+            .set_repo_index_policy(&uid, &reader.eligibility_fingerprint())
+            .unwrap();
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        git(&["commit", "--allow-empty", "-m", "no source change"]);
+        let clean = head();
+        assert_ne!(clean, base);
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            store.lookup_repo(&uid).unwrap().unwrap().indexed_sha,
+            base,
+            "precondition: indexed_sha stays behind {clean} while missed.js is absent"
+        );
+        drop(store);
+
+        // Deleted from the working tree but still committed: it cannot be
+        // prepared. That must not block the index, and must not read complete.
+        std::fs::remove_file(root.join("src/missed.js")).unwrap();
+        let index = || {
+            if server_mode {
+                let store = GraphStore::open_or_create(&db).unwrap();
+                let reader = crate::content_reader::FilesystemReader::new(&root);
+                crate::index::incremental_index_with_reader_and_write_gate(
+                    &reader,
+                    &root,
+                    &store,
+                    "test",
+                    &url,
+                    &head(),
+                    || Ok(()),
+                )
+                .unwrap()
+            } else {
+                crate::index::incremental_index(&root, &db, "test", &url).unwrap()
+            }
+        };
+        let result = index();
+        assert_eq!(result.files_added, 0, "{result:?}");
+        assert!(
+            result.skipped_files.iter().any(|skipped| {
+                skipped.path == "src/missed.js"
+                    && skipped.reason_code == nestweaver_parser::SkipReasonCode::ReadError
+            }),
+            "the unreadable committed source must be disclosed: {:?}",
+            result.skipped_files
+        );
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert_eq!(
+            store.lookup_repo(&uid).unwrap().unwrap().indexed_sha,
+            clean,
+            "HEAD is recorded even though the committed source could not be restored"
+        );
+        let generation = store.graph_generation();
+        drop(store);
+
+        // Same commit, same missing source: a second invocation must not
+        // clear coverage merely because the first invocation recorded HEAD.
+        for _ in 0..2 {
+            let repeated = index();
+            assert_eq!(repeated.files_added, 0, "{repeated:?}");
+            assert_eq!(repeated.files_skipped, repeated.skipped_files.len());
+            assert_eq!(
+                repeated
+                    .skipped_files
+                    .iter()
+                    .filter(|skipped| {
+                        skipped.path == "src/missed.js"
+                            && skipped.reason_code == nestweaver_parser::SkipReasonCode::ReadError
+                    })
+                    .count(),
+                1,
+                "{repeated:?}"
+            );
+            let store = GraphStore::open_or_create(&db).unwrap();
+            assert_eq!(
+                store.graph_generation(),
+                generation,
+                "reporting the same read failure must not republish the graph"
+            );
+        }
+
+        // A restored source can still be ineligible. Report its actual skip
+        // reason instead of clearing the gap or continuing to call it unreadable.
+        std::fs::write(root.join("src/missed.js"), b"binary\0source").unwrap();
+        let binary = index();
+        assert_eq!(binary.files_added, 0, "{binary:?}");
+        assert_eq!(binary.skipped_files.len(), 1, "{binary:?}");
+        assert_eq!(
+            binary.skipped_files[0].reason_code,
+            nestweaver_parser::SkipReasonCode::Binary
+        );
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert_eq!(store.graph_generation(), generation);
+        drop(store);
+
+        // Restoring the bytes needs no commit: the same-SHA path must repair
+        // the graph through the ordinary publication transaction.
+        std::fs::write(root.join("src/missed.js"), missed_body).unwrap();
+        let restored = index();
+        assert_eq!(restored.files_added, 1, "{restored:?}");
+        assert!(restored.skipped_files.is_empty(), "{restored:?}");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert_eq!(store.lookup_repo(&uid).unwrap().unwrap().indexed_sha, clean);
+        assert!(!store.lookup_symbols_by_name("missed").unwrap().is_empty());
+        let restored_generation = store.graph_generation();
+        drop(store);
+        let steady = index();
+        assert_eq!(steady.files_added, 0, "{steady:?}");
+        assert!(steady.skipped_files.is_empty(), "{steady:?}");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert_eq!(
+            store.graph_generation(),
+            restored_generation,
+            "a healthy unchanged run must stay read-only"
+        );
+    }
+
     /// `record_applied_head` leaves `indexed_sha` behind when `src/missed.js`
     /// is committed and absent from the graph. The following incremental index
     /// sees an empty `indexed_sha..HEAD` diff, so it must put that file back
@@ -3981,6 +4259,131 @@ mod tests {
             .find(|s| s.name == name)
             .unwrap_or_else(|| panic!("symbol {name} should be indexed"))
             .uid
+    }
+
+    /// The walk discloses a tracked gitignored source and indexing keeps it out
+    /// of the graph. A save event must not publish it, or every later index
+    /// would fall back to a full reindex to retract it again.
+    #[test]
+    fn watcher_keeps_tracked_gitignored_sources_out_of_the_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root) = index_fixture_repo(&dir);
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "src/ignored.js\n").unwrap();
+        // The walk also honours `.ignore`, which `git check-ignore` does not.
+        std::fs::write(root.join(".ignore"), "src/dot_ignored.js\n").unwrap();
+        let ignored = root.join("src/ignored.js");
+        let dot_ignored = root.join("src/dot_ignored.js");
+        let kept = root.join("src/kept_new.js");
+        std::fs::write(&ignored, "export function ignoredFn() { return 1; }\n").unwrap();
+        std::fs::write(
+            &dot_ignored,
+            "export function dotIgnoredFn() { return 3; }\n",
+        )
+        .unwrap();
+        std::fs::write(&kept, "export function keptFn() { return 2; }\n").unwrap();
+        git(&["add", "-f", "."]);
+        let reader = crate::content_reader::FilesystemReader::new(&root);
+        crate::content_reader::ContentReader::list_files(&reader).unwrap();
+        assert!(
+            crate::content_reader::ContentReader::skipped_dirs(&reader)
+                .iter()
+                .filter(|row| row.reason == crate::content_reader::TRACKED_BUT_IGNORED_REASON)
+                .count()
+                == 2,
+            "precondition: the walk discloses both tracked ignored sources"
+        );
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            &[ignored, dot_ignored, kept.clone()],
+        );
+        let files: Vec<String> = store
+            .list_files_by_repo(&r_uid)
+            .unwrap()
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        assert!(
+            !files.iter().any(|path| path == "src/ignored.js"),
+            "{files:?}"
+        );
+        assert!(
+            !files.iter().any(|path| path == "src/dot_ignored.js"),
+            "{files:?}"
+        );
+        assert!(
+            files.iter().any(|path| path == "src/kept_new.js"),
+            "{files:?}"
+        );
+        let graphed = |store: &GraphStore| -> Vec<String> {
+            store
+                .list_files_by_repo(&r_uid)
+                .unwrap()
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect()
+        };
+
+        // A source the graph holds is retracted once it becomes ignored.
+        std::fs::write(root.join(".gitignore"), "src/ignored.js\nsrc/kept_new.js\n").unwrap();
+        process_fixture_batch(&watcher, &store, &r_uid, &root, std::slice::from_ref(&kept));
+        assert!(
+            !graphed(&store).iter().any(|path| path == "src/kept_new.js"),
+            "a newly ignored incumbent must be retracted"
+        );
+
+        // A directory the walk cannot list must not void the verdict for the
+        // rest of the batch, nor drop coverage beneath it.
+        use std::os::unix::fs::PermissionsExt;
+        let locked_dir = root.join("src/locked");
+        std::fs::create_dir(&locked_dir).unwrap();
+        let locked = locked_dir.join("inside.js");
+        std::fs::write(&locked, "export function insideFn() { return 4; }\n").unwrap();
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            std::slice::from_ref(&locked),
+        );
+        assert!(
+            graphed(&store)
+                .iter()
+                .any(|path| path == "src/locked/inside.js")
+        );
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o111)).unwrap();
+        if std::fs::read_dir(&locked_dir).is_err() {
+            let ignored = root.join("src/ignored.js");
+            std::fs::write(&ignored, "export function ignoredFn() { return 5; }\n").unwrap();
+            std::fs::write(&locked, "export function insideFn() { return 6; }\n").unwrap();
+            process_fixture_batch(&watcher, &store, &r_uid, &root, &[ignored, locked]);
+            let files = graphed(&store);
+            assert!(
+                !files.iter().any(|path| path == "src/ignored.js"),
+                "an unlistable sibling must not publish ignored sources: {files:?}"
+            );
+            assert!(
+                files.iter().any(|path| path == "src/locked/inside.js"),
+                "coverage below an unlistable directory is kept: {files:?}"
+            );
+        }
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     fn process_fixture_batch(

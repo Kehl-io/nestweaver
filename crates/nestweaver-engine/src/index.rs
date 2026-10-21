@@ -1656,6 +1656,39 @@ pub(crate) fn establish_index_publication_marker_on_lease<'a>(
     Ok(lease)
 }
 
+/// Preparation has not changed the graph. Retire this run's fresh marker and
+/// reservation, but preserve a recovered publication whose previous owner may
+/// already have committed changes.
+fn retire_failed_index_preparation(
+    publication: nestweaver_store::IndexPublicationLease<'_>,
+    db_path: Option<&Path>,
+    io: &dyn IndexEpilogueIo,
+    primary: anyhow::Error,
+) -> anyhow::Error {
+    if publication.is_recovered() {
+        return primary;
+    }
+    let cleanup = (|| -> Result<(), anyhow::Error> {
+        if let Some(db_path) = db_path {
+            publication
+                .store()
+                .with_index_publication_rank_barrier(|| {
+                    publication.cancel_generation()?;
+                    io.clear_marker(&crate::sidecar_path(db_path, ".index-dirty"))?;
+                    Ok::<(), anyhow::Error>(())
+                })?;
+        }
+        publication.release()?;
+        Ok(())
+    })();
+    match cleanup {
+        Ok(()) => primary,
+        Err(error) => primary.context(format!(
+            "failed to retire uncommitted index marker after preparation failure: {error:#}"
+        )),
+    }
+}
+
 fn finalize_committed_index_with_io(
     lease: nestweaver_store::IndexPublicationLease<'_>,
     db_path: Option<&Path>,
@@ -5526,17 +5559,61 @@ where
             )
         },
     )?;
-    skipped_files.extend(contract_plan.skipped_files.iter().cloned());
-    skipped_files.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| left.reason_code.cmp(&right.reason_code))
-    });
-    skipped_files
-        .dedup_by(|left, right| left.path == right.path && left.reason_code == right.reason_code);
     let _write_guard = write_guard;
     let graph_mutation_attempted = std::cell::Cell::new(false);
     let graph_result = (|| -> Result<IndexResult, anyhow::Error> {
+        // The filesystem walk cannot enumerate a tracked source deleted from a
+        // dirty working tree. Disclose that coverage gap on every local index,
+        // including unchanged-HEAD runs through the daemon's full-index funnel.
+        // Directory-only callers may supply synthetic revisions, including full
+        // hexadecimal strings. Require a local Git administrative entry as well
+        // as a full object ID before consulting the committed tree. A failed tree
+        // listing for that repository must not publish a clean coverage report,
+        // but it is disclosed rather than blocking the working-tree index.
+        if root_path.is_some()
+            && matches!(indexed_sha.len(), 40 | 64)
+            && indexed_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && reader.root().join(".git").symlink_metadata().is_ok()
+        {
+            let mut occupied = present_files.clone();
+            occupied.extend(skipped_files.iter().map(|skipped| skipped.path.clone()));
+            match prepare_missing_committed_sources(
+                reader,
+                reader.root(),
+                indexed_sha,
+                &occupied,
+                false,
+            ) {
+                Ok(missing) => {
+                    log_unprepared_committed_sources(&missing);
+                    for outcome in missing.into_values() {
+                        if let PreparedIncrementalOutcome::PolicySkipped(skipped) = outcome
+                            && skipped.reason_code == SkipReasonCode::ReadError
+                        {
+                            skipped_files.push(skipped);
+                        }
+                    }
+                }
+                // An unknown commit is a wrong revision, not a coverage gap:
+                // recording it as indexed would be false. A known commit whose
+                // tree cannot be listed is a damaged object store.
+                Err(error)
+                    if crate::git_diff::resolve_commit_ref(reader.root(), indexed_sha).is_ok() =>
+                {
+                    skipped_files.push(unverified_committed_coverage(&error));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        skipped_files.extend(contract_plan.skipped_files.iter().cloned());
+        skipped_files.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.reason_code.cmp(&right.reason_code))
+        });
+        skipped_files.dedup_by(|left, right| {
+            left.path == right.path && left.reason_code == right.reason_code
+        });
         // Re-identify prune: when a local repo previously indexed under a
         // `file://<root_path>` identity is now indexed under a different
         // identity (its git origin remote), the old file:// node is a stale
@@ -7583,14 +7660,24 @@ fn incremental_index_with_name_and_io_and_authority(
     let policy_reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits)
         .unskipping(unskip)
         .excluding(excludes)?;
+    // An up-to-date repository does no work, so an inventory failure there is
+    // disclosed rather than fatal (nw-287). A changed SHA needs the walk.
+    let mut unverified_coverage = None;
+    if let Err(error) = crate::content_reader::ContentReader::list_files(&policy_reader) {
+        let error = error.context("refresh source inventory before incremental policy checks");
+        if old_sha != new_sha {
+            return Err(error);
+        }
+        unverified_coverage = Some(error);
+    }
+    let ignored_files = tracked_ignored_source_paths(&policy_reader);
     if store.get_repo_index_policy(&r_uid)?.as_deref()
         != Some(
             crate::content_reader::ContentReader::eligibility_fingerprint(&policy_reader).as_str(),
         )
-        || store
-            .list_files_by_repo(&r_uid)?
-            .iter()
-            .any(|(_, path)| !policy_reader.accepts_path(Path::new(path)))
+        || store.list_files_by_repo(&r_uid)?.iter().any(|(_, path)| {
+            !policy_reader.accepts_path(Path::new(path)) || ignored_files.contains(Path::new(path))
+        })
     {
         return full_index_fallback(
             &store,
@@ -7610,8 +7697,42 @@ fn incremental_index_with_name_and_io_and_authority(
         );
     }
 
-    // 4. Nothing changed.
-    if old_sha == new_sha {
+    // A prior run can record HEAD while disclosing a committed source it
+    // could not restore. Recheck the missing sources before the SHA shortcut:
+    // report a persistent read failure again, or restore newly readable bytes
+    // through the normal publication transaction even without a new commit.
+    let mut unchanged_result = IncrementalResult::default();
+    let mut restore_at_same_sha = false;
+    if old_sha == new_sha && unverified_coverage.is_none() {
+        let occupied = store
+            .list_files_by_repo(&r_uid)?
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        match prepare_missing_committed_sources(
+            &policy_reader,
+            repo_path,
+            &new_sha,
+            &occupied,
+            false,
+        ) {
+            Ok(missing) => {
+                restore_at_same_sha = missing
+                    .values()
+                    .any(|outcome| matches!(outcome, PreparedIncrementalOutcome::Ready(_)));
+                if !restore_at_same_sha {
+                    record_missing_committed_source_skips(&missing, &mut unchanged_result);
+                }
+            }
+            Err(error) => {
+                unverified_coverage =
+                    Some(error.context("check committed sources before unchanged-SHA shortcut"));
+            }
+        }
+    }
+
+    // 4. Nothing changed and no previously missing source can be restored.
+    if old_sha == new_sha && !restore_at_same_sha {
         // Working-tree manifests can change without a commit. This shortcut
         // does not publish a new graph generation, so invalidate derived
         // suggestions only when captured package inputs actually differ from
@@ -7641,42 +7762,12 @@ fn incremental_index_with_name_and_io_and_authority(
             tracing::info!("manifest suggestions await daemon reconciliation");
         }
         tracing::debug!(sha = old_sha, "repo is already up to date; skipping");
-        // nw-387 RESIDUAL: THE DISCLOSURE HAS TO BE DURABLE, AND THIS IS THE
-        // BRANCH THAT BROKE IT. On the item's own fixture (`canary.py` plus a
-        // committed `vendor/v.py`) run 1 reported `degraded` and exited 1; run
-        // 2 — a plain `nestweaver index` over the same unchanged tree, which is
-        // the normal CI shape — took exactly this early return, handed back
-        // `IncrementalResult::default()`, and reported `skipped_files: []`,
-        // `coverage_status: "complete"`, exit 0. The pruned tree is still
-        // missing on run 2; only the report changed. A gate a second run
-        // silently clears is worse than no gate, because it teaches people to
-        // re-run until it passes.
-        //
-        // A prune is a property of the tree and the config, not of the diff, so
-        // it must be RE-DERIVED here rather than remembered — and re-deriving it
-        // needs the walk, which is why `list_files` is called for its side
-        // effect on the recorder and its result discarded. That is a real cost
-        // on an up-to-date repo (one `ignore` walk, no parsing, no reads), paid
-        // deliberately: `nestweaver index` is user-invoked, and the alternative
-        // is a coverage claim that is only true the first time.
-        let reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits)
-            .unskipping(unskip)
-            .excluding(excludes)?;
-        let mut result = IncrementalResult::default();
-        // Fully qualified because this module deliberately does not import the
-        // `ContentReader` trait; every other call here goes through `&dyn`.
-        if let Err(error) = crate::content_reader::ContentReader::list_files(&reader) {
-            // Enumeration failure is not "nothing was pruned" (nw-287). Say so
-            // and return the clean result rather than inventing rows: the index
-            // itself is untouched on this branch, so a hard error here would
-            // fail a run that did no work.
-            tracing::warn!(
-                %error,
-                "could not re-walk an up-to-date repo; pruned directories are not \
-                 disclosed on this run"
-            );
-        } else {
-            drain_pruned_dirs_into_incremental(&reader, &mut result);
+        // The missing-source preflight already walked this reader. Reuse its
+        // disclosures rather than enumerate the same unchanged tree again.
+        let mut result = unchanged_result;
+        match unverified_coverage {
+            Some(error) => record_unverified_unchanged_coverage(&mut result, &error),
+            None => drain_pruned_dirs_into_incremental(&policy_reader, &mut result),
         }
         return Ok(result);
     }
@@ -7692,9 +7783,7 @@ fn incremental_index_with_name_and_io_and_authority(
         "processing incremental changes"
     );
 
-    let reader = crate::content_reader::FilesystemReader::with_limits(repo_path, limits)
-        .unskipping(unskip)
-        .excluding(excludes)?;
+    let reader = policy_reader;
     // nw-418/nw-652: ask the READER whether a path is skipped rather than
     // re-deriving the rule here. `unskipping` normalises the names (it trims
     // them) and the reader alone can answer the manifest probe `target` needs,
@@ -7716,7 +7805,7 @@ fn incremental_index_with_name_and_io_and_authority(
         .collect();
     occupied.extend(paths_covered_by_changes(&changes));
     let mut missing_committed =
-        prepare_missing_committed_sources(skip_reader, repo_path, &new_sha, &occupied)
+        prepare_missing_committed_sources(skip_reader, repo_path, &new_sha, &occupied, false)
             .context("prepare committed sources missing from the graph")?;
     extend_changed_with_missing_sources(&mut changed_files, &missing_committed);
     let mut rdeps = collect_reverse_dep_files(&store, &r_uid, &changed_files, &removed_files);
@@ -7735,41 +7824,57 @@ fn incremental_index_with_name_and_io_and_authority(
         "incremental index",
         epilogue_io,
     )?;
-    // The publication lease may have waited on another writer. Re-read the
-    // tree before this transaction stores source prepared before that wait.
-    (changed_files, removed_files) = partition_changed_removed(&changes, skip_reader);
-    occupied = store
-        .list_files_by_repo(&r_uid)
-        .with_context(|| "list files after incremental publication lease")?
-        .into_iter()
-        .map(|(_, path)| path)
-        .collect();
-    occupied.extend(paths_covered_by_changes(&changes));
-    missing_committed =
-        prepare_missing_committed_sources(skip_reader, repo_path, &new_sha, &occupied)
-            .context("rebuild committed sources missing from the graph")?;
-    extend_changed_with_missing_sources(&mut changed_files, &missing_committed);
-    rdeps = collect_reverse_dep_files(&store, &r_uid, &changed_files, &removed_files);
-    extend_rdeps_for_added_files(
-        skip_reader,
-        &store,
-        Some(db_path),
-        &r_uid,
-        &changed_files,
-        &removed_files,
-        &mut rdeps,
-    );
-    let prepared_files = prepare_incremental_files(&reader, &changes)
-        .context("rebuild incremental source files after publication lease")?;
-    let contract_plan = match prepare_incremental_contract_derivation(&reader, &r_uid, repo_url) {
+    let prepared_plan = (|| -> Result<_, anyhow::Error> {
+        // The publication lease may have waited on another writer. Re-read the
+        // tree before this transaction stores source prepared before that wait.
+        (changed_files, removed_files) = partition_changed_removed(&changes, skip_reader);
+        occupied = store
+            .list_files_by_repo(&r_uid)
+            .with_context(|| "list files after incremental publication lease")?
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        occupied.extend(paths_covered_by_changes(&changes));
+        missing_committed =
+            prepare_missing_committed_sources(skip_reader, repo_path, &new_sha, &occupied, true)
+                .context("rebuild committed sources missing from the graph")?;
+        extend_changed_with_missing_sources(&mut changed_files, &missing_committed);
+        rdeps = collect_reverse_dep_files(&store, &r_uid, &changed_files, &removed_files);
+        extend_rdeps_for_added_files(
+            skip_reader,
+            &store,
+            Some(db_path),
+            &r_uid,
+            &changed_files,
+            &removed_files,
+            &mut rdeps,
+        );
+        let prepared_files = prepare_incremental_files(&reader, &changes)
+            .context("rebuild incremental source files after publication lease")?;
+        let contract_plan = match prepare_incremental_contract_derivation(&reader, &r_uid, repo_url)
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                if let Err(marker_error) =
+                    store.set_contract_derivation_failed(&r_uid, &error.to_string())
+                {
+                    tracing::warn!("recording contract derivation failure failed: {marker_error}");
+                }
+                return Err(error)
+                    .context("rebuild incremental contract plan after publication lease");
+            }
+        };
+        Ok((prepared_files, contract_plan))
+    })();
+    let (prepared_files, contract_plan) = match prepared_plan {
         Ok(plan) => plan,
         Err(error) => {
-            if let Err(marker_error) =
-                store.set_contract_derivation_failed(&r_uid, &error.to_string())
-            {
-                tracing::warn!("recording contract derivation failure failed: {marker_error}");
-            }
-            return Err(error).context("rebuild incremental contract plan after publication lease");
+            return Err(retire_failed_index_preparation(
+                publication,
+                Some(db_path),
+                epilogue_io,
+                error,
+            ));
         }
     };
     // Recorded from the post-lease plan: the publication wait can change which
@@ -7789,10 +7894,19 @@ fn incremental_index_with_name_and_io_and_authority(
     // Wrap the entire incremental update in a single transaction so that a
     // crash mid-index doesn't leave partial data in the store. The indexed
     // SHA is updated inside the transaction — if we crash before commit, the
-    // next run replays from the old SHA.
-    let txn = store
-        .begin_transaction()
-        .with_context(|| "begin incremental transaction")?;
+    // next run replays from the old SHA. Nothing has been written yet, so a
+    // failure to begin retires this run's fresh marker like preparation does.
+    let txn = match store.begin_transaction() {
+        Ok(txn) => txn,
+        Err(error) => {
+            return Err(retire_failed_index_preparation(
+                publication,
+                Some(db_path),
+                epilogue_io,
+                anyhow::Error::from(error).context("begin incremental transaction"),
+            ));
+        }
+    };
 
     for change in &changes {
         match change {
@@ -8100,15 +8214,60 @@ where
         });
     }
 
+    // An up-to-date repository does no work, so an inventory failure there is
+    // disclosed rather than fatal (nw-287). A changed SHA needs the walk.
+    if let Err(error) = reader.list_files() {
+        let error = error.context("refresh source inventory before incremental policy checks");
+        if old_sha != new_sha {
+            return Err(error);
+        }
+        let mut result = IncrementalResult::default();
+        record_unverified_unchanged_coverage(&mut result, &error);
+        return Ok(result);
+    }
+    let ignored_files = tracked_ignored_source_paths(reader);
     let mut policy_removed: std::collections::HashSet<String> = store
         .list_files_by_repo(&r_uid)?
         .into_iter()
-        .filter_map(|(_, path)| (!reader.accepts_path(Path::new(&path))).then_some(path))
+        .filter_map(|(_, path)| {
+            (!reader.accepts_path(Path::new(&path)) || ignored_files.contains(Path::new(&path)))
+                .then_some(path)
+        })
         .collect();
 
     if old_sha == new_sha && policy_removed.is_empty() {
-        tracing::debug!(sha = old_sha, "repo is already up to date; skipping");
-        return Ok(IncrementalResult::default());
+        let occupied = store
+            .list_files_by_repo(&r_uid)?
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        let missing = match prepare_missing_committed_sources(
+            reader,
+            git_repo_path,
+            new_sha,
+            &occupied,
+            false,
+        ) {
+            Ok(missing) => missing,
+            Err(error) => {
+                let mut result = IncrementalResult::default();
+                record_unverified_unchanged_coverage(
+                    &mut result,
+                    &error.context("check committed sources before unchanged-SHA shortcut"),
+                );
+                return Ok(result);
+            }
+        };
+        if !missing
+            .values()
+            .any(|outcome| matches!(outcome, PreparedIncrementalOutcome::Ready(_)))
+        {
+            tracing::debug!(sha = old_sha, "repo is already up to date; skipping");
+            let mut result = IncrementalResult::default();
+            record_missing_committed_source_skips(&missing, &mut result);
+            drain_pruned_dirs_into_incremental(reader, &mut result);
+            return Ok(result);
+        }
     }
 
     if !crate::git_diff::is_ancestor(git_repo_path, &old_sha, new_sha) {
@@ -8166,7 +8325,7 @@ where
         .collect();
     occupied.extend(paths_covered_by_changes(&changes));
     let mut missing_committed =
-        prepare_missing_committed_sources(skip_reader, git_repo_path, new_sha, &occupied)
+        prepare_missing_committed_sources(skip_reader, git_repo_path, new_sha, &occupied, false)
             .context("prepare committed sources missing from the graph")?;
     extend_changed_with_missing_sources(&mut changed_files, &missing_committed);
     let mut rdeps = collect_reverse_dep_files(store, &r_uid, &changed_files, &removed_files);
@@ -8213,9 +8372,14 @@ where
                 .map(|(_, path)| path)
                 .collect();
             occupied.extend(paths_covered_by_changes(&changes));
-            missing_committed =
-                prepare_missing_committed_sources(skip_reader, git_repo_path, new_sha, &occupied)
-                    .context("rebuild committed sources missing from the graph")?;
+            missing_committed = prepare_missing_committed_sources(
+                skip_reader,
+                git_repo_path,
+                new_sha,
+                &occupied,
+                true,
+            )
+            .context("rebuild committed sources missing from the graph")?;
             extend_changed_with_missing_sources(&mut changed_files, &missing_committed);
             rdeps = collect_reverse_dep_files(store, &r_uid, &changed_files, &removed_files);
             extend_rdeps_for_added_files(
@@ -8660,6 +8824,79 @@ fn paths_covered_by_changes(changes: &[crate::git_diff::FileChange]) -> HashSet<
     paths
 }
 
+/// Individually logged committed sources that could not be prepared per run.
+const MAX_LOGGED_UNPREPARED: usize = 10;
+
+/// Log only the final restore plan, once its caller has finished preparing and
+/// refreshing after publication waits. Preflights must not multiply warnings.
+fn log_unprepared_committed_sources(missing: &HashMap<String, PreparedIncrementalOutcome>) {
+    // Sorted so the individually logged paths are the same on every run.
+    let mut unprepared: Vec<&SkippedFile> = missing
+        .values()
+        .filter_map(|outcome| match outcome {
+            PreparedIncrementalOutcome::PolicySkipped(skipped)
+                if skipped.reason_code == SkipReasonCode::ReadError =>
+            {
+                Some(skipped)
+            }
+            _ => None,
+        })
+        .collect();
+    unprepared.sort_by(|left, right| left.path.cmp(&right.path));
+    for skipped in unprepared.iter().take(MAX_LOGGED_UNPREPARED) {
+        tracing::warn!(
+            path = %skipped.path,
+            error = %skipped.reason,
+            "committed source could not be prepared; leaving it out of the graph"
+        );
+    }
+    let unprepared = unprepared.len();
+    if unprepared > MAX_LOGGED_UNPREPARED {
+        tracing::warn!(
+            unprepared,
+            logged = MAX_LOGGED_UNPREPARED,
+            "more committed sources could not be prepared than were logged individually"
+        );
+    }
+}
+
+/// An unchanged SHA did no work, so an inventory failure must not fail the run
+/// (nw-287). Disclose it so coverage does not read complete either.
+fn record_unverified_unchanged_coverage(result: &mut IncrementalResult, error: &anyhow::Error) {
+    record_incremental_file_outcome(
+        result,
+        IncrementalFileOutcome::PolicySkipped(unverified_committed_coverage(error)),
+    );
+}
+
+/// A committed-tree listing failure (for example a damaged object store) must
+/// neither block indexing the working tree nor let coverage read complete.
+fn unverified_committed_coverage(error: &anyhow::Error) -> SkippedFile {
+    tracing::warn!(
+        error = %format!("{error:#}"),
+        "could not verify committed source coverage"
+    );
+    SkippedFile::new(
+        ".".to_string(),
+        SkipReasonCode::ReadError,
+        format!(
+            "committed source coverage could not be verified ({error:#}); repair the \
+             repository and re-run the index"
+        ),
+    )
+}
+
+fn tracked_ignored_source_paths(
+    reader: &dyn crate::content_reader::ContentReader,
+) -> HashSet<PathBuf> {
+    reader
+        .skipped_dirs()
+        .into_iter()
+        .filter(|row| row.reason == crate::content_reader::TRACKED_BUT_IGNORED_REASON)
+        .map(|row| PathBuf::from(row.path))
+        .collect()
+}
+
 /// Indexable paths in `sha`'s tree that the graph does not hold and that this
 /// run's diff does not already cover.
 ///
@@ -8671,13 +8908,36 @@ fn prepare_missing_committed_sources(
     git_repo_path: &Path,
     sha: &str,
     already_present: &HashSet<String>,
+    refresh_inventory: bool,
 ) -> Result<HashMap<String, PreparedIncrementalOutcome>, anyhow::Error> {
+    // The commit tree is a superset of the filesystem reader's accepted
+    // inventory. Refresh its disclosures before restoring holes: a tracked
+    // gitignored file must stay excluded, and an unreadable subtree is already
+    // represented by one directory-level ReadError rather than one per child.
+    if refresh_inventory {
+        reader
+            .list_files()
+            .context("refresh source inventory before restoring committed sources")?;
+    }
+    let disclosures = reader.skipped_dirs();
+    let unreadable_dirs: Vec<PathBuf> = disclosures
+        .iter()
+        .filter(|row| row.reason == crate::content_reader::UNREADABLE_DIR_REASON)
+        .map(|row| PathBuf::from(&row.path))
+        .collect();
+    let ignored_files: HashSet<PathBuf> = disclosures
+        .into_iter()
+        .filter(|row| row.reason == crate::content_reader::TRACKED_BUT_IGNORED_REASON)
+        .map(|row| PathBuf::from(row.path))
+        .collect();
     let mut prepared = HashMap::new();
     for path in crate::git_diff::list_commit_paths(git_repo_path, sha)
         .context("list committed paths before recording HEAD")?
     {
         let rel = path.to_string_lossy();
         if already_present.contains(rel.as_ref())
+            || path_under_unreadable_dir(rel.as_ref(), &unreadable_dirs)
+            || ignored_files.contains(&path)
             || !reader.accepts_path(&path)
             || reader.skips_path(&path)
             || !is_parseable(&path)
@@ -8689,18 +8949,25 @@ fn prepare_missing_committed_sources(
             Ok(outcome) => {
                 prepared.insert(rel.into_owned(), outcome);
             }
-            // A missing worktree file (deleted without a commit) or a
-            // directory the walk cannot read must not abort the rest of the
-            // incremental index. The path stays absent, so a later commit
-            // retries it once the bytes can be read.
+            // Restoring a missing source is best effort. A committed path can
+            // be unreadable (a directory the walk already discloses as a
+            // ReadError, a mode-000 file), absent from a dirty working tree
+            // (deleted or renamed without a commit), or unparsable. Failing
+            // the index here would block every later commit until the tree
+            // is repaired. The path stays out of the graph, is disclosed as a
+            // `ReadError` skip so coverage does not read complete, and is
+            // retried on the next index, even when HEAD has not changed.
             Err(error) => {
-                // NotFound, a closed directory, or a file the parser cannot
-                // read must not stall every later commit. The path stays out
-                // of the graph, so the next commit retries it.
-                tracing::warn!(
-                    path = %path.display(),
-                    %error,
-                    "leaving a committed source that could not be prepared"
+                prepared.insert(
+                    rel.into_owned(),
+                    PreparedIncrementalOutcome::PolicySkipped(SkippedFile::new(
+                        path.to_string_lossy().into_owned(),
+                        SkipReasonCode::ReadError,
+                        format!(
+                            "committed source could not be read or parsed ({error:#}), so it \
+                             is not in the graph; restore it and re-run the index"
+                        ),
+                    )),
                 );
             }
         }
@@ -8709,7 +8976,8 @@ fn prepare_missing_committed_sources(
 }
 
 /// Oversized and minified sources are policy skips. Stat them instead of
-/// reading and parsing a file the restore will discard.
+/// reading and parsing a file the restore will discard. Files that cannot be
+/// stat'ed are left to the caller so the failure is disclosed.
 fn committed_source_needs_no_restore(
     reader: &dyn crate::content_reader::ContentReader,
     path: &Path,
@@ -8722,19 +8990,12 @@ fn committed_source_needs_no_restore(
         // `None` means this reader has no filesystem metadata (a bare git
         // repo), not that the path is missing.
         Ok(None) => false,
-        Err(error) => io_error_blocks_restore(&error),
+        // A path that cannot even be stat'ed (deleted from the working tree,
+        // or in an unreadable directory) is NOT skipped here: it falls through
+        // to `prepare_incremental_file`, fails, and is disclosed as a
+        // `ReadError` skip instead of vanishing.
+        Err(_) => false,
     }
-}
-
-fn io_error_blocks_restore(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
-            matches!(
-                io.kind(),
-                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-            )
-        })
-    })
 }
 
 fn extend_changed_with_missing_sources(
@@ -8744,6 +9005,24 @@ fn extend_changed_with_missing_sources(
     for (path, outcome) in missing {
         if matches!(outcome, PreparedIncrementalOutcome::Ready(_)) {
             changed.insert(path.clone());
+        }
+    }
+}
+
+/// Preserve missing-source disclosure on a read-only unchanged-SHA run.
+/// Deliberate policy skips do not require a graph publication just to retry
+/// restoring them; a source that becomes readable takes the normal write path.
+fn record_missing_committed_source_skips(
+    missing: &HashMap<String, PreparedIncrementalOutcome>,
+    result: &mut IncrementalResult,
+) {
+    log_unprepared_committed_sources(missing);
+    for outcome in missing.values() {
+        if let PreparedIncrementalOutcome::PolicySkipped(skipped) = outcome {
+            record_incremental_file_outcome(
+                result,
+                IncrementalFileOutcome::PolicySkipped(skipped.clone()),
+            );
         }
     }
 }
@@ -8760,6 +9039,7 @@ fn write_missing_committed_sources_on(
     txn: &nestweaver_store::DbConnection<'_>,
     result: &mut IncrementalResult,
 ) -> Result<(), anyhow::Error> {
+    log_unprepared_committed_sources(missing);
     if missing.is_empty() {
         return Ok(());
     }
@@ -8773,7 +9053,12 @@ fn write_missing_committed_sources_on(
             continue;
         }
         match outcome {
-            PreparedIncrementalOutcome::Excluded | PreparedIncrementalOutcome::PolicySkipped(_) => {
+            PreparedIncrementalOutcome::Excluded => {}
+            PreparedIncrementalOutcome::PolicySkipped(skipped) => {
+                record_incremental_file_outcome(
+                    result,
+                    IncrementalFileOutcome::PolicySkipped(skipped.clone()),
+                );
             }
             PreparedIncrementalOutcome::Ready(prepared) => {
                 let outcome = write_prepared_incremental_file_txn(
@@ -8797,6 +9082,7 @@ fn prepare_incremental_files(
     // cannot disagree about which files exist. They used to: the loop's
     // `expect("parseable added file was prepared")` is only sound because both
     // sides apply the identical predicate.
+    let ignored_files = tracked_ignored_source_paths(reader);
     let mut prepared = HashMap::new();
     for change in changes {
         let path = match change {
@@ -8807,6 +9093,13 @@ fn prepare_incremental_files(
         };
         let Some(path) = path else { continue };
         if reader.skips_path(path) || !is_parseable(path) {
+            continue;
+        }
+        if ignored_files.contains(path) {
+            prepared.insert(
+                path.to_string_lossy().into_owned(),
+                PreparedIncrementalOutcome::Excluded,
+            );
             continue;
         }
         prepared.insert(
@@ -10708,6 +11001,286 @@ mod tests {
         git
     }
 
+    /// An up-to-date index did no work. A committed-tree listing failure must
+    /// not fail it, and must not let coverage read complete either.
+    #[test]
+    fn unchanged_sha_discloses_unverifiable_committed_sources_without_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("kept.py"), "def kept():\n    return 1\n").unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let sha = git(&["rev-parse", "HEAD"]);
+        let db = dir.path().join("graph.lbug");
+        let url = "https://example.test/unverifiable-unchanged";
+        index_directory(&repo, &db, "test", url, &sha).unwrap();
+        let generation = fs::read(crate::sidecar_path(&db, ".generation")).unwrap();
+        let tree = git(&["rev-parse", "HEAD^{tree}"]);
+        fs::remove_file(repo.join(".git/objects").join(&tree[..2]).join(&tree[2..])).unwrap();
+
+        let result = incremental_index(&repo, &db, "test", url)
+            .expect("an unchanged SHA must not fail on an unlistable commit tree");
+        assert_eq!(result.files_added, 0);
+        assert_eq!(result.skipped_files.len(), 1, "{:?}", result.skipped_files);
+        assert_eq!(result.skipped_files[0].path, ".");
+        assert_eq!(
+            result.skipped_files[0].reason_code,
+            SkipReasonCode::ReadError
+        );
+        assert_eq!(
+            fs::read(crate::sidecar_path(&db, ".generation")).unwrap(),
+            generation
+        );
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert!(!store.is_index_publication_dirty());
+        assert!(!store.lookup_symbols_by_name("kept").unwrap().is_empty());
+    }
+
+    #[test]
+    fn force_and_incremental_keep_tracked_gitignored_sources_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("kept.py"), "def kept():\n    return 1\n").unwrap();
+        fs::write(repo.join("ignored.py"), "def ignored():\n    return 2\n").unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let db = dir.path().join("graph.lbug");
+        let url = "https://example.test/tracked-ignored-consistency";
+        index_directory(&repo, &db, "test", url, &git(&["rev-parse", "HEAD"])).unwrap();
+        {
+            let store = GraphStore::open_or_create(&db).unwrap();
+            assert!(!store.lookup_symbols_by_name("ignored").unwrap().is_empty());
+        }
+        fs::write(repo.join(".gitignore"), "ignored.py\n").unwrap();
+        git(&["add", ".gitignore"]);
+        git(&["commit", "-q", "-m", "ignore previously tracked source"]);
+        let sha = git(&["rev-parse", "HEAD"]);
+        let assert_excluded = |skips: &[SkippedFile]| {
+            assert_eq!(skips.len(), 1, "{skips:?}");
+            assert_eq!(skips[0].path, "ignored.py");
+            assert_eq!(skips[0].reason_code, SkipReasonCode::Ignored);
+            let store = GraphStore::open_or_create(&db).unwrap();
+            assert!(store.lookup_symbols_by_name("ignored").unwrap().is_empty());
+            assert!(
+                store
+                    .lookup_symbols_by_name("changed_ignored")
+                    .unwrap()
+                    .is_empty()
+            );
+        };
+        let introduced_rule = incremental_index(&repo, &db, "test", url).unwrap();
+        assert!(introduced_rule.fell_back_to_full);
+        assert_excluded(&introduced_rule.skipped_files);
+        for _ in 0..2 {
+            let full =
+                index_directory_with_options(&repo, &db, "test", url, &sha, true, None).unwrap();
+            assert_excluded(&full.skipped_files);
+            let generation = fs::read(crate::sidecar_path(&db, ".generation")).unwrap();
+            let plain = incremental_index(&repo, &db, "test", url).unwrap();
+            assert_excluded(&plain.skipped_files);
+            assert_eq!(plain.files_added, 0);
+            assert_eq!(
+                fs::read(crate::sidecar_path(&db, ".generation")).unwrap(),
+                generation
+            );
+        }
+        fs::write(
+            repo.join("ignored.py"),
+            "def changed_ignored():\n    return 3\n",
+        )
+        .unwrap();
+        git(&["add", "-u"]);
+        git(&["commit", "-q", "-m", "edit tracked ignored source"]);
+        let changed = incremental_index(&repo, &db, "test", url).unwrap();
+        assert_excluded(&changed.skipped_files);
+    }
+
+    #[test]
+    fn server_incremental_retracts_tracked_gitignored_incumbent_at_same_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("kept.py"), "def kept():\n    return 1\n").unwrap();
+        fs::write(repo.join("ignored.py"), "def ignored():\n    return 2\n").unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let sha = git(&["rev-parse", "HEAD"]);
+        let url = "https://example.test/server-ignore-policy";
+        let (_, store) = index_directory_in_memory(&repo, "test", url, &sha).unwrap();
+        assert!(!store.lookup_symbols_by_name("ignored").unwrap().is_empty());
+        fs::write(repo.join(".gitignore"), "ignored.py\n").unwrap();
+        let reader = crate::content_reader::FilesystemReader::new(&repo);
+        let result = incremental_index_with_reader_and_write_gate(
+            &reader,
+            &repo,
+            &store,
+            "test",
+            url,
+            &sha,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(result.files_deleted, 1);
+        assert_eq!(result.skipped_files.len(), 1);
+        assert_eq!(result.skipped_files[0].path, "ignored.py");
+        assert!(store.lookup_symbols_by_name("ignored").unwrap().is_empty());
+        let generation = store.graph_generation();
+        let repeated = incremental_index_with_reader_and_write_gate(
+            &reader,
+            &repo,
+            &store,
+            "test",
+            url,
+            &sha,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(repeated.files_added, 0);
+        assert_eq!(repeated.skipped_files.len(), 1);
+        assert_eq!(store.graph_generation(), generation);
+    }
+
+    #[test]
+    fn full_local_index_tree_listing_failure_retires_uncommitted_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("kept.py"), "def kept():\n    return 1\n").unwrap();
+        let _git = commit_all_in(&repo, "initial");
+        let db = dir.path().join("graph.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let generation = store.graph_generation();
+        let reader = crate::content_reader::FilesystemReader::new(&repo);
+        let local_root = repo.display().to_string();
+        let error = index_into_store(
+            &reader,
+            &store,
+            "test",
+            "https://example.test/unknown-commit",
+            &"a".repeat(40),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&local_root),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("list committed paths"));
+        assert_eq!(store.graph_generation(), generation);
+        assert!(!store.is_index_publication_dirty());
+        assert_eq!(store.count_symbols().unwrap(), 0);
+    }
+
+    /// The daemon's index funnel: a known commit whose tree cannot be listed
+    /// (a damaged object store) still indexes the working tree, but coverage
+    /// discloses that committed sources were not verified.
+    #[test]
+    fn full_local_index_discloses_unlistable_commit_tree_without_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("kept.py"), "def kept():\n    return 1\n").unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let sha = git(&["rev-parse", "HEAD"]);
+        let tree = git(&["rev-parse", "HEAD^{tree}"]);
+        fs::remove_file(repo.join(".git/objects").join(&tree[..2]).join(&tree[2..])).unwrap();
+        let store = GraphStore::in_memory().unwrap();
+        let reader = crate::content_reader::FilesystemReader::new(&repo);
+        let local_root = repo.display().to_string();
+        let result = index_into_store(
+            &reader,
+            &store,
+            "test",
+            "https://example.test/unlistable-tree",
+            &sha,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&local_root),
+        )
+        .expect("a damaged commit tree must not block indexing the working tree");
+        assert_eq!(result.skipped_files.len(), 1, "{:?}", result.skipped_files);
+        assert_eq!(result.skipped_files[0].path, ".");
+        assert_eq!(
+            result.skipped_files[0].reason_code,
+            SkipReasonCode::ReadError
+        );
+        assert_eq!(store.lookup_symbols_by_name("kept").unwrap().len(), 1);
+        assert!(!store.is_index_publication_dirty());
+    }
+
+    #[test]
+    fn full_local_index_accepts_non_git_directory_with_hexadecimal_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("kept.py"), "def kept():\n    return 1\n").unwrap();
+        let (result, store) = index_directory_in_memory(
+            dir.path(),
+            "test",
+            "https://example.test/non-git-directory",
+            &"a".repeat(40),
+        )
+        .unwrap();
+        assert!(result.skipped_files.is_empty());
+        assert_eq!(store.lookup_symbols_by_name("kept").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn full_local_index_discloses_missing_committed_sources_until_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("kept.py"), "def kept():\n    return 1\n").unwrap();
+        let missing = repo.join("missing.py");
+        let source = "def restored_same_sha():\n    return 2\n";
+        fs::write(&missing, source).unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let sha = git(&["rev-parse", "HEAD"]);
+        fs::remove_file(&missing).unwrap();
+        let store = GraphStore::in_memory().unwrap();
+        let reader = crate::content_reader::FilesystemReader::new(&repo);
+        let local_root = repo.display().to_string();
+        let run = || {
+            index_into_store(
+                &reader,
+                &store,
+                "test",
+                "https://example.test/full-missing-source",
+                &sha,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&local_root),
+            )
+            .unwrap()
+        };
+        for _ in 0..2 {
+            let result = run();
+            assert!(result.skipped_files.iter().any(|skipped| {
+                skipped.path == "missing.py" && skipped.reason_code == SkipReasonCode::ReadError
+            }));
+            assert!(
+                store
+                    .lookup_symbols_by_name("restored_same_sha")
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        fs::write(&missing, source).unwrap();
+        assert!(run().skipped_files.is_empty());
+        assert_eq!(
+            store
+                .lookup_symbols_by_name("restored_same_sha")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(run().skipped_files.is_empty());
+    }
+
     /// A committed file missing from the graph and deleted in the worktree
     /// is not in `git diff`. Restoring it used to stat a missing path and
     /// fail the whole incremental index, so `indexed_sha` never moved.
@@ -11229,6 +11802,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first.files_count, 1, "the readable file is still indexed");
+        assert_eq!(
+            first.skipped_files.len(),
+            1,
+            "directory disclosure must cover its descendants"
+        );
         let row = first
             .skipped_files
             .iter()
@@ -11252,12 +11830,22 @@ mod tests {
             second.skipped_files
         );
         assert_eq!(second.files_skipped, second.skipped_files.len());
+        assert_eq!(
+            second.skipped_files.len(),
+            1,
+            "unchanged SHA must not expand directory disclosure"
+        );
 
         fs::write(repo.join("later.py"), "def later():\n    return 3\n").unwrap();
         git(&["add", "later.py"]);
         git(&["commit", "-q", "-m", "later"]);
         let third = incremental_index(&repo, &db, "test", repo_url).unwrap();
         assert_eq!(third.files_added, 1, "precondition: the new file landed");
+        assert_eq!(
+            third.skipped_files.len(),
+            1,
+            "changed SHA must not expand directory disclosure"
+        );
         assert!(
             third.skipped_files.iter().any(is_locked_row),
             "the changed-file incremental branch must disclose it too: {:?}",
@@ -14702,10 +15290,15 @@ function hello(name) { return "Hello " + name; }
         let error = incremental_index(&repo, &incremental_db, "test", repo_url)
             .expect_err("strict incremental contract preflight must fail");
         assert!(
-            format!("{error:#}").contains("prepare incremental contract derivation"),
+            format!("{error:#}")
+                .contains("rebuild incremental contract plan after publication lease"),
             "unexpected error: {error:#}"
         );
         let incremental_store = GraphStore::open_or_create(&incremental_db).unwrap();
+        assert!(
+            !incremental_store.is_index_publication_dirty(),
+            "failed contract preparation must retire its uncommitted marker"
+        );
         assert_eq!(snapshot(&incremental_store), post_only_snapshot);
         assert_eq!(
             fs::read(&generation_path).unwrap(),
@@ -14726,7 +15319,24 @@ function hello(name) { return "Hello " + name; }
             incremental_store
                 .contract_derivation_failures(Some(&repo_uid))
                 .unwrap(),
-            vec![repo_uid]
+            vec![repo_uid.clone()]
+        );
+        drop(incremental_store);
+        fs::write(
+            repo.join("openapi.v2.yaml"),
+            git(&["show", &format!("{third_sha}:openapi.v2.yaml")]),
+        )
+        .unwrap();
+        incremental_index(&repo, &incremental_db, "test", repo_url)
+            .expect("repairing the spec must allow a plain retry");
+        let repaired = GraphStore::open_or_create(&incremental_db).unwrap();
+        assert!(!repaired.is_index_publication_dirty());
+        assert_eq!(snapshot(&repaired), post_only_snapshot);
+        assert!(
+            repaired
+                .contract_derivation_failures(Some(&repo_uid))
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -20353,6 +20963,7 @@ module.exports = { check, plain };\n";
         let old_sha = git(&["rev-parse", "HEAD"]);
         let repo_url = "https://example.com/transient-read";
         index_directory(&repo, &db_path, "test", repo_url, &old_sha).unwrap();
+        let generation_before = fs::read(crate::sidecar_path(&db_path, ".generation")).unwrap();
 
         // nw-190: invalid UTF-8 now decodes lossily and is no longer a read
         // failure, so it cannot stand in for one. nw-355: neither can a binary
@@ -20376,10 +20987,19 @@ module.exports = { check, plain };\n";
         assert!(
             error
                 .to_string()
-                .contains("prepare incremental source files")
+                .contains("rebuild incremental source files after publication lease"),
+            "unexpected error: {error:#}"
         );
 
         let store = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(
+            !store.is_index_publication_dirty(),
+            "failed source preparation must retire its uncommitted marker"
+        );
+        assert_eq!(
+            fs::read(crate::sidecar_path(&db_path, ".generation")).unwrap(),
+            generation_before
+        );
         assert!(
             store
                 .symbols_in_file("main.rs")
@@ -20391,6 +21011,18 @@ module.exports = { check, plain };\n";
         assert_eq!(
             store.lookup_repo(&r_uid).unwrap().unwrap().indexed_sha,
             old_sha
+        );
+        drop(store);
+        fs::write(repo.join("main.rs"), "pub fn replacement() {}\n").unwrap();
+        incremental_index(&repo, &db_path, "test", repo_url)
+            .expect("restoring source must allow a plain retry without recovery");
+        let repaired = GraphStore::open_or_create(&db_path).unwrap();
+        assert!(!repaired.is_index_publication_dirty());
+        assert!(
+            !repaired
+                .lookup_symbols_by_name("replacement")
+                .unwrap()
+                .is_empty()
         );
     }
 
