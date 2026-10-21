@@ -12,6 +12,12 @@ cp examples/minimal-instance.toml nestweaver-instance.toml
 nestweaver config validate nestweaver-instance.toml
 ```
 
+`config validate` parses the file and also checks what parsing alone does not:
+the `[embedding]` retrieval weights must be non-negative and sum to 1.0, and no
+two `[[repos]]` entries may share a `name` (case-insensitive) or a `url`. A
+violation exits 1 (`--json`: `"valid": false`). A config file larger than 4 MiB
+is refused on every route.
+
 It contains every required setting and no repository declarations:
 
 ```toml
@@ -164,7 +170,8 @@ auto_repair_cache = true # default; set false to require an explicit `nestweaver
 # external_endpoint = "https://api.openai.com"
 # external_model = "text-embedding-3-small"
 
-# Retrieval fusion weights (must sum to 1.0)
+# Retrieval fusion weights (must sum to 1.0, each non-negative; the runtime
+# blends them as given, so `nestweaver config validate` reports a violation)
 weight_ppr = 0.40         # graph structure (Personalized PageRank)
 weight_bm25 = 0.25        # text match
 weight_semantic = 0.35    # embedding similarity

@@ -1039,6 +1039,14 @@ nestweaver backup save ./brain-backup.nwsnap.zst
 nestweaver backup save ./brain-backup.nwsnap.zst --force
 ```
 
+A relative destination is resolved against your working directory, also when
+a running daemon writes the archive. A destination that is the database itself
+or one of its files (`<db>`, `<db>.wal`, `<db>.tantivy/...`, a symlink or hard
+link to one of them) is refused, even with `--force`. An archive named after
+the database beside it, such as `brain.lbug.2026-10-21.nwsnap.zst`, is fine.
+A save that was killed leaves `<archive>.partial.<pid>.<n>`; the next save into
+the same directory removes those whose process is gone.
+
 The backup process:
 1. Quiesces writes (blocks new write transactions)
 2. Runs SQLite CHECKPOINT
@@ -1059,6 +1067,12 @@ nestweaver backup restore /backups/brain-2026-06-25T10-30-00.nwsnap.zst \
 nestweaver backup restore /backups/brain-2026-06-25T10-30-00.nwsnap.zst \
   --data-dir ./restored-brain --force
 ```
+
+`--force` replaces only a NestWeaver data directory: one holding a `*.lbug`
+database or the `publication.json` a restore leaves. Any other non-empty
+directory is refused, even with `--force`, because replacing it deletes its
+contents. A killed restore leaves a `.<dir>.restore-staging.<pid>.*` directory
+beside `--data-dir`; the next restore there removes those whose process is gone.
 
 ### Inspect a backup
 

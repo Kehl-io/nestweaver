@@ -16603,3 +16603,126 @@ fn brain_add_refuses_a_control_character_name_before_touching_the_database() {
         "nothing may be written for a refused name"
     );
 }
+
+/// An isolated command for the QA fix-round tests below: every root a daemon
+/// lookup could touch points into `scratch`.
+fn qa_isolated_cmd(scratch: &std::path::Path) -> Command {
+    let mut cmd = nestweaver_cmd();
+    cmd.env_remove("NESTWEAVER_DB")
+        .env("HOME", scratch.join("home"))
+        .env("XDG_STATE_HOME", scratch.join("state"))
+        .env("XDG_RUNTIME_DIR", scratch.join("runtime"))
+        .env("XDG_CONFIG_HOME", scratch.join("config"))
+        .env("XDG_DATA_HOME", scratch.join("data"))
+        .env("XDG_CACHE_HOME", scratch.join("cache"))
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", scratch.join("fallback"));
+    cmd
+}
+
+/// A file that passes the read-path admission (`LBUG` header) without a real
+/// graph behind it: enough for commands that must refuse or no-op first.
+fn qa_fake_lbug(dir: &std::path::Path) -> std::path::PathBuf {
+    let db = dir.join("fake.lbug");
+    let mut bytes = b"LBUG".to_vec();
+    bytes.resize(4096, 0);
+    std::fs::write(&db, bytes).unwrap();
+    db
+}
+
+/// QA (LOW): `watch-stop` with no daemon running AUTOSTARTED one. Stopping
+/// must not start anything: no daemon means no watcher, exit 0.
+#[test]
+fn watch_stop_without_a_daemon_does_not_start_one() {
+    let scratch = tempfile::tempdir().unwrap();
+    let db = qa_fake_lbug(scratch.path());
+    let output = qa_isolated_cmd(scratch.path())
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .args(["watch-stop", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("No daemon is running"), "{stderr}");
+    assert!(
+        !scratch.path().join("state").join("nestweaver").exists()
+            || std::fs::read_dir(scratch.path().join("state").join("nestweaver"))
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.path().join("daemon.log").exists()),
+        "no daemon may have been started"
+    );
+}
+
+/// QA (LOW): `interactions clear --db /nonexistent` exited 0.
+#[test]
+fn interactions_clear_on_a_missing_database_fails() {
+    let scratch = tempfile::tempdir().unwrap();
+    qa_isolated_cmd(scratch.path())
+        .args(["interactions", "clear", "--db"])
+        .arg(scratch.path().join("nope.lbug"))
+        .assert()
+        .failure()
+        .stderr(contains("not found"));
+}
+
+/// QA (LOW): `--json` failures for an unusable database printed nothing on
+/// stdout. They now carry an envelope a script can branch on.
+#[test]
+fn json_database_problems_write_an_envelope_on_stdout() {
+    let scratch = tempfile::tempdir().unwrap();
+    let not_a_db = scratch.path().join("text.lbug");
+    std::fs::write(&not_a_db, "not a database at all").unwrap();
+    for db in [scratch.path().join("nope.lbug"), not_a_db, scratch.path().to_path_buf()] {
+        let output = qa_isolated_cmd(scratch.path())
+            .args(["search", "anything", "--json", "--db"])
+            .arg(&db)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{}", db.display());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("{}: stdout is not one JSON envelope ({e}): {stdout:?}", db.display()));
+        assert_eq!(envelope["error"], "database unavailable", "{envelope}");
+        assert!(envelope["message"].as_str().is_some_and(|m| !m.is_empty()));
+    }
+}
+
+/// QA (LOW): `NESTWEAVER_DB=` (empty) resolved to the path "" instead of
+/// counting as unset.
+#[test]
+fn an_empty_nestweaver_db_counts_as_unset() {
+    let scratch = tempfile::tempdir().unwrap();
+    let output = qa_isolated_cmd(scratch.path())
+        .current_dir(scratch.path())
+        .env("NESTWEAVER_DB", "")
+        .args(["interactions", "clear"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nestweaver.lbug"),
+        "an empty NESTWEAVER_DB must fall back to the default database: {stderr}"
+    );
+}
+
+/// QA (LOW): an invalid tuning variable was ignored without a word, and
+/// tracing output carried ANSI colour into a pipe.
+#[test]
+fn an_invalid_tuning_variable_is_named_in_a_plain_warning() {
+    let scratch = tempfile::tempdir().unwrap();
+    let db = qa_fake_lbug(scratch.path());
+    let output = qa_isolated_cmd(scratch.path())
+        .env("NESTWEAVER_LBUG_MAX_DB_SIZE", "lots")
+        .args(["instance", "identity", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("NESTWEAVER_LBUG_MAX_DB_SIZE") && stderr.contains("lots"),
+        "the ignored value must be named: {stderr}"
+    );
+    assert!(!stderr.contains('\u{1b}'), "non-TTY stderr must carry no ANSI: {stderr:?}");
+}

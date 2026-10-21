@@ -116,7 +116,7 @@ use nestweaver_engine::{
     record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
     search_symbols, suggest_links,
 };
-use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol, parse_drain_ceiling};
+use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
 
 // ── Exit codes ────────────────────────────────────────────────────────────────
@@ -141,6 +141,12 @@ const EXIT_AMBIGUOUS: i32 = 3;
 /// `nestweaver stale-chekc` from "your graph is stale". The sysexits range
 /// starts at 64 precisely to avoid clashing with codes programs already use.
 const EXIT_USAGE: i32 = 64;
+/// `daemon status` found the daemon unhealthy: something owns the instance
+/// but no client can reach it, or its identity cannot be verified.
+/// `EX_UNAVAILABLE` from `sysexits.h`: the check itself worked (not 1), and
+/// "stopped" (0) and "stuck" must not share a code, because only the second
+/// needs an operator.
+const EXIT_DAEMON_UNHEALTHY: i32 = 69;
 const DEFAULT_EXTERNAL_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 
 /// Default `server init-tls --validity-days`.
@@ -2090,13 +2096,15 @@ const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
                   pr-impact --strict blocked, dead-code refused on a stale graph.\n  \
                   3   ambiguous match (several symbols share the name)\n  \
                   4   unauthorized (pull)      5   unavailable (pull)\n  \
-                  64  usage error — unknown flag, out-of-range value, uncompilable --pattern\n\n\
+                  64  usage error — unknown flag, out-of-range value, a regex pattern that does\n      \
+                  not compile (regex-search / count-patterns)\n  \
+                  69  `daemon status` found the daemon unhealthy (running but unreachable)\n\n\
                   With --json, exit 2 writes {\"error\":\"not found\", ...} to stdout on the read\n      \
                   commands listed above; branch on `error`, not on prose.\n  \
                   NOT UNIVERSAL, and stated precisely because a contract that overreaches is\n      \
                   worse than none: exit 64 from an out-of-range or unknown FLAG is raised by the\n      \
                   argument parser BEFORE --json is read, so it writes to stderr and nothing to\n      \
-                  stdout. Only an uncompilable --pattern reaches the JSON path. Exit 3 emits a\n      \
+                  stdout. Only an uncompilable regex pattern reaches the JSON path. Exit 3 emits a\n      \
                   candidate list, and `impact` keys it \"status\", not \"error\". `read-symbols`\n      \
                   lists misses under \"not_found\" instead. Check the code, then stderr.\n\n\
                   Shell completions:\n  \
@@ -2509,6 +2517,29 @@ fn parse_brain_context_kind(value: &str) -> Result<String, String> {
         .map_err(|error| error.to_string())
 }
 
+/// A `project-context --kinds` value. The tool keeps a node whose kind STARTS
+/// WITH the filter (case-insensitive), so `sym` is as valid as `Symbol`; a
+/// value that is a prefix of no kind a result can hold silently emptied the
+/// answer. Refused at parse time instead (exit 64), listing the kinds.
+fn parse_project_context_kind(value: &str) -> Result<String, String> {
+    const KINDS: [&str; 5] = ["Symbol", "Note", "Section", "Tag", "Heading"];
+    let lower = value.to_lowercase();
+    let is_prefix = !lower.is_empty()
+        && KINDS
+            .iter()
+            .any(|kind| kind.to_lowercase().starts_with(&lower));
+    let is_symbol_subkind = lower.len() > "symbol/".len() && lower.starts_with("symbol/");
+    if is_prefix || is_symbol_subkind {
+        Ok(value.to_string())
+    } else {
+        Err(format!(
+            "unknown kind '{value}'; expected a case-insensitive prefix of one of: {} \
+             (or a 'Symbol/<sub-kind>' prefix)",
+            KINDS.join(", ")
+        ))
+    }
+}
+
 /// MCP `project_context.response_format`: only `concise` or `detailed`,
 /// case-insensitive, the same two values the tool accepts. Anything else is a
 /// usage error that names `--detailed`, the CLI flag agents already have.
@@ -2526,6 +2557,26 @@ fn parse_project_context_response_format(value: &str) -> Result<String, String> 
 /// (exit 64) naming the valid intents rather than an internal error.
 fn parse_query_intent(value: &str) -> Result<String, String> {
     value.parse::<QueryIntent>().map(|_| value.to_string())
+}
+
+/// A symbol name, UID or seed: blank is a usage error (exit 64), not a lookup
+/// that fails as "not found" (2) or as an internal error (1).
+fn parse_non_blank_seed(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        Err("an empty symbol name, UID or seed is not allowed".to_string())
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+/// `pr-impact --files`: must name at least one file. `--files ""` (or only
+/// commas) used to fail later as exit 1.
+fn parse_changed_files_list(value: &str) -> Result<String, String> {
+    if value.split(',').all(|file| file.trim().is_empty()) {
+        Err("--files must name at least one file (omit it to auto-detect via git diff)".to_string())
+    } else {
+        Ok(value.to_string())
+    }
 }
 
 fn parse_non_blank_query(value: &str) -> Result<String, String> {
@@ -3414,6 +3465,32 @@ fn print_json_not_found_suggesting(target_key: &str, target: &str, candidates: &
             candidates,
         )
     );
+}
+
+/// How `project-context` reports a lookup miss, on both routes, keyed on the
+/// error's TYPE rather than its text. Any error mentioning "not found" used to
+/// be reported as "Project '<name>' not found", so `--repos <unknown>` blamed
+/// the project. A project miss is the tool's not-found envelope keyed
+/// `project`; an unresolved `--repos` selector reports itself (not found 2,
+/// ambiguous 3, malformed 64). `None` for anything else.
+fn report_project_context_failure(error: &anyhow::Error, name: &str, json: bool) -> Option<i32> {
+    if let Some(envelope) = nestweaver_mcp::tools::not_found_envelope(error)
+        && envelope.get("project").is_some()
+    {
+        // nw-399: a `--json` caller gets the envelope on stdout, not an
+        // empty stream it cannot tell from a crash.
+        let candidates = value_did_you_mean(&envelope);
+        if json {
+            print_json_not_found_suggesting("project", name, &candidates);
+        }
+        eprintln!("Project '{name}' not found. Try: nestweaver list-projects");
+        eprint_did_you_mean(&candidates);
+        return Some(EXIT_NOT_FOUND);
+    }
+    if error_is_unresolved_repo_filter(error) {
+        return Some(report_unresolved_repo_filter(error, json));
+    }
+    None
 }
 
 /// 12.1.1 (V4): how `investigate` reports a failure it can classify, on both
@@ -6762,6 +6839,7 @@ enum Commands {
     )]
     Symbol {
         /// Symbol name or UID (use UID to disambiguate)
+        #[arg(value_parser = parse_non_blank_seed)]
         name_or_uid: String,
         #[arg(long, help = "Filter by instance ID")]
         instance: Option<String>,
@@ -7357,7 +7435,7 @@ enum Commands {
     )]
     Context {
         /// Symbol names, UIDs, path::name specs, or file paths to seed from (not required when --feature is set)
-        #[arg(required_unless_present = "feature")]
+        #[arg(required_unless_present = "feature", value_parser = parse_non_blank_seed)]
         seeds: Vec<String>,
         #[arg(long, help = "Feature name from instance config")]
         feature: Option<String>,
@@ -7967,6 +8045,7 @@ enum Commands {
         #[arg(
             long = "kinds",
             value_delimiter = ',',
+            value_parser = parse_project_context_kind,
             help = "Filter result kinds by case-insensitive prefix, e.g. Symbol,Note (MCP project_context kinds)"
         )]
         kinds: Vec<String>,
@@ -8523,6 +8602,7 @@ enum Commands {
     PrImpact {
         #[arg(
             long,
+            value_parser = parse_changed_files_list,
             help = "Comma-separated list of changed file paths (omit to auto-detect via git diff)"
         )]
         files: Option<String>,
@@ -8971,6 +9051,14 @@ enum DaemonAction {
     /// write lock or pidfile lock with no way for a client to reach it. That
     /// third state is repairable and names the owning PID when the kernel
     /// reports one.
+    ///
+    /// Exit codes: 0 running or not running (including a database problem
+    /// reported as a warning) · 1 not running and the database is unusable ·
+    /// 69 unhealthy: running but unreachable, or an owner/endpoint that
+    /// cannot be verified. With --json the state is printed either way.
+    #[command(
+        after_help = "Exit codes:\n  0   running, or not running\n  1   not running and the database cannot be used\n  69  UNHEALTHY: running but unreachable (e.g. a stopped/hung daemon still holds the\n      database), or the owner/endpoint cannot be verified"
+    )]
     Status {
         /// Emit read-only lifecycle evidence as JSON.
         #[arg(long)]
@@ -10449,7 +10537,7 @@ enum BackupCommands {
         include_clones: bool,
         #[arg(
             long,
-            help = "Overwrite an existing archive. Without this flag, save leaves that file untouched"
+            help = "Overwrite an existing archive. Without this flag, save leaves that file untouched. Never overwrites the database or one of its files"
         )]
         force: bool,
     },
@@ -10475,7 +10563,7 @@ enum BackupCommands {
         start: bool,
         #[arg(
             long,
-            help = "Replace a non-empty data directory. Without this flag, restore leaves that directory untouched"
+            help = "Replace a non-empty NestWeaver data directory (one holding a *.lbug database or publication.json). Without this flag, restore leaves that directory untouched; any other non-empty directory is refused even with it"
         )]
         force: bool,
     },
@@ -10726,14 +10814,17 @@ fn stop_still_draining_message(pid: i32, waited_secs: u64, serving_reads: bool) 
 /// `stop_env` / `drain_env` are the raw env-var strings (passed in so this is
 /// unit-testable without touching process env).
 fn resolve_stop_grace_secs(stop_env: Option<&str>, drain_env: Option<&str>) -> u64 {
-    if let Some(v) = stop_env.and_then(|s| s.trim().parse::<u64>().ok()) {
+    // An unparsable value is ignored with a one-time warning naming it.
+    if let Some(v) =
+        nestweaver_schema::env::parse_env_value::<u64>("NESTWEAVER_STOP_GRACE_SECS", stop_env)
+    {
         return v;
     }
     // Share the drain-ceiling parse semantics with the daemon/client so a
     // whitespace/format change can't make the CLI derive a different ceiling.
-    let ceiling = drain_env
-        .map(parse_drain_ceiling)
-        .unwrap_or(DEFAULT_DRAIN_CEILING_SECS);
+    let ceiling =
+        nestweaver_schema::env::parse_env_value::<u64>("NESTWEAVER_DRAIN_TIMEOUT_SECS", drain_env)
+            .unwrap_or(DEFAULT_DRAIN_CEILING_SECS);
     ceiling.saturating_add(STOP_GRACE_BUFFER_SECS)
 }
 
@@ -10979,14 +11070,23 @@ fn wholly_inferred_write_message(
     ))
 }
 
+/// `NESTWEAVER_DB`, with an empty or all-whitespace value treated as unset.
+/// `NESTWEAVER_DB=` used to resolve to the path "" and fail every command with
+/// an unhelpful error instead of falling back to the default.
+fn nestweaver_db_env() -> Option<PathBuf> {
+    std::env::var_os("NESTWEAVER_DB")
+        .filter(|value| !value.to_string_lossy().trim().is_empty())
+        .map(PathBuf::from)
+}
+
 fn default_db_path() -> PathBuf {
     default_db_path_with_source().0
 }
 
 /// [`default_db_path`] with the nw-284/S2 provenance retained.
 fn default_db_path_with_source() -> (PathBuf, DbSource) {
-    if let Ok(env_db) = std::env::var("NESTWEAVER_DB") {
-        (PathBuf::from(env_db), DbSource::Env)
+    if let Some(env_db) = nestweaver_db_env() {
+        (env_db, DbSource::Env)
     } else {
         (PathBuf::from("./nestweaver.lbug"), DbSource::CwdLocal)
     }
@@ -12304,8 +12404,8 @@ fn resolve_index_db_path(
         Some(path) => (path, DbSource::Flag),
         None => match cfg.as_ref().and_then(|config| config.db_path()) {
             Some(path) => (path, DbSource::Config),
-            None => match std::env::var("NESTWEAVER_DB").ok() {
-                Some(value) => (PathBuf::from(value), DbSource::Env),
+            None => match nestweaver_db_env() {
+                Some(value) => (value, DbSource::Env),
                 None => (repo_root.join("nestweaver.lbug"), DbSource::RepoLocal),
             },
         },
@@ -14930,18 +15030,78 @@ const LBUG_FILE_MAGIC: &[u8; 4] = b"LBUG";
 /// and whose index region is not still passes here, by construction; see
 /// `nestweaver-store`'s `open_crash_guard` (nw-285) for why a header check
 /// cannot be that guard and must not be mistaken for one.
+/// The `prune-stale` text lines for sources kept because their root could
+/// not be checked (permission denied, I/O error).
+fn prune_stale_skipped_lines(skipped_warnings: &[String]) -> Vec<String> {
+    skipped_warnings
+        .iter()
+        .map(|warning| format!("Warning: kept (root could not be checked): {warning}"))
+        .collect()
+}
+
+/// Whether any socket a daemon for `db_path` would serve on exists. For the
+/// stop-type commands that must attach to a running daemon and never
+/// autostart one.
+fn daemon_socket_present(db_path: &std::path::Path) -> bool {
+    let canonical = std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+    let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(&canonical);
+    nestweaver_daemon::lifecycle::daemon_socket_candidates(&instance_id)
+        .iter()
+        .any(|socket| socket.exists())
+}
+
+/// `--db` names something that is not a usable database (a directory, an
+/// unreadable file, a file whose header is not `LBUG`). Typed so `main` can
+/// tell a database problem from any other failure under `--json`.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct DbAdmissionRefused(String);
+
+/// Under `--json`, the stdout envelope for a command that failed because its
+/// database cannot be used. Those failures printed NOTHING on stdout, so a
+/// `--json` consumer saw an empty stream it could not tell from a crash; every
+/// other classified failure already writes an envelope. `None` when the
+/// failure is not a database problem.
+fn db_problem_json_envelope(
+    admission_refused: bool,
+    report: &miette::Report,
+) -> Option<serde_json::Value> {
+    let typed = admission_refused;
+    let code = report.code().map(|code| code.to_string());
+    let db_code = code
+        .as_deref()
+        .is_some_and(|code| code.starts_with("nestweaver::db_") || code == "nestweaver::empty_db");
+    if !typed && !db_code {
+        return None;
+    }
+    Some(serde_json::json!({
+        "error": "database unavailable",
+        "code": code.unwrap_or_else(|| "nestweaver::db_unusable".to_string()),
+        "message": report.to_string(),
+    }))
+}
+
+/// Whether the command line asked for `--json` (before any `--`).
+fn argv_requests_json() -> bool {
+    std::env::args_os()
+        .skip(1)
+        .take_while(|arg| arg != "--")
+        .any(|arg| arg == "--json")
+}
+
 fn require_openable_db(db_path: &std::path::Path) -> anyhow::Result<()> {
     let Some(selected) = selected_existing_database(db_path)? else {
         anyhow::bail!("database not found at {}", db_path.display());
     };
     let db_path = selected.as_path();
     if db_path.is_dir() {
-        anyhow::bail!(
+        return Err(DbAdmissionRefused(format!(
             "{} is a directory, not a NestWeaver database. Point --db at a \
              `.lbug` file, or run `nestweaver index --repo <path> --db <new \
              path>` to create one.",
             db_path.display()
-        );
+        ))
+        .into());
     }
     let mut header = [0u8; 4];
     let read = (|| -> std::io::Result<usize> {
@@ -14950,11 +15110,12 @@ fn require_openable_db(db_path: &std::path::Path) -> anyhow::Result<()> {
         file.read(&mut header)
     })();
     match read {
-        Err(error) => anyhow::bail!(
+        Err(error) => Err(DbAdmissionRefused(format!(
             "{} cannot be read: {error}. Check its permissions, or point --db \
              at a database you can read.",
             db_path.display()
-        ),
+        ))
+        .into()),
         // nw-385. A `--db` that yields NO bytes is REFUSED on the read path,
         // and the exemption this arm replaces is the whole bug.
         //
@@ -14987,12 +15148,13 @@ fn require_openable_db(db_path: &std::path::Path) -> anyhow::Result<()> {
         // the cost nw-309 (see above) exists to eliminate.
         Ok(0) => Err(no_bytes_refusal(db_path)),
         Ok(_) if header == *LBUG_FILE_MAGIC => Ok(()),
-        Ok(_) => anyhow::bail!(
+        Ok(_) => Err(DbAdmissionRefused(format!(
             "{} is not a NestWeaver database (its header is not `LBUG`). \
              Point --db at a `.lbug` file, or run `nestweaver index --repo <path> \
              --db <new path>` to create one.",
             db_path.display()
-        ),
+        ))
+        .into()),
     }
 }
 
@@ -16669,8 +16831,29 @@ macro_rules! cli_stderr_tracing {
                     .add_directive(tracing::Level::WARN.into()),
             )
             .with_writer(BrokenPipeStderr::process)
+            .with_ansi(stderr_tracing_ansi())
             .log_internal_errors(false)
     };
+}
+
+/// `--no-color`/`--plain`, recorded before the stderr subscriber is built.
+static CLI_NO_COLOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether stderr tracing may use ANSI colour: only on a terminal, and never
+/// under `--no-color`, `--plain` or `NO_COLOR`. The subscriber coloured
+/// unconditionally, so a log file or a pipe got escape sequences the rest of
+/// the CLI's output was already careful to omit.
+fn stderr_tracing_ansi() -> bool {
+    use std::io::IsTerminal;
+    tracing_ansi_allowed(
+        std::io::stderr().is_terminal(),
+        CLI_NO_COLOR.load(std::sync::atomic::Ordering::Relaxed),
+        std::env::var_os("NO_COLOR").is_some(),
+    )
+}
+
+fn tracing_ansi_allowed(stderr_is_terminal: bool, no_color_flag: bool, no_color_env: bool) -> bool {
+    stderr_is_terminal && !no_color_flag && !no_color_env
 }
 
 fn write_stderr_to(
@@ -16916,6 +17099,10 @@ fn main() {
     );
     #[cfg(target_os = "macos")]
     let forks_into_daemon = false;
+    CLI_NO_COLOR.store(
+        cli.no_color || cli.plain,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     if !is_daemon_run && !forks_into_daemon {
         cli_stderr_tracing!().init();
     }
@@ -16979,7 +17166,17 @@ fn main() {
             } else {
                 EXIT_ERROR
             };
+            let admission_refused = e.chain().any(|cause| cause.is::<DbAdmissionRefused>());
             let report = into_diagnostic(e);
+            if argv_requests_json()
+                && let Some(envelope) = db_problem_json_envelope(admission_refused, &report)
+            {
+                // Best effort: a closed stdout must not turn into a panic.
+                let _ = std::io::Write::write_fmt(
+                    &mut std::io::stdout(),
+                    format_args!("{envelope}\n"),
+                );
+            }
             if let Err(error) = write_stderr(format_args!("{report:?}")) {
                 // The failure message is what hit the closed pipe. Dropping
                 // it must not replace the command's exit code with success.
@@ -18049,7 +18246,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     eprintln!("  {} ({})", r.uid, r.name.as_deref().unwrap_or(&r.url));
                 }
                 eprintln!("Re-run with the full UID to disambiguate.");
-                return Ok((EXIT_ERROR, None));
+                // Ambiguous is 3 in the documented exit-code contract.
+                return Ok((EXIT_AMBIGUOUS, None));
             }
 
             let repo = matched[0];
@@ -18109,7 +18307,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     eprintln!("  {} ({})", p.uid, p.name);
                 }
                 eprintln!("Re-run with the full UID to disambiguate.");
-                return Ok((EXIT_ERROR, None));
+                // Ambiguous is 3 in the documented exit-code contract.
+                return Ok((EXIT_AMBIGUOUS, None));
             }
 
             let project = matched[0];
@@ -18240,6 +18439,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             println!("Pruned {total} stale source(s).");
                         }
                         println!("Committed: {}", resp.committed);
+                        // Sources KEPT because their root could not be
+                        // checked: the JSON route reported them, the text
+                        // route silently dropped them.
+                        for line in prune_stale_skipped_lines(&resp.skipped_warnings) {
+                            eprintln!("{line}");
+                        }
                         for failure in &resp.reconciliation_failures {
                             eprintln!(
                                 "Warning: reconciliation {} [{}]: {}",
@@ -21181,6 +21386,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // History lives beside the graph the daemon serves: follow the
                 // publication CURRENT, not a base left behind by a rebuild.
                 let db_path = selected_db_path(&db.unwrap_or_else(default_db_path))?;
+                // A typo'd `--db` used to report "No interaction data to
+                // clear." and exit 0, indistinguishable from a real clear.
+                if !db_path.exists() {
+                    anyhow::bail!("database not found at {}", db_path.display());
+                }
                 if nestweaver_engine::clear_interaction_sidecar(&db_path) {
                     println!("Interaction memory cleared.");
                 } else {
@@ -22564,10 +22774,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // exists to catch, and it caught this.
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             require_openable_db(&db_path)?;
+            // Stopping must not START a daemon: with none running there is
+            // no watcher, which is the outcome the caller asked for. `connect`
+            // autostarts, so look for a live socket first and only then attach.
+            if !daemon_socket_present(&db_path) {
+                out.status("No daemon is running, so no watcher was running.");
+                return Ok((EXIT_SUCCESS, None));
+            }
             let rt = tokio::runtime::Runtime::new()?;
-            let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
+            let mut client = rt.block_on(nestweaver_client::DaemonClient::connect_existing(
                 &db_path,
-                config.as_deref(),
             ))?;
             let resp = rt
                 .block_on(async {
@@ -25115,18 +25331,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // failed".
             let daemon_value = match daemon_result {
                 Ok(value) => value,
-                Err(error) if format!("{error:#}").contains("not found") => {
-                    // nw-399: this arm already had the right EXIT code (2) and
-                    // the right remedy on stderr — and emitted zero bytes on
-                    // stdout, so a `--json` caller saw an empty stream and could
-                    // not tell it apart from a crash.
-                    if json {
-                        print_json_not_found("project", &name);
-                    }
-                    eprintln!("Project '{name}' not found. Try: nestweaver list-projects");
-                    return Ok((EXIT_NOT_FOUND, None));
-                }
-                Err(error) => return Err(error),
+                Err(error) => match report_project_context_failure(&error, &name, json) {
+                    Some(code) => return Ok((code, None)),
+                    None => return Err(error),
+                },
             };
             if let Some(value) = daemon_value {
                 render_project_context_daemon_response(&value, json, token_budget);
@@ -25188,18 +25396,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // not depend on which transport answered.
             let value = match response {
                 Ok(value) => value,
-                Err(error) if format!("{error:#}").contains("not found") => {
-                    // nw-399: this arm already had the right EXIT code (2) and
-                    // the right remedy on stderr — and emitted zero bytes on
-                    // stdout, so a `--json` caller saw an empty stream and could
-                    // not tell it apart from a crash.
-                    if json {
-                        print_json_not_found("project", &name);
-                    }
-                    eprintln!("Project '{name}' not found. Try: nestweaver list-projects");
-                    return Ok((EXIT_NOT_FOUND, None));
-                }
-                Err(error) => return Err(error),
+                Err(error) => match report_project_context_failure(&error, &name, json) {
+                    Some(code) => return Ok((code, None)),
+                    None => return Err(error),
+                },
             };
             render_project_context_daemon_response(&value, json, token_budget);
             Ok((EXIT_SUCCESS, None))
@@ -27814,7 +28014,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         )
                     };
                     let mut waited_ms: u64 = 0;
-                    for _ in 0..(grace_secs * 10) {
+                    // Saturating: a huge NESTWEAVER_STOP_GRACE_SECS overflowed
+                    // `grace_secs * 10` (a panic in debug, a wrapped — possibly
+                    // zero — wait in release).
+                    for _ in 0..grace_secs.saturating_mul(10) {
                         std::thread::sleep(std::time::Duration::from_millis(100));
                         waited_ms += 100;
                         if unsafe { libc::kill(pid, 0) } != 0 {
@@ -28009,16 +28212,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             }
                             _ => ("not_running", "no_observed_owner", None),
                         };
+                        // Absolute: a relative `--db` is meaningless to
+                        // whoever reads this JSON from another directory.
+                        let db_path_abs =
+                            std::path::absolute(&db_path).unwrap_or_else(|_| db_path.clone());
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&serde_json::json!({
                                 "state": state, "evidence": evidence, "pid": pid, "endpoint_error": endpoint_error,
-                                "db_path": db_path, "instance_id": instance_id, "socket": socket,
+                                "db_path": db_path_abs, "instance_id": instance_id, "socket": socket,
                                 "supervision": pid.map(nestweaver_daemon::lifecycle::process_supervision).unwrap_or("unknown/unverifiable"),
                                 "next_action": if state == "running_but_unreachable" || state == "unknown" { "Inspect the verified holder. Do not start another writer or remove runtime files." } else { "Use daemon stop/restart for this selected database; a systemd-user owner may restart it until its unit is stopped." }
                             }))?
                         );
-                        return Ok((EXIT_SUCCESS, None));
+                        let unhealthy = matches!(state, "running_but_unreachable" | "unknown");
+                        return Ok((
+                            if unhealthy { EXIT_DAEMON_UNHEALTHY } else { EXIT_SUCCESS },
+                            None,
+                        ));
                     }
                     if let Some(error) = &endpoint_error {
                         println!(
@@ -28087,6 +28298,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     owner, &db_path, &socket, &pidfile, &log_hint
                                 )
                             );
+                            return Ok((EXIT_DAEMON_UNHEALTHY, None));
                         } else {
                             println!(
                                 "{}",
@@ -28128,7 +28340,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 owner, &db_path, &socket, &pidfile, &log_hint
                             )
                         );
-                        return Ok((EXIT_SUCCESS, None));
+                        return Ok((EXIT_DAEMON_UNHEALTHY, None));
                     }
                     // nw-145 migration: before declaring nothing is running,
                     // check the pre-anchoring identity 6.3.0 would have used.
@@ -28168,7 +28380,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         "{}",
                         format_daemon_not_running_status("Daemon is not running.")
                     );
-                    Ok((EXIT_SUCCESS, None))
+                    // The endpoint failed verification (printed above): the
+                    // same "unknown" state the JSON route reports as unhealthy.
+                    Ok((
+                        if endpoint_error.is_some() { EXIT_DAEMON_UNHEALTHY } else { EXIT_SUCCESS },
+                        None,
+                    ))
                 }
                 DaemonAction::Gc { .. } => unreachable!("daemon gc returns before db resolution"),
                 DaemonAction::Restart {
@@ -43821,5 +44038,104 @@ mod publication_status_recovery_tests {
             .unwrap(),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod cli_fix_round_tests {
+    use super::*;
+
+    /// QA: `project-context --repos <unknown>` was reported as "Project not
+    /// found" because any error text containing "not found" was. The class
+    /// now comes from the error's type.
+    #[test]
+    fn project_context_classifies_misses_by_type_not_text() {
+        let repo_miss: anyhow::Error = nestweaver_engine::node_scope::RepoFilterUnresolved::new(
+            "nope",
+            &anyhow::anyhow!("repo 'nope' not found"),
+        )
+        .into();
+        assert_eq!(
+            report_project_context_failure(&repo_miss, "proj", false),
+            Some(EXIT_NOT_FOUND)
+        );
+        let project_miss = nestweaver_mcp::tools::target_not_found(
+            "project 'proj' not found",
+            "project",
+            serde_json::json!("proj"),
+            &[],
+        );
+        assert_eq!(
+            report_project_context_failure(&project_miss, "proj", false),
+            Some(EXIT_NOT_FOUND)
+        );
+        // A plain failure that merely says "not found" is not a miss.
+        let other = anyhow::anyhow!("tantivy segment not found");
+        assert_eq!(report_project_context_failure(&other, "proj", false), None);
+    }
+
+    /// QA: `--no-color` and a non-TTY stderr still got ANSI in tracing output.
+    #[test]
+    fn stderr_tracing_colours_only_an_unsuppressed_terminal() {
+        assert!(tracing_ansi_allowed(true, false, false));
+        assert!(!tracing_ansi_allowed(false, false, false), "a pipe or file");
+        assert!(!tracing_ansi_allowed(true, true, false), "--no-color / --plain");
+        assert!(!tracing_ansi_allowed(true, false, true), "NO_COLOR");
+    }
+
+    /// QA: `prune-stale` text output dropped the sources it KEPT.
+    #[test]
+    fn prune_stale_text_names_the_sources_it_kept() {
+        let lines = prune_stale_skipped_lines(&["repo:a (/x): permission denied".to_string()]);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("kept"), "{}", lines[0]);
+        assert!(lines[0].contains("permission denied"), "{}", lines[0]);
+        assert!(prune_stale_skipped_lines(&[]).is_empty());
+    }
+
+    /// QA: an unparsable stop grace silently fell back, and a huge one
+    /// overflowed `grace_secs * 10`.
+    #[test]
+    fn stop_grace_ignores_garbage_and_never_overflows() {
+        assert_eq!(
+            resolve_stop_grace_secs(Some("5m"), None),
+            DEFAULT_DRAIN_CEILING_SECS + STOP_GRACE_BUFFER_SECS
+        );
+        let huge = resolve_stop_grace_secs(Some("18446744073709551615"), None);
+        assert_eq!(huge, u64::MAX);
+        assert_eq!(huge.saturating_mul(10), u64::MAX);
+    }
+
+    #[test]
+    fn project_context_kinds_are_validated_as_prefixes() {
+        for ok in ["Symbol", "sym", "NOTE", "section", "Symbol/Function", "tag"] {
+            assert!(parse_project_context_kind(ok).is_ok(), "{ok}");
+        }
+        for bad in ["bogus", "", "symbol/", "notes"] {
+            let error = parse_project_context_kind(bad).unwrap_err();
+            assert!(error.contains("Symbol, Note, Section"), "{bad}: {error}");
+        }
+        // A big stack: building the very wide `Commands` parser overflows
+        // libtest's default 2 MiB thread stack.
+        let refused = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                [
+                    vec!["nestweaver", "project-context", "p", "--kinds", "bogus"],
+                    vec!["nestweaver", "context", ""],
+                    vec!["nestweaver", "symbol", "  "],
+                    vec!["nestweaver", "pr-impact", "--files", ""],
+                    vec!["nestweaver", "pr-impact", "--files", ",,"],
+                ]
+                .into_iter()
+                .map(|argv| (argv.join(" "), Cli::try_parse_from(argv).is_err()))
+                .collect::<Vec<_>>()
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+        for (argv, is_err) in refused {
+            assert!(is_err, "clap must refuse `{argv}` (a usage error, exit 64)");
+        }
     }
 }

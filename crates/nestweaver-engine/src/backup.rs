@@ -371,6 +371,7 @@ fn stage_backup_with_statistics(
             store_db_path.display()
         );
     }
+    refuse_output_in_database_footprint(&config.db_path, &config.output_path)?;
     let staged_db_filename = config
         .db_path
         .file_name()
@@ -546,6 +547,9 @@ pub fn package_staged(config: &BackupConfig, staged: StagedBackup) -> anyhow::Re
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
     std::fs::write(staging.path().join("manifest.json"), &manifest_json)?;
 
+    // Re-checked at publish time: the destination may have changed since
+    // staging began (a symlink or hard link made in the meantime).
+    refuse_output_in_database_footprint(&config.db_path, &config.output_path)?;
     publish_backup_archive(staging.path(), &config.output_path, config.overwrite)?;
 
     // The compressed size is only known after packaging, so it cannot live in
@@ -1449,6 +1453,9 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
             config.data_dir.display()
         );
     }
+    if config.replace && restore_target_occupied(&config.data_dir)? {
+        refuse_replacing_foreign_directory(&config.data_dir)?;
+    }
 
     // Extract to a sibling temp directory so we can atomically rename on success.
     let parent = config
@@ -1456,7 +1463,11 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
         .parent()
         .unwrap_or(std::path::Path::new("."));
     std::fs::create_dir_all(parent)?;
-    let temp_dir = tempfile::tempdir_in(parent)?;
+    let staging_prefix = restore_staging_prefix(&config.data_dir);
+    sweep_dead_pid_leftovers(parent, &staging_prefix, true);
+    let temp_dir = tempfile::Builder::new()
+        .prefix(&format!("{staging_prefix}{}.", std::process::id()))
+        .tempdir_in(parent)?;
 
     let file = std::fs::File::open(&config.snapshot_path)?;
     let decoder = nestweaver_store::zstd::Decoder::new(file)?;
@@ -2346,6 +2357,139 @@ fn validate_restored_logical_identity(
 }
 
 /// Whether `path` already holds something restore would rename aside.
+/// `--force` replaces a data directory, which ends in deleting it. Only do
+/// that to a directory that is recognisably NestWeaver's: one holding a graph
+/// database file (`*.lbug`, or a legacy `*.kuzu`) or the `publication.json`
+/// a restore leaves. Any other non-empty directory (a home directory, a
+/// source tree, a typo) is refused even with `--force`, because the cost of
+/// guessing wrong is the user's files.
+fn refuse_replacing_foreign_directory(data_dir: &Path) -> anyhow::Result<()> {
+    if is_recognisable_data_dir(data_dir)? {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "backup restore refused: {} is not empty and does not look like a NestWeaver data \
+         directory (no *.lbug database or publication.json in it). --force only replaces a \
+         NestWeaver data directory, because replacing deletes the old contents. Restore into an \
+         empty or new directory instead. Nothing in {} was changed.",
+        data_dir.display(),
+        data_dir.display()
+    )
+}
+
+fn is_recognisable_data_dir(data_dir: &Path) -> anyhow::Result<bool> {
+    let metadata = std::fs::symlink_metadata(data_dir)
+        .with_context(|| format!("inspect restore target {}", data_dir.display()))?;
+    if !metadata.is_dir() {
+        return Ok(false);
+    }
+    let entries = std::fs::read_dir(data_dir)
+        .with_context(|| format!("inspect restore target {}", data_dir.display()))?;
+    for entry in entries {
+        let entry =
+            entry.with_context(|| format!("inspect restore target {}", data_dir.display()))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let is_marker = name == crate::publication::PUBLICATION_MANIFEST_FILE
+            || name.ends_with(".lbug")
+            || name.ends_with(".kuzu");
+        if is_marker && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Refuse a backup destination that IS the database or one of its files.
+///
+/// `--force` publishes by renaming over the destination, so `backup save
+/// <db> --force` replaced the live graph with an archive. The database's
+/// footprint is the database path and every `<db>.<suffix>` / `<db>-<suffix>`
+/// sibling (WAL, lock, tantivy, generation, publications, ...), including
+/// anything beneath one of those. The check is made on canonical paths, so a
+/// symlink to the database is caught, and on (device, inode), so a hard link
+/// to any existing footprint file is caught too.
+fn refuse_output_in_database_footprint(db_path: &Path, output: &Path) -> anyhow::Result<()> {
+    let db = std::fs::canonicalize(db_path).unwrap_or_else(|_| absolute_lexically(db_path));
+    let (Some(db_parent), Some(db_name)) = (db.parent(), db.file_name()) else {
+        return Ok(());
+    };
+    let db_name = db_name.to_string_lossy().into_owned();
+    let refuse = || -> anyhow::Result<()> {
+        anyhow::bail!(
+            "backup refused: the destination {} is the database {} or one of its files. Choose \
+             a path outside the database's files; nothing was written.",
+            output.display(),
+            db.display()
+        )
+    };
+    let in_footprint = |name: &str| {
+        name == db_name
+            || name
+                .strip_prefix(db_name.as_str())
+                .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('-'))
+    };
+
+    // A sibling named like a sidecar is refused even when it does not exist
+    // yet (an archive saved as `<db>.wal` would later be read as the WAL),
+    // except for an archive name: no sidecar ends `.nwsnap.zst`, and a backup
+    // called `<db>.2026-10-21.nwsnap.zst` beside the database is legitimate.
+    let resolved = resolve_output_path(output);
+    if let Ok(rest) = resolved.strip_prefix(db_parent) {
+        let mut components = rest.components();
+        if let Some(std::path::Component::Normal(first)) = components.next() {
+            let first = first.to_string_lossy();
+            let archive_name = components.next().is_none() && first.ends_with(".nwsnap.zst");
+            if in_footprint(&first) && (first == db_name || !archive_name) {
+                return refuse();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(target) = std::fs::metadata(output) {
+            let same = |path: &Path| {
+                std::fs::metadata(path)
+                    .is_ok_and(|meta| meta.dev() == target.dev() && meta.ino() == target.ino())
+            };
+            if same(&db) {
+                return refuse();
+            }
+            if let Ok(entries) = std::fs::read_dir(db_parent) {
+                for entry in entries.flatten() {
+                    if in_footprint(&entry.file_name().to_string_lossy()) && same(&entry.path()) {
+                        return refuse();
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The path `output` names once symlinks are followed: canonical when it
+/// exists, else its canonical parent joined with its file name.
+fn resolve_output_path(output: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(output) {
+        return canonical;
+    }
+    let absolute = absolute_lexically(output);
+    match (absolute.parent(), absolute.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+            .map(|parent| parent.join(name))
+            .unwrap_or(absolute),
+        _ => absolute,
+    }
+}
+
+fn absolute_lexically(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn restore_target_occupied(path: &Path) -> anyhow::Result<bool> {
     match std::fs::read_dir(path) {
         Ok(mut entries) => Ok(entries.next().is_some()),
@@ -2372,6 +2516,14 @@ fn publish_backup_archive(staging: &Path, output: &Path, overwrite: bool) -> any
         .filter(|parent| !parent.as_os_str().is_empty())
     {
         std::fs::create_dir_all(parent)?;
+    }
+    if let Some(name) = output.file_name() {
+        let parent = output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let prefix = format!("{}.partial.", name.to_string_lossy());
+        sweep_dead_pid_leftovers(parent, &prefix, false);
     }
     let packaged = package_tar_zstd(staging, &temp);
     if packaged.is_err() {
@@ -2459,6 +2611,63 @@ fn copy_new_file(from: &Path, to: &Path) -> std::io::Result<()> {
 
 fn is_already_exists(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::AlreadyExists
+}
+
+/// Prefix of a restore's staging directory beside `data_dir`; the pid that
+/// made it follows, so a later restore can tell a dead run's leftover from a
+/// live one's.
+fn restore_staging_prefix(data_dir: &Path) -> String {
+    let name = data_dir
+        .file_name()
+        .map_or_else(|| "data".to_string(), |name| name.to_string_lossy().into_owned());
+    format!(".{name}.restore-staging.")
+}
+
+/// Remove `<prefix><pid>.<rest>` entries in `dir` whose pid is not alive.
+///
+/// A killed `backup save` left `<archive>.partial.<pid>.<n>` files and a
+/// killed restore left its staging directory; nothing ever removed them, so
+/// each kill leaked a full-size copy. Only an entry whose pid parses and is
+/// provably gone is removed (liveness fails closed), and never this process's
+/// own. Best effort: a failure here must not fail the save or restore.
+fn sweep_dead_pid_leftovers(dir: &Path, prefix: &str, directories: bool) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|name| name.strip_prefix(prefix)) else {
+            continue;
+        };
+        let Some(pid) = rest
+            .split('.')
+            .next()
+            .and_then(|pid| pid.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid <= 0
+            || pid as u32 == std::process::id()
+            || crate::index_publication::process_is_alive(pid)
+        {
+            continue;
+        }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        let removed = if directories && kind.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else if !directories && kind.is_file() {
+            std::fs::remove_file(&path)
+        } else {
+            continue;
+        };
+        match removed {
+            Ok(()) => tracing::info!(path = %path.display(), pid, "removed leftover of a dead backup/restore"),
+            Err(error) => tracing::warn!(path = %path.display(), %error, "could not remove leftover of a dead backup/restore"),
+        }
+    }
 }
 
 fn archive_partial_path(output: &Path) -> PathBuf {
@@ -5358,5 +5567,169 @@ mod hardening_statistics_tests {
         let result = package_staged(&config, staged).unwrap();
         assert_eq!(result.manifest.symbol_count, 0);
         assert!(config.output_path.exists());
+    }
+}
+
+#[cfg(test)]
+mod destination_guard_tests {
+    use super::*;
+
+    fn save_config(db: &Path, output: PathBuf) -> BackupConfig {
+        BackupConfig {
+            db_path: db.to_path_buf(),
+            output_path: output,
+            include_clones: false,
+            instance_id: "test".into(),
+            workspace_path: None,
+            overwrite: true,
+        }
+    }
+
+    fn make_db(dir: &Path) -> PathBuf {
+        let db = dir.join("brain.lbug");
+        drop(nestweaver_store::GraphStore::open(&db).unwrap());
+        db
+    }
+
+    /// QA (HIGH): `backup save <live db> --force` renamed the archive over
+    /// the database. Every spelling of "the database or one of its files"
+    /// must be refused, and the database left byte-for-byte alone.
+    #[test]
+    fn save_refuses_a_destination_in_the_database_footprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = make_db(dir.path());
+        let engine_format = crate::sidecar_path(&db, ".engine-format-test");
+        std::fs::write(&engine_format, "sidecar").unwrap();
+        let tantivy = crate::sidecar_path(&db, ".tantivy-test");
+        std::fs::create_dir_all(&tantivy).unwrap();
+        let before = std::fs::read(&db).unwrap();
+
+        let mut destinations = vec![
+            db.clone(),
+            crate::sidecar_path(&db, ".wal"),
+            engine_format.clone(),
+            tantivy.join("inside.nwsnap.zst"),
+            dir.path().join(".").join("brain.lbug"),
+        ];
+        #[cfg(unix)]
+        {
+            let symlink = dir.path().join("link-to-db.nwsnap.zst");
+            std::os::unix::fs::symlink(&db, &symlink).unwrap();
+            destinations.push(symlink);
+            let hardlink = dir.path().join("hard-to-db.nwsnap.zst");
+            std::fs::hard_link(&db, &hardlink).unwrap();
+            destinations.push(hardlink);
+            let symlinked_dir = dir.path().join("alias");
+            std::os::unix::fs::symlink(dir.path(), &symlinked_dir).unwrap();
+            destinations.push(symlinked_dir.join("brain.lbug"));
+        }
+        for output in destinations {
+            let error = backup_save(&save_config(&db, output.clone()))
+                .expect_err(&format!("{} must be refused", output.display()));
+            assert!(
+                error.to_string().contains("is the database"),
+                "{}: {error:#}",
+                output.display()
+            );
+        }
+        assert_eq!(std::fs::read(&db).unwrap(), before, "database untouched");
+        assert_eq!(std::fs::read(&engine_format).unwrap(), b"sidecar");
+        assert!(!crate::sidecar_path(&db, ".wal").exists());
+
+        // Counterweight: an archive named after the database beside it, and
+        // one elsewhere, are still allowed.
+        for output in [
+            crate::sidecar_path(&db, ".2026-10-21.nwsnap.zst"),
+            dir.path().join("elsewhere.nwsnap.zst"),
+        ] {
+            backup_save(&save_config(&db, output.clone())).unwrap();
+            assert!(output.exists());
+        }
+    }
+
+    /// QA (HIGH): `backup restore --force --data-dir <dir>` deleted any
+    /// non-empty directory. `--force` must only replace a directory that is
+    /// recognisably a NestWeaver data directory.
+    #[test]
+    fn forced_restore_refuses_a_foreign_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let db = make_db(&source);
+        let archive = dir.path().join("b.nwsnap.zst");
+        let mut config = save_config(&db, archive.clone());
+        config.overwrite = false;
+        backup_save(&config).unwrap();
+
+        let foreign = dir.path().join("home");
+        std::fs::create_dir_all(foreign.join("Documents")).unwrap();
+        std::fs::write(foreign.join("notes.txt"), "mine").unwrap();
+        let error = backup_restore(&RestoreConfig {
+            snapshot_path: archive.clone(),
+            data_dir: foreign.clone(),
+            replace: true,
+        })
+        .expect_err("a foreign directory must be refused even with --force");
+        assert!(
+            error.to_string().contains("does not look like a NestWeaver data"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(foreign.join("notes.txt")).unwrap(), b"mine");
+        assert!(foreign.join("Documents").is_dir());
+
+        // Counterweight: a directory holding a database is still replaced.
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        make_db(&data);
+        std::fs::write(data.join("stale.txt"), "old").unwrap();
+        backup_restore(&RestoreConfig {
+            snapshot_path: archive,
+            data_dir: data.clone(),
+            replace: true,
+        })
+        .unwrap();
+        assert!(data.join("brain.lbug").exists());
+        assert!(!data.join("stale.txt").exists());
+    }
+
+    /// QA (LOW): a killed save left `<archive>.partial.<pid>.<n>` and a
+    /// killed restore left its staging directory, forever. The next save /
+    /// restore removes a dead pid's leftovers and keeps a live pid's.
+    #[cfg(unix)]
+    #[test]
+    fn save_and_restore_sweep_a_dead_runs_leftovers() {
+        let dead = {
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            pid
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let db = make_db(&source);
+        let archive = dir.path().join("b.nwsnap.zst");
+        let dead_partial = dir.path().join(format!("b.nwsnap.zst.partial.{dead}.0"));
+        let live_partial = dir.path().join("b.nwsnap.zst.partial.1.0");
+        std::fs::write(&dead_partial, "x").unwrap();
+        std::fs::write(&live_partial, "x").unwrap();
+        backup_save(&save_config(&db, archive.clone())).unwrap();
+        assert!(!dead_partial.exists(), "dead save's partial is swept");
+        assert!(live_partial.exists(), "a live pid's partial is kept");
+
+        let data = dir.path().join("data");
+        let dead_staging = dir.path().join(format!(".data.restore-staging.{dead}.abc"));
+        let live_staging = dir.path().join(".data.restore-staging.1.abc");
+        std::fs::create_dir_all(dead_staging.join("inner")).unwrap();
+        std::fs::create_dir_all(&live_staging).unwrap();
+        backup_restore(&RestoreConfig {
+            snapshot_path: archive,
+            data_dir: data.clone(),
+            replace: false,
+        })
+        .unwrap();
+        assert!(!dead_staging.exists(), "dead restore's staging dir is swept");
+        assert!(live_staging.exists());
+        assert!(data.join("brain.lbug").exists());
     }
 }

@@ -7,7 +7,15 @@ use crate::*;
 pub(crate) fn run_config(command: ConfigCommands) -> anyhow::Result<(i32, Option<String>)> {
     match command {
         ConfigCommands::Validate { path, json } => {
-            match nestweaver_engine::InstanceConfig::from_file(&path) {
+            let loaded = nestweaver_engine::InstanceConfig::from_file(&path).and_then(|config| {
+                    let problems = config_validate_problems(&config);
+                    if problems.is_empty() {
+                        Ok(config)
+                    } else {
+                        Err(anyhow::anyhow!("{}", problems.join("; ")))
+                    }
+                });
+            match loaded {
                 Ok(config) => {
                     if json {
                         let result = serde_json::json!({
@@ -42,6 +50,48 @@ pub(crate) fn run_config(command: ConfigCommands) -> anyhow::Result<(i32, Option
             }
         }
     }
+}
+
+/// What `config validate` checks beyond "it parses". The runtime blends the
+/// three retrieval weights as given, without normalising them, so the
+/// documented rule (non-negative, summing to 1.0) is an error here; and two
+/// `[[repos]]` entries with the same name or URL leave every name selector
+/// ambiguous.
+fn config_validate_problems(config: &nestweaver_engine::InstanceConfig) -> Vec<String> {
+    let mut problems = Vec::new();
+    let embedding = &config.embedding;
+    let weights = [
+        ("weight_ppr", embedding.weight_ppr),
+        ("weight_bm25", embedding.weight_bm25),
+        ("weight_semantic", embedding.weight_semantic),
+    ];
+    for (name, weight) in weights {
+        if !weight.is_finite() || weight < 0.0 {
+            problems.push(format!(
+                "[embedding] {name} = {weight} must be a non-negative number"
+            ));
+        }
+    }
+    let sum: f64 = weights.iter().map(|(_, weight)| weight).sum();
+    if sum.is_finite() && (sum - 1.0).abs() > 1e-6 {
+        problems.push(format!(
+            "[embedding] weight_ppr + weight_bm25 + weight_semantic = {sum}, but the weights \
+             must sum to 1.0"
+        ));
+    }
+    let mut names = std::collections::HashSet::new();
+    let mut urls = std::collections::HashSet::new();
+    for repo in &config.repos {
+        if let Some(name) = repo.name.as_deref()
+            && !names.insert(name.to_lowercase())
+        {
+            problems.push(format!("duplicate [[repos]] name {name:?}"));
+        }
+        if !urls.insert(repo.url.as_str()) {
+            problems.push(format!("duplicate [[repos]] url {:?}", repo.url));
+        }
+    }
+    problems
 }
 
 /// nw-359 leg (3). Disclose that a daemon-only operation cannot honour a
@@ -448,4 +498,62 @@ pub(crate) fn merge_reindex_guidance(repos: &[String]) -> String {
     guidance.push_str("  nestweaver index --repo <path> --force\n");
     guidance.push_str("  nestweaver materialize-projects --config <instance.toml>");
     guidance
+}
+
+#[cfg(test)]
+mod config_validate_tests {
+    use super::config_validate_problems;
+
+    const BASE: &str = r#"
+instance_id = "test-instance"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+"#;
+
+    fn problems(extra: &str) -> Vec<String> {
+        let config =
+            nestweaver_engine::InstanceConfig::from_toml_str(&format!("{BASE}{extra}")).unwrap();
+        config_validate_problems(&config)
+    }
+
+    /// QA: `config validate` accepted weights that do not sum to 1.0,
+    /// negative weights and duplicate `[[repos]]` names.
+    #[test]
+    fn validate_refuses_bad_weights_and_duplicate_repos() {
+        assert!(problems("[[repos]]\nurl = \"https://x/a\"\n").is_empty());
+        let sum = problems("[embedding]\nweight_ppr = 0.9\nweight_bm25 = 0.9\nweight_semantic = 0.9\n");
+        assert!(sum.iter().any(|p| p.contains("sum to 1.0")), "{sum:?}");
+        let negative =
+            problems("[embedding]\nweight_ppr = -0.5\nweight_bm25 = 1.0\nweight_semantic = 0.5\n");
+        assert!(negative.iter().any(|p| p.contains("non-negative")), "{negative:?}");
+        let fine = problems("[embedding]\nweight_ppr = 0.1\nweight_bm25 = 0.2\nweight_semantic = 0.7\n");
+        assert!(fine.is_empty(), "float rounding is tolerated: {fine:?}");
+        let dup = problems(
+            "[[repos]]\nurl = \"https://x/a\"\nname = \"svc\"\n[[repos]]\nurl = \"https://x/b\"\nname = \"SVC\"\n",
+        );
+        assert!(dup.iter().any(|p| p.contains("duplicate [[repos]] name")), "{dup:?}");
+    }
+
+    /// QA: `config validate /dev/zero` read without bound.
+    #[cfg(unix)]
+    #[test]
+    fn an_endless_config_file_is_refused_promptly() {
+        let error = nestweaver_engine::InstanceConfig::from_file(std::path::Path::new("/dev/zero"))
+            .unwrap_err();
+        assert!(error.to_string().contains("larger than"), "{error:#}");
+    }
 }

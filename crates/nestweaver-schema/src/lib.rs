@@ -3,6 +3,7 @@
 pub mod confidence;
 pub mod edges;
 pub mod embedding;
+pub mod env;
 pub mod limits;
 pub mod nodes;
 pub mod provenance;

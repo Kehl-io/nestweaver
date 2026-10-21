@@ -656,9 +656,36 @@ pub(super) fn status_overlay(state: &DaemonState, value: &mut serde_json::Value)
         _ => return,
     };
     let instance = record_instance(state);
-    let records = load_records(&state.db_path, &expectation(&identity, &instance))
-        .ok()
-        .flatten();
+    let loaded = load_records(&state.db_path, &expectation(&identity, &instance));
+    // A foreign record set used to be swallowed here, so `brain status`
+    // looked healthy while every link-graph read refused with ForeignRecord.
+    if matches!(loaded, Err(RecordError::ForeignIdentity))
+        && let serde_json::Value::Object(object) = value
+    {
+        object.insert(
+            "vault_derivation".to_string(),
+            serde_json::json!({
+                "expected_version": markdown_derivation::DERIVATION_VERSION,
+                "foreign_records": {
+                    "daemon_instance": instance,
+                    "instance_stated_by_config": state.instance_stated_by_config,
+                },
+                "read_only": state.read_only,
+            }),
+        );
+        let degraded = object
+            .entry("degraded_components")
+            .or_insert_with(|| serde_json::json!([]));
+        if let Some(components) = degraded.as_array_mut()
+            && !components
+                .iter()
+                .any(|component| component.as_str() == Some("vault_derivation"))
+        {
+            components.push(serde_json::json!("vault_derivation"));
+        }
+        return;
+    }
+    let records = loaded.ok().flatten();
     let in_progress = in_progress_json(state);
     // A derivation that runs before any record exists (the sidecar was lost)
     // is still disclosed.

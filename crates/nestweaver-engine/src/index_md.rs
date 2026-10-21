@@ -2702,6 +2702,27 @@ fn index_markdown_since_with_reader(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Refuse a vault name the store would reject, BEFORE the publication marker.
+///
+/// The store refuses a control character in a vault name, but it does so
+/// inside the bulk write, which runs after `begin_graph_mutation_publication`
+/// has made the durable dirty marker. A dropped guard deliberately leaves that
+/// marker, so a rejected `brain add` of a folder named with a control
+/// character wedged every later vault write ("refusing to overwrite a dirty
+/// publication") until a daemon restart. Checking here keeps the refusal a
+/// plain error with nothing published. The name is usually the folder's own
+/// name, so the message says how to give another one.
+fn refuse_unstorable_vault_name(vault_name: &str, vault_root: &Path) -> anyhow::Result<()> {
+    if let Some(problem) = nestweaver_schema::source_name_problem(vault_name) {
+        anyhow::bail!(
+            "invalid vault name {vault_name:?} for {}: {problem}; pass a valid --name \
+             (MCP: `name`) to register this folder under another name",
+            vault_root.display()
+        );
+    }
+    Ok(())
+}
+
 fn index_markdown_since_with_reader_mode(
     store: &GraphStore,
     reader: &dyn ContentReader,
@@ -2716,6 +2737,7 @@ fn index_markdown_since_with_reader_mode(
     let v_uid = vault_uid(instance_id, &root_str);
     let vault_name =
         &crate::vault_registration::effective_vault_name(store, &v_uid, vault_name, vault_root);
+    refuse_unstorable_vault_name(vault_name, vault_root)?;
     crate::vault_registration::refuse_new_local_vault(
         store,
         &v_uid,
@@ -4176,6 +4198,7 @@ where
     let v_uid = vault_uid(instance_id, &root_str);
     let vault_name =
         &crate::vault_registration::effective_vault_name(store, &v_uid, vault_name, vault_root);
+    refuse_unstorable_vault_name(vault_name, vault_root)?;
     // nw-608: before any scan work. The server-mode route names a vault by its
     // repo URL and roots it at a bare clone, so it is not a local registration.
     if record_repo_sha.is_none() {
@@ -8026,6 +8049,51 @@ sub b body
             result.index.skipped[0].reason_code,
             SkipReasonCode::Oversized
         );
+    }
+
+    /// QA regression (#513): a vault name the store refuses (a control
+    /// character, usually from the folder name) used to be rejected inside
+    /// the bulk write, after the durable `.index-dirty` marker was made. The
+    /// dropped guard kept the marker, so every later vault write failed with
+    /// "refusing to overwrite a dirty publication". The refusal must come
+    /// first, on both refresh routes, and leave the next write working.
+    #[test]
+    fn unstorable_vault_name_is_refused_before_the_publication_marker() {
+        let (dir, root) = make_vault(&[("ok.md", "# Ok\n\nbody\n")]);
+        let db_path = dir.path().join("graph.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let marker = crate::sidecar_path(&db_path, ".index-dirty");
+        let since = std::time::SystemTime::UNIX_EPOCH;
+
+        let full = index_markdown_directory_with_store(
+            &store,
+            &root,
+            &db_path,
+            "default",
+            "bad\u{7}name",
+            &[],
+        );
+        let message = format!("{:#}", full.expect_err("control character must be refused"));
+        assert!(message.contains("--name"), "{message}");
+        assert!(!marker.exists(), "a refused add must not leave {marker:?}");
+
+        let incremental = index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "default",
+            "bad\u{1b}name",
+            since,
+            &[],
+        );
+        let message = format!("{:#}", incremental.expect_err("--since route too"));
+        assert!(message.contains("--name"), "{message}");
+        assert!(!marker.exists(), "a refused --since add must not leave {marker:?}");
+
+        // The next write is not wedged.
+        let ok = index_markdown_directory_with_store(&store, &root, &db_path, "default", "v", &[])
+            .unwrap();
+        assert_eq!(ok.notes_count, 1);
+        assert!(!marker.exists());
     }
 
     #[test]

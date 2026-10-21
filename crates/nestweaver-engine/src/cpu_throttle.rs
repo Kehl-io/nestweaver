@@ -270,8 +270,7 @@ impl CpuThrottle {
     }
 
     fn from_env_value(value: Option<&str>) -> Self {
-        let percent = value
-            .and_then(|s| s.trim().parse::<u32>().ok())
+        let percent = nestweaver_schema::env::parse_env_value::<u32>(ENV_VAR, value)
             .unwrap_or(DEFAULT_PERCENT);
         let percent = if percent > MAX_PERCENT && percent < 100 {
             DEFAULT_PERCENT

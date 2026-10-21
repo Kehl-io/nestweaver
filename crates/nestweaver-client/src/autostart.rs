@@ -795,9 +795,7 @@ const DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS: u64 = 60;
 /// command — this is a patience knob, not a correctness input, mirroring
 /// [`daemon_boot_timeout`]'s own fallback discipline.
 fn ephemeral_idle_timeout_secs() -> u64 {
-    std::env::var(EPHEMERAL_IDLE_TIMEOUT_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
+    nestweaver_schema::env::env_parse::<u64>(EPHEMERAL_IDLE_TIMEOUT_ENV)
         .filter(|secs| *secs > 0)
         .unwrap_or(DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECS)
 }
@@ -1139,14 +1137,27 @@ fn graph_footprint_bytes(db_path: &Path) -> u64 {
 /// out-of-range value falls back to the default rather than failing the
 /// command — this is a patience knob, not a correctness input.
 pub fn daemon_boot_timeout() -> Duration {
-    std::env::var(DAEMON_BOOT_TIMEOUT_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|secs| (1..=600).contains(secs))
+    explicit_daemon_boot_timeout_secs()
         .map_or_else(
             || Duration::from_secs(DEFAULT_DAEMON_BOOT_TIMEOUT_SECS),
             Duration::from_secs,
         )
+}
+
+/// `NESTWEAVER_DAEMON_BOOT_TIMEOUT_SECS` when it is a number in 1..=600; any
+/// other value is ignored with a one-time warning naming the variable.
+fn explicit_daemon_boot_timeout_secs() -> Option<u64> {
+    let secs = nestweaver_schema::env::env_parse::<u64>(DAEMON_BOOT_TIMEOUT_ENV)?;
+    if (1..=600).contains(&secs) {
+        Some(secs)
+    } else {
+        nestweaver_schema::env::warn_invalid_env_once(
+            DAEMON_BOOT_TIMEOUT_ENV,
+            &secs.to_string(),
+            "outside 1..=600",
+        );
+        None
+    }
 }
 
 /// The boot ceiling for a SPECIFIC database, scaled by what the daemon has to
@@ -1159,11 +1170,7 @@ pub fn daemon_boot_timeout() -> Duration {
 /// and `wait_for_socket_watching` continues to watch process liveness, so a
 /// genuinely dead daemon is still reported promptly rather than waited out.
 pub fn daemon_boot_timeout_for(db_path: &Path) -> Duration {
-    if let Some(explicit) = std::env::var(DAEMON_BOOT_TIMEOUT_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|secs| (1..=600).contains(secs))
-    {
+    if let Some(explicit) = explicit_daemon_boot_timeout_secs() {
         return Duration::from_secs(explicit);
     }
     const GIB: u64 = 1024 * 1024 * 1024;

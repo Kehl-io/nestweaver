@@ -6305,15 +6305,17 @@ fn missing_socket_retains_live_writer_evidence_across_repeated_status_calls() {
     std::fs::rename(&socket, &displaced).unwrap();
     let restore = RestoreSocket(displaced, socket.clone());
     for _ in 0..2 {
+        // Unhealthy is exit 69 (EX_UNAVAILABLE), not success: a script
+        // checking `daemon status` must see that something needs attention.
         daemon_action_cmd(&db, "status")
             .assert()
-            .success()
+            .code(69)
             .stdout(contains("Daemon is running but UNREACHABLE"));
         let output = daemon_action_cmd(&db, "status")
             .arg("--json")
             .output()
             .unwrap();
-        assert!(output.status.success());
+        assert_eq!(output.status.code(), Some(69));
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(report["state"], "running_but_unreachable");
         assert_eq!(report["evidence"], "database_write_lock");
