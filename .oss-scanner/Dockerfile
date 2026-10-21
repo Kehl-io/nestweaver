@@ -27,8 +27,11 @@ ENV LBUG_SOURCE_DIR=/opt/ladybug \
     LBUG_BUILD_FROM_SOURCE=1 \
     CFLAGS="-DZSTD_DISABLE_ASM" \
     RUST_BACKTRACE=1 \
+    CARGO_INCREMENTAL=0 \
     CARGO_PROFILE_DEV_DEBUG=line-tables-only \
     CARGO_PROFILE_TEST_DEBUG=line-tables-only
+# CARGO_INCREMENTAL=0: a one-shot image build gains nothing from incremental
+# state, which costs compile time and disk.
 # Link with mold, as CI does: GNU ld runs out of memory linking the test binaries
 # in parallel. On aarch64, gemm-f16 (under the candle embedder) also needs fp16,
 # which aarch64-apple-darwin enables by default and aarch64 Linux does not; that
