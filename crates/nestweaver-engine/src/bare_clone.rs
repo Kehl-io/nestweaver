@@ -465,7 +465,11 @@ pub fn ensure_own_git_metadata(path: &Path) -> Result<()> {
     let common = match std::fs::read_to_string(git_dir.join("commondir")) {
         Ok(common) => common,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(refuse("file names metadata whose `commondir` is unreadable")),
+        Err(_) => {
+            return Err(refuse(
+                "file names metadata whose `commondir` is unreadable",
+            ));
+        }
     };
     let common = Path::new(common.trim_end_matches(['\n', '\r']));
     let common = if common.is_absolute() {
@@ -656,13 +660,24 @@ mod tests {
         );
         let forged = tmp.path().join("forged-worktree");
         std::fs::create_dir_all(&forged).unwrap();
-        std::fs::write(forged.join("commondir"), format!("{}\n", victim_git.display())).unwrap();
+        std::fs::write(
+            forged.join("commondir"),
+            format!("{}\n", victim_git.display()),
+        )
+        .unwrap();
         std::fs::write(forged.join("HEAD"), "ref: refs/heads/master\n").unwrap();
         let worktree = tmp.path().join("worktree-evil");
         std::fs::create_dir_all(&worktree).unwrap();
-        std::fs::write(worktree.join(".git"), format!("gitdir: {}\n", forged.display())).unwrap();
-        std::fs::write(forged.join("gitdir"), format!("{}\n", worktree.join(".git").display()))
-            .unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", forged.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            forged.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
         assert!(ensure_own_git_metadata(&worktree).is_err());
 
         // A symlinked `.git` to the victim's.
@@ -683,7 +698,14 @@ mod tests {
         let linked = tmp.path().join("linked");
         fixture_git(
             &main,
-            &["worktree", "add", "-q", "-b", "side", linked.to_str().unwrap()],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                linked.to_str().unwrap(),
+            ],
         );
         ensure_own_git_metadata(&linked).unwrap();
         assert_eq!(

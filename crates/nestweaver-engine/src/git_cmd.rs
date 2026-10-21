@@ -20,11 +20,11 @@
 //!
 //! Unix-only: this is a macOS/Linux developer tool.
 
-use std::io::Read;
 use std::ffi::{OsStr, OsString};
+use std::io::Read;
 use std::os::unix::ffi::OsStringExt;
-use std::path::Path;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -565,11 +565,27 @@ pub(crate) mod hostile_repo {
             script(markers, "extdiff"),
         );
         for driver in ["evil", "Ev.il"] {
-            git(&["config", &format!("filter.{driver}.clean"), clean.to_str().unwrap()]);
-            git(&["config", &format!("filter.{driver}.smudge"), smudge.to_str().unwrap()]);
+            git(&[
+                "config",
+                &format!("filter.{driver}.clean"),
+                clean.to_str().unwrap(),
+            ]);
+            git(&[
+                "config",
+                &format!("filter.{driver}.smudge"),
+                smudge.to_str().unwrap(),
+            ]);
             git(&["config", &format!("filter.{driver}.required"), "true"]);
-            git(&["config", &format!("diff.{driver}.textconv"), textconv.to_str().unwrap()]);
-            git(&["config", &format!("diff.{driver}.command"), extdiff.to_str().unwrap()]);
+            git(&[
+                "config",
+                &format!("diff.{driver}.textconv"),
+                textconv.to_str().unwrap(),
+            ]);
+            git(&[
+                "config",
+                &format!("diff.{driver}.command"),
+                extdiff.to_str().unwrap(),
+            ]);
         }
         let included = markers.join("included.config");
         std::fs::write(
@@ -677,8 +693,18 @@ mod tests {
             assert!(ran.iter().any(|name| name == program), "{program}: {ran:?}");
         }
         repo.clear();
-        repo.plain_git(&["add", "-A"]);
-        repo.plain_git(&["commit", "-q", "-m", "two"]);
+        // `inc`'s marker is not a real long-running process filter; keep it
+        // out of the commit so the commit cannot fail on its handshake.
+        let commit = repo.plain_git(&[
+            "-c",
+            "filter.inc.process=",
+            "commit",
+            "-q",
+            "-a",
+            "-m",
+            "two",
+        ]);
+        assert!(commit.status.success(), "{commit:?}");
         repo.clear();
         repo.plain_git(&["log", "-1", "-p", "--no-ext-diff"]);
         assert!(repo.ran().iter().any(|name| name == "ran-textconv"));
@@ -700,7 +726,10 @@ mod tests {
         assert!(names.status.success(), "{names:?}");
         let listed = String::from_utf8_lossy(&names.stdout).into_owned();
         for file in ["a.rs", "b.rs", "c.rs"] {
-            assert!(listed.contains(file), "{file} must read as changed: {listed:?}");
+            assert!(
+                listed.contains(file),
+                "{file} must read as changed: {listed:?}"
+            );
         }
         run(&["diff", "--stat", "HEAD"]);
         run(&["diff", "--numstat", "HEAD"]);
@@ -756,7 +785,7 @@ mod tests {
         apply_git_isolation(&mut command);
         let count = command
             .get_envs()
-            .find(|(key, _)| *key == "GIT_CONFIG_COUNT")
+            .find(|(key, _)| *key == OsStr::new("GIT_CONFIG_COUNT"))
             .and_then(|(_, value)| value)
             .map(|value| value.to_string_lossy().into_owned());
         assert_eq!(count.as_deref(), Some("9"));

@@ -929,6 +929,9 @@ pub(crate) fn run_snapshot(command: SnapshotCommands, _use_daemon: bool) -> anyh
         } => {
             // Resolve snapshot directory and backend from args/config/instance registry.
             let (snap_dir, backend_name, b_path) = if let Some(inst_id) = instance {
+                // The id names a directory below; a registry written before
+                // ids were validated may still hold `../..`.
+                nestweaver_engine::validate_instance_id(&inst_id)?;
                 // Load from registry → instance config
                 let registry = nestweaver_engine::registry::Registry::load_or_create(
                     &default_registry_path(),

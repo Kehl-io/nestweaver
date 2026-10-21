@@ -358,7 +358,16 @@ mod tests {
         let repo = crate::git_cmd::hostile_repo::hostile_repo();
         // Plain Git runs the filters to commit; only the code under test is
         // measured.
-        let commit = repo.plain_git(&["commit", "-q", "-a", "-m", "two"]);
+        // `inc`'s marker is not a real long-running process filter.
+        let commit = repo.plain_git(&[
+            "-c",
+            "filter.inc.process=",
+            "commit",
+            "-q",
+            "-a",
+            "-m",
+            "two",
+        ]);
         assert!(commit.status.success(), "{commit:?}");
         repo.clear();
         let changes =

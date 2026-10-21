@@ -730,6 +730,7 @@ impl FilesystemReader {
             skip_dirs: crate::index::SKIP_DIRS,
             skipped_dirs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             tracked_files: std::sync::Arc::new(std::sync::OnceLock::new()),
+            canonical_root: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -2201,13 +2202,15 @@ mod tests {
         std::fs::create_dir_all(repo.join("src")).unwrap();
         std::fs::write(outside.path().join("secret"), "TOP SECRET\n").unwrap();
         std::fs::write(repo.join("src/real.rs"), "fn real() {}\n").unwrap();
-        std::os::unix::fs::symlink(outside.path().join("secret"), repo.join("src/lib.rs"))
-            .unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), repo.join("src/lib.rs")).unwrap();
         std::os::unix::fs::symlink("real.rs", repo.join("src/inner.rs")).unwrap();
         let reader = FilesystemReader::new(&repo);
 
         let error = reader.read_file(Path::new("src/lib.rs")).unwrap_err();
-        assert!(format!("{error:#}").contains("outside the repository"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("outside the repository"),
+            "{error:#}"
+        );
         assert!(reader.read_optional_file(Path::new("src/lib.rs")).is_err());
         let escape = format!(
             "../../{}/secret",
@@ -2218,7 +2221,10 @@ mod tests {
             reader.read_file(Path::new("src/inner.rs")).unwrap(),
             "fn real() {}\n"
         );
-        assert_eq!(reader.read_optional_file(Path::new("missing.rs")).unwrap(), None);
+        assert_eq!(
+            reader.read_optional_file(Path::new("missing.rs")).unwrap(),
+            None
+        );
     }
 
     #[test]

@@ -1100,7 +1100,6 @@ mod tests {
         assert_eq!(repo.ran(), Vec::<String>::new());
     }
 
-
     /// Comparing the working tree reads the index, which would run the
     /// repository's `core.fsmonitor` program without isolation.
     #[test]

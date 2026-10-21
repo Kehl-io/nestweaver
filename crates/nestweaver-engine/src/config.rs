@@ -1337,8 +1337,7 @@ fn read_bounded_config(path: &std::path::Path) -> Result<String, anyhow::Error> 
             MAX_INSTANCE_CONFIG_BYTES / (1024 * 1024)
         );
     }
-    String::from_utf8(bytes)
-        .map_err(|_| anyhow::anyhow!("{} is not valid UTF-8", path.display()))
+    String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("{} is not valid UTF-8", path.display()))
 }
 
 // File configuration paths follow the canonical config's directory; raw TOML
