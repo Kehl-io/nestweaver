@@ -5340,6 +5340,38 @@ fn cache_stats(db_path: &Path) -> (u64, usize, Option<f64>) {
 pub(crate) const MAX_IDENTIFIER_COUNT: usize = 1000;
 pub(crate) const MAX_IDENTIFIER_LEN: usize = 512;
 
+/// Seed lists for `brain_context` / `code_context`. PPR seeding is
+/// superlinear in the seed count (10,000 seeds took ~100 s and kept the daemon
+/// busy after the client left), and no real question needs more than this.
+pub(crate) const MAX_CONTEXT_SEEDS: usize = 256;
+/// Node-kind filters: the kind vocabulary is a handful of names.
+pub(crate) const MAX_KIND_FILTERS: usize = 32;
+/// Repo / vault / tag scope filters.
+pub(crate) const MAX_SCOPE_FILTERS: usize = 100;
+/// `note_get.sections` heading names.
+pub(crate) const MAX_NOTE_SECTIONS: usize = 256;
+/// `investigate_expand.targets`.
+pub(crate) const MAX_EXPAND_TARGETS: usize = 256;
+
+/// Collapse duplicate seeds (first occurrence wins) and refuse a list over
+/// [`MAX_CONTEXT_SEEDS`]. The schema declares the same bound; this is the
+/// backstop for routes that reach a handler without schema validation.
+fn bound_context_seeds(seeds: Vec<String>) -> Result<Vec<String>, anyhow::Error> {
+    let mut seen = HashSet::new();
+    let seeds: Vec<String> = seeds
+        .into_iter()
+        .filter(|seed| seen.insert(seed.clone()))
+        .collect();
+    if seeds.len() > MAX_CONTEXT_SEEDS {
+        anyhow::bail!(
+            "'seeds' has {} distinct entries; the maximum is {MAX_CONTEXT_SEEDS}. Narrow the \
+             seed list (or use brain_search to pick the most relevant seeds) and retry.",
+            seeds.len()
+        );
+    }
+    Ok(seeds)
+}
+
 /// Bound a list of client-supplied identifiers (symbol UIDs/names/FQNs, repo-
 /// relative paths) so an oversized entry or an over-long list can't be echoed
 /// back verbatim (a response-amplification lever) or waste work.
@@ -6104,8 +6136,9 @@ fn tool_schema_regex_search() -> Value {
                 "path_prefix": { "type": "string", "description": "Restrict to nodes whose file path starts with this prefix." },
                 "kinds": {
                     "type": "array",
+                    "maxItems": MAX_KIND_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Restrict to these node kinds: Section, Note, Symbol, Frontmatter (case-insensitive)."
+                    "description": "Restrict to these node kinds: Section, Note, Symbol, Frontmatter (case-insensitive). At most 32 entries."
                 },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Maximum results to return (1-10000; MCP presentation remains bounded by 50 rows and output bytes). Default: 50; MCP candidate work is capped at 2000." },
                 "max_millis": { "type": "integer", "minimum": 1, "maximum": 600000, "description": "Wall-clock time budget in milliseconds (1-600000). Default 2000." },
@@ -6164,14 +6197,16 @@ fn tool_schema_count_patterns() -> Value {
             "properties": {
                 "patterns": {
                     "type": "array",
+                    "maxItems": 64,
                     "items": { "type": "string" },
-                    "description": "One or more Rust regex patterns to count."
+                    "description": "One or more Rust regex patterns to count. At most 64 patterns."
                 },
                 "path_prefix": { "type": "string", "description": "Restrict to nodes whose file path starts with this prefix." },
                 "kinds": {
                     "type": "array",
+                    "maxItems": MAX_KIND_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Restrict to these node kinds: Section, Note, Symbol, Frontmatter (case-insensitive)."
+                    "description": "Restrict to these node kinds: Section, Note, Symbol, Frontmatter (case-insensitive). At most 32 entries."
                 }
             },
             "required": ["patterns"]
@@ -6258,8 +6293,9 @@ fn tool_schema_brain_orphan_documents() -> Value {
                 "path_prefix": { "type": "string", "description": "Restrict to notes whose file path starts with this prefix." },
                 "allowlist": {
                     "type": "array",
+                    "maxItems": MAX_IDENTIFIER_COUNT,
                     "items": { "type": "string" },
-                    "description": "Note paths/titles to exclude (overrides the default index/MOC allowlist when provided)."
+                    "description": "Note paths/titles to exclude (overrides the default index/MOC allowlist when provided). At most 1000 entries."
                 },
                 "limit": limit_schema(
                     "Max orphan documents to return (1-1000, default 50). The total count is always reported.",
@@ -7408,12 +7444,13 @@ fn tool_schema_code_context() -> Value {
             "properties": {
                 "seeds": {
                     "type": "array",
+                    "maxItems": MAX_CONTEXT_SEEDS,
                     // nw-379: an empty-string ELEMENT is a different axis
                     // than an empty ARRAY (the handler already rejects that
                     // one) -- `minLength` closes the one the handler cannot
                     // see, matching `read_symbols`' `targets`/`uids_or_fqns`.
                     "items": { "type": "string", "minLength": 1 },
-                    "description": "Symbol names or `sym:` UIDs to seed the traversal."
+                    "description": "Symbol names or `sym:` UIDs to seed the traversal. At most 256 seeds (duplicates are collapsed); a longer list is REJECTED."
                 },
                 "limit": {
                     "type": "integer",
@@ -7447,6 +7484,7 @@ fn tool_schema_brain_context() -> Value {
             "properties": {
                 "seeds": {
                     "type": "array",
+                    "maxItems": MAX_CONTEXT_SEEDS,
                     // nw-379: `brain_context(seeds: [""])` returned arbitrary
                     // notes at a flat `relevance: 0.4` -- the handler already
                     // rejects an empty ARRAY ('seeds' must contain at least
@@ -7456,7 +7494,7 @@ fn tool_schema_brain_context() -> Value {
                     // `uids_or_fqns` already declare this; the fix here is
                     // the same declaration, not new code.
                     "items": { "type": "string", "minLength": 1 },
-                    "description": "One or more seed strings to anchor the PPR walk. Accepts note titles, tag names (with or without #), symbol names, or UIDs (sym:/note:/head:/sec:/tag:). Seeds are NAMES, not questions: a natural-language question resolves to no seed and returns the not_found envelope, whose message names the `investigate` call to make instead. Use the `investigate` tool for a question."
+                    "description": "One or more seed strings to anchor the PPR walk. Accepts note titles, tag names (with or without #), symbol names, or UIDs (sym:/note:/head:/sec:/tag:). Seeds are NAMES, not questions: a natural-language question resolves to no seed and returns the not_found envelope, whose message names the `investigate` call to make instead. Use the `investigate` tool for a question. At most 256 seeds (duplicates are collapsed); a longer list is REJECTED."
                 },
                 "limit": {
                     "type": "integer", "minimum": 1, "maximum": 1000,
@@ -7477,18 +7515,21 @@ fn tool_schema_brain_context() -> Value {
                 },
                 "repos": {
                     "type": "array",
+                    "maxItems": MAX_SCOPE_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Filter to specific repositories (post-PPR). Each entry must RESOLVE to one repo — exact repo UID (\"repo:{instance}:{hash}\"), exact display name (case-insensitive), or exact clone URL / local root; an entry that names no repo, or that names two, is an ERROR rather than a filter that quietly matches nothing. Only nodes OWNED by a resolved repo are kept. Vault content (Note/Section/Heading/Tag) belongs to a vault and not to any repository, so it is DROPPED when this is set — use `vaults` to scope vault content."
+                    "description": "Filter to specific repositories (post-PPR). Each entry must RESOLVE to one repo — exact repo UID (\"repo:{instance}:{hash}\"), exact display name (case-insensitive), or exact clone URL / local root; an entry that names no repo, or that names two, is an ERROR rather than a filter that quietly matches nothing. Only nodes OWNED by a resolved repo are kept. Vault content (Note/Section/Heading/Tag) belongs to a vault and not to any repository, so it is DROPPED when this is set — use `vaults` to scope vault content. At most 100 entries."
                 },
                 "vaults": {
                     "type": "array",
+                    "maxItems": MAX_SCOPE_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Filter to specific vaults (post-PPR). Each entry must RESOLVE to one vault — exact vault UID (\"vlt:{instance}:{hash}\"), exact name (case-insensitive), or exact root path; an unresolvable or ambiguous entry is an ERROR. Only nodes OWNED by a resolved vault (Note/Section/Heading/Tag) are kept; Symbol nodes belong to a repository and are DROPPED when this is set."
+                    "description": "Filter to specific vaults (post-PPR). Each entry must RESOLVE to one vault — exact vault UID (\"vlt:{instance}:{hash}\"), exact name (case-insensitive), or exact root path; an unresolvable or ambiguous entry is an ERROR. Only nodes OWNED by a resolved vault (Note/Section/Heading/Tag) are kept; Symbol nodes belong to a repository and are DROPPED when this is set. At most 100 entries."
                 },
                 "kinds": {
                     "type": "array",
+                    "maxItems": MAX_KIND_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Include only nodes with these kind prefixes (e.g. Symbol, Note, Section, Tag, Heading). Case-insensitive prefix match against the node's kind field."
+                    "description": "Include only nodes with these kind prefixes (e.g. Symbol, Note, Section, Tag, Heading). Case-insensitive prefix match against the node's kind field. At most 32 entries."
                 },
                 "path_prefix": {
                     "type": "string",
@@ -7496,13 +7537,15 @@ fn tool_schema_brain_context() -> Value {
                 },
                 "tags": {
                     "type": "array",
+                    "maxItems": MAX_SCOPE_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Include only nodes tagged with any of these tags. Applies to Note and Section nodes; Symbol nodes carry no tags and are DROPPED when this is set, so a tag-scoped result can never be larger than the unscoped one. Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\"."
+                    "description": "Include only nodes tagged with any of these tags. Applies to Note and Section nodes; Symbol nodes carry no tags and are DROPPED when this is set, so a tag-scoped result can never be larger than the unscoped one. Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\". At most 100 entries."
                 },
                 "exclude_tags": {
                     "type": "array",
+                    "maxItems": MAX_SCOPE_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Exclude nodes tagged with any of these tags (applies to Note and Section nodes). Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\". An excluded parent therefore drops its whole subtree."
+                    "description": "Exclude nodes tagged with any of these tags (applies to Note and Section nodes). Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\". An excluded parent therefore drops its whole subtree. At most 100 entries."
                 },
                 "weight_ppr": {
                     "type": "number",
@@ -7608,6 +7651,7 @@ fn tool_code_context(
     if seeds.is_empty() {
         anyhow::bail!("code_context requires at least one seed");
     }
+    let seeds = bound_context_seeds(seeds)?;
     // An omitted `limit` used to mean NO CAP, matching the engine's
     // `limit.unwrap_or(usize::MAX)`. That made the advertised 500-result
     // safeguard unreachable by simply not sending the field, so a seed in a
@@ -7756,6 +7800,7 @@ fn tool_brain_context(
     if seeds.is_empty() {
         return Err(anyhow!("'seeds' must contain at least one string"));
     }
+    let seeds = bound_context_seeds(seeds)?;
     for seed in &seeds {
         match resolve_note_by_title(store, seed)? {
             StrictNoteResolve::Ambiguous(notes) => {
@@ -10068,8 +10113,9 @@ fn tool_schema_note_get() -> Value {
                 "body_offset": { "type": "integer", "minimum": 0, "description": "Unicode character offset in body; continue using next_body_offset, with the same UID and sections." },
                 "sections": {
                     "type": "array",
+                    "maxItems": MAX_NOTE_SECTIONS,
                     "items": { "type": "string" },
-                    "description": "Optional list of heading names. If provided, returns only those sections instead of the full body. Case-insensitive match."
+                    "description": "Optional list of heading names. If provided, returns only those sections instead of the full body. Case-insensitive match. At most 256 headings."
                 }
             },
             // nw-410: the either/or requirement, declared where the
@@ -18578,8 +18624,9 @@ fn tool_schema_project_context() -> Value {
                 },
                 "kinds": {
                     "type": "array",
+                    "maxItems": MAX_KIND_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Filter result kinds: \"Symbol\" for code, \"Note\" for documents, \"Section\" for note sections. Case-insensitive prefix match. When this is only Symbol, member notes are not seeded into the PPR walk — otherwise a notes-heavy project spends the whole candidate pool on notes that this filter then drops."
+                    "description": "Filter result kinds: \"Symbol\" for code, \"Note\" for documents, \"Section\" for note sections. Case-insensitive prefix match. When this is only Symbol, member notes are not seeded into the PPR walk — otherwise a notes-heavy project spends the whole candidate pool on notes that this filter then drops. At most 32 entries."
                 },
                 "include_components": {
                     "type": "boolean",
@@ -18616,8 +18663,9 @@ fn tool_schema_project_context() -> Value {
                 },
                 "repos": {
                     "type": "array",
+                    "maxItems": MAX_SCOPE_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Scope results to these repositories. Each entry must RESOLVE to one repo — exact repo UID, exact display name (case-insensitive), or exact clone URL / local root; an unresolvable or ambiguous entry is an ERROR rather than a filter that quietly matches nothing. Only nodes OWNED by a resolved repo are kept, so vault content (Note/Section/Heading/Tag), which belongs to a vault and not to any repository, is DROPPED when this is set. Also narrows which member symbols are eligible to seed the PPR walk in the first place, not just which results are kept afterward — so a repo-scoped call can surface symbols that an unscoped call would never reach. Use on a returning session to skip the broad load."
+                    "description": "Scope results to these repositories. Each entry must RESOLVE to one repo — exact repo UID, exact display name (case-insensitive), or exact clone URL / local root; an unresolvable or ambiguous entry is an ERROR rather than a filter that quietly matches nothing. Only nodes OWNED by a resolved repo are kept, so vault content (Note/Section/Heading/Tag), which belongs to a vault and not to any repository, is DROPPED when this is set. Also narrows which member symbols are eligible to seed the PPR walk in the first place, not just which results are kept afterward — so a repo-scoped call can surface symbols that an unscoped call would never reach. Use on a returning session to skip the broad load. At most 100 entries."
                 },
                 "path_prefix": {
                     "type": "string",
@@ -18625,13 +18673,15 @@ fn tool_schema_project_context() -> Value {
                 },
                 "tags": {
                     "type": "array",
+                    "maxItems": MAX_SCOPE_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Keep only note/section nodes tagged with any of these tags. Symbol nodes carry no tags and are DROPPED when this is set, so a tag-scoped result can never be larger than the unscoped one. Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\"."
+                    "description": "Keep only note/section nodes tagged with any of these tags. Symbol nodes carry no tags and are DROPPED when this is set, so a tag-scoped result can never be larger than the unscoped one. Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\". At most 100 entries."
                 },
                 "exclude_tags": {
                     "type": "array",
+                    "maxItems": MAX_SCOPE_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Drop note/section nodes tagged with any of these tags. Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\". An excluded parent therefore drops its whole subtree."
+                    "description": "Drop note/section nodes tagged with any of these tags. Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\". An excluded parent therefore drops its whole subtree. At most 100 entries."
                 },
                 "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
                 "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." },
@@ -23069,7 +23119,7 @@ fn tool_schema_investigate_expand() -> Value {
             "additionalProperties": false,
             "properties": {
                 "bundle_id": { "type": "string", "description": "The bundle_id returned by a prior `investigate` call." },
-                "targets": { "type": "array", "items": { "type": "string" }, "description": "asset_ids (from the investigate map) or raw node uids to expand." },
+                "targets": { "type": "array", "maxItems": MAX_EXPAND_TARGETS, "items": { "type": "string" }, "description": "asset_ids (from the investigate map) or raw node uids to expand. At most 256 entries." },
                 "root": { "type": "string", "description": "Filesystem root for reading source bodies. When omitted, each symbol is read from its owning repo's local_root in the graph (like read_symbols); falls back to the server working directory if that path is missing." }
             },
             "required": ["bundle_id", "targets"]
@@ -35405,6 +35455,134 @@ mod request_bound_tests {
             tool_read_symbols(&store, json!({ "targets": [at_cap] })).is_ok(),
             "an identifier exactly at the cap must be accepted"
         );
+    }
+
+    /// Every list argument of the context, search and drill-down tools is
+    /// bounded: 10,000 `brain_context` seeds ran for ~100 s and kept the
+    /// daemon busy after the client disconnected.
+    #[test]
+    fn context_and_filter_lists_are_bounded_at_the_schema() {
+        let cases: Vec<(&str, &str, usize, Value)> = vec![
+            ("brain_context", "seeds", MAX_CONTEXT_SEEDS, json!({})),
+            (
+                "brain_context",
+                "kinds",
+                MAX_KIND_FILTERS,
+                json!({ "seeds": ["a"] }),
+            ),
+            (
+                "brain_context",
+                "repos",
+                MAX_SCOPE_FILTERS,
+                json!({ "seeds": ["a"] }),
+            ),
+            (
+                "brain_context",
+                "vaults",
+                MAX_SCOPE_FILTERS,
+                json!({ "seeds": ["a"] }),
+            ),
+            (
+                "brain_context",
+                "tags",
+                MAX_SCOPE_FILTERS,
+                json!({ "seeds": ["a"] }),
+            ),
+            (
+                "brain_context",
+                "exclude_tags",
+                MAX_SCOPE_FILTERS,
+                json!({ "seeds": ["a"] }),
+            ),
+            ("code_context", "seeds", MAX_CONTEXT_SEEDS, json!({})),
+            (
+                "project_context",
+                "kinds",
+                MAX_KIND_FILTERS,
+                json!({ "project": "p" }),
+            ),
+            (
+                "project_context",
+                "repos",
+                MAX_SCOPE_FILTERS,
+                json!({ "project": "p" }),
+            ),
+            (
+                "project_context",
+                "tags",
+                MAX_SCOPE_FILTERS,
+                json!({ "project": "p" }),
+            ),
+            (
+                "project_context",
+                "exclude_tags",
+                MAX_SCOPE_FILTERS,
+                json!({ "project": "p" }),
+            ),
+            (
+                "regex_search",
+                "kinds",
+                MAX_KIND_FILTERS,
+                json!({ "pattern": "a" }),
+            ),
+            (
+                "count_patterns",
+                "kinds",
+                MAX_KIND_FILTERS,
+                json!({ "patterns": ["a"] }),
+            ),
+            ("count_patterns", "patterns", 64, json!({})),
+            (
+                "brain_orphan_documents",
+                "allowlist",
+                MAX_IDENTIFIER_COUNT,
+                json!({}),
+            ),
+            (
+                "investigate_expand",
+                "targets",
+                MAX_EXPAND_TARGETS,
+                json!({ "bundle_id": "b" }),
+            ),
+            (
+                "note_get",
+                "sections",
+                MAX_NOTE_SECTIONS,
+                json!({ "uid": "note:x" }),
+            ),
+        ];
+        for (tool, field, max, base) in cases {
+            let with = |count: usize| {
+                let mut args = base.clone();
+                args[field] = json!(targets(count));
+                args
+            };
+            assert!(
+                validate_tool_arguments(tool, &with(max)).is_ok(),
+                "{tool}.{field} must accept {max}"
+            );
+            let error = validate_tool_arguments(tool, &with(max + 1))
+                .expect_err(&format!("{tool}.{field} must refuse {}", max + 1));
+            assert!(error.to_string().contains(field), "{tool}.{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn context_seeds_are_deduplicated_then_bounded_in_the_handler() {
+        let mut seeds = targets(MAX_CONTEXT_SEEDS);
+        seeds.extend(targets(MAX_CONTEXT_SEEDS));
+        assert_eq!(bound_context_seeds(seeds).unwrap().len(), MAX_CONTEXT_SEEDS);
+        let error = bound_context_seeds(targets(MAX_CONTEXT_SEEDS + 1)).unwrap_err();
+        assert!(error.to_string().contains("256"), "{error}");
+        // The handler backstop holds on a route that skipped the schema.
+        let store = store();
+        let error = tool_code_context(
+            &store,
+            json!({ "seeds": targets(MAX_CONTEXT_SEEDS + 1) }),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("maximum is 256"), "{error}");
     }
 
     /// Both schemas must DECLARE the bound they enforce, so the oversized call
