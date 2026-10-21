@@ -8,13 +8,13 @@ pub(crate) fn run_config(command: ConfigCommands) -> anyhow::Result<(i32, Option
     match command {
         ConfigCommands::Validate { path, json } => {
             let loaded = nestweaver_engine::InstanceConfig::from_file(&path).and_then(|config| {
-                    let problems = config_validate_problems(&config);
-                    if problems.is_empty() {
-                        Ok(config)
-                    } else {
-                        Err(anyhow::anyhow!("{}", problems.join("; ")))
-                    }
-                });
+                let problems = config_validate_problems(&config);
+                if problems.is_empty() {
+                    Ok(config)
+                } else {
+                    Err(anyhow::anyhow!("{}", problems.join("; ")))
+                }
+            });
             match loaded {
                 Ok(config) => {
                     if json {
@@ -535,17 +535,25 @@ credential_method = "ssh"
     #[test]
     fn validate_refuses_bad_weights_and_duplicate_repos() {
         assert!(problems("[[repos]]\nurl = \"https://x/a\"\n").is_empty());
-        let sum = problems("[embedding]\nweight_ppr = 0.9\nweight_bm25 = 0.9\nweight_semantic = 0.9\n");
+        let sum =
+            problems("[embedding]\nweight_ppr = 0.9\nweight_bm25 = 0.9\nweight_semantic = 0.9\n");
         assert!(sum.iter().any(|p| p.contains("sum to 1.0")), "{sum:?}");
         let negative =
             problems("[embedding]\nweight_ppr = -0.5\nweight_bm25 = 1.0\nweight_semantic = 0.5\n");
-        assert!(negative.iter().any(|p| p.contains("non-negative")), "{negative:?}");
-        let fine = problems("[embedding]\nweight_ppr = 0.1\nweight_bm25 = 0.2\nweight_semantic = 0.7\n");
+        assert!(
+            negative.iter().any(|p| p.contains("non-negative")),
+            "{negative:?}"
+        );
+        let fine =
+            problems("[embedding]\nweight_ppr = 0.1\nweight_bm25 = 0.2\nweight_semantic = 0.7\n");
         assert!(fine.is_empty(), "float rounding is tolerated: {fine:?}");
         let dup = problems(
             "[[repos]]\nurl = \"https://x/a\"\nname = \"svc\"\n[[repos]]\nurl = \"https://x/b\"\nname = \"SVC\"\n",
         );
-        assert!(dup.iter().any(|p| p.contains("duplicate [[repos]] name")), "{dup:?}");
+        assert!(
+            dup.iter().any(|p| p.contains("duplicate [[repos]] name")),
+            "{dup:?}"
+        );
     }
 
     /// QA: `config validate /dev/zero` read without bound.

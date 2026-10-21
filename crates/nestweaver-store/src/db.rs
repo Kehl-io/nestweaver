@@ -10732,6 +10732,9 @@ mod backing_file_tests {
 
     #[test]
     fn an_in_memory_store_always_passes() {
-        GraphStore::in_memory().unwrap().verify_backing_file().unwrap();
+        GraphStore::in_memory()
+            .unwrap()
+            .verify_backing_file()
+            .unwrap();
     }
 }
