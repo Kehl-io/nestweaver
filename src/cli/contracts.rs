@@ -236,6 +236,12 @@ pub(crate) fn run_contracts(
                 .with_context(|| format!("read base spec {}", base.display()))?;
             let head_src = std::fs::read_to_string(&head)
                 .with_context(|| format!("read head spec {}", head.display()))?;
+            // QA #9: a pathologically nested document made this call
+            // quadratic in depth; refuse it before parsing, by name.
+            for (path, source) in [(&base, &base_src), (&head, &head_src)] {
+                nestweaver_engine::contracts::check_spec_nesting(source)
+                    .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
+            }
             let changes = nestweaver_engine::contracts::diff_openapi(
                 &base.to_string_lossy(),
                 &base_src,

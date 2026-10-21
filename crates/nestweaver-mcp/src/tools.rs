@@ -4910,7 +4910,54 @@ fn response_cache_key(
     // this is the narrower guarantee that a manifest change nothing bumped
     // for — an external edit, a restore, a half-written file — still cannot
     // be served past.
-    mix_visibility_cache_key(key, manifest_sidecar_cache_salt(db_path))
+    let key = mix_visibility_cache_key(key, manifest_sidecar_cache_salt(db_path));
+    // QA #1: `blast_radius` (and hubs/bridges/get_summary/affected_tests)
+    // read DERIVED sidecars — clusters, summaries, co-change and git
+    // activity — that are written by their own commands without bumping the
+    // graph generation. Without this salt a `blast_radius` computed before
+    // `clusters` ran was served after it: (0 clusters, medium) and
+    // (10 clusters, high) for the same query, depending on cache age.
+    mix_visibility_cache_key(key, derived_sidecar_cache_salt(db_path))
+}
+
+/// Sidecars written outside indexing whose content changes tool answers.
+const DERIVED_CACHE_SIDECARS: &[&str] = &[
+    ".clusters.json",
+    ".summaries.json",
+    ".cochange.json",
+    ".gitactivity.json",
+];
+
+/// Salt over the IDENTITY of each derived sidecar: absent, or present with a
+/// given length, modification time and (on Unix) inode. Metadata rather than
+/// bytes because a clusters sidecar lists every symbol and this runs on every
+/// cacheable call; every writer replaces the file atomically (new inode) or
+/// rewrites it (new mtime/length), so each write moves the salt. All absent
+/// contributes 0, the value the key had before this salt existed.
+fn derived_sidecar_cache_salt(db_path: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut any = false;
+    for suffix in DERIVED_CACHE_SIDECARS {
+        let path = nestweaver_engine::sidecar_path(db_path, suffix);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        any = true;
+        suffix.hash(&mut hasher);
+        meta.len().hash(&mut hasher);
+        if let Ok(modified) = meta.modified()
+            && let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH)
+        {
+            since.as_nanos().hash(&mut hasher);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            meta.ino().hash(&mut hasher);
+        }
+    }
+    if any { hasher.finish() } else { 0 }
 }
 
 /// Salt folded into every cacheable tool's key so a response cannot outlive
@@ -6143,7 +6190,7 @@ fn tool_regex_search(
 fn tool_schema_regex_search() -> Value {
     json!({
         "name": "regex_search",
-        "description": "Run a Rust regex against indexed text (section bodies and their heading lines, note titles, frontmatter, symbol signatures) with database-bound, per-scope acceleration and final Rust-regex verification. ^ and $ are line anchors; (?-m) anchors the whole candidate.\n\nGuidelines:\n- Use for exact pattern matching; for fuzzy/semantic lookup use brain_search instead\n- Output names ready/dirty/error scopes, posting hits, hydrated and verified candidate counts, exact truncation reason, and planning/hydration/verification timings\n- scanned_fallback means one or more scopes were safely scanned; stale_index means an existing shard was unavailable or stale, never that matches were dropped\n\nLimitations:\n- MCP candidate cap of 2000 or time budget (default 2000ms) may truncate results; truncation_reason distinguishes the bound\n- Does not search binary files or unindexed content",
+        "description": "Run a Rust regex against indexed text (section bodies and their heading lines, note titles, frontmatter, symbol signatures) with database-bound, per-scope acceleration and final Rust-regex verification. ^ and $ are line anchors; (?-m) anchors the whole candidate.\n\nGuidelines:\n- Use for exact pattern matching; for fuzzy/semantic lookup use brain_search instead\n- Output names ready/dirty/error scopes, posting hits, hydrated and verified candidate counts, exact truncation reason, and planning/hydration/verification timings\n- scanned_fallback means one or more scopes were safely scanned; stale_index means an existing shard was unavailable or stale, never that matches were dropped\n\nLimitations:\n- MCP candidate cap of 2000 (counted over nodes that match; scanned nodes that do not match never consume it) or time budget (default 2000ms) may truncate results; truncation_reason distinguishes the bound. With no trigram index every scope is scanned and the note says so\n- Does not search binary files or unindexed content",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -6513,8 +6560,21 @@ fn tool_brain_memory_consolidate(store: &GraphStore, args: Value) -> Result<Valu
     )?;
     // The limit is applied BEFORE apply: it used to apply every proposal and
     // then trim the list, so `limit: 1` moved notes the response never named.
-    let consolidation = memory_consolidate_limited(store, apply, now_epoch_secs(), Some(limit))?;
+    let mut consolidation =
+        memory_consolidate_limited(store, apply, now_epoch_secs(), Some(limit))?;
     let total = consolidation.proposals_discovered;
+    let already_applied = consolidation.proposals_already_applied;
+    // QA #6: the remediation names the tool an MCP agent can call, not the
+    // CLI. `brain_add_source` on an indexed vault re-indexes it through the
+    // daemon with its full bookkeeping (search, code links, publication).
+    for warning in &mut consolidation.warnings {
+        if warning.contains("nestweaver brain refresh <vault-path>") {
+            *warning = warning.replace(
+                "nestweaver brain refresh <vault-path>",
+                "call brain_add_source with each path in refresh_vault_paths",
+            );
+        }
+    }
     let mut manifest = serde_json::to_value(consolidation)?;
     if let Some(obj) = manifest.as_object_mut() {
         let returned = obj
@@ -6526,7 +6586,13 @@ fn tool_brain_memory_consolidate(store: &GraphStore, args: Value) -> Result<Valu
         // Discovered but past the limit: neither returned nor applied.
         obj.insert(
             "proposals_deferred".to_string(),
-            json!(total.saturating_sub(limit)),
+            json!(total.saturating_sub(already_applied).saturating_sub(limit)),
+        );
+        // Discovered, but an earlier apply already performed them; the graph
+        // has not been re-indexed since (see refresh_vault_paths).
+        obj.insert(
+            "proposals_already_applied".to_string(),
+            json!(already_applied),
         );
     }
     Ok(manifest)
@@ -6535,7 +6601,7 @@ fn tool_brain_memory_consolidate(store: &GraphStore, args: Value) -> Result<Valu
 fn tool_schema_brain_memory_consolidate() -> Value {
     json!({
         "name": "brain_memory_consolidate",
-        "description": "Propose promotions of vault notes up memory tiers (daily logs to ideas to project files). DRY-RUN by default.\n\nGuidelines:\n- Set apply:true to execute moves; default is safe dry-run\n- Promotes daily logs referenced by 3+ idea notes (>14 days old) and ideas referenced by both sync.md and status.md\n- Returns proposals with source paths, destinations, and evidence\n\nLimitations:\n- Only proposes promotions along the predefined tier path\n- Requires specific vault structure (_logs/, _ideas/) to detect candidates",
+        "description": "Propose promotions of vault notes up memory tiers (daily logs to ideas to project files). DRY-RUN by default.\n\nGuidelines:\n- Set apply:true to execute moves; default is safe dry-run\n- Promotes daily logs referenced by 3+ idea notes (>14 days old) and ideas referenced by both sync.md and status.md\n- Returns proposals with source paths, destinations, and evidence\n- After an apply the graph still names the moved notes until the vault is re-indexed: call brain_add_source with each path in refresh_vault_paths. Proposals an earlier apply already performed are counted in proposals_already_applied, not re-proposed\n\nLimitations:\n- Only proposes promotions along the predefined tier path\n- Requires specific vault structure (_logs/, _ideas/) to detect candidates",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -7527,7 +7593,7 @@ fn tool_schema_brain_context() -> Value {
                     "type": "string",
                     "enum": ["concise", "detailed"],
                     "default": "detailed",
-                    "description": "\"concise\" returns names and relationships only; \"detailed\" (default) adds file paths, relevance scores, and UIDs."
+                    "description": "\"concise\" returns uid, kind, title and location per node; \"detailed\" (default) adds relevance scores and inline bodies."
                 },
                 "repos": {
                     "type": "array",
@@ -7904,11 +7970,21 @@ fn tool_brain_context(
     // Feature F7 (PRF half): opt in to pseudo-relevance-feedback query
     // expansion on the BM25 leg via `prf: true`. Off by default.
     let prf = args.get("prf").and_then(|v| v.as_bool()).unwrap_or(false);
+    // nw-405: resolve the repo scope to CONCRETE UIDs before anything runs,
+    // so an unresolvable entry is one error for the call. QA #2: the scope
+    // also narrows seed resolution itself, before the per-seed cap — a
+    // post-hoc filter let out-of-scope matches fill the cap and then
+    // removed them, answering `total: 0` for a repo that defines the name.
+    let repo_scope = match filter_repos {
+        Some(ref selectors) => Some(resolve_repo_filter(store, selectors, visible)?),
+        None => None,
+    };
     let config = HybridSearchConfig {
         weight_ppr,
         weight_bm25,
         weight_semantic,
         prf,
+        seed_scope_repo_uids: repo_scope.clone(),
         ..defaults
     };
 
@@ -7948,11 +8024,8 @@ fn tool_brain_context(
     // nw-405: resolve the scope arguments to CONCRETE container UIDs before
     // filtering anything. Resolution happens here, outside the per-list
     // closure, so an unresolvable entry is one ERROR for the call rather than
-    // a predicate that silently matches nothing on both lists.
-    let repo_scope = match filter_repos {
-        Some(ref selectors) => Some(resolve_repo_filter(store, selectors, visible)?),
-        None => None,
-    };
+    // a predicate that silently matches nothing on both lists. (`repo_scope`
+    // was resolved above, before seed resolution.)
     let vault_scope = match filter_vaults {
         Some(ref selectors) => Some(resolve_vault_filter(store, selectors)?),
         None => None,
@@ -8195,9 +8268,14 @@ fn tool_brain_context(
         .take(cut)
         .map(|n| {
             if concise {
+                // QA #4: concise keeps the identity an agent needs for a
+                // follow-up call (uid) and where to look (location); it drops
+                // only scores and bodies, the same contract as brain_search.
                 json!({
+                    "uid": n.uid,
                     "kind": n.kind,
                     "title": n.title,
+                    "location": n.location,
                 })
             } else {
                 let mut obj = json!({
@@ -8286,8 +8364,10 @@ fn tool_brain_context(
             .map(|n| {
                 if concise {
                     json!({
+                        "uid": n.uid,
                         "kind": n.kind,
                         "title": n.title,
+                        "location": n.location,
                     })
                 } else {
                     json!({
@@ -8418,9 +8498,8 @@ fn budgeted_cut(
 /// arrangement in which the estimate and the renderer cannot disagree.
 pub fn render_cost(n: &nestweaver_engine::BrainNode, concise: bool) -> usize {
     if concise {
-        // Concise renderers emit only {kind, title, location} (brain_context
-        // omits location too, but one conservative model keeps this simple).
-        (n.title.len() + n.kind.len() + n.location.len() + 50).div_ceil(4)
+        // Concise renderers emit {uid, kind, title, location}.
+        (n.uid.len() + n.title.len() + n.kind.len() + n.location.len() + 50).div_ceil(4)
     } else {
         // UID + title + kind + location + relevance (~10 chars) + JSON overhead
         (n.uid.len() + n.title.len() + n.kind.len() + n.location.len() + 10 + 80).div_ceil(4)
@@ -12288,8 +12367,15 @@ fn match_repo_target<'a>(
         .iter()
         .filter(|r| {
             let r_url = r.url.trim_end_matches('/');
+            // QA #7: the DISPLAY name, derived from the URL when no name is
+            // stored — the name every other tool prints and accepts. The
+            // stored `name` is usually None, so comparing only it refused the
+            // names agents were shown. Still exact (no substring leg), and a
+            // derived name shared with a vault or another repo is refused as
+            // ambiguous by `resolve_remove_target`.
             r.uid == target
-                || r.name.as_deref() == Some(target_trimmed)
+                || (!target_trimmed.is_empty()
+                    && nestweaver_engine::repo_display_name(r) == target_trimmed)
                 || r_url == target_trimmed
                 || r_url == url_target.trim_end_matches('/')
                 || r_url == canonical_target.trim_end_matches('/')
@@ -12365,7 +12451,7 @@ fn resolve_remove_target<'a>(
                 .map(|candidate| match candidate {
                     RemoveTarget::Repo(repo) => format!(
                         "repo '{}' (uid {})",
-                        repo.name.as_deref().unwrap_or(&repo.url),
+                        nestweaver_engine::repo_display_name(repo),
                         repo.uid
                     ),
                     RemoveTarget::Vault(vault) => {
@@ -13147,7 +13233,7 @@ fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_brain_impact() -> Value {
     json!({
         "name": "brain_impact",
-        "description": "Trace reverse dependencies of a symbol to understand what might break if it changes. Returns confidence-weighted impact scores (0.0-1.0) decaying through the call graph.\n\nGuidelines:\n- Use BEFORE modifying a function, class, or interface\n- Results sorted by impact_score (highest risk first); type-aware resolution follows class hierarchies\n- Use response_format 'concise' for names only, 'detailed' for full metadata\n- `symbol` may be `path::name`, `Class::method` or `path::Class::method`: the first qualifier narrows by file (exact repo-relative path, `/`-boundary suffix, or that suffix without its extension) and the rest by container, or every qualifier narrows by container; both readings are kept. One matching neither is not_found with `path::name` suggestions. `path::<module>` names a file's top-level code\n- A caller labelled `path::<module>` is that file's top-level code (the module owner)\n- Dependents are returned once, as `impact_nodes` (the CLI's JSON also mirrors them as `nodes`). Rows cut to fit the MCP output budget are counted in `output_budget.cuts`; `truncated_by_limit` is set only when `limit` cut them, so raise `limit` only then\n\nLimitations:\n- A bare `symbol` name resolves by EXACT match only, never substring/fuzzy -- a name `brain_search` finds hits for can still be not_found here; the not_found response (`isError: true`, like every lookup tool's miss) carries a bounded `did_you_mean` list (substring matches, then names a small typo away; that file's members for `path::name`) when any exist\n- For forward call chains use flow_trace; for file-level impact use detect_changes or blast_radius\n- For cross-repo impact use cross_repo_contracts\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
+        "description": "Trace reverse dependencies of a symbol to understand what might break if it changes. Returns confidence-weighted impact scores (0.0-1.0) decaying through the call graph.\n\nGuidelines:\n- Use BEFORE modifying a function, class, or interface\n- Results sorted by impact_score (highest risk first); type-aware resolution follows class hierarchies\n- Use response_format 'concise' for uid/name/location rows, 'detailed' for full metadata\n- `symbol` may be `path::name`, `Class::method` or `path::Class::method`: the first qualifier narrows by file (exact repo-relative path, `/`-boundary suffix, or that suffix without its extension) and the rest by container, or every qualifier narrows by container; both readings are kept. One matching neither is not_found with `path::name` suggestions. `path::<module>` names a file's top-level code\n- A caller labelled `path::<module>` is that file's top-level code (the module owner)\n- Dependents are returned once, as `impact_nodes` (the CLI's JSON also mirrors them as `nodes`). Rows cut to fit the MCP output budget are counted in `output_budget.cuts`; `truncated_by_limit` is set only when `limit` cut them, so raise `limit` only then\n\nLimitations:\n- A bare `symbol` name resolves by EXACT match only, never substring/fuzzy -- a name `brain_search` finds hits for can still be not_found here; the not_found response (`isError: true`, like every lookup tool's miss) carries a bounded `did_you_mean` list (substring matches, then names a small typo away; that file's members for `path::name`) when any exist\n- For forward call chains use flow_trace; for file-level impact use detect_changes or blast_radius\n- For cross-repo impact use cross_repo_contracts\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -13167,7 +13253,7 @@ fn tool_schema_brain_impact() -> Value {
                     "type": "string",
                     "enum": ["concise", "detailed"],
                     "default": "detailed",
-                    "description": "\"concise\" returns affected symbol names only; \"detailed\" (default) adds file paths, edge types, confidence scores, and depth levels."
+                    "description": "\"concise\" returns uid, name, file_path, start_line, depth and impact_score per affected symbol; \"detailed\" (default) adds edge types and confidence scores."
                 },
                 "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
                 "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
@@ -13323,16 +13409,25 @@ fn tool_brain_impact(
     let limited = nodes.len().min(limit);
     let rows = bounded_mapped_rows(&nodes[..limited], 16_000, |n, bytes| {
         if concise {
+            // QA #4: two overloads or same-named methods rendered as
+            // identical `{"name":"sign"}` rows; uid + file:line keep concise
+            // rows distinguishable and followable.
             #[derive(serde::Serialize)]
             struct Row<'a> {
+                uid: &'a str,
                 name: std::borrow::Cow<'a, str>,
+                file_path: &'a str,
+                start_line: u32,
                 depth: u32,
                 impact_score: f64,
             }
             bounded_metadata(
                 &Row {
+                    uid: &n.uid,
                     // nw-113: an owner reads `path::<module>`, never bare.
                     name: nestweaver_schema::symbol_display_name(&n.name, &n.file_path),
+                    file_path: &n.file_path,
+                    start_line: n.start_line,
                     depth: n.depth,
                     impact_score: n.impact_score,
                 },
@@ -13549,7 +13644,7 @@ fn tool_schema_flow_trace() -> Value {
                     "type": "string",
                     "enum": ["concise", "detailed"],
                     "default": "detailed",
-                    "description": "\"concise\" returns function name chain only; \"detailed\" (default) adds file paths, UIDs, and depth at each node."
+                    "description": "\"concise\" returns uid, name and file_path per node; \"detailed\" (default) adds repo, depth and boundary metadata at each node."
                 }
             },
             "required": ["symbol"],
@@ -14076,7 +14171,12 @@ fn build_flow_tree(
                 // is exponential on a recursive graph, which is why a canonical
                 // expansion exists at all.
                 let mut stub = if opts.concise {
-                    json!({ "name": callee.name, "deduped_ref": callee.uid, "children": [] })
+                    json!({
+                        "uid": callee.uid,
+                        "name": callee.name,
+                        "deduped_ref": callee.uid,
+                        "children": [],
+                    })
                 } else {
                     json!({
                         "uid": callee.uid,
@@ -14150,8 +14250,12 @@ fn build_flow_tree(
         // The label ships in concise mode too: a caller scanning a compact tree
         // is exactly the one who cannot afford to mistake a cross-repo guess for
         // a call.
+        // QA #4: the uid rides along so a concise node can be traced,
+        // read or impacted next without a second name lookup.
         let mut node = json!({
+            "uid": uid,
             "name": name,
+            "file_path": file_path,
             "children": children,
         });
         attach_markers(&mut node);
@@ -18837,7 +18941,7 @@ fn tool_schema_project_context() -> Value {
                     "type": "string",
                     "enum": ["concise", "detailed"],
                     "default": "concise",
-                    "description": "'concise' (default) returns kind/title/location per node at a ~1000-token budget — right for orienting at session start, then narrow with brain_context. 'detailed' adds uid + relevance and uses a ~3000-token budget."
+                    "description": "'concise' (default) returns uid/kind/title/location per node at a ~1000-token budget — right for orienting at session start, then narrow with brain_context. 'detailed' adds relevance and uses a ~3000-token budget."
                 },
                 "repos": {
                     "type": "array",
@@ -19592,13 +19696,15 @@ fn tool_project_context(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
-    // concise drops the machine id (uid) and the relevance score in favor of the semantic
-    // fields an agent orients with (kind/title/location); detailed keeps the full record.
+    // concise drops the relevance score but keeps the uid (QA #4: without it
+    // a concise row cannot be followed up by any other tool); detailed keeps
+    // the full record.
     let render_node = |n: &nestweaver_engine::BrainNode| -> Value {
         #[cfg(test)]
         project_render_observer::rendered();
         let mut row = if concise {
             json!({
+                "uid": n.uid,
                 "kind": n.kind,
                 "title": n.title,
                 "location": n.location,
@@ -20240,7 +20346,7 @@ fn tool_schema_hub_nodes() -> Value {
                     "type": "string",
                     "enum": ["concise", "detailed"],
                     "default": "detailed",
-                    "description": "\"concise\" returns name + total degree only; \"detailed\" (default) adds UIDs, file paths, PageRank scores, and cluster IDs."
+                    "description": "\"concise\" returns uid, name, file_path and total degree; \"detailed\" (default) adds in/out degree, PageRank scores, and cluster IDs."
                 },
                 "repos": {
                     "type": "array",
@@ -20317,7 +20423,9 @@ fn tool_hub_nodes(
         .map(|h| {
             if concise {
                 json!({
+                    "uid": h.uid,
                     "name": h.name,
+                    "file_path": h.file_path,
                     "total_degree": h.total_degree,
                 })
             } else {
@@ -20394,7 +20502,7 @@ fn tool_schema_bridge_nodes() -> Value {
                     "type": "string",
                     "enum": ["concise", "detailed"],
                     "default": "detailed",
-                    "description": "\"concise\" returns name + betweenness score only; \"detailed\" (default) adds UIDs, file paths, and connected community IDs."
+                    "description": "\"concise\" returns uid, name, file_path and betweenness score; \"detailed\" (default) adds connected community IDs."
                 },
                 "repos": {
                     "type": "array",
@@ -20471,7 +20579,9 @@ fn tool_bridge_nodes(
         .map(|b| {
             if concise {
                 json!({
+                    "uid": b.uid,
                     "name": b.name,
+                    "file_path": b.file_path,
                     "betweenness_score": b.betweenness_score,
                 })
             } else {
@@ -20575,6 +20685,24 @@ fn tool_schema_blast_radius() -> Value {
     })
 }
 
+/// QA #1: the engine's "clusters not computed" note names the CLI command.
+/// An MCP agent cannot run that; it can call the `clusters` tool, which
+/// computes and persists the same sidecar. Rewrite the remediation for the
+/// MCP delivery profile only, keeping the descriptor stable.
+fn mcp_cluster_remediation(
+    notifications: &mut [nestweaver_engine::blast_radius::Notification],
+) {
+    for notification in notifications
+        .iter_mut()
+        .filter(|n| n.descriptor == "clusters-not-computed")
+    {
+        notification.message = "no cluster data for this graph — cluster-based risk is not \
+                                 included; call the `clusters` tool (no `repos` filter) to \
+                                 compute it, then re-run blast_radius"
+            .to_string();
+    }
+}
+
 fn tool_blast_radius(
     store: &GraphStore,
     args: Value,
@@ -20656,6 +20784,9 @@ fn tool_blast_radius(
     let db_path = current_db_path(store).ok();
     let mut result = analyze_blast_radius(store, &files, &options, cancel, db_path.as_deref())
         .context("analyze_blast_radius")?;
+    if bounded_delivery() {
+        mcp_cluster_remediation(&mut result.notifications);
+    }
 
     // R9b: redact the typed result down to the caller's visible repos BEFORE
     // building any output (both the JSON and SARIF paths), so every derived
@@ -26153,6 +26284,57 @@ mod cache_dispatch_tests {
         );
         assert_eq!(CACHE_MISSES.with(|c| c.get()), 1);
         assert_eq!(CACHE_HITS.with(|c| c.get()), 0);
+    }
+
+    /// QA #1: `blast_radius` answered (0 clusters, medium) or (10 clusters,
+    /// high) for the same query depending on whether its cached entry
+    /// predated `clusters`. The clusters sidecar is an input outside the
+    /// graph generation and file digest, so writing it must miss the cache.
+    #[test]
+    fn writing_the_clusters_sidecar_invalidates_cached_blast_radius() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        let args = json!({ "changed_files": ["main.js"] });
+        let has_missing_cluster_note = |value: &Value| {
+            value["notifications"]
+                .as_array()
+                .is_some_and(|all| all.iter().any(|n| n["descriptor"] == "clusters-not-computed"))
+        };
+
+        let before = dispatch(&store, None, "blast_radius", args.clone(), None).unwrap();
+        assert!(has_missing_cluster_note(&before), "{before}");
+        let key_before = response_cache_key("blast_radius", &args, &db_path, None, None);
+
+        let clustering = nestweaver_engine::compute_clusters(&store, 0.5).unwrap();
+        nestweaver_engine::save_clusters(&db_path, &clustering, store.graph_generation()).unwrap();
+        assert_ne!(
+            key_before,
+            response_cache_key("blast_radius", &args, &db_path, None, None),
+            "the clusters sidecar must be part of the cache key"
+        );
+
+        let after = dispatch(&store, None, "blast_radius", args, None).unwrap();
+        assert!(
+            !has_missing_cluster_note(&after),
+            "a cached pre-clusters answer was served after clusters ran: {after}"
+        );
+        assert_eq!(CACHE_HITS.with(|c| c.get()), 0);
+    }
+
+    /// The missing-clusters remediation names the MCP tool on the MCP
+    /// profile, not a CLI command an agent cannot run.
+    #[test]
+    fn missing_cluster_remediation_names_the_mcp_tool() {
+        let mut notes = vec![nestweaver_engine::blast_radius::Notification {
+            level: nestweaver_engine::blast_radius::NotificationLevel::Note,
+            message: "run `nestweaver clusters`".to_string(),
+            descriptor: "clusters-not-computed".to_string(),
+        }];
+        mcp_cluster_remediation(&mut notes);
+        assert!(notes[0].message.contains("`clusters` tool"), "{}", notes[0].message);
+        assert!(!notes[0].message.contains("nestweaver clusters"));
     }
 
     #[test]
@@ -32039,8 +32221,12 @@ mod source_management_tests {
             None,
         )];
         // Only an exact uid / name / url / path selects a repo to delete.
-        assert!(match_repo_target(&repos, "nw-fragment-test").is_empty());
+        // QA #7: the bare name IS the repo's display name (derived from its
+        // URL, as every other tool derives it), so it now selects the repo;
+        // a path fragment still does not.
+        assert_eq!(match_repo_target(&repos, "nw-fragment-test").len(), 1);
         assert!(match_repo_target(&repos, "org/nw-fragment-test").is_empty());
+        assert!(match_repo_target(&repos, "fragment-test").is_empty());
         assert_eq!(
             match_repo_target(&repos, "https://github.com/org/nw-fragment-test").len(),
             1
@@ -32078,6 +32264,28 @@ mod source_management_tests {
             Ok(RemoveTarget::Repo(r)) if r.uid == "repo:py:ts"
         ));
         assert!(resolve_remove_target(&repos, &vaults, "py").is_err());
+    }
+
+    /// QA #7: a repo with no stored name is removable by the display name
+    /// other tools derive from its URL, and that derived name colliding with
+    /// a vault name still refuses (#513).
+    #[test]
+    fn remove_target_accepts_the_derived_repo_name_and_keeps_cross_kind_refusal() {
+        let repos = vec![repo("repo:u:u", "https://github.com/google/uuid", None, None)];
+        assert!(matches!(
+            resolve_remove_target(&repos, &[], "uuid"),
+            Ok(RemoveTarget::Repo(r)) if r.uid == "repo:u:u"
+        ));
+        let vaults = vec![nestweaver_schema::Vault {
+            uid: "vault:u:u".into(),
+            name: "uuid".into(),
+            root_path: "/nw/x/uuid-vault".into(),
+            instance_id: "test".into(),
+        }];
+        let error = resolve_remove_target(&repos, &vaults, "uuid")
+            .expect_err("a derived repo name equal to a vault name is ambiguous");
+        let text = error.to_string();
+        assert!(text.contains("repo:u:u") && text.contains("vault:u:u"), "{text}");
     }
 
     #[cfg(feature = "daemon")]

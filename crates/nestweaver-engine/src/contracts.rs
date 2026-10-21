@@ -304,11 +304,84 @@ fn openapi_contracts_from_value(doc: &serde_json::Value) -> Result<Vec<SpecContr
 
 /// Parse an OpenAPI document from YAML or JSON into generic JSON.
 fn openapi_document(source: &str, json: bool) -> Result<serde_json::Value, String> {
+    check_spec_nesting(source)?;
     if json {
         serde_json::from_str(source).map_err(|error| error.to_string())
     } else {
         serde_yaml_ng::from_str(source).map_err(|error| error.to_string())
     }
+}
+
+/// Deepest structure an OpenAPI document may have before it is refused
+/// unparsed. Real specs nest a few dozen levels; QA #9 measured a 200 KB
+/// document nested 100k deep taking 381 s to index and `contracts diff`
+/// growing quadratically with depth.
+pub const MAX_SPEC_NESTING: usize = 256;
+
+/// Fail fast on a YAML/JSON document nested deeper than
+/// [`MAX_SPEC_NESTING`], in one linear pass and before any parser runs.
+///
+/// Depth is estimated as the larger of the flow-bracket depth (`{`/`[`
+/// outside quoted strings) and the block depth (the stack of increasing
+/// indentation levels, plus a run of leading `- ` sequence markers). Taking
+/// the larger rather than the sum lets a pretty-printed JSON document, which
+/// is indented AND bracketed, count once; an adversarial mix of both is
+/// still bounded by twice the limit.
+pub fn check_spec_nesting(source: &str) -> Result<(), String> {
+    let mut bracket_depth = 0usize;
+    let mut max_brackets = 0usize;
+    let mut indents: Vec<usize> = Vec::new();
+    let mut max_block = 0usize;
+    for line in source.lines() {
+        let trimmed = line.trim_start_matches(' ');
+        if !(trimmed.is_empty() || trimmed.starts_with('#')) {
+            let indent = line.len() - trimmed.len();
+            while indents.last().is_some_and(|&top| top >= indent) {
+                indents.pop();
+            }
+            indents.push(indent);
+            let mut dashes = 0usize;
+            let mut rest = trimmed;
+            while let Some(after) = rest.strip_prefix("- ") {
+                dashes += 1;
+                rest = after.trim_start_matches(' ');
+            }
+            max_block = max_block.max(indents.len() + dashes);
+        }
+        let mut quote: Option<char> = None;
+        let mut escaped = false;
+        for ch in line.chars() {
+            match quote {
+                Some(q) => {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' && q == '"' {
+                        escaped = true;
+                    } else if ch == q {
+                        quote = None;
+                    }
+                }
+                None => match ch {
+                    '"' | '\'' => quote = Some(ch),
+                    '{' | '[' => {
+                        bracket_depth += 1;
+                        max_brackets = max_brackets.max(bracket_depth);
+                    }
+                    '}' | ']' => bracket_depth = bracket_depth.saturating_sub(1),
+                    '#' => break,
+                    _ => {}
+                },
+            }
+        }
+        let depth = max_brackets.max(max_block);
+        if depth > MAX_SPEC_NESTING {
+            return Err(format!(
+                "document nesting exceeds {MAX_SPEC_NESTING} levels; refusing to parse it \
+                 (a real OpenAPI spec is far shallower)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Convert a protobuf RPC name to the Rust method identifier tonic generates.
@@ -912,7 +985,7 @@ fn parse_node_route_in(
     lines: &[&str],
     idx: usize,
     extra_receivers: &[String],
-) -> Option<(String, String, String)> {
+) -> Option<(String, String, String, Option<String>)> {
     let line = *lines.get(idx)?;
     let receivers = NODE_ROUTE_RECEIVERS
         .iter()
@@ -948,10 +1021,81 @@ fn parse_node_route_in(
                 verb.to_uppercase(),
                 normalize_http_path(&path),
                 receiver.clone(),
+                node_route_handler_name(&window),
             ));
         }
     }
     None
+}
+
+/// The handler a Node route registration names, when it names one:
+/// `app.get("/orders/:id", getOrderHandler)` -> `getOrderHandler`, and
+/// `router.post("/x", auth, controller.create)` -> `create` (the LAST
+/// argument; earlier ones are middleware). `None` for an inline function or
+/// any other expression, and for a call whose argument list does not close
+/// inside the scanned window.
+///
+/// `call` starts at the registration's opening parenthesis.
+fn node_route_handler_name(call: &str) -> Option<String> {
+    let mut chars = call.chars();
+    if chars.next() != Some('(') {
+        return None;
+    }
+    let mut args: Vec<String> = vec![String::new()];
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut closed = false;
+    for ch in chars {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                quote = None;
+            }
+            args.last_mut()?.push(ch);
+            continue;
+        }
+        match ch {
+            '"' | '\'' | '`' => quote = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' if depth == 0 => {
+                closed = true;
+                break;
+            }
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                args.push(String::new());
+                continue;
+            }
+            _ => {}
+        }
+        args.last_mut()?.push(ch);
+    }
+    if !closed {
+        return None;
+    }
+    // A trailing comma leaves an empty last argument.
+    while args.last().is_some_and(|arg| arg.trim().is_empty()) {
+        args.pop();
+    }
+    if args.len() < 2 {
+        return None;
+    }
+    let handler = args.last()?.trim();
+    let is_ident = |segment: &str| {
+        let mut segment_chars = segment.chars();
+        segment_chars
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
+            && segment_chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+    };
+    if !handler.split('.').all(is_ident) {
+        return None;
+    }
+    handler.rsplit('.').next().map(str::to_string)
 }
 
 /// The Node framework whose route registrations appear in `source`, if any.
@@ -1031,7 +1175,7 @@ fn detect_node_route_handlers(source: &str, symbols: &[HandlerSymbol]) -> Vec<Ha
     let prefixes = node_mount_prefixes(source);
     for offset in 0..lines.len() {
         let line_no = (offset + 1) as u32;
-        let Some((verb, sub_path, receiver)) =
+        let Some((verb, sub_path, receiver, handler_name)) =
             parse_node_route_in(&lines, offset, &extra_receivers)
         else {
             continue;
@@ -1043,19 +1187,39 @@ fn detect_node_route_handlers(source: &str, symbols: &[HandlerSymbol]) -> Vec<Ha
             Some(base) => join_paths_dedup(base, &sub_path),
             None => sub_path,
         };
-        let owner = symbols
-            .iter()
-            .enumerate()
-            // nw-113: the whole-file `<module>` owner is never a route's
-            // implementer. `HandlerSymbol` carries no entry kind, so this is
-            // the kind-and-name half of `nestweaver_schema::is_module_owner`.
-            .filter(|(_, symbol)| {
-                symbol.start_line <= line_no
-                    && !(symbol.kind == nestweaver_schema::SymbolKind::Module
-                        && symbol.name == nestweaver_schema::MODULE_OWNER_NAME)
-            })
-            .max_by_key(|(_, symbol)| symbol.start_line)
-            .map(|(index, _)| index);
+        let is_module_owner = |symbol: &HandlerSymbol| {
+            symbol.kind == nestweaver_schema::SymbolKind::Module
+                && symbol.name == nestweaver_schema::MODULE_OWNER_NAME
+        };
+        // QA #10: a registration that NAMES its handler
+        // (`app.get("/orders/:id", getOrderHandler)`) is implemented by that
+        // symbol. The nearest-declaration-above heuristic attributed it to
+        // whatever function happened to precede the line, so the named
+        // handler never linked. A unique same-file symbol of that name wins;
+        // otherwise the enclosing heuristic stands.
+        let named = handler_name.as_deref().and_then(|name| {
+            let mut found = symbols
+                .iter()
+                .enumerate()
+                .filter(|(_, symbol)| symbol.name == name && !is_module_owner(symbol));
+            let first = found.next();
+            if found.next().is_some() {
+                return None;
+            }
+            first.map(|(index, _)| index)
+        });
+        let owner = named.or_else(|| {
+            symbols
+                .iter()
+                .enumerate()
+                // nw-113: the whole-file `<module>` owner is never a route's
+                // implementer. `HandlerSymbol` carries no entry kind, so this
+                // is the kind-and-name half of
+                // `nestweaver_schema::is_module_owner`.
+                .filter(|(_, symbol)| symbol.start_line <= line_no && !is_module_owner(symbol))
+                .max_by_key(|(_, symbol)| symbol.start_line)
+                .map(|(index, _)| index)
+        });
         let Some(symbol_index) = owner else {
             continue;
         };
@@ -1648,6 +1812,93 @@ struct OpShape {
     req_required: std::collections::BTreeSet<String>,
     /// success-response field name → type string
     resp_fields: std::collections::BTreeMap<String, String>,
+    /// QA #8: `(location, name)` → parameter shape. Path-item parameters are
+    /// merged under the operation's own (which override by location+name).
+    params: std::collections::BTreeMap<(String, String), ParamShape>,
+    /// Declared response status codes (`200`, `2XX`, `default`).
+    response_codes: std::collections::BTreeSet<String>,
+}
+
+/// One request parameter's contract: whether it must be sent, and its type.
+#[derive(Clone, PartialEq, Eq)]
+struct ParamShape {
+    required: bool,
+    ty: String,
+}
+
+/// A short type name for a parameter schema (`string`, `integer`, a `$ref`
+/// target name), or `content` for a content-encoded parameter.
+fn schema_type_name(spec: &openapiv3::OpenAPI, sref: &openapiv3::ReferenceOr<openapiv3::Schema>) -> String {
+    if let openapiv3::ReferenceOr::Reference { reference } = sref {
+        return reference.rsplit('/').next().unwrap_or(reference).to_string();
+    }
+    let Some(schema) = resolve_schema(spec, sref, REF_DEPTH_CAP) else {
+        return "any".to_string();
+    };
+    match &schema.schema_kind {
+        openapiv3::SchemaKind::Type(t) => match t {
+            openapiv3::Type::String(_) => "string",
+            openapiv3::Type::Number(_) => "number",
+            openapiv3::Type::Integer(_) => "integer",
+            openapiv3::Type::Object(_) => "object",
+            openapiv3::Type::Array(_) => "array",
+            openapiv3::Type::Boolean(_) => "boolean",
+        }
+        .to_string(),
+        openapiv3::SchemaKind::OneOf { .. } => "oneOf".to_string(),
+        openapiv3::SchemaKind::AllOf { .. } => "allOf".to_string(),
+        openapiv3::SchemaKind::AnyOf { .. } => "anyOf".to_string(),
+        _ => "any".to_string(),
+    }
+}
+
+/// Resolve a parameter, following `#/components/parameters/*` refs.
+fn resolve_parameter<'a>(
+    spec: &'a openapiv3::OpenAPI,
+    mut pref: &'a openapiv3::ReferenceOr<openapiv3::Parameter>,
+) -> Option<&'a openapiv3::Parameter> {
+    for _ in 0..=REF_DEPTH_CAP {
+        match pref {
+            openapiv3::ReferenceOr::Item(parameter) => return Some(parameter),
+            openapiv3::ReferenceOr::Reference { reference } => {
+                let name = reference.rsplit('/').next()?;
+                pref = spec.components.as_ref()?.parameters.get(name)?;
+            }
+        }
+    }
+    None
+}
+
+/// `(location, name) → shape` for a list of parameters.
+fn param_shapes<'a>(
+    spec: &openapiv3::OpenAPI,
+    params: impl IntoIterator<Item = &'a openapiv3::ReferenceOr<openapiv3::Parameter>>,
+    out: &mut std::collections::BTreeMap<(String, String), ParamShape>,
+) {
+    for pref in params {
+        let Some(parameter) = resolve_parameter(spec, pref) else {
+            continue;
+        };
+        let location = match parameter {
+            openapiv3::Parameter::Query { .. } => "query",
+            openapiv3::Parameter::Header { .. } => "header",
+            openapiv3::Parameter::Path { .. } => "path",
+            openapiv3::Parameter::Cookie { .. } => "cookie",
+        };
+        let data = parameter.parameter_data_ref();
+        let ty = match &data.format {
+            openapiv3::ParameterSchemaOrContent::Schema(schema) => schema_type_name(spec, schema),
+            openapiv3::ParameterSchemaOrContent::Content(_) => "content".to_string(),
+        };
+        out.insert(
+            (location.to_string(), data.name.clone()),
+            ParamShape {
+                // A path parameter is always required, whatever the spec says.
+                required: data.required || location == "path",
+                ty,
+            },
+        );
+    }
 }
 
 const REF_DEPTH_CAP: usize = 8;
@@ -1775,6 +2026,15 @@ fn spec_shapes(spec: &openapiv3::OpenAPI) -> SpecShapes {
         for (verb, op) in ops {
             let Some(op) = op else { continue };
             let mut shape = OpShape::default();
+            param_shapes(spec, &pi.parameters, &mut shape.params);
+            param_shapes(spec, &op.parameters, &mut shape.params);
+            shape.response_codes = op
+                .responses
+                .responses
+                .keys()
+                .map(ToString::to_string)
+                .chain(op.responses.default.as_ref().map(|_| "default".to_string()))
+                .collect();
             // Request body.
             if let Some(openapiv3::ReferenceOr::Item(rb)) = &op.request_body
                 && let Some((f, r)) = json_shape(spec, &rb.content)
@@ -1801,6 +2061,9 @@ fn spec_shapes(spec: &openapiv3::OpenAPI) -> SpecShapes {
 }
 
 fn parse_openapi(path: &str, source: &str) -> Option<openapiv3::OpenAPI> {
+    if check_spec_nesting(source).is_err() {
+        return None;
+    }
     match spec_kind(path) {
         Some(SpecFileKind::OpenApiYaml) => serde_yaml_ng::from_str(source).ok(),
         Some(SpecFileKind::OpenApiJson) => serde_json::from_str(source).ok(),
@@ -1822,6 +2085,137 @@ fn parse_openapi_by_content(source: &str) -> Option<openapiv3::OpenAPI> {
         return None;
     }
     serde_yaml_ng::from_value(value).ok()
+}
+
+/// QA #8: parameter changes. A caller that sent the old request must still
+/// be served: a newly required parameter, a type change, a parameter that
+/// moved location, and a removed path parameter break it; an added optional
+/// parameter, a relaxed requirement and a removed optional query/header/
+/// cookie parameter do not.
+fn diff_params(
+    base: &std::collections::BTreeMap<(String, String), ParamShape>,
+    head: &std::collections::BTreeMap<(String, String), ParamShape>,
+) -> Vec<(SpecChangeSeverity, String)> {
+    use SpecChangeSeverity::{Breaking, Info};
+    let mut out = Vec::new();
+    // Head keys already reported as the destination of a move or rename.
+    let mut moved_into: std::collections::BTreeSet<(String, String)> = Default::default();
+    // Renaming a path template variable (`{id}` -> `{orderId}`) changes no
+    // request on the wire: the path is normalized, so pair an equal number of
+    // removed and added path parameters as renames rather than reporting a
+    // breaking removal plus a breaking required addition.
+    let removed_path: Vec<_> = base
+        .keys()
+        .filter(|k| k.0 == "path" && !head.contains_key(*k))
+        .collect();
+    let added_path: Vec<_> = head
+        .keys()
+        .filter(|k| k.0 == "path" && !base.contains_key(*k))
+        .collect();
+    let mut renamed_from: std::collections::BTreeSet<(String, String)> = Default::default();
+    if !removed_path.is_empty() && removed_path.len() == added_path.len() {
+        for (old, new) in removed_path.into_iter().zip(added_path) {
+            let (b, h) = (&base[old], &head[new]);
+            out.push((Info, format!("path parameter '{}' renamed to '{}'", old.1, new.1)));
+            if b.ty != h.ty {
+                out.push((
+                    Breaking,
+                    format!(
+                        "path parameter '{}' type changed ({} -> {})",
+                        new.1, b.ty, h.ty
+                    ),
+                ));
+            }
+            renamed_from.insert(old.clone());
+            moved_into.insert(new.clone());
+        }
+    }
+    for (key, b) in base {
+        let (location, name) = key;
+        if renamed_from.contains(key) {
+            continue;
+        }
+        let Some(h) = head.get(key) else {
+            let destination = head
+                .keys()
+                .find(|k| k.1 == *name && k.0 != *location && !base.contains_key(*k));
+            match destination {
+                Some(to) => {
+                    out.push((
+                        Breaking,
+                        format!("parameter '{name}' moved from {location} to {}", to.0),
+                    ));
+                    moved_into.insert(to.clone());
+                }
+                None => out.push((
+                    if b.required || location == "path" {
+                        Breaking
+                    } else {
+                        Info
+                    },
+                    format!("{location} parameter '{name}' removed"),
+                )),
+            }
+            continue;
+        };
+        if h.ty != b.ty {
+            out.push((
+                Breaking,
+                format!(
+                    "{location} parameter '{name}' type changed ({} -> {})",
+                    b.ty, h.ty
+                ),
+            ));
+        }
+        if h.required && !b.required {
+            out.push((
+                Breaking,
+                format!("{location} parameter '{name}' is now required"),
+            ));
+        } else if !h.required && b.required {
+            out.push((Info, format!("{location} parameter '{name}' is now optional")));
+        }
+    }
+    for (key, h) in head {
+        if base.contains_key(key) || moved_into.contains(key) {
+            continue;
+        }
+        let (location, name) = key;
+        if h.required {
+            out.push((
+                Breaking,
+                format!("required {location} parameter '{name}' added"),
+            ));
+        } else {
+            out.push((Info, format!("optional {location} parameter '{name}' added")));
+        }
+    }
+    out
+}
+
+/// QA #8: response status changes. A success code a client was promised and
+/// no longer gets (`200` → `202`) breaks it; a removed error code, or any
+/// added code, is informational.
+fn diff_response_codes(
+    base: &std::collections::BTreeSet<String>,
+    head: &std::collections::BTreeSet<String>,
+) -> Vec<(SpecChangeSeverity, String)> {
+    let is_success = |code: &str| code.starts_with('2');
+    let mut out = Vec::new();
+    for code in base.difference(head) {
+        out.push((
+            if is_success(code) {
+                SpecChangeSeverity::Breaking
+            } else {
+                SpecChangeSeverity::Info
+            },
+            format!("response {code} removed"),
+        ));
+    }
+    for code in head.difference(base) {
+        out.push((SpecChangeSeverity::Info, format!("response {code} added")));
+    }
+    out
 }
 
 /// Compare a base and head OpenAPI spec, classifying each operation/field/type
@@ -1917,6 +2311,12 @@ pub fn diff_openapi(
                     format!("optional request field '{name}' added"),
                 );
             }
+        }
+        for (severity, detail) in diff_params(&b.params, &h.params) {
+            push(&mut changes, severity, detail);
+        }
+        for (severity, detail) in diff_response_codes(&b.response_codes, &h.response_codes) {
+            push(&mut changes, severity, detail);
         }
     }
     // Added endpoints (INFO). Suppress when base expresses the path as a $ref
@@ -2238,6 +2638,92 @@ paths:
         assert!(info.iter().any(|d| d.contains("endpoint added")));
         // A new required field must NOT also be double-reported as "optional added".
         assert!(!info.iter().any(|d| d.contains("'currency'")), "{info:?}");
+    }
+
+    const QA_BASE_SPEC: &str = r#"openapi: 3.0.3
+info: {title: Orders, version: "1.0"}
+paths:
+  /orders/{id}:
+    get:
+      operationId: getOrder
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string}}
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Order'}
+components:
+  schemas:
+    Order:
+      type: object
+      properties:
+        id: {type: string}
+"#;
+
+    fn breaking(changes: &[SpecChange]) -> Vec<String> {
+        changes
+            .iter()
+            .filter(|c| c.severity == SpecChangeSeverity::Breaking)
+            .map(|c| c.detail.clone())
+            .collect()
+    }
+
+    /// QA #8: a new required query parameter, a path parameter type change
+    /// and a success code change all reported "No API changes".
+    #[test]
+    fn diff_openapi_classifies_parameter_and_status_changes() {
+        let diff = |head: &str| diff_openapi("base.yaml", QA_BASE_SPEC, "head.yaml", head).unwrap();
+
+        let required_query = QA_BASE_SPEC.replace(
+            "        - {name: id, in: path, required: true, schema: {type: string}}\n",
+            "        - {name: id, in: path, required: true, schema: {type: string}}\n        - {name: v, in: query, required: true, schema: {type: string}}\n",
+        );
+        assert_eq!(
+            breaking(&diff(&required_query)),
+            ["required query parameter 'v' added"]
+        );
+
+        let optional_query = QA_BASE_SPEC.replace(
+            "        - {name: id, in: path, required: true, schema: {type: string}}\n",
+            "        - {name: id, in: path, required: true, schema: {type: string}}\n        - {name: v, in: query, schema: {type: string}}\n",
+        );
+        let changes = diff(&optional_query);
+        assert!(breaking(&changes).is_empty(), "{changes:?}");
+        assert_eq!(changes.len(), 1);
+
+        let path_type = QA_BASE_SPEC.replace(
+            "{name: id, in: path, required: true, schema: {type: string}}",
+            "{name: id, in: path, required: true, schema: {type: integer}}",
+        );
+        assert_eq!(
+            breaking(&diff(&path_type)),
+            ["path parameter 'id' type changed (string -> integer)"]
+        );
+
+        let status = QA_BASE_SPEC.replace("\"200\":", "\"202\":");
+        let changes = diff(&status);
+        assert_eq!(breaking(&changes), ["response 200 removed"], "{changes:?}");
+
+        let moved = QA_BASE_SPEC.replace(
+            "        - {name: id, in: path, required: true, schema: {type: string}}\n",
+            "        - {name: id, in: path, required: true, schema: {type: string}}\n        - {name: v, in: query, schema: {type: string}}\n",
+        );
+        let moved_head = moved.replace("in: query", "in: header");
+        assert_eq!(
+            breaking(&diff_openapi("b.yaml", &moved, "h.yaml", &moved_head).unwrap()),
+            ["parameter 'v' moved from query to header"]
+        );
+
+        // Renaming the template variable changes no request.
+        let renamed = QA_BASE_SPEC
+            .replace("/orders/{id}:", "/orders/{orderId}:")
+            .replace("{name: id, in: path", "{name: orderId, in: path");
+        let changes = diff(&renamed);
+        assert!(breaking(&changes).is_empty(), "{changes:?}");
+
+        assert!(diff(QA_BASE_SPEC).is_empty());
     }
 
     #[test]
@@ -2745,6 +3231,59 @@ admin.get('/gyms', requireAdmin, listGyms);
             found.contains(&("GET".to_string(), "/gyms".to_string())),
             "a receiver bound to express.Router() must be recognised as a \
              route receiver, not just the five hard-coded names: {found:?}"
+        );
+    }
+
+    /// QA #10: `app.get("/orders/:id", getOrderHandler)` is implemented by
+    /// `getOrderHandler`, not by whichever function precedes the line.
+    #[test]
+    fn an_express_route_links_to_its_named_handler() {
+        let source = r#"import express from "express";
+const app = express();
+const router = express.Router();
+
+export function getOrderHandler(req: any, res: any) { res.json({ id: req.params.id }); }
+export function createOrderHandler(req: any, res: any) { res.status(201).end(); }
+
+app.get("/orders/:id", getOrderHandler);
+router.post("/orders", auth, controller.createOrderHandler);
+app.delete("/orders/:id", (req: any, res: any) => res.end());
+"#;
+        let symbol = |name: &str, start_line| HandlerSymbol {
+            name: name.into(),
+            signature: format!("export function {name}(req: any, res: any)"),
+            start_line,
+            kind: nestweaver_schema::SymbolKind::Function,
+        };
+        let symbols = vec![
+            symbol("getOrderHandler", 5),
+            symbol("createOrderHandler", 6),
+        ];
+        let found: Vec<(String, String)> = detect_handlers("express", source, &symbols)
+            .into_iter()
+            .map(|m| {
+                (
+                    format!(
+                        "{} {}",
+                        m.contract.verb.unwrap_or_default(),
+                        m.contract.path.unwrap_or_default()
+                    ),
+                    symbols[m.symbol_index].name.clone(),
+                )
+            })
+            .collect();
+        assert!(
+            found.contains(&("GET /orders/{}".into(), "getOrderHandler".into())),
+            "{found:?}"
+        );
+        assert!(
+            found.contains(&("POST /orders".into(), "createOrderHandler".into())),
+            "{found:?}"
+        );
+        assert_eq!(node_route_handler_name("(\"/x\", (req) => res.end())"), None);
+        assert_eq!(
+            node_route_handler_name("(\"/x\", auth, h.run,\n)").as_deref(),
+            Some("run")
         );
     }
 
