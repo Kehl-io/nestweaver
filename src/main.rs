@@ -38852,7 +38852,8 @@ mod pr_impact_hook_tests {
         let repo = tmp.path();
         git(repo, &["init", "-q"]);
 
-        let code = install_pre_push_hook(repo, false, &repo.join("nestweaver.lbug")).expect("install");
+        let code =
+            install_pre_push_hook(repo, false, &repo.join("nestweaver.lbug")).expect("install");
         assert_eq!(code, EXIT_SUCCESS);
 
         let hook = git_hooks_dir(repo).unwrap().join("pre-push");
@@ -39166,9 +39167,15 @@ mod pr_impact_hook_tests {
 
         install_pre_push_hook(&repo, false, &repo.join("nestweaver.lbug")).expect("install");
 
-        assert!(!outside.exists(), "nothing may be created at the link target");
+        assert!(
+            !outside.exists(),
+            "nothing may be created at the link target"
+        );
         let meta = std::fs::symlink_metadata(&hook).unwrap();
-        assert!(meta.file_type().is_file(), "the hook must be a regular file");
+        assert!(
+            meta.file_type().is_file(),
+            "the hook must be a regular file"
+        );
         let backup = hooks_dir.join("pre-push.nestweaver.bak");
         assert!(
             std::fs::symlink_metadata(&backup)
