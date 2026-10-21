@@ -16428,7 +16428,7 @@ fn affected_tests_rpc_args(changed_files: &[String]) -> serde_json::Value {
 /// caller, so an absent `--root` resolves here, on the client, rather than
 /// being left for the server to guess.
 fn client_source_root(root: Option<&std::path::Path>) -> String {
-    root.map(std::path::Path::to_path_buf)
+    root.map(abs_for_daemon)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
         .to_string_lossy()
         .into_owned()
@@ -16451,8 +16451,9 @@ fn read_symbols_rpc_args(
     if let Some(tb) = token_budget {
         args["token_budget"] = serde_json::json!(tb);
     }
+    // Absolute path: a relative `--root` would resolve against the daemon's CWD.
     if let Some(root) = root {
-        args["root"] = serde_json::json!(root.to_string_lossy().into_owned());
+        args["root"] = serde_json::json!(abs_for_daemon(root).to_string_lossy().into_owned());
     }
     args
 }
@@ -16483,8 +16484,9 @@ fn investigate_rpc_args(
     if let Some(tb) = token_budget {
         args["token_budget"] = serde_json::json!(tb);
     }
+    // Absolute path: a relative `--root` would resolve against the daemon's CWD.
     if let Some(root) = root {
-        args["root"] = serde_json::json!(root.to_string_lossy().into_owned());
+        args["root"] = serde_json::json!(abs_for_daemon(root).to_string_lossy().into_owned());
     }
     args
 }
@@ -25304,8 +25306,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 ))
                 .context("failed to connect to daemon")?;
 
+            // Absolute path: the daemon runs with its own CWD and would load a
+            // different instance.toml for a client-relative `--config`.
+            let config_abs = std::fs::canonicalize(config_path).with_context(|| {
+                format!("failed to resolve config path {}", config_path.display())
+            })?;
             let mut stream = rt
-                .block_on(client.materialize_projects(&config_path.to_string_lossy(), instance_id))
+                .block_on(client.materialize_projects(&config_abs.to_string_lossy(), instance_id))
                 .context("materialize_projects RPC failed")?;
 
             let mut had_error = false;

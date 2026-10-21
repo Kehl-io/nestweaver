@@ -9222,6 +9222,15 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let config_path = PathBuf::from(&req.config_path);
+        // A relative path would resolve against the daemon's CWD, not the
+        // caller's, and silently load a different instance.toml.
+        if !config_path.is_absolute() {
+            return Err(Status::invalid_argument(format!(
+                "config_path must be absolute, got '{}': the daemon cannot resolve a \
+                 path relative to the caller's working directory",
+                req.config_path
+            )));
+        }
         let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         // Configuration I/O and parsing do not mutate the graph and must not
         // occupy the sole writer while a slow filesystem is being read.
