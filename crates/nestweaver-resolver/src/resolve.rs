@@ -505,8 +505,7 @@ fn go_build_variant_edges(
     };
     // A declaration in the calling file is the one this build compiles with
     // that file; the same-file tier already chose it.
-    if target_file == file_path
-        || !matches!(target.kind, SymbolKind::Function | SymbolKind::Method)
+    if target_file == file_path || !matches!(target.kind, SymbolKind::Function | SymbolKind::Method)
     {
         return Vec::new();
     }
@@ -1999,9 +1998,7 @@ fn typed_receiver_origin(
         .get(type_name)
         .into_iter()
         .flatten()
-        .filter(|(file, symbol)| {
-            *file == source_file && type_kind(symbol.kind)
-        })
+        .filter(|(file, symbol)| *file == source_file && type_kind(symbol.kind))
         .collect();
     if local.len() == 1 {
         return Some(TypedReceiverOrigin {
@@ -2037,9 +2034,7 @@ fn typed_receiver_origin(
         let declarations = symbol_map
             .get(name)?
             .iter()
-            .filter(|(candidate, symbol)| {
-                *candidate == file && type_kind(symbol.kind)
-            })
+            .filter(|(candidate, symbol)| *candidate == file && type_kind(symbol.kind))
             .count();
         return (declarations == 1).then(|| TypedReceiverOrigin {
             file: file.into(),
@@ -2070,16 +2065,16 @@ fn typed_receiver_origin(
     })
 }
 
-/// Bound on nested receiver expressions followed by [`infer_receiver_type`]
+/// Bound on nested receiver expressions followed by [`ReceiverInference::infer`]
 /// (`a.b().c().d()` is three levels).
 const RECEIVER_INFERENCE_DEPTH: u8 = 4;
 
-/// Everything [`infer_receiver_type`] reads. Bundled so the recursion does
+/// Everything [`ReceiverInference::infer`] reads. Bundled so the recursion does
 /// not thread ten parameters.
-struct ReceiverInference<'a, 'b> {
+struct ReceiverInference<'a, 'b, 'c> {
     file_path: &'a str,
     reference: &'a RawReference,
-    scope_index: &'a FileScopeIndex<'b>,
+    scope_index: &'a FileScopeIndex<'c>,
     symbol_map: &'a std::collections::HashMap<String, Vec<(&'b str, &'b RawSymbol)>>,
     extends_map: &'a std::collections::HashMap<String, Vec<String>>,
     graph: &'a ImportGraph,
@@ -2204,10 +2199,19 @@ fn normalize_return_type(
 ) -> Option<String> {
     let mut text = raw.trim();
     text = text.trim_start_matches(':').trim_start_matches("->").trim();
+    // Defensive: a recorded type never includes a body or expression body.
+    text = text[..text.find(['{', '=']).unwrap_or(text.len())].trim();
     loop {
         let before = text;
-        for prefix in ["&mut ", "&", "*", "mut ", "?", "impl "] {
+        for prefix in ["&mut ", "&", "*", "mut ", "?", "impl ", "dyn "] {
             text = text.strip_prefix(prefix).unwrap_or(text).trim_start();
+        }
+        // A Rust lifetime (`&'a Foo`).
+        if let Some(rest) = text.strip_prefix('\'') {
+            text = rest
+                .split_once(char::is_whitespace)
+                .map_or("", |(_, rest)| rest)
+                .trim_start();
         }
         if text == before {
             break;
@@ -2232,7 +2236,7 @@ fn normalize_return_type(
     .then(|| name.to_string())
 }
 
-impl ReceiverInference<'_, '_> {
+impl ReceiverInference<'_, '_, '_> {
     /// The static type of a receiver expression, or `None` when nothing in
     /// the graph establishes one. Every step needs exact evidence: a `new`
     /// of a repository type, a declared return type, or a typed binding.
@@ -2245,12 +2249,18 @@ impl ReceiverInference<'_, '_> {
             let path: String = rest
                 .trim_start()
                 .chars()
-                .take_while(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$' | '.' | ':' | '\\'))
+                .take_while(|ch| {
+                    ch.is_alphanumeric() || matches!(*ch, '_' | '$' | '.' | ':' | '\\')
+                })
                 .collect();
             let name = path.rsplit(['.', ':', '\\']).next()?;
             return self.type_exists(name).then(|| name.to_string());
         }
         if let Some(callee) = split_trailing_call(expr) {
+            if callee.is_empty() {
+                // A parenthesized receiver: PHP `(new Foo())->bar()`.
+                return self.infer(&expr[1..expr.len() - 1], depth + 1);
+            }
             let callee = strip_type_arguments(callee);
             if callee.starts_with("new ") {
                 return self.infer(callee, depth + 1);
@@ -2310,7 +2320,8 @@ impl ReceiverInference<'_, '_> {
     /// (`Child()`, `Point(1, 2)`), or a function with one declared return
     /// type among the visible declarations.
     fn free_call_type(&self, callee: &str) -> Option<String> {
-        if active_lexical_binding(self.scope_index, self.reference, callee, self.language).is_some() {
+        if active_lexical_binding(self.scope_index, self.reference, callee, self.language).is_some()
+        {
             return None;
         }
         let symbols = self.symbol_map.get(callee)?;
@@ -2320,6 +2331,10 @@ impl ReceiverInference<'_, '_> {
                 symbol.kind == SymbolKind::Function
                     && symbol.parent_name.is_none()
                     && self.file_visible(file)
+                    // A bare Go name never reaches a package imported under
+                    // a qualifier (see `candidate_matches`).
+                    && !(self.language == Language::Go
+                        && self.graph.go_requires_qualifier(self.file_path, file))
             })
             .collect();
         if functions.is_empty() {
@@ -2352,22 +2367,17 @@ impl ReceiverInference<'_, '_> {
         let owner = if is_identifier(base)
             && !is_self_receiver(base)
             && self.type_exists(base)
-            && active_lexical_binding(self.scope_index, self.reference, base, self.language).is_none()
+            && active_lexical_binding(self.scope_index, self.reference, base, self.language)
+                .is_none()
             && self.identifier_type(base).is_none()
         {
             Some(base.to_string())
         } else if is_identifier(base) && !is_self_receiver(base) && !self.type_exists(base) {
             // A namespace or package qualifier (`calc.New(3)`): a free
-            // function reached through an import of that name.
+            // function of the module or package that qualifier imports.
             match self.identifier_type(base) {
                 Some(owner) => Some(owner),
-                None => {
-                    return self
-                        .graph
-                        .bindings_named(self.file_path, base)
-                        .next()
-                        .and_then(|_| self.free_call_type(method));
-                }
+                None => return self.qualified_free_call_type(base, method),
             }
         } else if is_identifier(base) {
             self.identifier_type(base)
@@ -2375,6 +2385,42 @@ impl ReceiverInference<'_, '_> {
             self.infer(base, depth + 1)
         }?;
         self.method_return_type(&owner, method)
+    }
+
+    /// `qualifier.function(...)` where `qualifier` names an imported module
+    /// or package, not a value. Go uses the same package-qualifier table as
+    /// `candidate_matches` (`import c "…/calc"` binds `c` to every file of
+    /// `calc`); elsewhere a whole-module binding (`import pkg.helpers as h`,
+    /// `import * as m from`) names its one source file.
+    fn qualified_free_call_type(&self, qualifier: &str, function: &str) -> Option<String> {
+        let files: Vec<&str> = if self.language == Language::Go {
+            self.graph
+                .go_qualified_package(self.file_path, qualifier)?
+                .iter()
+                .map(String::as_str)
+                .collect()
+        } else {
+            self.graph
+                .bindings_named(self.file_path, qualifier)
+                .filter(|binding| binding.original_name == "*")
+                .filter_map(|binding| binding.source_file.as_deref())
+                .collect()
+        };
+        let functions: Vec<&RawSymbol> = self
+            .symbol_map
+            .get(function)?
+            .iter()
+            .filter(|(file, symbol)| {
+                symbol.kind == SymbolKind::Function
+                    && symbol.parent_name.is_none()
+                    && files.contains(file)
+            })
+            .map(|(_, symbol)| *symbol)
+            .collect();
+        if functions.is_empty() {
+            return None;
+        }
+        self.agreed_return_type(functions.into_iter(), None)
     }
 
     fn method_return_type(&self, owner: &str, method: &str) -> Option<String> {
@@ -2398,7 +2444,7 @@ impl ReceiverInference<'_, '_> {
                     .map(|(_, symbol)| *symbol)
                     .collect();
                 if !methods.is_empty() {
-                    return self.agreed_return_type(methods.into_iter(), Some(owner));
+                    return self.agreed_return_type(methods.into_iter(), Some(owner.as_str()));
                 }
                 if let Some(parents) = self.extends_map.get(owner) {
                     next.extend(parents.iter().cloned());
@@ -2437,7 +2483,10 @@ impl ReceiverInference<'_, '_> {
 /// `new K()`, `New` in `New(1)`.
 fn receiver_chain_head(receiver: &str) -> &str {
     let receiver = receiver.trim();
-    let receiver = receiver.strip_prefix("new ").unwrap_or(receiver).trim_start();
+    let receiver = receiver
+        .strip_prefix("new ")
+        .unwrap_or(receiver)
+        .trim_start();
     let end = receiver
         .find(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '$'))
         .unwrap_or(receiver.len());
@@ -2456,7 +2505,7 @@ fn receiver_chain_head(receiver: &str) -> &str {
 ///
 /// A common name such as `get` that is declared twice anywhere links nothing.
 fn unique_expression_method<'s>(
-    inference: &ReceiverInference<'_, 's>,
+    inference: &ReceiverInference<'_, 's, '_>,
     receiver: &str,
     method: &str,
     source: &RawSymbol,
@@ -12045,7 +12094,12 @@ export function readIt(b: Box) { size(); run(); b.run(); return value(); }
         );
         for variant in [js, net] {
             assert!(
-                qa_calls(&files, &edges, (node, "NodeID"), (variant, "getHardwareInterface", 5)),
+                qa_calls(
+                    &files,
+                    &edges,
+                    (node, "NodeID"),
+                    (variant, "getHardwareInterface", 5)
+                ),
                 "{variant}: {edges:#?}"
             );
         }

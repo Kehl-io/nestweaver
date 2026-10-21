@@ -1255,10 +1255,39 @@ fn extract_java_style_type_info(sig: &str) -> Option<TypeInfo> {
     None
 }
 
+/// Byte index of the `)` closing the `(` at `open`, or `None`.
+fn matching_paren(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, ch) in text[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open + index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A signature's text after the return-type marker, ending where a body,
+/// expression body or `where` clause begins. The signature is the
+/// declaration's first line, so a one-line declaration carries its whole body
+/// (`static make(): K { return new K(); }`); the body is not part of the type.
+fn return_type_text(after_marker: &str) -> &str {
+    let end = after_marker
+        .find(['{', '='])
+        .unwrap_or(after_marker.len())
+        .min(after_marker.find(" where").unwrap_or(after_marker.len()));
+    after_marker[..end].trim().trim_end_matches(':').trim()
+}
+
 fn extract_rust_type_info(sig: &str) -> Option<TypeInfo> {
     if let Some(arrow_pos) = sig.find("->") {
-        let return_type = sig[arrow_pos + 2..].trim();
-        let return_type = return_type.trim_end_matches('{').trim();
+        let return_type = return_type_text(&sig[arrow_pos + 2..]);
         if !return_type.is_empty() {
             return Some(TypeInfo {
                 declared_type: None,
@@ -1271,11 +1300,20 @@ fn extract_rust_type_info(sig: &str) -> Option<TypeInfo> {
 }
 
 fn extract_go_type_info(sig: &str) -> Option<TypeInfo> {
-    // "func greet(name string) string {"
-    if let Some(close_paren) = sig.rfind(')') {
-        let after = sig[close_paren + 1..].trim();
-        let return_type = after.trim_end_matches('{').trim();
-        if !return_type.is_empty() && !return_type.starts_with('{') {
+    // "func greet(name string) string {", "func (i *Impl) Add(a, b int) int {".
+    // The parameter list is the first one after the optional receiver; the
+    // LAST `)` of a one-line declaration can sit inside its body.
+    let rest = sig.trim_start();
+    let rest = rest.strip_prefix("func").unwrap_or(rest).trim_start();
+    let rest = if rest.starts_with('(') {
+        &rest[matching_paren(rest, 0)? + 1..]
+    } else {
+        rest
+    };
+    if let Some(close_paren) = rest.find('(').and_then(|open| matching_paren(rest, open)) {
+        let after = &rest[close_paren + 1..];
+        let return_type = after[..after.find('{').unwrap_or(after.len())].trim();
+        if !return_type.is_empty() {
             return Some(TypeInfo {
                 declared_type: None,
                 parameter_types: Vec::new(),
@@ -1292,8 +1330,7 @@ fn extract_annotated_type_info(sig: &str) -> Option<TypeInfo> {
     // Swift: "func greet(name: String) -> String"
     // Dart: "String greet(String name)"
     if let Some(arrow_pos) = sig.find("->") {
-        let return_type = sig[arrow_pos + 2..].trim();
-        let return_type = return_type.trim_end_matches('{').trim();
+        let return_type = return_type_text(&sig[arrow_pos + 2..]);
         if !return_type.is_empty() {
             return Some(TypeInfo {
                 declared_type: None,
@@ -1302,11 +1339,13 @@ fn extract_annotated_type_info(sig: &str) -> Option<TypeInfo> {
             });
         }
     }
-    // Check for ): Type pattern (TypeScript/Kotlin)
-    if let Some(close_paren) = sig.rfind(')') {
+    // Check for ): Type pattern (TypeScript/Kotlin). The parameter list is
+    // the first one; the LAST `)` of a one-line declaration can sit inside
+    // its body (`static make(): K { return new K(); }`).
+    if let Some(close_paren) = sig.find('(').and_then(|open| matching_paren(sig, open)) {
         let after = sig[close_paren + 1..].trim();
         if let Some(rest) = after.strip_prefix(':') {
-            let return_type = rest.trim().trim_end_matches('{').trim();
+            let return_type = return_type_text(rest);
             if !return_type.is_empty() {
                 return Some(TypeInfo {
                     declared_type: None,
@@ -1322,8 +1361,10 @@ fn extract_annotated_type_info(sig: &str) -> Option<TypeInfo> {
 fn extract_python_type_info(sig: &str) -> Option<TypeInfo> {
     // "def greet(name: str) -> str:"
     if let Some(arrow_pos) = sig.find("->") {
-        let return_type = sig[arrow_pos + 2..].trim();
-        let return_type = return_type.trim_end_matches(':').trim();
+        // A one-line `def make() -> K: return K()` carries its body after
+        // the colon; an annotation never contains one.
+        let after = &sig[arrow_pos + 2..];
+        let return_type = after[..after.find(':').unwrap_or(after.len())].trim();
         if !return_type.is_empty() {
             return Some(TypeInfo {
                 declared_type: None,
@@ -1358,9 +1399,31 @@ fn extract_type_info(signature: &str, lang: Language) -> Option<TypeInfo> {
 
 // ── parent name extraction ────────────────────────────────────────────────
 
-/// Walk the tree-sitter AST parent chain from `node` to find the enclosing
-/// class, struct, impl, trait, or interface. Returns the parent type/class name
-/// (e.g. `"GraphStore"` for a method inside `impl GraphStore { ... }`).
+/// The receiver type of a Go method: `Impl` for `func (i *Impl) Add()`,
+/// `List` for `func (l List[T]) Len()`.
+///
+/// A Go method is declared outside its type, so `find_parent_name`'s
+/// enclosing-container walk never found one: every Go method had no
+/// `parent_name`, so a typed receiver (`i.Add()`, `New(1).Add()`) had no
+/// method to match and Go member calls resolved to nothing.
+fn go_method_receiver_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let receiver = node.child_by_field_name("receiver")?;
+    let mut cursor = receiver.walk();
+    let parameter = receiver
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "parameter_declaration")?;
+    let mut ty = parameter.child_by_field_name("type")?;
+    loop {
+        ty = match ty.kind() {
+            "pointer_type" | "parenthesized_type" => ty.named_child(0)?,
+            "generic_type" => ty.child_by_field_name("type")?,
+            "type_identifier" => break,
+            _ => return None,
+        };
+    }
+    ty.utf8_text(source).ok().map(str::to_string)
+}
+
 /// Whether a JS/TS `this.x = …` assignment's nearest enclosing method is the
 /// class constructor.
 fn js_assignment_in_constructor(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
@@ -1380,7 +1443,7 @@ fn js_assignment_in_constructor(node: tree_sitter::Node<'_>, source: &[u8]) -> b
     false
 }
 
-/// nw-QA: `queries/typescript.scm` mints a `Property` for every `this.x = …`
+/// `queries/typescript.scm` mints a `Property` for every `this.x = …`
 /// assignment, and the symbol dedupe is keyed on `(name, line)`, so a field
 /// assigned in three methods became three `Property` symbols, plus a fourth
 /// when the class also declared it. One property is one symbol:
@@ -1428,7 +1491,7 @@ fn dedupe_js_assignment_properties(symbols: &mut Vec<RawSymbol>, assignments: &[
             })
             .or_insert(rank);
     }
-    let drop: std::collections::HashSet<usize> = minted
+    let dropped: std::collections::HashSet<usize> = minted
         .keys()
         .copied()
         .filter(|&index| {
@@ -1439,17 +1502,20 @@ fn dedupe_js_assignment_properties(symbols: &mut Vec<RawSymbol>, assignments: &[
             })
         })
         .collect();
-    if drop.is_empty() {
+    if dropped.is_empty() {
         return;
     }
     let mut index = 0;
     symbols.retain(|_| {
-        let retain = !drop.contains(&index);
+        let retain = !dropped.contains(&index);
         index += 1;
         retain
     });
 }
 
+/// Walk the tree-sitter AST parent chain from `node` to find the enclosing
+/// class, struct, impl, trait, or interface. Returns the parent type/class name
+/// (e.g. `"GraphStore"` for a method inside `impl GraphStore { ... }`).
 fn find_parent_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
     let mut current = node.parent();
     while let Some(parent) = current {
@@ -2004,6 +2070,8 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 let parent_name = if matches!(kind, SymbolKind::Method | SymbolKind::Property) {
                     if commonjs_object_methods.contains(&node.start_byte()) {
                         Some("module.exports".into())
+                    } else if lang == Language::Go && node.kind() == "method_declaration" {
+                        go_method_receiver_type(node, source_bytes)
                     } else {
                         find_parent_name(&node, source_bytes)
                     }
@@ -15037,7 +15105,8 @@ export function G(a) {\n\
 
     #[test]
     fn rust_turbofish_method_call_keeps_its_receiver() {
-        let source = "fn f(x: &str) { let _ = x.parse::<u32>(); generic::<u8>(1); T::make::<u8>(); }\n";
+        let source =
+            "fn f(x: &str) { let _ = x.parse::<u32>(); generic::<u8>(1); T::make::<u8>(); }\n";
         let parsed = parse_source(Path::new("src/lib.rs"), source).unwrap();
         let call = |name: &str| {
             parsed
