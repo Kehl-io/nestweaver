@@ -14809,9 +14809,8 @@ fn git_command_for_indexed_path(path: &Path) -> std::process::Command {
 /// refuse repositories owned by another user that the operator already trusts
 /// (container volumes, shared mounts). Command-line `safe.directory` is
 /// protected configuration, and the indexed repository cannot author it.
-/// Values are read with `--type=path`, since HOME is hidden from inspection.
+/// Read every 30 seconds at most.
 fn trusted_safe_directories() -> Vec<std::ffi::OsString> {
-    use std::os::unix::ffi::OsStrExt;
     static CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<std::ffi::OsString>)>> =
         std::sync::Mutex::new(None);
     let mut cache = CACHE
@@ -14822,17 +14821,70 @@ fn trusted_safe_directories() -> Vec<std::ffi::OsString> {
     {
         return values.clone();
     }
+    let values = read_safe_directories(|name| std::env::var_os(name));
+    *cache = Some((std::time::Instant::now(), values.clone()));
+    values
+}
+
+/// `safe.directory` values from the operator's system and global config, in
+/// Git's order, using `env` for the operator's environment.
+///
+/// Git subprocesses here always run isolated (`GIT_CONFIG_GLOBAL=/dev/null`),
+/// so global files are named explicitly with `--file`: `GIT_CONFIG_GLOBAL`
+/// when the operator set it, otherwise the XDG file and then `~/.gitconfig`.
+/// Values are read with `--type=path` under the operator's HOME, because
+/// inspection later hides HOME, and the operator's own includes are followed.
+fn read_safe_directories(
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    let set = |name: &str| env(name).filter(|value| !value.is_empty());
+    let mut scopes: Vec<Vec<std::ffi::OsString>> = Vec::new();
+    let no_system = set("GIT_CONFIG_NOSYSTEM").is_some_and(|value| {
+        !matches!(
+            value.to_string_lossy().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    });
+    if !no_system {
+        scopes.push(match set("GIT_CONFIG_SYSTEM") {
+            Some(file) => vec!["--file".into(), file],
+            None => vec!["--system".into()],
+        });
+    }
+    let global_files: Vec<std::path::PathBuf> = match set("GIT_CONFIG_GLOBAL") {
+        Some(file) => vec![file.into()],
+        None => {
+            let home = set("HOME").map(std::path::PathBuf::from);
+            let xdg = set("XDG_CONFIG_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| home.as_ref().map(|home| home.join(".config")));
+            xdg.map(|xdg| xdg.join("git/config"))
+                .into_iter()
+                .chain(home.map(|home| home.join(".gitconfig")))
+                .collect()
+        }
+    };
+    scopes.extend(
+        global_files
+            .into_iter()
+            .filter(|file| file.is_file())
+            .map(|file| vec!["--file".into(), file.into_os_string()]),
+    );
     let mut values = Vec::new();
-    for scope in ["--system", "--global"] {
+    for scope in scopes {
         let mut command = std::process::Command::new("git");
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("GIT_") {
                 command.env_remove(key);
             }
         }
-        command.current_dir("/").args([
-            "config",
-            scope,
+        match env("HOME") {
+            Some(home) => command.env("HOME", home),
+            None => command.env_remove("HOME"),
+        };
+        command.current_dir("/").arg("config").args(&scope).args([
+            "--includes",
             "--type=path",
             "--null",
             "--get-all",
@@ -14855,7 +14907,6 @@ fn trusted_safe_directories() -> Vec<std::ffi::OsString> {
                 .map(|value| std::ffi::OsStr::from_bytes(value).to_owned()),
         );
     }
-    *cache = Some((std::time::Instant::now(), values.clone()));
     values
 }
 
@@ -16208,6 +16259,62 @@ mod affected_tests_base_ref_tests {
         std::os::unix::fs::symlink(shared_hooks.path(), &hooks).unwrap();
         std::fs::write(hooked.path().join("tracked.txt"), "after\n").unwrap();
         assert_diffs_tracked_file(hooked.path(), "symlinked-hooks");
+    }
+
+    /// Global entries must be forwarded even though every Git subprocess here
+    /// runs with `GIT_CONFIG_GLOBAL=/dev/null`. A container test found the
+    /// first version silently read nothing from `~/.gitconfig`.
+    #[test]
+    fn operator_safe_directories_are_read_from_global_files_in_git_order() {
+        let home = tempfile::tempdir().unwrap();
+        let xdg = home.path().join("xdg");
+        std::fs::create_dir_all(xdg.join("git")).unwrap();
+        std::fs::write(xdg.join("git/config"), "[safe]\n\tdirectory = /srv/xdg\n").unwrap();
+        let included = home.path().join("included");
+        std::fs::write(&included, "[safe]\n\tdirectory = /srv/included\n").unwrap();
+        std::fs::write(
+            home.path().join(".gitconfig"),
+            format!(
+                "[safe]\n\tdirectory = ~/shared\n\tdirectory = *\n[include]\n\tpath = {}\n",
+                included.display()
+            ),
+        )
+        .unwrap();
+        let env = |overrides: Vec<(&'static str, std::ffi::OsString)>| {
+            let home = home.path().as_os_str().to_owned();
+            let xdg = xdg.as_os_str().to_owned();
+            move |name: &str| match name {
+                "GIT_CONFIG_NOSYSTEM" => Some("1".into()),
+                "HOME" => Some(home.clone()),
+                "XDG_CONFIG_HOME" => Some(xdg.clone()),
+                _ => overrides
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.clone()),
+            }
+        };
+        let values = read_safe_directories(env(Vec::new()));
+        assert_eq!(
+            values,
+            vec![
+                std::ffi::OsString::from("/srv/xdg"),
+                home.path().join("shared").into_os_string(),
+                "*".into(),
+                "/srv/included".into(),
+            ]
+        );
+
+        let explicit = home.path().join("explicit");
+        std::fs::write(&explicit, "[safe]\n\tdirectory = /srv/a\n\tdirectory =\n").unwrap();
+        let values = read_safe_directories(env(vec![(
+            "GIT_CONFIG_GLOBAL",
+            explicit.as_os_str().to_owned(),
+        )]));
+        assert_eq!(
+            values,
+            vec![std::ffi::OsString::from("/srv/a"), "".into()],
+            "GIT_CONFIG_GLOBAL replaces the default files; an empty value is kept as a reset"
+        );
     }
 
     /// Git requires exactly `gitdir: ` and takes the rest of the gitfile up to
