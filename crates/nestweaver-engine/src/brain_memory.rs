@@ -2994,6 +2994,48 @@ mod tests {
         );
     }
 
+    /// QA #6: on a graph not re-indexed since an apply, the move it made is
+    /// neither re-proposed nor silently dropped: it is counted as already
+    /// applied and its vault is named for a refresh.
+    #[test]
+    fn an_already_applied_move_is_counted_not_reproposed() {
+        let (_dir, root) = make_vault(&[
+            (
+                "_logs/2025-01-01.md",
+                "# Log Jan 1\n\nA recurring idea worth promoting.\n",
+            ),
+            (
+                "_ideas/idea-a.md",
+                "# Idea A\n\nSee [[_logs/2025-01-01]].\n",
+            ),
+            (
+                "_ideas/idea-b.md",
+                "# Idea B\n\nRefs [[_logs/2025-01-01]].\n",
+            ),
+            (
+                "_ideas/idea-c.md",
+                "# Idea C\n\nAlso [[_logs/2025-01-01]].\n",
+            ),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        let first = memory_consolidate_limited(&store, true, 4_000_000_000.0, Some(50)).unwrap();
+        assert!(first.applied, "{:?}", first.warnings);
+        assert_eq!(first.proposals_already_applied, 0);
+        assert!(!first.refresh_vault_paths.is_empty(), "the moved vault is named");
+
+        for apply in [false, true] {
+            let stale = memory_consolidate_limited(&store, apply, 4_000_000_000.0, Some(50)).unwrap();
+            assert!(stale.proposals.is_empty(), "apply={apply}: {:?}", stale.proposals);
+            assert_eq!(stale.proposals_discovered, 1, "apply={apply}");
+            assert_eq!(stale.proposals_already_applied, 1, "apply={apply}");
+            assert_eq!(
+                stale.refresh_vault_paths,
+                [store.list_vaults(None).unwrap()[0].root_path.clone()],
+                "apply={apply}"
+            );
+        }
+    }
+
     fn prepared_log_promotion_journal(store: &GraphStore, root: &Path) -> ConsolidationJournal {
         let manifest = memory_consolidate(store, false, 4_000_000_000.0).unwrap();
         let proposal = manifest
