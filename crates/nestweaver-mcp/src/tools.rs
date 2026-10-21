@@ -993,6 +993,19 @@ fn tool_alias_groups(tool: &str) -> &'static [&'static [&'static str]] {
     }
 }
 
+/// `affected_tests` takes its changed set from `changed_files` (alias
+/// `files`) OR from a `base_ref` diff. Given both, the explicit list won and
+/// `base_ref` was silently ignored, so a caller believed it had tested a diff
+/// it never read.
+const AFFECTED_TESTS_FILES_AND_BASE_REF: &str = "conflicting arguments: pass either \
+     'changed_files' (alias 'files') or 'base_ref', not both — the explicit list would \
+     silently replace the base_ref diff";
+
+fn affected_tests_has_files_and_base_ref(args: &Value) -> bool {
+    args.get("base_ref").is_some()
+        && (args.get("changed_files").is_some() || args.get("files").is_some())
+}
+
 /// Fold alias spellings onto the canonical key (nw-558). Call before
 /// validation and dispatch; a conflict is left in place for
 /// [`validate_tool_arguments`] to refuse with a named error.
@@ -1038,6 +1051,9 @@ fn conflicting_alias_error(name: &str, args: &Value) -> Option<String> {
     match name {
         "regex_search" if args.get("pattern").is_some() && args.get("query").is_some() => {
             Some("conflicting arguments: pass only one of 'pattern' or 'query'".to_string())
+        }
+        "affected_tests" if affected_tests_has_files_and_base_ref(args) => {
+            Some(AFFECTED_TESTS_FILES_AND_BASE_REF.to_string())
         }
         // nw-630: `symbol` is an alias of `name`. Unlike `pattern`/`query`,
         // which reject the pair unconditionally, this only rejects a
@@ -14458,7 +14474,7 @@ fn tool_detect_changes_scoped(
 fn tool_schema_affected_tests() -> Value {
     json!({
         "name": "affected_tests",
-        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (at least one must be provided).\n\nREFUSAL: when a repo that owns a changed file (or shares a recorded cross-repo edge or a declared `[[links]]` entry with one) has edges that predate the running resolver, this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos`, a `remedies` array, `recommendation: \"run-full-suite\"`, and NO tier keys at all — a missing edge can only make the selection SMALLER, so an under-resolved graph silently drops a regression test while the gate still reports success. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required, a generation-stale repo is already at HEAD so a plain incremental index writes nothing) and call again. A stale repo unrelated to the change does not refuse; it is named in a `resolver-generation-stale-unrelated` warning notification.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against. base_ref diffs the repository named by `repo`; several visible local repositories and no `repo` is an error, not a silent pick of one unnamed repository. The result names the repository it diffed. A path that is not a git work tree fails naming that repository\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive. Each test file is listed once, in its best tier\n- A test file whose own top level calls a changed function is selected; its module owner (`path::<module>`) is never a changed symbol or a test name. When none of that file's tests was reached, its `tests` is empty and `selected_by: \"top_level_code\"` says why; it counts as one test in the summary\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n- `recommendation` is a machine-readable CI directive: 'selection-usable' requires a complete run with nonempty test files, or an explicitly documented docs-only/proven-empty exception; otherwise 'run-full-suite'. Documentation-only changes are disclosed as docs; unassessed source/config changes are disclosed and widen to the full suite\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n- `resolver_stale_repos` (repo UIDs, generation-mismatch) is NOT the same population as `_meta.stale_repos` (federation lag, present only via the hybrid client) or `stale_check`'s/`hub_nodes`'s own `stale_repos` (different tools, different populations under the same key name — nw-371)\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
+        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (exactly one; passing both is refused).\n\nREFUSAL: when a repo that owns a changed file (or shares a recorded cross-repo edge or a declared `[[links]]` entry with one) has edges that predate the running resolver, this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos`, a `remedies` array, `recommendation: \"run-full-suite\"`, and NO tier keys at all — a missing edge can only make the selection SMALLER, so an under-resolved graph silently drops a regression test while the gate still reports success. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required, a generation-stale repo is already at HEAD so a plain incremental index writes nothing) and call again. A stale repo unrelated to the change does not refuse; it is named in a `resolver-generation-stale-unrelated` warning notification.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against. base_ref diffs the repository named by `repo`; several visible local repositories and no `repo` is an error, not a silent pick of one unnamed repository. The result names the repository it diffed. A path that is not a git work tree fails naming that repository\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive. Each test file is listed once, in its best tier\n- A test file whose own top level calls a changed function is selected; its module owner (`path::<module>`) is never a changed symbol or a test name. When none of that file's tests was reached, its `tests` is empty and `selected_by: \"top_level_code\"` says why; it counts as one test in the summary\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n- `recommendation` is a machine-readable CI directive: 'selection-usable' requires a complete run with nonempty test files, or an explicitly documented docs-only/proven-empty exception; otherwise 'run-full-suite'. Documentation-only changes are disclosed as docs; unassessed source/config changes are disclosed and widen to the full suite\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n- `resolver_stale_repos` (repo UIDs, generation-mismatch) is NOT the same population as `_meta.stale_repos` (federation lag, present only via the hybrid client) or `stale_check`'s/`hub_nodes`'s own `stale_repos` (different tools, different populations under the same key name — nw-371)\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -14513,9 +14529,12 @@ fn tool_affected_tests(
     args: Value,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
+    if affected_tests_has_files_and_base_ref(&args) {
+        return Err(anyhow!(AFFECTED_TESTS_FILES_AND_BASE_REF));
+    }
     let owners = restricted_symbol_owners(store, visible)?;
 
-    // Resolve the set of changed files: explicit list takes precedence over base_ref.
+    // Resolve the set of changed files: an explicit list or a base_ref diff.
     let explicit_changed_files = args
         .get("changed_files")
         .map(|value| {
@@ -18436,6 +18455,40 @@ fn tool_schema_brain_diff() -> Value {
     })
 }
 
+/// Name the cause of a failed `brain_diff` git step. The bare `.context("git
+/// diff")` surfaced as "tool brain_diff failed: git diff" with the cause
+/// hidden below the top context; an unknown `since_sha` is the common case and
+/// deserves to be said plainly. Only the innermost message is shown (first
+/// line, bounded), never a raw stderr dump.
+fn brain_diff_git_error(
+    error: &anyhow::Error,
+    base_sha: &str,
+    head_sha: &str,
+    base_from_caller: bool,
+) -> anyhow::Error {
+    let step = |context: &str| error.chain().any(|cause| cause.to_string() == context);
+    if step("resolve old git commit") {
+        let origin = if base_from_caller {
+            "since_sha"
+        } else {
+            "the indexed SHA"
+        };
+        return anyhow!(
+            "git diff failed: unknown revision '{base_sha}' ({origin} does not name a commit in \
+             this repository; it may be mistyped, or unreachable after a rebase or shallow clone)"
+        );
+    }
+    if step("resolve new git commit") {
+        return anyhow!("git diff failed: unknown revision '{head_sha}' (current HEAD)");
+    }
+    let root = error.root_cause().to_string();
+    let first_line = root.lines().next().unwrap_or_default();
+    anyhow!(
+        "git diff failed: {}",
+        truncate_utf8_bytes(first_line, MAX_VALIDATION_ITEM_BYTES)
+    )
+}
+
 fn tool_brain_diff(
     store: &GraphStore,
     args: Value,
@@ -18515,7 +18568,9 @@ fn tool_brain_diff(
     }
 
     let changes = git_diff::detect_changes(std::path::Path::new(repo_path), base_sha, &head_sha)
-        .context("git diff")?;
+        .map_err(|error| {
+            brain_diff_git_error(&error, base_sha, &head_sha, since_sha_arg.is_some())
+        })?;
 
     let mut added: Vec<String> = Vec::new();
     let mut modified: Vec<String> = Vec::new();
@@ -25439,9 +25494,19 @@ mod cache_dispatch_tests {
         assert_eq!(CACHE_HITS.with(|count| count.get()), 0);
         assert_eq!(CACHE_MISSES.with(|count| count.get()), 0);
 
-        // Explicit files take precedence even when a base ref is present, and
-        // must retain graph caching. Check the public alias normalization too.
-        let explicit = json!({ "files": ["main.js"], "base_ref": "HEAD" });
+        // Explicit files with a base ref is refused: the base ref used to be
+        // silently ignored. Neither spelling of the list may slip past.
+        for files_key in ["files", "changed_files"] {
+            let both = json!({ files_key: ["main.js"], "base_ref": "HEAD" });
+            let error = dispatch(&store, None, "affected_tests", both, None).unwrap_err();
+            assert!(
+                error.to_string().contains("not both"),
+                "{files_key}: {error:#}"
+            );
+        }
+        // Explicit files retain graph caching. Check the public alias
+        // normalization too.
+        let explicit = json!({ "files": ["main.js"] });
         let first = dispatch(&store, None, "affected_tests", explicit.clone(), None).unwrap();
         let second = dispatch(&store, None, "affected_tests", explicit, None).unwrap();
         assert_eq!(first, second);
@@ -37084,6 +37149,41 @@ mod ambiguous_name_contract_tests {
         assert_eq!(owners, 3, "{names:?}");
         assert_eq!(payload["module_owners_omitted"], 397, "{payload}");
         assert_eq!(payload["truncated"], true, "{payload}");
+    }
+
+    /// An unknown `since_sha` names itself instead of "failed: git diff".
+    #[test]
+    fn brain_diff_names_an_unknown_since_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let head = nestweaver_engine::git_diff::current_head_sha(dir.path()).unwrap();
+        let error = nestweaver_engine::git_diff::detect_changes(dir.path(), "0badc0ffee", &head)
+            .unwrap_err();
+        let message = brain_diff_git_error(&error, "0badc0ffee", &head, true).to_string();
+        assert!(
+            message.contains("unknown revision '0badc0ffee'"),
+            "{message}"
+        );
+        assert!(message.contains("since_sha"), "{message}");
+        assert!(
+            !message.contains(&dir.path().display().to_string()),
+            "{message}"
+        );
     }
 
     /// nw-113: `brain_diff` never lists a changed file's owner as a changed
