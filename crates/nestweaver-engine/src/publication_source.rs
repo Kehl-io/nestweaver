@@ -232,6 +232,8 @@ fn hash_repo_tree(
         return hash_relative_files(root, paths, prior);
     }
     let walker = ignore::WalkBuilder::new(root)
+        // Global excludes are anchored at the worktree top, as git does.
+        .current_dir(root)
         .follow_links(false)
         .hidden(false)
         .git_ignore(true)

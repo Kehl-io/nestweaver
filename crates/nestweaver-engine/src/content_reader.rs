@@ -350,6 +350,14 @@ fn dir_is_excluded(dir_excludes: Option<&GlobSet>, rel: &Path) -> bool {
     dir_excludes.is_some_and(|gs| gs.is_match(rel))
 }
 
+/// A filesystem read failure that keeps the `io::Error` in the chain, so a
+/// caller can tell a vanished file (`NotFound`) or an unreadable one
+/// (`PermissionDenied`) from any other fault. The message is unchanged.
+fn io_read_error(verb: &str, path: &Path, error: std::io::Error) -> anyhow::Error {
+    let message = format!("{verb} {}: {error}", path.display());
+    anyhow::Error::new(error).context(message)
+}
+
 /// Local filesystem reader — wraps the existing `ignore::WalkBuilder` + `fs::read_to_string`.
 pub struct FilesystemReader {
     repo_path: PathBuf,
@@ -1063,7 +1071,7 @@ impl ContentReader for FilesystemReader {
     fn read_file(&self, rel_path: &Path) -> Result<String> {
         let abs = self.repo_path.join(rel_path);
         let observed_bytes = std::fs::metadata(&abs)
-            .map_err(|e| anyhow::anyhow!("stat {}: {e}", abs.display()))?
+            .map_err(|e| io_read_error("stat", &abs, e))?
             .len();
         if observed_bytes > self.limits.max_source_file_bytes() {
             return Err(SourceTooLarge {
@@ -1075,8 +1083,7 @@ impl ContentReader for FilesystemReader {
         }
         // Bound the actual read as well as the metadata preflight so a file
         // that grows between stat and read cannot force an unbounded allocation.
-        let file = std::fs::File::open(&abs)
-            .map_err(|e| anyhow::anyhow!("open {}: {e}", abs.display()))?;
+        let file = std::fs::File::open(&abs).map_err(|e| io_read_error("open", &abs, e))?;
         let mut bounded = file.take(self.limits.max_source_file_bytes() + 1);
         // nw-190: read bytes and decode lossily rather than read_to_string, which
         // hard-errors on invalid UTF-8. Every call site propagates that error with
@@ -1092,7 +1099,7 @@ impl ContentReader for FilesystemReader {
         let mut raw = Vec::new();
         bounded
             .read_to_end(&mut raw)
-            .map_err(|e| anyhow::anyhow!("read {}: {e}", abs.display()))?;
+            .map_err(|e| io_read_error("read", &abs, e))?;
         // Genuinely binary content would decode into garbage symbols, so skip it
         // using the NUL-byte heuristic that ripgrep, git and grep all use: a file is
         // binary iff it contains a NUL, tested over the leading window.
@@ -1200,6 +1207,10 @@ impl ContentReader for FilesystemReader {
         let record = std::sync::Arc::clone(&recorded);
         let record_root = self.repo_path.clone();
         let walker = WalkBuilder::new(&self.repo_path)
+            // Git anchors global-excludes patterns at the worktree top; the
+            // `ignore` crate anchors them at the process CWD unless told, so
+            // `sub/deep/a.ts` in `~/.config/git/ignore` never matched.
+            .current_dir(&self.repo_path)
             .follow_links(false)
             .hidden(false)
             .git_ignore(true)
