@@ -2662,7 +2662,7 @@ fn typed_member_accessible(
         || source_file == target_file
         || (language == Language::Go
             && parent_dir(source_file) == parent_dir(target_file)
-            && graph.same_go_package(source_file, target_file))
+            && go_same_package(graph, source_file, target_file))
         || (language == Language::Rust && graph.resolves_parent(source_file, target_file))
 }
 
@@ -2678,7 +2678,7 @@ fn candidate_matches(
         && sym.visibility == Visibility::Private
         && !(language == Language::Go
             && parent_dir(source_file) == parent_dir(candidate_file)
-            && graph.same_go_package(source_file, candidate_file))
+            && go_same_package(graph, source_file, candidate_file))
     {
         return false;
     }
