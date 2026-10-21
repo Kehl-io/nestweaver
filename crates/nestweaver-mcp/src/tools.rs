@@ -6475,7 +6475,16 @@ fn tool_schema_brain_broken_links() -> Value {
 }
 
 fn tool_brain_orphan_documents(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    let vault = args.get("vault").and_then(|v| v.as_str());
+    // QA #11: a vault NAME (or a typo) silently matched nothing and reported
+    // zero orphans. Resolve it like `brain_context.vaults`: UID, name or root
+    // path, and an unknown or ambiguous entry is an error.
+    let vault_uid = match args.get("vault").and_then(|v| v.as_str()) {
+        Some(selector) => resolve_vault_filter(store, &[selector.to_string()])?
+            .into_iter()
+            .next(),
+        None => None,
+    };
+    let vault = vault_uid.as_deref();
     let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
     let allowlist = parse_string_array(&args, "allowlist").unwrap_or_default();
     let limit = read_limit(
@@ -6501,7 +6510,7 @@ fn tool_schema_brain_orphan_documents() -> Value {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "vault": { "type": "string", "description": "Restrict to this vault UID." },
+                "vault": { "type": "string", "description": "Restrict to this vault: its UID, name or root path. An unknown or ambiguous vault is an error." },
                 "path_prefix": { "type": "string", "description": "Restrict to notes whose file path starts with this prefix." },
                 "allowlist": {
                     "type": "array",
@@ -10351,7 +10360,7 @@ fn tool_schema_note_get() -> Value {
                     "type": "array",
                     "maxItems": MAX_NOTE_SECTIONS,
                     "items": { "type": "string" },
-                    "description": "Optional list of heading names. If provided, returns only those sections instead of the full body. Case-insensitive match. At most 256 headings."
+                    "description": "Optional list of heading names. If provided, returns only those sections instead of the full body. Case-insensitive match. At most 256 headings. Names matching no heading of the note are listed in missing_sections."
                 }
             },
             // nw-410: the either/or requirement, declared where the
@@ -10983,6 +10992,36 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
             ));
         }
     }
+    // QA #11: `sections: ["Nope"]` returned `body: ""` with nothing saying
+    // the heading does not exist. Report requested sections that match no
+    // heading of this note. Skipped (absent) when the probe was cut, since a
+    // cut probe cannot prove a name absent.
+    let missing_sections: Option<Vec<String>> = match section_filter.as_deref() {
+        Some(names) if !names.is_empty() => {
+            const MISSING_SECTION_PROBE: usize = 1000;
+            let found = store
+                .selected_headings_bounded(&note.uid, names, MISSING_SECTION_PROBE)
+                .map_err(|e| anyhow!("selected_headings_bounded: {e}"))?;
+            (found.len() < MISSING_SECTION_PROBE).then(|| {
+                let found_lower: Vec<String> =
+                    found.iter().map(|heading| heading.text.to_lowercase()).collect();
+                names
+                    .iter()
+                    .filter(|name| {
+                        let wanted = name.to_lowercase();
+                        // The probe returns at most 256 characters of a
+                        // heading; a longer one matched on its full text.
+                        !found_lower.iter().any(|text| {
+                            *text == wanted
+                                || (text.chars().count() >= 256 && wanted.starts_with(text.as_str()))
+                        })
+                    })
+                    .cloned()
+                    .collect()
+            })
+        }
+        _ => None,
+    };
     let mut response = json!({
         "uid": note.uid,
         "title": note.title,
@@ -11005,6 +11044,9 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         "truncated": truncated,
         "retry": if body_truncated { Some("Continue with next_body_offset as body_offset and returned body_version; keep UID/sections unchanged. Metadata and outline remain independently bounded.") } else if truncated { Some("Body is complete or omitted; only metadata/outline are bounded. Read the source file for complete metadata.") } else { None },
     });
+    if let Some(missing) = missing_sections.filter(|missing| !missing.is_empty()) {
+        response["missing_sections"] = json!(missing);
+    }
     if publishing {
         // Answered from the live graph while an index publication was in
         // flight; the note itself was verified unchanged across the read.
@@ -26923,6 +26965,22 @@ mod cache_dispatch_tests {
         assert_eq!(result["truncated"], true);
     }
 
+    /// QA #11: `vault` accepts a name like `brain_context.vaults` does, and
+    /// an unknown vault is an error rather than a silent zero.
+    #[test]
+    fn orphan_documents_resolves_a_vault_name_and_refuses_an_unknown_one() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault_fixture()).unwrap();
+        store.insert_note(&note_fixture("note:lonely")).unwrap();
+        let by_uid = tool_brain_orphan_documents(&store, json!({"vault": "vlt:test"})).unwrap();
+        let by_name = tool_brain_orphan_documents(&store, json!({"vault": "test"})).unwrap();
+        assert_eq!(by_uid["total"], 1, "{by_uid}");
+        assert_eq!(by_name["total"], by_uid["total"], "{by_name}");
+        let error = tool_brain_orphan_documents(&store, json!({"vault": "nope"}))
+            .expect_err("an unknown vault must not answer zero");
+        assert!(error.to_string().contains("nope"), "{error}");
+    }
+
     fn vault_fixture() -> nestweaver_schema::Vault {
         nestweaver_schema::Vault {
             uid: "vlt:test".to_string(),
@@ -27248,6 +27306,34 @@ mod cache_dispatch_tests {
         );
         assert_eq!(result["candidate_total"], 250);
         assert_eq!(result["truncated"], true);
+    }
+
+    /// QA #11: a requested section that matches no heading is named in
+    /// `missing_sections` instead of silently yielding an empty body.
+    #[test]
+    fn note_get_names_requested_sections_that_do_not_exist() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault_fixture()).unwrap();
+        let note = note_fixture("note:sections");
+        store.insert_note(&note).unwrap();
+        store
+            .insert_heading(&nestweaver_schema::Heading {
+                uid: "head:sections:intro".into(),
+                note_uid: note.uid.clone(),
+                level: 2,
+                text: "Intro".into(),
+                slug: "intro".into(),
+                start_line: 1,
+                end_line: 3,
+                content_hash: "h".into(),
+                embedding: None,
+            })
+            .unwrap();
+        let result =
+            tool_note_get(&store, json!({"uid": note.uid, "sections": ["intro", "Nope"]})).unwrap();
+        assert_eq!(result["missing_sections"], json!(["Nope"]), "{result}");
+        let result = tool_note_get(&store, json!({"uid": note.uid, "sections": ["Intro"]})).unwrap();
+        assert!(result.get("missing_sections").is_none(), "{result}");
     }
 
     #[test]
