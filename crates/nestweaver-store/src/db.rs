@@ -381,6 +381,14 @@ impl Drop for HoldOff<'_> {
 /// success with no rows, and the store is flagged for a reopen (see
 /// [`GraphStore::reopen_required`]). Reporting it as a failure would invite a
 /// retry that applies the write twice.
+///
+/// The one exception is a bulk `COPY … FROM`. The engine writes copied rows
+/// straight into data pages and logs no row records for them; the checkpoint
+/// it forces after the COPY is what makes them durable (`replayCopyTableRecord`
+/// in `src/storage/wal/records/copy_table_record_replay.cpp` is a no-op). If
+/// that checkpoint fails, the rows are visible on this handle but the reopen
+/// loses them, so a transaction that ran a COPY reports the failure as a
+/// failure (see [`bulk_copy_not_durable`]).
 pub struct StoreConnection<'a> {
     // Declared first so it drops BEFORE the guard below.
     conn: std::mem::ManuallyDrop<lbug::Connection<'a>>,
@@ -390,6 +398,11 @@ pub struct StoreConnection<'a> {
     native_timeout_ms: std::sync::atomic::AtomicU64,
     _native_registration: Option<ConnectionRegistration<'a>>,
     deferred: Option<&'a std::sync::atomic::AtomicBool>,
+    /// An explicit `BEGIN TRANSACTION` is open on this connection.
+    explicit_transaction: std::sync::atomic::AtomicBool,
+    /// The open transaction (explicit, or the statement now running) ran a
+    /// bulk `COPY … FROM`, whose rows only a checkpoint makes durable.
+    bulk_copy_pending: std::sync::atomic::AtomicBool,
     native_admission: Option<&'a NativeAdmission>,
     // Keep the native database open through destruction and unregistering.
     _open: Option<std::sync::RwLockReadGuard<'a, ()>>,
@@ -471,6 +484,71 @@ impl std::fmt::Display for StoreRows<'_, '_> {
             None => Ok(()),
         }
     }
+}
+
+/// What a statement does to the connection's transaction, as far as the
+/// durability of a bulk COPY is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatementEffect {
+    Begin,
+    End,
+    BulkCopy,
+    Other,
+}
+
+/// Classify `query` by its words. A false positive only makes a checkpoint
+/// failure read as a failure, which is the safe direction.
+fn statement_effect(query: &str) -> StatementEffect {
+    let mut words = query
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|word| !word.is_empty());
+    match words.next() {
+        Some(word) if word.eq_ignore_ascii_case("BEGIN") => StatementEffect::Begin,
+        Some(word)
+            if word.eq_ignore_ascii_case("COMMIT") || word.eq_ignore_ascii_case("ROLLBACK") =>
+        {
+            StatementEffect::End
+        }
+        Some(word)
+            if word.eq_ignore_ascii_case("COPY")
+                && words.any(|word| word.eq_ignore_ascii_case("FROM")) =>
+        {
+            StatementEffect::BulkCopy
+        }
+        _ => StatementEffect::Other,
+    }
+}
+
+/// The error for a transaction that ran a bulk COPY and whose checkpoint the
+/// engine then deferred: the rows it loaded are NOT durable.
+///
+/// The engine's own wording ("Transaction committed successfully … The
+/// committed data is durable and will be recovered on restart") is true of
+/// rows the log holds and false of copied rows, which it never logs. Only the
+/// underlying cause is kept, with the frozen-log sentence reworded, so the
+/// message never classifies as
+/// [`crate::error::CheckpointFailure::CommittedCheckpointDeferred`] and no
+/// caller can read it as committed.
+fn bulk_copy_not_durable(message: &str) -> String {
+    const RESTART: &str = "recovered on restart:";
+    const FROZEN: &str = "the frozen wal of an earlier checkpoint is still pending";
+    let lower = message.to_ascii_lowercase();
+    let mut cause = match lower.rfind(RESTART) {
+        Some(at) => message[at + RESTART.len()..].trim().to_string(),
+        None => message.to_string(),
+    };
+    while let Some(at) = cause.to_ascii_lowercase().find(FROZEN) {
+        cause.replace_range(
+            at..at + FROZEN.len(),
+            "the log of an earlier interrupted checkpoint is still on disk",
+        );
+    }
+    format!(
+        "bulk COPY was NOT made durable: the storage engine loads COPY rows into data \
+         pages that only its post-COPY checkpoint persists, and that checkpoint failed, so \
+         the rows are lost when the store reopens (the daemon reopens it automatically). \
+         Nothing this transaction loaded by COPY may be treated as written. Cause: {cause}"
+    )
 }
 
 /// True when `query` has a `RETURN` clause: its rows are part of its answer.
@@ -594,6 +672,7 @@ fn statement_has_checkpoint(query: &str) -> bool {
 pub struct StoreStatement<'c> {
     inner: lbug::PreparedStatement,
     returns_rows: bool,
+    effect: StatementEffect,
     exclusive: bool,
     checkpoint: bool,
     _connection: std::marker::PhantomData<&'c ()>,
@@ -619,6 +698,8 @@ impl<'a> StoreConnection<'a> {
             _native_registration: None,
             _open: None,
             deferred: None,
+            explicit_transaction: std::sync::atomic::AtomicBool::new(false),
+            bulk_copy_pending: std::sync::atomic::AtomicBool::new(false),
             native_admission: None,
         }
     }
@@ -638,8 +719,12 @@ impl<'a> StoreConnection<'a> {
         {
             gate.observe_write("BEGIN TRANSACTION");
         }
+        let effect = statement_effect(query);
+        self.note_statement_start(effect);
         let result = self.conn.query(query);
-        self.settle(result, statement_returns_rows(query))
+        let settled = self.settle(result, statement_returns_rows(query));
+        self.note_statement_end(effect);
+        settled
     }
 
     /// Prepare one statement.
@@ -652,6 +737,7 @@ impl<'a> StoreConnection<'a> {
         Ok(StoreStatement {
             inner,
             returns_rows: statement_returns_rows(query),
+            effect: statement_effect(query),
             exclusive,
             checkpoint: statement_has_checkpoint(query),
             _connection: std::marker::PhantomData,
@@ -678,8 +764,37 @@ impl<'a> StoreConnection<'a> {
         {
             gate.observe_write("write statement");
         }
+        self.note_statement_start(statement.effect);
         let result = self.conn.execute(&mut statement.inner, params);
-        self.settle(result, statement.returns_rows)
+        let settled = self.settle(result, statement.returns_rows);
+        self.note_statement_end(statement.effect);
+        settled
+    }
+
+    /// Track whether the transaction a statement belongs to ran a bulk COPY,
+    /// before the statement runs (its own commit may defer the checkpoint).
+    fn note_statement_start(&self, effect: StatementEffect) {
+        use std::sync::atomic::Ordering;
+        match effect {
+            StatementEffect::Begin => {
+                self.explicit_transaction.store(true, Ordering::Relaxed);
+                self.bulk_copy_pending.store(false, Ordering::Relaxed);
+            }
+            StatementEffect::BulkCopy => self.bulk_copy_pending.store(true, Ordering::Relaxed),
+            StatementEffect::End | StatementEffect::Other => {}
+        }
+    }
+
+    /// A statement outside an explicit transaction, or a COMMIT/ROLLBACK,
+    /// ends the transaction the COPY flag describes.
+    fn note_statement_end(&self, effect: StatementEffect) {
+        use std::sync::atomic::Ordering;
+        if effect == StatementEffect::End {
+            self.explicit_transaction.store(false, Ordering::Relaxed);
+        }
+        if !self.explicit_transaction.load(Ordering::Relaxed) {
+            self.bulk_copy_pending.store(false, Ordering::Relaxed);
+        }
     }
 
     // Legacy callers receive lbug::Error. A scoped context boundary must check
@@ -813,6 +928,17 @@ impl<'a> StoreConnection<'a> {
                 }
                 if let Some(deferred) = self.deferred {
                     deferred.store(true, std::sync::atomic::Ordering::Release);
+                }
+                if self
+                    .bulk_copy_pending
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    // Not durable, whatever the engine says: see
+                    // `bulk_copy_not_durable`. The reopen is still flagged, so
+                    // the visible-but-lost rows go away at the next safe point.
+                    let detail = bulk_copy_not_durable(&message);
+                    tracing::error!("{detail}");
+                    return Err(lbug::Error::FailedQuery(detail));
                 }
                 if message
                     .to_lowercase()
@@ -4534,6 +4660,8 @@ impl GraphStore {
             _native_registration: Some(registration),
             _open: Some(open),
             deferred: Some(&self.checkpoint_deferred),
+            explicit_transaction: std::sync::atomic::AtomicBool::new(false),
+            bulk_copy_pending: std::sync::atomic::AtomicBool::new(false),
             native_admission: Some(&self.db.native_admission),
         };
         if let Some(deadline) = READ_DEADLINE.get() {
@@ -9950,6 +10078,149 @@ mod wal_recovery_arm_tests {
             "{error}"
         );
         assert!(fresh.reopen_required());
+    }
+
+    fn bulk_copy_symbol(uid: &str) -> nestweaver_schema::Symbol {
+        nestweaver_schema::Symbol {
+            uid: uid.to_string(),
+            name: uid.to_string(),
+            kind: nestweaver_schema::SymbolKind::Function,
+            repo_uid: "repo:copy".to_string(),
+            file_path: "src/a.ts".to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature: format!("function {uid}()"),
+            summary: None,
+            content_hash: "hash".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: nestweaver_schema::Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        }
+    }
+
+    /// The real engine, no NestWeaver code: a COPY whose forced checkpoint
+    /// fails reports "committed … durable", its rows are visible on the
+    /// handle, and a reopen loses every one of them. This is why a COPY's
+    /// deferred checkpoint cannot be reported as committed.
+    #[test]
+    fn the_engine_loses_a_bulk_copy_whose_forced_checkpoint_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.lbug");
+        let csv = dir.path().join("rows.csv");
+        std::fs::write(&csv, "k\na\nb\nc\n").unwrap();
+        let count = |db: &lbug::Database| -> i64 {
+            let conn = lbug::Connection::new(db).unwrap();
+            let mut rows = conn.query("MATCH (t:T) RETURN count(t)").unwrap();
+            match rows.next().unwrap().remove(0) {
+                lbug::Value::Int64(n) => n,
+                other => panic!("count returned {other:?}"),
+            }
+        };
+        {
+            let db = lbug::Database::new(&path, bounded_system_config()).unwrap();
+            let conn = lbug::Connection::new(&db).unwrap();
+            conn.query("CREATE NODE TABLE T(k STRING, PRIMARY KEY(k))")
+                .unwrap();
+            conn.query("CHECKPOINT").unwrap();
+            std::fs::write(format!("{}.wal.checkpoint", path.display()), b"").unwrap();
+            let message = match conn.query(&format!(
+                "COPY T FROM '{}' (HEADER=true, PARALLEL=FALSE)",
+                csv.display()
+            )) {
+                Ok(_) => panic!("the forced checkpoint must refuse over a pending frozen log"),
+                Err(error) => error.to_string(),
+            };
+            assert_eq!(
+                classify_checkpoint_failure(&message),
+                Some(CheckpointFailure::CommittedCheckpointDeferred),
+                "{message}"
+            );
+            drop(conn);
+            assert_eq!(
+                count(&db),
+                3,
+                "the copied rows are visible before the reopen"
+            );
+        }
+        let db = lbug::Database::new(&path, bounded_system_config()).unwrap();
+        assert_eq!(
+            count(&db),
+            0,
+            "the engine said the COPY was durable; the reopen kept none of its rows"
+        );
+    }
+
+    /// Through the store: a COPY whose checkpoint the engine defers is a
+    /// FAILURE, autocommitted or inside an explicit transaction, never an
+    /// error that reads as committed. The reopen is still flagged, and after
+    /// it the rows are gone, exactly as the error said.
+    #[test]
+    fn the_store_reports_a_bulk_copy_whose_checkpoint_fails_as_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = GraphStore::create(&db).unwrap();
+        store.checkpoint().unwrap();
+        let frozen = dir.path().join("brain.lbug.wal.checkpoint");
+
+        std::fs::write(&frozen, b"").unwrap();
+        let error = store
+            .batch_insert_symbols(&[bulk_copy_symbol("autocommit")])
+            .expect_err("a COPY whose checkpoint failed was not written");
+        assert!(!error.is_committed_despite_error(), "{error}");
+        assert!(error.to_string().contains("NOT made durable"), "{error}");
+        assert!(store.reopen_required());
+        assert_eq!(
+            store.reopen_after_deferred_checkpoint(None).unwrap(),
+            ReopenOutcome::Reopened
+        );
+        assert_eq!(
+            store.count_symbols().unwrap(),
+            0,
+            "the reopen dropped the rows"
+        );
+
+        std::fs::write(&frozen, b"").unwrap();
+        let conn = store.begin_transaction().unwrap();
+        GraphStore::batch_insert_symbols_on(&conn, &[bulk_copy_symbol("explicit")]).unwrap();
+        let error = store
+            .commit_transaction(&conn)
+            .expect_err("the COMMIT of a transaction that ran a COPY is not durable");
+        drop(conn);
+        assert!(!error.is_committed_despite_error(), "{error}");
+        assert!(store.reopen_required());
+        // Reopen checkpointing every commit, so the counterweight's ordinary
+        // write meets the same refused checkpoint a COPY forces.
+        super::CHECKPOINT_EVERY_COMMIT.with(|flag| flag.set(true));
+        let reopened = store.reopen_after_deferred_checkpoint(None);
+        super::CHECKPOINT_EVERY_COMMIT.with(|flag| flag.set(false));
+        assert_eq!(reopened.unwrap(), ReopenOutcome::Reopened);
+        assert_eq!(store.count_symbols().unwrap(), 0);
+
+        // Counterweight: the same failure after a write the log holds is still
+        // committed, and survives the reopen.
+        std::fs::write(&frozen, b"").unwrap();
+        store
+            .insert_symbol(&bulk_copy_symbol("logged"))
+            .expect("a logged write whose checkpoint was deferred committed");
+        assert!(store.reopen_required());
+        assert_eq!(
+            store.reopen_after_deferred_checkpoint(None).unwrap(),
+            ReopenOutcome::Reopened
+        );
+        assert_eq!(store.count_symbols().unwrap(), 1);
+        assert_eq!(
+            super::statement_effect("copy Symbol FROM '/x.csv' (HEADER=true)"),
+            super::StatementEffect::BulkCopy
+        );
+        assert_eq!(
+            super::statement_effect("COPY (MATCH (n) RETURN n) TO '/x.csv'"),
+            super::StatementEffect::Other
+        );
     }
 
     /// The recovery the flag asks for: close and reopen the handle in place.
