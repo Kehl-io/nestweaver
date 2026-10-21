@@ -908,11 +908,36 @@ impl GraphStore {
         if candidates.is_empty() {
             return Ok(candidates);
         }
-        let uids: Vec<&str> = candidates.iter().map(|s| s.uid.as_str()).collect();
-        let chains = self.container_chains(&uids, qualified.max_container_depth())?;
+        let chains = self.symbol_container_chains(&candidates, qualified.max_container_depth())?;
         Ok(qualified.select(candidates, |uid| {
             chains.get(uid).map_or(&[][..], Vec::as_slice)
         }))
+    }
+
+    /// [`Self::container_chains`] for `symbols`, with a Go method's receiver
+    /// type as its container when it has no `MEMBER_OF` edge (QA #5: Go
+    /// declares methods outside their type, so `UUID::String` named
+    /// nothing). Use this wherever the symbols are already in hand.
+    pub fn symbol_container_chains(
+        &self,
+        symbols: &[Symbol],
+        depth: usize,
+    ) -> Result<HashMap<String, Vec<String>>, StoreError> {
+        let uids: Vec<&str> = symbols.iter().map(|s| s.uid.as_str()).collect();
+        let mut chains = self.container_chains(&uids, depth)?;
+        if depth > 0 {
+            for symbol in symbols {
+                if chains.get(&symbol.uid).is_some_and(|chain| !chain.is_empty()) {
+                    continue;
+                }
+                if let Some(receiver) =
+                    nestweaver_schema::go_receiver_type(&symbol.file_path, &symbol.signature)
+                {
+                    chains.insert(symbol.uid.clone(), vec![receiver.to_string()]);
+                }
+            }
+        }
+        Ok(chains)
     }
 
     /// Each symbol's `MEMBER_OF` container names, innermost first, up to

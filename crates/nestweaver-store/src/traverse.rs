@@ -21,6 +21,10 @@ pub struct SymbolSearchPage {
 }
 
 struct RankedSymbol<'a> {
+    /// Name-match tier: 3 = exact (case-sensitive), 2 = exact ignoring case,
+    /// 1 = prefix, 0 = contains. Compared BEFORE the path-adjusted score so
+    /// a fuzzier match can never displace an exact one from a capped page.
+    tier: u8,
     adjusted_score: f64,
     kind_rank: usize,
     file_path: &'a str,
@@ -47,9 +51,14 @@ impl Ord for RankedSymbol<'_> {
         // "Less" means better-ranked. BinaryHeap therefore keeps the worst
         // retained candidate at peek(), making bounded top-K replacement O(log K).
         other
-            .adjusted_score
-            .partial_cmp(&self.adjusted_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .tier
+            .cmp(&self.tier)
+            .then_with(|| {
+                other
+                    .adjusted_score
+                    .partial_cmp(&self.adjusted_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .then_with(|| self.kind_rank.cmp(&other.kind_rank))
             .then_with(|| self.file_path.cmp(other.file_path))
             // Preserve stable DB/cache order for otherwise identical keys.
@@ -164,6 +173,27 @@ impl SymbolNameTable {
             limit,
             seed_resolution,
             SYMBOL_SEARCH_COUNT_CAP,
+            &|_| true,
+        )
+    }
+
+    /// [`Self::search_page`] restricted to symbols `keep` admits. The filter
+    /// runs BEFORE ranking and the `limit` cut, so a scope (one repo, say)
+    /// gets its own top `limit` rather than whatever survived a global cut.
+    pub fn search_page_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        seed_resolution: &SeedResolutionConfig,
+        keep: &dyn Fn(&nestweaver_schema::Symbol) -> bool,
+    ) -> Result<SymbolSearchPage, StoreError> {
+        rank_symbol_name_page(
+            &self.0,
+            query,
+            limit,
+            seed_resolution,
+            SYMBOL_SEARCH_COUNT_CAP,
+            keep,
         )
     }
 }
@@ -1380,7 +1410,10 @@ impl GraphStore {
     /// DB round-trip entirely and filter the in-memory list.
     ///
     /// Candidates are scored by:
-    /// 1. **Name quality** — exact (`4.0`), prefix (`2.0`), or contains (`1.0`).
+    /// 1. **Name tier** — exact case-sensitive, then exact ignoring case, then
+    ///    prefix, then contains. Tiers are strict: no path factor lifts a
+    ///    prefix match above an exact one, so a capped page never drops an
+    ///    exact match while it keeps a fuzzier one.
     /// 2. **Path factor** — multiplicative `[seed_resolution].path_deboost`
     ///    rules (defaults target JS/TS test mirrors like `playwright/`,
     ///    `__tests__/`, `*.test.ts`).
@@ -1537,7 +1570,7 @@ impl GraphStore {
             });
         }
         let entry = self.symbol_name_entry(after_db_scan, inside_publication_barrier)?;
-        rank_symbol_name_page(&entry, query, limit, seed_resolution, count_cap)
+        rank_symbol_name_page(&entry, query, limit, seed_resolution, count_cap, &|_| true)
     }
 }
 
@@ -1548,6 +1581,7 @@ fn rank_symbol_name_page(
     limit: usize,
     seed_resolution: &SeedResolutionConfig,
     count_cap: usize,
+    keep: &dyn Fn(&nestweaver_schema::Symbol) -> bool,
 ) -> Result<SymbolSearchPage, StoreError> {
     if limit > crate::tantivy_index::SEARCH_PRESENTATION_LIMIT_MAX {
         return Err(StoreError::PresentationLimitExceeded {
@@ -1575,6 +1609,9 @@ fn rank_symbol_name_page(
         if sym.is_module_owner() && *lower != needle {
             continue;
         }
+        if !keep(sym) {
+            continue;
+        }
         if counted < count_cap {
             counted += 1;
             if counted == count_cap {
@@ -1583,12 +1620,17 @@ fn rank_symbol_name_page(
         } else {
             count_saturated = true;
         }
-        let base_score = if *lower == needle {
-            4.0_f64 // exact
+        // The caller typed a case; honour it. `Parse` and five `parse`
+        // methods all match case-insensitively, and ranking them as equals
+        // let kind/path tiebreaks cut the one symbol actually named.
+        let (tier, base_score) = if sym.name == query {
+            (3_u8, 4.0_f64) // exact, case-sensitive
+        } else if *lower == needle {
+            (2, 4.0) // exact ignoring case
         } else if lower.starts_with(&needle) {
-            2.0_f64 // prefix
+            (1, 2.0) // prefix
         } else {
-            1.0_f64 // contains
+            (0, 1.0) // contains
         };
         let path_factor = compute_path_factor(&sym.file_path, &seed_resolution.path_deboost);
         let adjusted = base_score * path_factor;
@@ -1596,6 +1638,7 @@ fn rank_symbol_name_page(
             continue;
         }
         let ranked = RankedSymbol {
+            tier,
             adjusted_score: adjusted,
             kind_rank: kind_rank(sym.kind, &seed_resolution.kind_priority),
             file_path: &sym.file_path,
@@ -1942,6 +1985,65 @@ mod tests {
             .search_symbols_by_name("payment", 1, &no_rules())
             .unwrap();
         assert_eq!(page.symbols[0].uid, legacy[0].uid);
+    }
+
+    /// QA: seeds `["Parse"]` returned five lowercase `parse` methods and cut
+    /// the only symbol actually named `Parse`. An exact-case match must rank
+    /// first, and no fuzzier tier may displace an exact one from the page.
+    #[test]
+    fn exact_case_match_outranks_case_insensitive_and_prefix_matches() {
+        let store = GraphStore::in_memory().unwrap();
+        for i in 0..5 {
+            let mut sym = make_symbol(&format!("lower{i}"), "parse");
+            sym.kind = SymbolKind::Method;
+            sym.file_path = format!("a/lower{i}.go");
+            store.insert_symbol(&sym).unwrap();
+        }
+        let mut exact = make_symbol("exact", "Parse");
+        exact.file_path = "z/uuid.go".to_string();
+        store.insert_symbol(&exact).unwrap();
+        let page = store
+            .search_symbols_by_name_page("Parse", 5, &SeedResolutionConfig::default())
+            .unwrap();
+        assert_eq!(page.symbols[0].uid, "exact", "{:?}", page.symbols);
+        assert_eq!(page.total.value, 6);
+
+        // A prefix match in production code does not displace an exact match
+        // that a path rule deboosts.
+        let store = GraphStore::in_memory().unwrap();
+        let mut in_tests = make_symbol("t", "socket_path");
+        in_tests.file_path = "tests/support.rs".to_string();
+        store.insert_symbol(&in_tests).unwrap();
+        store
+            .insert_symbol(&make_symbol("p", "socket_path_for"))
+            .unwrap();
+        let page = store
+            .search_symbols_by_name_page("socket_path", 1, &SeedResolutionConfig::default())
+            .unwrap();
+        assert_eq!(page.symbols[0].uid, "t");
+    }
+
+    /// A scope filter applies before the cut: a repo's own exact match is
+    /// returned even when other repos fill the global top-`limit`.
+    #[test]
+    fn filtered_name_search_ranks_inside_the_scope() {
+        let store = GraphStore::in_memory().unwrap();
+        for i in 0..6 {
+            store
+                .insert_symbol(&make_symbol(&format!("other{i}"), "Parse"))
+                .unwrap();
+        }
+        let mut mine = make_symbol("mine", "Parse");
+        mine.repo_uid = "repo:uuid".to_string();
+        mine.file_path = "zzz.go".to_string();
+        store.insert_symbol(&mine).unwrap();
+        let table = store.symbol_name_table().unwrap();
+        let page = table
+            .search_page_filtered("Parse", 5, &no_rules(), &|s| s.repo_uid == "repo:uuid")
+            .unwrap();
+        assert_eq!(page.symbols.len(), 1);
+        assert_eq!(page.symbols[0].uid, "mine");
+        assert_eq!(page.total.value, 1);
     }
 
     #[test]

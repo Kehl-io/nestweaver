@@ -1575,6 +1575,7 @@ fn rebuild_full_index_write_set_from_disk(
         )?;
     }
     let contract_plan_result = if *set.files_unchanged == 0 {
+        let published = published_spec_sources(store, set.r_uid);
         prepare_contract_derivation(
             reader,
             set.r_uid,
@@ -1582,6 +1583,7 @@ fn rebuild_full_index_write_set_from_disk(
             set.handler_files,
             set.all_symbols,
             true,
+            published.as_ref(),
         )
     } else {
         prepare_incremental_contract_derivation(reader, set.r_uid, set.repo_url)
@@ -5609,6 +5611,7 @@ where
     spec_files.sort();
     handler_files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     let contract_plan_result = if files_unchanged == 0 {
+        let published = published_spec_sources(store, &r_uid);
         prepare_contract_derivation(
             reader,
             &r_uid,
@@ -5616,6 +5619,7 @@ where
             &handler_files,
             &all_symbols,
             true,
+            published.as_ref(),
         )
     } else {
         prepare_incremental_contract_derivation(reader, &r_uid, repo_url)
@@ -6773,6 +6777,7 @@ fn prepare_incremental_contract_derivation(
         &handler_files,
         &all_symbols,
         true,
+        None,
     )?;
     plan.skipped_files.extend(skipped_files);
     Ok(plan)
@@ -6894,6 +6899,7 @@ where
         &handler_files,
         &all_symbols,
         true,
+        None,
     )?;
     plan.skipped_files.extend(skipped_files);
     after_plan();
@@ -6958,6 +6964,19 @@ pub(crate) struct ContractDerivationPlan {
     pub(crate) skipped_files: Vec<SkippedFile>,
 }
 
+/// Source paths that already published contracts for `r_uid`. A full index
+/// may skip an unparseable spec only when it is absent from this set; `None`
+/// (the listing failed) keeps every spec fail-closed.
+fn published_spec_sources(store: &GraphStore, r_uid: &str) -> Option<HashSet<String>> {
+    match store.list_contracts(Some(r_uid)) {
+        Ok(contracts) => Some(contracts.into_iter().map(|c| c.source_path).collect()),
+        Err(error) => {
+            tracing::warn!("listing published contracts for {r_uid} failed: {error}");
+            None
+        }
+    }
+}
+
 /// Prepare contract rows and implementation edges without mutating the graph.
 /// All source reads and parsing finish before an incremental transaction opens.
 fn prepare_contract_derivation(
@@ -6967,6 +6986,7 @@ fn prepare_contract_derivation(
     handler_files: &[HandlerFileData],
     all_symbols: &[nestweaver_schema::Symbol],
     strict: bool,
+    published_spec_sources: Option<&HashSet<String>>,
 ) -> Result<ContractDerivationPlan, anyhow::Error> {
     use nestweaver_schema::{EdgeType, ResolvedEdge};
 
@@ -7021,9 +7041,32 @@ fn prepare_contract_derivation(
         }
         let parsed_specs = if strict {
             input_hashes.insert(rel.clone(), crate::hash::blake3_hex(&source));
-            crate::contracts::parse_spec_file_strict(&rel, &source)
-                .map_err(anyhow::Error::msg)
-                .with_context(|| format!("parse watched contract spec {rel}"))?
+            match crate::contracts::parse_spec_file_strict(&rel, &source) {
+                Ok(parsed) => parsed,
+                // QA #9: one malformed `openapi.yaml` anywhere in a repo used
+                // to fail the whole index, including the FIRST one. Strictness
+                // exists to protect contracts already published from a spec
+                // (a half-saved file must not clear them); a spec that never
+                // produced any has nothing to protect, so it is skipped and
+                // disclosed as degraded coverage instead.
+                Err(error)
+                    if published_spec_sources.is_some_and(|published| !published.contains(&rel)) =>
+                {
+                    tracing::warn!("skipping unparseable contract spec {rel}: {error}");
+                    skipped_files.push(SkippedFile {
+                        path: rel,
+                        reason: format!("contract spec could not be parsed: {error}"),
+                        reason_code: SkipReasonCode::ParseError,
+                        observed_bytes: None,
+                        limit_bytes: None,
+                    });
+                    continue;
+                }
+                Err(error) => {
+                    return Err(anyhow::Error::msg(error))
+                        .with_context(|| format!("parse watched contract spec {rel}"));
+                }
+            }
         } else {
             crate::contracts::parse_spec_file(&rel, &source)
         };
@@ -15914,6 +15957,54 @@ function hello(name) { return "Hello " + name; }
                 .is_clean(),
             "a successful re-index must clear the degradation marker"
         );
+    }
+
+    /// QA #9: a malformed spec that never published contracts is a disclosed
+    /// skip on the FIRST index, not a failure of the whole repository. The
+    /// healthy spec beside it still derives its contracts.
+    #[test]
+    fn first_index_skips_an_unparseable_spec_that_published_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        write_shared_route_repo(&src);
+        fs::create_dir_all(src.join("docs")).unwrap();
+        fs::write(src.join("docs/openapi.yaml"), "openapi: [malformed").unwrap();
+
+        let (first, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123")
+                .expect("an unparseable, never-published spec must not fail the first index");
+        assert!(first.contracts_derived > 0, "the healthy spec still derives");
+        assert!(
+            first.skipped_files.iter().any(|skipped| {
+                skipped.path == "docs/openapi.yaml"
+                    && skipped.reason_code == SkipReasonCode::ParseError
+            }),
+            "the skip must be disclosed: {:?}",
+            first.skipped_files
+        );
+        assert!(
+            store
+                .list_contracts(None)
+                .unwrap()
+                .iter()
+                .all(|contract| contract.source_path != "docs/openapi.yaml")
+        );
+    }
+
+    /// QA #9: a pathologically nested spec is refused in one linear pass
+    /// rather than handed to the YAML parser.
+    #[test]
+    fn deeply_nested_spec_is_refused_quickly() {
+        let depth = 20_000;
+        let mut spec = String::from("openapi: 3.0.0\npaths: ");
+        spec.push_str(&"{a: ".repeat(depth));
+        spec.push('1');
+        spec.push_str(&"}".repeat(depth));
+        let started = std::time::Instant::now();
+        let error = crate::contracts::parse_spec_file_strict("openapi.yaml", &spec)
+            .expect_err("a 20k-deep document must be refused");
+        assert!(error.contains("nesting"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     /// A malformed recognized spec fails before graph/SHA publication, retains

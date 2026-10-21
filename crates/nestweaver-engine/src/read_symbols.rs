@@ -491,6 +491,23 @@ pub fn resolve_spec_detailed(store: &GraphStore, spec: &str) -> SpecResolution {
         }
         return SpecResolution::default();
     }
+    // QA #5: `UUID.String` named every `String` in the graph. A dotted
+    // `Type.member` is read as `Type::member` first; only when that names
+    // nothing does the last segment answer, as before.
+    if let Some((owner, member)) = spec.rsplit_once('.')
+        && !owner.is_empty()
+        && !member.is_empty()
+    {
+        let qualified = store
+            .lookup_symbols_by_spec(&format!("{owner}::{member}"))
+            .unwrap_or_default();
+        if !qualified.is_empty() {
+            return SpecResolution {
+                symbols: qualified,
+                qualifier_ignored: None,
+            };
+        }
+    }
     SpecResolution {
         symbols: store
             .lookup_symbols_by_name(last_dotted_segment(spec))
@@ -583,8 +600,9 @@ pub fn not_found_suggestions(store: &GraphStore, not_found: &[String]) -> Vec<St
 
 /// nw-113: the [`AmbiguousMatch::hint`] for `candidates` of `spec`.
 fn ambiguity_hint(store: &GraphStore, spec: &str, candidates: &[Symbol]) -> String {
-    let uids: Vec<&str> = candidates.iter().map(|s| s.uid.as_str()).collect();
-    let containers = store.container_chains(&uids, 1).unwrap_or_default();
+    let containers = store
+        .symbol_container_chains(candidates, 1)
+        .unwrap_or_default();
     let class_of = |s: &Symbol| containers.get(&s.uid).and_then(|chain| chain.first());
     // Candidates in a class are told apart by `path::Class::name`.
     let mut seen = HashSet::new();
