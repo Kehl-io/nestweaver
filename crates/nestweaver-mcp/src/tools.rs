@@ -12221,15 +12221,97 @@ fn match_repo_target<'a>(
             let r_url = r.url.trim_end_matches('/');
             r.uid == target
                 || r.name.as_deref() == Some(target_trimmed)
+                || r_url == target_trimmed
                 || r_url == url_target.trim_end_matches('/')
                 || r_url == canonical_target.trim_end_matches('/')
                 || (!origin_target.is_empty() && r_url == origin_target.trim_end_matches('/'))
                 || (!canonical_path.is_empty()
                     && r.local_root().map(|p| p.trim_end_matches('/'))
                         == Some(canonical_path.trim_end_matches('/')))
-                || r_url.ends_with(&format!("/{target_trimmed}"))
         })
         .collect()
+}
+
+/// Match a `target` against indexed vaults by UID, display name, root path, or
+/// canonical root path — exact matches only, as for repos.
+fn match_vault_target<'a>(
+    vaults: &'a [nestweaver_schema::Vault],
+    target: &str,
+) -> Vec<&'a nestweaver_schema::Vault> {
+    let target_trimmed = target.trim_end_matches('/');
+    let canonical_target = std::fs::canonicalize(target_trimmed)
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    vaults
+        .iter()
+        .filter(|v| {
+            let root = v.root_path.trim_end_matches('/');
+            v.uid == target
+                || v.name == target_trimmed
+                || root == target_trimmed
+                || (!canonical_target.is_empty()
+                    && (root == canonical_target.trim_end_matches('/')
+                        || std::fs::canonicalize(&v.root_path)
+                            .is_ok_and(|p| p.display().to_string() == canonical_target)))
+        })
+        .collect()
+}
+
+/// The single source a `brain_remove_source` target names.
+#[derive(Debug)]
+enum RemoveTarget<'a> {
+    Repo(&'a nestweaver_schema::Repo),
+    Vault(&'a nestweaver_schema::Vault),
+}
+
+/// Resolve a removal target across repos AND vaults before deleting anything.
+/// Removal is permanent, so a target that names more than one source — two
+/// repos, or a repo and a vault sharing a name — refuses and lists every
+/// candidate with its UID; it used to delete the repo without checking vaults.
+fn resolve_remove_target<'a>(
+    repos: &'a [nestweaver_schema::Repo],
+    vaults: &'a [nestweaver_schema::Vault],
+    target: &str,
+) -> Result<RemoveTarget<'a>, anyhow::Error> {
+    let mut matches: Vec<RemoveTarget<'a>> = match_repo_target(repos, target)
+        .into_iter()
+        .map(RemoveTarget::Repo)
+        .collect();
+    matches.extend(
+        match_vault_target(vaults, target)
+            .into_iter()
+            .map(RemoveTarget::Vault),
+    );
+    match matches.len() {
+        0 => Err(target_not_found(
+            format!("no repo or vault matching '{target}' found"),
+            "target",
+            json!(target),
+            &[],
+        )),
+        1 => Ok(matches.remove(0)),
+        _ => {
+            let candidates = matches
+                .iter()
+                .map(|candidate| match candidate {
+                    RemoveTarget::Repo(repo) => format!(
+                        "repo '{}' (uid {})",
+                        repo.name.as_deref().unwrap_or(&repo.url),
+                        repo.uid
+                    ),
+                    RemoveTarget::Vault(vault) => {
+                        format!("vault '{}' (uid {})", vault.name, vault.uid)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(anyhow!(
+                "'{target}' matches {} sources: {candidates}. Nothing was removed; pass one \
+                 candidate's UID to choose.",
+                matches.len()
+            ))
+        }
+    }
 }
 
 fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
@@ -12239,102 +12321,60 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
         .ok_or_else(|| anyhow!("'target' is required"))?
         .to_string();
 
-    // Try to resolve as a repo first, then as a vault.
     let repos = store.list_repos(None)?;
-    let canonical_target = std::fs::canonicalize(&target)
-        .map(|p| format!("file://{}", p.display()))
-        .unwrap_or_default();
-    let matched_repo = match_repo_target(&repos, &target);
-
-    if matched_repo.len() == 1 {
-        #[cfg(feature = "daemon")]
-        {
-            let repo = matched_repo[0];
-            let repo_uid = repo.uid.clone();
-            let display = repo.name.clone().unwrap_or_else(|| repo.url.clone());
-            let db_path = current_db_path(store)?;
-            let db_path_buf = std::path::PathBuf::from(&db_path);
-            let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
-            let sock_path = inline_ensure_daemon(&db_path_buf)
-                .map_err(|e| anyhow::anyhow!("failed to start daemon: {e}"))?;
-            let mut client = rt.block_on(inline_connect_daemon(&sock_path))?;
-            let resp = rt
-                .block_on(client.remove_repo(nestweaver_proto::RemoveRepoRequest {
-                    repo_uid: repo_uid.clone(),
-                }))
-                .map_err(|e| anyhow!("remove_repo RPC failed: {e}"))?;
-            let inner = resp.into_inner();
-            return Ok(json!({
-                "kind": "repo",
-                "name": display,
-                "uid": repo_uid,
-                "files_deleted": inner.files_deleted,
-                "symbols_deleted": inner.symbols_deleted
-            }));
-        }
-        #[cfg(not(feature = "daemon"))]
-        return Err(anyhow!("brain_remove_source requires daemon mode"));
-    }
-
-    // Try vaults
     let vaults = store.list_vaults(None)?;
-    let matched_vault: Vec<&nestweaver_schema::Vault> = vaults
-        .iter()
-        .filter(|v| {
-            v.uid == target
-                || v.name == target
-                || v.root_path == target
-                || v.root_path == canonical_target.strip_prefix("file://").unwrap_or("")
-                || std::fs::canonicalize(&v.root_path)
-                    .map(|p| format!("file://{}", p.display()))
-                    .unwrap_or_default()
-                    == canonical_target
-        })
-        .collect();
+    let resolved = resolve_remove_target(&repos, &vaults, &target)?;
 
-    if matched_vault.len() == 1 {
-        #[cfg(feature = "daemon")]
-        {
-            let vault = matched_vault[0];
-            let vault_uid = vault.uid.clone();
-            let display = vault.name.clone();
-            let db_path = current_db_path(store)?;
-            let db_path_buf = std::path::PathBuf::from(&db_path);
-            let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
-            let sock_path = inline_ensure_daemon(&db_path_buf)
-                .map_err(|e| anyhow::anyhow!("failed to start daemon: {e}"))?;
-            let mut client = rt.block_on(inline_connect_daemon(&sock_path))?;
-            let resp = rt
-                .block_on(client.remove_vault(nestweaver_proto::RemoveVaultRequest {
-                    vault_uid: vault_uid.clone(),
+    #[cfg(feature = "daemon")]
+    {
+        let db_path = current_db_path(store)?;
+        let db_path_buf = std::path::PathBuf::from(&db_path);
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
+        let sock_path = inline_ensure_daemon(&db_path_buf)
+            .map_err(|e| anyhow::anyhow!("failed to start daemon: {e}"))?;
+        let mut client = rt.block_on(inline_connect_daemon(&sock_path))?;
+        match resolved {
+            RemoveTarget::Repo(repo) => {
+                let repo_uid = repo.uid.clone();
+                let display = repo.name.clone().unwrap_or_else(|| repo.url.clone());
+                let resp = rt
+                    .block_on(client.remove_repo(nestweaver_proto::RemoveRepoRequest {
+                        repo_uid: repo_uid.clone(),
+                    }))
+                    .map_err(|e| anyhow!("remove_repo RPC failed: {e}"))?;
+                let inner = resp.into_inner();
+                Ok(json!({
+                    "kind": "repo",
+                    "name": display,
+                    "uid": repo_uid,
+                    "files_deleted": inner.files_deleted,
+                    "symbols_deleted": inner.symbols_deleted
                 }))
-                .map_err(|e| anyhow!("remove_vault RPC failed: {e}"))?;
-            let inner = resp.into_inner();
-            return Ok(json!({
-                "kind": "vault",
-                "name": display,
-                "uid": vault_uid,
-                "notes_deleted": inner.notes_deleted
-            }));
+            }
+            RemoveTarget::Vault(vault) => {
+                let vault_uid = vault.uid.clone();
+                let display = vault.name.clone();
+                let resp = rt
+                    .block_on(client.remove_vault(nestweaver_proto::RemoveVaultRequest {
+                        vault_uid: vault_uid.clone(),
+                    }))
+                    .map_err(|e| anyhow!("remove_vault RPC failed: {e}"))?;
+                let inner = resp.into_inner();
+                Ok(json!({
+                    "kind": "vault",
+                    "name": display,
+                    "uid": vault_uid,
+                    "notes_deleted": inner.notes_deleted
+                }))
+            }
         }
-        #[cfg(not(feature = "daemon"))]
-        return Err(anyhow!("brain_remove_source requires daemon mode"));
     }
-
-    // No match or ambiguous
-    if matched_repo.len() > 1 || matched_vault.len() > 1 {
-        return Err(anyhow!(
-            "'{target}' matches multiple sources. Use a UID to disambiguate."
-        ));
+    #[cfg(not(feature = "daemon"))]
+    {
+        let _ = resolved;
+        Err(anyhow!("brain_remove_source requires daemon mode"))
     }
-    Err(target_not_found(
-        format!("no repo or vault matching '{target}' found"),
-        "target",
-        json!(target),
-        &[],
-    ))
 }
 
 // ── 6c. prune_stale ─────────────────────────────────────────────────────────
@@ -22037,34 +22077,6 @@ fn dispatch_via_daemon_inner(
             serde_json::from_str(&resp.into_inner().result_json)
                 .map_err(|e| anyhow!("repository inventory decode failed before removal; retry after repairing daemon response: {e}"))?
         };
-        let matched_repo = match_repo_target(&repos, &target);
-        if matched_repo.len() > 1 {
-            return Err(anyhow::anyhow!(
-                "'{target}' matches multiple repos — pass a full UID to disambiguate."
-            ));
-        }
-        if let Some(repo) = matched_repo.first() {
-            let resp = rt
-                .block_on(client.remove_repo(nestweaver_proto::RemoveRepoRequest {
-                    repo_uid: repo.uid.clone(),
-                }))
-                .map_err(|s| anyhow::anyhow!("remove_repo RPC failed: {}", s.message()))?;
-            let inner = resp.into_inner();
-            return Ok(Unstamped::new(json!({
-                "kind": "repo",
-                "name": repo.name.clone().unwrap_or_else(|| repo.url.clone()),
-                "uid": repo.uid,
-                "files_deleted": inner.files_deleted,
-                "symbols_deleted": inner.symbols_deleted,
-                // nw-091 / Bug 2: committed=true means the delete HAPPENED even if
-                // some post-commit reconciliation step failed — surfaced as warnings,
-                // never as an RPC error that reads as "nothing happened".
-                "committed": inner.committed,
-                "reconciliation_warnings": reconciliation_warnings(&inner.reconciliation_failures),
-            })));
-        }
-
-        // Not a repo — resolve as a vault (by uid, name, or root path).
         let vaults: Vec<nestweaver_schema::Vault> = {
             let req = profiled_daemon_request(nestweaver_proto::JsonRequest {
                 args_json: "{}".to_string(),
@@ -22075,49 +22087,47 @@ fn dispatch_via_daemon_inner(
             serde_json::from_str(&resp.into_inner().result_json)
                 .map_err(|e| anyhow!("vault inventory decode failed before removal; repair daemon response and retry: {e}"))?
         };
-        let canonical_target = std::fs::canonicalize(&target)
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        let target_trimmed = target.trim_end_matches('/');
-        let matched_vault: Vec<&nestweaver_schema::Vault> = vaults
-            .iter()
-            .filter(|v| {
-                v.uid == target
-                    || v.name == target_trimmed
-                    || v.root_path.trim_end_matches('/') == target_trimmed
-                    || (!canonical_target.is_empty()
-                        && v.root_path.trim_end_matches('/')
-                            == canonical_target.trim_end_matches('/'))
-            })
-            .collect();
-        if matched_vault.len() > 1 {
-            return Err(anyhow::anyhow!(
-                "'{target}' matches multiple vaults — pass a full UID to disambiguate."
-            ));
-        }
-        if let Some(vault) = matched_vault.first() {
-            let resp = rt
-                .block_on(client.remove_vault(nestweaver_proto::RemoveVaultRequest {
-                    vault_uid: vault.uid.clone(),
-                }))
-                .map_err(|s| anyhow::anyhow!("remove_vault RPC failed: {}", s.message()))?;
-            let inner = resp.into_inner();
-            return Ok(Unstamped::new(json!({
-                "kind": "vault",
-                "name": vault.name.clone(),
-                "uid": vault.uid,
-                "notes_deleted": inner.notes_deleted,
-                "committed": inner.committed,
-                "reconciliation_warnings": reconciliation_warnings(&inner.reconciliation_failures),
-            })));
-        }
-
-        return Err(target_not_found(
-            format!("no repo or vault matching '{target}' found"),
-            "target",
-            json!(target),
-            &[],
-        ));
+        // Resolve across BOTH kinds before deleting: a repo match no longer
+        // short-circuits past a vault of the same name.
+        let payload = match resolve_remove_target(&repos, &vaults, &target)? {
+            RemoveTarget::Repo(repo) => {
+                let resp = rt
+                    .block_on(client.remove_repo(nestweaver_proto::RemoveRepoRequest {
+                        repo_uid: repo.uid.clone(),
+                    }))
+                    .map_err(|s| anyhow::anyhow!("remove_repo RPC failed: {}", s.message()))?;
+                let inner = resp.into_inner();
+                json!({
+                    "kind": "repo",
+                    "name": repo.name.clone().unwrap_or_else(|| repo.url.clone()),
+                    "uid": repo.uid.clone(),
+                    "files_deleted": inner.files_deleted,
+                    "symbols_deleted": inner.symbols_deleted,
+                    // nw-091 / Bug 2: committed=true means the delete HAPPENED even if
+                    // some post-commit reconciliation step failed — surfaced as warnings,
+                    // never as an RPC error that reads as "nothing happened".
+                    "committed": inner.committed,
+                    "reconciliation_warnings": reconciliation_warnings(&inner.reconciliation_failures),
+                })
+            }
+            RemoveTarget::Vault(vault) => {
+                let resp = rt
+                    .block_on(client.remove_vault(nestweaver_proto::RemoveVaultRequest {
+                        vault_uid: vault.uid.clone(),
+                    }))
+                    .map_err(|s| anyhow::anyhow!("remove_vault RPC failed: {}", s.message()))?;
+                let inner = resp.into_inner();
+                json!({
+                    "kind": "vault",
+                    "name": vault.name.clone(),
+                    "uid": vault.uid.clone(),
+                    "notes_deleted": inner.notes_deleted,
+                    "committed": inner.committed,
+                    "reconciliation_warnings": reconciliation_warnings(&inner.reconciliation_failures),
+                })
+            }
+        };
+        return Ok(Unstamped::new(payload));
     }
 
     // prune_stale uses a typed PruneStaleRequest RPC.
@@ -31757,6 +31767,56 @@ mod source_management_tests {
         );
         // no match
         assert!(match_repo_target(&repos, "/nope/nope").is_empty());
+    }
+
+    #[test]
+    fn a_partial_path_fragment_no_longer_matches_a_repo_for_removal() {
+        let repos = vec![repo(
+            "repo:aa:bb",
+            "https://github.com/org/nw-fragment-test",
+            None,
+            None,
+        )];
+        // Only an exact uid / name / url / path selects a repo to delete.
+        assert!(match_repo_target(&repos, "nw-fragment-test").is_empty());
+        assert!(match_repo_target(&repos, "org/nw-fragment-test").is_empty());
+        assert_eq!(
+            match_repo_target(&repos, "https://github.com/org/nw-fragment-test").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_name_shared_by_a_repo_and_a_vault_refuses_and_lists_both_uids() {
+        let repos = vec![repo(
+            "repo:py:ts",
+            "file:///nw/x/pyts-repo",
+            Some("pyts"),
+            None,
+        )];
+        let vaults = vec![nestweaver_schema::Vault {
+            uid: "vault:py:ts".into(),
+            name: "pyts".into(),
+            root_path: "/nw/x/pyts-vault".into(),
+            instance_id: "test".into(),
+        }];
+        let error = resolve_remove_target(&repos, &vaults, "pyts")
+            .expect_err("a cross-kind name collision must not delete anything");
+        let text = error.to_string();
+        assert!(
+            text.contains("repo:py:ts") && text.contains("vault:py:ts"),
+            "{text}"
+        );
+        // A UID still selects exactly one of them.
+        assert!(matches!(
+            resolve_remove_target(&repos, &vaults, "vault:py:ts"),
+            Ok(RemoveTarget::Vault(v)) if v.uid == "vault:py:ts"
+        ));
+        assert!(matches!(
+            resolve_remove_target(&repos, &vaults, "repo:py:ts"),
+            Ok(RemoveTarget::Repo(r)) if r.uid == "repo:py:ts"
+        ));
+        assert!(resolve_remove_target(&repos, &vaults, "py").is_err());
     }
 
     #[cfg(feature = "daemon")]
