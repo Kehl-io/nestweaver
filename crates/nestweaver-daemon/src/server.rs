@@ -1592,25 +1592,91 @@ fn watcher_status(state: &DaemonState) -> Option<nestweaver_proto::WatcherStatus
 }
 
 fn note_watcher_exit(state: &DaemonState, kind: &str, error: Option<String>) {
+    note_watcher_failure(state, kind, None, error, false);
+}
+
+/// Record a watcher failure. `target` is the watched repository of a code
+/// watcher, which names the command that restarts it. `batch` marks a
+/// watcher that is still running but could not publish its last batch: it
+/// is not indexing edits either, so it warns the same way, and it is the
+/// watcher's own next published batch that clears it.
+fn note_watcher_failure(
+    state: &DaemonState,
+    kind: &str,
+    target: Option<&Path>,
+    error: Option<String>,
+    batch: bool,
+) {
     let Some(error) = error else {
         return;
     };
-    let message = format!(
-        "{kind} watcher exited and is no longer indexing edits: {error}. \
-         Restart watching; later edits stay unindexed until it is running again."
-    );
+    let message = if batch {
+        format!(
+            "{kind} watcher{} is running but could not publish its last batch: {error}. \
+             Edits there stay unindexed until a batch publishes; it retries automatically.",
+            target
+                .map(|target| format!(" for {}", target.display()))
+                .unwrap_or_default()
+        )
+    } else {
+        format!(
+            "{kind} watcher exited and is no longer indexing edits: {error}. \
+             Restart watching; later edits stay unindexed until it is running again."
+        )
+    };
     if let Ok(mut slot) = state.last_watcher_failure.lock() {
-        *slot = Some(serde_json::json!({
+        let mut record = serde_json::json!({
             "kind": kind,
             "at_unix_seconds": std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_secs())
                 .unwrap_or_default(),
             "error": error,
-        }));
+        });
+        if let Some(target) = target {
+            record["target"] = serde_json::json!(target.display().to_string());
+        }
+        if batch {
+            record["batch"] = serde_json::json!(true);
+        }
+        *slot = Some(record);
     }
     if let Ok(mut slot) = state.watcher_failure.lock() {
         *slot = Some(message);
+    }
+}
+
+/// A code watcher's batch published: clear the warning only if it is this
+/// watcher's own batch failure, never a different watcher's exit.
+fn clear_watcher_batch_failure(state: &DaemonState, target: &Path) {
+    let own = state.last_watcher_failure.lock().ok().is_some_and(|slot| {
+        slot.as_ref().is_some_and(|last| {
+            last["batch"] == serde_json::json!(true)
+                && last["target"] == serde_json::json!(target.display().to_string())
+        })
+    });
+    if own {
+        clear_watcher_failure(state);
+    }
+}
+
+/// The command that restarts the watcher a failure names: a code watcher is
+/// restarted per repository, the vault watcher by `brain watch`.
+fn watcher_failure_action(state: &DaemonState) -> String {
+    let last = last_watcher_failure_json(state);
+    if last["kind"] != "code" {
+        return "nestweaver brain watch".to_string();
+    }
+    match last["target"].as_str() {
+        Some(target)
+            if target
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "/._-+".contains(c)) =>
+        {
+            format!("nestweaver watch {target}")
+        }
+        Some(target) => format!("nestweaver watch '{}'", target.replace('\'', "'\\''")),
+        None => "nestweaver watch <repo>".to_string(),
     }
 }
 
@@ -1646,7 +1712,11 @@ mod watcher_failure_disclosure_tests {
     #[test]
     fn a_dead_watcher_is_a_status_warning() {
         let mut value = serde_json::json!({"warnings": [{"kind": "other", "warning": "kept"}]});
-        disclose_watcher_failure(&mut value, Some("vault watcher exited"));
+        disclose_watcher_failure(
+            &mut value,
+            Some("vault watcher exited"),
+            "nestweaver brain watch",
+        );
         let warnings = value["warnings"].as_array().unwrap();
         assert_eq!(warnings.len(), 2);
         assert_eq!(warnings[1]["kind"], "watcher_exited");
@@ -1662,8 +1732,8 @@ mod watcher_failure_disclosure_tests {
     #[test]
     fn no_failure_adds_nothing() {
         let mut value = serde_json::json!({"notes": 1});
-        disclose_watcher_failure(&mut value, None);
-        disclose_watcher_failure(&mut value, Some(""));
+        disclose_watcher_failure(&mut value, None, "nestweaver brain watch");
+        disclose_watcher_failure(&mut value, Some(""), "nestweaver brain watch");
         assert!(value.get("warnings").is_none());
     }
 }
@@ -1705,14 +1775,14 @@ fn disclose_manifest_recovery(
 
 /// Attach a dead-watcher warning to a `brain status` document. Absence of a
 /// failure leaves the document unchanged, including when `warnings` is missing.
-fn disclose_watcher_failure(value: &mut serde_json::Value, failure: Option<&str>) {
+fn disclose_watcher_failure(value: &mut serde_json::Value, failure: Option<&str>, action: &str) {
     let Some(failure) = failure.filter(|message| !message.is_empty()) else {
         return;
     };
     let warning = serde_json::json!({
         "kind": "watcher_exited",
         "warning": failure,
-        "action": "nestweaver brain watch",
+        "action": action,
     });
     match value
         .get_mut("warnings")
@@ -4124,9 +4194,25 @@ impl DaemonService {
         let predecessors = watcher_task_ids(&self.state, None);
         let watcher_id = register_watcher(&self.state, shutdown_handle, force, owner_pid)?;
         describe_watcher(&self.state, watcher_id, "code", &repo_path);
+        // A watcher is running again: the previous one's exit is history
+        // (kept in `last_watcher_failure`), not a live warning. Cleared before
+        // the thread starts, so its own failure cannot be erased.
+        clear_watcher_failure(&self.state);
 
-        watcher =
-            watcher.with_mutation_lease_factory(daemon_mutation_lease_factory(self.state.clone()));
+        let report_state = self.state.clone();
+        let report_repo = repo_path.clone();
+        watcher = watcher
+            .with_mutation_lease_factory(daemon_mutation_lease_factory(self.state.clone()))
+            .with_batch_failure_reporter(move |failure| match failure {
+                Some(error) => note_watcher_failure(
+                    &report_state,
+                    "code",
+                    Some(&report_repo),
+                    Some(error.to_string()),
+                    true,
+                ),
+                None => clear_watcher_batch_failure(&report_state, &report_repo),
+            });
         let state = self.state.clone();
         let store = self.state.store.clone();
         let on_change = Self::make_embed_on_change(
@@ -4149,7 +4235,7 @@ impl DaemonService {
                 Ok(Err(error)) => log_code_watcher_error(error, watcher_id),
                 Err(_) => tracing::error!(watcher_id, "code watcher thread panicked"),
             }
-            note_watcher_exit(&state, "code", failure);
+            note_watcher_failure(&state, "code", Some(&repo_path), failure, false);
             clear_watcher_registration(&state, watcher_id);
         });
 
@@ -10268,7 +10354,11 @@ impl NestWeaverDaemon for DaemonService {
         if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&json_resp.result_json) {
             value["runtime_telemetry"] = serde_json::json!("available");
             value["watcher"] = watcher_status_json(&self.state);
-            disclose_watcher_failure(&mut value, watcher_failure_message(&self.state).as_deref());
+            disclose_watcher_failure(
+                &mut value,
+                watcher_failure_message(&self.state).as_deref(),
+                &watcher_failure_action(&self.state),
+            );
             disclose_manifest_recovery(&mut value, &self.state.manifest_recovery.status());
             value["last_watcher_failure"] = last_watcher_failure_json(&self.state);
             value["watcher_pid"] =
@@ -26256,6 +26346,62 @@ repos = ["alpha"]
             manifest::manifest_debt_revision(&state.db_path)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// A code watcher's warning names the command that restarts IT, not the
+    /// vault watcher's; a batch failure warns while the watcher still runs
+    /// and only that watcher's next published batch clears it.
+    #[test]
+    fn a_code_watcher_failure_names_its_own_restart_and_batch_failures_clear() {
+        let state = test_state_with_writer();
+        let repo = std::path::Path::new("/work/my repo");
+        super::note_watcher_failure(
+            &state,
+            "code",
+            Some(repo),
+            Some("repo root vanished".to_string()),
+            false,
+        );
+        assert_eq!(
+            super::watcher_failure_action(&state),
+            "nestweaver watch '/work/my repo'"
+        );
+        super::clear_watcher_batch_failure(&state, repo);
+        assert!(
+            super::watcher_failure_message(&state).is_some(),
+            "a batch publishing never clears a watcher EXIT"
+        );
+        super::clear_watcher_failure(&state);
+
+        super::note_watcher_failure(
+            &state,
+            "code",
+            Some(repo),
+            Some("read watcher contract input src/m5.ts: Permission denied".to_string()),
+            true,
+        );
+        let message = super::watcher_failure_message(&state).unwrap();
+        assert!(
+            message.contains("is running but could not publish"),
+            "{message}"
+        );
+        assert!(message.contains("/work/my repo"), "{message}");
+        assert_eq!(super::last_watcher_failure_json(&state)["batch"], true);
+        super::clear_watcher_batch_failure(&state, std::path::Path::new("/work/other"));
+        assert!(super::watcher_failure_message(&state).is_some());
+        super::clear_watcher_batch_failure(&state, repo);
+        assert!(super::watcher_failure_message(&state).is_none());
+        assert_eq!(
+            super::last_watcher_failure_json(&state)["kind"],
+            "code",
+            "the record outlives the warning"
+        );
+
+        super::note_watcher_exit(&state, "vault", Some("boom".to_string()));
+        assert_eq!(
+            super::watcher_failure_action(&state),
+            "nestweaver brain watch"
         );
     }
 
