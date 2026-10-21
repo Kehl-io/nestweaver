@@ -331,10 +331,10 @@ pub fn compute_claude_hook_patch(existing: &Value) -> Result<Value, anyhow::Erro
             // for the `Agent` tool. Widen its matcher rather than adding a
             // second entry, which would run the hook twice on `Task`.
             match entries
-                .iter_mut()
-                .find(|entry| is_nestweaver_hook_entry(entry, LEGACY_CLAUDE_SUBAGENT_MATCHER))
+                .iter()
+                .position(|entry| is_nestweaver_hook_entry(entry, LEGACY_CLAUDE_SUBAGENT_MATCHER))
             {
-                Some(legacy) => legacy["matcher"] = json!(CLAUDE_SUBAGENT_MATCHER),
+                Some(index) => entries[index]["matcher"] = json!(CLAUDE_SUBAGENT_MATCHER),
                 None => entries.push(claude_task_hook_entry()),
             }
         }
