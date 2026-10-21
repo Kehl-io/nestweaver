@@ -15,19 +15,38 @@ impl std::error::Error for StdoutWriteFailure {
     }
 }
 
+/// [`write_cli_stdout_to`] for a terminal, the case tests pin.
+#[cfg(test)]
 fn write_cli_stdout(
     writer: &mut impl std::io::Write,
     arguments: std::fmt::Arguments<'_>,
     newline: bool,
 ) -> std::io::Result<()> {
-    // Indexed content (note titles and bodies, headings, symbol names, file
-    // paths) reaches stdout through here, and any of it can carry terminal
-    // control sequences. Escape them at this one boundary.
-    let text = match arguments.as_str() {
-        Some(text) => std::borrow::Cow::Borrowed(text),
-        None => std::borrow::Cow::Owned(arguments.to_string()),
-    };
-    writer.write_all(terminal_safe(&text).as_bytes())?;
+    write_cli_stdout_to(writer, arguments, newline, true)
+}
+
+/// Write CLI output, escaping terminal control sequences when `terminal`.
+///
+/// Indexed content (note titles and bodies, headings, symbol names, file
+/// paths) reaches stdout through here, and any of it can carry terminal
+/// control sequences. They are only dangerous to a terminal: piped and
+/// redirected output (`note get > file`, `export`, scripts) keeps the bytes
+/// as indexed, CRLF line endings and form feeds included.
+fn write_cli_stdout_to(
+    writer: &mut impl std::io::Write,
+    arguments: std::fmt::Arguments<'_>,
+    newline: bool,
+    terminal: bool,
+) -> std::io::Result<()> {
+    if terminal {
+        let text = match arguments.as_str() {
+            Some(text) => std::borrow::Cow::Borrowed(text),
+            None => std::borrow::Cow::Owned(arguments.to_string()),
+        };
+        writer.write_all(terminal_safe(&text).as_bytes())?;
+    } else {
+        writer.write_fmt(arguments)?;
+    }
     if newline {
         writer.write_all(b"\n")?;
     }
@@ -36,17 +55,28 @@ fn write_cli_stdout(
 
 /// `text` with every control character a terminal would act on made visible.
 ///
-/// C0 controls other than `\n` and `\t`, DEL and the C1 controls become
-/// `\u00XX`. That neutralizes cursor movement, screen clears, title and
-/// clipboard writes (OSC), hyperlinks and BEL. The `\u00XX` form is also a
-/// JSON string escape for the same character, so JSON output (where serde
-/// already escapes C0, and C1/DEL can only occur inside strings) decodes to
-/// the same values. Plain SGR colour sequences (`ESC [ <digits;> m`) pass
-/// through: the CLI colours its own labels with them, and they can only
-/// change colours.
+/// C0 controls other than `\n`, `\t` and a `\r` that ends a CRLF line, DEL
+/// and the C1 controls become `\u00XX`. That neutralizes cursor movement,
+/// screen clears, title and clipboard writes (OSC), hyperlinks and BEL. The
+/// `\u00XX` form is also a JSON string escape for the same character, so JSON
+/// output (where serde already escapes C0, and C1/DEL can only occur inside
+/// strings) decodes to the same values. SGR sequences pass through only when
+/// every parameter is one the CLI's own labels use (reset, bold, dim, normal
+/// intensity, the 16 foreground colours and default foreground): those
+/// change colours and nothing else, while conceal (`8`) or a background
+/// colour could hide text.
 fn terminal_safe(text: &str) -> std::borrow::Cow<'_, str> {
     fn is_control(c: char) -> bool {
         (c.is_control() && c != '\n' && c != '\t') || c == '\u{7f}'
+    }
+    fn allowed_sgr(params: &str) -> bool {
+        params.split(';').all(|param| {
+            param.is_empty()
+                || matches!(
+                    param.parse::<u16>(),
+                    Ok(0 | 1 | 2 | 22 | 30..=37 | 39 | 90..=97)
+                )
+        })
     }
     if !text.chars().any(is_control) {
         return std::borrow::Cow::Borrowed(text);
@@ -60,7 +90,7 @@ fn terminal_safe(text: &str) -> std::borrow::Cow<'_, str> {
                 let digits = params
                     .find(|p: char| !(p.is_ascii_digit() || p == ';'))
                     .unwrap_or(params.len());
-                if params[digits..].starts_with('m') {
+                if params[digits..].starts_with('m') && allowed_sgr(&params[..digits]) {
                     let length = 2 + digits + 1;
                     safe.push_str(&rest[..length]);
                     rest = &rest[length..];
@@ -68,7 +98,8 @@ fn terminal_safe(text: &str) -> std::borrow::Cow<'_, str> {
                 }
             }
         }
-        if is_control(c) {
+        let crlf = c == '\r' && rest[1..].starts_with('\n');
+        if is_control(c) && !crlf {
             safe.push_str(&format!("\\u{:04x}", u32::from(c)));
         } else {
             safe.push(c);
@@ -110,9 +141,12 @@ fn print_cli_stdout(arguments: std::fmt::Arguments<'_>, newline: bool) {
     if STDOUT_FAILED.load(Ordering::Relaxed) {
         return;
     }
+    // Decided once: whether stdout is a terminal does not change mid-run.
+    static TERMINAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let terminal = *TERMINAL.get_or_init(|| std::io::stdout().is_terminal());
     // TypedStdout converts the otherwise-untyped `io::Error` into the one
     // unwind payload accepted by the process boundary.
-    let _ = write_cli_stdout(&mut TypedStdout, arguments, newline);
+    let _ = write_cli_stdout_to(&mut TypedStdout, arguments, newline, terminal);
 }
 
 // Keep unit-test output on the standard harness capture path. Production CLI
@@ -6632,16 +6666,17 @@ mod daemon_status_renderer_tests {
             written,
             "  Note\\u001b]0;pwned\\u0007\\u001b[2J\\u001b[H\\u000dspoof\\u009b31m\\u007f  [note]\tok\n"
         );
-        assert!(
-            !written
-                .chars()
-                .any(|c| c.is_control() && c != '\n' && c != '\t')
-        );
-        // The CLI's own colour labels survive.
+        assert!(!written.chars().any(|c| c.is_control() && c != '\n' && c != '\t'));
+        // The CLI's own colour labels survive; conceal and background
+        // colours, which can hide text, do not.
         assert_eq!(
             terminal_safe("\u{1b}[31mBREAKING\u{1b}[0m \u{1b}[1;33mWARN\u{1b}[m"),
             "\u{1b}[31mBREAKING\u{1b}[0m \u{1b}[1;33mWARN\u{1b}[m"
         );
+        assert_eq!(terminal_safe("a\u{1b}[8mb"), "a\\u001b[8mb");
+        assert_eq!(terminal_safe("a\u{1b}[30;40mb"), "a\\u001b[30;40mb");
+        // A CRLF line ending is not a control sequence; a lone CR is.
+        assert_eq!(terminal_safe("a\r\nb\rc"), "a\r\nb\\u000dc");
         // JSON is unchanged in meaning: the escapes are JSON escapes.
         let value = serde_json::json!({ "title": "a\u{9b}b\u{7f}c\u{1b}d" });
         let json = serde_json::to_string(&value).unwrap();
@@ -6654,6 +6689,10 @@ mod daemon_status_renderer_tests {
             terminal_safe("plain\ttext\n"),
             std::borrow::Cow::Borrowed(_)
         ));
+        // Output that is not a terminal keeps its bytes.
+        let mut piped = Vec::new();
+        write_cli_stdout_to(&mut piped, format_args!("{title}\r\n\u{c}"), false, false).unwrap();
+        assert_eq!(piped, format!("{title}\r\n\u{c}").into_bytes());
     }
 
     #[test]

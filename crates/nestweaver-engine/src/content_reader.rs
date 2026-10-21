@@ -416,7 +416,7 @@ pub struct FilesystemReader {
     tracked_files: std::sync::Arc<std::sync::OnceLock<Option<HashSet<PathBuf>>>>,
     /// `repo_path` with symlinks resolved, computed on the first read. Reads
     /// must stay below it: see [`Self::contained_path`].
-    canonical_root: std::sync::Arc<std::sync::OnceLock<Option<PathBuf>>>,
+    canonical_root: std::sync::Arc<std::sync::OnceLock<PathBuf>>,
 }
 
 /// The `reason` a [`SkippedDir`] carries when a configured `[[repos]] exclude`
@@ -765,16 +765,27 @@ impl FilesystemReader {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(abs),
             Err(error) => return Err(io_read_error("resolve", &abs, error)),
         };
-        let root = self
-            .canonical_root
-            .get_or_init(|| std::fs::canonicalize(&self.repo_path).ok());
-        match root {
-            Some(root) if resolved.starts_with(root) => Ok(resolved),
-            _ => anyhow::bail!(
+        // Only a successful resolution is cached: a long-lived reader (the
+        // watcher's) whose root was briefly unavailable must not refuse every
+        // later read.
+        let root = match self.canonical_root.get() {
+            Some(root) => root.clone(),
+            None => {
+                let root = std::fs::canonicalize(&self.repo_path).map_err(|error| {
+                    io_read_error("resolve repository root", &self.repo_path, error)
+                })?;
+                let _ = self.canonical_root.set(root.clone());
+                root
+            }
+        };
+        if resolved.starts_with(&root) {
+            Ok(resolved)
+        } else {
+            anyhow::bail!(
                 "refusing to read {}: it resolves outside the repository root {}",
                 rel_path.display(),
                 self.repo_path.display()
-            ),
+            )
         }
     }
 

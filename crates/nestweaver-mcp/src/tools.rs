@@ -23533,30 +23533,71 @@ fn contained_source_root(
         return Ok(canonical);
     }
     // A linked worktree of an indexed repository shares its common directory.
+    // Each indexed root's own checkout is asked for (not assumed to be
+    // `<root>/.git`): an indexed subdirectory of a monorepo, a root that is
+    // itself a linked worktree, and a `--separate-git-dir` checkout all keep
+    // their common directory elsewhere. The candidate must also sit at (or
+    // below) the indexed root's place in its checkout: an indexed vault that
+    // happens to live inside a dotfiles repository at `~` must not admit the
+    // rest of the home directory.
+    let Some(candidate) = git_checkout_position(&canonical) else {
+        return Err(refused());
+    };
+    let admitted = indexed.iter().any(|indexed| {
+        git_checkout_position(indexed).is_some_and(|own| {
+            own.common_dir == candidate.common_dir && candidate.relative.starts_with(&own.relative)
+        })
+    });
+    if admitted {
+        Ok(canonical)
+    } else {
+        Err(refused())
+    }
+}
+
+/// Where a path sits in its Git checkout: the checkout's canonical common
+/// directory, and the path relative to the checkout's top level.
+struct GitCheckoutPosition {
+    common_dir: std::path::PathBuf,
+    relative: std::path::PathBuf,
+}
+
+/// [`GitCheckoutPosition`] of `path`, asked of an isolated Git. `None` when
+/// `path` is not inside a work tree.
+fn git_checkout_position(path: &Path) -> Option<GitCheckoutPosition> {
+    use std::os::unix::ffi::OsStrExt;
     let mut command = nestweaver_engine::git_cmd::isolated_git();
-    command.arg("-C").arg(&canonical).args([
+    command.arg("-C").arg(path).args([
         "rev-parse",
         "--path-format=absolute",
         "--git-common-dir",
+        "--show-toplevel",
     ]);
-    let common = nestweaver_engine::git_cmd::run_git_with_timeout_and_output_limit(
+    let output = nestweaver_engine::git_cmd::run_git_with_timeout_and_output_limit(
         command,
         nestweaver_engine::git_cmd::git_net_timeout(),
         64 * 1024,
     )
     .ok()
-    .filter(|output| output.status.success())
-    .and_then(|output| {
-        use std::os::unix::ffi::OsStrExt;
-        let value = output.stdout.strip_suffix(b"\n")?;
-        std::fs::canonicalize(std::ffi::OsStr::from_bytes(value)).ok()
-    });
-    match common {
-        Some(common) if indexed.iter().any(|indexed| indexed.join(".git") == common) => {
-            Ok(canonical)
-        }
-        _ => Err(refused()),
+    .filter(|output| output.status.success())?;
+    let mut lines = output
+        .stdout
+        .strip_suffix(b"\n")?
+        .split(|byte| *byte == b'\n');
+    let common_dir = std::fs::canonicalize(std::ffi::OsStr::from_bytes(lines.next()?)).ok()?;
+    let toplevel = std::fs::canonicalize(std::ffi::OsStr::from_bytes(lines.next()?)).ok()?;
+    if lines.next().is_some() {
+        return None;
     }
+    let relative = std::fs::canonicalize(path)
+        .ok()?
+        .strip_prefix(&toplevel)
+        .ok()?
+        .to_path_buf();
+    Some(GitCheckoutPosition {
+        common_dir,
+        relative,
+    })
 }
 
 /// Like [`arg_root`], but returns `None` when `root` was omitted instead of
@@ -37882,6 +37923,21 @@ mod ambiguous_name_contract_tests {
         );
         let linked = read(&worktree).unwrap();
         assert!(linked.to_string().contains("return n"), "{linked}");
+
+        // A monorepo subdirectory indexed on its own: the same subdirectory
+        // of a linked worktree is admitted, the rest of the checkout is not.
+        let (_sub, sub_store) =
+            index_directory_in_memory(&repo.join("src"), "test", "https://example.com/s", "sha")
+                .unwrap();
+        let read_sub = |root: &std::path::Path| {
+            tool_read_symbols(
+                &sub_store,
+                json!({ "targets": ["helper"], "root": root.to_string_lossy() }),
+            )
+        };
+        let sub_linked = read_sub(&worktree.join("src")).unwrap();
+        assert!(sub_linked.to_string().contains("return n"), "{sub_linked}");
+        assert!(read_sub(&worktree).is_err(), "above the indexed subdirectory");
     }
 
     /// 12.1.1 (M1): a `read_symbols` target whose qualifier names no file
