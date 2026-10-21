@@ -68,9 +68,8 @@ impl WorkspaceContext {
 pub fn discover_workspace_context(repo_path: &Path) -> WorkspaceContext {
     let packages = discover_workspace_packages(repo_path);
     let aliases = load_tsconfig_aliases(repo_path);
-    let go_modules = discover_go_modules_with(&|rel: &Path| {
-        std::fs::read_to_string(repo_path.join(rel))
-    });
+    let go_modules =
+        discover_go_modules_with(&|rel: &Path| std::fs::read_to_string(repo_path.join(rel)));
     WorkspaceContext {
         packages,
         aliases,
@@ -219,12 +218,12 @@ fn go_mod_directives(contents: &str) -> Vec<(String, Vec<String>)> {
             .split_whitespace()
             .map(|word| word.trim_matches(|c| c == '"' || c == '`').to_string())
             .collect();
+        if block.is_some() && line == ")" {
+            block = None;
+            continue;
+        }
         if let Some(directive) = &block {
-            if line == ")" {
-                block = None;
-            } else {
-                out.push((directive.clone(), words));
-            }
+            out.push((directive.clone(), words));
             continue;
         }
         let Some((directive, rest)) = words.split_first() else {

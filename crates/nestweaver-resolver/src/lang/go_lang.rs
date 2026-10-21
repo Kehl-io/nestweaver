@@ -250,7 +250,10 @@ mod tests {
 
     #[test]
     fn go_default_package_name_drops_major_versions() {
-        assert_eq!(default_package_name("example.com/go1/internal/calc"), "calc");
+        assert_eq!(
+            default_package_name("example.com/go1/internal/calc"),
+            "calc"
+        );
         assert_eq!(default_package_name("github.com/x/y/v2"), "y");
         assert_eq!(default_package_name("gopkg.in/yaml.v3"), "yaml");
         assert_eq!(default_package_name("fmt"), "fmt");

@@ -79,7 +79,9 @@ impl<'a> JvmPackageIndex<'a> {
                 file.as_str(),
                 symbols
                     .iter()
-                    .filter(|symbol| symbol.parent_name.is_none() && symbol.kind != SymbolKind::Method)
+                    .filter(|symbol| {
+                        symbol.parent_name.is_none() && symbol.kind != SymbolKind::Method
+                    })
                     .map(|symbol| symbol.name.as_str())
                     .collect(),
             );

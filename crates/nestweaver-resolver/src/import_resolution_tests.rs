@@ -138,7 +138,9 @@ func TestTwice() { Twice(1) }
     // Counterweight: a bare `Twice` in package main is not the imported
     // package's `Twice`; Go requires the qualifier.
     assert!(
-        !calls.iter().any(|call| call.starts_with("cmd/app/other.go::bare ->")),
+        !calls
+            .iter()
+            .any(|call| call.starts_with("cmd/app/other.go::bare ->")),
         "{calls:#?}"
     );
 }
@@ -146,7 +148,8 @@ func TestTwice() { Twice(1) }
 /// Without the module path the import path never matched a directory.
 #[test]
 fn go_module_import_needs_the_module_path() {
-    let main = "package main\n\nimport \"example.com/go1/internal/calc\"\n\nfunc main() { calc.New() }\n";
+    let main =
+        "package main\n\nimport \"example.com/go1/internal/calc\"\n\nfunc main() { calc.New() }\n";
     let calc = "package calc\n\nfunc New() int { return 1 }\n";
     let inputs = [("cmd/app/main.go", main), ("internal/calc/lib.go", calc)];
     let (files, edges) = resolve(&inputs, Language::Go, &go_workspace());
@@ -185,7 +188,13 @@ def e():
     ];
     let (files, edges) = resolve(&inputs, Language::Python, &WorkspaceContext::default());
     let calls = calls(&files, &edges);
-    for (caller, callee) in [("a", "h1"), ("b", "h2"), ("c", "h3"), ("d", "h4"), ("e", "h5")] {
+    for (caller, callee) in [
+        ("a", "h1"),
+        ("b", "h2"),
+        ("c", "h3"),
+        ("d", "h4"),
+        ("e", "h5"),
+    ] {
         let expected = format!("pkg/user.py::{caller} -> pkg/helpers.py::{callee}");
         assert!(calls.contains(&expected), "missing {expected}: {calls:#?}");
     }
@@ -362,7 +371,11 @@ fn parser_records_import_names_and_package_clauses() {
 
     for (path, source, package) in [
         ("A.kt", "package com.acme.a\n\nfun f() = 1\n", "com.acme.a"),
-        ("A.java", "package com.acme.a;\n\nclass A {}\n", "com.acme.a"),
+        (
+            "A.java",
+            "package com.acme.a;\n\nclass A {}\n",
+            "com.acme.a",
+        ),
     ] {
         let parsed = parse_source(Path::new(path), source).unwrap();
         let packages: Vec<&str> = parsed
