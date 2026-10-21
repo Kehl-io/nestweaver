@@ -1,6 +1,5 @@
 use anyhow::Context as _;
 use nestweaver_engine::user_config;
-use std::io::Write as IoWrite;
 use std::path::Path;
 
 const DEPRECATED_MCP_ARGS: &[&str] = &["--allow-mcp-add-sources"];
@@ -72,6 +71,13 @@ struct SetupCtx<'a> {
     db: &'a Path,
     base: &'a Path,
     force: bool,
+    /// Whether `--force` may rebind a GLOBAL registration (Windsurf's one
+    /// per-user entry). Only when that tool was named explicitly: `setup --all
+    /// --force` in project B must not silently take the entry from project A.
+    force_global: bool,
+    /// Run the live server probe after a successful tool. Off in unit tests,
+    /// which must never launch whatever `nestweaver` is on PATH.
+    probe: bool,
 }
 
 impl SetupCtx<'_> {
@@ -111,6 +117,9 @@ fn absolute_db_path(db_path: &Path) -> Result<std::path::PathBuf, anyhow::Error>
 /// `items`. Does NOT print — callers own the output so a failure can be
 /// reported together with what was already written (nw-051).
 fn configure_tool(name: &str, ctx: &SetupCtx, items: &mut Items) -> Result<(), anyhow::Error> {
+    for relative in project_paths(name, ctx.base)? {
+        refuse_directory_escape(ctx.base, &relative)?;
+    }
     match name {
         "claude-code" => setup_claude_code(ctx, items),
         "cursor" => setup_cursor(ctx, items),
@@ -130,6 +139,73 @@ fn configure_tool(name: &str, ctx: &SetupCtx, items: &mut Items) -> Result<(), a
             Ok(())
         }
     }
+}
+
+/// The project-relative files `name` writes, for [`refuse_directory_escape`].
+/// A global file (Windsurf's) is not under the project and is not listed.
+fn project_paths(name: &str, base: &Path) -> Result<Vec<std::path::PathBuf>, anyhow::Error> {
+    let fixed: &[&str] = match name {
+        "claude-code" => &[
+            ".claude/skills/nestweaver/SKILL.md",
+            ".claude/settings.json",
+        ],
+        "cursor" => &[".cursor/rules/nestweaver.mdc"],
+        "codex" => &[".codex/config.toml", "AGENTS.md"],
+        "copilot" => &[".github/copilot-instructions.md"],
+        "aider" => &[".aider.conf.yml"],
+        _ => &[],
+    };
+    let mut paths: Vec<std::path::PathBuf> = fixed.iter().map(std::path::PathBuf::from).collect();
+    if let Some(target) = json_registration(name, base)?
+        && let Ok(relative) = target.path.strip_prefix(base)
+    {
+        paths.push(relative.to_path_buf());
+    }
+    Ok(paths)
+}
+
+/// Refuse when a DIRECTORY on the way to `relative` (below `base`) is a
+/// symbolic link that resolves outside the project.
+///
+/// `create_dir_all` and the atomic write both follow directory links, so a
+/// cloned repository shipping `.continue -> ~/.config/<app>` (or `.kiro`,
+/// `.claude`, …) made `setup` — and the auto-setup `index` runs — create
+/// directories and write a registration outside the project. A link that
+/// stays inside the project is fine. The final FILE may still be a symlink:
+/// a dotfiles-managed `.mcp.json` is a documented workflow, resolved by
+/// `user_config`.
+fn refuse_directory_escape(base: &Path, relative: &Path) -> Result<(), anyhow::Error> {
+    let Some(parent) = relative.parent() else {
+        return Ok(());
+    };
+    let canonical_base = base
+        .canonicalize()
+        .with_context(|| format!("resolve project directory {}", base.display()))?;
+    let mut current = base.to_path_buf();
+    for component in parent.components() {
+        current.push(component);
+        let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+            // Absent: everything below it will be created inside `current`'s
+            // already-checked parent.
+            return Ok(());
+        };
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+        let inside = current
+            .canonicalize()
+            .is_ok_and(|resolved| resolved.starts_with(&canonical_base));
+        if !inside {
+            anyhow::bail!(
+                "{} is a symbolic link that leads outside the project ({}). NestWeaver                  changed nothing for this tool: it will not create directories or write                  files outside {} through a link. Replace the link with a directory, or                  add the registration by hand.",
+                current.display(),
+                std::fs::read_link(&current)
+                    .map_or_else(|_| "unresolvable".to_string(), |t| t.display().to_string()),
+                base.display(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Where a tool's JSON MCP registration lives and under which key.
@@ -289,6 +365,8 @@ pub fn run_setup(
         db: &db,
         base,
         force: force_overwrite,
+        force_global: force_overwrite && tool.is_some(),
+        probe: true,
     };
     run_setup_for_tools(tool, &ctx, force_all, detect_tools(base))
 }
@@ -331,7 +409,9 @@ fn run_setup_for_tools(
         match configure_tool(t.name, ctx, &mut items) {
             Ok(()) => {
                 print_result(format_name(t.name), &items);
-                probe_configured_tool(t.name, base);
+                if ctx.probe {
+                    probe_configured_tool(t.name, base);
+                }
             }
             Err(error) => {
                 print_failure(format_name(t.name), &items, &error);
@@ -903,6 +983,13 @@ fn setup_codex(ctx: &SetupCtx, items: &mut Items) -> Result<(), anyhow::Error> {
 fn setup_windsurf(ctx: &SetupCtx, items: &mut Items) -> Result<(), anyhow::Error> {
     let target =
         json_registration("windsurf", ctx.base)?.context("windsurf has a JSON registration")?;
+    let ctx = &SetupCtx {
+        db: ctx.db,
+        base: ctx.base,
+        force: ctx.force && ctx.force_global,
+        force_global: ctx.force_global,
+        probe: ctx.probe,
+    };
     if let Some(parent) = target.path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -963,20 +1050,7 @@ fn setup_aider(ctx: &SetupCtx, items: &mut Items) -> Result<(), anyhow::Error> {
     let config_path = ctx.base.join(".aider.conf.yml");
     let status = match std::fs::read_to_string(&config_path) {
         Ok(existing) if existing.contains(LEGACY_AIDER_KEY) => {
-            let kept: Vec<&str> = existing
-                .lines()
-                .filter(|line| {
-                    let trimmed = line.trim();
-                    trimmed != LEGACY_AIDER_COMMENT && !trimmed.starts_with(LEGACY_AIDER_KEY)
-                })
-                .collect();
-            let mut cleaned = kept.join("\n");
-            while cleaned.ends_with('\n') {
-                cleaned.pop();
-            }
-            if !cleaned.is_empty() {
-                cleaned.push('\n');
-            }
+            let cleaned = remove_legacy_aider_block(&existing);
             user_config::replace_file_atomically(&config_path, &cleaned, SETUP_COMMAND)?;
             "removed the invalid `repo-map:` line an older NestWeaver wrote; Aider has \
              no MCP client, so nothing is registered"
@@ -987,6 +1061,33 @@ fn setup_aider(ctx: &SetupCtx, items: &mut Items) -> Result<(), anyhow::Error> {
     };
     items.push((".aider.conf.yml".to_string(), status.to_string()));
     Ok(())
+}
+
+/// Drop exactly what older releases appended: each `repo-map: nestweaver mcp`
+/// line, the `# NestWeaver code intelligence` comment directly above it, and
+/// the blank separator line directly above that. Every other line, and every
+/// line ending (CRLF included), is kept as it was.
+fn remove_legacy_aider_block(existing: &str) -> String {
+    let lines: Vec<&str> = existing.split_inclusive('\n').collect();
+    let mut dropped = vec![false; lines.len()];
+    for (index, line) in lines.iter().enumerate() {
+        if !line.trim().starts_with(LEGACY_AIDER_KEY) {
+            continue;
+        }
+        dropped[index] = true;
+        if index >= 1 && lines[index - 1].trim() == LEGACY_AIDER_COMMENT {
+            dropped[index - 1] = true;
+            if index >= 2 && lines[index - 2].trim().is_empty() {
+                dropped[index - 2] = true;
+            }
+        }
+    }
+    lines
+        .iter()
+        .zip(dropped)
+        .filter(|(_, dropped)| !dropped)
+        .map(|(line, _)| *line)
+        .collect()
 }
 
 /// Cline keeps MCP servers in ONE user-level file
@@ -1225,7 +1326,12 @@ fn merge_json_mcp(
             }
 
             let existing_config = flag_value(args.iter().map(|a| a.as_str()), "--config");
-            if let Some(config) = desired_config.as_deref() {
+            // An entry left pointing at ANOTHER database keeps its own
+            // config too: this project's `--config` beside that database
+            // would pair two installations, under a status that says "left
+            // unchanged".
+            let points_elsewhere = matches!(outcome, Registration::PointsElsewhere { .. });
+            if !points_elsewhere && let Some(config) = desired_config.as_deref() {
                 match existing_config {
                     None => {
                         args.push(serde_json::Value::String("--config".to_string()));
@@ -1403,7 +1509,10 @@ fn merge_codex_mcp(
     }
 
     let mut added_config = false;
-    if let Some(desired_config) = desired_config.as_deref() {
+    // As in `merge_json_mcp`: an entry left on another database keeps its
+    // own config.
+    let points_elsewhere = matches!(outcome, Registration::PointsElsewhere { .. });
+    if !points_elsewhere && let Some(desired_config) = desired_config.as_deref() {
         if let Some(config_index) = args
             .iter()
             .position(|value| value.as_str() == Some("--config"))
@@ -1664,16 +1773,18 @@ fn run_auto_setup_for_tools(
         return Ok(());
     }
 
+    let db = absolute_db_path(db_path)?;
     // Banner once per invocation, and suppressed under --quiet (nw-051).
     if !quiet {
-        print_setup_banner(db_path);
+        print_setup_banner(&db);
     }
 
-    let db = absolute_db_path(db_path)?;
     let ctx = SetupCtx {
         db: &db,
         base,
         force: false,
+        force_global: false,
+        probe: true,
     };
     let mut configured = Vec::new();
     let mut failures = Vec::new();
@@ -1786,6 +1897,8 @@ fn test_ctx<'a>(db: &'a Path, base: &'a Path) -> SetupCtx<'a> {
         db,
         base,
         force: false,
+        force_global: false,
+        probe: false,
     }
 }
 
@@ -2114,7 +2227,10 @@ args = [
         )
         .unwrap();
 
-        let desired = "\n[mcp_servers.nestweaver]\ncommand = \"nestweaver\"\nargs = [\"mcp\", \"--db\", \"/db\", \"--config\", \"/cfg/instance.toml\"]\n";
+        // The SAME database the section already binds: a section bound to a
+        // different one is left entirely alone, --config included (see
+        // `a_different_db_is_reported_without_force_and_rebound_with_it`).
+        let desired = "\n[mcp_servers.nestweaver]\ncommand = \"nestweaver\"\nargs = [\"mcp\", \"--db\", \"/custom-db\", \"--config\", \"/cfg/instance.toml\"]\n";
         merge_codex_mcp(&path, desired, false, dir.path()).unwrap();
 
         let written = std::fs::read_to_string(&path).unwrap();
@@ -2772,8 +2888,10 @@ mod integration_fix_tests {
             r#"{"mcpServers":{"nestweaver":{"command":"nestweaver","args":["mcp","--lite","--db","/old.lbug"]}}}"#,
         )
         .unwrap();
-        let desired =
-            serde_json::json!({"command": "nestweaver", "args": ["mcp", "--db", "/new.lbug"]});
+        let desired = serde_json::json!({
+            "command": "nestweaver",
+            "args": ["mcp", "--db", "/new.lbug", "--config", "/new/instance.toml"]
+        });
         let before = std::fs::read_to_string(&path).unwrap();
 
         let outcome = merge_json_mcp(
@@ -2812,8 +2930,16 @@ mod integration_fix_tests {
         );
         assert_eq!(
             args_of(&path, "/mcpServers/nestweaver/args"),
-            ["mcp", "--lite", "--db", "/new.lbug"],
-            "--force rebinds the database and keeps the user's other flags"
+            [
+                "mcp",
+                "--lite",
+                "--db",
+                "/new.lbug",
+                "--config",
+                "/new/instance.toml"
+            ],
+            "--force rebinds the database and keeps the user's other flags; \
+             --config is added only once the entry is this database's"
         );
     }
 
@@ -2968,6 +3094,49 @@ mod integration_fix_tests {
         assert!(!tmp.path().join(".cline").exists());
         assert!(items[0].1.contains("Configure MCP Servers"), "{items:?}");
         assert!(items[0].1.contains("\"nestweaver\""), "{items:?}");
+    }
+
+    /// A repository can ship `.continue -> <somewhere outside>`; following it
+    /// made setup create directories and write files outside the project.
+    #[test]
+    #[cfg(unix)]
+    fn a_directory_link_leading_outside_the_project_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, project.join(".continue")).unwrap();
+        let db = tmp.path().join("t.lbug");
+
+        let error =
+            configure_tool("continue", &test_ctx(&db, &project), &mut Items::new()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("outside the project"),
+            "{error:#}"
+        );
+        assert!(
+            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "nothing may be created through the link"
+        );
+
+        // A link that stays inside the project is fine.
+        let inside = tmp.path().join("project/real-kiro");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::os::unix::fs::symlink(&inside, project.join(".kiro")).unwrap();
+        configure_tool("kiro", &test_ctx(&db, &project), &mut Items::new()).unwrap();
+        assert!(inside.join("settings/mcp.json").exists());
+    }
+
+    /// Only what older releases appended is removed; CRLF endings and an
+    /// unrelated copy of the comment survive.
+    #[test]
+    fn aider_cleanup_removes_only_the_legacy_block() {
+        let original = "# NestWeaver code intelligence\r\nmodel: sonnet\r\n\r\n# NestWeaver code intelligence\nrepo-map: nestweaver mcp --db ./x.lbug\n";
+        assert_eq!(
+            remove_legacy_aider_block(original),
+            "# NestWeaver code intelligence\r\nmodel: sonnet\r\n"
+        );
     }
 
     /// `repo-map:` is not an Aider option. Setup no longer writes it and
