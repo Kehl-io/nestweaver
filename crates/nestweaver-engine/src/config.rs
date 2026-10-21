@@ -1050,6 +1050,11 @@ pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
 /// Empty IDs are rejected because every graph write must have an owning
 /// instance. "default" and ordinary names (`a-b_c`, `my.instance`) remain
 /// valid.
+///
+/// The id is also a directory name (`<data dir>/nestweaver/<instance>/snapshot`,
+/// `snapshot-<instance>`), so path separators, control characters and the
+/// `.`/`..` components are rejected: `instance_id = "../../evil"` must not
+/// name a directory outside the data directory.
 pub fn validate_instance_id(instance_id: &str) -> Result<(), anyhow::Error> {
     if instance_id.is_empty() {
         anyhow::bail!("invalid instance_id: value must not be empty");
@@ -1058,6 +1063,21 @@ pub fn validate_instance_id(instance_id: &str) -> Result<(), anyhow::Error> {
         anyhow::bail!(
             "invalid instance_id {instance_id:?}: character {bad:?} is not allowed \
              (colons and whitespace break graph uids like `repo:<instance>:<hash>`)"
+        );
+    }
+    if let Some(bad) = instance_id
+        .chars()
+        .find(|c| matches!(c, '/' | '\\') || c.is_control())
+    {
+        anyhow::bail!(
+            "invalid instance_id {instance_id:?}: character {bad:?} is not allowed \
+             (the instance id names a directory)"
+        );
+    }
+    if matches!(instance_id, "." | "..") {
+        anyhow::bail!(
+            "invalid instance_id {instance_id:?}: `.` and `..` are not allowed \
+             (the instance id names a directory)"
         );
     }
     Ok(())
@@ -2052,10 +2072,21 @@ url = "https://github.com/example/repo"
     // ordinary logical names.
     #[test]
     fn validate_instance_id_rules() {
-        for valid in ["default", "kory-brain", "my.instance-01_ok"] {
+        for valid in ["default", "kory-brain", "my.instance-01_ok", "a..b"] {
             assert!(validate_instance_id(valid).is_ok(), "valid id: {valid:?}");
         }
-        for invalid in ["", "a:b", "has space", "has\ttab"] {
+        for invalid in [
+            "",
+            "a:b",
+            "has space",
+            "has\ttab",
+            "../../evil",
+            "..",
+            ".",
+            "a/b",
+            "a\\b",
+            "esc\u{1b}[2J",
+        ] {
             assert!(
                 validate_instance_id(invalid).is_err(),
                 "invalid id: {invalid:?}"

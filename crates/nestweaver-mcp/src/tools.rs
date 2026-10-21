@@ -5470,10 +5470,7 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .get("token_budget")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
-    let explicit_root = args
-        .get("root")
-        .and_then(|v| v.as_str())
-        .map(std::path::PathBuf::from);
+    let explicit_root = arg_root_opt(store, &args)?;
     let fallback_root = explicit_root
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
@@ -8144,13 +8141,9 @@ fn tool_brain_context(
         .unwrap_or(false);
     if include_bodies {
         let response_config = configured_response();
-        let root = args
-            .get("root")
-            .and_then(|v| v.as_str())
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-            });
+        let root = arg_root_opt(store, &args)?.unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        });
         let reader_resolver = inline_body_reader_resolver(store);
         populate_inline_bodies(
             store,
@@ -8991,13 +8984,9 @@ fn tool_brain_search(
         .unwrap_or(false);
     if include_bodies && !concise {
         let response_config = configured_response();
-        let root = args
-            .get("root")
-            .and_then(|v| v.as_str())
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-            });
+        let root = arg_root_opt(store, &args)?.unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        });
         let mut nodes: Vec<nestweaver_engine::BrainNode> = note_results
             .iter()
             .filter_map(|v| {
@@ -11500,7 +11489,7 @@ pub fn brain_status_json(
             continue;
         }
         // Check git HEAD vs indexed SHA — fast (no network), just reads .git/HEAD
-        if let Ok(output) = std::process::Command::new("git")
+        if let Ok(output) = nestweaver_engine::git_cmd::isolated_git()
             .args(["rev-parse", "HEAD"])
             .current_dir(repo_path)
             .output()
@@ -23156,11 +23145,79 @@ mod daemon_index_progress_tests {
 }
 
 /// Resolve the source root for body reads: explicit `root` arg, else cwd.
-fn arg_root(args: &Value) -> std::path::PathBuf {
-    args.get("root")
-        .and_then(|v| v.as_str())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+fn arg_root(store: &GraphStore, args: &Value) -> Result<std::path::PathBuf, anyhow::Error> {
+    match arg_root_opt(store, args)? {
+        Some(root) => Ok(root),
+        None => Ok(std::env::current_dir().unwrap_or_default()),
+    }
+}
+
+/// An explicit `root` for reading source bodies, refused unless it lies inside
+/// an indexed repository's or vault's root, or is a linked worktree of an
+/// indexed repository.
+///
+/// `root` decides which directory symbol spans are read from. Unchecked, any
+/// caller could read lines of any file on the host whose relative path matches
+/// an indexed one.
+fn contained_source_root(
+    store: &GraphStore,
+    root: &Path,
+) -> Result<std::path::PathBuf, anyhow::Error> {
+    let refused = || {
+        anyhow!(
+            "root '{}' is not inside an indexed repository or vault; omit root to read each \
+             symbol from its repository",
+            root.display()
+        )
+    };
+    let canonical = std::fs::canonicalize(root).map_err(|_| refused())?;
+    let mut roots: Vec<std::path::PathBuf> = store
+        .list_repos(None)?
+        .iter()
+        .filter_map(|repo| repo.local_root().map(std::path::PathBuf::from))
+        .collect();
+    roots.extend(
+        store
+            .list_vaults(None)?
+            .into_iter()
+            .map(|vault| std::path::PathBuf::from(vault.root_path)),
+    );
+    let indexed: Vec<std::path::PathBuf> = roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .collect();
+    if indexed.iter().any(|indexed| canonical.starts_with(indexed)) {
+        return Ok(canonical);
+    }
+    // A linked worktree of an indexed repository shares its common directory.
+    let mut command = nestweaver_engine::git_cmd::isolated_git();
+    command.arg("-C").arg(&canonical).args([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    ]);
+    let common = nestweaver_engine::git_cmd::run_git_with_timeout_and_output_limit(
+        command,
+        nestweaver_engine::git_cmd::git_net_timeout(),
+        64 * 1024,
+    )
+    .ok()
+    .filter(|output| output.status.success())
+    .and_then(|output| {
+        use std::os::unix::ffi::OsStrExt;
+        let value = output.stdout.strip_suffix(b"\n")?;
+        std::fs::canonicalize(std::ffi::OsStr::from_bytes(value)).ok()
+    });
+    match common {
+        Some(common)
+            if indexed
+                .iter()
+                .any(|indexed| indexed.join(".git") == common) =>
+        {
+            Ok(canonical)
+        }
+        _ => Err(refused()),
+    }
 }
 
 /// Like [`arg_root`], but returns `None` when `root` was omitted instead of
@@ -23170,10 +23227,16 @@ fn arg_root(args: &Value) -> std::path::PathBuf {
 /// from "explicit" apart so they can fall back to each symbol's owning-repo
 /// `local_root` (like `read_symbols`) rather than the server's working
 /// directory, while an explicit `root` still wins outright.
-fn arg_root_opt(args: &Value) -> Option<std::path::PathBuf> {
+///
+/// An explicit `root` must pass [`contained_source_root`].
+fn arg_root_opt(
+    store: &GraphStore,
+    args: &Value,
+) -> Result<Option<std::path::PathBuf>, anyhow::Error> {
     args.get("root")
         .and_then(|v| v.as_str())
-        .map(std::path::PathBuf::from)
+        .map(|root| contained_source_root(store, Path::new(root)))
+        .transpose()
 }
 
 fn tool_schema_investigate() -> Value {
@@ -23243,7 +23306,7 @@ fn tool_investigate(
         .get("token_budget")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
-    let root = arg_root(&args);
+    let root = arg_root(store, &args)?;
     let db_path = current_db_path(store).ok();
     let result = investigate(
         store,
@@ -23322,7 +23385,7 @@ fn tool_investigate_expand(store: &GraphStore, args: Value) -> Result<Value, any
     if targets.is_empty() {
         return Err(anyhow!("'targets' must be a non-empty array"));
     }
-    let root = arg_root_opt(&args);
+    let root = arg_root_opt(store, &args)?;
     let db_path = current_db_path(store)?;
     let result = investigate_expand(store, &db_path, root.as_deref(), bundle_id, &targets)
         .map_err(|error| bundle_not_found(error, bundle_id))?;
@@ -23362,7 +23425,7 @@ fn tool_investigate_hydrate(store: &GraphStore, args: Value) -> Result<Value, an
         .get("token_budget")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
-    let root = arg_root_opt(&args);
+    let root = arg_root_opt(store, &args)?;
     let db_path = current_db_path(store)?;
     let result = investigate_hydrate(store, &db_path, root.as_deref(), bundle_id, token_budget)
         .map_err(|error| bundle_not_found(error, bundle_id))?;
@@ -34287,6 +34350,19 @@ mod repo_visibility_coverage_tests {
             format!("def alphaPublicHelper():\n    pass  # {CANARY}\n"),
         )
         .unwrap();
+        // An explicit root must lie inside an indexed source, so register the
+        // checkout as one; the scoped refusal below must still win.
+        store
+            .insert_repo(&Repo {
+                uid: "repo:inst:checkout".to_string(),
+                url: format!("file://{}", root.path().display()),
+                indexed_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "inst".to_string(),
+                name: Some("checkout".to_string()),
+                root_path: Some(root.path().display().to_string()),
+            })
+            .unwrap();
 
         let read_args = json!({
             "targets": ["sym:alpha:public"],
@@ -37157,6 +37233,66 @@ mod ambiguous_name_contract_tests {
             ],
             "{ambiguous}"
         );
+    }
+
+    /// An explicit `root` decides where symbol bodies are read from, so it
+    /// must lie inside an indexed repository (or be a linked worktree of
+    /// one); any other directory is refused before anything is read.
+    #[test]
+    fn read_symbols_refuses_a_root_outside_indexed_repositories() {
+        use nestweaver_engine::index_directory_in_memory;
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/util.js"), "function helper(n) { return n; }\n").unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        git(&repo, &["config", "user.name", "t"]);
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+        let (_repo, store) =
+            index_directory_in_memory(&repo, "test", "https://example.com/r", "sha").unwrap();
+        let read = |root: &std::path::Path| {
+            tool_read_symbols(
+                &store,
+                json!({ "targets": ["helper"], "root": root.to_string_lossy() }),
+            )
+        };
+
+        let inside = read(&repo).unwrap();
+        assert!(inside.to_string().contains("return n"), "{inside}");
+
+        // Same relative path, unrelated directory: refused, not read.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("src")).unwrap();
+        std::fs::write(
+            outside.path().join("src/util.js"),
+            "function helper(n) { return 'outside-canary'; }\n",
+        )
+        .unwrap();
+        let error = read(outside.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("not inside an indexed repository"), "{error:#}");
+
+        // A linked worktree of the indexed repository is still accepted.
+        let worktree = dir.path().join("linked");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "side", worktree.to_str().unwrap()],
+        );
+        let linked = read(&worktree).unwrap();
+        assert!(linked.to_string().contains("return n"), "{linked}");
     }
 
     /// 12.1.1 (M1): a `read_symbols` target whose qualifier names no file

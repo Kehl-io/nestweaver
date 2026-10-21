@@ -40,6 +40,8 @@ impl Registry {
     }
 
     pub fn register(&mut self, id: &str, config_path: &str) -> Result<(), anyhow::Error> {
+        // The id later names a directory (`<data dir>/nestweaver/<id>`).
+        crate::config::validate_instance_id(id)?;
         if self.instances.iter().any(|e| e.id == id) {
             anyhow::bail!("instance '{}' is already registered", id);
         }
@@ -74,6 +76,16 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_refuses_an_id_that_escapes_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::load_or_create(&dir.path().join("registry.json")).unwrap();
+        for id in ["../../evil", "..", "a/b"] {
+            assert!(registry.register(id, "/tmp/x.toml").is_err(), "{id:?}");
+        }
+        assert!(registry.list().is_empty());
+    }
 
     #[test]
     fn register_and_list() {

@@ -414,6 +414,9 @@ pub struct FilesystemReader {
     /// between the walk and the `ls-files` is not load-bearing — a file added
     /// to the index mid-index is already outside this run's snapshot.
     tracked_files: std::sync::Arc<std::sync::OnceLock<Option<HashSet<PathBuf>>>>,
+    /// `repo_path` with symlinks resolved, computed on the first read. Reads
+    /// must stay below it: see [`Self::contained_path`].
+    canonical_root: std::sync::Arc<std::sync::OnceLock<Option<PathBuf>>>,
 }
 
 /// The `reason` a [`SkippedDir`] carries when a configured `[[repos]] exclude`
@@ -742,6 +745,35 @@ impl FilesystemReader {
             skip_dirs: crate::index::SKIP_DIRS,
             skipped_dirs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             tracked_files: std::sync::Arc::new(std::sync::OnceLock::new()),
+            canonical_root: std::sync::Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    /// The path a read of `rel_path` opens, refused when it resolves outside
+    /// the repository root.
+    ///
+    /// A path read after indexing (`read_symbols`, investigate bodies, the
+    /// watcher) is whatever is on disk now: a file replaced by a symlink to
+    /// `~/.ssh/id_ed25519`, or a `..` in a stored path, must not be read.
+    /// Symlinks that stay inside the root still work. A path that does not
+    /// exist is returned as joined, so callers keep reporting it as missing.
+    fn contained_path(&self, rel_path: &Path) -> Result<PathBuf> {
+        let abs = self.repo_path.join(rel_path);
+        let resolved = match std::fs::canonicalize(&abs) {
+            Ok(resolved) => resolved,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(abs),
+            Err(error) => return Err(io_read_error("resolve", &abs, error)),
+        };
+        let root = self
+            .canonical_root
+            .get_or_init(|| std::fs::canonicalize(&self.repo_path).ok());
+        match root {
+            Some(root) if resolved.starts_with(root) => Ok(resolved),
+            _ => anyhow::bail!(
+                "refusing to read {}: it resolves outside the repository root {}",
+                rel_path.display(),
+                self.repo_path.display()
+            ),
         }
     }
 
@@ -1014,7 +1046,7 @@ impl ContentReader for FilesystemReader {
     /// pattern. Invalid UTF-8 is an error carrying a typed
     /// [`std::string::FromUtf8Error`].
     fn read_optional_file(&self, rel_path: &Path) -> Result<Option<String>> {
-        let abs = self.repo_path.join(rel_path);
+        let abs = self.contained_path(rel_path)?;
         let metadata = match std::fs::metadata(&abs) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1069,7 +1101,7 @@ impl ContentReader for FilesystemReader {
     }
 
     fn read_file(&self, rel_path: &Path) -> Result<String> {
-        let abs = self.repo_path.join(rel_path);
+        let abs = self.contained_path(rel_path)?;
         let observed_bytes = std::fs::metadata(&abs)
             .map_err(|e| io_read_error("stat", &abs, e))?
             .len();
@@ -2156,6 +2188,37 @@ mod tests {
             error.chain().any(|cause| cause.is::<SourceTooLarge>()),
             "{error:#}"
         );
+    }
+
+    /// A file swapped for a symlink to a path outside the repository after
+    /// indexing (or a stored path with `..`) must not be read; a symlink that
+    /// stays inside the repository still is.
+    #[test]
+    fn filesystem_reader_refuses_reads_that_resolve_outside_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(outside.path().join("secret"), "TOP SECRET\n").unwrap();
+        std::fs::write(repo.join("src/real.rs"), "fn real() {}\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), repo.join("src/lib.rs"))
+            .unwrap();
+        std::os::unix::fs::symlink("real.rs", repo.join("src/inner.rs")).unwrap();
+        let reader = FilesystemReader::new(&repo);
+
+        let error = reader.read_file(Path::new("src/lib.rs")).unwrap_err();
+        assert!(format!("{error:#}").contains("outside the repository"), "{error:#}");
+        assert!(reader.read_optional_file(Path::new("src/lib.rs")).is_err());
+        let escape = format!(
+            "../../{}/secret",
+            outside.path().file_name().unwrap().to_string_lossy()
+        );
+        assert!(reader.read_file(Path::new(&escape)).is_err());
+        assert_eq!(
+            reader.read_file(Path::new("src/inner.rs")).unwrap(),
+            "fn real() {}\n"
+        );
+        assert_eq!(reader.read_optional_file(Path::new("missing.rs")).unwrap(), None);
     }
 
     #[test]

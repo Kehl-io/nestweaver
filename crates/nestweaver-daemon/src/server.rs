@@ -8308,6 +8308,10 @@ impl NestWeaverDaemon for DaemonService {
                 repo_path.display()
             )));
         }
+        // A `.git` borrowing another repository's metadata would mint that
+        // repository's identity and replace its graph.
+        nestweaver_engine::ensure_own_git_metadata(&repo_path)
+            .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
         let state = self.state.clone();
         let force = req.force;
         // Three-state trigram policy. A plain bool could not distinguish "the
@@ -8442,7 +8446,7 @@ impl NestWeaverDaemon for DaemonService {
             // (and collide with) its parent repo's identity.
             let repo_url = nestweaver_engine::mint_repo_identity(&repo_path);
 
-            let indexed_sha = std::process::Command::new("git")
+            let indexed_sha = nestweaver_engine::git_cmd::isolated_git()
                 .args(["rev-parse", "HEAD"])
                 .current_dir(&repo_path)
                 .output()
@@ -8818,6 +8822,18 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
+        // The refusal `index_repo` applies: a vault is a specific folder,
+        // never a system root, a home directory or a pseudo-filesystem.
+        let resolved = vault_path
+            .canonicalize()
+            .unwrap_or_else(|_| vault_path.clone());
+        if is_unsafe_index_root(&resolved) {
+            return Err(Status::invalid_argument(format!(
+                "refusing to index vault '{}': system roots, home directories and \
+                 pseudo-filesystems are not sources; pass a specific folder",
+                resolved.display()
+            )));
+        }
         // A defaulted name is resolved by the engine: a registered vault
         // keeps its stored name, a new one takes its directory's.
         let vault_name = if req.vault_name_defaulted {
@@ -12484,8 +12500,25 @@ fn is_unsafe_index_root(path: &std::path::Path) -> bool {
         "/tmp",
         "/volumes",
         "/dev",
+        "/proc",
+        "/sys",
+        "/run",
+        "/boot",
+        "/root",
+        "/lib",
+        "/lib64",
+        "/snap",
     ];
     if dangerous.iter().any(|d| p == *d) {
+        return true;
+    }
+    // Kernel and device pseudo-filesystems hold no sources at any depth, and
+    // walking them reads live process memory maps, environments and devices
+    // (`/proc/self` canonicalizes to `/proc/<pid>`).
+    if ["/proc/", "/sys/", "/dev/"]
+        .iter()
+        .any(|prefix| p.starts_with(prefix))
+    {
         return true;
     }
     if let Some(home) = std::env::var_os("HOME") {
@@ -24645,6 +24678,36 @@ repos = ["alpha"]
                 !is_unsafe_index_root(Path::new(ok)),
                 "{ok:?} is a specific repo path and must be allowed"
             );
+        }
+    }
+
+    /// `brain_add_source /proc/self` registered `file:///proc/<pid>`.
+    #[test]
+    fn is_unsafe_index_root_refuses_pseudo_filesystems_at_any_depth() {
+        use std::path::Path;
+        for bad in [
+            "/proc",
+            "/proc/self",
+            "/proc/1234",
+            "/proc/1234/root",
+            "/sys",
+            "/sys/kernel",
+            "/dev/shm",
+            "/run",
+            "/boot",
+            "/root",
+        ] {
+            assert!(
+                is_unsafe_index_root(Path::new(bad)),
+                "{bad:?} must be refused"
+            );
+        }
+        let self_proc = Path::new("/proc/self")
+            .canonicalize()
+            .unwrap_or_else(|_| "/proc/self".into());
+        assert!(is_unsafe_index_root(&self_proc), "{self_proc:?}");
+        for ok in ["/home/user/proc", "/srv/sys/app", "/home/user/dev/proc"] {
+            assert!(!is_unsafe_index_root(Path::new(ok)), "{ok:?} must be allowed");
         }
     }
 
