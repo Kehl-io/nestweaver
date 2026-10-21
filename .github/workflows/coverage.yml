@@ -172,4 +172,5 @@ jobs:
         with:
           name: coverage-report
           path: lcov.info
+          retention-days: 3
 

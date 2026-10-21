@@ -668,6 +668,7 @@ jobs:
             ${{ runner.temp }}/metal-build-evidence
             target/cargo-timings
           if-no-files-found: warn
+          retention-days: 3
 
   fmt:
     name: Rustfmt
@@ -866,6 +867,7 @@ jobs:
             /tmp/nw-release-*/daemon.log
             /tmp/nw-release-*/ui.log
           if-no-files-found: error
+          retention-days: 3
 
   clippy:
     name: Clippy
@@ -1220,6 +1222,7 @@ jobs:
           name: mutants-report
           path: mutation-evidence/
           if-no-files-found: error
+          retention-days: 3
 
   audit:
     name: Security Audit
