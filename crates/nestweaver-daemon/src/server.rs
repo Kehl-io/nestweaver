@@ -8879,6 +8879,15 @@ impl NestWeaverDaemon for DaemonService {
                         }
                     };
 
+                    // `brain list` reads this as "Last indexed"; without it the
+                    // column falls back to the newest note mtime.
+                    if let Err(error) = nestweaver_engine::record_last_indexed_at(
+                        &state.db_path,
+                        &result.index.vault_uid,
+                    ) {
+                        tracing::warn!(%error, "failed to record vault index timestamp");
+                    }
+
                     // DONE phase. nw-651: a coverage gap is disclosed (the
                     // skip rows, degraded coverage), not a failure — say why
                     // derivation was left un-Current instead of erroring.
@@ -18071,6 +18080,48 @@ credential_method = "gh"
         service.remove_vault(request).await.unwrap();
 
         assert_embeddings_absent(&state, &[&note_uid, &heading_uid]);
+    }
+
+    /// `brain list` shows "Last indexed" from the extension sidecar; a daemon
+    /// IndexVault that never recorded it fell back to the newest note mtime.
+    #[tokio::test]
+    async fn index_vault_records_last_indexed_at() {
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.md"), "# A\n\nBody.\n").unwrap();
+        let vault_uid =
+            nestweaver_schema::vault_uid(&state.data_instance_id, &root.to_string_lossy());
+        assert_eq!(
+            nestweaver_engine::get_last_indexed_at(&state.db_path, &vault_uid),
+            None
+        );
+
+        let progress = index_vault_via_rpc(&state, &root).await;
+        assert!(
+            progress.iter().any(|p| p.phase == Phase::Done as i32),
+            "{progress:?}"
+        );
+        assert!(
+            nestweaver_engine::get_last_indexed_at(&state.db_path, &vault_uid).is_some(),
+            "a successful IndexVault records last_indexed_at"
+        );
+    }
+
+    /// A relative config_path would be resolved against the daemon's CWD and
+    /// load some other instance.toml; it is refused instead.
+    #[tokio::test]
+    async fn materialize_projects_rejects_relative_config_path() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state);
+        let mut request = Request::new(MaterializeProjectsRequest {
+            config_path: "instance.toml".to_string(),
+            ..Default::default()
+        });
+        request.extensions_mut().insert(crate::auth::IsAdmin(true));
+        let status = service.materialize_projects(request).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("must be absolute"), "{status:?}");
     }
 
     async fn index_vault_via_rpc(state: &Arc<DaemonState>, root: &Path) -> Vec<IndexProgress> {
