@@ -163,7 +163,8 @@ stdio MCP, default config) weighs more than one that needs an unusual setting.
   - the `ssh://` clone DNS-rebinding window;
   - backup-archive (`.nwsnap.zst`) expansion on restore, which is a local operation on a trusted file;
   - `git rev-parse <ref>` without `--`;
-  - the advisory-flagged transitive dependencies listed there (`paste`, `cxx`, `lru`).
+  - the advisory-flagged transitive dependencies listed there, including the `zip` advisories ignored in
+    `.cargo/audit.toml`.
 - The Unix-domain socket gRPC service has no authentication by design. Access control is the socket's file
   permissions and its private directory, so report a way for another user to reach it, not the absence of a token.
 - A tokenless daemon on loopback trusts local processes. Report cross-origin or other-user reachability, not the
