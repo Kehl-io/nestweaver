@@ -1586,7 +1586,12 @@ fn rebuild_full_index_write_set_from_disk(
             published.as_ref(),
         )
     } else {
-        prepare_incremental_contract_derivation(reader, set.r_uid, set.repo_url)
+        prepare_incremental_contract_derivation(
+            reader,
+            set.r_uid,
+            set.repo_url,
+            published_spec_sources(store, set.r_uid).as_ref(),
+        )
     };
     *contract_plan = match contract_plan_result {
         Ok(plan) => plan,
@@ -5618,7 +5623,12 @@ where
             published.as_ref(),
         )
     } else {
-        prepare_incremental_contract_derivation(reader, &r_uid, repo_url)
+        prepare_incremental_contract_derivation(
+            reader,
+            &r_uid,
+            repo_url,
+            published_spec_sources(store, &r_uid).as_ref(),
+        )
     };
 
     // nw-812: type environments are CPU-throttled parse-pool work. Build
@@ -6188,10 +6198,12 @@ where
         drop(contract_txn);
         let (contracts_derived, contracts_status) = match contract_apply {
             Ok(count) => {
-                if let Err(error) = store.clear_contract_derivation_failed(&r_uid) {
-                    tracing::warn!("clearing contract derivation marker failed: {error}");
-                }
-                (count, crate::blast_radius::AnalysisStatus::Complete)
+                let status = if settle_contract_derivation_marker(store, &r_uid, &contract_plan) {
+                    crate::blast_radius::AnalysisStatus::Complete
+                } else {
+                    crate::blast_radius::AnalysisStatus::Degraded
+                };
+                (count, status)
             }
             Err(error) => {
                 if let Err(marker_error) =
@@ -6763,10 +6775,15 @@ fn collect_contract_derivation_inputs(
     Ok((spec_files, handler_files, all_symbols, skipped_files))
 }
 
+/// `published_spec_sources`: see [`prepare_contract_derivation`]. Index
+/// routes pass the store's published spec sources so a never-published,
+/// unparseable spec is skipped (QA #9) on every non-forced `index`, not only
+/// on a full replacement; `None` keeps every spec fail-closed.
 fn prepare_incremental_contract_derivation(
     reader: &dyn crate::content_reader::ContentReader,
     r_uid: &str,
     repo_url: &str,
+    published_spec_sources: Option<&HashSet<String>>,
 ) -> Result<ContractDerivationPlan, anyhow::Error> {
     let (spec_files, handler_files, all_symbols, skipped_files) =
         collect_contract_derivation_inputs(reader, r_uid, repo_url, true)?;
@@ -6777,7 +6794,7 @@ fn prepare_incremental_contract_derivation(
         &handler_files,
         &all_symbols,
         true,
-        None,
+        published_spec_sources,
     )?;
     plan.skipped_files.extend(skipped_files);
     Ok(plan)
@@ -6953,15 +6970,46 @@ fn empty_contract_plan() -> ContractDerivationPlan {
         input_hashes: std::collections::BTreeMap::new(),
         observed_input_hashes: std::collections::BTreeMap::new(),
         skipped_files: Vec::new(),
+        unparsed_specs: Vec::new(),
     }
 }
 
 pub(crate) struct ContractDerivationPlan {
+    /// Recognized specs that failed to parse and were skipped because they had
+    /// never published a contract. Non-empty means the contract graph is
+    /// incomplete: the repo is marked contract-derivation-failed (degraded)
+    /// rather than clean, so drift does not read "declares none".
+    pub(crate) unparsed_specs: Vec<String>,
     contracts: Vec<nestweaver_schema::Contract>,
     edges: Vec<nestweaver_schema::ResolvedEdge>,
     pub(crate) input_hashes: std::collections::BTreeMap<String, String>,
     pub(crate) observed_input_hashes: std::collections::BTreeMap<String, String>,
     pub(crate) skipped_files: Vec<SkippedFile>,
+}
+
+/// After a successful contract apply: clear the contract-derivation-failed
+/// marker, unless the plan skipped unparseable specs, in which case the
+/// marker names them so consumers report the repo's contracts as degraded.
+/// Returns whether the contract graph is complete.
+fn settle_contract_derivation_marker(
+    store: &GraphStore,
+    r_uid: &str,
+    plan: &ContractDerivationPlan,
+) -> bool {
+    if plan.unparsed_specs.is_empty() {
+        if let Err(error) = store.clear_contract_derivation_failed(r_uid) {
+            tracing::warn!("clearing contract derivation marker failed: {error}");
+        }
+        return true;
+    }
+    let reason = format!(
+        "contract spec(s) could not be parsed and were skipped: {}",
+        plan.unparsed_specs.join(", ")
+    );
+    if let Err(error) = store.set_contract_derivation_failed(r_uid, &reason) {
+        tracing::warn!("recording contract derivation failure failed: {error}");
+    }
+    false
 }
 
 /// Source paths that already published contracts for `r_uid`. A full index
@@ -6994,6 +7042,9 @@ fn prepare_contract_derivation(
     let mut all_contracts = ContractSet::new();
     let mut input_hashes = std::collections::BTreeMap::new();
     let mut skipped_files = Vec::new();
+    // Specs skipped as unparseable (QA #9); the run reports contracts as
+    // degraded while any remain.
+    let mut unparsed_specs: Vec<String> = Vec::new();
     // (contract_uid, "<package>.<Service>/<Rpc>") for every declared gRPC method.
     let mut declared_grpc: Vec<(String, String)> = Vec::new();
     let repo_path = reader.root();
@@ -7054,13 +7105,14 @@ fn prepare_contract_derivation(
                         .is_some_and(|published| !published.contains(&rel)) =>
                 {
                     tracing::warn!("skipping unparseable contract spec {rel}: {error}");
-                    skipped_files.push(SkippedFile {
-                        path: rel,
-                        reason: format!("contract spec could not be parsed: {error}"),
-                        reason_code: SkipReasonCode::ParseError,
-                        observed_bytes: None,
-                        limit_bytes: None,
-                    });
+                    // `new` caps the reason: a parser error can be long and
+                    // quote source text.
+                    skipped_files.push(SkippedFile::new(
+                        rel.clone(),
+                        SkipReasonCode::ParseError,
+                        format!("contract spec could not be parsed: {error}"),
+                    ));
+                    unparsed_specs.push(rel);
                     continue;
                 }
                 Err(error) => {
@@ -7241,6 +7293,7 @@ fn prepare_contract_derivation(
         input_hashes,
         observed_input_hashes: std::collections::BTreeMap::new(),
         skipped_files,
+        unparsed_specs,
     })
 }
 
@@ -8098,8 +8151,12 @@ fn incremental_index_with_name_and_io_and_authority(
         );
         let prepared_files = prepare_incremental_files(&reader, &changes)
             .context("rebuild incremental source files after publication lease")?;
-        let contract_plan = match prepare_incremental_contract_derivation(&reader, &r_uid, repo_url)
-        {
+        let contract_plan = match prepare_incremental_contract_derivation(
+            &reader,
+            &r_uid,
+            repo_url,
+            published_spec_sources(&store, &r_uid).as_ref(),
+        ) {
             Ok(plan) => plan,
             Err(error) => {
                 if let Err(marker_error) =
@@ -8372,9 +8429,7 @@ fn incremental_index_with_name_and_io_and_authority(
         .commit_transaction(&txn)
         .with_context(|| "commit incremental transaction")?;
     drop(txn);
-    if let Err(error) = store.clear_contract_derivation_failed(&r_uid) {
-        tracing::warn!("clearing contract derivation marker failed: {error}");
-    }
+    settle_contract_derivation_marker(&store, &r_uid, &contract_plan);
     persist_unresolved_imports(
         &reader,
         &store,
@@ -8585,7 +8640,12 @@ where
         &removed_files,
         &mut rdeps,
     );
-    let contract_plan_result = prepare_incremental_contract_derivation(reader, &r_uid, repo_url);
+    let contract_plan_result = prepare_incremental_contract_derivation(
+        reader,
+        &r_uid,
+        repo_url,
+        published_spec_sources(store, &r_uid).as_ref(),
+    );
     let mut prepared_files = prepare_incremental_files(reader, &changes)
         .context("prepare server incremental source files")?;
 
@@ -8640,8 +8700,12 @@ where
             );
             prepared_files = prepare_incremental_files(reader, &changes)
                 .context("rebuild server incremental source files after publication yield")?;
-            contract_plan = match prepare_incremental_contract_derivation(reader, &r_uid, repo_url)
-            {
+            contract_plan = match prepare_incremental_contract_derivation(
+                reader,
+                &r_uid,
+                repo_url,
+                published_spec_sources(store, &r_uid).as_ref(),
+            ) {
                 Ok(plan) => plan,
                 Err(error) => {
                     if let Err(marker_error) =
@@ -8899,9 +8963,7 @@ where
         .commit_transaction(&txn)
         .with_context(|| "commit incremental transaction")?;
     drop(txn);
-    if let Err(error) = store.clear_contract_derivation_failed(&r_uid) {
-        tracing::warn!("clearing contract derivation marker failed: {error}");
-    }
+    settle_contract_derivation_marker(store, &r_uid, &contract_plan);
     if let Some(db_path) = store.db_path() {
         persist_unresolved_imports(
             reader,
@@ -15135,6 +15197,7 @@ function hello(name) { return "Hello " + name; }
             input_hashes: std::collections::BTreeMap::new(),
             observed_input_hashes: std::collections::BTreeMap::new(),
             skipped_files: Vec::new(),
+            unparsed_specs: Vec::new(),
         };
         let transaction = store.begin_transaction().unwrap();
         apply_contract_derivation_on(&transaction, repo_a, &plan).unwrap();
@@ -15759,6 +15822,7 @@ function hello(name) { return "Hello " + name; }
             input_hashes: std::collections::BTreeMap::new(),
             observed_input_hashes: std::collections::BTreeMap::new(),
             skipped_files: Vec::new(),
+            unparsed_specs: Vec::new(),
         };
         let transaction = store.begin_transaction().unwrap();
         let err = apply_contract_derivation_on(&transaction, &repo_uid, &invalid_plan)
@@ -16025,6 +16089,61 @@ function hello(name) { return "Hello " + name; }
                 .unwrap()
                 .iter()
                 .all(|contract| contract.source_path != "docs/openapi.yaml")
+        );
+    }
+
+    /// QA #9 (review): a malformed spec added to an ALREADY-indexed repo is
+    /// skipped on the incremental derivation route too, and the repo's
+    /// contracts read as degraded rather than clean.
+    #[test]
+    fn incremental_index_skips_an_unparseable_new_spec_and_reports_degraded() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        write_shared_route_repo(&src);
+        let (_first, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let repo_uid = store
+            .list_contracts(None)
+            .unwrap()
+            .first()
+            .expect("first index derives a contract")
+            .repo_uid
+            .clone();
+
+        fs::create_dir_all(src.join("docs")).unwrap();
+        fs::write(src.join("docs/openapi.yaml"), "openapi: [malformed").unwrap();
+        let second = reindex_into(&store, &src, "def456")
+            .expect("a never-published malformed spec must not fail a non-forced index");
+        assert!(
+            second
+                .skipped_files
+                .iter()
+                .any(|skipped| skipped.path == "docs/openapi.yaml"
+                    && skipped.reason_code == SkipReasonCode::ParseError),
+            "{:?}",
+            second.skipped_files
+        );
+        assert_eq!(
+            second.contracts_status,
+            crate::blast_radius::AnalysisStatus::Degraded
+        );
+        assert_eq!(
+            store.contract_derivation_failures(Some(&repo_uid)).unwrap(),
+            vec![repo_uid.clone()],
+            "drift must not read the repo as clean"
+        );
+        assert!(
+            !crate::contracts::drift_for_store(&store, Some(&repo_uid))
+                .unwrap()
+                .is_clean()
+        );
+
+        // Fixing the spec clears the degradation.
+        fs::remove_file(src.join("docs/openapi.yaml")).unwrap();
+        let healed = reindex_into(&store, &src, "ghi789").unwrap();
+        assert_eq!(
+            healed.contracts_status,
+            crate::blast_radius::AnalysisStatus::Complete
         );
     }
 
