@@ -5779,6 +5779,17 @@ where
         // by disk path — so unrelated repos can never be caught by this delete.
         // Detected before the parse phase (see above) so the filemeta cache was
         // already bypassed for this pass.
+        //
+        // Every graph write from here on (the re-identify prune included)
+        // spans several store transactions. Commit the debt first so a process
+        // killed between them leaves a durable record that this repo's graph
+        // may be partial; the run's last write retires it. An error between
+        // the two also leaves it, deliberately: proving that every earlier
+        // transaction rolled back is harder than one spare full rebuild.
+        graph_mutation_attempted.set(true);
+        store
+            .set_repo_publication_incomplete(&r_uid, "index graph write")
+            .context("record publication-incomplete debt")?;
         if let Some(old_uid) = &reidentify_old_uid {
             graph_mutation_attempted.set(true);
             tracing::info!(
@@ -5802,12 +5813,6 @@ where
         // attempt before the first one so even a partially committed store error
         // is conservatively finalized.
         graph_mutation_attempted.set(true);
-        // The writes below span several store transactions. Commit the debt
-        // first so a process killed between them leaves a durable record that
-        // this repo's graph may be partial; the run's last write retires it.
-        store
-            .set_repo_publication_incomplete(&r_uid, "index graph write")
-            .context("record publication-incomplete debt")?;
         if existing_repo.is_none() {
             let repo = Repo {
                 uid: r_uid.clone(),
@@ -9744,6 +9749,80 @@ fn unresolved_importers_of_added_files(
     importers_of_added_paths(reader, unresolved, added, &known)
 }
 
+/// One seeded importer parsed for the resolver view.
+struct SeededImporterParse {
+    rel_path: String,
+    symbols: Vec<RawSymbol>,
+    references: Vec<RawReference>,
+    retained: Option<String>,
+    type_env: Option<nestweaver_resolver::types::TypeEnvironment>,
+}
+
+/// Read and parse one seeded importer. `None` (logged) leaves its edges in
+/// place: the caller only names a file in the resolve filter once it parsed.
+fn parse_seeded_importer(
+    reader: &dyn crate::content_reader::ContentReader,
+    file_languages: &HashMap<String, Language>,
+    rel_path: &str,
+) -> Option<SeededImporterParse> {
+    let Some(language) = file_languages
+        .get(rel_path)
+        .copied()
+        .or_else(|| detect_language(Path::new(rel_path)))
+    else {
+        tracing::warn!(
+            file = %rel_path,
+            "seeded importer has no detected language; leaving its edges in place"
+        );
+        return None;
+    };
+    let Ok(source) = reader.read_file(Path::new(rel_path)) else {
+        tracing::warn!(
+            file = %rel_path,
+            "seeded importer could not be read; leaving its edges in place"
+        );
+        return None;
+    };
+    let Ok(parsed) = parse_source(&reader.root().join(rel_path), &source) else {
+        tracing::warn!(
+            file = %rel_path,
+            "seeded importer could not be parsed; leaving its edges in place"
+        );
+        return None;
+    };
+    if parsed.unparsable_skip(rel_path.to_string()).is_some() {
+        tracing::warn!(
+            file = %rel_path,
+            "seeded importer was unparsable; leaving its edges in place"
+        );
+        return None;
+    }
+    let env = nestweaver_resolver::types::TypeEnvironment::build(
+        &source,
+        language,
+        &parsed.symbols,
+        &parsed.type_bindings,
+    );
+    let type_env = (env.binding_count() > 0 || env.has_scoped_call_assignments()).then_some(env);
+    // Same retention rule as a normal parse: JS/TS keep source for
+    // decorator recovery; other languages keep it under 2 MB.
+    const SOURCE_RETENTION_CAP: usize = 2 * 1024 * 1024;
+    let retained = if matches!(language, Language::TypeScript | Language::JavaScript)
+        || source.len() <= SOURCE_RETENTION_CAP
+    {
+        Some(source)
+    } else {
+        None
+    };
+    Some(SeededImporterParse {
+        rel_path: rel_path.to_string(),
+        symbols: parsed.symbols,
+        references: parsed.references,
+        retained,
+        type_env,
+    })
+}
+
 /// Parse seeded importers that are missing from `parsed_files` into that view.
 ///
 /// nw-806. Filemeta can classify an untouched importer as Unchanged when the
@@ -9762,72 +9841,30 @@ fn include_missing_seeded_importer_parses(
     file_languages: &HashMap<String, Language>,
     seeded: &HashSet<String>,
 ) -> HashSet<String> {
+    use rayon::prelude::*;
     let mut present: HashSet<String> = parsed_files
         .iter()
         .map(|(path, _, _, _)| path.clone())
         .collect();
-    for rel_path in seeded {
-        if present.contains(rel_path) {
-            continue;
+    let missing: Vec<&String> = seeded
+        .iter()
+        .filter(|path| !present.contains(path.as_str()))
+        .collect();
+    // Import-target rows can name many dependents of a widely imported
+    // module, so a cold parsed cache makes this the bulk of the pass: read
+    // and parse on the parse pool, as the scan phase does.
+    let parsed: Vec<SeededImporterParse> = crate::parse_pool::install_parse_pool(|| {
+        missing
+            .par_iter()
+            .filter_map(|rel_path| parse_seeded_importer(reader, file_languages, rel_path))
+            .collect()
+    });
+    for seed in parsed {
+        if let Some(env) = seed.type_env {
+            type_envs.insert(seed.rel_path.clone(), env);
         }
-        let Some(language) = file_languages
-            .get(rel_path)
-            .copied()
-            .or_else(|| detect_language(Path::new(rel_path)))
-        else {
-            tracing::warn!(
-                file = %rel_path,
-                "seeded importer has no detected language; leaving its edges in place"
-            );
-            continue;
-        };
-        let Ok(source) = reader.read_file(Path::new(rel_path)) else {
-            tracing::warn!(
-                file = %rel_path,
-                "seeded importer could not be read; leaving its edges in place"
-            );
-            continue;
-        };
-        let Ok(parsed) = parse_source(&reader.root().join(rel_path), &source) else {
-            tracing::warn!(
-                file = %rel_path,
-                "seeded importer could not be parsed; leaving its edges in place"
-            );
-            continue;
-        };
-        if parsed.unparsable_skip(rel_path.clone()).is_some() {
-            tracing::warn!(
-                file = %rel_path,
-                "seeded importer was unparsable; leaving its edges in place"
-            );
-            continue;
-        }
-        let env = nestweaver_resolver::types::TypeEnvironment::build(
-            &source,
-            language,
-            &parsed.symbols,
-            &parsed.type_bindings,
-        );
-        if env.binding_count() > 0 || env.has_scoped_call_assignments() {
-            type_envs.insert(rel_path.clone(), env);
-        }
-        // Same retention rule as a normal parse: JS/TS keep source for
-        // decorator recovery; other languages keep it under 2 MB.
-        const SOURCE_RETENTION_CAP: usize = 2 * 1024 * 1024;
-        let retained = if matches!(language, Language::TypeScript | Language::JavaScript)
-            || source.len() <= SOURCE_RETENTION_CAP
-        {
-            Some(source)
-        } else {
-            None
-        };
-        parsed_files.push((
-            rel_path.clone(),
-            parsed.symbols,
-            parsed.references,
-            retained,
-        ));
-        present.insert(rel_path.clone());
+        present.insert(seed.rel_path.clone());
+        parsed_files.push((seed.rel_path, seed.symbols, seed.references, seed.retained));
     }
     seeded
         .iter()

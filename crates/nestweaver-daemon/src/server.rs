@@ -12337,6 +12337,14 @@ impl NestWeaverDaemon for DaemonService {
                 // Vectors since the last checkpoint die with the process. The
                 // marker outlives such a death so `brain status` can say the
                 // pass is incomplete; any exit this process survives drops it.
+                // Nothing left to embed: whatever an interrupted pass this
+                // scope covers set out to do is done, so retire its marker.
+                if plan.eligible == 0 {
+                    nestweaver_engine::embed_pass_marker::retire_if_covered(
+                        &marker_db_path,
+                        &progress_scope,
+                    );
+                }
                 let _pass_marker = (plan.eligible > 0).then(|| {
                     nestweaver_engine::embed_pass_marker::begin(
                         &marker_db_path,

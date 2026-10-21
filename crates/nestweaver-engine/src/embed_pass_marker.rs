@@ -46,16 +46,36 @@ pub fn read(db_path: &Path) -> Option<EmbedPassRecord> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Removes the marker when dropped. Hold it for the duration of the pass.
+/// Whether a pass over `finishing` re-embeds everything a pass over `marked`
+/// set out to: `all` covers every scope, otherwise the scopes must be equal.
+pub fn scope_covers(finishing: &str, marked: &str) -> bool {
+    finishing == "all" || finishing == marked
+}
+
+/// Removes the marker when dropped, if this pass owns it. Hold it for the
+/// duration of the pass.
 #[must_use = "the marker is removed when the guard drops"]
 pub struct EmbedPassGuard {
     path: PathBuf,
+    owns_marker: bool,
 }
 
 /// Durably record that a pass is starting. A failure is logged and yields a
 /// guard anyway: losing the disclosure must not refuse the embedding work.
+///
+/// A marker left by an interrupted pass whose scope this pass does not cover
+/// (an `all` pass, under a `symbols` pass) is kept as it is: finishing the
+/// narrower pass does not finish the wider one, so its gap stays disclosed.
 pub fn begin(db_path: &Path, record: &EmbedPassRecord) -> EmbedPassGuard {
     let path = marker_path(db_path);
+    if let Some(existing) = read(db_path)
+        && !scope_covers(&record.scope, &existing.scope)
+    {
+        return EmbedPassGuard {
+            path,
+            owns_marker: false,
+        };
+    }
     let written = serde_json::to_vec(record)
         .map_err(std::io::Error::other)
         .and_then(|bytes| {
@@ -66,18 +86,38 @@ pub fn begin(db_path: &Path, record: &EmbedPassRecord) -> EmbedPassGuard {
     if let Err(error) = written {
         tracing::warn!(path = %path.display(), "could not record embedding pass marker: {error}");
     }
-    EmbedPassGuard { path }
+    EmbedPassGuard {
+        path,
+        owns_marker: true,
+    }
+}
+
+/// A pass over `scope` that found nothing left to embed completes whatever an
+/// interrupted pass it covers had set out to do: retire that pass's marker.
+/// A marker for a scope this pass does not cover stays.
+pub fn retire_if_covered(db_path: &Path, scope: &str) {
+    let Some(existing) = read(db_path) else {
+        return;
+    };
+    if !scope_covers(scope, &existing.scope) {
+        return;
+    }
+    remove(&marker_path(db_path));
+}
+
+fn remove(path: &Path) {
+    if let Err(error) = nestweaver_store::durable_sidecar::remove_file_durable_if_exists(path) {
+        tracing::warn!(
+            path = %path.display(),
+            "could not remove embedding pass marker: {error}"
+        );
+    }
 }
 
 impl Drop for EmbedPassGuard {
     fn drop(&mut self) {
-        if let Err(error) =
-            nestweaver_store::durable_sidecar::remove_file_durable_if_exists(&self.path)
-        {
-            tracing::warn!(
-                path = %self.path.display(),
-                "could not remove embedding pass marker: {error}"
-            );
+        if self.owns_marker {
+            remove(&self.path);
         }
     }
 }
@@ -137,6 +177,37 @@ mod tests {
         }
         assert!(read(&db).is_none());
         assert!(interrupted_pass_json(&db, false, 30).is_none());
+    }
+
+    fn scoped(scope: &str) -> EmbedPassRecord {
+        EmbedPassRecord {
+            scope: scope.to_string(),
+            ..record()
+        }
+    }
+
+    /// Review: a narrower pass must not retire a wider interrupted pass's
+    /// marker, and a covering pass with nothing left to embed must.
+    #[test]
+    fn only_a_covering_pass_retires_an_interrupted_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        std::mem::forget(begin(&db, &scoped("all")));
+
+        // A `symbols` pass runs and finishes: the `all` gap stays.
+        drop(begin(&db, &scoped("symbols")));
+        assert_eq!(read(&db).map(|r| r.scope), Some("all".to_string()));
+        retire_if_covered(&db, "notes");
+        assert!(read(&db).is_some());
+
+        // An `all` pass with nothing left to embed never calls `begin`.
+        retire_if_covered(&db, "all");
+        assert!(read(&db).is_none());
+
+        // A same-scope pass replaces and then removes the marker.
+        std::mem::forget(begin(&db, &scoped("notes")));
+        drop(begin(&db, &scoped("notes")));
+        assert!(read(&db).is_none());
     }
 
     #[test]
