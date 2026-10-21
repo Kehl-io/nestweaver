@@ -67,3 +67,8 @@
 (instance_expression
   (generic_type
     type: (type_identifier) @name)) @reference.call
+
+; The grammar may also read `Foo(...)` after `new` as one applied type.
+(instance_expression
+  (applied_constructor_type
+    (type_identifier) @name)) @reference.call
