@@ -12,6 +12,7 @@
     "glibc"
   ],
   "files": [
+    "LICENSE",
     "bin/"
   ],
   "license": "MIT",

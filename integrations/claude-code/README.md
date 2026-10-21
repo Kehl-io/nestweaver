@@ -23,24 +23,39 @@ Deep integration between NestWeaver's code knowledge graph and Claude Code.
 
    The MCP server automatically starts a background daemon that owns the database. Multiple MCP servers and CLI commands can share the same database concurrently — no lock contention.
 
-3. (Optional) Enable hooks for enriched context:
+3. (Optional) Enable the enrichment hooks in this directory. They are shell
+   scripts that need `bash` and `jq` on `PATH`; each stays silent (exit 0) when
+   either is missing or the database does not exist.
    ```bash
-   # Merge the hook config into your existing .claude/settings.json
-   cat integrations/claude-code/settings.json
+   mkdir -p .claude/hooks/nestweaver
+   cp /path/to/nestweaver/integrations/claude-code/hooks/*.sh .claude/hooks/nestweaver/
    ```
+   Then merge the `hooks` object from
+   [`settings.json`](settings.json) into your project's `.claude/settings.json`.
+   The commands reference the scripts as
+   `"$CLAUDE_PROJECT_DIR/.claude/hooks/nestweaver/<name>.sh"`, so they work from
+   any working directory inside the project. If you keep the scripts elsewhere,
+   change those paths. MCP servers belong in `.mcp.json` (step 2), not in
+   `settings.json`.
 
-> **Recommended:** Use `nestweaver setup claude-code` to automatically install the MCP server config (`.mcp.json`) and skill (`.claude/skills/nestweaver/SKILL.md`).
+> **Recommended:** Use `nestweaver setup claude-code` to automatically install the MCP server config (`.mcp.json`), the skill (`.claude/skills/nestweaver/SKILL.md`), and two lightweight hooks (SessionStart brain status, and a PreToolUse hint on grep/rg/find) in `.claude/settings.json`. Re-running it repairs hooks written by older releases.
 
 ## Hooks
 
-| Hook | Trigger | Effect |
-|------|---------|--------|
-| `SessionStart` | Session begins | Prints brain status and staleness check |
-| `pre-read-enrich.sh` | Claude reads a file | Shows related symbols and their graph position |
-| `pre-write-impact` | Claude writes/edits a file | Shows blast radius of the file being modified |
-| `pre-search-enrich.sh` | Claude runs grep/rg | Adds PageRank-ordered graph results |
-| `post-commit-stale-check.sh` | After `git commit` | Warns if index is stale |
-| `post-edit-impact.sh` | After file edits | Shows blast radius of the change |
+Every script reads the hook event from stdin (`tool_input.file_path` or
+`tool_input.command`) and reports back as
+`{"hookSpecificOutput": {"hookEventName": …, "additionalContext": …}}` on
+stdout, which Claude Code adds to the conversation next to the tool result.
+None of them blocks a tool call. The database is `$NESTWEAVER_DB` when set,
+otherwise `$CLAUDE_PROJECT_DIR/nestweaver.lbug`.
+
+| Hook | Event (matcher) | Effect |
+|------|-----------------|--------|
+| SessionStart command | `SessionStart` | Prints brain status; plain stdout on SessionStart becomes session context |
+| `pre-read-enrich.sh` | `PreToolUse` (`Read`) | Adds the symbols related to the file being read |
+| `post-edit-impact.sh` | `PreToolUse` (`Write\|Edit`) | Adds the blast radius of the file about to be modified. It runs *before* the edit so the impact is known while the change is being made; the name is kept for compatibility with existing configs |
+| `pre-search-enrich.sh` | `PreToolUse` (`Bash`) | On `grep`/`rg` commands, adds graph search results for the search term |
+| `post-commit-stale-check.sh` | `PostToolUse` (`Bash`) | After `git commit`, adds a re-index reminder when `stale-check` reports drift |
 
 ## MCP Tools
 

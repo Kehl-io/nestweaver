@@ -9,6 +9,7 @@
     "x64"
   ],
   "files": [
+    "LICENSE",
     "bin/"
   ],
   "license": "MIT",

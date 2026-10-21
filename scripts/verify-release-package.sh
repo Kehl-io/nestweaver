@@ -105,13 +105,19 @@ verify_main_contract() {
   jq -e --arg version "$npm_version" '
     .bin.nestweaver == "bin/nestweaver" and
     (.scripts // {} | length) == 0 and
-    (.files | sort) == ["README.md", "bin/", "media/"] and
+    (.files | sort) == ["LICENSE", "README.md", "bin/"] and
     (.os | sort) == ["darwin", "linux"] and
     (.cpu | sort) == ["arm64", "x64"] and
     (has("libc") | not) and
     (.version == $version)
   ' "$repo_root/npm/package.json" >/dev/null || {
     echo "npm/package.json failed the main-package contract" >&2
+    return 1
+  }
+  # The npm packages carry their own copy of the license (npm only packs files
+  # under the package directory). It must be the repository's, byte for byte.
+  cmp -s "$repo_root/LICENSE" "$repo_root/npm/LICENSE" || {
+    echo "npm/LICENSE is missing or differs from the repository LICENSE" >&2
     return 1
   }
 
@@ -153,11 +159,15 @@ verify_platform_contract() {
     .version == $version and
     (.os | sort) == [$os] and
     (.cpu | sort) == [$cpu] and
-    (.files | sort) == ["bin/"] and
+    (.files | sort) == ["LICENSE", "bin/"] and
     (.scripts // {} | length) == 0 and
     (if $expect_libc then (.libc // []) == ["glibc"] else (has("libc") | not) end)
   ' "$pkg_json" >/dev/null || {
     echo "$pkg_json failed the platform-package contract (os=$expected_os cpu=$expected_cpu libc=$expect_libc)" >&2
+    return 1
+  }
+  cmp -s "$repo_root/LICENSE" "$repo_root/npm/platforms/$platform_key/LICENSE" || {
+    echo "npm/platforms/$platform_key/LICENSE is missing or differs from the repository LICENSE" >&2
     return 1
   }
 }
@@ -189,6 +199,11 @@ pack_package() {
     any(.[0].files[]; .path == "bin/nestweaver" and .mode == 493)
   ' <<< "$pack_json" >/dev/null || {
     echo "$pkg_dir did not pack an executable bin/nestweaver" >&2
+    return 1
+  }
+
+  jq -e 'any(.[0].files[]; .path == "LICENSE")' <<< "$pack_json" >/dev/null || {
+    echo "$pkg_dir did not pack LICENSE" >&2
     return 1
   }
 
@@ -332,6 +347,10 @@ verify_package_artifact() {
     }
   grep -qFx 'package/bin/nestweaver' <<< "$listing" || {
     echo "npm tarball is missing bin/nestweaver" >&2
+    return 1
+  }
+  grep -qFx 'package/LICENSE' <<< "$listing" || {
+    echo "npm tarball is missing LICENSE" >&2
     return 1
   }
 

@@ -8767,6 +8767,13 @@ enum Commands {
         /// change (tune what --strict blocks on via [pr_impact] in the config)
         #[arg(long)]
         strict: bool,
+        /// Database the hook checks against; written into the hook as an
+        /// absolute path
+        #[arg(
+            long,
+            help = "Path to the database file the hook checks [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
     },
 }
 
@@ -10254,7 +10261,7 @@ enum AdminCommands {
     },
     /// Install a runtime hook that injects subagent guidance.
     ///
-    /// For the `claude` runtime, adds a PreToolUse hook on the `Task` matcher
+    /// For the `claude` runtime, adds a PreToolUse hook on the `Task|Agent` (subagent) matcher
     /// that runs `nestweaver admin instructions --for-subagent`. Hook JSON
     /// schemas are Claude-Code-specific.
     InstallHook {
@@ -11999,8 +12006,15 @@ fn git_repo_root(cwd: &Path) -> Option<PathBuf> {
 /// never block a push; strict drops the fail-open shim so `pr-impact`'s configured
 /// block policy (default: a contract-verified breaking change) can exit 2 and
 /// block the push.
-fn nestweaver_pre_push_hook(strict: bool) -> String {
+///
+/// `db` is baked in as an absolute, shell-quoted `--db`. Git runs the hook from
+/// the repository root with no `--db`, so the hook used to fall back to
+/// `./nestweaver.lbug` there: `--strict` then rejected EVERY push with
+/// "Database not found" whenever the graph lived anywhere else, and the
+/// advisory hook's `|| true` hid the same failure, so it never ran.
+fn nestweaver_pre_push_hook(strict: bool, db: &Path) -> String {
     let mode = if strict { "strict" } else { "advisory" };
+    let db_arg = setup::shell_quote(&db.to_string_lossy());
     let mut s = String::new();
     s.push_str("#!/bin/sh\n");
     s.push_str(&format!("# {NESTWEAVER_HOOK_MARKER} ({mode})\n"));
@@ -12017,13 +12031,17 @@ fn nestweaver_pre_push_hook(strict: bool) -> String {
     s.push_str("  exit 0\n");
     s.push_str("fi\n");
     if strict {
-        s.push_str("nestweaver pr-impact --base \"$base\" --strict\n");
+        s.push_str(&format!(
+            "nestweaver pr-impact --base \"$base\" --strict --db {db_arg}\n"
+        ));
     } else {
         // Advisory: swallow ANY failure of the tool itself (missing binary/DB,
         // arg error) so a broken environment can never abort the push. The gate
         // verdict already exits 0 in non-strict mode; `|| true` also covers the
         // pre-verdict failures (127/2/…) that `|| exit $?` would have propagated.
-        s.push_str("nestweaver pr-impact --base \"$base\" || true\n");
+        s.push_str(&format!(
+            "nestweaver pr-impact --base \"$base\" --db {db_arg} || true\n"
+        ));
         s.push_str("exit 0\n");
     }
     s
@@ -12045,9 +12063,43 @@ fn make_executable(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether anything — a file, a directory, or a symbolic link, live or
+/// dangling — occupies `path`. `Path::exists` follows links, so a dangling link
+/// reads as "absent" and the write that follows creates its target.
+fn path_occupied(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Backups `install` has made, oldest first: `pre-push.nestweaver.bak`, then
+/// `.bak.1`, `.bak.2`, … in creation order.
+fn pre_push_backups(hooks_dir: &Path) -> Vec<PathBuf> {
+    let mut backups = Vec::new();
+    let first = hooks_dir.join("pre-push.nestweaver.bak");
+    if path_occupied(&first) {
+        backups.push(first);
+    }
+    let mut numbered: Vec<(u64, PathBuf)> = std::fs::read_dir(hooks_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let n = name
+                .to_str()?
+                .strip_prefix("pre-push.nestweaver.bak.")?
+                .parse::<u64>()
+                .ok()?;
+            Some((n, entry.path()))
+        })
+        .collect();
+    numbered.sort();
+    backups.extend(numbered.into_iter().map(|(_, path)| path));
+    backups
+}
+
 /// Install the advisory (or strict) pre-push blast-radius hook in the current
 /// git repo. Backs up any pre-existing non-nestweaver hook.
-fn install_pre_push_hook(cwd: &Path, strict: bool) -> anyhow::Result<i32> {
+fn install_pre_push_hook(cwd: &Path, strict: bool, db: &Path) -> anyhow::Result<i32> {
     let hooks_dir = git_hooks_dir(cwd)?;
     // A custom core.hooksPath can point OUTSIDE the repo — installing a
     // hook there affects other repos, so say so loudly. Only checked when the
@@ -12067,39 +12119,86 @@ fn install_pre_push_hook(cwd: &Path, strict: bool) -> anyhow::Result<i32> {
             );
         }
     }
+    let db = std::path::absolute(db)
+        .with_context(|| format!("resolving database path {}", db.display()))?;
     std::fs::create_dir_all(&hooks_dir)
         .with_context(|| format!("creating hooks dir {}", hooks_dir.display()))?;
     let hook_path = hooks_dir.join("pre-push");
 
-    if hook_path.exists() {
-        let existing = std::fs::read_to_string(&hook_path).unwrap_or_default();
-        if !existing.contains(NESTWEAVER_HOOK_MARKER) {
-            // Don't clobber a backup from a previous install — that could destroy
-            // the user's *original* hook. Fall back to a numbered suffix.
-            let mut backup = hooks_dir.join("pre-push.nestweaver.bak");
-            if backup.exists() {
-                let mut n = 1;
-                loop {
-                    let candidate = hooks_dir.join(format!("pre-push.nestweaver.bak.{n}"));
-                    if !candidate.exists() {
-                        backup = candidate;
-                        break;
+    // `symlink_metadata`, not `exists`/`read_to_string`: both FOLLOW a link, so
+    // a dangling `pre-push` link read as "no hook" and the write below created
+    // an executable file wherever the link pointed — outside the repository.
+    // A link is never ours; it is moved aside like any other foreign hook.
+    match std::fs::symlink_metadata(&hook_path) {
+        Ok(meta) if meta.is_dir() => anyhow::bail!(
+            "{} is a directory, not a hook script; remove or rename it and retry",
+            hook_path.display()
+        ),
+        Ok(meta) => {
+            let ours = meta.file_type().is_file()
+                && std::fs::read_to_string(&hook_path)
+                    .unwrap_or_default()
+                    .contains(NESTWEAVER_HOOK_MARKER);
+            if ours {
+                std::fs::remove_file(&hook_path)
+                    .with_context(|| format!("replacing hook {}", hook_path.display()))?;
+            } else {
+                // Don't clobber a backup from a previous install — that could
+                // destroy the user's *original* hook. Fall back to a numbered
+                // suffix.
+                let mut backup = hooks_dir.join("pre-push.nestweaver.bak");
+                if path_occupied(&backup) {
+                    let mut n = 1;
+                    loop {
+                        let candidate = hooks_dir.join(format!("pre-push.nestweaver.bak.{n}"));
+                        if !path_occupied(&candidate) {
+                            backup = candidate;
+                            break;
+                        }
+                        n += 1;
                     }
-                    n += 1;
+                }
+                // `rename` moves the directory entry itself, so a symbolic link
+                // is moved as a link and its target is never touched.
+                std::fs::rename(&hook_path, &backup).with_context(|| {
+                    format!("backing up existing pre-push hook to {}", backup.display())
+                })?;
+                if meta.file_type().is_symlink() {
+                    println!(
+                        "Warning: your pre-push hook was a symbolic link; moved the link (not its target) to {}",
+                        backup.display()
+                    );
+                } else {
+                    println!(
+                        "Warning: backed up your existing pre-push hook to {}",
+                        backup.display()
+                    );
                 }
             }
-            std::fs::rename(&hook_path, &backup).with_context(|| {
-                format!("backing up existing pre-push hook to {}", backup.display())
-            })?;
-            println!(
-                "Warning: backed up your existing pre-push hook to {}",
-                backup.display()
-            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting {}", hook_path.display()));
         }
     }
 
-    std::fs::write(&hook_path, nestweaver_pre_push_hook(strict))
-        .with_context(|| format!("writing hook {}", hook_path.display()))?;
+    // `create_new` refuses to follow or replace anything that appeared at the
+    // path since the check above.
+    {
+        use std::io::Write as _;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o755);
+        }
+        let mut file = options
+            .open(&hook_path)
+            .with_context(|| format!("writing hook {}", hook_path.display()))?;
+        file.write_all(nestweaver_pre_push_hook(strict, &db).as_bytes())
+            .with_context(|| format!("writing hook {}", hook_path.display()))?;
+    }
     make_executable(&hook_path)?;
 
     if strict {
@@ -12129,36 +12228,75 @@ fn install_pre_push_hook(cwd: &Path, strict: bool) -> anyhow::Result<i32> {
         );
         println!("remove it with: nestweaver hooks --uninstall");
     }
+    println!("Database: {}", db.display());
+    if !db.exists() {
+        eprintln!(
+            "warning: database {} does not exist yet. Index it (nestweaver index --repo . --db {}) \
+             or reinstall with --db pointing at your graph; until then the hook {}.",
+            db.display(),
+            db.display(),
+            if strict {
+                "rejects every push"
+            } else {
+                "only reports that the database is missing"
+            }
+        );
+    }
     Ok(EXIT_SUCCESS)
 }
 
-/// Remove the nestweaver pre-push hook and restore any backed-up hook.
+/// Remove the nestweaver pre-push hook and restore the most recent backed-up
+/// hook — the one that was in place when nestweaver's was last installed.
 fn uninstall_pre_push_hook(cwd: &Path) -> anyhow::Result<i32> {
     let hooks_dir = git_hooks_dir(cwd)?;
     let hook_path = hooks_dir.join("pre-push");
-    let backup = hooks_dir.join("pre-push.nestweaver.bak");
 
-    if hook_path.exists() {
-        let existing = std::fs::read_to_string(&hook_path).unwrap_or_default();
-        if existing.contains(NESTWEAVER_HOOK_MARKER) {
-            std::fs::remove_file(&hook_path)
-                .with_context(|| format!("removing hook {}", hook_path.display()))?;
-            println!("Removed the nestweaver pre-push hook.");
-        } else {
-            println!("The pre-push hook was not installed by nestweaver — leaving it untouched.");
-            return Ok(EXIT_SUCCESS);
+    match std::fs::symlink_metadata(&hook_path) {
+        Ok(meta) => {
+            let ours = meta.file_type().is_file()
+                && std::fs::read_to_string(&hook_path)
+                    .unwrap_or_default()
+                    .contains(NESTWEAVER_HOOK_MARKER);
+            if ours {
+                std::fs::remove_file(&hook_path)
+                    .with_context(|| format!("removing hook {}", hook_path.display()))?;
+                println!("Removed the nestweaver pre-push hook.");
+            } else {
+                println!(
+                    "The pre-push hook was not installed by nestweaver — leaving it untouched."
+                );
+                return Ok(EXIT_SUCCESS);
+            }
         }
-    } else {
-        println!("No pre-push hook to remove.");
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!("No pre-push hook to remove.");
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting {}", hook_path.display()));
+        }
     }
 
-    if backup.exists() {
-        std::fs::rename(&backup, &hook_path)
+    // The newest backup is the hook that was displaced most recently. The
+    // fixed `pre-push.nestweaver.bak` is the OLDEST, so restoring it whenever
+    // numbered backups also existed brought back the wrong hook.
+    let mut backups = pre_push_backups(&hooks_dir);
+    if let Some(newest) = backups.pop() {
+        std::fs::rename(&newest, &hook_path)
             .with_context(|| format!("restoring previous hook {}", hook_path.display()))?;
         println!(
             "Restored your previous pre-push hook from {}",
-            backup.display()
+            newest.display()
         );
+        if !backups.is_empty() {
+            println!(
+                "Older backups were left in place: {}",
+                backups
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
     }
     Ok(EXIT_SUCCESS)
 }
@@ -28484,12 +28622,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             install,
             uninstall,
             strict,
+            db,
         } => {
             let cwd = std::env::current_dir().context("resolving current directory")?;
             if uninstall {
                 Ok((uninstall_pre_push_hook(&cwd)?, None))
             } else if install {
-                Ok((install_pre_push_hook(&cwd, strict)?, None))
+                let db_path = db.unwrap_or_else(default_db_path);
+                Ok((install_pre_push_hook(&cwd, strict, &db_path)?, None))
             } else {
                 eprintln!(
                     "Specify --install (optionally with --strict) or --uninstall.\n\
@@ -38282,7 +38422,7 @@ mod pr_impact_hook_tests {
         let repo = tmp.path();
         git(repo, &["init", "-q"]);
 
-        let code = install_pre_push_hook(repo, false).expect("install");
+        let code = install_pre_push_hook(repo, false, &repo.join("nestweaver.lbug")).expect("install");
         assert_eq!(code, EXIT_SUCCESS);
 
         let hook = git_hooks_dir(repo).unwrap().join("pre-push");
@@ -38323,7 +38463,7 @@ mod pr_impact_hook_tests {
         let repo = tmp.path();
         git(repo, &["init", "-q"]);
 
-        install_pre_push_hook(repo, true).expect("install");
+        install_pre_push_hook(repo, true, &repo.join("nestweaver.lbug")).expect("install");
         let hook = git_hooks_dir(repo).unwrap().join("pre-push");
         let body = std::fs::read_to_string(&hook).unwrap();
         assert!(
@@ -38351,7 +38491,7 @@ mod pr_impact_hook_tests {
         let hook = hooks_dir.join("pre-push");
         std::fs::write(&hook, "#!/bin/sh\necho custom-hook\n").unwrap();
 
-        install_pre_push_hook(repo, false).expect("install");
+        install_pre_push_hook(repo, false, &repo.join("nestweaver.lbug")).expect("install");
         let backup = hooks_dir.join("pre-push.nestweaver.bak");
         assert!(backup.exists(), "a foreign pre-push must be backed up");
         assert!(
@@ -38413,7 +38553,7 @@ mod pr_impact_hook_tests {
         let real_path = std::env::var("PATH").unwrap_or_default();
         let path = format!("{}:{}", bindir.display(), real_path);
 
-        let script = nestweaver_pre_push_hook(false);
+        let script = nestweaver_pre_push_hook(false, Path::new("/tmp/nestweaver.lbug"));
         // Every failure the tool can exit with — missing DB (1), arg error (2),
         // binary-not-found (127) — must still leave the push un-blocked.
         for code in [1, 2, 127] {
@@ -38456,7 +38596,7 @@ mod pr_impact_hook_tests {
 
         // First foreign hook → backed up to the default `.bak`.
         std::fs::write(&hook, "#!/bin/sh\necho original\n").unwrap();
-        install_pre_push_hook(repo, false).expect("install 1");
+        install_pre_push_hook(repo, false, &repo.join("nestweaver.lbug")).expect("install 1");
         let bak = hooks_dir.join("pre-push.nestweaver.bak");
         assert!(
             std::fs::read_to_string(&bak)
@@ -38468,7 +38608,7 @@ mod pr_impact_hook_tests {
         // Drop a *second* foreign hook in place and reinstall; the original
         // backup must survive and the second goes to a numbered backup.
         std::fs::write(&hook, "#!/bin/sh\necho second\n").unwrap();
-        install_pre_push_hook(repo, false).expect("install 2");
+        install_pre_push_hook(repo, false, &repo.join("nestweaver.lbug")).expect("install 2");
         assert!(
             std::fs::read_to_string(&bak)
                 .unwrap()
@@ -38482,6 +38622,137 @@ mod pr_impact_hook_tests {
                 .contains("echo second"),
             "a second foreign hook must get a numbered backup"
         );
+
+        // Uninstall restores the hook displaced MOST RECENTLY (`.bak.1`), not
+        // the oldest fixed-name `.bak`, and leaves the older one in place.
+        uninstall_pre_push_hook(repo).expect("uninstall");
+        assert!(
+            std::fs::read_to_string(&hook)
+                .unwrap()
+                .contains("echo second"),
+            "uninstall must restore the newest backup"
+        );
+        assert!(!bak1.exists());
+        assert!(
+            std::fs::read_to_string(&bak)
+                .unwrap()
+                .contains("echo original"),
+            "the older backup must survive"
+        );
+    }
+
+    /// The hook ran `pr-impact` with no `--db`, so from the repository root it
+    /// looked for `./nestweaver.lbug`: `--strict` rejected every push whose
+    /// graph lived elsewhere. The resolved database must reach `pr-impact` as
+    /// one verbatim argument, whatever characters its path contains.
+    #[test]
+    #[cfg(unix)]
+    fn hook_passes_the_installed_database_to_pr_impact() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "c0",
+            ],
+        );
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+        let pwned = tmp.path().join("PWNED");
+        let db = tmp
+            .path()
+            .join(format!("graphs dir/it's;touch {}.lbug", pwned.display()));
+        for strict in [false, true] {
+            let script = nestweaver_pre_push_hook(strict, &db);
+            let bindir = tmp.path().join("bin");
+            std::fs::create_dir_all(&bindir).unwrap();
+            let record = tmp.path().join("argv");
+            let stub = bindir.join("nestweaver");
+            std::fs::write(
+                &stub,
+                format!(
+                    "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\nexit 0\n",
+                    record.display()
+                ),
+            )
+            .unwrap();
+            make_executable(&stub).unwrap();
+            let path = format!(
+                "{}:{}",
+                bindir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .current_dir(&repo)
+                .env("PATH", &path)
+                .output()
+                .expect("run hook");
+            assert!(out.status.success(), "{out:?}");
+            assert!(!pwned.exists(), "the database path was executed as shell");
+            let argv = std::fs::read_to_string(&record).unwrap();
+            let argv: Vec<&str> = argv.lines().collect();
+            let at = argv.iter().position(|a| *a == "--db").expect("--db passed");
+            assert_eq!(argv[at + 1], db.to_str().unwrap(), "strict={strict}");
+        }
+    }
+
+    /// A dangling `pre-push` symlink read as "no hook" (`exists` follows
+    /// links) and the write created a 0755 file at the link's target — outside
+    /// the repository. The link must be moved aside as a link, nothing created
+    /// at its target, and a regular hook file written in its place.
+    #[test]
+    #[cfg(unix)]
+    fn install_never_writes_through_a_pre_push_symlink() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        let hooks_dir = git_hooks_dir(&repo).unwrap();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let hook = hooks_dir.join("pre-push");
+        let outside = tmp.path().join("outside/created-by-install");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside, &hook).unwrap();
+
+        install_pre_push_hook(&repo, false, &repo.join("nestweaver.lbug")).expect("install");
+
+        assert!(!outside.exists(), "nothing may be created at the link target");
+        let meta = std::fs::symlink_metadata(&hook).unwrap();
+        assert!(meta.file_type().is_file(), "the hook must be a regular file");
+        let backup = hooks_dir.join("pre-push.nestweaver.bak");
+        assert!(
+            std::fs::symlink_metadata(&backup)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the user's link is moved aside as a link"
+        );
+        assert_eq!(std::fs::read_link(&backup).unwrap(), outside);
+
+        // Uninstall puts the link back as it was.
+        uninstall_pre_push_hook(&repo).expect("uninstall");
+        assert_eq!(std::fs::read_link(&hook).unwrap(), outside);
+        assert!(!outside.exists());
     }
 }
 

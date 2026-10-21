@@ -39,6 +39,8 @@ const {
   muslMessage,
   missingPlatformPackageMessage,
   resolveBinaryPath,
+  exitDisposition,
+  FORWARDED_SIGNALS,
 } = require("./bin/nestweaver");
 
 let passed = 0;
@@ -274,6 +276,100 @@ const launcherSource = fs.readFileSync(path.join(__dirname, "bin", "nestweaver")
   });
 })();
 
+// ── Signal forwarding ────────────────────────────────────────────────────
+// The launcher used `spawnSync`, which cannot react to a signal: SIGTERM to
+// the launcher's PID (a supervisor, `kill <pid>`) killed the launcher and
+// orphaned the binary, still holding the database.
+check("exitDisposition mirrors the child's exit code or signal", () => {
+  assert.deepStrictEqual(exitDisposition(0, null), { code: 0 });
+  assert.deepStrictEqual(exitDisposition(7, null), { code: 7 });
+  assert.deepStrictEqual(exitDisposition(null, "SIGTERM"), { signal: "SIGTERM" });
+  assert.deepStrictEqual(exitDisposition(null, null), { code: 1 });
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+    assert.ok(FORWARDED_SIGNALS.includes(signal), signal);
+  }
+});
+
+(() => {
+  const currentPkg = currentPlatformPackage();
+  if (!currentPkg || process.platform === "win32") {
+    console.log("  skip - signal forwarding (no published platform package here)");
+    return;
+  }
+  check("SIGTERM to the launcher reaches the binary and the launcher dies by it", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nestweaver-launcher-test-"));
+    try {
+      makeFakeNodeModulesTree(tmpDir, [currentPkg]);
+      const pidFile = path.join(tmpDir, "child.pid");
+      // A long-running stand-in for the binary that records its PID.
+      fs.writeFileSync(
+        path.join(tmpDir, "node_modules", currentPkg, "bin", "nestweaver"),
+        `#!/usr/bin/env node\nrequire("fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`,
+      );
+      const launcherPath = path.join(tmpDir, "node_modules", "nestweaver", "bin", "nestweaver");
+      fs.writeFileSync(launcherPath, launcherSource);
+      fs.chmodSync(launcherPath, 0o755);
+      const script = [
+        // Detach the launcher's output from this pipe, so an orphaned binary
+        // cannot hold it open and hang the test instead of failing it.
+        `"${process.execPath}" "${launcherPath}" >/dev/null 2>&1 & pid=$!`,
+        `i=0; while [ ! -s "${pidFile}" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done`,
+        "kill -TERM $pid",
+        "wait $pid; echo \"status=$?\"",
+      ].join("\n");
+      const out = execFileSync("sh", ["-c", script], { encoding: "utf8", timeout: 30000 });
+      assert.match(out, /status=143/, `launcher must die by SIGTERM: ${out}`);
+      const childPid = Number(fs.readFileSync(pidFile, "utf8"));
+      let alive = true;
+      for (let i = 0; i < 50 && alive; i += 1) {
+        try {
+          process.kill(childPid, 0);
+          execFileSync("sleep", ["0.1"]);
+        } catch {
+          alive = false;
+        }
+      }
+      if (alive) {
+        process.kill(childPid, "SIGKILL");
+      }
+      assert.ok(!alive, "the binary was orphaned instead of receiving SIGTERM");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+})();
+
+// ── Package contents ─────────────────────────────────────────────────────
+// Every package must ship the license (MIT requires the notice to travel with
+// the software), and the main package must not ship `media/`: the README
+// references its images by absolute raw.githubusercontent.com URL, so the
+// 441 KB directory was dead weight in every install.
+check("every npm package ships LICENSE, identical to the repository's", () => {
+  const license = fs.readFileSync(path.join(__dirname, "..", "LICENSE"), "utf8");
+  const dirs = [__dirname].concat(
+    fs
+      .readdirSync(path.join(__dirname, "platforms"), { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => path.join(__dirname, "platforms", e.name)),
+  );
+  for (const dir of dirs) {
+    const pkg = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
+    assert.ok(pkg.files.includes("LICENSE"), `${dir}/package.json files lacks LICENSE`);
+    assert.strictEqual(
+      fs.readFileSync(path.join(dir, "LICENSE"), "utf8"),
+      license,
+      `${dir}/LICENSE differs from the repository LICENSE`,
+    );
+  }
+});
+
+check("the main package does not ship media/", () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "package.json"), "utf8"));
+  assert.ok(!pkg.files.some((f) => f.startsWith("media")), JSON.stringify(pkg.files));
+  const readme = fs.readFileSync(path.join(__dirname, "README.md"), "utf8");
+  assert.ok(!/\]\(\.?\/?media\//.test(readme) && !/src="\.?\/?media\//.test(readme),
+    "README references media/ by relative path; it would break without media/ in the package");
+});
 
 // ── Release version lockstep ────────────────────────────────────────────
 // nw-425/nw-433 replaced a `postinstall` downloader with one
