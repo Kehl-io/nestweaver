@@ -1,0 +1,13 @@
+# Reviewed 2026-10-19.
+#
+# candle-core 0.11 (the latest release) requires zip ^8.6.0, so the lockfile
+# cannot move to the patched 9.x line. candle reads npz entries with
+# ZipArchive::by_index / by_name. It does not call ZipArchive::extract or
+# ZipStreamReader::extract, which is the API these advisories cover
+# (symlink targets and Unix permission bits during extraction).
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+]
