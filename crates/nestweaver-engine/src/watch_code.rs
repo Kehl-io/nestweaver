@@ -3351,15 +3351,8 @@ fn prepare_code_file(
     // still the exact snapshot represented by `symbols`.
     let lang = detect_language(&abs_path).unwrap_or(nestweaver_schema::Language::JavaScript);
 
-    // Load workspace context for JS/TS monorepo resolution.
-    let workspace_ctx = if matches!(
-        lang,
-        nestweaver_schema::Language::JavaScript
-            | nestweaver_schema::Language::TypeScript
-            | nestweaver_schema::Language::Vue
-            | nestweaver_schema::Language::Svelte
-            | nestweaver_schema::Language::Astro
-    ) {
+    // Load workspace context for JS/TS monorepo and Go module resolution.
+    let workspace_ctx = if crate::index::language_uses_workspace_context(lang) {
         discover_workspace_context(reader.root())
     } else {
         Default::default()

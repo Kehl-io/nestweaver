@@ -9499,14 +9499,7 @@ fn write_prepared_incremental_file_txn(
     let lang = nestweaver_parser::detect_language(abs_path)
         .unwrap_or(nestweaver_schema::Language::JavaScript);
 
-    let workspace_ctx = if matches!(
-        lang,
-        nestweaver_schema::Language::JavaScript
-            | nestweaver_schema::Language::TypeScript
-            | nestweaver_schema::Language::Vue
-            | nestweaver_schema::Language::Svelte
-            | nestweaver_schema::Language::Astro
-    ) {
+    let workspace_ctx = if language_uses_workspace_context(lang) {
         discover_workspace_context_with(|p| {
             reader
                 .read_file(p)
@@ -9755,7 +9748,7 @@ pub(crate) fn persist_unresolved_imports(
     }
 }
 
-fn language_uses_workspace_context(language: Language) -> bool {
+pub(crate) fn language_uses_workspace_context(language: Language) -> bool {
     matches!(
         language,
         Language::JavaScript
@@ -9952,6 +9945,7 @@ fn importers_of_added_paths(
     }
     let workspace = workspace_context_for_languages(reader, by_lang.keys().copied());
     let known: HashSet<&str> = known_files.iter().map(String::as_str).collect();
+    let targets = nestweaver_resolver::imports::ImportTargets::new(&known);
     let mut seeded = HashSet::new();
     for (language, importers) in by_lang {
         for importer in importers {
@@ -9959,9 +9953,7 @@ fn importers_of_added_paths(
                 continue;
             };
             let names_added = specs.iter().any(|specifier| {
-                nestweaver_resolver::imports::resolved_import_paths(
-                    &importer, specifier, &known, language, &workspace,
-                )
+                targets.paths(&importer, specifier, language, &workspace)
                 .into_iter()
                 .any(|target| target != importer && added.contains(&target))
             });
@@ -10024,6 +10016,7 @@ fn survey_import_specifiers(
     only: &HashSet<String>,
 ) -> ImportSurvey {
     let known: HashSet<&str> = known_files.iter().map(String::as_str).collect();
+    let import_targets = nestweaver_resolver::imports::ImportTargets::new(&known);
     let mut survey = ImportSurvey::default();
     for path in only {
         let Some(language) = languages.get(path) else {
@@ -10050,9 +10043,7 @@ fn survey_import_specifiers(
             // Every file the specifier names: a Go import names its whole
             // package, so a symbol added to any file of it concerns the
             // importer (the same set `importers_of_added_paths` consults).
-            let named = nestweaver_resolver::imports::resolved_import_paths(
-                path, specifier, &known, *language, workspace,
-            );
+            let named = import_targets.paths(path, specifier, *language, workspace);
             if named.is_empty() {
                 specs.insert(specifier.to_string());
             }
