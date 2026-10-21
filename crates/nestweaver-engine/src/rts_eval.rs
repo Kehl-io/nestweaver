@@ -783,7 +783,7 @@ fn resolve_selection_sha(store: &nestweaver_store::GraphStore, repo_uid: &str) -
         return "unknown".to_string();
     };
     if let Some(root) = repo.local_root()
-        && let Ok(out) = std::process::Command::new("git")
+        && let Ok(out) = crate::git_cmd::isolated_git()
             .args(["-C", root, "rev-parse", "HEAD"])
             .output()
         && out.status.success()

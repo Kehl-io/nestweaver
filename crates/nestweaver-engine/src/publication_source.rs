@@ -199,7 +199,7 @@ fn canonical_source_root(path: &Path, kind: &str) -> anyhow::Result<PathBuf> {
 }
 
 fn git_head(root: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = crate::git_cmd::isolated_git()
         .args(["rev-parse", "HEAD"])
         .current_dir(root)
         .output()
@@ -216,7 +216,7 @@ fn hash_repo_tree(
     root: &Path,
     prior: Option<&[PublicationSourceFile]>,
 ) -> anyhow::Result<(String, u64, Vec<PublicationSourceFile>)> {
-    let output = std::process::Command::new("git")
+    let output = crate::git_cmd::isolated_git()
         .args(["ls-files", "-co", "--exclude-standard", "-z"])
         .current_dir(root)
         .output();
