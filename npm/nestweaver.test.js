@@ -41,6 +41,7 @@ const {
   resolveBinaryPath,
   exitDisposition,
   FORWARDED_SIGNALS,
+  signalExitCode,
 } = require("./bin/nestweaver");
 
 let passed = 0;
@@ -333,6 +334,40 @@ check("exitDisposition mirrors the child's exit code or signal", () => {
         process.kill(childPid, "SIGKILL");
       }
       assert.ok(!alive, "the binary was orphaned instead of receiving SIGTERM");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+})();
+
+check("a signal Node ignores still ends the launcher as a signal death, not 0", () => {
+  assert.strictEqual(signalExitCode("SIGPIPE"), 128 + 13);
+  assert.strictEqual(signalExitCode("SIGTERM"), 128 + 15);
+});
+
+(() => {
+  const currentPkg = currentPlatformPackage();
+  if (!currentPkg || process.platform === "win32") {
+    return;
+  }
+  check("a binary killed by SIGPIPE does not make the launcher exit 0", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nestweaver-launcher-test-"));
+    try {
+      makeFakeNodeModulesTree(tmpDir, [currentPkg]);
+      // A stand-in binary that dies of SIGPIPE (a shell, whose default
+      // disposition for it is "terminate").
+      const bin = path.join(tmpDir, "node_modules", currentPkg, "bin", "nestweaver");
+      fs.writeFileSync(bin, "#!/bin/sh\nkill -PIPE $$\nsleep 5\n");
+      fs.chmodSync(bin, 0o755);
+      const launcherPath = path.join(tmpDir, "node_modules", "nestweaver", "bin", "nestweaver");
+      fs.writeFileSync(launcherPath, launcherSource);
+      fs.chmodSync(launcherPath, 0o755);
+      const out = execFileSync(
+        "sh",
+        ["-c", `"${process.execPath}" "${launcherPath}" >/dev/null 2>&1; echo "status=$?"`],
+        { encoding: "utf8", timeout: 30000 },
+      );
+      assert.match(out, /status=141/, `launcher must report the SIGPIPE death: ${out}`);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

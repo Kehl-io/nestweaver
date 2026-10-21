@@ -124,6 +124,12 @@ function exitDisposition(code, signal) {
   return { code: code === null || code === undefined ? 1 : code };
 }
 
+/// The shell's exit status for a death by `signal`: 128 + its number.
+function signalExitCode(signal) {
+  const number = require("os").constants.signals[signal];
+  return 128 + (number || 0);
+}
+
 module.exports = {
   PLATFORM_PACKAGES,
   FORWARDED_SIGNALS,
@@ -135,6 +141,7 @@ module.exports = {
   missingPlatformPackageMessage,
   resolveBinaryPath,
   exitDisposition,
+  signalExitCode,
 };
 
 // ── Execution ────────────────────────────────────────────────────────────
@@ -213,6 +220,11 @@ function main() {
         process.removeListener(name, relay);
       }
       process.kill(process.pid, outcome.signal);
+      // A signal Node ignores or handles itself (SIGPIPE is SIG_IGN in Node)
+      // does not end this process; without a fallback the event loop drains
+      // and the launcher exits 0, reporting a signal death as success. Exit
+      // with the shell's 128+n convention instead.
+      setImmediate(() => process.exit(signalExitCode(outcome.signal)));
       return;
     }
     process.exit(outcome.code);

@@ -29,9 +29,11 @@ DB="${NESTWEAVER_DB:-${CLAUDE_PROJECT_DIR:-.}/nestweaver.lbug}"
 # Best-effort extraction: takes the last whitespace-delimited or double-quoted
 # token from the command. Does not handle single-quoted strings or escaped
 # quotes — acceptable for a non-blocking enrichment hook.
-SEARCH_TERM=$(echo "$COMMAND" | grep -oE '"[^"]+"|[^ ]+$' | tail -1 | tr -d '"')
+# `|| true`: under `set -euo pipefail` a command with no token to extract
+# (e.g. one ending in whitespace) would otherwise fail the whole hook.
+SEARCH_TERM=$(echo "$COMMAND" | grep -oE '"[^"]+"|[^ ]+$' | tail -1 | tr -d '"' || true)
 if [ -n "$SEARCH_TERM" ]; then
-  RESULTS=$(nestweaver search "$SEARCH_TERM" --json --db "$DB" 2>/dev/null || true)
+  RESULTS=$(nestweaver search --json --db "$DB" -- "$SEARCH_TERM" 2>/dev/null || true)
   # `nestweaver search --json` returns {"results": [...]} on 6.4+ and a bare
   # array before it. Normalise so this hook works against either binary.
   ROWS=$(printf '%s' "$RESULTS" | jq -c 'if type == "object" then (.results // []) else . end' 2>/dev/null || printf '[]')

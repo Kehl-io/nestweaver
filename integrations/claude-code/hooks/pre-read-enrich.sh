@@ -26,7 +26,8 @@ FILE_PATH=$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // empty')
 DB="${NESTWEAVER_DB:-${CLAUDE_PROJECT_DIR:-.}/nestweaver.lbug}"
 [ -e "$DB" ] || exit 0
 
-SYMBOLS=$(nestweaver search "$(basename "$FILE_PATH" | sed 's/\.[^.]*$//')" --json --db "$DB" 2>/dev/null || true)
+# `--` ends option parsing: a file named `--db=x.py` must stay a search term.
+SYMBOLS=$(nestweaver search --json --db "$DB" -- "$(basename "$FILE_PATH" | sed 's/\.[^.]*$//')" 2>/dev/null || true)
 # `nestweaver search --json` returns {"results": [...]} on 6.4+ and a bare
 # array before it. Normalise to an array so this hook works against either
 # binary on PATH — a hook installed by `nestweaver setup` outlives any one
