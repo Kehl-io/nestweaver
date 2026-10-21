@@ -64,6 +64,10 @@ pub struct CodeWatcher {
     emulate_inotify_watch: bool,
     #[cfg(test)]
     contract_plan_observer: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Told when a batch or reconciliation fails to publish (`Some(error)`)
+    /// and when one publishes again (`None`), so a supervisor can report a
+    /// watcher that is alive but not indexing.
+    batch_failure_reporter: Option<Box<dyn Fn(Option<&str>) + Send + Sync>>,
 }
 
 /// The watcher's cross-repo relinker thread: signalled and joined on drop,
@@ -97,6 +101,11 @@ enum WatchBatchOutcome {
         reason: anyhow::Error,
     },
 }
+
+/// A batch abandoned before publication because the watcher is stopping.
+#[derive(Debug, thiserror::Error)]
+#[error("code watcher stopping; batch abandoned before publication (graph unchanged)")]
+struct WatchBatchStopped;
 
 enum PreparedPath {
     Replace(Box<PreparedCodeFile>),
@@ -162,6 +171,23 @@ impl CodeWatcher {
             emulate_inotify_watch: false,
             #[cfg(test)]
             contract_plan_observer: None,
+            batch_failure_reporter: None,
+        }
+    }
+
+    /// Report batch publication failures and recoveries. See
+    /// `batch_failure_reporter`.
+    pub fn with_batch_failure_reporter(
+        mut self,
+        reporter: impl Fn(Option<&str>) + Send + Sync + 'static,
+    ) -> Self {
+        self.batch_failure_reporter = Some(Box::new(reporter));
+        self
+    }
+
+    fn report_batch(&self, failure: Option<&str>) {
+        if let Some(reporter) = &self.batch_failure_reporter {
+            reporter(failure);
         }
     }
 
@@ -467,6 +493,14 @@ impl CodeWatcher {
                         });
                         break;
                     }
+                    WatchBatchOutcome::Skipped { reason }
+                        if reason.downcast_ref::<WatchBatchStopped>().is_some() =>
+                    {
+                        tracing::info!(
+                            "CodeWatcher stop requested during the initial snapshot; exiting"
+                        );
+                        return Ok(());
+                    }
                     WatchBatchOutcome::Skipped { reason } => {
                         // A save racing the cold snapshot is expected to be
                         // queued because notification was registered first.
@@ -634,9 +668,16 @@ impl CodeWatcher {
             let head_moved = batch
                 .iter()
                 .any(|path| git_head_or_refs_event(&self.repo_root, &external_git_dirs, path));
+            // `.git/info/exclude` is git metadata AND an ignore file: an edit
+            // re-evaluates which sources the walk hides.
             let source_events: Vec<PathBuf> = batch
                 .iter()
-                .filter(|path| !is_dot_git_metadata(&self.repo_root, &external_git_dirs, path))
+                .filter(|path| {
+                    !is_dot_git_metadata(&self.repo_root, &external_git_dirs, path)
+                        || path
+                            .strip_prefix(&self.repo_root)
+                            .is_ok_and(|rel| rel == Path::new(".git/info/exclude"))
+                })
                 .cloned()
                 .collect();
             if source_events.is_empty() {
@@ -671,6 +712,7 @@ impl CodeWatcher {
             )?;
             let files_processed = match outcome {
                 WatchBatchOutcome::Published { files_processed } => {
+                    self.report_batch(None);
                     // nw-664 review: these paths are now what the graph holds,
                     // so any disclosure about them is stale.
                     // An unwatched directory's row stays: a batch touching
@@ -711,6 +753,7 @@ impl CodeWatcher {
                     reason,
                 } => {
                     tracing::warn!(error = %reason, files_processed, "code watcher committed; evidence repair remains owed");
+                    self.report_batch(None);
                     self.record_debt(&source_events, &[], Some(&format!("{reason:#}")));
                     if pending.is_none() {
                         pending = Some(crate::watcher::PendingReconciliation {
@@ -721,6 +764,14 @@ impl CodeWatcher {
                         });
                     }
                     files_processed
+                }
+                WatchBatchOutcome::Skipped { reason }
+                    if reason.downcast_ref::<WatchBatchStopped>().is_some() =>
+                {
+                    // Nothing was published; startup reconciliation replays
+                    // these paths on the next run.
+                    tracing::info!("CodeWatcher stop requested mid-batch; exiting: {reason}");
+                    return Ok(());
                 }
                 WatchBatchOutcome::Skipped { reason } => {
                     // nw-669: this used to be the whole handling — a warning,
@@ -737,6 +788,7 @@ impl CodeWatcher {
                         "code watcher batch skipped before publication; previous graph \
                          preserved; reconciling with retry"
                     );
+                    self.report_batch(Some(&format!("{reason:#}")));
                     // nw-669 review: only when no retry is owed yet. An owed
                     // retry keeps its schedule — its recomputed drift will
                     // include these paths — so in a permanently blocked repo
@@ -794,6 +846,14 @@ impl CodeWatcher {
     /// inventory: filesystem metadata alone cannot recover their descendants.
     /// Keep indexed paths even when policy now excludes them so publication
     /// retracts stale coverage instead of silently leaving it behind.
+    ///
+    /// Linear in the batch: a mass edit or delete under an ignored or skipped
+    /// directory (20,000 files) used to cost one quadratic root dedupe, one
+    /// probe of every graphed file against every root, and one batch row per
+    /// vanished path, all under the write lease. A path the walk hides is only
+    /// kept when the graph holds it (to be retracted), a vanished path only
+    /// when the graph holds it (to be deleted), and a stop request abandons
+    /// the batch before publication.
     fn expand_event_paths(
         &self,
         store: &GraphStore,
@@ -805,7 +865,19 @@ impl CodeWatcher {
         let mut paths = HashSet::new();
         let mut incumbent_paths = HashSet::new();
         let mut subtrees = Vec::new();
-        for path in events.iter().collect::<HashSet<_>>() {
+        // Existing event files: admitted below unless the walk hides them.
+        let mut event_files = Vec::new();
+        // Directories whose ignore rules changed: re-evaluated for visibility.
+        let mut ignore_roots = Vec::new();
+        for (seen, path) in events
+            .iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .enumerate()
+        {
+            if seen % 1024 == 0 {
+                self.ensure_not_stopping()?;
+            }
             let Ok(rel) = path.strip_prefix(&self.repo_root) else {
                 continue;
             };
@@ -815,16 +887,23 @@ impl CodeWatcher {
             {
                 continue;
             }
+            if let Some(scope) = ignore_rules_scope(rel) {
+                ignore_roots.push(self.repo_root.join(scope));
+            }
             let metadata = std::fs::symlink_metadata(path);
             match metadata {
                 Ok(meta) if meta.is_dir() => subtrees.push(path.clone()),
                 Ok(meta) if meta.is_file() => {
                     subtrees.push(path.clone());
-                    if is_watcher_input(path) {
-                        paths.insert(path.clone());
+                    // Policy-excluded files are dropped below unless the
+                    // graph holds them; only the rest need the walk.
+                    if is_watcher_input(path) && reader.accepts_path(rel) {
+                        event_files.push(rel.to_path_buf());
                     }
                 }
                 Ok(meta) if meta.file_type().is_symlink() => subtrees.push(path.clone()),
+                // A vanished path is a deletion candidate only if the graph
+                // holds it, which the inventory pass below decides.
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -832,9 +911,6 @@ impl CodeWatcher {
                     ) =>
                 {
                     subtrees.push(path.clone());
-                    if is_watcher_input(path) {
-                        paths.insert(path.clone());
-                    }
                 }
                 Err(error) => {
                     return Err(error)
@@ -845,18 +921,26 @@ impl CodeWatcher {
         }
         // Collapse overlapping directory notifications before walking. A
         // directory and its file notifications still publish each file once.
+        // `Path` orders by component, so every descendant of a root sorts
+        // directly after it: comparing with the last root kept is enough.
         subtrees.sort();
         subtrees.dedup();
         let mut roots: Vec<PathBuf> = Vec::new();
         for subtree in subtrees {
-            if !roots.iter().any(|root| subtree.starts_with(root)) {
+            if !roots.last().is_some_and(|root| subtree.starts_with(root)) {
                 roots.push(subtree);
             }
         }
+        let root_set: HashSet<&Path> = roots.iter().map(PathBuf::as_path).collect();
+        let under_root = |path: &Path| {
+            #[cfg(test)]
+            expansion_witness::probe();
+            path.ancestors().any(|ancestor| root_set.contains(ancestor))
+        };
         if !roots.is_empty() {
             for (_, rel) in store.list_files_by_repo(r_uid)? {
                 let path = self.repo_root.join(&rel);
-                if roots.iter().any(|root| path.starts_with(root)) && is_watcher_input(&path) {
+                if is_watcher_input(&path) && under_root(&path) {
                     incumbent_paths.insert(path.clone());
                     paths.insert(path);
                 }
@@ -867,12 +951,24 @@ impl CodeWatcher {
         if !roots.is_empty() {
             for contract in store.list_contracts(Some(r_uid))? {
                 let path = self.repo_root.join(contract.source_path);
-                if roots.iter().any(|root| path.starts_with(root)) && is_watcher_input(&path) {
+                if is_watcher_input(&path) && under_root(&path) {
                     incumbent_paths.insert(path.clone());
                     paths.insert(path);
                 }
             }
         }
+        self.ensure_not_stopping()?;
+        // One restricted walk decides every event file: what it hides (an
+        // ignored directory is never entered) has nothing to publish unless
+        // the graph holds it, and those are already incumbents.
+        let hidden =
+            sources_hidden_from_walk(&self.repo_root, event_files.iter().map(PathBuf::as_path));
+        for rel in event_files {
+            if !hidden.contains(&rel) {
+                paths.insert(self.repo_root.join(rel));
+            }
+        }
+        let mut policy = None;
         for root in roots {
             let relative = root.strip_prefix(&self.repo_root)?;
             if path_has_symlink(&self.repo_root, relative)? || !reader.accepts_path(relative) {
@@ -893,9 +989,16 @@ impl CodeWatcher {
                         .with_context(|| format!("enumerate watched subtree {}", root.display()));
                 }
             }
-            let policy = self.reader_for(repo_url)?;
+            if policy.is_none() {
+                policy = Some(Arc::new(self.reader_for(repo_url)?));
+            }
+            #[cfg(test)]
+            expansion_witness::walk();
+            let policy = Arc::clone(policy.as_ref().expect("set above"));
             let repo_root = self.repo_root.clone();
             for entry in ignore::WalkBuilder::new(&root)
+                // Global excludes are anchored at the worktree top, as git does.
+                .current_dir(&self.repo_root)
                 .follow_links(false)
                 .hidden(false)
                 .git_ignore(true)
@@ -909,6 +1012,7 @@ impl CodeWatcher {
                 })
                 .build()
             {
+                self.ensure_not_stopping()?;
                 let entry = entry.context("enumerate watched subtree")?;
                 if entry.file_type().is_some_and(|kind| kind.is_file())
                     && is_watcher_input(entry.path())
@@ -916,6 +1020,16 @@ impl CodeWatcher {
                 {
                     paths.insert(entry.into_path());
                 }
+            }
+        }
+        if !ignore_roots.is_empty() {
+            let policy = match &policy {
+                Some(policy) => Arc::clone(policy),
+                None => Arc::new(self.reader_for(repo_url)?),
+            };
+            for path in self.ignore_rule_changes(store, r_uid, reader, policy, ignore_roots)? {
+                incumbent_paths.insert(path.clone());
+                paths.insert(path);
             }
         }
         paths.retain(|path| {
@@ -927,6 +1041,124 @@ impl CodeWatcher {
         let mut paths: Vec<_> = paths.into_iter().collect();
         paths.sort();
         Ok(paths)
+    }
+
+    /// The sources whose visibility an ignore-rule edit changed under
+    /// `roots`: graphed sources the walk now hides (or that policy excludes,
+    /// or that vanished), to retract, and visible sources the graph lacks, to
+    /// add. A source both visible and graphed is unaffected by the edit and is
+    /// not re-parsed, so editing a root `.gitignore` does not re-index the
+    /// repository. A graphed source under a directory the walk cannot read is
+    /// left alone, as the startup reconciliation leaves it.
+    fn ignore_rule_changes(
+        &self,
+        store: &GraphStore,
+        r_uid: &str,
+        reader: &crate::content_reader::FilesystemReader,
+        policy: Arc<crate::content_reader::FilesystemReader>,
+        mut roots: Vec<PathBuf>,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        roots.sort();
+        roots.dedup();
+        let mut collapsed: Vec<PathBuf> = Vec::new();
+        for root in roots {
+            if !collapsed.last().is_some_and(|kept| root.starts_with(kept)) {
+                collapsed.push(root);
+            }
+        }
+        let root_set: HashSet<&Path> = collapsed.iter().map(PathBuf::as_path).collect();
+        let graphed: HashSet<PathBuf> = store
+            .list_files_by_repo(r_uid)?
+            .into_iter()
+            .map(|(_, rel)| self.repo_root.join(rel))
+            .filter(|path| {
+                is_watcher_input(path)
+                    && path.ancestors().any(|ancestor| root_set.contains(ancestor))
+            })
+            .collect();
+        let mut visible = HashSet::new();
+        for root in &collapsed {
+            if !root.is_dir() {
+                continue;
+            }
+            let walk_policy = Arc::clone(&policy);
+            let repo_root = self.repo_root.clone();
+            for entry in ignore::WalkBuilder::new(root)
+                .current_dir(&self.repo_root)
+                .follow_links(false)
+                .hidden(false)
+                .git_ignore(true)
+                .git_global(true)
+                .git_exclude(true)
+                .filter_entry(move |entry| {
+                    entry
+                        .path()
+                        .strip_prefix(&repo_root)
+                        .is_ok_and(|rel| walk_policy.accepts_path(rel))
+                })
+                .build()
+            {
+                self.ensure_not_stopping()?;
+                let Ok(entry) = entry else {
+                    continue;
+                };
+                if entry.file_type().is_some_and(|kind| kind.is_file())
+                    && is_watcher_input(entry.path())
+                    && reader.accepts_path(entry.path().strip_prefix(&self.repo_root)?)
+                {
+                    visible.insert(entry.into_path());
+                }
+            }
+        }
+        // A visible source the graph lacks may be one the index skipped
+        // (binary, oversized, unreadable): only a readable one is admitted, or
+        // the batch would fail on it at every ignore-file edit.
+        let mut changed: Vec<PathBuf> = visible
+            .difference(&graphed)
+            .filter(|path| {
+                path.strip_prefix(&self.repo_root)
+                    .is_ok_and(|rel| reader.read_file(rel).is_ok())
+            })
+            .cloned()
+            .collect();
+        let mut present = Vec::new();
+        for path in graphed.difference(&visible) {
+            match std::fs::symlink_metadata(path) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    changed.push(path.clone());
+                }
+                Ok(_) => present.push(path.strip_prefix(&self.repo_root)?.to_path_buf()),
+                Err(_) => {}
+            }
+        }
+        let hidden =
+            sources_hidden_from_walk(&self.repo_root, present.iter().map(PathBuf::as_path));
+        for rel in present {
+            let path = self.repo_root.join(&rel);
+            if hidden.contains(&rel)
+                || matches!(
+                    source_policy_exclusion(reader, &self.repo_root, &path),
+                    Ok(Some(_))
+                )
+            {
+                changed.push(path);
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Fail a batch that has not published yet once shutdown is requested, so
+    /// a long batch cannot hold the write lease past the daemon's drain.
+    fn ensure_not_stopping(&self) -> anyhow::Result<()> {
+        if self.stop_flag.load(Ordering::Acquire) {
+            anyhow::bail!(WatchBatchStopped);
+        }
+        Ok(())
     }
 
     /// Prepare and atomically publish one watcher batch.
@@ -1158,6 +1390,9 @@ impl CodeWatcher {
                 .collect()
         };
         for path in relevant.iter().filter(|path| is_supported_source(path)) {
+            if let Err(reason) = self.ensure_not_stopping() {
+                return Ok(WatchBatchOutcome::Skipped { reason });
+            }
             let rel_path = match path.strip_prefix(&self.repo_root) {
                 Ok(r) => r,
                 Err(_) => {
@@ -1745,15 +1980,39 @@ impl CodeWatcher {
             }
         }
         if !seen.is_empty() {
+            // A graphed source the walk no longer lists either vanished (the
+            // batch deletes it) or is still on disk. On disk, it is retracted
+            // only when the walk HIDES it (an ignore rule added while nothing
+            // was watching) or policy now excludes it; one under a directory
+            // the walk cannot read is left as the graph has it.
+            let mut present = Vec::new();
             for rel_str in indexed.keys().filter(|path| !seen.contains(*path)) {
                 let abs_path = self.repo_root.join(rel_str);
-                if matches!(
-                    std::fs::symlink_metadata(&abs_path),
-                    Err(error) if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                match std::fs::symlink_metadata(&abs_path) {
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        drift.replay.push(abs_path);
+                    }
+                    Ok(meta) if meta.is_file() && is_supported_source(&abs_path) => {
+                        present.push(PathBuf::from(rel_str));
+                    }
+                    _ => {}
+                }
+            }
+            let hidden =
+                sources_hidden_from_walk(&self.repo_root, present.iter().map(PathBuf::as_path));
+            for rel in present {
+                let abs_path = self.repo_root.join(&rel);
+                if hidden.contains(&rel)
+                    || matches!(
+                        source_policy_exclusion(&reader, &self.repo_root, &abs_path),
+                        Ok(Some(_))
                     )
-                ) {
+                {
                     drift.replay.push(abs_path);
                 }
             }
@@ -1903,6 +2162,13 @@ impl CodeWatcher {
                 );
                 let replayed = self.replay_startup(store, r_uid, repo_url, &drift, on_change);
                 match replayed {
+                    // Shutdown, not a failure: no debt to record, and every
+                    // caller exits on an error here.
+                    Ok(WatchBatchOutcome::Skipped { reason })
+                        if reason.downcast_ref::<WatchBatchStopped>().is_some() =>
+                    {
+                        return Err(reason);
+                    }
                     Ok(WatchBatchOutcome::Skipped { reason }) => {
                         (Some(drift.replay), drift.unreadable, reason)
                     }
@@ -1916,6 +2182,7 @@ impl CodeWatcher {
                             .clear();
                         self.record_unindexable_after_replay(store, r_uid, repo_url, &drift.replay);
                         self.record_debt(&[], &drift.unreadable, None);
+                        self.report_batch(None);
                         return Ok(None);
                     }
                     Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
@@ -1929,6 +2196,7 @@ impl CodeWatcher {
         let failures = failures.saturating_add(1);
         let delay = crate::watcher::reconcile_retry_delay(self.reconcile_retry_base, failures);
         let message = format!("{error:#}");
+        self.report_batch(Some(&message));
         tracing::error!(
             repo = %self.repo_root.display(),
             error = %message,
@@ -2480,6 +2748,18 @@ fn unwatched_dir_reason(error: &str) -> String {
     )
 }
 
+/// The repo-relative directory whose ignore rules `rel` defines, when `rel`
+/// is an ignore file the walk honours: a `.gitignore` or `.ignore` governs its
+/// own directory, and `.git/info/exclude` the whole checkout. The global
+/// excludes file lives outside the repository and is not watched.
+fn ignore_rules_scope(rel: &Path) -> Option<&Path> {
+    let name = rel.file_name()?;
+    if name == ".gitignore" || name == ".ignore" {
+        return rel.parent();
+    }
+    (rel == Path::new(".git/info/exclude")).then_some(Path::new(""))
+}
+
 fn is_watcher_input(path: &Path) -> bool {
     is_supported_source(path) || crate::contracts::is_spec_file(&path.to_string_lossy())
 }
@@ -2876,6 +3156,9 @@ fn sources_hidden_from_walk<'a>(
     let visit = wanted.clone();
     let mut seen = HashSet::new();
     for entry in ignore::WalkBuilder::new(repo_root)
+        // Global excludes are anchored at the worktree top, as git does (the
+        // `ignore` crate would otherwise anchor them at the process CWD).
+        .current_dir(repo_root)
         .follow_links(false)
         .hidden(false)
         .git_ignore(true)
@@ -3170,6 +3453,30 @@ fn reject_recovered_publication(
         );
     }
     Ok(())
+}
+
+/// Counts the work one batch expansion does, so a test can show it stays
+/// linear in the batch rather than timing it.
+#[cfg(test)]
+mod expansion_witness {
+    use std::cell::Cell;
+    thread_local! {
+        static WALKS: Cell<usize> = const { Cell::new(0) };
+        static PROBES: Cell<usize> = const { Cell::new(0) };
+    }
+    pub(super) fn walk() {
+        WALKS.with(|walks| walks.set(walks.get() + 1));
+    }
+    pub(super) fn probe() {
+        PROBES.with(|probes| probes.set(probes.get() + 1));
+    }
+    /// (subtree walks, root-containment probes) since the last reset.
+    pub(super) fn take() -> (usize, usize) {
+        (
+            WALKS.with(|walks| walks.replace(0)),
+            PROBES.with(|probes| probes.replace(0)),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -4259,6 +4566,196 @@ mod tests {
             .find(|s| s.name == name)
             .unwrap_or_else(|| panic!("symbol {name} should be indexed"))
             .uid
+    }
+
+    fn git_init(root: &Path) {
+        let output = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git init failed");
+    }
+
+    fn graphed_paths(store: &GraphStore, r_uid: &str) -> Vec<String> {
+        let mut files: Vec<String> = store
+            .list_files_by_repo(r_uid)
+            .unwrap()
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// QA: 20,000 touched files under a gitignored directory held the write
+    /// lock for 451 s in one batch (5,000 took 25 s: quadratic), and
+    /// `rm -rf` of it for 20+ minutes. Expansion must do work linear in the
+    /// batch: no walk for file events, one containment probe per graphed file
+    /// (not per graphed file per event), and nothing to publish for ignored,
+    /// skipped or vanished paths the graph never held.
+    #[test]
+    fn churn_in_ignored_skipped_and_vanished_paths_expands_in_linear_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root) = index_fixture_repo(&dir);
+        git_init(&root);
+        std::fs::write(root.join(".gitignore"), "bigign/\n").unwrap();
+        let graphed = graphed_paths(&store, &r_uid);
+        assert_eq!(graphed.len(), 3, "{graphed:?}");
+        const N: usize = 3000;
+        let mut events = Vec::new();
+        for (dir_name, exists) in [
+            ("bigign", true),
+            ("node_modules/pkg", true),
+            ("gone", false),
+        ] {
+            let parent = root.join(dir_name);
+            if exists {
+                std::fs::create_dir_all(&parent).unwrap();
+            }
+            for index in 0..N {
+                let path = parent.join(format!("f{index}.ts"));
+                if exists {
+                    std::fs::write(&path, format!("export function f{index}() {{}}\n")).unwrap();
+                }
+                events.push(path);
+            }
+        }
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        let reader = crate::content_reader::FilesystemReader::new(&root);
+        let url = format!("file://{}", root.display());
+        let _ = expansion_witness::take();
+        let started = Instant::now();
+        let relevant = watcher
+            .expand_event_paths(&store, &r_uid, &reader, &url, &events)
+            .unwrap();
+        let elapsed = started.elapsed();
+        let (walks, probes) = expansion_witness::take();
+        assert!(
+            relevant.is_empty(),
+            "{:?}",
+            &relevant[..relevant.len().min(5)]
+        );
+        assert_eq!(walks, 0, "file events need no subtree walk");
+        assert_eq!(
+            probes,
+            graphed.len(),
+            "one containment probe per graphed file, independent of the {} events",
+            events.len()
+        );
+        // Generous: the quadratic version needed ~25 s for 5,000 events.
+        assert!(elapsed < Duration::from_secs(20), "{elapsed:?}");
+
+        let outcome = process_fixture_batch(&watcher, &store, &r_uid, &root, &events);
+        assert!(
+            matches!(outcome, WatchBatchOutcome::Unchanged),
+            "{outcome:?}"
+        );
+        assert_eq!(graphed_paths(&store, &r_uid), graphed);
+
+        // Counterweight: a visible new file beside the churn still publishes.
+        let kept = root.join("src/kept.js");
+        std::fs::write(&kept, "export function kept() { return 1; }\n").unwrap();
+        events.push(kept);
+        let relevant = watcher
+            .expand_event_paths(&store, &r_uid, &reader, &url, &events)
+            .unwrap();
+        assert_eq!(relevant, vec![root.join("src/kept.js")]);
+    }
+
+    /// A stop request (the daemon's drain sets it) abandons a batch that has
+    /// not published, so a long batch cannot hold the write lease past the
+    /// drain ceiling; the graph is unchanged and nothing reads as published.
+    #[test]
+    fn a_stop_request_abandons_an_unpublished_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root) = index_fixture_repo(&dir);
+        let before = graphed_paths(&store, &r_uid);
+        let added = root.join("src/added.js");
+        std::fs::write(&added, "export function added() { return 1; }\n").unwrap();
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        watcher.shutdown_handle().stop();
+        let outcome = process_fixture_batch(&watcher, &store, &r_uid, &root, &[added]);
+        let WatchBatchOutcome::Skipped { reason } = outcome else {
+            panic!("a stopping watcher must not publish: {outcome:?}");
+        };
+        assert!(
+            reason.downcast_ref::<WatchBatchStopped>().is_some(),
+            "{reason:#}"
+        );
+        assert_eq!(graphed_paths(&store, &r_uid), before);
+    }
+
+    /// QA: files newly ignored by a `.gitignore` edit stayed in the graph
+    /// (even across a watcher restart) and newly un-ignored files were not
+    /// added until restart. An ignore-file edit re-evaluates its directory;
+    /// the startup reconciliation retracts graphed sources the walk hides.
+    #[test]
+    fn ignore_rule_edits_retract_and_admit_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, r_uid, root) = index_fixture_repo(&dir);
+        git_init(&root);
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        let gitignore = root.join(".gitignore");
+        std::fs::write(
+            root.join("src/d.js"),
+            "export function delta() { return 4; }\n",
+        )
+        .unwrap();
+
+        std::fs::write(&gitignore, "src/c.js\nsrc/d.js\n").unwrap();
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            std::slice::from_ref(&gitignore),
+        );
+        assert_eq!(graphed_paths(&store, &r_uid), vec!["src/a.js", "src/b.js"]);
+
+        std::fs::write(&gitignore, "src/c.js\n").unwrap();
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            std::slice::from_ref(&gitignore),
+        );
+        assert_eq!(
+            graphed_paths(&store, &r_uid),
+            vec!["src/a.js", "src/b.js", "src/d.js"],
+            "an un-ignored source is added without a restart"
+        );
+
+        // While nothing watched: c.js is re-admitted, then b.js is ignored.
+        std::fs::write(&gitignore, "").unwrap();
+        process_fixture_batch(
+            &watcher,
+            &store,
+            &r_uid,
+            &root,
+            std::slice::from_ref(&gitignore),
+        );
+        assert!(graphed_paths(&store, &r_uid).contains(&"src/c.js".to_string()));
+        std::fs::write(&gitignore, "src/b.js\n").unwrap();
+        let drift = watcher
+            .startup_drift(&store, &r_uid, &format!("file://{}", root.display()))
+            .unwrap();
+        assert_eq!(drift.replay, vec![root.join("src/b.js")], "{drift:?}");
+        process_fixture_batch(&watcher, &store, &r_uid, &root, &drift.replay);
+        assert_eq!(
+            graphed_paths(&store, &r_uid),
+            vec!["src/a.js", "src/c.js", "src/d.js"]
+        );
+        assert_eq!(
+            super::ignore_rules_scope(Path::new("src/.gitignore")),
+            Some(Path::new("src"))
+        );
+        assert_eq!(
+            super::ignore_rules_scope(Path::new(".git/info/exclude")),
+            Some(Path::new(""))
+        );
+        assert_eq!(super::ignore_rules_scope(Path::new("src/a.js")), None);
     }
 
     /// The walk discloses a tracked gitignored source and indexing keeps it out
