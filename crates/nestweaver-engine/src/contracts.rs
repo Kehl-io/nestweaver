@@ -2120,7 +2120,10 @@ fn diff_params(
         .filter(|k| k.0 == "path" && !base.contains_key(*k))
         .collect();
     let mut renamed_from: std::collections::BTreeSet<(String, String)> = Default::default();
-    if !removed_path.is_empty() && removed_path.len() == added_path.len() {
+    // Only an unambiguous one-for-one swap is paired: with two or more, map
+    // order is alphabetical, not template position, and could pair the
+    // wrong variables.
+    if removed_path.len() == 1 && added_path.len() == 1 {
         for (old, new) in removed_path.into_iter().zip(added_path) {
             let (b, h) = (&base[old], &head[new]);
             out.push((
@@ -2217,10 +2220,20 @@ fn diff_response_codes(
     head: &std::collections::BTreeSet<String>,
 ) -> Vec<(SpecChangeSeverity, String)> {
     let is_success = |code: &str| code.starts_with('2');
+    // `200` and `2XX` cover each other for a client: replacing one with the
+    // other changes no promised success class.
+    let covered_by = |code: &str, other: &std::collections::BTreeSet<String>| {
+        let class = code.chars().next().map(|c| format!("{c}XX"));
+        class.as_ref().is_some_and(|class| other.contains(class))
+            || (code.ends_with("XX")
+                && other
+                    .iter()
+                    .any(|candidate| candidate.len() == 3 && candidate.starts_with(&code[..1])))
+    };
     let mut out = Vec::new();
     for code in base.difference(head) {
         out.push((
-            if is_success(code) {
+            if is_success(code) && !covered_by(code, head) {
                 SpecChangeSeverity::Breaking
             } else {
                 SpecChangeSeverity::Info
@@ -2740,6 +2753,13 @@ components:
         assert!(breaking(&changes).is_empty(), "{changes:?}");
 
         assert!(diff(QA_BASE_SPEC).is_empty());
+
+        // Review: a code and its range cover each other.
+        let ranged = QA_BASE_SPEC.replace("\"200\":", "\"2XX\":");
+        let changes = diff(&ranged);
+        assert!(breaking(&changes).is_empty(), "{changes:?}");
+        let back = diff_openapi("b.yaml", &ranged, "h.yaml", QA_BASE_SPEC).unwrap();
+        assert!(breaking(&back).is_empty(), "{back:?}");
     }
 
     #[test]
