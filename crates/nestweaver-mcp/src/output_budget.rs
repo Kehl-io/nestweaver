@@ -301,6 +301,8 @@ fn shrink(value: &mut Value, omitted: &mut BTreeMap<String, Value>) -> Result<bo
                 "unreachable_symbols" | "broken_links" => &["returned"],
                 "backlinks" => &["count"],
                 "summaries" | "hubs" | "bridges" => &["returned", "count"],
+                // brain_context / code_context: both name the returned count.
+                "connected" => &["returned", "connected_count"],
                 _ => &[],
             };
             let cursor = match key.as_str() {
@@ -773,6 +775,10 @@ mod tests {
     #[test]
     fn quality_budget_bridge_count_aliases_follow_late_prefix() {
         quality_count_case("bridges", &["count", "returned"]);
+    }
+    #[test]
+    fn quality_budget_context_connected_counts_follow_late_prefix() {
+        quality_count_case("connected", &["returned", "connected_count"]);
     }
 
     #[test]

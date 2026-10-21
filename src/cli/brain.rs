@@ -30,6 +30,15 @@ pub(crate) fn require_complete_graph_publication(
     )
 }
 
+/// `--name` is echoed by every later vault listing, so refuse one the graph
+/// cannot hold (control characters, blank, over-long) before anything runs.
+/// A usage error, hence EXIT_USAGE.
+fn refuse_invalid_source_name(name: Option<&str>) -> Option<i32> {
+    let problem = nestweaver_schema::validate_explicit_source_name(name?).err()?;
+    eprintln!("Error: invalid --name: {problem}");
+    Some(EXIT_USAGE)
+}
+
 pub(crate) fn run_brain(
     command: BrainCommands,
     out: &OutputConfig,
@@ -45,6 +54,9 @@ pub(crate) fn run_brain(
             config,
             ignore,
         } => {
+            if let Some(code) = refuse_invalid_source_name(name.as_deref()) {
+                return Ok((code, None));
+            }
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             // Create-operation (like `index`): create a missing parent
             // directory for --db up front instead of failing deep inside
@@ -1265,6 +1277,9 @@ pub(crate) fn run_brain(
             config,
             force,
         } => {
+            if let Some(code) = refuse_invalid_source_name(name.as_deref()) {
+                return Ok((code, None));
+            }
             if refresh_wiki_hours.is_some() && config.is_none() {
                 // nw-252: a USAGE error, so EXIT_USAGE (64, EX_USAGE from
                 // sysexits.h) — the same code clap's own parse failures
@@ -1530,6 +1545,9 @@ pub(crate) fn run_brain(
             json,
             fail_on_skip,
         } => {
+            if let Some(code) = refuse_invalid_source_name(name.as_deref()) {
+                return Ok((code, None));
+            }
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             if !path.exists() || !path.is_dir() {
                 eprintln!("Error: vault path is not a directory: {}", path.display());

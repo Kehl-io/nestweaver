@@ -5756,7 +5756,7 @@ impl<'a> WikilinkLookup<'a> {
     /// order: exact known note UID, unique path match, unique title match.
     /// Returns `None` when the reference is unknown or ambiguous.
     fn resolve_one(&self, reference: &str) -> Option<String> {
-        let raw = reference.trim();
+        let raw = frontmatter_link_target(reference);
         if raw.is_empty() {
             return None;
         }
@@ -5777,6 +5777,21 @@ impl<'a> WikilinkLookup<'a> {
         }
         None
     }
+}
+
+/// The note a frontmatter relationship value names. Obsidian writes these as
+/// links (`depends_on: "[[Projects/Billing|Billing]]"`), which never matched a
+/// UID, path or title, so the edge was dropped and lint called it dangling.
+/// The `[[...]]` wrapper, `|alias` and `#heading` are stripped only when the
+/// value IS a link — a plain title such as `C# notes` is left alone.
+pub(crate) fn frontmatter_link_target(reference: &str) -> &str {
+    let raw = reference.trim();
+    let Some(inner) = raw.strip_prefix("[[").and_then(|r| r.strip_suffix("]]")) else {
+        return raw;
+    };
+    let inner = inner.split_once('|').map_or(inner, |(target, _)| target);
+    let inner = inner.split_once('#').map_or(inner, |(target, _)| target);
+    inner.trim()
 }
 
 /// F11: derive typed Note→Note relationship edges from frontmatter keys and

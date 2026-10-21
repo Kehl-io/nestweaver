@@ -16570,3 +16570,36 @@ fn not_found_and_usage_exit_codes_are_consistent() {
     let payload: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(payload["error"], "not found", "{payload}");
 }
+
+/// A source name the graph cannot hold is a usage error, refused before any
+/// database or daemon is touched: a stored NUL name used to break every later
+/// vault listing, including the one `brain remove` needs.
+#[test]
+fn brain_add_refuses_a_control_character_name_before_touching_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    let db_path = dir.path().join("never-created.lbug");
+    for name in ["\u{1b}[31mevil", "a\nb", "   "] {
+        let mut cmd = Command::cargo_bin("nestweaver").unwrap();
+        let output = cmd
+            .env("NESTWEAVER_DIAGNOSTIC_WIDTH", "1000")
+            .args(["brain", "add"])
+            .arg(&vault)
+            .args(["--name", name, "--db"])
+            .arg(&db_path)
+            .timeout(std::time::Duration::from_secs(20))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(64), "{name:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("invalid --name"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        !db_path.exists(),
+        "nothing may be written for a refused name"
+    );
+}

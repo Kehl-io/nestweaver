@@ -21,7 +21,7 @@ use nestweaver_engine::{
     generate_claude_md_with_rules, generate_cursor_rule_with_rules, generate_guide_with_tools,
     generate_skill_with_tools, generate_summaries, get_all_properties, get_last_indexed_at,
     investigate, investigate_expand, investigate_hydrate, load_alias_sidecar, load_clusters,
-    load_extensions, memory_consolidate, memory_lint, memory_related, orphan_documents,
+    load_extensions, memory_consolidate_limited, memory_lint, memory_related, orphan_documents,
     parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text, topic_clusters,
     truncate_to_budget_keeping_first,
 };
@@ -993,6 +993,19 @@ fn tool_alias_groups(tool: &str) -> &'static [&'static [&'static str]] {
     }
 }
 
+/// `affected_tests` takes its changed set from `changed_files` (alias
+/// `files`) OR from a `base_ref` diff. Given both, the explicit list won and
+/// `base_ref` was silently ignored, so a caller believed it had tested a diff
+/// it never read.
+const AFFECTED_TESTS_FILES_AND_BASE_REF: &str = "conflicting arguments: pass either \
+     'changed_files' (alias 'files') or 'base_ref', not both — the explicit list would \
+     silently replace the base_ref diff";
+
+fn affected_tests_has_files_and_base_ref(args: &Value) -> bool {
+    args.get("base_ref").is_some()
+        && (args.get("changed_files").is_some() || args.get("files").is_some())
+}
+
 /// Fold alias spellings onto the canonical key (nw-558). Call before
 /// validation and dispatch; a conflict is left in place for
 /// [`validate_tool_arguments`] to refuse with a named error.
@@ -1038,6 +1051,9 @@ fn conflicting_alias_error(name: &str, args: &Value) -> Option<String> {
     match name {
         "regex_search" if args.get("pattern").is_some() && args.get("query").is_some() => {
             Some("conflicting arguments: pass only one of 'pattern' or 'query'".to_string())
+        }
+        "affected_tests" if affected_tests_has_files_and_base_ref(args) => {
+            Some(AFFECTED_TESTS_FILES_AND_BASE_REF.to_string())
         }
         // nw-630: `symbol` is an alias of `name`. Unlike `pattern`/`query`,
         // which reject the pair unconditionally, this only rejects a
@@ -5340,6 +5356,38 @@ fn cache_stats(db_path: &Path) -> (u64, usize, Option<f64>) {
 pub(crate) const MAX_IDENTIFIER_COUNT: usize = 1000;
 pub(crate) const MAX_IDENTIFIER_LEN: usize = 512;
 
+/// Seed lists for `brain_context` / `code_context`. PPR seeding is
+/// superlinear in the seed count (10,000 seeds took ~100 s and kept the daemon
+/// busy after the client left), and no real question needs more than this.
+pub(crate) const MAX_CONTEXT_SEEDS: usize = 256;
+/// Node-kind filters: the kind vocabulary is a handful of names.
+pub(crate) const MAX_KIND_FILTERS: usize = 32;
+/// Repo / vault / tag scope filters.
+pub(crate) const MAX_SCOPE_FILTERS: usize = 100;
+/// `note_get.sections` heading names.
+pub(crate) const MAX_NOTE_SECTIONS: usize = 256;
+/// `investigate_expand.targets`.
+pub(crate) const MAX_EXPAND_TARGETS: usize = 256;
+
+/// Collapse duplicate seeds (first occurrence wins) and refuse a list over
+/// [`MAX_CONTEXT_SEEDS`]. The schema declares the same bound; this is the
+/// backstop for routes that reach a handler without schema validation.
+fn bound_context_seeds(seeds: Vec<String>) -> Result<Vec<String>, anyhow::Error> {
+    let mut seen = HashSet::new();
+    let seeds: Vec<String> = seeds
+        .into_iter()
+        .filter(|seed| seen.insert(seed.clone()))
+        .collect();
+    if seeds.len() > MAX_CONTEXT_SEEDS {
+        anyhow::bail!(
+            "'seeds' has {} distinct entries; the maximum is {MAX_CONTEXT_SEEDS}. Narrow the \
+             seed list (or use brain_search to pick the most relevant seeds) and retry.",
+            seeds.len()
+        );
+    }
+    Ok(seeds)
+}
+
 /// Bound a list of client-supplied identifiers (symbol UIDs/names/FQNs, repo-
 /// relative paths) so an oversized entry or an over-long list can't be echoed
 /// back verbatim (a response-amplification lever) or waste work.
@@ -6104,8 +6152,9 @@ fn tool_schema_regex_search() -> Value {
                 "path_prefix": { "type": "string", "description": "Restrict to nodes whose file path starts with this prefix." },
                 "kinds": {
                     "type": "array",
+                    "maxItems": MAX_KIND_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Restrict to these node kinds: Section, Note, Symbol, Frontmatter (case-insensitive)."
+                    "description": "Restrict to these node kinds: Section, Note, Symbol, Frontmatter (case-insensitive). At most 32 entries."
                 },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Maximum results to return (1-10000; MCP presentation remains bounded by 50 rows and output bytes). Default: 50; MCP candidate work is capped at 2000." },
                 "max_millis": { "type": "integer", "minimum": 1, "maximum": 600000, "description": "Wall-clock time budget in milliseconds (1-600000). Default 2000." },
@@ -6164,14 +6213,16 @@ fn tool_schema_count_patterns() -> Value {
             "properties": {
                 "patterns": {
                     "type": "array",
+                    "maxItems": 64,
                     "items": { "type": "string" },
-                    "description": "One or more Rust regex patterns to count."
+                    "description": "One or more Rust regex patterns to count. At most 64 patterns."
                 },
                 "path_prefix": { "type": "string", "description": "Restrict to nodes whose file path starts with this prefix." },
                 "kinds": {
                     "type": "array",
+                    "maxItems": MAX_KIND_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Restrict to these node kinds: Section, Note, Symbol, Frontmatter (case-insensitive)."
+                    "description": "Restrict to these node kinds: Section, Note, Symbol, Frontmatter (case-insensitive). At most 32 entries."
                 }
             },
             "required": ["patterns"]
@@ -6258,8 +6309,9 @@ fn tool_schema_brain_orphan_documents() -> Value {
                 "path_prefix": { "type": "string", "description": "Restrict to notes whose file path starts with this prefix." },
                 "allowlist": {
                     "type": "array",
+                    "maxItems": MAX_IDENTIFIER_COUNT,
                     "items": { "type": "string" },
-                    "description": "Note paths/titles to exclude (overrides the default index/MOC allowlist when provided)."
+                    "description": "Note paths/titles to exclude (overrides the default index/MOC allowlist when provided). At most 1000 entries."
                 },
                 "limit": limit_schema(
                     "Max orphan documents to return (1-1000, default 50). The total count is always reported.",
@@ -6459,19 +6511,23 @@ fn tool_brain_memory_consolidate(store: &GraphStore, args: Value) -> Result<Valu
         1,
         RESULT_LIMIT_MAX,
     )?;
-    let mut manifest = serde_json::to_value(memory_consolidate(store, apply, now_epoch_secs())?)?;
-    // Truncate proposals to limit and report total.
+    // The limit is applied BEFORE apply: it used to apply every proposal and
+    // then trim the list, so `limit: 1` moved notes the response never named.
+    let consolidation = memory_consolidate_limited(store, apply, now_epoch_secs(), Some(limit))?;
+    let total = consolidation.proposals_discovered;
+    let mut manifest = serde_json::to_value(consolidation)?;
     if let Some(obj) = manifest.as_object_mut() {
-        let (total, returned) =
-            if let Some(proposals) = obj.get_mut("proposals").and_then(|v| v.as_array_mut()) {
-                let total = proposals.len();
-                proposals.truncate(limit);
-                (total, proposals.len())
-            } else {
-                (0, 0)
-            };
+        let returned = obj
+            .get("proposals")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
         obj.insert("proposals_total".to_string(), json!(total));
         obj.insert("proposals_returned".to_string(), json!(returned));
+        // Discovered but past the limit: neither returned nor applied.
+        obj.insert(
+            "proposals_deferred".to_string(),
+            json!(total.saturating_sub(limit)),
+        );
     }
     Ok(manifest)
 }
@@ -6494,7 +6550,7 @@ fn tool_schema_brain_memory_consolidate() -> Value {
                 // parameter at all). Fixed schema-side, so no write path had to
                 // be exercised to close it.
                 "limit": limit_schema(
-                    "Max proposals to return (1-1000, default 50). The total count is always reported.",
+                    "Max proposals to return AND, with apply:true, to apply (1-1000, default 50). Proposals past the limit are neither returned nor applied; proposals_total and proposals_deferred report them.",
                     DEFAULT_RESULT_LIMIT, 1, RESULT_LIMIT_MAX)
             }
         }
@@ -7404,12 +7460,13 @@ fn tool_schema_code_context() -> Value {
             "properties": {
                 "seeds": {
                     "type": "array",
+                    "maxItems": MAX_CONTEXT_SEEDS,
                     // nw-379: an empty-string ELEMENT is a different axis
                     // than an empty ARRAY (the handler already rejects that
                     // one) -- `minLength` closes the one the handler cannot
                     // see, matching `read_symbols`' `targets`/`uids_or_fqns`.
                     "items": { "type": "string", "minLength": 1 },
-                    "description": "Symbol names or `sym:` UIDs to seed the traversal."
+                    "description": "Symbol names or `sym:` UIDs to seed the traversal. At most 256 seeds (duplicates are collapsed); a longer list is REJECTED."
                 },
                 "limit": {
                     "type": "integer",
@@ -7443,6 +7500,7 @@ fn tool_schema_brain_context() -> Value {
             "properties": {
                 "seeds": {
                     "type": "array",
+                    "maxItems": MAX_CONTEXT_SEEDS,
                     // nw-379: `brain_context(seeds: [""])` returned arbitrary
                     // notes at a flat `relevance: 0.4` -- the handler already
                     // rejects an empty ARRAY ('seeds' must contain at least
@@ -7452,7 +7510,7 @@ fn tool_schema_brain_context() -> Value {
                     // `uids_or_fqns` already declare this; the fix here is
                     // the same declaration, not new code.
                     "items": { "type": "string", "minLength": 1 },
-                    "description": "One or more seed strings to anchor the PPR walk. Accepts note titles, tag names (with or without #), symbol names, or UIDs (sym:/note:/head:/sec:/tag:). Seeds are NAMES, not questions: a natural-language question resolves to no seed and returns the not_found envelope, whose message names the `investigate` call to make instead. Use the `investigate` tool for a question."
+                    "description": "One or more seed strings to anchor the PPR walk. Accepts note titles, tag names (with or without #), symbol names, or UIDs (sym:/note:/head:/sec:/tag:). Seeds are NAMES, not questions: a natural-language question resolves to no seed and returns the not_found envelope, whose message names the `investigate` call to make instead. Use the `investigate` tool for a question. At most 256 seeds (duplicates are collapsed); a longer list is REJECTED."
                 },
                 "limit": {
                     "type": "integer", "minimum": 1, "maximum": 1000,
@@ -7473,18 +7531,21 @@ fn tool_schema_brain_context() -> Value {
                 },
                 "repos": {
                     "type": "array",
+                    "maxItems": MAX_SCOPE_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Filter to specific repositories (post-PPR). Each entry must RESOLVE to one repo — exact repo UID (\"repo:{instance}:{hash}\"), exact display name (case-insensitive), or exact clone URL / local root; an entry that names no repo, or that names two, is an ERROR rather than a filter that quietly matches nothing. Only nodes OWNED by a resolved repo are kept. Vault content (Note/Section/Heading/Tag) belongs to a vault and not to any repository, so it is DROPPED when this is set — use `vaults` to scope vault content."
+                    "description": "Filter to specific repositories (post-PPR). Each entry must RESOLVE to one repo — exact repo UID (\"repo:{instance}:{hash}\"), exact display name (case-insensitive), or exact clone URL / local root; an entry that names no repo, or that names two, is an ERROR rather than a filter that quietly matches nothing. Only nodes OWNED by a resolved repo are kept. Vault content (Note/Section/Heading/Tag) belongs to a vault and not to any repository, so it is DROPPED when this is set — use `vaults` to scope vault content. At most 100 entries."
                 },
                 "vaults": {
                     "type": "array",
+                    "maxItems": MAX_SCOPE_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Filter to specific vaults (post-PPR). Each entry must RESOLVE to one vault — exact vault UID (\"vlt:{instance}:{hash}\"), exact name (case-insensitive), or exact root path; an unresolvable or ambiguous entry is an ERROR. Only nodes OWNED by a resolved vault (Note/Section/Heading/Tag) are kept; Symbol nodes belong to a repository and are DROPPED when this is set."
+                    "description": "Filter to specific vaults (post-PPR). Each entry must RESOLVE to one vault — exact vault UID (\"vlt:{instance}:{hash}\"), exact name (case-insensitive), or exact root path; an unresolvable or ambiguous entry is an ERROR. Only nodes OWNED by a resolved vault (Note/Section/Heading/Tag) are kept; Symbol nodes belong to a repository and are DROPPED when this is set. At most 100 entries."
                 },
                 "kinds": {
                     "type": "array",
+                    "maxItems": MAX_KIND_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Include only nodes with these kind prefixes (e.g. Symbol, Note, Section, Tag, Heading). Case-insensitive prefix match against the node's kind field."
+                    "description": "Include only nodes with these kind prefixes (e.g. Symbol, Note, Section, Tag, Heading). Case-insensitive prefix match against the node's kind field. At most 32 entries."
                 },
                 "path_prefix": {
                     "type": "string",
@@ -7492,13 +7553,15 @@ fn tool_schema_brain_context() -> Value {
                 },
                 "tags": {
                     "type": "array",
+                    "maxItems": MAX_SCOPE_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Include only nodes tagged with any of these tags. Applies to Note and Section nodes; Symbol nodes carry no tags and are DROPPED when this is set, so a tag-scoped result can never be larger than the unscoped one. Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\"."
+                    "description": "Include only nodes tagged with any of these tags. Applies to Note and Section nodes; Symbol nodes carry no tags and are DROPPED when this is set, so a tag-scoped result can never be larger than the unscoped one. Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\". At most 100 entries."
                 },
                 "exclude_tags": {
                     "type": "array",
+                    "maxItems": MAX_SCOPE_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Exclude nodes tagged with any of these tags (applies to Note and Section nodes). Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\". An excluded parent therefore drops its whole subtree."
+                    "description": "Exclude nodes tagged with any of these tags (applies to Note and Section nodes). Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\". An excluded parent therefore drops its whole subtree. At most 100 entries."
                 },
                 "weight_ppr": {
                     "type": "number",
@@ -7604,6 +7667,7 @@ fn tool_code_context(
     if seeds.is_empty() {
         anyhow::bail!("code_context requires at least one seed");
     }
+    let seeds = bound_context_seeds(seeds)?;
     // An omitted `limit` used to mean NO CAP, matching the engine's
     // `limit.unwrap_or(usize::MAX)`. That made the advertised 500-result
     // safeguard unreachable by simply not sending the field, so a seed in a
@@ -7752,6 +7816,7 @@ fn tool_brain_context(
     if seeds.is_empty() {
         return Err(anyhow!("'seeds' must contain at least one string"));
     }
+    let seeds = bound_context_seeds(seeds)?;
     for seed in &seeds {
         match resolve_note_by_title(store, seed)? {
             StrictNoteResolve::Ambiguous(notes) => {
@@ -10064,8 +10129,9 @@ fn tool_schema_note_get() -> Value {
                 "body_offset": { "type": "integer", "minimum": 0, "description": "Unicode character offset in body; continue using next_body_offset, with the same UID and sections." },
                 "sections": {
                     "type": "array",
+                    "maxItems": MAX_NOTE_SECTIONS,
                     "items": { "type": "string" },
-                    "description": "Optional list of heading names. If provided, returns only those sections instead of the full body. Case-insensitive match."
+                    "description": "Optional list of heading names. If provided, returns only those sections instead of the full body. Case-insensitive match. At most 256 headings."
                 }
             },
             // nw-410: the either/or requirement, declared where the
@@ -11912,12 +11978,26 @@ fn tool_schema_brain_add_source() -> Value {
                 "path": { "type": "string", "description": "Absolute or ~/-relative directory path to the vault, repo, or markdown folder to index." },
                 "name": {
                     "type": "string",
-                    "description": "Friendly display name (vaults only). Defaults to the directory name. Has no effect for code repos."
+                    "maxLength": nestweaver_schema::MAX_SOURCE_NAME_CHARS,
+                    "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$",
+                    "description": "Friendly display name (vaults only). Defaults to the directory name. Has no effect for code repos. At most 255 characters, not blank, and no control characters (NUL, CR, LF, ESC, ...)."
                 }
             },
             "required": ["path"]
         }
     })
+}
+
+/// The optional `name` argument, validated before anything is written: a
+/// stored name with a NUL made every later vault listing fail.
+fn add_source_name_arg(args: &Value) -> Result<Option<String>, anyhow::Error> {
+    match args.get("name") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(name)) => nestweaver_schema::validate_explicit_source_name(name)
+            .map(|()| Some(name.clone()))
+            .map_err(|problem| anyhow!("invalid 'name': {problem}")),
+        Some(_) => Err(anyhow!("'name' must be a string")),
+    }
 }
 
 fn resolve_add_source_path(raw_path: &str) -> Result<std::path::PathBuf, anyhow::Error> {
@@ -11927,6 +12007,35 @@ fn resolve_add_source_path(raw_path: &str) -> Result<std::path::PathBuf, anyhow:
 #[cfg(test)]
 mod add_source_path_tests {
     use super::*;
+
+    #[test]
+    fn a_control_character_or_oversized_name_is_refused_before_indexing() {
+        let long = "x".repeat(nestweaver_schema::MAX_SOURCE_NAME_CHARS + 1);
+        for name in ["\u{0}evil", "a\r\nb", "\u{1b}[2J", long.as_str()] {
+            let args = json!({ "path": "/tmp", "name": name });
+            assert!(
+                validate_tool_arguments("brain_add_source", &args).is_err(),
+                "schema must refuse {name:?}"
+            );
+            // The handler backstop for routes that skip schema validation.
+            assert!(
+                add_source_name_arg(&args).is_err(),
+                "handler must refuse {name:?}"
+            );
+        }
+        // Blank is a handler-only refusal: the schema only bounds the shape.
+        assert!(add_source_name_arg(&json!({ "path": "/tmp", "name": "  " })).is_err());
+        let ok = json!({ "path": "/tmp", "name": "My Vault" });
+        assert!(validate_tool_arguments("brain_add_source", &ok).is_ok());
+        assert_eq!(
+            add_source_name_arg(&ok).unwrap().as_deref(),
+            Some("My Vault")
+        );
+        assert_eq!(
+            add_source_name_arg(&json!({ "path": "/tmp" })).unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn empty_path_is_rejected_instead_of_becoming_the_working_directory() {
@@ -12015,11 +12124,7 @@ fn tool_brain_add_source(store: &GraphStore, args: Value) -> Result<Value, anyho
             let kind = if has_obsidian { "obsidian" } else { "markdown" };
             // Empty when `name` is absent: the indexer then keeps a registered
             // vault's stored name, and names a new one after its directory.
-            let name = args
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .unwrap_or_default();
+            let name = add_source_name_arg(&args)?.unwrap_or_default();
             // We need a db_path for index_markdown_directory; but the server
             // already opened one. Reuse it indirectly: call the in-memory
             // primitive? No — that doesn't persist. Reopen the same DB by
@@ -12185,15 +12290,97 @@ fn match_repo_target<'a>(
             let r_url = r.url.trim_end_matches('/');
             r.uid == target
                 || r.name.as_deref() == Some(target_trimmed)
+                || r_url == target_trimmed
                 || r_url == url_target.trim_end_matches('/')
                 || r_url == canonical_target.trim_end_matches('/')
                 || (!origin_target.is_empty() && r_url == origin_target.trim_end_matches('/'))
                 || (!canonical_path.is_empty()
                     && r.local_root().map(|p| p.trim_end_matches('/'))
                         == Some(canonical_path.trim_end_matches('/')))
-                || r_url.ends_with(&format!("/{target_trimmed}"))
         })
         .collect()
+}
+
+/// Match a `target` against indexed vaults by UID, display name, root path, or
+/// canonical root path — exact matches only, as for repos.
+fn match_vault_target<'a>(
+    vaults: &'a [nestweaver_schema::Vault],
+    target: &str,
+) -> Vec<&'a nestweaver_schema::Vault> {
+    let target_trimmed = target.trim_end_matches('/');
+    let canonical_target = std::fs::canonicalize(target_trimmed)
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    vaults
+        .iter()
+        .filter(|v| {
+            let root = v.root_path.trim_end_matches('/');
+            v.uid == target
+                || v.name == target_trimmed
+                || root == target_trimmed
+                || (!canonical_target.is_empty()
+                    && (root == canonical_target.trim_end_matches('/')
+                        || std::fs::canonicalize(&v.root_path)
+                            .is_ok_and(|p| p.display().to_string() == canonical_target)))
+        })
+        .collect()
+}
+
+/// The single source a `brain_remove_source` target names.
+#[derive(Debug)]
+enum RemoveTarget<'a> {
+    Repo(&'a nestweaver_schema::Repo),
+    Vault(&'a nestweaver_schema::Vault),
+}
+
+/// Resolve a removal target across repos AND vaults before deleting anything.
+/// Removal is permanent, so a target that names more than one source — two
+/// repos, or a repo and a vault sharing a name — refuses and lists every
+/// candidate with its UID; it used to delete the repo without checking vaults.
+fn resolve_remove_target<'a>(
+    repos: &'a [nestweaver_schema::Repo],
+    vaults: &'a [nestweaver_schema::Vault],
+    target: &str,
+) -> Result<RemoveTarget<'a>, anyhow::Error> {
+    let mut matches: Vec<RemoveTarget<'a>> = match_repo_target(repos, target)
+        .into_iter()
+        .map(RemoveTarget::Repo)
+        .collect();
+    matches.extend(
+        match_vault_target(vaults, target)
+            .into_iter()
+            .map(RemoveTarget::Vault),
+    );
+    match matches.len() {
+        0 => Err(target_not_found(
+            format!("no repo or vault matching '{target}' found"),
+            "target",
+            json!(target),
+            &[],
+        )),
+        1 => Ok(matches.remove(0)),
+        _ => {
+            let candidates = matches
+                .iter()
+                .map(|candidate| match candidate {
+                    RemoveTarget::Repo(repo) => format!(
+                        "repo '{}' (uid {})",
+                        repo.name.as_deref().unwrap_or(&repo.url),
+                        repo.uid
+                    ),
+                    RemoveTarget::Vault(vault) => {
+                        format!("vault '{}' (uid {})", vault.name, vault.uid)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(anyhow!(
+                "'{target}' matches {} sources: {candidates}. Nothing was removed; pass one \
+                 candidate's UID to choose.",
+                matches.len()
+            ))
+        }
+    }
 }
 
 fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
@@ -12203,102 +12390,60 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
         .ok_or_else(|| anyhow!("'target' is required"))?
         .to_string();
 
-    // Try to resolve as a repo first, then as a vault.
     let repos = store.list_repos(None)?;
-    let canonical_target = std::fs::canonicalize(&target)
-        .map(|p| format!("file://{}", p.display()))
-        .unwrap_or_default();
-    let matched_repo = match_repo_target(&repos, &target);
-
-    if matched_repo.len() == 1 {
-        #[cfg(feature = "daemon")]
-        {
-            let repo = matched_repo[0];
-            let repo_uid = repo.uid.clone();
-            let display = repo.name.clone().unwrap_or_else(|| repo.url.clone());
-            let db_path = current_db_path(store)?;
-            let db_path_buf = std::path::PathBuf::from(&db_path);
-            let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
-            let sock_path = inline_ensure_daemon(&db_path_buf)
-                .map_err(|e| anyhow::anyhow!("failed to start daemon: {e}"))?;
-            let mut client = rt.block_on(inline_connect_daemon(&sock_path))?;
-            let resp = rt
-                .block_on(client.remove_repo(nestweaver_proto::RemoveRepoRequest {
-                    repo_uid: repo_uid.clone(),
-                }))
-                .map_err(|e| anyhow!("remove_repo RPC failed: {e}"))?;
-            let inner = resp.into_inner();
-            return Ok(json!({
-                "kind": "repo",
-                "name": display,
-                "uid": repo_uid,
-                "files_deleted": inner.files_deleted,
-                "symbols_deleted": inner.symbols_deleted
-            }));
-        }
-        #[cfg(not(feature = "daemon"))]
-        return Err(anyhow!("brain_remove_source requires daemon mode"));
-    }
-
-    // Try vaults
     let vaults = store.list_vaults(None)?;
-    let matched_vault: Vec<&nestweaver_schema::Vault> = vaults
-        .iter()
-        .filter(|v| {
-            v.uid == target
-                || v.name == target
-                || v.root_path == target
-                || v.root_path == canonical_target.strip_prefix("file://").unwrap_or("")
-                || std::fs::canonicalize(&v.root_path)
-                    .map(|p| format!("file://{}", p.display()))
-                    .unwrap_or_default()
-                    == canonical_target
-        })
-        .collect();
+    let resolved = resolve_remove_target(&repos, &vaults, &target)?;
 
-    if matched_vault.len() == 1 {
-        #[cfg(feature = "daemon")]
-        {
-            let vault = matched_vault[0];
-            let vault_uid = vault.uid.clone();
-            let display = vault.name.clone();
-            let db_path = current_db_path(store)?;
-            let db_path_buf = std::path::PathBuf::from(&db_path);
-            let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
-            let sock_path = inline_ensure_daemon(&db_path_buf)
-                .map_err(|e| anyhow::anyhow!("failed to start daemon: {e}"))?;
-            let mut client = rt.block_on(inline_connect_daemon(&sock_path))?;
-            let resp = rt
-                .block_on(client.remove_vault(nestweaver_proto::RemoveVaultRequest {
-                    vault_uid: vault_uid.clone(),
+    #[cfg(feature = "daemon")]
+    {
+        let db_path = current_db_path(store)?;
+        let db_path_buf = std::path::PathBuf::from(&db_path);
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
+        let sock_path = inline_ensure_daemon(&db_path_buf)
+            .map_err(|e| anyhow::anyhow!("failed to start daemon: {e}"))?;
+        let mut client = rt.block_on(inline_connect_daemon(&sock_path))?;
+        match resolved {
+            RemoveTarget::Repo(repo) => {
+                let repo_uid = repo.uid.clone();
+                let display = repo.name.clone().unwrap_or_else(|| repo.url.clone());
+                let resp = rt
+                    .block_on(client.remove_repo(nestweaver_proto::RemoveRepoRequest {
+                        repo_uid: repo_uid.clone(),
+                    }))
+                    .map_err(|e| anyhow!("remove_repo RPC failed: {e}"))?;
+                let inner = resp.into_inner();
+                Ok(json!({
+                    "kind": "repo",
+                    "name": display,
+                    "uid": repo_uid,
+                    "files_deleted": inner.files_deleted,
+                    "symbols_deleted": inner.symbols_deleted
                 }))
-                .map_err(|e| anyhow!("remove_vault RPC failed: {e}"))?;
-            let inner = resp.into_inner();
-            return Ok(json!({
-                "kind": "vault",
-                "name": display,
-                "uid": vault_uid,
-                "notes_deleted": inner.notes_deleted
-            }));
+            }
+            RemoveTarget::Vault(vault) => {
+                let vault_uid = vault.uid.clone();
+                let display = vault.name.clone();
+                let resp = rt
+                    .block_on(client.remove_vault(nestweaver_proto::RemoveVaultRequest {
+                        vault_uid: vault_uid.clone(),
+                    }))
+                    .map_err(|e| anyhow!("remove_vault RPC failed: {e}"))?;
+                let inner = resp.into_inner();
+                Ok(json!({
+                    "kind": "vault",
+                    "name": display,
+                    "uid": vault_uid,
+                    "notes_deleted": inner.notes_deleted
+                }))
+            }
         }
-        #[cfg(not(feature = "daemon"))]
-        return Err(anyhow!("brain_remove_source requires daemon mode"));
     }
-
-    // No match or ambiguous
-    if matched_repo.len() > 1 || matched_vault.len() > 1 {
-        return Err(anyhow!(
-            "'{target}' matches multiple sources. Use a UID to disambiguate."
-        ));
+    #[cfg(not(feature = "daemon"))]
+    {
+        let _ = resolved;
+        Err(anyhow!("brain_remove_source requires daemon mode"))
     }
-    Err(target_not_found(
-        format!("no repo or vault matching '{target}' found"),
-        "target",
-        json!(target),
-        &[],
-    ))
 }
 
 // ── 6c. prune_stale ─────────────────────────────────────────────────────────
@@ -12306,7 +12451,7 @@ fn tool_brain_remove_source(store: &GraphStore, args: Value) -> Result<Value, an
 fn tool_schema_prune_stale() -> Value {
     json!({
         "name": "prune_stale",
-        "description": "Remove all indexed repos and vaults whose source directories no longer exist on disk. No parameters required.\n\nGuidelines:\n- Use after moving, renaming, or deleting project directories\n- Returns the list of removed repos and vaults\n\nReading the response:\n- `committed: true` means the prune HAPPENED and is durable. If `reconciliation_warnings` is also non-empty, some post-commit bookkeeping step failed — the prune still succeeded. Do NOT retry as though nothing happened; re-run only to retry the bookkeeping.\n- `committed: false` means nothing was pruned.\n\nLimitations:\n- Only checks filesystem existence, not content staleness (use stale_check for that)\n- Cannot undo — removed sources must be re-indexed with brain_add_source",
+        "description": "Remove all indexed repos and vaults whose source directories no longer exist on disk. No parameters required.\n\nGuidelines:\n- Use after moving, renaming, or deleting project directories\n- Returns the list of removed repos and vaults\n\nReading the response:\n- `committed: true` means the prune HAPPENED and is durable. If `reconciliation_warnings` is also non-empty, some post-commit bookkeeping step failed — the prune still succeeded. Do NOT retry as though nothing happened; re-run only to retry the bookkeeping.\n- `committed: false` means nothing was pruned.\n- `skipped_warnings` lists sources KEPT because their root could not be checked (permission denied, I/O error); only a root that is definitely gone is pruned.\n\nLimitations:\n- Only checks filesystem existence, not content staleness (use stale_check for that)\n- Cannot undo — removed sources must be re-indexed with brain_add_source",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -14332,7 +14477,7 @@ fn tool_detect_changes_scoped(
 fn tool_schema_affected_tests() -> Value {
     json!({
         "name": "affected_tests",
-        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (at least one must be provided).\n\nREFUSAL: when a repo that owns a changed file (or shares a recorded cross-repo edge or a declared `[[links]]` entry with one) has edges that predate the running resolver, this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos`, a `remedies` array, `recommendation: \"run-full-suite\"`, and NO tier keys at all — a missing edge can only make the selection SMALLER, so an under-resolved graph silently drops a regression test while the gate still reports success. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required, a generation-stale repo is already at HEAD so a plain incremental index writes nothing) and call again. A stale repo unrelated to the change does not refuse; it is named in a `resolver-generation-stale-unrelated` warning notification.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against. base_ref diffs the repository named by `repo`; several visible local repositories and no `repo` is an error, not a silent pick of one unnamed repository. The result names the repository it diffed. A path that is not a git work tree fails naming that repository\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive. Each test file is listed once, in its best tier\n- A test file whose own top level calls a changed function is selected; its module owner (`path::<module>`) is never a changed symbol or a test name. When none of that file's tests was reached, its `tests` is empty and `selected_by: \"top_level_code\"` says why; it counts as one test in the summary\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n- `recommendation` is a machine-readable CI directive: 'selection-usable' requires a complete run with nonempty test files, or an explicitly documented docs-only/proven-empty exception; otherwise 'run-full-suite'. Documentation-only changes are disclosed as docs; unassessed source/config changes are disclosed and widen to the full suite\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n- `resolver_stale_repos` (repo UIDs, generation-mismatch) is NOT the same population as `_meta.stale_repos` (federation lag, present only via the hybrid client) or `stale_check`'s/`hub_nodes`'s own `stale_repos` (different tools, different populations under the same key name — nw-371)\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
+        "description": "Prioritize which test files a PR should run by mapping changed files through the call/import graph to test files. Results bucketed into priority tiers.\n\nRequires either 'changed_files' or 'base_ref' (exactly one; passing both is refused).\n\nREFUSAL: when a repo that owns a changed file (or shares a recorded cross-repo edge or a declared `[[links]]` entry with one) has edges that predate the running resolver, this tool returns `refused: true` with `reason: \"outdated_resolver\"`, `resolver_stale_repos`, a `remedies` array, `recommendation: \"run-full-suite\"`, and NO tier keys at all — a missing edge can only make the selection SMALLER, so an under-resolved graph silently drops a regression test while the gate still reports success. Re-index every repo it names (`nestweaver index --repo <path> --force`; `--force` is required, a generation-stale repo is already at HEAD so a plain incremental index writes nothing) and call again. A stale repo unrelated to the change does not refuse; it is named in a `resolver-generation-stale-unrelated` warning notification.\n\nGuidelines:\n- Provide changed_files (repo-relative) or base_ref (git ref like 'main') to diff against. base_ref diffs the repository named by `repo`; several visible local repositories and no `repo` is an error, not a silent pick of one unnamed repository. The result names the repository it diffed. A path that is not a git work tree fails naming that repository\n- tier_1 = directly references changed symbol, tier_2 = direct caller, tier_3 = transitive. Each test file is listed once, in its best tier\n- A test file whose own top level calls a changed function is selected; its module owner (`path::<module>`) is never a changed symbol or a test name. When none of that file's tests was reached, its `tests` is empty and `selected_by: \"top_level_code\"` says why; it counts as one test in the summary\n- For symbol-level blast radius use brain_impact; for risk scoring use detect_changes\n- `recommendation` is a machine-readable CI directive: 'selection-usable' requires a complete run with nonempty test files, or an explicitly documented docs-only/proven-empty exception; otherwise 'run-full-suite'. Documentation-only changes are disclosed as docs; unassessed source/config changes are disclosed and widen to the full suite\n\nLimitations:\n- Static call-graph regression test selection — misses reflection, DI, codegen, and integration/e2e tests\n- 'No tests found' does NOT mean safe to skip testing. IMPORTANT: keep periodic full test runs in CI\n- `resolver_stale_repos` (repo UIDs, generation-mismatch) is NOT the same population as `_meta.stale_repos` (federation lag, present only via the hybrid client) or `stale_check`'s/`hub_nodes`'s own `stale_repos` (different tools, different populations under the same key name — nw-371)\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -14387,9 +14532,12 @@ fn tool_affected_tests(
     args: Value,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
+    if affected_tests_has_files_and_base_ref(&args) {
+        return Err(anyhow!(AFFECTED_TESTS_FILES_AND_BASE_REF));
+    }
     let owners = restricted_symbol_owners(store, visible)?;
 
-    // Resolve the set of changed files: explicit list takes precedence over base_ref.
+    // Resolve the set of changed files: an explicit list or a base_ref diff.
     let explicit_changed_files = args
         .get("changed_files")
         .map(|value| {
@@ -18159,10 +18307,12 @@ fn tool_schema_set_extension() -> Value {
                 },
                 "key": {
                     "type": "string",
-                    "description": "Property name (e.g. \"team_owner\", \"deprecated\", \"review_needed\", \"priority\")."
+                    "maxLength": nestweaver_engine::extensions::MAX_EXTENSION_KEY_BYTES,
+                    "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$",
+                    "description": "Property name (e.g. \"team_owner\", \"deprecated\", \"review_needed\", \"priority\"). At most 256 bytes, no control characters."
                 },
                 "value": {
-                    "description": "Property value — any JSON value (string, number, boolean, object, array). Overwrites any existing value for this key on this node."
+                    "description": "Property value — any JSON value (string, number, boolean, object, array). Overwrites any existing value for this key on this node. At most 64 KiB once serialized as JSON; a larger value is refused."
                 }
             },
             "required": ["uid", "key", "value"]
@@ -18284,6 +18434,8 @@ fn tool_set_extension(args: Value) -> Result<Value, anyhow::Error> {
             .get("value")
             .cloned()
             .ok_or_else(|| anyhow!("'value' is required"))?;
+        nestweaver_engine::extensions::validate_extension_property(key, &value)
+            .map_err(|problem| anyhow!(problem))?;
 
         let mut store = load_extensions(&db_path);
         set_property(&mut store, uid, key, value.clone());
@@ -18426,6 +18578,40 @@ fn tool_schema_brain_diff() -> Value {
     })
 }
 
+/// Name the cause of a failed `brain_diff` git step. The bare `.context("git
+/// diff")` surfaced as "tool brain_diff failed: git diff" with the cause
+/// hidden below the top context; an unknown `since_sha` is the common case and
+/// deserves to be said plainly. Only the innermost message is shown (first
+/// line, bounded), never a raw stderr dump.
+fn brain_diff_git_error(
+    error: &anyhow::Error,
+    base_sha: &str,
+    head_sha: &str,
+    base_from_caller: bool,
+) -> anyhow::Error {
+    let step = |context: &str| error.chain().any(|cause| cause.to_string() == context);
+    if step("resolve old git commit") {
+        let origin = if base_from_caller {
+            "since_sha"
+        } else {
+            "the indexed SHA"
+        };
+        return anyhow!(
+            "git diff failed: unknown revision '{base_sha}' ({origin} does not name a commit in \
+             this repository; it may be mistyped, or unreachable after a rebase or shallow clone)"
+        );
+    }
+    if step("resolve new git commit") {
+        return anyhow!("git diff failed: unknown revision '{head_sha}' (current HEAD)");
+    }
+    let root = error.root_cause().to_string();
+    let first_line = root.lines().next().unwrap_or_default();
+    anyhow!(
+        "git diff failed: {}",
+        truncate_utf8_bytes(first_line, MAX_VALIDATION_ITEM_BYTES)
+    )
+}
+
 fn tool_brain_diff(
     store: &GraphStore,
     args: Value,
@@ -18505,7 +18691,9 @@ fn tool_brain_diff(
     }
 
     let changes = git_diff::detect_changes(std::path::Path::new(repo_path), base_sha, &head_sha)
-        .context("git diff")?;
+        .map_err(|error| {
+            brain_diff_git_error(&error, base_sha, &head_sha, since_sha_arg.is_some())
+        })?;
 
     let mut added: Vec<String> = Vec::new();
     let mut modified: Vec<String> = Vec::new();
@@ -18614,8 +18802,9 @@ fn tool_schema_project_context() -> Value {
                 },
                 "kinds": {
                     "type": "array",
+                    "maxItems": MAX_KIND_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Filter result kinds: \"Symbol\" for code, \"Note\" for documents, \"Section\" for note sections. Case-insensitive prefix match. When this is only Symbol, member notes are not seeded into the PPR walk — otherwise a notes-heavy project spends the whole candidate pool on notes that this filter then drops."
+                    "description": "Filter result kinds: \"Symbol\" for code, \"Note\" for documents, \"Section\" for note sections. Case-insensitive prefix match. When this is only Symbol, member notes are not seeded into the PPR walk — otherwise a notes-heavy project spends the whole candidate pool on notes that this filter then drops. At most 32 entries."
                 },
                 "include_components": {
                     "type": "boolean",
@@ -18652,8 +18841,9 @@ fn tool_schema_project_context() -> Value {
                 },
                 "repos": {
                     "type": "array",
+                    "maxItems": MAX_SCOPE_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Scope results to these repositories. Each entry must RESOLVE to one repo — exact repo UID, exact display name (case-insensitive), or exact clone URL / local root; an unresolvable or ambiguous entry is an ERROR rather than a filter that quietly matches nothing. Only nodes OWNED by a resolved repo are kept, so vault content (Note/Section/Heading/Tag), which belongs to a vault and not to any repository, is DROPPED when this is set. Also narrows which member symbols are eligible to seed the PPR walk in the first place, not just which results are kept afterward — so a repo-scoped call can surface symbols that an unscoped call would never reach. Use on a returning session to skip the broad load."
+                    "description": "Scope results to these repositories. Each entry must RESOLVE to one repo — exact repo UID, exact display name (case-insensitive), or exact clone URL / local root; an unresolvable or ambiguous entry is an ERROR rather than a filter that quietly matches nothing. Only nodes OWNED by a resolved repo are kept, so vault content (Note/Section/Heading/Tag), which belongs to a vault and not to any repository, is DROPPED when this is set. Also narrows which member symbols are eligible to seed the PPR walk in the first place, not just which results are kept afterward — so a repo-scoped call can surface symbols that an unscoped call would never reach. Use on a returning session to skip the broad load. At most 100 entries."
                 },
                 "path_prefix": {
                     "type": "string",
@@ -18661,13 +18851,15 @@ fn tool_schema_project_context() -> Value {
                 },
                 "tags": {
                     "type": "array",
+                    "maxItems": MAX_SCOPE_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Keep only note/section nodes tagged with any of these tags. Symbol nodes carry no tags and are DROPPED when this is set, so a tag-scoped result can never be larger than the unscoped one. Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\"."
+                    "description": "Keep only note/section nodes tagged with any of these tags. Symbol nodes carry no tags and are DROPPED when this is set, so a tag-scoped result can never be larger than the unscoped one. Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\". At most 100 entries."
                 },
                 "exclude_tags": {
                     "type": "array",
+                    "maxItems": MAX_SCOPE_FILTERS,
                     "items": { "type": "string" },
-                    "description": "Drop note/section nodes tagged with any of these tags. Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\". An excluded parent therefore drops its whole subtree."
+                    "description": "Drop note/section nodes tagged with any of these tags. Matching is case-insensitive and includes NESTED descendants: \"project\" matches \"project/nestweaver\" but never \"projectile\". An excluded parent therefore drops its whole subtree. At most 100 entries."
                 },
                 "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
                 "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." },
@@ -22117,34 +22309,6 @@ fn dispatch_via_daemon_inner(
             serde_json::from_str(&resp.into_inner().result_json)
                 .map_err(|e| anyhow!("repository inventory decode failed before removal; retry after repairing daemon response: {e}"))?
         };
-        let matched_repo = match_repo_target(&repos, &target);
-        if matched_repo.len() > 1 {
-            return Err(anyhow::anyhow!(
-                "'{target}' matches multiple repos — pass a full UID to disambiguate."
-            ));
-        }
-        if let Some(repo) = matched_repo.first() {
-            let resp = rt
-                .block_on(client.remove_repo(nestweaver_proto::RemoveRepoRequest {
-                    repo_uid: repo.uid.clone(),
-                }))
-                .map_err(|s| anyhow::anyhow!("remove_repo RPC failed: {}", s.message()))?;
-            let inner = resp.into_inner();
-            return Ok(Unstamped::new(json!({
-                "kind": "repo",
-                "name": repo.name.clone().unwrap_or_else(|| repo.url.clone()),
-                "uid": repo.uid,
-                "files_deleted": inner.files_deleted,
-                "symbols_deleted": inner.symbols_deleted,
-                // nw-091 / Bug 2: committed=true means the delete HAPPENED even if
-                // some post-commit reconciliation step failed — surfaced as warnings,
-                // never as an RPC error that reads as "nothing happened".
-                "committed": inner.committed,
-                "reconciliation_warnings": reconciliation_warnings(&inner.reconciliation_failures),
-            })));
-        }
-
-        // Not a repo — resolve as a vault (by uid, name, or root path).
         let vaults: Vec<nestweaver_schema::Vault> = {
             let req = profiled_daemon_request(nestweaver_proto::JsonRequest {
                 args_json: "{}".to_string(),
@@ -22155,49 +22319,47 @@ fn dispatch_via_daemon_inner(
             serde_json::from_str(&resp.into_inner().result_json)
                 .map_err(|e| anyhow!("vault inventory decode failed before removal; repair daemon response and retry: {e}"))?
         };
-        let canonical_target = std::fs::canonicalize(&target)
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        let target_trimmed = target.trim_end_matches('/');
-        let matched_vault: Vec<&nestweaver_schema::Vault> = vaults
-            .iter()
-            .filter(|v| {
-                v.uid == target
-                    || v.name == target_trimmed
-                    || v.root_path.trim_end_matches('/') == target_trimmed
-                    || (!canonical_target.is_empty()
-                        && v.root_path.trim_end_matches('/')
-                            == canonical_target.trim_end_matches('/'))
-            })
-            .collect();
-        if matched_vault.len() > 1 {
-            return Err(anyhow::anyhow!(
-                "'{target}' matches multiple vaults — pass a full UID to disambiguate."
-            ));
-        }
-        if let Some(vault) = matched_vault.first() {
-            let resp = rt
-                .block_on(client.remove_vault(nestweaver_proto::RemoveVaultRequest {
-                    vault_uid: vault.uid.clone(),
-                }))
-                .map_err(|s| anyhow::anyhow!("remove_vault RPC failed: {}", s.message()))?;
-            let inner = resp.into_inner();
-            return Ok(Unstamped::new(json!({
-                "kind": "vault",
-                "name": vault.name.clone(),
-                "uid": vault.uid,
-                "notes_deleted": inner.notes_deleted,
-                "committed": inner.committed,
-                "reconciliation_warnings": reconciliation_warnings(&inner.reconciliation_failures),
-            })));
-        }
-
-        return Err(target_not_found(
-            format!("no repo or vault matching '{target}' found"),
-            "target",
-            json!(target),
-            &[],
-        ));
+        // Resolve across BOTH kinds before deleting: a repo match no longer
+        // short-circuits past a vault of the same name.
+        let payload = match resolve_remove_target(&repos, &vaults, &target)? {
+            RemoveTarget::Repo(repo) => {
+                let resp = rt
+                    .block_on(client.remove_repo(nestweaver_proto::RemoveRepoRequest {
+                        repo_uid: repo.uid.clone(),
+                    }))
+                    .map_err(|s| anyhow::anyhow!("remove_repo RPC failed: {}", s.message()))?;
+                let inner = resp.into_inner();
+                json!({
+                    "kind": "repo",
+                    "name": repo.name.clone().unwrap_or_else(|| repo.url.clone()),
+                    "uid": repo.uid.clone(),
+                    "files_deleted": inner.files_deleted,
+                    "symbols_deleted": inner.symbols_deleted,
+                    // nw-091 / Bug 2: committed=true means the delete HAPPENED even if
+                    // some post-commit reconciliation step failed — surfaced as warnings,
+                    // never as an RPC error that reads as "nothing happened".
+                    "committed": inner.committed,
+                    "reconciliation_warnings": reconciliation_warnings(&inner.reconciliation_failures),
+                })
+            }
+            RemoveTarget::Vault(vault) => {
+                let resp = rt
+                    .block_on(client.remove_vault(nestweaver_proto::RemoveVaultRequest {
+                        vault_uid: vault.uid.clone(),
+                    }))
+                    .map_err(|s| anyhow::anyhow!("remove_vault RPC failed: {}", s.message()))?;
+                let inner = resp.into_inner();
+                json!({
+                    "kind": "vault",
+                    "name": vault.name.clone(),
+                    "uid": vault.uid.clone(),
+                    "notes_deleted": inner.notes_deleted,
+                    "committed": inner.committed,
+                    "reconciliation_warnings": reconciliation_warnings(&inner.reconciliation_failures),
+                })
+            }
+        };
+        return Ok(Unstamped::new(payload));
     }
 
     // prune_stale uses a typed PruneStaleRequest RPC.
@@ -22667,6 +22829,7 @@ fn dispatch_add_source_via_daemon(
         .get("path")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("'path' is required for brain_add_source"))?;
+    let name_arg = add_source_name_arg(&args)?;
     let path = resolve_add_source_path(raw_path)?
         .to_string_lossy()
         .into_owned();
@@ -22677,7 +22840,6 @@ fn dispatch_add_source_via_daemon(
     // literally), while for code repos an empty name is meaningful — the
     // daemon derives the repo name (package/remote) and a directory-name
     // default would override that derivation.
-    let name_arg = args.get("name").and_then(|v| v.as_str()).map(String::from);
 
     let resolved = std::path::Path::new(&path);
     // nw-089: validate the path exists — the old code returned a phantom
@@ -23135,7 +23297,7 @@ fn tool_schema_investigate_expand() -> Value {
             "additionalProperties": false,
             "properties": {
                 "bundle_id": { "type": "string", "description": "The bundle_id returned by a prior `investigate` call." },
-                "targets": { "type": "array", "items": { "type": "string" }, "description": "asset_ids (from the investigate map) or raw node uids to expand." },
+                "targets": { "type": "array", "maxItems": MAX_EXPAND_TARGETS, "items": { "type": "string" }, "description": "asset_ids (from the investigate map) or raw node uids to expand. At most 256 entries." },
                 "root": { "type": "string", "description": "Filesystem root for reading source bodies. When omitted, each symbol is read from its owning repo's local_root in the graph (like read_symbols); falls back to the server working directory if that path is missing." }
             },
             "required": ["bundle_id", "targets"]
@@ -25455,9 +25617,19 @@ mod cache_dispatch_tests {
         assert_eq!(CACHE_HITS.with(|count| count.get()), 0);
         assert_eq!(CACHE_MISSES.with(|count| count.get()), 0);
 
-        // Explicit files take precedence even when a base ref is present, and
-        // must retain graph caching. Check the public alias normalization too.
-        let explicit = json!({ "files": ["main.js"], "base_ref": "HEAD" });
+        // Explicit files with a base ref is refused: the base ref used to be
+        // silently ignored. Neither spelling of the list may slip past.
+        for files_key in ["files", "changed_files"] {
+            let both = json!({ files_key: ["main.js"], "base_ref": "HEAD" });
+            let error = dispatch(&store, None, "affected_tests", both, None).unwrap_err();
+            assert!(
+                error.to_string().contains("not both"),
+                "{files_key}: {error:#}"
+            );
+        }
+        // Explicit files retain graph caching. Check the public alias
+        // normalization too.
+        let explicit = json!({ "files": ["main.js"] });
         let first = dispatch(&store, None, "affected_tests", explicit.clone(), None).unwrap();
         let second = dispatch(&store, None, "affected_tests", explicit, None).unwrap();
         assert_eq!(first, second);
@@ -31858,6 +32030,56 @@ mod source_management_tests {
         assert!(match_repo_target(&repos, "/nope/nope").is_empty());
     }
 
+    #[test]
+    fn a_partial_path_fragment_no_longer_matches_a_repo_for_removal() {
+        let repos = vec![repo(
+            "repo:aa:bb",
+            "https://github.com/org/nw-fragment-test",
+            None,
+            None,
+        )];
+        // Only an exact uid / name / url / path selects a repo to delete.
+        assert!(match_repo_target(&repos, "nw-fragment-test").is_empty());
+        assert!(match_repo_target(&repos, "org/nw-fragment-test").is_empty());
+        assert_eq!(
+            match_repo_target(&repos, "https://github.com/org/nw-fragment-test").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_name_shared_by_a_repo_and_a_vault_refuses_and_lists_both_uids() {
+        let repos = vec![repo(
+            "repo:py:ts",
+            "file:///nw/x/pyts-repo",
+            Some("pyts"),
+            None,
+        )];
+        let vaults = vec![nestweaver_schema::Vault {
+            uid: "vault:py:ts".into(),
+            name: "pyts".into(),
+            root_path: "/nw/x/pyts-vault".into(),
+            instance_id: "test".into(),
+        }];
+        let error = resolve_remove_target(&repos, &vaults, "pyts")
+            .expect_err("a cross-kind name collision must not delete anything");
+        let text = error.to_string();
+        assert!(
+            text.contains("repo:py:ts") && text.contains("vault:py:ts"),
+            "{text}"
+        );
+        // A UID still selects exactly one of them.
+        assert!(matches!(
+            resolve_remove_target(&repos, &vaults, "vault:py:ts"),
+            Ok(RemoveTarget::Vault(v)) if v.uid == "vault:py:ts"
+        ));
+        assert!(matches!(
+            resolve_remove_target(&repos, &vaults, "repo:py:ts"),
+            Ok(RemoveTarget::Repo(r)) if r.uid == "repo:py:ts"
+        ));
+        assert!(resolve_remove_target(&repos, &vaults, "py").is_err());
+    }
+
     #[cfg(feature = "daemon")]
     #[test]
     fn dir_is_markdown_dominant_classifies_code_vs_notes() {
@@ -35442,6 +35664,134 @@ mod request_bound_tests {
         );
     }
 
+    /// Every list argument of the context, search and drill-down tools is
+    /// bounded: 10,000 `brain_context` seeds ran for ~100 s and kept the
+    /// daemon busy after the client disconnected.
+    #[test]
+    fn context_and_filter_lists_are_bounded_at_the_schema() {
+        let cases: Vec<(&str, &str, usize, Value)> = vec![
+            ("brain_context", "seeds", MAX_CONTEXT_SEEDS, json!({})),
+            (
+                "brain_context",
+                "kinds",
+                MAX_KIND_FILTERS,
+                json!({ "seeds": ["a"] }),
+            ),
+            (
+                "brain_context",
+                "repos",
+                MAX_SCOPE_FILTERS,
+                json!({ "seeds": ["a"] }),
+            ),
+            (
+                "brain_context",
+                "vaults",
+                MAX_SCOPE_FILTERS,
+                json!({ "seeds": ["a"] }),
+            ),
+            (
+                "brain_context",
+                "tags",
+                MAX_SCOPE_FILTERS,
+                json!({ "seeds": ["a"] }),
+            ),
+            (
+                "brain_context",
+                "exclude_tags",
+                MAX_SCOPE_FILTERS,
+                json!({ "seeds": ["a"] }),
+            ),
+            ("code_context", "seeds", MAX_CONTEXT_SEEDS, json!({})),
+            (
+                "project_context",
+                "kinds",
+                MAX_KIND_FILTERS,
+                json!({ "project": "p" }),
+            ),
+            (
+                "project_context",
+                "repos",
+                MAX_SCOPE_FILTERS,
+                json!({ "project": "p" }),
+            ),
+            (
+                "project_context",
+                "tags",
+                MAX_SCOPE_FILTERS,
+                json!({ "project": "p" }),
+            ),
+            (
+                "project_context",
+                "exclude_tags",
+                MAX_SCOPE_FILTERS,
+                json!({ "project": "p" }),
+            ),
+            (
+                "regex_search",
+                "kinds",
+                MAX_KIND_FILTERS,
+                json!({ "pattern": "a" }),
+            ),
+            (
+                "count_patterns",
+                "kinds",
+                MAX_KIND_FILTERS,
+                json!({ "patterns": ["a"] }),
+            ),
+            ("count_patterns", "patterns", 64, json!({})),
+            (
+                "brain_orphan_documents",
+                "allowlist",
+                MAX_IDENTIFIER_COUNT,
+                json!({}),
+            ),
+            (
+                "investigate_expand",
+                "targets",
+                MAX_EXPAND_TARGETS,
+                json!({ "bundle_id": "b" }),
+            ),
+            (
+                "note_get",
+                "sections",
+                MAX_NOTE_SECTIONS,
+                json!({ "uid": "note:x" }),
+            ),
+        ];
+        for (tool, field, max, base) in cases {
+            let with = |count: usize| {
+                let mut args = base.clone();
+                args[field] = json!(targets(count));
+                args
+            };
+            assert!(
+                validate_tool_arguments(tool, &with(max)).is_ok(),
+                "{tool}.{field} must accept {max}"
+            );
+            let error = validate_tool_arguments(tool, &with(max + 1))
+                .expect_err(&format!("{tool}.{field} must refuse {}", max + 1));
+            assert!(error.to_string().contains(field), "{tool}.{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn context_seeds_are_deduplicated_then_bounded_in_the_handler() {
+        let mut seeds = targets(MAX_CONTEXT_SEEDS);
+        seeds.extend(targets(MAX_CONTEXT_SEEDS));
+        assert_eq!(bound_context_seeds(seeds).unwrap().len(), MAX_CONTEXT_SEEDS);
+        let error = bound_context_seeds(targets(MAX_CONTEXT_SEEDS + 1)).unwrap_err();
+        assert!(error.to_string().contains("256"), "{error}");
+        // The handler backstop holds on a route that skipped the schema.
+        let store = store();
+        let error = tool_code_context(
+            &store,
+            json!({ "seeds": targets(MAX_CONTEXT_SEEDS + 1) }),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("maximum is 256"), "{error}");
+    }
+
     /// Both schemas must DECLARE the bound they enforce, so the oversized call
     /// is rejected by validation at the MCP boundary rather than reaching a
     /// handler that used to shorten it. Neither declared `maxItems` before.
@@ -36941,6 +37291,41 @@ mod ambiguous_name_contract_tests {
         assert_eq!(owners, 3, "{names:?}");
         assert_eq!(payload["module_owners_omitted"], 397, "{payload}");
         assert_eq!(payload["truncated"], true, "{payload}");
+    }
+
+    /// An unknown `since_sha` names itself instead of "failed: git diff".
+    #[test]
+    fn brain_diff_names_an_unknown_since_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let head = nestweaver_engine::git_diff::current_head_sha(dir.path()).unwrap();
+        let error = nestweaver_engine::git_diff::detect_changes(dir.path(), "0badc0ffee", &head)
+            .unwrap_err();
+        let message = brain_diff_git_error(&error, "0badc0ffee", &head, true).to_string();
+        assert!(
+            message.contains("unknown revision '0badc0ffee'"),
+            "{message}"
+        );
+        assert!(message.contains("since_sha"), "{message}");
+        assert!(
+            !message.contains(&dir.path().display().to_string()),
+            "{message}"
+        );
     }
 
     /// nw-113: `brain_diff` never lists a changed file's owner as a changed

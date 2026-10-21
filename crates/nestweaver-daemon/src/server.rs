@@ -2980,6 +2980,15 @@ fn resolve_effective_instance_id(requested: &str, state: &DaemonState) -> Result
     pick_effective_instance_id(requested, &configured)
 }
 
+/// Refuse a requested source name the graph cannot safely store. Empty means
+/// "defaulted" and passes; the store repeats the control-character check.
+fn validate_request_source_name(name: &str) -> Result<(), Status> {
+    match nestweaver_schema::source_name_problem(name) {
+        Some(problem) => Err(Status::invalid_argument(problem)),
+        None => Ok(()),
+    }
+}
+
 fn resolve_request_note_limits(
     requested: u64,
     state: &DaemonState,
@@ -5065,6 +5074,25 @@ type ProgressStream = tokio_stream::wrappers::ReceiverStream<Result<IndexProgres
 struct PrunedRepos {
     names: Vec<String>,
     uids: Vec<String>,
+    /// Repos kept because their root could not be checked.
+    skipped: Vec<String>,
+}
+
+/// Whether a source root is DEFINITELY gone. Only `NotFound` proves that; a
+/// permission or I/O error says nothing about the source, and treating it as
+/// "gone" (as `Path::exists` does) deleted a vault whose parent was merely
+/// `chmod 000`. Such a root is kept and reported in `skipped`.
+fn source_root_missing(kind: &str, name: &str, root: &str, skipped: &mut Vec<String>) -> bool {
+    match Path::new(root).try_exists() {
+        Ok(exists) => !exists,
+        Err(error) => {
+            tracing::warn!(kind, name, root, %error, "prune_stale: kept source whose root cannot be checked");
+            skipped.push(format!(
+                "kept {kind} '{name}': cannot check {root}: {error}"
+            ));
+            false
+        }
+    }
 }
 
 impl PrunedRepos {
@@ -5095,7 +5123,8 @@ where
         let Some(path) = repo.local_root() else {
             continue;
         };
-        if !Path::new(path).exists() {
+        let display = repo.name.as_deref().unwrap_or(&repo.url);
+        if source_root_missing("repo", display, path, &mut removed_repos.skipped) {
             tracing::info!(
                 uid = %repo.uid,
                 url = %repo.url,
@@ -6163,12 +6192,18 @@ where
     let mut removed_vaults = Vec::new();
     let mut removed_vault_uids = Vec::new();
     let mut vault_mutation_attempted = false;
+    let mut skipped_warnings = removed_repos.skipped.clone();
 
     if error.is_none() {
         match state.store.list_vaults(None) {
             Ok(vaults) => {
                 for vault in &vaults {
-                    if !Path::new(&vault.root_path).exists() {
+                    if source_root_missing(
+                        "vault",
+                        &vault.name,
+                        &vault.root_path,
+                        &mut skipped_warnings,
+                    ) {
                         vault_mutation_attempted = true;
                         if let Err(delete_error) = delete_vault(&state.store, vault) {
                             error = Some(delete_error);
@@ -6221,6 +6256,7 @@ where
             removed_vaults,
             committed: changed,
             reconciliation_failures: to_proto_reconciliation_failures(&failures),
+            skipped_warnings,
         }),
     };
     finish_reconciled_mutation(mutation, "prune_stale", failures)
@@ -7426,6 +7462,7 @@ impl NestWeaverDaemon for DaemonService {
         } else {
             req.vault_name.clone()
         };
+        validate_request_source_name(&vault_name)?;
         let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         let extra_patterns = req.extra_ignore_patterns.clone();
         let force = req.force;
@@ -8293,6 +8330,7 @@ impl NestWeaverDaemon for DaemonService {
         let with_trigrams = resolve_trigram_policy(req.trigram_policy(), req.with_trigrams, false);
         let rebuild_trigrams = req.rebuild_trigrams;
         let with_git_activity = req.with_git_activity;
+        validate_request_source_name(&req.name)?;
         let name = if req.name.is_empty() {
             None
         } else {
@@ -8787,6 +8825,7 @@ impl NestWeaverDaemon for DaemonService {
         } else {
             req.vault_name.clone()
         };
+        validate_request_source_name(&vault_name)?;
         let extra_patterns = req.extra_ignore_patterns.clone();
         let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         let note_limits = resolve_request_note_limits(req.max_note_bytes, &self.state)?;
@@ -9049,6 +9088,7 @@ impl NestWeaverDaemon for DaemonService {
         } else {
             req.vault_name.clone()
         };
+        validate_request_source_name(&vault_name)?;
         let extra_patterns = req.extra_ignore_patterns.clone();
         let instance_id = resolve_effective_instance_id(&req.instance_id, &self.state)?;
         let note_limits = resolve_request_note_limits(req.max_note_bytes, &self.state)?;
@@ -10820,6 +10860,9 @@ impl NestWeaverDaemon for DaemonService {
             let value = args.get("value").cloned().ok_or_else(|| {
                 Status::invalid_argument("tool set_extension failed: 'value' is required")
             })?;
+            nestweaver_engine::extensions::validate_extension_property(key, &value).map_err(
+                |problem| Status::invalid_argument(format!("tool set_extension failed: {problem}")),
+            )?;
 
             let mut store = nestweaver_engine::extensions::load_extensions(&db_path);
             nestweaver_engine::extensions::set_property(&mut store, uid, key, value.clone());
@@ -20403,6 +20446,59 @@ repos = ["alpha"]
             flag.load(Ordering::SeqCst),
             "the pruned repo's watcher stops"
         );
+    }
+
+    /// An UNREADABLE root is not a missing one: a vault under a `chmod 000`
+    /// parent used to be pruned because `Path::exists` folds every error into
+    /// false. It is kept and reported in `skipped_warnings`.
+    #[cfg(unix)]
+    #[test]
+    fn prune_stale_keeps_a_vault_whose_root_cannot_be_checked() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let locked = tmp.path().join("locked");
+        let root = locked.join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = root.try_exists().is_err();
+        let state = test_state_with_writer();
+        let root_str = root.to_string_lossy().into_owned();
+        seed_vault_note_heading_embeddings(&state, "vlt:prune:locked", "locked", &root_str);
+        let gone = tmp.path().join("gone").to_string_lossy().into_owned();
+        seed_vault_note_heading_embeddings(&state, "vlt:prune:gone", "gone", &gone);
+
+        let response = run_prune_stale_with(
+            &state,
+            delete_repo_cascade,
+            |store, vault| {
+                store
+                    .delete_vault_cascade(&vault.uid)
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            response.removed_vaults,
+            vec!["vault-vlt:prune:gone".to_string()]
+        );
+        let uids: Vec<String> = state
+            .store
+            .list_vaults(None)
+            .unwrap()
+            .into_iter()
+            .map(|vault| vault.uid)
+            .collect();
+        assert!(uids.contains(&"vlt:prune:locked".to_string()), "{uids:?}");
+        if unreadable {
+            // Root bypasses the permission bits, so only assert the warning
+            // where the root really could not be checked.
+            assert_eq!(response.skipped_warnings.len(), 1, "{response:?}");
+            assert!(response.skipped_warnings[0].contains("locked"));
+        }
     }
 
     #[test]
@@ -30562,6 +30658,41 @@ external_model = "unavailable-test-model"
         })
         .await
         .expect("cancelled extension worker must finish after gate release");
+    }
+
+    /// An oversized value or a control-character key is refused before the
+    /// sidecar is touched: one 20 MB value used to be accepted and rewritten
+    /// on every later set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_extension_refuses_oversized_values_and_bad_keys() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+        let big = "x".repeat(nestweaver_engine::extensions::MAX_EXTENSION_VALUE_BYTES + 1);
+        let long_key = "k".repeat(nestweaver_engine::extensions::MAX_EXTENSION_KEY_BYTES + 1);
+        for args in [
+            serde_json::json!({ "uid": "sym:x", "key": "owner", "value": big }),
+            serde_json::json!({ "uid": "sym:x", "key": "own\u{0}er", "value": 1 }),
+            serde_json::json!({ "uid": "sym:x", "key": "own\ner", "value": 1 }),
+            serde_json::json!({ "uid": "sym:x", "key": long_key, "value": 1 }),
+        ] {
+            let mut req = Request::new(JsonRequest {
+                args_json: args.to_string(),
+            });
+            req.extensions_mut().insert(crate::auth::IsAdmin(true));
+            let status = service.set_extension(req).await.unwrap_err();
+            assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+        }
+        assert!(
+            nestweaver_engine::extensions::load_extensions(&state.db_path).is_empty(),
+            "a refused set must write nothing"
+        );
+
+        let mut req = Request::new(JsonRequest {
+            args_json: serde_json::json!({ "uid": "sym:x", "key": "owner", "value": "team-a" })
+                .to_string(),
+        });
+        req.extensions_mut().insert(crate::auth::IsAdmin(true));
+        service.set_extension(req).await.expect("an ordinary set");
     }
 
     /// nw-462: the DELETE must hold the gate exactly as the WRITE does.
