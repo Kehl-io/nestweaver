@@ -74,8 +74,27 @@ pub struct ImportGraph {
     literal_export_lines: HashMap<String, HashMap<String, u32>>,
     star_exports: HashMap<String, Vec<String>>,
     go_packages: HashMap<String, String>,
+    /// Go importer → the package qualifiers its imports bind.
+    go_imports: HashMap<String, GoFileImports>,
     unresolved_exports: HashMap<String, HashSet<String>>,
     incomplete_stars: HashSet<String>,
+}
+
+/// What one Go file's imports bind.
+///
+/// A Go import names a package, which is every non-test file of a directory,
+/// and binds it to a qualifier: the import's explicit name, or the package's
+/// own name. `calc.New` therefore denotes `New` in ANY file of that package,
+/// and a bare `New` denotes no imported file at all unless the package was
+/// dot-imported.
+#[derive(Debug, Default)]
+struct GoFileImports {
+    /// qualifier → the package files it names, sorted.
+    qualifiers: HashMap<String, Vec<String>>,
+    /// Files of packages imported under a qualifier (not dot-imported).
+    qualified_files: HashSet<String>,
+    /// Files of dot-imported packages: their names are usable bare.
+    dot_files: HashSet<String>,
 }
 
 impl ImportGraph {
@@ -291,6 +310,24 @@ impl ImportGraph {
         complete
     }
 
+    /// The package files a Go qualifier (`calc` in `calc.New`) names in
+    /// `file`, when `receiver` is one of that file's import qualifiers.
+    pub(crate) fn go_qualified_package(&self, file: &str, receiver: &str) -> Option<&[String]> {
+        self.go_imports
+            .get(file)?
+            .qualifiers
+            .get(receiver)
+            .map(Vec::as_slice)
+    }
+
+    /// True when `candidate` belongs only to packages `file` imports under a
+    /// qualifier, so an unqualified name in `file` cannot denote it.
+    pub(crate) fn go_requires_qualifier(&self, file: &str, candidate: &str) -> bool {
+        self.go_imports.get(file).is_some_and(|imports| {
+            imports.qualified_files.contains(candidate) && !imports.dot_files.contains(candidate)
+        })
+    }
+
     pub(crate) fn same_go_package(&self, from: &str, to: &str) -> bool {
         self.go_packages
             .get(from)
@@ -358,15 +395,20 @@ pub(crate) fn build_import_graph_with_languages(
     let mut literal_export_lines = HashMap::new();
     let mut star_exports = HashMap::new();
     let mut go_packages = HashMap::new();
+    let mut go_imports: HashMap<String, GoFileImports> = HashMap::new();
     let mut unresolved_exports: HashMap<String, HashSet<String>> = HashMap::new();
     let mut incomplete_stars = HashSet::new();
-
-    for (file_path, symbols, references) in files {
-        let language = file_languages
+    let language_of = |file_path: &str| {
+        file_languages
             .and_then(|languages| languages.get(file_path))
             .copied()
-            .unwrap_or(fallback_language);
-        if language == Language::Go {
+            .unwrap_or(fallback_language)
+    };
+
+    // Package clauses first: an importer's qualifier is the IMPORTED file's
+    // package name, and that file may come later in `files`.
+    for (file_path, _, references) in files {
+        if language_of(file_path) == Language::Go {
             let packages: Vec<_> = references
                 .iter()
                 .filter(|reference| reference.kind == ReferenceKind::PackageBinding)
@@ -375,6 +417,37 @@ pub(crate) fn build_import_graph_with_languages(
                 go_packages.insert(file_path.clone(), packages[0].name.clone());
             }
         }
+    }
+    let go_index = files
+        .iter()
+        .any(|(file_path, _, _)| language_of(file_path) == Language::Go)
+        .then(|| lang::go_lang::GoPackageIndex::new(known_files.iter().copied()));
+    let jvm_index = files
+        .iter()
+        .any(|(file_path, _, _)| {
+            matches!(language_of(file_path), Language::Kotlin | Language::Java)
+        })
+        .then(|| lang::kotlin::JvmPackageIndex::new(files, &language_of));
+    // Python `from pkg import name` reads the attribute `name` of `pkg` first
+    // and imports the submodule `pkg.name` only when no such attribute
+    // exists, so the top-level names of each module decide between the two.
+    let python_top_level: HashMap<&str, HashSet<&str>> = files
+        .iter()
+        .filter(|(file_path, _, _)| language_of(file_path) == Language::Python)
+        .map(|(file_path, symbols, _)| {
+            (
+                file_path.as_str(),
+                symbols
+                    .iter()
+                    .filter(|symbol| symbol.parent_name.is_none() && !symbol.is_module_owner())
+                    .map(|symbol| symbol.name.as_str())
+                    .collect(),
+            )
+        })
+        .collect();
+
+    for (file_path, symbols, references) in files {
+        let language = language_of(file_path);
         let literal_methods: HashSet<_> = symbols
             .iter()
             .filter(|symbol| {
@@ -547,19 +620,14 @@ pub(crate) fn build_import_graph_with_languages(
             // is already covered by its own Import reference, so it is not
             // added to `imports` again here.
             if reference.kind == ReferenceKind::ImportAlias {
-                let resolved = resolve_specifier(
+                let mut resolved = resolve_specifier(
                     file_path,
                     &reference.context,
                     &known_files,
                     language,
                     workspace_ctx,
                 );
-                if resolved.is_none()
-                    && !matches!(language, Language::JavaScript | Language::TypeScript)
-                {
-                    continue;
-                }
-                let original_name = reference
+                let mut original_name = reference
                     .receiver
                     .as_deref()
                     .unwrap_or(&reference.context)
@@ -567,6 +635,33 @@ pub(crate) fn build_import_graph_with_languages(
                     .next()
                     .unwrap_or(reference.context.as_str())
                     .to_string();
+                // `from . import helpers` / `from pkg import helpers as h`
+                // binds the SUBMODULE `helpers` unless the package itself
+                // defines that name. The binding then denotes the whole
+                // module, exactly like `import pkg.helpers as h`.
+                if language == Language::Python
+                    && original_name != "*"
+                    && resolved.as_deref().is_none_or(|package| {
+                        !python_top_level
+                            .get(package)
+                            .is_some_and(|names| names.contains(original_name.as_str()))
+                    })
+                    && let Some(submodule) = resolve_specifier(
+                        file_path,
+                        &python_submodule_specifier(&reference.context, &original_name),
+                        &known_files,
+                        language,
+                        workspace_ctx,
+                    )
+                {
+                    resolved = Some(submodule);
+                    original_name = "*".into();
+                }
+                if resolved.is_none()
+                    && !matches!(language, Language::JavaScript | Language::TypeScript)
+                {
+                    continue;
+                }
                 let rust_inline_modules = if language == Language::Rust {
                     resolved.as_deref().and_then(|file| {
                         lang::rust::inline_type_modules(
@@ -596,6 +691,42 @@ pub(crate) fn build_import_graph_with_languages(
                 continue;
             }
             let specifier = &reference.name;
+            // A Go import names a package (every file of a directory), and a
+            // Kotlin/Java import may name a declaration in any file of a
+            // package: each target file is recorded.
+            if reference.kind == ReferenceKind::Import
+                && let Some(go_index) = go_index.as_ref().filter(|_| language == Language::Go)
+            {
+                let targets = go_index.package_files(specifier, &workspace_ctx.go_modules);
+                record_go_import(
+                    go_imports.entry(file_path.clone()).or_default(),
+                    reference,
+                    &targets,
+                    &go_packages,
+                );
+                imports.extend(
+                    targets
+                        .into_iter()
+                        .map(|target| (specifier.clone(), target.to_string())),
+                );
+                continue;
+            }
+            if reference.kind == ReferenceKind::Import
+                && let Some(jvm_index) = jvm_index
+                    .as_ref()
+                    .filter(|_| matches!(language, Language::Kotlin | Language::Java))
+            {
+                let targets = jvm_index.resolve(specifier);
+                if !targets.is_empty() {
+                    imports.extend(
+                        targets
+                            .into_iter()
+                            .filter(|target| *target != file_path.as_str())
+                            .map(|target| (specifier.clone(), target.to_string())),
+                    );
+                    continue;
+                }
+            }
             let resolved =
                 resolve_specifier(file_path, specifier, &known_files, language, workspace_ctx);
             // A module import consumes the final path segment. An item
@@ -640,6 +771,8 @@ pub(crate) fn build_import_graph_with_languages(
         }
     }
 
+    follow_python_reexported_bindings(&mut named_bindings, files, &language_of);
+
     ImportGraph {
         resolved_imports,
         exports,
@@ -648,8 +781,158 @@ pub(crate) fn build_import_graph_with_languages(
         literal_export_lines,
         star_exports,
         go_packages,
+        go_imports,
         unresolved_exports,
         incomplete_stars,
+    }
+}
+
+/// Record the qualifier one Go import binds in its importing file.
+fn record_go_import(
+    imports: &mut GoFileImports,
+    reference: &RawReference,
+    targets: &[&str],
+    go_packages: &HashMap<String, String>,
+) {
+    if targets.is_empty() {
+        return;
+    }
+    let qualifier = match reference.receiver.as_deref() {
+        // A blank import runs the package's `init` and binds nothing.
+        Some("_") => return,
+        Some(".") => {
+            imports
+                .dot_files
+                .extend(targets.iter().map(|target| target.to_string()));
+            return;
+        }
+        Some(alias) => alias.to_string(),
+        None => {
+            // The package clause of the imported files, when they agree;
+            // otherwise Go's conventional name for the import path.
+            let mut names = targets.iter().filter_map(|target| go_packages.get(*target));
+            match names.next() {
+                Some(first) if names.all(|name| name == first) => first.clone(),
+                _ => lang::go_lang::default_package_name(&reference.name).to_string(),
+            }
+        }
+    };
+    imports
+        .qualified_files
+        .extend(targets.iter().map(|target| target.to_string()));
+    let files = imports.qualifiers.entry(qualifier).or_default();
+    files.extend(targets.iter().map(|target| target.to_string()));
+    files.sort_unstable();
+    files.dedup();
+}
+
+/// The specifier of submodule `name` of the Python package `package`:
+/// `.` + `helpers` is `.helpers`, `pkg.sub` + `helpers` is `pkg.sub.helpers`.
+fn python_submodule_specifier(package: &str, name: &str) -> String {
+    if package.ends_with('.') {
+        format!("{package}{name}")
+    } else {
+        format!("{package}.{name}")
+    }
+}
+
+/// Follow Python bindings through a package's re-export.
+///
+/// `from pkg import compute_alias`, where `pkg/__init__.py` says
+/// `from .core import compute as compute_alias`, names `compute` in
+/// `pkg/core.py`; the package itself declares nothing of that name. A binding
+/// whose source module does not declare its name, but binds it with a
+/// module-level import of its own, is rewritten to that import's source.
+/// Bounded at three hops; a cycle stops at the hop limit.
+fn follow_python_reexported_bindings(
+    named_bindings: &mut HashMap<String, FileBindings>,
+    files: &[(String, Vec<RawSymbol>, Vec<RawReference>)],
+    language_of: &dyn Fn(&str) -> Language,
+) {
+    let symbols_of: HashMap<&str, &[RawSymbol]> = files
+        .iter()
+        .filter(|(file_path, _, _)| language_of(file_path) == Language::Python)
+        .map(|(file_path, symbols, _)| (file_path.as_str(), symbols.as_slice()))
+        .collect();
+    // The module-level binding `name` of `module`, when the module declares
+    // no top-level symbol `name` itself.
+    let reexport = |named_bindings: &HashMap<String, FileBindings>,
+                    module: &str,
+                    name: &str|
+     -> Option<(String, String)> {
+        let symbols = symbols_of.get(module)?;
+        if symbols
+            .iter()
+            .any(|symbol| symbol.parent_name.is_none() && symbol.name == name)
+        {
+            return None;
+        }
+        let bindings = named_bindings.get(module)?;
+        let mut module_level = bindings
+            .named(name)
+            .iter()
+            .map(|&index| &bindings.all[index])
+            .filter(|binding| {
+                !symbols.iter().any(|symbol| {
+                    !symbol.is_module_owner()
+                        && matches!(
+                            symbol.kind,
+                            nestweaver_schema::SymbolKind::Function
+                                | nestweaver_schema::SymbolKind::Method
+                                | nestweaver_schema::SymbolKind::Class
+                        )
+                        && symbol.start_line <= binding.start_line
+                        && binding.start_line <= symbol.end_line
+                })
+            });
+        let binding = module_level.next()?;
+        // Two module-level imports of one name: the later one wins at run
+        // time, but which one a reader meant is not evidence enough.
+        if module_level.next().is_some() {
+            return None;
+        }
+        Some((binding.source_file.clone()?, binding.original_name.clone()))
+    };
+    let mut rewrites = Vec::new();
+    for (file, bindings) in named_bindings.iter() {
+        if !symbols_of.contains_key(file.as_str()) {
+            continue;
+        }
+        for (index, binding) in bindings.all.iter().enumerate() {
+            if binding.original_name == "*" {
+                continue;
+            }
+            let Some(mut source) = binding.source_file.clone() else {
+                continue;
+            };
+            let mut original = binding.original_name.clone();
+            let mut changed = false;
+            for _ in 0..3 {
+                if original == "*" {
+                    break;
+                }
+                let Some((next_source, next_original)) =
+                    reexport(named_bindings, &source, &original)
+                else {
+                    break;
+                };
+                source = next_source;
+                original = next_original;
+                changed = true;
+            }
+            if changed {
+                rewrites.push((file.clone(), index, source, original));
+            }
+        }
+    }
+    for (file, index, source, original) in rewrites {
+        if let Some(binding) = named_bindings
+            .get_mut(&file)
+            .and_then(|bindings| bindings.all.get_mut(index))
+        {
+            binding.source_file = Some(source);
+            binding.original_name = original;
+        }
     }
 }
 
@@ -668,6 +951,30 @@ pub fn resolved_import_path(
     resolve_specifier(from_file, specifier, known_files, language, workspace_ctx)
 }
 
+/// Every path an import specifier names: all files of a Go package, or the
+/// single path [`resolved_import_path`] gives for any other language.
+///
+/// A file added to a Go package is a new target of every importer of that
+/// package, which a single representative path cannot show.
+pub fn resolved_import_paths(
+    from_file: &str,
+    specifier: &str,
+    known_files: &HashSet<&str>,
+    language: Language,
+    workspace_ctx: &WorkspaceContext,
+) -> Vec<String> {
+    if language == Language::Go {
+        return lang::go_lang::GoPackageIndex::new(known_files.iter().copied())
+            .package_files(specifier, &workspace_ctx.go_modules)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+    }
+    resolve_specifier(from_file, specifier, known_files, language, workspace_ctx)
+        .into_iter()
+        .collect()
+}
+
 fn resolve_specifier(
     from_file: &str,
     specifier: &str,
@@ -680,7 +987,12 @@ fn resolve_specifier(
             lang::javascript::resolve_import(from_file, specifier, known_files, workspace_ctx)
         }
         Language::Java => lang::java::resolve_import(from_file, specifier, known_files),
-        Language::Go => lang::go_lang::resolve_import(from_file, specifier, known_files),
+        Language::Go => lang::go_lang::resolve_import(
+            from_file,
+            specifier,
+            known_files,
+            &workspace_ctx.go_modules,
+        ),
         Language::Python => lang::python::resolve_import(from_file, specifier, known_files),
         // nw-349 (cross-lane) / nw-351: C++ `#include` is captured by
         // `queries/cpp.scm` and was then thrown away here, while the identical

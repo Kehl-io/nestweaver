@@ -270,6 +270,7 @@ mod tests {
                 prefix: "@/".to_string(),
                 target: "src/".to_string(),
             }],
+            ..Default::default()
         };
         let result = resolve_import("src/main.ts", "@/utils/helpers", &known, &ctx);
         assert_eq!(result, Some("src/utils/helpers.ts".to_string()));
@@ -284,6 +285,7 @@ mod tests {
                 prefix: "@/".to_string(),
                 target: "src/".to_string(),
             }],
+            ..Default::default()
         };
         let result = resolve_import("src/main.ts", "@/utils", &known, &ctx);
         assert_eq!(result, Some("src/utils/index.ts".to_string()));
@@ -298,6 +300,7 @@ mod tests {
                 prefix: "~/".to_string(),
                 target: "lib/".to_string(),
             }],
+            ..Default::default()
         };
         let result = resolve_import("src/main.ts", "~/core", &known, &ctx);
         assert_eq!(result, Some("lib/core.ts".to_string()));
@@ -312,6 +315,7 @@ mod tests {
                 prefix: "@/".to_string(),
                 target: "src/".to_string(),
             }],
+            ..Default::default()
         };
         let result = resolve_import("src/main.ts", "lodash", &known, &ctx);
         assert_eq!(result, None);
@@ -332,6 +336,7 @@ mod tests {
                 directory: "packages/shared".to_string(),
             }],
             aliases: vec![],
+            ..Default::default()
         };
         let result = resolve_import("apps/web/src/main.ts", "@myorg/shared", &known, &ctx);
         assert_eq!(result, Some("packages/shared/src/index.ts".to_string()));
@@ -349,6 +354,7 @@ mod tests {
                 directory: "packages/shared".to_string(),
             }],
             aliases: vec![],
+            ..Default::default()
         };
         let result = resolve_import(
             "apps/web/src/main.ts",
@@ -368,6 +374,7 @@ mod tests {
                 directory: "packages/utils".to_string(),
             }],
             aliases: vec![],
+            ..Default::default()
         };
         let result = resolve_import("apps/web/src/main.ts", "my-utils", &known, &ctx);
         assert_eq!(result, Some("packages/utils/index.ts".to_string()));
@@ -382,6 +389,7 @@ mod tests {
                 directory: "packages/shared".to_string(),
             }],
             aliases: vec![],
+            ..Default::default()
         };
         let result = resolve_import("apps/web/src/main.ts", "@myorg/other", &known, &ctx);
         assert_eq!(result, None);
@@ -402,6 +410,7 @@ mod tests {
                 prefix: "@/".to_string(),
                 target: "src/".to_string(),
             }],
+            ..Default::default()
         };
         let result = resolve_import("apps/web/main.ts", "@/shared", &known, &ctx);
         // Alias resolves "@/shared" -> "src/shared" -> "src/shared/index.ts"
@@ -524,6 +533,7 @@ mod tests {
                 prefix: "@/".to_string(),
                 target: "src/".to_string(),
             }],
+            ..Default::default()
         };
         assert_eq!(
             resolve_import("src/main.ts", "@/common/money.js", &known, &ctx),

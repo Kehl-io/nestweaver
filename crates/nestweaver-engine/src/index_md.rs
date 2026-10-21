@@ -4001,6 +4001,7 @@ fn note_context_from_candidate(candidate: &ParsedCandidate) -> NoteContext {
                     .map(|heading| heading.text.to_lowercase())
             })
             .collect(),
+        block_ids: Some(note_block_ids(&candidate.parsed)),
     }
 }
 
@@ -4050,6 +4051,7 @@ fn note_context_from_stored(note: &Note, headings: Vec<Heading>) -> NoteContext 
         tags: Vec::new(),
         frontmatter,
         section_heading_text: Vec::new(),
+        block_ids: None,
     }
 }
 
@@ -4639,6 +4641,7 @@ where
             tags: parsed.tags.clone(),
             frontmatter: parsed.frontmatter.clone(),
             section_heading_text,
+            block_ids: Some(note_block_ids(&parsed)),
         };
 
         parse_pb.inc(1);
@@ -5107,6 +5110,19 @@ struct NoteContext {
     /// "Supersedes" / "Depends on" / "See also" groups). `None` for the
     /// preamble or a section with no owning heading.
     section_heading_text: Vec<Option<String>>,
+    /// Lowercased Obsidian block ids (`^blk1`) declared in the note, or `None`
+    /// when they are not known: a note loaded from the store keeps no block
+    /// ids, so a block link into it cannot be checked and resolves to the note.
+    block_ids: Option<HashSet<String>>,
+}
+
+/// Lowercased block ids of a parsed note, for block-reference links.
+fn note_block_ids(parsed: &nestweaver_parser::markdown::ParsedNote) -> HashSet<String> {
+    parsed
+        .block_refs
+        .iter()
+        .map(|(_, id)| id.to_lowercase())
+        .collect()
 }
 
 /// A navigable destination resolved by the indexing wikilink policy.
@@ -5188,6 +5204,7 @@ pub fn resolve_note_wikilink(
                 tags: Vec::new(),
                 frontmatter,
                 section_heading_text: Vec::new(),
+                block_ids: None,
             }
         })
         .collect();
@@ -5380,6 +5397,8 @@ struct WikilinkLookup<'a> {
     folder_by_note: HashMap<&'a str, &'a str>,
     /// note_uid → heading slug → heading_uid. For anchor resolution.
     headings_by_note: HashMap<&'a str, HashMap<&'a str, &'a str>>,
+    /// note_uid → its block ids, when known. For `[[Note#^block]]` links.
+    blocks_by_note: HashMap<&'a str, &'a HashSet<String>>,
     /// (folder, lowercased filename stem) → note_uids in that folder.
     ///
     /// Stems ONLY. This map used to hold titles as well, under the same key
@@ -5400,6 +5419,7 @@ impl<'a> WikilinkLookup<'a> {
         let mut by_stem: HashMap<String, Vec<&'a str>> = HashMap::new();
         let mut folder_by_note: HashMap<&'a str, &'a str> = HashMap::new();
         let mut headings_by_note: HashMap<&'a str, HashMap<&'a str, &'a str>> = HashMap::new();
+        let mut blocks_by_note: HashMap<&'a str, &'a HashSet<String>> = HashMap::new();
         let mut by_folder_stem: HashMap<(String, String), Vec<&'a str>> = HashMap::new();
         let mut known_uids: HashSet<&'a str> = HashSet::new();
 
@@ -5452,6 +5472,9 @@ impl<'a> WikilinkLookup<'a> {
                 heading_map.insert(slug.as_str(), h_uid.as_str());
             }
             headings_by_note.insert(note.note_uid.as_str(), heading_map);
+            if let Some(blocks) = &note.block_ids {
+                blocks_by_note.insert(note.note_uid.as_str(), blocks);
+            }
         }
 
         Self {
@@ -5461,6 +5484,7 @@ impl<'a> WikilinkLookup<'a> {
             by_stem,
             folder_by_note,
             headings_by_note,
+            blocks_by_note,
             by_folder_stem,
             known_uids,
         }
@@ -5829,7 +5853,26 @@ impl<'a> WikilinkLookup<'a> {
             unresolved: false,
         };
         for candidate in candidates {
-            if let Some(anchor) = &link.heading_anchor {
+            if let Some(block) = link
+                .heading_anchor
+                .as_deref()
+                .and_then(|anchor| anchor.strip_prefix('^'))
+            {
+                // `[[Note#^blk1]]` names a block, never a heading: it links
+                // the note when the note declares that block id (or when the
+                // note's block ids are not known to this pass).
+                let declared = self
+                    .blocks_by_note
+                    .get(candidate.note_uid.as_str())
+                    .is_none_or(|blocks| blocks.contains(&block.trim().to_lowercase()));
+                if declared {
+                    resolved
+                        .targets
+                        .push((candidate.note_uid, confidence, false));
+                } else {
+                    resolved.unresolved = true;
+                }
+            } else if let Some(anchor) = &link.heading_anchor {
                 if let Some(heading) =
                     self.find_heading(&candidate.note_uid, &slugify_anchor(anchor))
                 {
@@ -8865,6 +8908,38 @@ sub b body
         // Verify the wikilink went to the Heading variant.
         let count = store.count_wikilink_edges().unwrap();
         assert_eq!(count, 1);
+    }
+
+    /// QA vault: `[[Beta#^blk1]]` names an Obsidian block id, not a heading.
+    /// It used to be slugified as a heading and recorded as unresolved.
+    #[test]
+    fn block_ref_anchor_resolves_against_block_ids() {
+        let (_dir, root) = make_vault(&[
+            ("beta.md", "# Beta\n\n## Section One\nSome text ^blk1\n"),
+            (
+                "alpha.md",
+                "# Alpha\n\n[[Beta#^blk1]] [[Beta#^BLK1]] [[Beta#^nope]] [[Absent#^blk1]]\n",
+            ),
+        ]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.resolved_link_edges, 2);
+        let targets: HashSet<_> = store
+            .all_unresolved_wikilinks()
+            .unwrap()
+            .into_iter()
+            .map(|record| record.4)
+            .collect();
+        assert_eq!(
+            targets,
+            HashSet::from(["Beta#^nope".into(), "Absent#^blk1".into()])
+        );
+        let broken = crate::brain_docgraph::broken_links(&store, 3).unwrap();
+        let missing: HashMap<_, _> = broken
+            .iter()
+            .map(|link| (link.wikilink_text.as_str(), link.missing_anchor.as_deref()))
+            .collect();
+        assert_eq!(missing.get("Beta#^nope"), Some(&Some("^nope")));
+        assert_eq!(missing.get("Absent#^blk1"), Some(&None));
     }
 
     /// SECURITY regression test: a symlink whose target is outside the

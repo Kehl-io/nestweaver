@@ -28,17 +28,36 @@ pub struct TsconfigAlias {
     pub target: String,
 }
 
+/// A Go module rooted inside the repository.
+///
+/// Go import paths name a module path followed by a package directory
+/// relative to that module's root, so `example.com/app/internal/calc` under
+/// `module example.com/app` is the directory `internal/calc`. Without the
+/// module path an import cannot be mapped onto the repository at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoModule {
+    /// The module path from `go.mod` (`example.com/app`), or the path a local
+    /// `replace` directive maps onto a directory in the repository.
+    pub path: String,
+    /// Repo-relative module root directory (`""` for the repository root).
+    pub directory: String,
+}
+
 /// Context for resolving monorepo imports, loaded once per indexing run.
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceContext {
     pub packages: Vec<WorkspacePackage>,
     pub aliases: Vec<TsconfigAlias>,
+    /// Go modules declared by the root `go.mod`, the `go.work` `use` list and
+    /// local `replace` directives.
+    pub go_modules: Vec<GoModule>,
 }
 
 impl WorkspaceContext {
-    /// Returns true if there are no workspace packages and no tsconfig aliases.
+    /// Returns true if there are no workspace packages, no tsconfig aliases
+    /// and no Go modules.
     pub fn is_empty(&self) -> bool {
-        self.packages.is_empty() && self.aliases.is_empty()
+        self.packages.is_empty() && self.aliases.is_empty() && self.go_modules.is_empty()
     }
 }
 
@@ -49,7 +68,14 @@ impl WorkspaceContext {
 pub fn discover_workspace_context(repo_path: &Path) -> WorkspaceContext {
     let packages = discover_workspace_packages(repo_path);
     let aliases = load_tsconfig_aliases(repo_path);
-    WorkspaceContext { packages, aliases }
+    let go_modules = discover_go_modules_with(&|rel: &Path| {
+        std::fs::read_to_string(repo_path.join(rel))
+    });
+    WorkspaceContext {
+        packages,
+        aliases,
+        go_modules,
+    }
 }
 
 /// Discover workspace context using a content reader function.
@@ -70,7 +96,147 @@ where
 {
     let packages = discover_workspace_packages_with(&read_file);
     let aliases = load_tsconfig_aliases_with(&read_file);
-    WorkspaceContext { packages, aliases }
+    let go_modules = discover_go_modules_with(&read_file);
+    WorkspaceContext {
+        packages,
+        aliases,
+        go_modules,
+    }
+}
+
+/// Discover the Go modules rooted in the repository.
+///
+/// Reads the root `go.mod`, every directory a root `go.work` names in `use`
+/// (each with its own `go.mod`), and every `replace` directive in those files
+/// whose target is a path inside the repository. A nested module that neither
+/// a `go.work` nor a `replace` names is not discovered: finding it would need
+/// a directory listing, which the bare-repository reader cannot provide.
+///
+/// The result is sorted longest module path first, so a nested module wins
+/// over the module that encloses it.
+fn discover_go_modules_with<F>(read_file: &F) -> Vec<GoModule>
+where
+    F: Fn(&Path) -> Result<String, std::io::Error>,
+{
+    let mut modules: Vec<GoModule> = Vec::new();
+    let mut module_dirs = vec![String::new()];
+    if let Ok(work) = read_file(Path::new("go.work")) {
+        for (directive, args) in go_mod_directives(&work) {
+            if directive == "use"
+                && let Some(dir) = args.first().and_then(|dir| normalize_repo_dir("", dir))
+                && !module_dirs.contains(&dir)
+            {
+                module_dirs.push(dir);
+            }
+        }
+        collect_go_replaces("", &work, &mut modules);
+    }
+    for dir in &module_dirs {
+        let go_mod = if dir.is_empty() {
+            "go.mod".to_string()
+        } else {
+            format!("{dir}/go.mod")
+        };
+        let Ok(contents) = read_file(Path::new(&go_mod)) else {
+            continue;
+        };
+        for (directive, args) in go_mod_directives(&contents) {
+            if directive == "module"
+                && let Some(path) = args.first()
+            {
+                modules.push(GoModule {
+                    path: path.clone(),
+                    directory: dir.clone(),
+                });
+            }
+        }
+        collect_go_replaces(dir, &contents, &mut modules);
+    }
+    modules.sort_by(|a, b| {
+        b.path
+            .len()
+            .cmp(&a.path.len())
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.directory.cmp(&b.directory))
+    });
+    modules.dedup_by(|a, b| a.path == b.path);
+    modules
+}
+
+/// `replace old => ./local` directives whose target is inside the repository.
+fn collect_go_replaces(base_dir: &str, contents: &str, modules: &mut Vec<GoModule>) {
+    for (directive, args) in go_mod_directives(contents) {
+        if directive != "replace" {
+            continue;
+        }
+        let Some(arrow) = args.iter().position(|arg| arg == "=>") else {
+            continue;
+        };
+        let (Some(old), Some(target)) = (args.first(), args.get(arrow + 1)) else {
+            continue;
+        };
+        // Only a filesystem path (`./x`, `../x`) names a local directory; a
+        // module path target is another module, not a repository directory.
+        if !(target.starts_with("./") || target.starts_with("../") || target == ".") {
+            continue;
+        }
+        if let Some(directory) = normalize_repo_dir(base_dir, target) {
+            modules.push(GoModule {
+                path: old.clone(),
+                directory,
+            });
+        }
+    }
+}
+
+/// Repo-relative form of `rel` joined onto `base_dir`, or `None` when it
+/// escapes the repository root.
+fn normalize_repo_dir(base_dir: &str, rel: &str) -> Option<String> {
+    let mut parts: Vec<&str> = base_dir.split('/').filter(|p| !p.is_empty()).collect();
+    for part in rel.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+/// The `(directive, arguments)` lines of a `go.mod` / `go.work` file, with
+/// parenthesised blocks expanded and `//` comments and quotes removed.
+fn go_mod_directives(contents: &str) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    let mut block: Option<String> = None;
+    for line in contents.lines() {
+        let line = line.split("//").next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let words: Vec<String> = line
+            .split_whitespace()
+            .map(|word| word.trim_matches(|c| c == '"' || c == '`').to_string())
+            .collect();
+        if let Some(directive) = &block {
+            if line == ")" {
+                block = None;
+            } else {
+                out.push((directive.clone(), words));
+            }
+            continue;
+        }
+        let Some((directive, rest)) = words.split_first() else {
+            continue;
+        };
+        if rest.first().map(String::as_str) == Some("(") {
+            block = Some(directive.clone());
+            continue;
+        }
+        out.push((directive.clone(), rest.to_vec()));
+    }
+    out
 }
 
 /// Discover workspace packages using a content reader function.
@@ -696,6 +862,70 @@ pub fn build_package_lookup(packages: &[WorkspacePackage]) -> HashMap<&str, &Wor
 mod tests {
     use super::*;
 
+    // ── Go modules ────────────────────────────────────────────────────────
+
+    fn go_reader(
+        files: &'static [(&'static str, &'static str)],
+    ) -> impl Fn(&Path) -> Result<String, std::io::Error> {
+        move |path: &Path| {
+            files
+                .iter()
+                .find(|(name, _)| Path::new(name) == path)
+                .map(|(_, contents)| contents.to_string())
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+        }
+    }
+
+    #[test]
+    fn go_mod_module_path_is_discovered() {
+        let ctx = discover_workspace_context_with(go_reader(&[(
+            "go.mod",
+            "// comment\nmodule example.com/go1 // trailing\n\ngo 1.21\n",
+        )]));
+        assert_eq!(
+            ctx.go_modules,
+            vec![GoModule {
+                path: "example.com/go1".into(),
+                directory: String::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn go_work_and_local_replaces_add_modules_longest_first() {
+        let ctx = discover_workspace_context_with(go_reader(&[
+            ("go.work", "go 1.22\n\nuse (\n\t.\n\t./tools/gen\n)\n"),
+            (
+                "go.mod",
+                "module \"example.com/app\"\n\nreplace (\n\texample.com/lib => ./third_party/lib\n\texample.com/remote => example.com/fork v1.0.0\n\texample.com/escape => ../outside\n)\n",
+            ),
+            ("tools/gen/go.mod", "module example.com/app/tools/gen\n"),
+        ]));
+        assert_eq!(
+            ctx.go_modules,
+            vec![
+                GoModule {
+                    path: "example.com/app/tools/gen".into(),
+                    directory: "tools/gen".into(),
+                },
+                GoModule {
+                    path: "example.com/app".into(),
+                    directory: String::new(),
+                },
+                GoModule {
+                    path: "example.com/lib".into(),
+                    directory: "third_party/lib".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn no_go_mod_means_no_go_modules() {
+        let ctx = discover_workspace_context_with(go_reader(&[]));
+        assert!(ctx.go_modules.is_empty());
+    }
+
     // ── extract_package_name ──────────────────────────────────────────────
 
     #[test]
@@ -1065,6 +1295,7 @@ mod tests {
         let ctx = WorkspaceContext {
             packages: vec![],
             aliases,
+            ..Default::default()
         };
         assert_eq!(
             crate::lang::javascript::resolve_import(
