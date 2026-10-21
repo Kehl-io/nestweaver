@@ -80,6 +80,9 @@ jobs:
         run: scripts/fetch-lbug-source.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          # Only main saves: branch and PR caches are unreadable elsewhere and
+          # evicted main's under the 10 GB repository cap. Branches restore main's.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: backlog-performance
       - name: Install native build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libssl-dev protobuf-compiler mold time
@@ -233,6 +236,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         id: metal-cache
         with:
+          # Only main saves: branch and PR caches are unreadable elsewhere and
+          # evicted main's under the 10 GB repository cap. Branches restore main's.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           # A cancelled build saved an incomplete exact-key cache; later hits
           # cannot replace it. Seed this new namespace only after success.
           cache-on-failure: false
@@ -662,6 +668,7 @@ jobs:
             ${{ runner.temp }}/metal-build-evidence
             target/cargo-timings
           if-no-files-found: warn
+          retention-days: 3
 
   fmt:
     name: Rustfmt
@@ -709,6 +716,9 @@ jobs:
         run: scripts/fetch-lbug-source.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          # Only main saves: branch and PR caches are unreadable elsewhere and
+          # evicted main's under the 10 GB repository cap. Branches restore main's.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
           shared-key: build
       - name: Install build dependencies
@@ -723,8 +733,10 @@ jobs:
       - name: Cache native build outputs (lbug C++, OpenSSL)
         # lbug (C++ graph DB, built from source) and vendored OpenSSL dominate
         # cold-build time. Keyed on their package versions (not Cargo.lock as a
-        # whole) so they survive release-please lockfile churn.
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        # whole) so they survive release-please lockfile churn. Restore only:
+        # Build & Tests saves it on main, so branches never evict main's copy.
+        id: native-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             target/**/build/lbug-*/out
@@ -742,6 +754,14 @@ jobs:
           mkdir -p staged/standard
           cp target/debug/nestweaver staged/standard/nestweaver
           chmod a-w staged/standard/nestweaver
+      - name: Save native build outputs (main only)
+        if: github.ref == 'refs/heads/main' && steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            target/**/build/lbug-*/out
+            target/**/build/openssl-sys-*/out
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ steps.nativekey.outputs.key }}
       - name: Stage standard acceptance artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -847,6 +867,7 @@ jobs:
             /tmp/nw-release-*/daemon.log
             /tmp/nw-release-*/ui.log
           if-no-files-found: error
+          retention-days: 3
 
   clippy:
     name: Clippy
@@ -871,6 +892,9 @@ jobs:
         run: scripts/fetch-lbug-source.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          # Only main saves: branch and PR caches are unreadable elsewhere and
+          # evicted main's under the 10 GB repository cap. Branches restore main's.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
           shared-key: build
       - name: Install build dependencies
@@ -883,7 +907,8 @@ jobs:
           RUSTC_VER=$(rustc --version | awk '{print $2}')
           echo "key=${LBUG_VER}-${OSSL_VER}-rustc${RUSTC_VER}" >> "$GITHUB_OUTPUT"
       - name: Cache native build outputs (lbug C++, OpenSSL)
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        # Restore only; Build & Tests saves it on main.
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             target/**/build/lbug-*/out
@@ -937,6 +962,9 @@ jobs:
         run: scripts/fetch-lbug-source.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          # Only main saves: branch and PR caches are unreadable elsewhere and
+          # evicted main's under the 10 GB repository cap. Branches restore main's.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
           shared-key: build
       - name: Install build dependencies
@@ -951,8 +979,10 @@ jobs:
       - name: Cache native build outputs (lbug C++, OpenSSL)
         # lbug (C++ graph DB, built from source) and vendored OpenSSL dominate
         # cold-build time. Keyed on their package versions (not Cargo.lock as a
-        # whole) so they survive release-please lockfile churn.
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        # whole) so they survive release-please lockfile churn. Restore only:
+        # Build & Tests saves it on main, so branches never evict main's copy.
+        id: native-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             target/**/build/lbug-*/out
@@ -1087,7 +1117,7 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Install cargo-mutants
-        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
         with:
           # Pinned to the exact version the exit-code and outcomes.json
           # field-name comments below were verified against (`src/outcome.rs`
@@ -1192,6 +1222,7 @@ jobs:
           name: mutants-report
           path: mutation-evidence/
           if-no-files-found: error
+          retention-days: 3
 
   audit:
     name: Security Audit
@@ -1207,7 +1238,7 @@ jobs:
       # Prebuilt binary via install-action instead of `cargo install cargo-audit`
       # (which compiles it from source on every run, ~3 min).
       - name: Install cargo-audit
-        uses: taiki-e/install-action@0758d235715de2f3551eacc980d9ae8fce9342c3 # cargo-audit 2026-09-02
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # cargo-audit 2026-09-02
         with:
           tool: cargo-audit
       # No `|| true`. This check is displayed as "Security Audit" on every pull
@@ -1381,6 +1412,9 @@ jobs:
         run: scripts/fetch-lbug-source.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          # Only main saves: branch and PR caches are unreadable elsewhere and
+          # evicted main's under the 10 GB repository cap. Branches restore main's.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
           shared-key: build
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
@@ -1403,8 +1437,10 @@ jobs:
       - name: Cache native build outputs (lbug C++, OpenSSL)
         # lbug (C++ graph DB, built from source) and vendored OpenSSL dominate
         # cold-build time. Keyed on their package versions (not Cargo.lock as a
-        # whole) so they survive release-please lockfile churn.
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        # whole) so they survive release-please lockfile churn. Restore only:
+        # Build & Tests saves it on main, so branches never evict main's copy.
+        id: native-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             target/**/build/lbug-*/out

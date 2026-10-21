@@ -80,22 +80,41 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 ///   repo-local config might still add. (We use the env form because callers pass
 ///   a fully-built `Command` whose args already include the git subcommand, so a
 ///   trailing `-c` arg would land *after* the subcommand and be misparsed.)
+/// - `core.fsmonitor=` (empty) and `core.hooksPath=/dev/null` the same way. An
+///   indexed repository authors its own `.git/config`, and both name programs
+///   Git runs: indexing ran a repository's fsmonitor through `ls-files`. No
+///   production call needs either (they read, fetch and clone bare).
+/// - `maintenance.auto=false` and `gc.auto=0`: no call should start
+///   background maintenance in a repository it only inspects or fetches.
 ///
 /// This does NOT touch the caller's `-c` args (the SSRF `http.curloptResolve` /
 /// `http.followRedirects` pins and the `http.lowSpeed*` guards): those are
 /// command-line args on the `Command` and take precedence over config anyway.
 ///
 /// CALLER CONTRACT: callers must NOT set their own `GIT_CONFIG_*` env on the
-/// `Command`. This sets `GIT_CONFIG_COUNT=1` (plus `KEY_0`/`VALUE_0`)
+/// `Command`. This sets `GIT_CONFIG_COUNT=5` (plus `KEY_n`/`VALUE_n`)
 /// unconditionally, so a caller-supplied entry would either be clobbered or
 /// silently ignored — pass config via `-c` args instead.
 pub fn apply_git_isolation(cmd: &mut Command) {
     cmd.env("GIT_CONFIG_NOSYSTEM", "1");
     cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
     cmd.env("GIT_TERMINAL_PROMPT", "0");
-    cmd.env("GIT_CONFIG_COUNT", "1");
+    cmd.env("GIT_CONFIG_COUNT", "5");
     cmd.env("GIT_CONFIG_KEY_0", "credential.helper");
     cmd.env("GIT_CONFIG_VALUE_0", "");
+    cmd.env("GIT_CONFIG_KEY_1", "core.fsmonitor");
+    // Empty, not `false`: before Git 2.36 the value is a hook path, and
+    // `false` would run /bin/false. Empty disables it on every version.
+    cmd.env("GIT_CONFIG_VALUE_1", "");
+    cmd.env("GIT_CONFIG_KEY_2", "core.hooksPath");
+    cmd.env("GIT_CONFIG_VALUE_2", "/dev/null");
+    // `fetch` starts auto-maintenance, whose worktree-prune task (Git 2.5x)
+    // follows a symlink planted in `worktrees/` and deletes the repository
+    // it points to.
+    cmd.env("GIT_CONFIG_KEY_3", "maintenance.auto");
+    cmd.env("GIT_CONFIG_VALUE_3", "false");
+    cmd.env("GIT_CONFIG_KEY_4", "gc.auto");
+    cmd.env("GIT_CONFIG_VALUE_4", "0");
 }
 
 /// SIGKILL the whole process group, reap the direct child, and join both reader
@@ -255,6 +274,75 @@ fn run_git_with_output_limit(
 mod tests {
     use super::*;
 
+    /// A repository's own config names programs Git would run. Plain Git runs
+    /// them; an isolated invocation must not.
+    #[test]
+    fn isolation_disables_repository_fsmonitor_and_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = tempfile::tempdir().unwrap();
+        let markers = tempfile::tempdir().unwrap();
+        let plain = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+        };
+        plain(&["init", "-q"]);
+        plain(&["config", "user.email", "test@example.com"]);
+        plain(&["config", "user.name", "Test"]);
+        plain(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
+        plain(&["add", "a.txt"]);
+        plain(&["commit", "-q", "-m", "init"]);
+        let fsmonitor = markers.path().join("fsmonitor");
+        let hooks = markers.path().join("hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        let script = |path: &std::path::Path, marker: &str| {
+            std::fs::write(
+                path,
+                format!(
+                    "#!/bin/sh\ntouch '{}'\n",
+                    markers.path().join(marker).display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        script(&fsmonitor, "fsmonitor-ran");
+        script(&hooks.join("pre-commit"), "hook-ran");
+        plain(&["config", "core.fsmonitor", fsmonitor.to_str().unwrap()]);
+        plain(&["config", "core.hooksPath", hooks.to_str().unwrap()]);
+
+        plain(&["ls-files", "-z", "--cached"]);
+        plain(&["commit", "-q", "--allow-empty", "-m", "plain"]);
+        assert!(
+            markers.path().join("fsmonitor-ran").exists(),
+            "baseline fsmonitor"
+        );
+        assert!(markers.path().join("hook-ran").exists(), "baseline hook");
+        std::fs::remove_file(markers.path().join("fsmonitor-ran")).unwrap();
+        std::fs::remove_file(markers.path().join("hook-ran")).unwrap();
+
+        for args in [
+            &["ls-files", "-z", "--cached"][..],
+            &["commit", "-q", "--allow-empty", "-m", "isolated"][..],
+        ] {
+            let mut command = Command::new("git");
+            command.args(args).current_dir(repo.path());
+            let output = run_git_with_timeout(command, Duration::from_secs(30)).unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+        }
+        assert!(
+            !markers.path().join("fsmonitor-ran").exists(),
+            "fsmonitor ran"
+        );
+        assert!(!markers.path().join("hook-ran").exists(), "hook ran");
+    }
+
     #[test]
     fn bounded_git_output_fails_without_returning_truncated_success() {
         let mut cmd = Command::new("sh");
@@ -352,7 +440,7 @@ mod tests {
         assert_eq!(get("GIT_TERMINAL_PROMPT").as_deref(), Some("0"));
         // credential.helper= (empty) injected via the GIT_CONFIG_* env form —
         // the equivalent of `-c credential.helper=`, disabling all helpers.
-        assert_eq!(get("GIT_CONFIG_COUNT").as_deref(), Some("1"));
+        assert_eq!(get("GIT_CONFIG_COUNT").as_deref(), Some("5"));
         assert_eq!(
             get("GIT_CONFIG_KEY_0").as_deref(),
             Some("credential.helper")
@@ -362,6 +450,15 @@ mod tests {
             Some(""),
             "credential.helper must be reset to empty to disable helpers"
         );
+        // Repository config cannot name programs Git runs during inspection.
+        assert_eq!(get("GIT_CONFIG_KEY_1").as_deref(), Some("core.fsmonitor"));
+        assert_eq!(get("GIT_CONFIG_VALUE_1").as_deref(), Some(""));
+        assert_eq!(get("GIT_CONFIG_KEY_2").as_deref(), Some("core.hooksPath"));
+        assert_eq!(get("GIT_CONFIG_VALUE_2").as_deref(), Some("/dev/null"));
+        assert_eq!(get("GIT_CONFIG_KEY_3").as_deref(), Some("maintenance.auto"));
+        assert_eq!(get("GIT_CONFIG_VALUE_3").as_deref(), Some("false"));
+        assert_eq!(get("GIT_CONFIG_KEY_4").as_deref(), Some("gc.auto"));
+        assert_eq!(get("GIT_CONFIG_VALUE_4").as_deref(), Some("0"));
     }
 
     /// The isolation must not clobber a caller's own `-c` args (the SSRF pins and

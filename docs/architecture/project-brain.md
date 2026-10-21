@@ -1314,7 +1314,8 @@ Full-PageRank `pagerank_score` per node is marked stale and recomputed in a back
   daemon.log                                rolling log (last 7 days)
 
 ~/Library/LaunchAgents/com.nestweaver.daemon.plist   (macOS autostart)
-~/.config/systemd/user/nestweaver.service             (Linux autostart)
+(Linux: no unit is installed; `daemon start` spawns a detached process,
+ and an operator may supervise it with their own systemd unit)
 ```
 
 | Artefact | Format | When written |
