@@ -127,6 +127,7 @@ pub fn prune_stale_json(response: &PruneStaleResponse) -> serde_json::Value {
     serde_json::json!({
         "removed_repos": response.removed_repos,
         "removed_vaults": response.removed_vaults,
+        "skipped_warnings": response.skipped_warnings,
         "committed": response.committed,
         "reconciliation_failures": response.reconciliation_failures.iter().map(|failure| serde_json::json!({
             "stage": failure.stage, "repo_uid": failure.repo_uid, "message": failure.message,

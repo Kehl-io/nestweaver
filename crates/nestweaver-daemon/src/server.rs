@@ -4988,6 +4988,25 @@ type ProgressStream = tokio_stream::wrappers::ReceiverStream<Result<IndexProgres
 struct PrunedRepos {
     names: Vec<String>,
     uids: Vec<String>,
+    /// Repos kept because their root could not be checked.
+    skipped: Vec<String>,
+}
+
+/// Whether a source root is DEFINITELY gone. Only `NotFound` proves that; a
+/// permission or I/O error says nothing about the source, and treating it as
+/// "gone" (as `Path::exists` does) deleted a vault whose parent was merely
+/// `chmod 000`. Such a root is kept and reported in `skipped`.
+fn source_root_missing(kind: &str, name: &str, root: &str, skipped: &mut Vec<String>) -> bool {
+    match Path::new(root).try_exists() {
+        Ok(exists) => !exists,
+        Err(error) => {
+            tracing::warn!(kind, name, root, %error, "prune_stale: kept source whose root cannot be checked");
+            skipped.push(format!(
+                "kept {kind} '{name}': cannot check {root}: {error}"
+            ));
+            false
+        }
+    }
 }
 
 impl PrunedRepos {
@@ -5018,7 +5037,8 @@ where
         let Some(path) = repo.local_root() else {
             continue;
         };
-        if !Path::new(path).exists() {
+        let display = repo.name.as_deref().unwrap_or(&repo.url);
+        if source_root_missing("repo", display, path, &mut removed_repos.skipped) {
             tracing::info!(
                 uid = %repo.uid,
                 url = %repo.url,
@@ -6086,12 +6106,18 @@ where
     let mut removed_vaults = Vec::new();
     let mut removed_vault_uids = Vec::new();
     let mut vault_mutation_attempted = false;
+    let mut skipped_warnings = removed_repos.skipped.clone();
 
     if error.is_none() {
         match state.store.list_vaults(None) {
             Ok(vaults) => {
                 for vault in &vaults {
-                    if !Path::new(&vault.root_path).exists() {
+                    if source_root_missing(
+                        "vault",
+                        &vault.name,
+                        &vault.root_path,
+                        &mut skipped_warnings,
+                    ) {
                         vault_mutation_attempted = true;
                         if let Err(delete_error) = delete_vault(&state.store, vault) {
                             error = Some(delete_error);
@@ -6144,6 +6170,7 @@ where
             removed_vaults,
             committed: changed,
             reconciliation_failures: to_proto_reconciliation_failures(&failures),
+            skipped_warnings,
         }),
     };
     finish_reconciled_mutation(mutation, "prune_stale", failures)
@@ -20266,6 +20293,59 @@ repos = ["alpha"]
             flag.load(Ordering::SeqCst),
             "the pruned repo's watcher stops"
         );
+    }
+
+    /// An UNREADABLE root is not a missing one: a vault under a `chmod 000`
+    /// parent used to be pruned because `Path::exists` folds every error into
+    /// false. It is kept and reported in `skipped_warnings`.
+    #[cfg(unix)]
+    #[test]
+    fn prune_stale_keeps_a_vault_whose_root_cannot_be_checked() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let locked = tmp.path().join("locked");
+        let root = locked.join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = root.try_exists().is_err();
+        let state = test_state_with_writer();
+        let root_str = root.to_string_lossy().into_owned();
+        seed_vault_note_heading_embeddings(&state, "vlt:prune:locked", "locked", &root_str);
+        let gone = tmp.path().join("gone").to_string_lossy().into_owned();
+        seed_vault_note_heading_embeddings(&state, "vlt:prune:gone", "gone", &gone);
+
+        let response = run_prune_stale_with(
+            &state,
+            delete_repo_cascade,
+            |store, vault| {
+                store
+                    .delete_vault_cascade(&vault.uid)
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from)
+            },
+            |_state, _mutation, _operation| Ok(()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            response.removed_vaults,
+            vec!["vault-vlt:prune:gone".to_string()]
+        );
+        let uids: Vec<String> = state
+            .store
+            .list_vaults(None)
+            .unwrap()
+            .into_iter()
+            .map(|vault| vault.uid)
+            .collect();
+        assert!(uids.contains(&"vlt:prune:locked".to_string()), "{uids:?}");
+        if unreadable {
+            // Root bypasses the permission bits, so only assert the warning
+            // where the root really could not be checked.
+            assert_eq!(response.skipped_warnings.len(), 1, "{response:?}");
+            assert!(response.skipped_warnings[0].contains("locked"));
+        }
     }
 
     #[test]
