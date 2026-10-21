@@ -10751,13 +10751,16 @@ fn looks_like_note_path(input: &str) -> bool {
     input.contains('/') || input.contains('\\') || input.to_lowercase().ends_with(".md")
 }
 
+/// A path-qualified wikilink (`Workspaces/Payments/Decisions`) omits `.md`,
+/// so a path query without it also matches `<path>.md`.
 fn note_path_matches(file_path: &str, query: &str) -> bool {
     let fp = file_path.replace('\\', "/").to_lowercase();
     let q = query
         .replace('\\', "/")
         .trim_start_matches("./")
         .to_lowercase();
-    fp == q || fp.ends_with(&format!("/{q}"))
+    let matches = |q: &str| fp == q || fp.ends_with(&format!("/{q}"));
+    matches(&q) || (q.contains('/') && !q.ends_with(".md") && matches(&format!("{q}.md")))
 }
 
 /// Resolve a note by UID, vault-relative path, or title.
@@ -26524,6 +26527,25 @@ mod cache_dispatch_tests {
         store.insert_note(&two).unwrap();
         store.insert_note(&unique).unwrap();
         store
+    }
+
+    /// The brain links notes as `[[folder1/Same]]`, path-qualified without
+    /// `.md`; `note_get` and `backlinks` must resolve that form too.
+    #[test]
+    fn path_qualified_lookup_without_md_extension_resolves() {
+        let store = two_same_title_notes();
+        for path in ["folder1/Same", "folder1/Same.md"] {
+            let note = tool_note_get(&store, json!({ "title": path })).unwrap();
+            assert_eq!(note["uid"], "note:same-a", "{path}: {note}");
+            let links = tool_backlinks(&store, json!({ "title": path })).unwrap();
+            assert_ne!(links["status"], "ambiguous", "{path}: {links}");
+            assert!(links.get("error").is_none(), "{path}: {links}");
+        }
+        // A bare title stays ambiguous; the path form is what disambiguates.
+        let bare = tool_note_get(&store, json!({ "title": "Same" })).unwrap();
+        assert_eq!(bare["status"], "ambiguous", "{bare}");
+        assert!(note_path_matches("folder1/Same.md", "folder1/Same"));
+        assert!(!note_path_matches("folder1/Same.md", "Same"));
     }
 
     #[test]
