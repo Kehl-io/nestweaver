@@ -23585,6 +23585,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 c.scanned_candidates,
                                 c.timings.total_ms,
                             );
+                            if c.truncated {
+                                println!(
+                                    "    (incomplete: the time budget ran out; these counts are lower bounds)"
+                                );
+                            }
                         }
                         // Surface in-band staleness the daemon's stderr
                         // warning can't reach us with.
@@ -23635,6 +23640,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         c.scanned_candidates,
                         c.timings.total_ms,
                     );
+                    if c.truncated {
+                        println!(
+                            "    (incomplete: the time budget ran out; these counts are lower bounds)"
+                        );
+                    }
                 }
                 // Surface in-band staleness (the direct path's own
                 // stderr warning is a once-per-process latch that may already

@@ -12,6 +12,12 @@ use std::sync::{Arc, Mutex, mpsc};
 
 pub type CancelFlag = Arc<AtomicBool>;
 const MAX_PENDING_REQUESTS: usize = 128;
+/// Longest stdio frame (one JSON-RPC line) the server buffers, in bytes. A
+/// longer line is discarded as it streams in and answered with a -32700
+/// parse error; the session keeps serving. Unbounded, a single 300 MB line
+/// held 340 MB of RSS. 64 MiB is far above any legitimate request: tool
+/// arguments are schema-bounded well below it.
+pub const MAX_STDIO_FRAME_BYTES: usize = 64 * 1024 * 1024;
 type Pending = Arc<Mutex<HashMap<String, CancelFlag>>>;
 
 struct CancelOnReaderFailure {
@@ -127,10 +133,85 @@ pub fn run_stdio(dispatch: impl FnMut(&Request, &CancelFlag) -> Value) -> anyhow
     )
 }
 
+/// One stdio frame as read by [`read_frame`].
+enum FrameRead {
+    /// A complete line, without its `\n` / `\r\n` terminator.
+    Line(Vec<u8>),
+    /// A line longer than the frame limit; its bytes were discarded. Carries
+    /// the line's full length.
+    Oversized(usize),
+}
+
+/// Read one `\n`-terminated frame, buffering at most `max_bytes` of it.
+///
+/// `BufRead::lines` buffers a whole line before returning it, so a client
+/// could make the server hold any amount of memory with one unterminated
+/// line. This reads through the stream in `fill_buf` chunks and stops
+/// appending once the limit is passed, while still consuming to the end of
+/// the line so the NEXT frame starts at a frame boundary. `Ok(None)` is EOF.
+fn read_frame<R: BufRead>(reader: &mut R, max_bytes: usize) -> std::io::Result<Option<FrameRead>> {
+    let mut line = Vec::new();
+    let mut length = 0usize;
+    let mut oversized = false;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if available.is_empty() {
+            if length == 0 {
+                return Ok(None);
+            }
+            break;
+        }
+        let (chunk, terminated) = match available.iter().position(|byte| *byte == b'\n') {
+            Some(index) => (&available[..index], true),
+            None => (available, false),
+        };
+        length = length.saturating_add(chunk.len());
+        if !oversized {
+            if length > max_bytes {
+                oversized = true;
+                line = Vec::new();
+            } else {
+                line.extend_from_slice(chunk);
+            }
+        }
+        let consumed = chunk.len() + usize::from(terminated);
+        reader.consume(consumed);
+        if terminated {
+            break;
+        }
+    }
+    if oversized {
+        return Ok(Some(FrameRead::Oversized(length)));
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    Ok(Some(FrameRead::Line(line)))
+}
+
 /// Injectable I/O seam for deterministic wire tests, without a real database.
 pub fn run_with_io<R, W>(
     reader: R,
     writer: W,
+    dispatch: impl FnMut(&Request, &CancelFlag) -> Value,
+) -> anyhow::Result<()>
+where
+    R: BufRead + Send + 'static,
+    W: Write + Send + 'static,
+{
+    run_with_io_limited(reader, writer, MAX_STDIO_FRAME_BYTES, dispatch)
+}
+
+/// [`run_with_io`] with an explicit frame limit, so tests can exercise the
+/// oversized-frame path without allocating 64 MiB.
+fn run_with_io_limited<R, W>(
+    mut reader: R,
+    writer: W,
+    max_frame_bytes: usize,
     mut dispatch: impl FnMut(&Request, &CancelFlag) -> Value,
 ) -> anyhow::Result<()>
 where
@@ -150,32 +231,49 @@ where
             pending: reader_pending.clone(),
             clean_eof: false,
         };
-        for line in reader.lines() {
-            let line = match line {
-                Ok(line) => line,
-                // nw-745: `BufRead::lines` consumes a frame that is not valid
-                // UTF-8 and returns InvalidData ("stream did not contain valid
-                // UTF-8"). That frame is a JSON-RPC parse error, the same
-                // -32700 a malformed JSON line already gets. Reply and keep
-                // reading so the next request is still served.
-                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-                    if write(
-                        &reader_output,
-                        &failure(
-                            Value::Null,
-                            error_code::PARSE_ERROR,
-                            format!("invalid JSON: {error}"),
-                        ),
-                    )
+        loop {
+            let frame = match read_frame(&mut reader, max_frame_bytes) {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    return;
+                }
+            };
+            let parse_failure = |message: String| {
+                write(
+                    &reader_output,
+                    &failure(Value::Null, error_code::PARSE_ERROR, message),
+                )
+            };
+            let line = match frame {
+                FrameRead::Line(bytes) => match String::from_utf8(bytes) {
+                    Ok(line) => line,
+                    // nw-745: a frame that is not valid UTF-8 is a JSON-RPC
+                    // parse error, the same -32700 a malformed JSON line
+                    // already gets. Reply and keep reading so the next
+                    // request is still served.
+                    Err(_) => {
+                        if parse_failure(
+                            "invalid JSON: stream did not contain valid UTF-8".to_string(),
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
+                        continue;
+                    }
+                },
+                FrameRead::Oversized(length) => {
+                    if parse_failure(format!(
+                        "invalid JSON: frame of {length} bytes exceeds the {max_frame_bytes}-byte \
+                         stdio frame limit and was discarded"
+                    ))
                     .is_err()
                     {
                         return;
                     }
                     continue;
-                }
-                Err(error) => {
-                    let _ = sender.send(Err(error));
-                    return;
                 }
             };
             if line.trim().is_empty() {
@@ -450,6 +548,56 @@ mod tests {
         assert_eq!(third["id"], 3, "{third}");
         assert_eq!(third["result"], json!({}), "{third}");
         assert!(output.try_recv().is_err(), "unexpected extra frame");
+    }
+
+    /// A frame longer than the limit is discarded while it streams in and
+    /// answered with -32700; the frames around it are still served, and CRLF
+    /// framing keeps working.
+    #[test]
+    fn an_oversized_frame_is_a_parse_error_and_the_session_continues() {
+        let (writer, output) = writer();
+        let mut input = Vec::new();
+        input.extend_from_slice(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+        input.extend_from_slice(b"\r\n");
+        input.extend_from_slice(&vec![b'x'; 10_000]);
+        input.push(b'\n');
+        input.extend_from_slice(br#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#);
+        input.push(b'\n');
+        run_with_io_limited(std::io::Cursor::new(input), writer, 1024, |req, _| {
+            panic!("control frame reached dispatch: {req:?}");
+        })
+        .unwrap();
+        let first = output.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(first["id"], 1, "{first}");
+        let parse = output.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(parse["error"]["code"], error_code::PARSE_ERROR, "{parse}");
+        let message = parse["error"]["message"].as_str().unwrap_or("");
+        assert!(message.contains("10000 bytes"), "{parse}");
+        assert!(message.len() < 200, "{parse}");
+        let third = output.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(third["id"], 3, "{third}");
+        assert!(output.try_recv().is_err(), "unexpected extra frame");
+    }
+
+    #[test]
+    fn frame_reader_buffers_no_more_than_its_limit() {
+        let mut reader = std::io::BufReader::with_capacity(
+            16,
+            std::io::Cursor::new(b"abc\nTOO-LONG-LINE\nlast".to_vec()),
+        );
+        assert!(matches!(
+            read_frame(&mut reader, 8).unwrap(),
+            Some(FrameRead::Line(line)) if line == b"abc"
+        ));
+        assert!(matches!(
+            read_frame(&mut reader, 8).unwrap(),
+            Some(FrameRead::Oversized(13))
+        ));
+        assert!(matches!(
+            read_frame(&mut reader, 8).unwrap(),
+            Some(FrameRead::Line(line)) if line == b"last"
+        ));
+        assert!(read_frame(&mut reader, 8).unwrap().is_none());
     }
 
     #[test]

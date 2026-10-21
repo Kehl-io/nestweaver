@@ -1360,7 +1360,7 @@ async fn handle_mcp(
             "id": id,
             "error": {
                 "code": error_code::METHOD_NOT_FOUND,
-                "message": format!("method not implemented: {other}"),
+                "message": crate::tools::method_not_implemented_message(other),
             }
         }),
     };

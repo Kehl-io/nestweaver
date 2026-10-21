@@ -31,6 +31,17 @@ use crate::query::{
 /// is loaded.
 const BUNDLE_TTL_SECS: f64 = 24.0 * 60.0 * 60.0;
 
+/// Most bundles the sidecar keeps; the OLDEST are evicted past it. The TTL
+/// alone bounded nothing within a day: the sidecar is rewritten whole on
+/// every investigate/expand/hydrate, and ~450 investigations in a day grew it
+/// to 8.7 MB, so each write cost more than the last.
+const MAX_BUNDLES: usize = 128;
+
+/// Largest serialized bundle store a write may leave; the oldest bundles are
+/// evicted until it fits. The newest bundle always survives, so a single
+/// oversized bundle can still be drilled into.
+const MAX_BUNDLE_STORE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Default retrieval breadth — how many connected nodes we consider for the map.
 const DEFAULT_RETRIEVAL_BREADTH: usize = 30;
 
@@ -697,8 +708,44 @@ fn update_bundle_store<T>(
     let mut store = load_bundle_store_checked(db_path)?;
     let out = f(&mut store)?;
     store.version = 1;
+    enforce_bundle_store_caps(&mut store);
     save_bundle_store(db_path, &store)?;
     Ok(out)
+}
+
+/// Evict the oldest bundles until the store holds at most [`MAX_BUNDLES`] and
+/// serializes to at most [`MAX_BUNDLE_STORE_BYTES`]. Ties on `created_at`
+/// break by id, so eviction is deterministic. The newest bundle is never
+/// evicted: it is the one the caller was just handed.
+fn enforce_bundle_store_caps(store: &mut BundleStore) {
+    let mut by_age: Vec<(f64, String, usize)> = store
+        .bundles
+        .iter()
+        .map(|(id, bundle)| {
+            let bytes = serde_json::to_vec(bundle).map_or(0, |bytes| bytes.len());
+            (bundle.created_at, id.clone(), bytes)
+        })
+        .collect();
+    by_age.sort_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    // Per-entry JSON overhead (key, quotes, separators) is small next to a
+    // bundle; the estimate is padded rather than re-serializing the store.
+    let mut total: usize = by_age
+        .iter()
+        .map(|(_, id, bytes)| bytes + id.len() + 8)
+        .sum();
+    let mut remaining = by_age.len();
+    for (_, id, bytes) in by_age {
+        if remaining <= 1 || (remaining <= MAX_BUNDLES && total <= MAX_BUNDLE_STORE_BYTES) {
+            break;
+        }
+        store.bundles.remove(&id);
+        total = total.saturating_sub(bytes + id.len() + 8);
+        remaining -= 1;
+    }
 }
 
 /// Load a single live (non-expired) bundle by id.
@@ -1427,10 +1474,30 @@ pub fn investigate_hydrate(
                     *reasons.entry(reason.clone()).or_insert(0) += 1;
                     entry.unavailable_reason = Some(reason);
                 };
+            // The per-entry cap follows the budget: an even share of it across
+            // the entries still to fill, never below the inline default.
+            // It used to be the inline default ALWAYS (~1600 chars), so
+            // `token_budget` neither shortened a body nor lengthened one.
+            let pending = bundle
+                .entries
+                .iter()
+                .filter(|entry| entry.inline_body.is_none())
+                .count()
+                .max(1);
+            let per_entry_tokens = (budget / pending).max(INLINE_MAX_BODY_TOKENS);
             for entry in bundle.entries.iter_mut() {
                 if entry.inline_body.is_some() {
                     already_hydrated += 1;
                     entry.unavailable_reason = None;
+                    continue;
+                }
+                let remaining_tokens = budget.saturating_sub(used_tokens);
+                if remaining_tokens == 0 {
+                    skip(
+                        format!("token budget of {budget} exhausted"),
+                        entry,
+                        &mut skipped_reasons,
+                    );
                     continue;
                 }
                 let body = match fetch_full_body(store, &entry.uid, root) {
@@ -1444,14 +1511,23 @@ pub fn investigate_hydrate(
                     skip(BodyUnavailable::Empty.reason(), entry, &mut skipped_reasons);
                     continue;
                 }
-                let max_chars = INLINE_MAX_BODY_TOKENS.saturating_mul(4);
+                // The first body is cut to fit the whole budget: it used to be
+                // exempt from the budget and could overshoot a small one on its
+                // own. A later body that does not fit is skipped below rather
+                // than cut, so it cannot starve smaller entries after it.
+                let cap_tokens = if hydrated == 0 {
+                    per_entry_tokens.min(remaining_tokens)
+                } else {
+                    per_entry_tokens
+                };
+                let max_chars = cap_tokens.saturating_mul(4);
                 // Bug H: newline-aware truncation — see `truncate_body_to_chars`. The
                 // `complete` flag is propagated to BundleEntry.body_complete so
                 // consumers can decide whether to fall back to `read_symbols` for the
                 // full source.
                 let (body, complete) = crate::query::truncate_body_to_chars(body, max_chars);
                 let cost = body.len().div_ceil(4);
-                if hydrated > 0 && used_tokens + cost > budget {
+                if body.is_empty() || used_tokens + cost > budget {
                     // Over budget: skip THIS body and keep going — a later, smaller
                     // body may still fit. (Previously a `break` aborted every
                     // remaining entry.)
@@ -5948,6 +6024,85 @@ mod tests {
         );
     }
 
+    fn sized_bundle(id: &str, created_at: f64, query_bytes: usize) -> Bundle {
+        Bundle {
+            bundle_id: id.to_string(),
+            created_at,
+            query: "q".repeat(query_bytes),
+            scope: "vault".to_string(),
+            entries: vec![],
+        }
+    }
+
+    /// The TTL alone let the sidecar grow without bound inside a day (8.7 MB
+    /// after ~450 investigations), rewritten whole on every write. Every
+    /// write now evicts the oldest bundles past a count cap.
+    #[test]
+    fn bundle_store_writes_evict_the_oldest_past_the_count_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let now = now_epoch();
+        let mut store = BundleStore::default();
+        for index in 0..(MAX_BUNDLES + 20) {
+            let id = format!("bndl_{index:04}");
+            store.bundles.insert(
+                id.clone(),
+                sized_bundle(&id, now - 1000.0 + index as f64, 8),
+            );
+        }
+        save_bundle_store(&db_path, &store).unwrap();
+
+        update_bundle_store(&db_path, |store| {
+            store
+                .bundles
+                .insert("newest".to_string(), sized_bundle("newest", now, 8));
+            Ok(())
+        })
+        .unwrap();
+
+        let loaded = load_bundle_store(&db_path);
+        assert_eq!(loaded.bundles.len(), MAX_BUNDLES);
+        assert!(
+            loaded.bundles.contains_key("newest"),
+            "the new bundle survives"
+        );
+        assert!(
+            !loaded.bundles.contains_key("bndl_0000"),
+            "the oldest bundle is evicted"
+        );
+        assert!(
+            loaded
+                .bundles
+                .contains_key(&format!("bndl_{:04}", MAX_BUNDLES + 19))
+        );
+    }
+
+    #[test]
+    fn bundle_store_writes_evict_the_oldest_past_the_byte_cap() {
+        let now = now_epoch();
+        let mut store = BundleStore::default();
+        let each = MAX_BUNDLE_STORE_BYTES / 4;
+        for index in 0..6 {
+            let id = format!("big_{index}");
+            store
+                .bundles
+                .insert(id.clone(), sized_bundle(&id, now + index as f64, each));
+        }
+        enforce_bundle_store_caps(&mut store);
+        assert!(serde_json::to_vec(&store).unwrap().len() <= MAX_BUNDLE_STORE_BYTES);
+        assert!(store.bundles.contains_key("big_5"));
+        assert!(!store.bundles.contains_key("big_0"));
+
+        // A single bundle over the byte cap is still kept: it is the newest.
+        let mut single = BundleStore::default();
+        single.bundles.insert(
+            "huge".to_string(),
+            sized_bundle("huge", now, MAX_BUNDLE_STORE_BYTES + 1),
+        );
+        enforce_bundle_store_caps(&mut single);
+        assert!(single.bundles.contains_key("huge"));
+    }
+
     #[test]
     fn investigate_empty_query_is_graceful() {
         let (dir, src, store) = make_store();
@@ -6925,6 +7080,85 @@ mod tests {
             reason.contains("changed since indexing"),
             "a drifted span must be reported as stale, got: {reason:?}"
         );
+    }
+
+    /// `token_budget` used to change nothing about a body: every body was cut
+    /// to the 400-token inline default (~1600 chars), and the first body was
+    /// exempt from the budget. A large budget now buys a longer body and a
+    /// small one a shorter body.
+    #[test]
+    fn investigate_hydrate_body_length_follows_the_token_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        let padding = "    let x = 1; // padding padding padding padding\n".repeat(80);
+        fs::write(
+            src.join("big.js"),
+            format!("function hugeA() {{\n{padding}}}\n"),
+        )
+        .unwrap();
+        let (_r, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let db_path = dir.path().join("nestweaver.lbug");
+        let uid = store
+            .lookup_symbols_by_name("hugeA")
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "hugeA")
+            .expect("hugeA symbol exists")
+            .uid;
+        let hydrate_with = |budget: usize| {
+            let mut bundle_store = BundleStore::default();
+            bundle_store.bundles.insert(
+                "bndl_budget".to_string(),
+                Bundle {
+                    bundle_id: "bndl_budget".to_string(),
+                    created_at: now_epoch(),
+                    query: "q".to_string(),
+                    scope: "vault".to_string(),
+                    entries: vec![BundleEntry {
+                        asset_id: "a_hugeA".to_string(),
+                        uid: uid.clone(),
+                        kind: "Symbol".to_string(),
+                        title: "hugeA".to_string(),
+                        location: "big.js:1".to_string(),
+                        summary: None,
+                        inline_body: None,
+                        body_complete: true,
+                        expanded: false,
+                        unavailable_reason: None,
+                        is_seed: false,
+                        matched_query: None,
+                        relevance: 1.0,
+                    }],
+                },
+            );
+            save_bundle_store(&db_path, &bundle_store).unwrap();
+            let result =
+                investigate_hydrate(&store, &db_path, Some(&src), "bndl_budget", Some(budget))
+                    .unwrap();
+            result.entries[0].clone()
+        };
+
+        let generous = hydrate_with(16_000);
+        let generous_body = generous.inline_body.expect("hydrated");
+        assert!(
+            generous_body.len() > INLINE_MAX_BODY_TOKENS * 4,
+            "a 16000-token budget must not be capped at the inline default: {} chars",
+            generous_body.len()
+        );
+        assert!(generous.body_complete, "the whole ~4000-char body fits");
+
+        let tight = hydrate_with(50);
+        let tight_body = tight
+            .inline_body
+            .expect("the first body is cut to fit, not skipped");
+        assert!(
+            tight_body.len() <= 50 * 4,
+            "a 50-token budget must bound the first body: {} chars",
+            tight_body.len()
+        );
+        assert!(!tight.body_complete);
     }
 
     #[test]
