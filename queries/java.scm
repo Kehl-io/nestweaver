@@ -88,3 +88,17 @@
 ; Field access: obj.field
 (field_access
   field: (identifier) @name) @reference.read_access
+
+; Object construction: `new Foo(...)` is a call of the class, exactly as
+; typescript.scm records it (nw-323 defect D). Without it a class that is only
+; ever instantiated had no inbound reference at all and `dead-code` reported it.
+(object_creation_expression
+  type: (type_identifier) @name) @reference.call
+
+(object_creation_expression
+  type: (generic_type
+    (type_identifier) @name)) @reference.call
+
+(object_creation_expression
+  type: (scoped_type_identifier
+    (type_identifier) @name .)) @reference.call

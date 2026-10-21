@@ -1361,6 +1361,95 @@ fn extract_type_info(signature: &str, lang: Language) -> Option<TypeInfo> {
 /// Walk the tree-sitter AST parent chain from `node` to find the enclosing
 /// class, struct, impl, trait, or interface. Returns the parent type/class name
 /// (e.g. `"GraphStore"` for a method inside `impl GraphStore { ... }`).
+/// Whether a JS/TS `this.x = …` assignment's nearest enclosing method is the
+/// class constructor.
+fn js_assignment_in_constructor(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "method_definition" => {
+                return parent
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(source).ok())
+                    == Some("constructor");
+            }
+            "class_body" | "class_declaration" | "class" | "program" => return false,
+            _ => current = parent.parent(),
+        }
+    }
+    false
+}
+
+/// nw-QA: `queries/typescript.scm` mints a `Property` for every `this.x = …`
+/// assignment, and the symbol dedupe is keyed on `(name, line)`, so a field
+/// assigned in three methods became three `Property` symbols, plus a fourth
+/// when the class also declared it. One property is one symbol:
+///
+/// - when the class declares the member (a field declaration, accessor or
+///   method of that name), every assignment-minted duplicate is dropped and
+///   the declaration's line stands;
+/// - otherwise (a plain JS class with no field declarations) one symbol is
+///   kept: the first assignment in the constructor, else the first assignment.
+///
+/// Assignments outside any class (`parent_name` is `None`) are left alone:
+/// without an owner there is nothing to group them by.
+fn dedupe_js_assignment_properties(symbols: &mut Vec<RawSymbol>, assignments: &[(usize, bool)]) {
+    if assignments.is_empty() {
+        return;
+    }
+    let minted: std::collections::HashMap<usize, bool> = assignments.iter().copied().collect();
+    let declared: std::collections::HashSet<(&str, &str)> = symbols
+        .iter()
+        .enumerate()
+        .filter(|(index, symbol)| {
+            !minted.contains_key(index)
+                && matches!(symbol.kind, SymbolKind::Property | SymbolKind::Method)
+        })
+        .filter_map(|(_, symbol)| Some((symbol.parent_name.as_deref()?, symbol.name.as_str())))
+        .collect();
+    // The kept assignment per (class, name): constructor first, then source order.
+    let mut keep: std::collections::HashMap<(&str, &str), (bool, u32, usize)> =
+        std::collections::HashMap::new();
+    for (&index, &in_constructor) in &minted {
+        let symbol = &symbols[index];
+        let Some(owner) = symbol.parent_name.as_deref() else {
+            continue;
+        };
+        let key = (owner, symbol.name.as_str());
+        if declared.contains(&key) {
+            continue;
+        }
+        let rank = (!in_constructor, symbol.start_line, index);
+        keep.entry(key)
+            .and_modify(|best| {
+                if rank < *best {
+                    *best = rank;
+                }
+            })
+            .or_insert(rank);
+    }
+    let drop: std::collections::HashSet<usize> = minted
+        .keys()
+        .copied()
+        .filter(|&index| {
+            let symbol = &symbols[index];
+            symbol.parent_name.as_deref().is_some_and(|owner| {
+                keep.get(&(owner, symbol.name.as_str()))
+                    .is_none_or(|(_, _, kept)| *kept != index)
+            })
+        })
+        .collect();
+    if drop.is_empty() {
+        return;
+    }
+    let mut index = 0;
+    symbols.retain(|_| {
+        let retain = !drop.contains(&index);
+        index += 1;
+        retain
+    });
+}
+
 fn find_parent_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
     let mut current = node.parent();
     while let Some(parent) = current {
@@ -1550,6 +1639,10 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     let mut references: Vec<RawReference> = Vec::new();
     let mut seen_symbols: std::collections::HashSet<(String, u32)> =
         std::collections::HashSet::new();
+    // JS/TS `this.x = …` assignments minted as properties: (index into
+    // `symbols`, whether the assignment sits in a constructor). Deduplicated
+    // per class after the capture loop; see `dedupe_js_assignment_properties`.
+    let mut assignment_properties: Vec<(usize, bool)> = Vec::new();
     // nw-435: names called by a Python or bash call/command with no enclosing
     // `function_definition` (and, for Python, no enclosing `lambda`) ancestor —
     // see `is_top_level_reference` below. Collected during the capture loop,
@@ -1918,6 +2011,15 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     None
                 };
                 let scope_chain = extract_scope_chain(node, source, lang_str);
+                if matches!(lang, Language::JavaScript | Language::TypeScript)
+                    && kind == SymbolKind::Property
+                    && node.kind() == "assignment_expression"
+                {
+                    assignment_properties.push((
+                        symbols.len(),
+                        js_assignment_in_constructor(node, source_bytes),
+                    ));
+                }
                 symbols.push(RawSymbol {
                     name,
                     kind,
@@ -2034,9 +2136,19 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 //   Ruby:      call > receiver (direct field)
                 //   PHP:       member_call_expression > object
                 let receiver = if kind == ReferenceKind::Call {
+                    // A Rust turbofish (`x.parse::<T>()`, `Type::f::<T>()`)
+                    // wraps the callee in a `generic_function`; the receiver
+                    // lives on the wrapped node, exactly as without the
+                    // type arguments.
+                    let function = node.child_by_field_name("function").map(|f| {
+                        if f.kind() == "generic_function" {
+                            f.child_by_field_name("function").unwrap_or(f)
+                        } else {
+                            f
+                        }
+                    });
                     // Strategy 1: function child contains a member/field/selector/attribute node
-                    let from_function_child = node
-                        .child_by_field_name("function")
+                    let from_function_child = function
                         .and_then(|f| {
                             let k = f.kind();
                             if k.contains("field")
@@ -2087,7 +2199,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                         && from_direct_object.is_none()
                         && from_receiver_field.is_none()
                     {
-                        node.child_by_field_name("function")
+                        function
                             .filter(|f| {
                                 let k = f.kind();
                                 k.contains("scoped") || k.contains("qualified")
@@ -2180,6 +2292,8 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
             // Skip "name" captures — used via find_name_capture above
         }
     }
+
+    dedupe_js_assignment_properties(&mut symbols, &assignment_properties);
 
     // Preserve exact import bindings as well as package exclusions.
     if matches!(lang, Language::JavaScript | Language::TypeScript) {
@@ -14872,5 +14986,68 @@ export function G(a) {\n\
                 "{path} is sloppy"
             );
         }
+    }
+
+    #[test]
+    fn ts_this_assignments_do_not_duplicate_a_declared_property() {
+        let source = "export class Calculator {\n  private total = 0;\n  constructor() { this.total = 1; }\n  plus(n: number) { this.total = this.total + n; }\n  reset() { this.total = 0; }\n}\n";
+        let parsed = parse_source(Path::new("calc.ts"), source).unwrap();
+        let totals: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name == "total")
+            .map(|symbol| (symbol.kind, symbol.start_line))
+            .collect();
+        assert_eq!(totals, vec![(SymbolKind::Property, 2)], "{totals:?}");
+    }
+
+    #[test]
+    fn js_class_without_field_declarations_keeps_one_assigned_property() {
+        let source = "class Counter {\n  bump() { this.count = this.count + 1; }\n  constructor() { this.count = 0; }\n  reset() { this.count = 0; }\n}\n";
+        let parsed = parse_source(Path::new("counter.js"), source).unwrap();
+        let counts: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name == "count")
+            .map(|symbol| (symbol.kind, symbol.start_line, symbol.parent_name.clone()))
+            .collect();
+        assert_eq!(
+            counts,
+            vec![(SymbolKind::Property, 3, Some("Counter".to_string()))],
+            "the constructor's assignment is the declaration: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn ts_bare_decorator_is_a_call_reference() {
+        let source = "function log(target: any, key: string) {}\nexport class C {\n  @log\n  plus(n: number): number { return n; }\n}\n";
+        let parsed = parse_source(Path::new("c.ts"), source).unwrap();
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|reference| reference.kind == ReferenceKind::Call
+                    && reference.name == "log"
+                    && reference.start_line == 3
+                    && reference.receiver.is_none()),
+            "{:#?}",
+            parsed.references
+        );
+    }
+
+    #[test]
+    fn rust_turbofish_method_call_keeps_its_receiver() {
+        let source = "fn f(x: &str) { let _ = x.parse::<u32>(); generic::<u8>(1); T::make::<u8>(); }\n";
+        let parsed = parse_source(Path::new("src/lib.rs"), source).unwrap();
+        let call = |name: &str| {
+            parsed
+                .references
+                .iter()
+                .find(|reference| reference.kind == ReferenceKind::Call && reference.name == name)
+                .map(|reference| reference.receiver.clone())
+        };
+        assert_eq!(call("parse"), Some(Some("x".to_string())));
+        assert_eq!(call("generic"), Some(None));
+        assert_eq!(call("make"), Some(Some("T".to_string())));
     }
 }
