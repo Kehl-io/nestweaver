@@ -11062,7 +11062,8 @@ mod duplicate_vault_name_tests {
     /// death and is disclosed until a full index of the vault lands.
     #[test]
     fn an_interrupted_full_vault_index_is_disclosed_until_one_lands() {
-        let (_dir, root) = make_vault(&[("a.md", "# A\n")]);
+        let vault_dir = tempfile::tempdir().unwrap();
+        let root = vault_at(vault_dir.path(), "body");
         let db_dir = tempfile::tempdir().unwrap();
         let db = db_dir.path().join("brain.lbug");
         index_markdown_directory(&root, &db, "default", "v").unwrap();
@@ -11070,8 +11071,7 @@ mod duplicate_vault_name_tests {
         assert_eq!(pending(), 0, "a finished index owes nothing");
 
         // What a process killed between the scan and the commit leaves.
-        let canonical = root.canonicalize().unwrap();
-        record_vault_index_interrupted(Some(&db), &canonical);
+        record_vault_index_interrupted(Some(&db), &root);
         assert_eq!(pending(), 1);
         let notes = skipped_notes_status_json(Some(&db)).0["reconciliation_pending_notes"].clone();
         assert!(

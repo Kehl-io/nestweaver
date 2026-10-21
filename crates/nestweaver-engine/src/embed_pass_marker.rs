@@ -71,7 +71,8 @@ pub fn begin(db_path: &Path, record: &EmbedPassRecord) -> EmbedPassGuard {
 
 impl Drop for EmbedPassGuard {
     fn drop(&mut self) {
-        if let Err(error) = nestweaver_store::durable_sidecar::remove_file_durable_if_exists(&self.path)
+        if let Err(error) =
+            nestweaver_store::durable_sidecar::remove_file_durable_if_exists(&self.path)
         {
             tracing::warn!(
                 path = %self.path.display(),

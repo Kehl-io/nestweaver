@@ -9946,18 +9946,16 @@ fn survey_import_specifiers(
             let Some(specifier) = specifier.filter(|specifier| !specifier.is_empty()) else {
                 continue;
             };
-            match nestweaver_resolver::imports::resolved_import_path(
+            // Every file the specifier names: a Go import names its whole
+            // package, so a symbol added to any file of it concerns the
+            // importer (the same set `importers_of_added_paths` consults).
+            let named = nestweaver_resolver::imports::resolved_import_paths(
                 path, specifier, &known, *language, workspace,
-            ) {
-                Some(target) => {
-                    if &target != path {
-                        targets.insert(target);
-                    }
-                }
-                None => {
-                    specs.insert(specifier.to_string());
-                }
+            );
+            if named.is_empty() {
+                specs.insert(specifier.to_string());
             }
+            targets.extend(named.into_iter().filter(|target| target != path));
         }
         survey.unresolved.insert(path.clone(), specs);
         survey.targets.insert(path.clone(), targets);
@@ -23380,8 +23378,9 @@ impl Counter {
         assert_eq!(store.lookup_symbols_by_name("beta").unwrap().len(), 1);
     }
 
-    /// A filemeta entry whose content hash the store does not hold (the store
-    /// was restored from an older copy) re-parses that file.
+    /// A filemeta entry the store does not vouch for (the store lost that
+    /// file's rows, or holds an older copy of them) re-parses that file
+    /// instead of classifying it Unchanged.
     #[test]
     fn a_filemeta_entry_the_store_does_not_hold_is_reparsed() {
         let dir = tempfile::tempdir().unwrap();
@@ -23390,21 +23389,23 @@ impl Counter {
         fs::create_dir_all(&repo).unwrap();
         fs::write(repo.join("a.py"), "def alpha():\n    return 1\n").unwrap();
         fs::write(repo.join("b.py"), "def beta():\n    return 1\n").unwrap();
-        let url = "https://example.test/restored-store";
+        let url = "https://example.test/store-lost-a-file";
         index_directory(&repo, &db, "test", url, "s0").unwrap();
-        let backup = dir.path().join("backup.lbug");
-        fs::copy(&db, &backup).unwrap();
-        // The tree moves on and is indexed; then the old database comes back
-        // under the new sidecar.
-        fs::write(repo.join("a.py"), "def gamma():\n    return 1\n").unwrap();
-        index_directory(&repo, &db, "test", url, "s1").unwrap();
-        fs::copy(&backup, &db).unwrap();
+        let r_uid = repo_uid("test", url);
+        {
+            let store = GraphStore::open_or_create(&db).unwrap();
+            store.delete_symbols_in_file(&r_uid, "a.py").unwrap();
+            store
+                .delete_file_node(&nestweaver_schema::file_uid(&r_uid, "a.py"))
+                .unwrap();
+            assert!(store.lookup_symbols_by_name("alpha").unwrap().is_empty());
+        }
 
-        let result = index_directory(&repo, &db, "test", url, "s1").unwrap();
+        let result = index_directory(&repo, &db, "test", url, "s0").unwrap();
         assert_eq!(result.files_unchanged, 1, "b.py is vouched for; a.py is not");
         let store = GraphStore::open_or_create(&db).unwrap();
-        assert_eq!(store.lookup_symbols_by_name("gamma").unwrap().len(), 1);
-        assert!(store.lookup_symbols_by_name("alpha").unwrap().is_empty());
+        assert_eq!(store.lookup_symbols_by_name("alpha").unwrap().len(), 1);
+        assert_eq!(store.lookup_symbols_by_name("beta").unwrap().len(), 1);
     }
 
     /// QA HIGH: a publication killed between its store transactions left a
