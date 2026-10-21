@@ -14495,7 +14495,7 @@ fn build_flow_tree(
 fn tool_schema_detect_changes() -> Value {
     json!({
         "name": "detect_changes",
-        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high, or unknown when a changed file maps to no indexed symbols — never read unknown as low)\n- `risk` and `gate_state` are the verdict `blast_radius` returns for the same files at its default depth (nw-544), so a gate built on either tool agrees; `affected_processes` is detail, not a risk input\n- A process whose `affected_symbol_count` is 0 is listed because a member file's top-level code (its `path::<module>` owner, never a changed symbol) changed; it carries `top_level_code_changed: true`\n- A changed file that is only top-level code gets a `changed-file-top-level-only` warning; files that load it only for its side effects are not tracked, so the run is `status: partial` and `gate_state: degraded-unknown`\n- Gate on `gate_state`, not `status` (nw-467): a run that merely stopped at its configured depth is `status: partial` but `gate_state: ok` — bounded, not broken, and the normal state at the default depth. `degraded-unknown` means stale/errored/refused/cancelled and requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts\n- `resolver_stale_repos`, when present, is repo UIDs with generation-mismatched edges that own or are linked to a changed file (a stale repo unrelated to the change is only named in a `resolver-generation-stale-unrelated` warning) — a different population from `stale_check`'s or `hub_nodes`'s own `stale_repos` (same key name, different tools, different meanings — nw-371)",
+        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high, or unknown when a changed file maps to no indexed symbols — never read unknown as low)\n- `risk` and `gate_state` are the verdict `blast_radius` returns for the same files at its default depth (nw-544), so a gate built on either tool agrees; `affected_processes` is detail, not a risk input\n- `affected_symbols`/`affected_symbol_count` are the symbols DEFINED IN the changed files (also reported as `changed_symbol_count`, the name blast_radius uses for the same population); the transitive dependent count is `blast_radius`. blast_radius's own `affected_symbol_count` counts dependents, so the two tools' `affected_symbol_count` values are different populations\n- A process whose `affected_symbol_count` is 0 is listed because a member file's top-level code (its `path::<module>` owner, never a changed symbol) changed; it carries `top_level_code_changed: true`\n- A changed file that is only top-level code gets a `changed-file-top-level-only` warning; files that load it only for its side effects are not tracked, so the run is `status: partial` and `gate_state: degraded-unknown`\n- Gate on `gate_state`, not `status` (nw-467): a run that merely stopped at its configured depth is `status: partial` but `gate_state: ok` — bounded, not broken, and the normal state at the default depth. `degraded-unknown` means stale/errored/refused/cancelled and requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts\n- `resolver_stale_repos`, when present, is repo UIDs with generation-mismatched edges that own or are linked to a changed file (a stale repo unrelated to the change is only named in a `resolver-generation-stale-unrelated` warning) — a different population from `stale_check`'s or `hub_nodes`'s own `stale_repos` (same key name, different tools, different meanings — nw-371)",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -14663,6 +14663,7 @@ fn tool_detect_changes_scoped(
             "blast_radius": total,
             "affected_symbols": affected_symbols,
             "affected_symbol_count": total,
+            "changed_symbol_count": total,
             "affected_processes": [],
             "affected_process_count": 0,
             "process_analysis_unavailable": true,
@@ -14764,6 +14765,13 @@ fn tool_detect_changes_scoped(
         // against the array length is how a caller sees what was dropped, and
         // `truncated` says it outright rather than requiring the comparison.
         "affected_symbol_count": impact.affected_symbols.len(),
+        // QA #11: this tool's `affected_symbol_count` counts the symbols
+        // DEFINED IN the changed files — `blast_radius`'s
+        // `changed_symbol_count` — while `blast_radius`'s own
+        // `affected_symbol_count` counts their DEPENDENTS (this tool's
+        // `blast_radius`). The old key stays for compatibility; this one
+        // names the population the same way both tools now can.
+        "changed_symbol_count": impact.affected_symbols.len(),
         "affected_processes": affected_processes,
         "affected_process_count": impact.affected_processes.len(),
         "process_analysis_unavailable": false,
@@ -30553,6 +30561,38 @@ mod arg_alias_tests {
             1,
             0
         ));
+    }
+
+    /// QA #11: detect_changes names its symbol population the way
+    /// blast_radius does, beside the legacy key.
+    #[test]
+    fn detect_changes_reports_changed_symbol_count() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&nestweaver_schema::Symbol {
+                uid: "sym:r:src/a.rs:f:1".into(),
+                name: "f".into(),
+                kind: nestweaver_schema::SymbolKind::Function,
+                repo_uid: "repo:r".into(),
+                file_path: "src/a.rs".into(),
+                start_line: 1,
+                end_line: 2,
+                signature: "fn f()".into(),
+                summary: None,
+                content_hash: "h".into(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: nestweaver_schema::Visibility::Public,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+        let result = tool_detect_changes(&store, json!({ "changed_files": ["src/a.rs"] })).unwrap();
+        assert_eq!(result["changed_symbol_count"], 1, "{result}");
+        assert_eq!(result["changed_symbol_count"], result["affected_symbol_count"]);
     }
 
     #[test]
