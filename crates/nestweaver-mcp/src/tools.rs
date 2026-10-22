@@ -2325,7 +2325,8 @@ mod tool_schema_validation_tests {
                 }
             }
         }
-        assert_eq!(documented_arguments, 234);
+        // 235: count_patterns gained a documented `max_millis` budget.
+        assert_eq!(documented_arguments, 235);
         assert!(crate::output_budget::escaped_size(&page) <= crate::output_budget::CATALOGUE_BYTES);
         let envelope = json!({"jsonrpc":"2.0", "id":2, "result":page});
         assert!(crate::output_budget::escaped_size(&envelope) < 40_960);
