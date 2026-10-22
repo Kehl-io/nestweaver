@@ -23776,6 +23776,76 @@ impl Counter {
         assert_incremental_matches_full(dir.path(), &repo, &db, url, "s3");
     }
 
+    /// post-#515: the unique-method fallback types `Child.make().run()` from
+    /// `make`'s `return Child()`. That evidence lives in the factory file's
+    /// references, so an incremental run whose factory file is unchanged
+    /// (served from the parse cache) must reach the same verdict as a full
+    /// index, and editing the factory alone must re-resolve its caller.
+    #[test]
+    fn incremental_index_matches_full_for_a_factory_in_an_unchanged_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db = dir.path().join("inc.lbug");
+        fs::create_dir_all(repo.join("pkg")).unwrap();
+        fs::write(repo.join("pkg/__init__.py"), "").unwrap();
+        let core = |returned: &str| {
+            format!(
+                "class Base:\n    def run(self):\n        return 1\n\n\nclass Child(Base):\n    @staticmethod\n    def make():\n        return {returned}\n"
+            )
+        };
+        fs::write(repo.join("pkg/core.py"), core("Child()")).unwrap();
+        let user = |extra: &str| {
+            format!(
+                "from pkg.core import Child\n\n\ndef user():\n    return Child.make().run()\n{extra}"
+            )
+        };
+        fs::write(repo.join("pkg/use.py"), user("")).unwrap();
+        fs::write(
+            repo.join("pkg/other.py"),
+            "def untouched():\n    return 2\n",
+        )
+        .unwrap();
+        let url = "https://example.test/fallback-factory-unchanged";
+        index_directory(&repo, &db, "test", url, "s0").unwrap();
+        let user_calls_run = |db: &Path| {
+            let store = GraphStore::open_or_create(db).unwrap();
+            let uid_of = |name: &str| {
+                let symbols = store.lookup_symbols_by_name(name).unwrap();
+                assert_eq!(symbols.len(), 1, "{name}: {symbols:?}");
+                symbols[0].uid.clone()
+            };
+            let (user, run) = (uid_of("user"), uid_of("run"));
+            drop(store);
+            resolved_edge_set(db)
+                .iter()
+                .any(|(source, target, edge_type)| {
+                    *source == user && *target == run && edge_type == "CALLS"
+                })
+        };
+        assert!(user_calls_run(&db), "precondition: the fallback links run");
+
+        // Only the caller changes; the factory comes from the parse cache.
+        fs::write(
+            repo.join("pkg/use.py"),
+            user("\n\ndef later():\n    return 3\n"),
+        )
+        .unwrap();
+        assert_incremental_matches_full(dir.path(), &repo, &db, url, "s1");
+        assert!(
+            user_calls_run(&db),
+            "s1: the unchanged factory still types the chain"
+        );
+
+        // Only the factory changes: it no longer returns a Child.
+        fs::write(repo.join("pkg/core.py"), core("{}")).unwrap();
+        assert_incremental_matches_full(dir.path(), &repo, &db, url, "s2");
+        assert!(!user_calls_run(&db), "s2: a dict factory types nothing");
+
+        fs::write(repo.join("pkg/core.py"), core("Child()")).unwrap();
+        assert_incremental_matches_full(dir.path(), &repo, &db, url, "s3");
+        assert!(user_calls_run(&db), "s3: restored");
+    }
+
     /// QA (repos/inc2): `main.ts` reaches `greet` through a barrel
     /// (`util/index.ts`: `export * from "./strings"`). Renaming the barrel's
     /// target and updating the barrel lost the hello -> greet edge on every
