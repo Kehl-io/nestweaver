@@ -456,8 +456,8 @@ fn resolve_typed(inputs: &[(&str, &str)], language: Language) -> (Files, Vec<Res
     (files, edges)
 }
 
-/// QA (post-#515): Kotlin name precedence is explicit import > same package
-/// > star import. `import com.k1.make` imports `make`, not every top-level
+/// QA (post-#515): Kotlin name precedence is explicit import, then same
+/// package, then star import. `import com.k1.make` imports `make`, not every top-level
 /// declaration of its file, so `Thing()` in `com.k2` is `com.k2.Thing`.
 #[test]
 fn kotlin_same_package_type_wins_over_package_imports() {

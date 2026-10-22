@@ -42,6 +42,9 @@ pub fn resolve_import(
 /// class per file usually puts `Foo` in `Foo.java`, but a package-private
 /// top-level class can live in any file of its package, and a nested class
 /// `Outer.Inner` lives in `Outer.java`.
+/// A file's top-level declarations: name → line spans.
+type TopLevelSpans<'a> = HashMap<&'a str, Vec<(u32, u32)>>;
+
 pub struct JvmPackageIndex<'a> {
     /// Declared package → files declaring it.
     declared: HashMap<&'a str, Vec<&'a str>>,
@@ -52,7 +55,7 @@ pub struct JvmPackageIndex<'a> {
     /// every such file per import.
     undeclared: HashMap<&'a str, Vec<(&'a str, &'a str)>>,
     /// File → its top-level declarations: name → line spans.
-    top_level: HashMap<&'a str, HashMap<&'a str, Vec<(u32, u32)>>>,
+    top_level: HashMap<&'a str, TopLevelSpans<'a>>,
 }
 
 /// What one Kotlin/Java import names.
